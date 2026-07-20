@@ -2637,6 +2637,30 @@ mod tests {
     }
 
     #[test]
+    fn producer_multi_pool_validation_rejects_empty_duplicate_and_unknown_sets() {
+        let temp = tempdir().unwrap();
+        let error_for = |requested: Vec<String>| {
+            let mut registry = registry(&temp.path().join("effects.jsonl"));
+            let ProducerConfig::Calendar(calendar) = registry.get_mut("daily").unwrap() else {
+                unreachable!()
+            };
+            calendar.enqueue.pools = requested;
+            validate_registry(
+                &registry,
+                &BTreeSet::from(["slot".to_owned()]),
+                &BTreeSet::from(["shell".to_owned()]),
+            )
+            .unwrap_err()
+            .to_string()
+        };
+
+        assert!(error_for(Vec::new()).contains("at least one"));
+        assert!(error_for(vec!["slot".to_owned(), "slot".to_owned()]).contains("duplicate"));
+        assert!(error_for(vec!["slot".to_owned(), "missing".to_owned()])
+            .contains("references unknown pool \"missing\""));
+    }
+
+    #[test]
     fn calendar_emits_a_direct_payload_with_strftime_dedup_and_credentials() {
         let temp = tempdir().unwrap();
         let mut registry = registry(&temp.path().join("effects.jsonl"));

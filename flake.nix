@@ -197,7 +197,11 @@
                     credentials.PRODUCER_TOKEN = "/run/credentials/tally-producer";
                     enqueue = {
                       argv = [ "calendar-job" ];
-                      pool = "stock";
+                      pool = [
+                        "programmatic"
+                        "stock"
+                      ];
+                      consumptionEstimate = 1;
                       credentials.JOB_TOKEN = "/run/credentials/tally-job";
                     };
                   };
@@ -424,6 +428,33 @@
           ];
         };
         badPoolAttempt = builtins.tryEval (builtins.deepSeq badPoolNixos.config.system.build.toplevel true);
+        unknownMultiPoolNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            {
+              services.tally = {
+                enable = true;
+                pools.stock.resource = "build-slot";
+                producers.daily = {
+                  kind = "calendar";
+                  onCalendar = "daily";
+                  enqueue = {
+                    argv = [ "calendar-job" ];
+                    pool = [
+                      "stock"
+                      "missing"
+                    ];
+                  };
+                };
+              };
+            }
+          ];
+        };
+        unknownMultiPoolAttempt = builtins.tryEval (
+          builtins.deepSeq unknownMultiPoolNixos.config.system.build.toplevel true
+        );
         forbiddenAttempt =
           module:
           builtins.tryEval (
@@ -536,7 +567,9 @@
               .pools.stock.enforce == "cooperative" and
               .pools.programmatic.usageMeter.budgetClass == "programmatic" and
               .pools.programmatic.credentials.METER_TOKEN == "/run/credentials/tally-meter" and
+              .producers.daily.enqueue.pool == ["programmatic", "stock"] and
               .producers.daily.enqueue.credentials.JOB_TOKEN == "/run/credentials/tally-job" and
+              .producers.effects.onKey.pool == "stock" and
               .producers.health.onReturnAttest.noEnqueue == true and
               .adapters["project-codex"].argv == ["codex", "exec", "-C", "/work/project", "--json", "--"] and
               ([.. | objects | keys[]] | any(. == "remote" or . == "servingSlice" or . == "patchedSystemd") | not)
@@ -568,6 +601,11 @@
           bad-pool-rejected =
             assert !badPoolAttempt.success;
             pkgs.runCommand "tally-bad-pool-rejected" { } ''
+              touch "$out"
+            '';
+          unknown-multi-pool-rejected =
+            assert !unknownMultiPoolAttempt.success;
+            pkgs.runCommand "tally-unknown-multi-pool-rejected" { } ''
               touch "$out"
             '';
           producer-kind-required =

@@ -188,10 +188,13 @@ let
           description = "Open-map adapter name.";
         };
         pool = mkOption {
-          type = types.str;
-          default = "";
-          example = "worker-build";
-          description = "Required target pool name.";
+          type = types.coercedTo types.str (pool: [ pool ]) (types.listOf types.str);
+          default = [ ];
+          example = [
+            "worker-build"
+            "programmatic-budget"
+          ];
+          description = "Required non-empty set of target pool names; a legacy singleton string is accepted.";
         };
         priority = mkOption {
           type = types.enum [
@@ -266,8 +269,12 @@ let
           message = "tally producer enqueue ${name} requires a non-empty direct argv";
         }
         {
-          assertion = config.pool != "";
-          message = "tally producer enqueue ${name} requires a pool";
+          assertion = config.pool != [ ];
+          message = "tally producer enqueue ${name} requires a non-empty pool set";
+        }
+        {
+          assertion = builtins.length (unique config.pool) == builtins.length config.pool;
+          message = "tally producer enqueue ${name} pool set contains duplicates";
         }
         {
           assertion = config.adapter != "";
@@ -915,22 +922,27 @@ let
       };
     };
 
-  renderEnqueue = enqueue: {
-    inherit (enqueue)
-      argv
-      adapter
-      pool
-      priority
-      dedupKey
-      evidence
-      evidenceClass
-      manifestHash
-      consumptionEstimate
-      runtimeMaxSec
-      noEnqueue
-      ;
-    credentials = mapAttrs (_: toString) enqueue.credentials;
-  };
+  renderEnqueue =
+    enqueue:
+    let
+      pools = builtins.sort builtins.lessThan enqueue.pool;
+    in
+    {
+      inherit (enqueue)
+        argv
+        adapter
+        priority
+        dedupKey
+        evidence
+        evidenceClass
+        manifestHash
+        consumptionEstimate
+        runtimeMaxSec
+        noEnqueue
+        ;
+      pool = if builtins.length pools == 1 then builtins.head pools else pools;
+      credentials = mapAttrs (_: toString) enqueue.credentials;
+    };
 
   renderProducer =
     _: producer:
@@ -1073,16 +1085,18 @@ let
           else
             [ ]
         )
-        (map (enqueue: [
-          {
-            assertion = builtins.hasAttr enqueue.pool cfg.pools;
-            message = "tally producer ${name} references unknown pool ${enqueue.pool}";
-          }
-          {
-            assertion = builtins.hasAttr enqueue.adapter cfg.adapters;
-            message = "tally producer ${name} references unknown adapter ${enqueue.adapter}";
-          }
-        ]) (producerEnqueues producer))
+        (map (enqueue:
+          (map (pool: {
+            assertion = builtins.hasAttr pool cfg.pools;
+            message = "tally producer ${name} references unknown pool ${pool}";
+          }) enqueue.pool)
+          ++ [
+            {
+              assertion = builtins.hasAttr enqueue.adapter cfg.adapters;
+              message = "tally producer ${name} references unknown adapter ${enqueue.adapter}";
+            }
+          ]
+        ) (producerEnqueues producer))
       ]) cfg.producers)
       (
         let

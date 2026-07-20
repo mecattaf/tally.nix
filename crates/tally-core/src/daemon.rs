@@ -1490,7 +1490,14 @@ impl DaemonHandler {
                 context
                     .jobs
                     .get(job_id)
-                    .filter(|job| job.row.pools.iter().any(|name| name == pool))
+                    .filter(|job| {
+                        job.row.pools.iter().any(|name| name == pool)
+                            && !job
+                                .row
+                                .pools
+                                .iter()
+                                .any(|name| context.unreachable_pools.contains(name))
+                    })
                     .map(|_| *job_id)
             })
             .collect::<Vec<_>>();
@@ -5282,6 +5289,29 @@ mod tests {
         }
     }
 
+    struct RunningProbe {
+        attempt: u32,
+        lease_epoch: u64,
+    }
+
+    impl LocalUnitProbe for RunningProbe {
+        fn inspect(
+            &self,
+            unit: &str,
+            _paths: &ExecutionPaths,
+        ) -> Result<LocalUnitFact, ExecutorError> {
+            Ok(LocalUnitFact {
+                unit: unit.to_owned(),
+                loaded: true,
+                state: LocalUnitState::Running,
+                invocation_id: Some("restart-invocation".to_owned()),
+                attempt: Some(self.attempt),
+                lease_epoch: Some(self.lease_epoch),
+                exit_record: None,
+            })
+        }
+    }
+
     struct IntentObservingProbe {
         path: PathBuf,
         task_uuid: Uuid,
@@ -5350,6 +5380,19 @@ mod tests {
             producers: BTreeMap::new(),
             journald: JournaldConfig { native: false },
         }
+    }
+
+    fn two_pool_config() -> Config {
+        let mut config = one_pool_config();
+        config.pools.insert(
+            "zeta".to_owned(),
+            PoolConfig {
+                resource: ResourceKind::BuildSlot,
+                predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+                ..PoolConfig::default()
+            },
+        );
+        config
     }
 
     fn window_pool_config() -> Config {
@@ -5784,13 +5827,14 @@ mod tests {
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(
-                    one_pool_config(),
+                    two_pool_config(),
                     paths.clone(),
                     settings(),
                     executor,
                 )
                 .await
                 .unwrap();
+                let daemon_context = daemon.handler.context.clone();
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
                 let mut client = RpcClient::connect(&paths.socket).await.unwrap();
@@ -5805,7 +5849,7 @@ mod tests {
                         "queue.enqueue",
                         Some(json!({
                             "argv": ["true"],
-                            "pool": "slot",
+                            "pool": ["zeta", "slot"],
                             "priority": "high",
                             "adapter": "shell",
                             "source": "manual",
@@ -5829,6 +5873,10 @@ mod tests {
                     .iter()
                     .find(|record| record.task_uuid.as_deref() == Some(&task_uuid))
                     .unwrap();
+                assert_eq!(
+                    record.pools.as_deref(),
+                    Some(["slot".to_owned(), "zeta".to_owned()].as_slice())
+                );
                 assert_eq!(record.evidence_class.as_ref(), Some(&evidence_class));
                 assert_eq!(
                     record.manifest_hash,
@@ -5861,13 +5909,36 @@ mod tests {
                     .unwrap();
                 assert_eq!(queried["evidenceClass"], evidence_class);
                 assert_eq!(queried["manifestHash"], manifest_hash);
+                assert_eq!(queried["pool"], json!(["slot", "zeta"]));
+
+                let events = read_acknowledged_events(&paths.events_dir()).unwrap();
+                let durable = events
+                    .iter()
+                    .find(|event| event.row.uuid.to_string() == task_uuid)
+                    .unwrap();
+                assert_eq!(durable.row.pools, ["slot", "zeta"]);
+                let status = client.call("query.status", Some(json!({}))).await.unwrap();
+                let projected = status["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|job| job["taskUuid"] == task_uuid)
+                    .unwrap();
+                assert_eq!(projected["pool"], json!(["slot", "zeta"]));
+                let context = daemon_context.read().await;
+                assert!(context.recent_journal.iter().any(|entry| {
+                    entry.fields.task_uuid == task_uuid
+                        && entry.fields.pools.as_deref()
+                            == Some(["slot".to_owned(), "zeta".to_owned()].as_slice())
+                }));
+                drop(context);
 
                 let absent = client
                     .call(
                         "queue.enqueue",
                         Some(json!({
                             "argv": ["true"],
-                            "pool": "slot",
+                            "pool": ["slot", "zeta"],
                             "priority": "high",
                             "adapter": "shell",
                             "source": "manual",
@@ -7599,6 +7670,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn restart_re_adopts_an_in_flight_multi_pool_job_with_the_complete_set() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                prepare_paths(&paths).unwrap();
+                assert_eq!(bump_epoch(&paths.state_dir).unwrap(), 1);
+                let mut row = durable_row(Uuid::new_v4(), "restart-multi-pool", 1);
+                row.pools = vec!["slot".to_owned(), "zeta".to_owned()];
+                write_enqueue_event_atomic(
+                    &paths.events_dir(),
+                    &DurableEnqueueEvent::new(row.clone()).unwrap(),
+                )
+                .unwrap();
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(RunningProbe {
+                        attempt: 1,
+                        lease_epoch: 1,
+                    });
+
+                let daemon = Daemon::open_with_executor(
+                    two_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                assert_eq!(daemon.handler.context.read().await.epoch, 2);
+                assert_eq!(daemon.initial_jobs.len(), 1);
+                assert!(daemon.initial_jobs[0].adopted);
+                assert_eq!(daemon.initial_jobs[0].row.pools, ["slot", "zeta"]);
+                let context = daemon.handler.context.read().await;
+                let recovered = &context.jobs[&row.uuid];
+                assert!(recovered.adopted);
+                assert_eq!(recovered.row.pools, ["slot", "zeta"]);
+                assert!(recovered.lease_id.is_some());
+                assert_eq!(context.lease.engine().held_in_pool("slot").unwrap(), 1);
+                assert_eq!(context.lease.engine().held_in_pool("zeta").unwrap(), 1);
+                assert_eq!(context.lease.engine().queue_len(), 0);
+                drop(context);
+
+                let lease_log =
+                    fs::read_to_string(paths.state_dir.join(crate::lease::LEASE_EVENTS_FILE))
+                        .unwrap();
+                assert!(lease_log.contains(r#""pools":["slot","zeta"]"#));
+                assert!(!lease_log.contains(r#""kind":"released""#));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn restart_rebuilds_cache_and_preserves_terminal_wait_without_reexecution() {
         let local = LocalSet::new();
         local
@@ -7971,6 +8100,134 @@ mod tests {
                 assert_eq!(late_reused["verdict"], "reused");
                 reopened_shutdown.send(true).unwrap();
                 reopened_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_pool_admission_is_atomic_and_any_conflict_or_gate_blocks() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    two_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+
+                let held = daemon
+                    .handler
+                    .acquire(Some(json!({"pool": "slot"})))
+                    .await
+                    .unwrap();
+                let held_lease = held["outcome"]["granted"]["leaseId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let admitted = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": ["true"],
+                        "pool": ["zeta", "slot"],
+                        "priority": "low",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(admitted["state"], "queued");
+                let task_uuid = Uuid::parse_str(admitted["task_uuid"].as_str().unwrap()).unwrap();
+
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].row.pools, ["slot", "zeta"]);
+                    assert_eq!(context.lease.engine().held_in_pool("slot").unwrap(), 1);
+                    assert_eq!(context.lease.engine().held_in_pool("zeta").unwrap(), 0);
+                    assert_eq!(context.lease.engine().queued_in_pool("slot").unwrap(), 1);
+                    assert_eq!(context.lease.engine().queued_in_pool("zeta").unwrap(), 1);
+                }
+                let events = read_acknowledged_events(&paths.events_dir()).unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].row.pools, ["slot", "zeta"]);
+                let status = daemon
+                    .handler
+                    .query("query.status", Some(json!({})))
+                    .await
+                    .unwrap();
+                let projected = status["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|job| job["taskUuid"] == task_uuid.to_string())
+                    .unwrap();
+                assert_eq!(projected["pool"], json!(["slot", "zeta"]));
+
+                let paused = daemon
+                    .handler
+                    .pause(Some(json!({"pool": "zeta"})))
+                    .await
+                    .unwrap();
+                assert_eq!(paused["affected"], 1);
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Paused);
+                    assert_eq!(context.lease.engine().queue_len(), 0);
+                }
+
+                daemon
+                    .handler
+                    .resume(Some(json!({"pool": "zeta"})))
+                    .await
+                    .unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Queued);
+                    assert_eq!(context.lease.engine().queued_in_pool("slot").unwrap(), 1);
+                    assert_eq!(context.lease.engine().queued_in_pool("zeta").unwrap(), 1);
+                }
+
+                assert_eq!(daemon.handler.apply_pool_loss("zeta").await.unwrap(), 0);
+                assert_eq!(daemon.handler.apply_pool_loss("slot").await.unwrap(), 0);
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Paused);
+                    assert!(context.unreachable_paused_jobs.contains(&task_uuid));
+                    assert_eq!(context.lease.engine().queue_len(), 0);
+                }
+                daemon.handler.apply_pool_return("zeta").await.unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Paused);
+                    assert!(context.unreachable_paused_jobs.contains(&task_uuid));
+                }
+                daemon.handler.apply_pool_return("slot").await.unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Queued);
+                    assert!(!context.unreachable_paused_jobs.contains(&task_uuid));
+                    assert_eq!(context.lease.engine().queued_in_pool("slot").unwrap(), 1);
+                    assert_eq!(context.lease.engine().queued_in_pool("zeta").unwrap(), 1);
+                }
+                let released = daemon
+                    .handler
+                    .release(Some(json!({"lease": held_lease})))
+                    .await
+                    .unwrap();
+                assert_eq!(released["promoted"].as_array().unwrap().len(), 1);
+                assert_eq!(released["promoted"][0]["pools"], json!(["slot", "zeta"]));
             })
             .await;
     }

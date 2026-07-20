@@ -1449,6 +1449,33 @@ mod tests {
     }
 
     #[test]
+    fn lease_admission_canonicalizes_pool_order_before_grant_and_event_persistence() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = LeaseEventLog::in_state_dir(temp.path());
+        let mut engine = LeaseEngine::new(
+            3,
+            Duration::from_secs(20),
+            BTreeMap::from([("alpha".to_owned(), pool(1)), ("zeta".to_owned(), pool(1))]),
+            Some(log.clone()),
+        )
+        .unwrap();
+        let granted = grant(
+            engine
+                .admit_at(
+                    request("ordered", &["zeta", "alpha"], Priority::High),
+                    now(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(granted.pools, ["alpha", "zeta"]);
+        let events = log.read().unwrap();
+        let LeaseEventKind::Granted { grant, .. } = &events[0].event else {
+            panic!("expected durable grant")
+        };
+        assert_eq!(grant.pools, ["alpha", "zeta"]);
+    }
+
+    #[test]
     fn window_estimate_is_authoritative_and_expires() {
         let mut engine = LeaseEngine::new(
             1,

@@ -2250,6 +2250,22 @@ mod tests {
     }
 
     #[test]
+    fn execution_environment_preserves_scalar_compatibility_and_encodes_multi_pool_sets() {
+        let singleton = request();
+        let singleton_environment = execution_environment(&singleton).unwrap();
+        assert!(singleton_environment
+            .iter()
+            .any(|(name, value)| name == "TALLY_POOL" && value == "gpu"));
+
+        let mut multi = request();
+        multi.pools = vec!["alpha".to_owned(), "zeta".to_owned()];
+        let multi_environment = execution_environment(&multi).unwrap();
+        assert!(multi_environment
+            .iter()
+            .any(|(name, value)| { name == "TALLY_POOL" && value == r#"["alpha","zeta"]"# }));
+    }
+
+    #[test]
     fn rowless_identity_uses_job_uuid_and_optional_env_stays_absent() {
         let mut request = request();
         request.identity.task_uuid = None;

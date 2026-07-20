@@ -417,6 +417,16 @@ pub fn validate_fields(fields: &TallyFields) -> Result<(), JournalError> {
             )));
         }
     }
+    if let Some(pools) = &fields.pools {
+        let mut canonical = pools.clone();
+        crate::poolset::canonicalize(&mut canonical)
+            .map_err(|error| JournalError::Invalid(error.to_string()))?;
+        if &canonical != pools {
+            return Err(JournalError::Invalid(
+                "TALLY_POOL set must be in canonical order".to_owned(),
+            ));
+        }
+    }
     for (name, value) in string_fields(fields) {
         if value.contains('\0') {
             return Err(JournalError::Invalid(format!("{name} contains a NUL byte")));

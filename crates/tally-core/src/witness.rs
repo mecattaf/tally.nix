@@ -184,6 +184,11 @@ pub fn compute_hash(record: &WitnessRecord) -> Result<String, WitnessError> {
 }
 
 pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord, WitnessError> {
+    let mut pools = body.pools;
+    if let Some(pools) = &mut pools {
+        crate::poolset::canonicalize(pools)
+            .map_err(|error| WitnessError::Corrupt(error.to_string()))?;
+    }
     let mut record = WitnessRecord {
         task_uuid: body.task_uuid,
         transition_timestamp: body.transition_timestamp,
@@ -197,7 +202,7 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
         dedup_key: body.dedup_key,
         labor_class: body.labor_class,
         trace_ref: body.trace_ref,
-        pools: body.pools,
+        pools,
         charge: body.charge,
         model: body.model,
         evidence_class: body.evidence_class,
@@ -833,6 +838,26 @@ mod tests {
         assert!(json.find("evidence_class").unwrap() < json.find("manifest_hash").unwrap());
         assert!(json.find("manifest_hash").unwrap() < json.find("\"seq\"").unwrap());
         let report = verify_reader(BufReader::new(json.as_bytes()));
+        assert!(report.ok, "{:?}", report.problems);
+    }
+
+    #[test]
+    fn witness_pool_encoding_preserves_legacy_bytes_and_canonicalizes_multi() {
+        let singleton = build_record(body(), &ChainHead::default()).unwrap();
+        let singleton_json = serde_json::to_string(&singleton).unwrap();
+        assert!(singleton_json.contains(r#""pool":"worker-gpu""#));
+        assert!(!singleton_json.contains(r#""pool":["#));
+
+        let mut multi_body = body();
+        multi_body.pools = Some(vec!["zeta".to_owned(), "alpha".to_owned()]);
+        let multi = build_record(multi_body, &ChainHead::default()).unwrap();
+        assert_eq!(
+            multi.pools.as_deref(),
+            Some(["alpha".to_owned(), "zeta".to_owned()].as_slice())
+        );
+        let multi_json = serde_json::to_string(&multi).unwrap();
+        assert!(multi_json.contains(r#""pool":["alpha","zeta"]"#));
+        let report = verify_reader(BufReader::new(multi_json.as_bytes()));
         assert!(report.ok, "{:?}", report.problems);
     }
 

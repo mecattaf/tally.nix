@@ -705,6 +705,49 @@ mod tests {
     }
 
     #[test]
+    fn enqueue_pool_wire_compatibility_is_scalar_for_singletons_and_array_for_multi() {
+        let mut legacy = child_payload();
+        legacy.caller_job_id = None;
+        legacy.pools = Some(vec!["slot".to_owned()]);
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(encoded["pool"], "slot");
+        let decoded: EnqueuePayload = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.pools, Some(vec!["slot".to_owned()]));
+
+        legacy.pools = Some(vec!["slot".to_owned(), "zeta".to_owned()]);
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(encoded["pool"], serde_json::json!(["slot", "zeta"]));
+        let decoded: EnqueuePayload = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.pools, legacy.pools);
+    }
+
+    #[test]
+    fn enqueue_pool_set_rejections_are_actionable_and_canonicalization_is_stable() {
+        let mut state = GuardrailState::new(GuardrailConfig::default()).unwrap();
+        let mut payload = child_payload();
+        payload.caller_job_id = None;
+        payload.pools = Some(Vec::new());
+        assert!(state
+            .validate_enqueue(payload.clone(), &defaults())
+            .unwrap_err()
+            .message
+            .contains("at least one"));
+
+        payload.pools = Some(vec!["slot".to_owned(), "slot".to_owned()]);
+        assert!(state
+            .validate_enqueue(payload.clone(), &defaults())
+            .unwrap_err()
+            .message
+            .contains("duplicate"));
+
+        payload.pools = Some(vec!["zeta".to_owned(), "alpha".to_owned()]);
+        assert_eq!(
+            state.validate_enqueue(payload, &defaults()).unwrap().pools,
+            ["alpha", "zeta"]
+        );
+    }
+
+    #[test]
     fn quote_aware_split_is_direct_exec_only() {
         assert_eq!(
             split_invocation(r#"cmd "two words" 'three four' escaped\ space """#).unwrap(),

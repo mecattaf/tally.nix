@@ -1007,6 +1007,29 @@ mod tests {
     }
 
     #[test]
+    fn durable_pool_compatibility_migrates_legacy_scalars_and_canonicalizes_multi() {
+        let singleton = seed(Uuid::new_v4());
+        let scalar = serde_json::to_value(&singleton).unwrap();
+        assert_eq!(scalar["pool"], "worker-gpu");
+        let restored: RowSeed = serde_json::from_value(scalar).unwrap();
+        assert_eq!(restored.pools, ["worker-gpu"]);
+
+        let mut multi = seed(Uuid::new_v4());
+        multi.pools = vec!["zeta".to_owned(), "alpha".to_owned()];
+        let event = DurableEnqueueEvent::new(multi).unwrap();
+        assert_eq!(event.row.pools, ["alpha", "zeta"]);
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["row"]["pool"], serde_json::json!(["alpha", "zeta"]));
+        assert_eq!(
+            serde_json::from_value::<DurableEnqueueEvent>(encoded)
+                .unwrap()
+                .row
+                .pools,
+            ["alpha", "zeta"]
+        );
+    }
+
+    #[test]
     fn durable_credentials_require_absolute_systemd_safe_sources() {
         let mut row = seed(Uuid::new_v4());
         row.credentials

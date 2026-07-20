@@ -636,7 +636,7 @@ where
         .map_err(|error| anyhow::anyhow!("{environment} has an invalid value: {error}"))
 }
 
-async fn run_enqueue(socket: &Path, args: EnqueueArgs) -> Result<()> {
+async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
     let has_invocation = args.invocation.is_some();
     let has_argv = !args.argv.is_empty();
     if has_invocation == has_argv {
@@ -647,6 +647,8 @@ async fn run_enqueue(socket: &Path, args: EnqueueArgs) -> Result<()> {
     if args.runtime_max_sec == Some(0) {
         return Err(invalid("--runtime-max-sec must be positive"));
     }
+    tally_core::poolset::canonicalize(&mut args.pools)
+        .map_err(|error| invalid(error.to_string()))?;
     let payload = EnqueuePayload {
         invocation: args.invocation,
         argv: has_argv.then_some(args.argv),
@@ -764,7 +766,9 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
 
 async fn run_lease(socket: &Path, command: LeaseCommand) -> Result<()> {
     match command {
-        LeaseCommand::Acquire { pools } => {
+        LeaseCommand::Acquire { mut pools } => {
+            tally_core::poolset::canonicalize(&mut pools)
+                .map_err(|error| invalid(error.to_string()))?;
             let pool = match pools.as_slice() {
                 [pool] => Value::String(pool.clone()),
                 pools => serde_json::to_value(pools)?,
