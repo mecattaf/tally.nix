@@ -1,0 +1,104 @@
+[
+  {
+    "id": "1001",
+    "unread": true,
+    "reason": "review_requested",
+    "updated_at": "2026-07-09T09:15:00Z",
+    "last_read_at": null,
+    "subject": {
+      "title": "Fix witness chain restart recovery",
+      "url": "https://api.github.com/repos/mecattaf/tally/pulls/128",
+      "latest_comment_url": null,
+      "type": "PullRequest"
+    },
+    "repository": {
+      "id": 900001,
+      "full_name": "mecattaf/tally",
+      "name": "tally",
+      "owner": { "login": "mecattaf" }
+    },
+    "subscription_url": "https://api.github.com/notifications/threads/1001/subscription"
+  },
+  {
+    "id": "1002",
+    "unread": true,
+    "reason": "mention",
+    "updated_at": "2026-07-09T09:40:00Z",
+    "last_read_at": null,
+    "subject": {
+      "title": "Detector OSC fast-path discussion",
+      "url": "https://api.github.com/repos/mecattaf/tally/issues/131",
+      "latest_comment_url": "https://api.github.com/repos/mecattaf/tally/issues/comments/55501",
+      "type": "Issue"
+    },
+    "repository": {
+      "id": 900001,
+      "full_name": "mecattaf/tally",
+      "name": "tally",
+      "owner": { "login": "mecattaf" }
+    },
+    "subscription_url": "https://api.github.com/notifications/threads/1002/subscription"
+  },
+  {
+    "id": "1003",
+    "unread": true,
+    "reason": "assign",
+    "updated_at": "2026-07-09T08:05:00Z",
+    "last_read_at": null,
+    "subject": {
+      "title": "Package pls as flake=false wrap",
+      "url": "https://api.github.com/repos/mecattaf/tally/issues/117",
+      "latest_comment_url": null,
+      "type": "Issue"
+    },
+    "repository": {
+      "id": 900001,
+      "full_name": "mecattaf/tally",
+      "name": "tally",
+      "owner": { "login": "mecattaf" }
+    },
+    "subscription_url": "https://api.github.com/notifications/threads/1003/subscription"
+  },
+  {
+    "id": "1004",
+    "unread": true,
+    "reason": "subscribed",
+    "updated_at": "2026-07-09T07:30:00Z",
+    "last_read_at": null,
+    "subject": {
+      "title": "Weekly digest thread (muted)",
+      "url": "https://api.github.com/repos/mecattaf/tally/issues/40",
+      "latest_comment_url": null,
+      "type": "Issue"
+    },
+    "repository": {
+      "id": 900001,
+      "full_name": "mecattaf/tally",
+      "name": "tally",
+      "owner": { "login": "mecattaf" }
+    },
+    "subscription_url": "https://api.github.com/notifications/threads/1004/subscription",
+    "subscription": { "subscribed": false, "ignored": true, "reason": null }
+  },
+  {
+    "id": "1005",
+    "unread": true,
+    "reason": "review_requested",
+    "updated_at": "2026-07-09T06:10:00Z",
+    "last_read_at": null,
+    "subject": {
+      "title": "Unsubscribed noisy PR",
+      "url": "https://api.github.com/repos/mecattaf/tally/pulls/55",
+      "latest_comment_url": null,
+      "type": "PullRequest"
+    },
+    "repository": {
+      "id": 900001,
+      "full_name": "mecattaf/tally",
+      "name": "tally",
+      "owner": { "login": "mecattaf" }
+    },
+    "subscription_url": "https://api.github.com/notifications/threads/1005/subscription",
+    "subscription": { "subscribed": false, "ignored": false, "reason": "unsubscribed" }
+  }
+]

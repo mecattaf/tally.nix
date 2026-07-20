@@ -1,0 +1,16 @@
+{
+  "priority": "low",
+  "source": "r2",
+  "kind": "shell",
+  "argv": ["dev/mock/fake-worker.sh", "--", "paper-0421.pdf"],
+  "cwd": ".",
+  "evidence": [
+    "artifact:paper-0421.ocr.txt",
+    "hash:sha256",
+    "exit:0"
+  ],
+  "pool": "worker-gpu",
+  "model_class": "ocr",
+  "dedup_key": "ocr:paper-0421",
+  "detach": true
+}

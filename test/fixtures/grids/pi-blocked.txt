@@ -1,0 +1,16 @@
+▸ assistant
+  I'm about to delete the legacy migration files. This cannot be undone.
+
+  tool  run_command  rm -rf ./migrations/legacy
+
+────────────────────────────────────────────────────────────────
+
+⚠ This action requires your approval.
+
+  run_command: rm -rf ./migrations/legacy
+
+  Allow this command to run?
+
+╭──────────────────────────────────────────────────────────────╮
+│ (y) yes   (n) no   (a) always allow   waiting for input…      │
+╰──────────────────────────────────────────────────────────────╯

@@ -1,0 +1,17 @@
+# reference clones for analysis — not part of the product (see docs/REFERENCES.md)
+/vendor/
+
+# nix / rust build outputs
+/result
+/result-*
+/target/
+.direnv/
+
+# bun / typescript build outputs
+/dist/
+/node_modules/
+*.tsbuildinfo
+
+# scratch
+*.log
+__pycache__/

@@ -1,0 +1,93 @@
+# dev/process-compose.yaml — the tally dev rig, native process-compose form (M3.4 dev-rig).
+#
+# This is the NON-nix path: `process-compose -f dev/process-compose.yaml up` boots the same rig
+# `nix run .#dev` boots, for a checkout where you already have `tally`, `bash`, and `python3` on
+# PATH (e.g. inside `nix develop` or a `nix shell nixpkgs#bun`). `nix/dev.nix` renders the SAME
+# process graph through process-compose-flake so both entry points agree; this file is the
+# schema-of-record and lets `process-compose` run without evaluating the flake.
+#
+# The rig boots the daemon against MOCK jobs on a laptop with no GPU and no worker box
+# (SPEC "Inputs & dev rig"). Production is systemd user units — this is dev only.
+#
+# Processes:
+#   daemon   — `tally daemon run`: opens the §2 Unix socket, runs the real in-daemon surface.
+#   enqueue  — waits for the socket, asserts session.snapshot, drops the OCR sample + runs one
+#              mock job to completion (dev/mock/enqueue-samples.sh). Exits 0 on success.
+#   smoke    — the `test` process (excluded from `up`, run by the flake's check): re-runs the
+#              enqueue smoke as a pass/fail gate after the daemon is healthy.
+#
+# The rig points XDG_STATE/DATA/CONFIG at ONE shared scratch tree under
+# $XDG_RUNTIME_DIR/tally/dev-rig (override with $TALLY_DEV_RIG_ROOT) so it never touches the
+# operator's real ~/.local state and never litters the repo; the socket stays under
+# $XDG_RUNTIME_DIR/tally. This mirrors nix/dev.nix so both entry points behave identically.
+#
+# Authored fresh for tally; no vendor/ code (clean-room, CLI-SURFACE §4).
+version: "0.5"
+
+environment:
+  # A scratch state/data tree so the rig is disposable and isolated from real operator state.
+  # (These are defaults; a wrapping shell may override XDG_* to point elsewhere.)
+  - "TALLY_RIG=1"
+
+processes:
+  daemon:
+    command: |
+      set -euo pipefail
+      : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+      export XDG_RUNTIME_DIR
+      RIG_ROOT="${TALLY_DEV_RIG_ROOT:-$XDG_RUNTIME_DIR/tally/dev-rig}"
+      export XDG_STATE_HOME="$RIG_ROOT/state"
+      export XDG_DATA_HOME="$RIG_ROOT/data"
+      export XDG_CONFIG_HOME="$RIG_ROOT/config"
+      mkdir -p "$XDG_RUNTIME_DIR/tally" "$XDG_STATE_HOME/tally/events" "$XDG_DATA_HOME/tally/mock-artifacts" "$XDG_CONFIG_HOME/tally"
+      exec tally daemon run
+    availability:
+      restart: "on_failure"
+      backoff_seconds: 2
+    readiness_probe:
+      # The socket file appearing is the daemon's readiness signal.
+      exec:
+        command: |
+          test -S "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/tally/tally.sock"
+      initial_delay_seconds: 1
+      period_seconds: 1
+      timeout_seconds: 2
+      success_threshold: 1
+      failure_threshold: 30
+
+  enqueue:
+    command: |
+      set -euo pipefail
+      : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+      export XDG_RUNTIME_DIR
+      RIG_ROOT="${TALLY_DEV_RIG_ROOT:-$XDG_RUNTIME_DIR/tally/dev-rig}"
+      export XDG_STATE_HOME="$RIG_ROOT/state"
+      export XDG_DATA_HOME="$RIG_ROOT/data"
+      export XDG_CONFIG_HOME="$RIG_ROOT/config"
+      export SMOKE_TAG=enqueue
+      exec bash "$PWD/dev/mock/enqueue-samples.sh"
+    depends_on:
+      daemon:
+        condition: process_healthy
+    availability:
+      # A one-shot: succeed once, then stay done (do not loop the enqueue forever).
+      restart: "no"
+
+  # Named `test`: process-compose-flake EXCLUDES this from `up` and turns it into a flake check
+  # (`nix flake check` runs the rig, waits for the daemon healthy, then asserts the smoke passes).
+  test:
+    command: |
+      set -euo pipefail
+      : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
+      export XDG_RUNTIME_DIR
+      RIG_ROOT="${TALLY_DEV_RIG_ROOT:-$XDG_RUNTIME_DIR/tally/dev-rig}"
+      export XDG_STATE_HOME="$RIG_ROOT/state"
+      export XDG_DATA_HOME="$RIG_ROOT/data"
+      export XDG_CONFIG_HOME="$RIG_ROOT/config"
+      export SMOKE_TAG=test
+      exec bash "$PWD/dev/mock/enqueue-samples.sh"
+    depends_on:
+      daemon:
+        condition: process_healthy
+    availability:
+      restart: "no"

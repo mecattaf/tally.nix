@@ -1,0 +1,110 @@
+# tally — pi agent-state scrape manifest (IMPLEMENTATION-PLAN M2.3; CLI-SURFACE §3.3, §3.4).
+#
+# The Strategy-2 (UNIVERSAL FALLBACK) region+regex rules classifying a pi pane into the four wire
+# states `blocked | working | done | idle`. Authored fresh against the DOCUMENTED herdr manifest
+# FORMAT (CLI-SURFACE §3.3 / §4): `[[rules]]` with `id`, `state`, integer `priority` (highest wins),
+# a named `region`, match predicates (`contains`/`regex`/`line_regex`/`any`/`all`/`not`), and the
+# `visible_*`/`skip_state_update` flags. NO herdr/cmux code or fixtures are copied (clean-room law,
+# CLI-SURFACE §4) — every rule is written from pi's OWN observable UI (the rounded-box input frame,
+# the `working` status line, tool lines), NOT from the stale `vendor/pi` clone (§3.4 stale-pin flag).
+#
+# Two inherited laws (CLI-SURFACE §3.3): (1) match INVARIANT visible controls with explicit gates,
+# never incidental whole-pane prose; (2) NEVER key off the user-scrollable viewport — the rules scope
+# to the bottom-buffer grid regions and the OSC regions. `priority` breaks ties: a live blocking
+# prompt outranks a working status line outranks a settled input frame outranks idle.
+
+kind = "pi"
+version = "1"
+
+# --- BLOCKED: pi is awaiting an operator decision (a permission / choice prompt) -------------------
+# pi renders a decision affordance below the transcript when a tool or action needs confirmation.
+# Highest priority: a live blocking control must win over any working status still shown behind it.
+
+[[rules]]
+id = "pi-permission-prompt"
+state = "blocked"
+priority = 100
+region = "bottom_non_empty_lines(12)"
+visible_blocker = true
+any = [
+  { contains = "Allow this" },
+  { contains = "Approve" },
+  { line_regex = "^[\\s│┃|]*❯?\\s*1[.)]\\s*(Yes|Allow|Approve)" },
+  { contains = "(y/n)" },
+]
+
+[[rules]]
+id = "pi-waiting-input"
+state = "blocked"
+priority = 95
+region = "bottom_non_empty_lines(8)"
+visible_blocker = true
+contains = "waiting for input"
+
+# --- WORKING: an active turn is running -----------------------------------------------------------
+# pi shows a `working` status line while a turn runs, typically with the model and a live
+# `esc to interrupt` affordance: `⣷ working  ·  <model>  ·  <tokens>  ·  esc to interrupt`.
+
+[[rules]]
+id = "pi-status-working"
+state = "working"
+priority = 80
+region = "bottom_non_empty_lines(10)"
+visible_working = true
+all = [
+  { line_regex = "^\\s*[\\u2800-\\u28ff]?\\s*working\\b" },
+  { not = { contains = "waiting for input" } },
+]
+
+# The braille spinner in the status line is another live-turn signal (independent of the word).
+[[rules]]
+id = "pi-spinner"
+state = "working"
+priority = 78
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+all = [
+  { line_regex = "[\\u2800-\\u28ff]" },
+  { contains = "esc to interrupt" },
+]
+
+# A tool line still executing under the current turn.
+[[rules]]
+id = "pi-tool-running"
+state = "working"
+priority = 70
+region = "bottom_non_empty_lines(8)"
+visible_working = true
+line_regex = "^\\s*tool\\s+\\w+"
+
+# --- DONE: the turn finished; the empty input frame is shown, no live status ----------------------
+# pi draws a rounded input box (`╭───╮ / │ > │ / ╰───╯`) waiting for the next instruction. `not` gates
+# out the working/blocked signals so DONE never fires while a turn is live.
+
+[[rules]]
+id = "pi-input-frame-settled"
+state = "done"
+priority = 30
+region = "prompt_box_body"
+visible_idle = true
+all = [
+  { line_regex = "^\\s*[│┃|]\\s*>\\s*[│┃|]?\\s*$" },
+  { not = { contains = "esc to interrupt" } },
+  { not = { line_regex = "^\\s*[\\u2800-\\u28ff]?\\s*working\\b" } },
+]
+
+# --- IDLE: nothing agent-like on screen -----------------------------------------------------------
+# No live control, no working status, no settled input frame: the pane holds a pi session at rest.
+# Lowest priority — the universal fallback when no higher rule matched.
+
+[[rules]]
+id = "pi-idle"
+state = "idle"
+priority = 5
+region = "whole_recent"
+visible_idle = true
+not = { any = [
+  { contains = "esc to interrupt" },
+  { line_regex = "^\\s*[\\u2800-\\u28ff]?\\s*working\\b" },
+  { contains = "waiting for input" },
+] }

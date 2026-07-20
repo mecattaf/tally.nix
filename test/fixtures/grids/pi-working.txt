@@ -1,0 +1,20 @@
+▸ user
+  Refactor the auth module to use the new token store.
+
+▸ assistant
+  Reading the current auth module and the token store interface.
+
+  tool  read_file  src/auth/index.ts
+  tool  read_file  src/auth/token-store.ts
+
+  Applying the refactor now.
+
+  tool  edit_file  src/auth/index.ts
+
+────────────────────────────────────────────────────────────────
+
+⣷ working  ·  gpt-5.1-codex  ·  4213 tokens  ·  esc to interrupt
+
+╭──────────────────────────────────────────────────────────────╮
+│ >                                                              │
+╰──────────────────────────────────────────────────────────────╯

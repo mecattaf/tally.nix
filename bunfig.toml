@@ -1,0 +1,10 @@
+# tally — Bun runtime configuration (see package.json for scripts, tsconfig.json for the type surface)
+
+[install]
+# Deterministic, offline-friendly installs so `nix build .#tally` (bun2nix) stays reproducible.
+exact = true
+
+[test]
+# Tests live under test/**; every layer ≥1 module writes its bun tests against test/helpers (testkit).
+# Scope discovery to test/ so `bun test` never descends into vendor/ (reference-only: herdr AGPL, cmux GPL).
+root = "test"

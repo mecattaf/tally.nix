@@ -1,0 +1,19 @@
+● I'll install the missing build dependency to unblock the compile.
+
+● Bash(npm install --save-dev esbuild)
+  ⎿  Running…
+
+────────────────────────────────────────────────────────────────
+
+╭──────────────────────────────────────────────────────────────╮
+│ Bash command                                                   │
+│                                                                │
+│   npm install --save-dev esbuild                               │
+│   Add esbuild to the dev dependencies                          │
+│                                                                │
+│ Do you want to proceed?                                        │
+│ ❯ 1. Yes                                                       │
+│   2. Yes, and don't ask again for npm install                  │
+│   3. No, and tell Claude what to do differently (esc)          │
+│                                                                │
+╰──────────────────────────────────────────────────────────────╯

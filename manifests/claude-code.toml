@@ -1,0 +1,124 @@
+# tally — Claude Code agent-state scrape manifest (IMPLEMENTATION-PLAN M2.3; CLI-SURFACE §3.3).
+#
+# The Strategy-2 (UNIVERSAL FALLBACK) region+regex rules classifying a Claude Code pane into the
+# four wire states `blocked | working | done | idle`. Authored fresh against the DOCUMENTED herdr
+# manifest FORMAT (CLI-SURFACE §3.3 / §4): `[[rules]]` with `id`, `state`, integer `priority`
+# (highest wins), a named `region`, match predicates (`contains`/`regex`/`line_regex`/`any`/`all`/
+# `not`), and the `visible_*`/`skip_state_update` flags. NO herdr/cmux code or fixtures are copied
+# (clean-room law, CLI-SURFACE §4) — every rule below is written from Claude Code's OWN observable UI.
+#
+# Two inherited laws (CLI-SURFACE §3.3): (1) match INVARIANT visible controls with explicit gates,
+# never incidental whole-pane prose; (2) NEVER key off the user-scrollable viewport — the rules scope
+# to the bottom-buffer grid regions and the OSC regions. `priority` breaks ties: a live blocking
+# prompt outranks a spinner outranks a completed turn outranks idle.
+#
+# Region split by mechanism (CLI-SURFACE §3.3, deep-pass A1): the GRID regions (`whole_recent`,
+# `after_last_horizontal_rule`, `prompt_box_body`, `bottom_non_empty_lines(N)`) scope a
+# `kitty @ get-text` read; the OSC regions (`osc_title`, `osc_progress`) bind to
+# `kitty @ ls foreground_processes[].title` + OSC progress — never `get-text`, and are checked FIRST
+# as the zero-latency fast path (Claude Code's braille spinner).
+
+kind = "claude-code"
+version = "1"
+
+# --- BLOCKED: a live permission / choice prompt awaiting the operator ------------------------------
+# Claude Code renders a bordered box with a "Do you want to proceed?" header and numbered choices.
+# Highest priority: a live blocking control must win over any spinner still animating behind it.
+
+[[rules]]
+id = "cc-permission-box"
+state = "blocked"
+priority = 100
+region = "prompt_box_body"
+visible_blocker = true
+all = [
+  { contains = "Do you want" },
+  { line_regex = "^[\\s│┃|]*❯?\\s*1\\.\\s*Yes" },
+]
+
+[[rules]]
+id = "cc-tell-differently"
+state = "blocked"
+priority = 95
+region = "bottom_non_empty_lines(12)"
+visible_blocker = true
+contains = "tell Claude what to do differently"
+
+# --- WORKING: an animated turn in progress --------------------------------------------------------
+# The OSC-title fast path first (zero-latency, checked before the grid read): Claude Code writes a
+# braille spinner glyph into the terminal/process title while a turn runs.
+
+[[rules]]
+id = "cc-osc-spinner"
+state = "working"
+priority = 80
+region = "osc_title"
+visible_working = true
+regex = "[\\u2800-\\u28ff]"
+
+[[rules]]
+id = "cc-osc-progress"
+state = "working"
+priority = 78
+region = "osc_progress"
+visible_working = true
+# Any active OSC 9;4 progress state that is not "0" (cleared) means a turn is running.
+regex = "[1-4];"
+
+# The grid fallback: the "esc to interrupt" affordance is only shown while a turn is actively running.
+[[rules]]
+id = "cc-esc-to-interrupt"
+state = "working"
+priority = 70
+region = "bottom_non_empty_lines(6)"
+visible_working = true
+contains = "esc to interrupt"
+
+# A tool line still executing (the "Running…" spinner under a Bash/tool call).
+[[rules]]
+id = "cc-tool-running"
+state = "working"
+priority = 60
+region = "bottom_non_empty_lines(8)"
+visible_working = true
+any = [
+  { contains = "Running…" },
+  { line_regex = "^\\s*⎿\\s+Running" },
+]
+
+# --- DONE: the turn finished, output settled, no live control -------------------------------------
+# The auto-accept / prompt footer with no spinner and no blocking box ⇒ the turn ended and Claude is
+# waiting for the next instruction. `not` gates out the working/blocked signals so DONE never fires
+# while a turn is live.
+
+[[rules]]
+id = "cc-turn-settled"
+state = "done"
+priority = 30
+region = "bottom_non_empty_lines(6)"
+visible_idle = true
+all = [
+  { any = [
+    { contains = "auto-accept edits" },
+    { contains = "shift+tab to cycle" },
+    { line_regex = "^\\s*>\\s*$" },
+  ] },
+  { not = { contains = "esc to interrupt" } },
+  { not = { contains = "Do you want" } },
+]
+
+# --- IDLE: nothing agent-like on screen -----------------------------------------------------------
+# No live control, no settled-turn footer, no spinner: the pane holds a Claude Code session at rest.
+# Lowest priority — the universal fallback when no higher rule matched.
+
+[[rules]]
+id = "cc-idle-prompt"
+state = "idle"
+priority = 5
+region = "whole_recent"
+visible_idle = true
+not = { any = [
+  { contains = "esc to interrupt" },
+  { contains = "Do you want" },
+  { contains = "Running…" },
+] }

@@ -1,0 +1,62 @@
+{
+  "data": {
+    "search": {
+      "issueCount": 3,
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "Y3Vyc29yOjM="
+      },
+      "nodes": [
+        {
+          "__typename": "PullRequest",
+          "id": "PR_kwABC128",
+          "number": 128,
+          "title": "Fix witness chain restart recovery",
+          "url": "https://github.com/mecattaf/tally/pull/128",
+          "updatedAt": "2026-07-09T09:15:00Z",
+          "isDraft": false,
+          "state": "OPEN",
+          "reviewDecision": "REVIEW_REQUIRED",
+          "author": { "login": "contributor-a" },
+          "repository": { "nameWithOwner": "mecattaf/tally" },
+          "labels": { "nodes": [{ "name": "witness" }, { "name": "bug" }] },
+          "assignees": { "nodes": [{ "login": "mecattaf" }] },
+          "reviewRequests": {
+            "nodes": [{ "requestedReviewer": { "login": "mecattaf" } }]
+          },
+          "statusCheckRollup": { "state": "SUCCESS" }
+        },
+        {
+          "__typename": "Issue",
+          "id": "I_kwABC131",
+          "number": 131,
+          "title": "Detector OSC fast-path discussion",
+          "url": "https://github.com/mecattaf/tally/issues/131",
+          "updatedAt": "2026-07-09T09:40:00Z",
+          "state": "OPEN",
+          "author": { "login": "contributor-b" },
+          "repository": { "nameWithOwner": "mecattaf/tally" },
+          "labels": { "nodes": [{ "name": "detector" }] },
+          "assignees": { "nodes": [] },
+          "reviewRequests": { "nodes": [] },
+          "statusCheckRollup": null
+        },
+        {
+          "__typename": "Issue",
+          "id": "I_kwABC117",
+          "number": 117,
+          "title": "Package pls as flake=false wrap",
+          "url": "https://github.com/mecattaf/tally/issues/117",
+          "updatedAt": "2026-07-09T08:05:00Z",
+          "state": "OPEN",
+          "author": { "login": "mecattaf" },
+          "repository": { "nameWithOwner": "mecattaf/tally" },
+          "labels": { "nodes": [{ "name": "packaging" }] },
+          "assignees": { "nodes": [{ "login": "mecattaf" }] },
+          "reviewRequests": { "nodes": [] },
+          "statusCheckRollup": null
+        }
+      ]
+    }
+  }
+}
