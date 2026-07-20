@@ -57,7 +57,14 @@ pub struct WitnessRecord {
     pub labor_class: LaborClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_ref: Option<String>,
-    pub pool: Option<String>,
+    #[serde(
+        rename = "pool",
+        serialize_with = "crate::poolset::serialize_optional",
+        deserialize_with = "crate::poolset::deserialize_optional"
+    )]
+    pub pools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     pub charge: Option<Charge>,
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,7 +90,8 @@ pub struct WitnessBody {
     pub dedup_key: Option<String>,
     pub labor_class: LaborClass,
     pub trace_ref: Option<String>,
-    pub pool: Option<String>,
+    pub pools: Option<Vec<String>>,
+    pub executor: Option<String>,
     pub charge: Option<Charge>,
     pub model: Option<String>,
     pub evidence_class: Option<Value>,
@@ -179,6 +187,11 @@ pub fn compute_hash(record: &WitnessRecord) -> Result<String, WitnessError> {
 }
 
 pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord, WitnessError> {
+    let mut pools = body.pools;
+    if let Some(pools) = &mut pools {
+        crate::poolset::canonicalize(pools)
+            .map_err(|error| WitnessError::Corrupt(error.to_string()))?;
+    }
     let mut record = WitnessRecord {
         task_uuid: body.task_uuid,
         transition_timestamp: body.transition_timestamp,
@@ -192,7 +205,8 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
         dedup_key: body.dedup_key,
         labor_class: body.labor_class,
         trace_ref: body.trace_ref,
-        pool: body.pool,
+        pools,
+        executor: body.executor,
         charge: body.charge,
         model: body.model,
         evidence_class: body.evidence_class,
@@ -222,6 +236,27 @@ fn validate_record(raw: &Value) -> Result<WitnessRecord, String> {
     }
     let record: WitnessRecord =
         serde_json::from_value(raw.clone()).map_err(|error| error.to_string())?;
+    if let Some(pools) = &record.pools {
+        let mut canonical = pools.clone();
+        crate::poolset::canonicalize(&mut canonical).map_err(|error| error.to_string())?;
+        if &canonical != pools {
+            return Err("pool set is not in canonical order".to_owned());
+        }
+    }
+    if record.executor.as_ref().is_some_and(|executor| {
+        executor.is_empty()
+            || executor.len() > 96
+            || matches!(executor.as_str(), "." | "..")
+            || !executor
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            || !executor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    }) {
+        return Err("executor is not a safe registry component".to_owned());
+    }
     if record.seq == 0 {
         return Err("seq missing or not a positive integer".to_owned());
     }
@@ -780,7 +815,8 @@ mod tests {
             dedup_key: Some("ocr:paper-0001".to_owned()),
             labor_class: LaborClass::Fresh,
             trace_ref: None,
-            pool: Some("worker-gpu".to_owned()),
+            pools: Some(vec!["worker-gpu".to_owned()]),
+            executor: None,
             charge: Some(Charge {
                 unit: "gpu-seconds".to_owned(),
                 amount: 42.5,
@@ -821,6 +857,26 @@ mod tests {
         assert!(json.find("evidence_class").unwrap() < json.find("manifest_hash").unwrap());
         assert!(json.find("manifest_hash").unwrap() < json.find("\"seq\"").unwrap());
         let report = verify_reader(BufReader::new(json.as_bytes()));
+        assert!(report.ok, "{:?}", report.problems);
+    }
+
+    #[test]
+    fn witness_pool_encoding_preserves_legacy_bytes_and_canonicalizes_multi() {
+        let singleton = build_record(body(), &ChainHead::default()).unwrap();
+        let singleton_json = serde_json::to_string(&singleton).unwrap();
+        assert!(singleton_json.contains(r#""pool":"worker-gpu""#));
+        assert!(!singleton_json.contains(r#""pool":["#));
+
+        let mut multi_body = body();
+        multi_body.pools = Some(vec!["zeta".to_owned(), "alpha".to_owned()]);
+        let multi = build_record(multi_body, &ChainHead::default()).unwrap();
+        assert_eq!(
+            multi.pools.as_deref(),
+            Some(["alpha".to_owned(), "zeta".to_owned()].as_slice())
+        );
+        let multi_json = serde_json::to_string(&multi).unwrap();
+        assert!(multi_json.contains(r#""pool":["alpha","zeta"]"#));
+        let report = verify_reader(BufReader::new(multi_json.as_bytes()));
         assert!(report.ok, "{:?}", report.problems);
     }
 

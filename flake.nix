@@ -190,6 +190,14 @@
                     pattern = "$..model";
                   };
                 };
+                executors.worker = {
+                  host = "worker.example";
+                  user = "tally-worker";
+                  identityFile = "/run/credentials/tally-worker-key";
+                  knownHostsFile = "/etc/tally/worker-known-hosts";
+                  program = "/run/current-system/sw/bin/tally";
+                  stateDir = "/var/lib/tally-remote";
+                };
                 producers = {
                   daily = {
                     kind = "calendar";
@@ -197,7 +205,12 @@
                     credentials.PRODUCER_TOKEN = "/run/credentials/tally-producer";
                     enqueue = {
                       argv = [ "calendar-job" ];
-                      pool = "stock";
+                      pool = [
+                        "programmatic"
+                        "stock"
+                      ];
+                      executor = "worker";
+                      consumptionEstimate = 1;
                       credentials.JOB_TOKEN = "/run/credentials/tally-job";
                     };
                   };
@@ -424,6 +437,104 @@
           ];
         };
         badPoolAttempt = builtins.tryEval (builtins.deepSeq badPoolNixos.config.system.build.toplevel true);
+        unknownMultiPoolNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            {
+              services.tally = {
+                enable = true;
+                pools.stock.resource = "build-slot";
+                producers.daily = {
+                  kind = "calendar";
+                  onCalendar = "daily";
+                  enqueue = {
+                    argv = [ "calendar-job" ];
+                    pool = [
+                      "stock"
+                      "missing"
+                    ];
+                  };
+                };
+              };
+            }
+          ];
+        };
+        unknownMultiPoolAttempt = builtins.tryEval (
+          builtins.deepSeq unknownMultiPoolNixos.config.system.build.toplevel true
+        );
+        unknownMultiPoolMessages = builtins.map (entry: entry.message) (
+          builtins.filter (entry: !entry.assertion) unknownMultiPoolNixos.config.assertions
+        );
+        invalidPoolSetNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            {
+              services.tally = {
+                enable = true;
+                pools.stock.resource = "build-slot";
+                producers = {
+                  empty = {
+                    kind = "calendar";
+                    onCalendar = "daily";
+                    enqueue = {
+                      argv = [ "empty-pool-job" ];
+                      pool = [ ];
+                    };
+                  };
+                  duplicate = {
+                    kind = "calendar";
+                    onCalendar = "daily";
+                    enqueue = {
+                      argv = [ "duplicate-pool-job" ];
+                      pool = [
+                        "stock"
+                        "stock"
+                      ];
+                    };
+                  };
+                };
+              };
+            }
+          ];
+        };
+        invalidPoolSetAttempt = builtins.tryEval (
+          builtins.deepSeq invalidPoolSetNixos.config.system.build.toplevel true
+        );
+        invalidPoolSetMessages = builtins.map (entry: entry.message) (
+          builtins.filter (entry: !entry.assertion) invalidPoolSetNixos.config.assertions
+        );
+        unknownExecutorNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            {
+              services.tally = {
+                enable = true;
+                pools.stock.resource = "build-slot";
+                producers.daily = {
+                  kind = "calendar";
+                  onCalendar = "daily";
+                  enqueue = {
+                    argv = [ "calendar-job" ];
+                    pool = "stock";
+                    executor = "missing-worker";
+                  };
+                };
+              };
+            }
+          ];
+        };
+        unknownExecutorAttempt = builtins.tryEval (
+          builtins.deepSeq unknownExecutorNixos.config.system.build.toplevel true
+        );
+        unknownExecutorMessages = builtins.map (entry: entry.message) (
+          builtins.filter (entry: !entry.assertion) unknownExecutorNixos.config.assertions
+        );
         forbiddenAttempt =
           module:
           builtins.tryEval (
@@ -504,6 +615,10 @@
             systemWitnessEmitter.serviceConfig.Environment;
           assert systemDaemon.serviceConfig.StateDirectory == "tally";
           assert systemDaemon.serviceConfig.LogsDirectory == "tally";
+          assert systemDaemon.serviceConfig.RestrictAddressFamilies == [ "AF_UNIX" ];
+          assert builtins.elem "AF_UNIX" homeServices.tally-daemon.Service.RestrictAddressFamilies;
+          assert builtins.elem "AF_INET" homeServices.tally-daemon.Service.RestrictAddressFamilies;
+          assert builtins.elem "AF_INET6" homeServices.tally-daemon.Service.RestrictAddressFamilies;
           assert !(systemDaemon.serviceConfig ? Delegate);
           assert builtins.all (
             service: !(service.Service ? Delegate) && !(service.Service ? DeviceMemoryMax)
@@ -536,8 +651,18 @@
               .pools.stock.enforce == "cooperative" and
               .pools.programmatic.usageMeter.budgetClass == "programmatic" and
               .pools.programmatic.credentials.METER_TOKEN == "/run/credentials/tally-meter" and
+              .producers.daily.enqueue.pool == ["programmatic", "stock"] and
+              .producers.daily.enqueue.executor == "worker" and
               .producers.daily.enqueue.credentials.JOB_TOKEN == "/run/credentials/tally-job" and
+              .producers.effects.onKey.pool == "stock" and
               .producers.health.onReturnAttest.noEnqueue == true and
+              .executors.worker.kind == "ssh" and
+              .executors.worker.host == "worker.example" and
+              .executors.worker.user == "tally-worker" and
+              .executors.worker.identityFile == "/run/credentials/tally-worker-key" and
+              .executors.worker.knownHostsFile == "/etc/tally/worker-known-hosts" and
+              .executors.worker.program == "/run/current-system/sw/bin/tally" and
+              .executors.worker.stateDir == "/var/lib/tally-remote" and
               .adapters["project-codex"].argv == ["codex", "exec", "-C", "/work/project", "--json", "--"] and
               ([.. | objects | keys[]] | any(. == "remote" or . == "servingSlice" or . == "patchedSystemd") | not)
             ' ${checkedHomeConfig}
@@ -568,6 +693,33 @@
           bad-pool-rejected =
             assert !badPoolAttempt.success;
             pkgs.runCommand "tally-bad-pool-rejected" { } ''
+              touch "$out"
+            '';
+          unknown-multi-pool-rejected =
+            assert builtins.any (
+              message: nixpkgs.lib.hasInfix "references unknown pool missing" message
+            ) unknownMultiPoolMessages;
+            assert !unknownMultiPoolAttempt.success;
+            pkgs.runCommand "tally-unknown-multi-pool-rejected" { } ''
+              touch "$out"
+            '';
+          invalid-pool-sets-rejected =
+            assert builtins.any (
+              message: nixpkgs.lib.hasInfix "requires a non-empty pool set" message
+            ) invalidPoolSetMessages;
+            assert builtins.any (
+              message: nixpkgs.lib.hasInfix "pool set contains duplicates" message
+            ) invalidPoolSetMessages;
+            assert !invalidPoolSetAttempt.success;
+            pkgs.runCommand "tally-invalid-pool-sets-rejected" { } ''
+              touch "$out"
+            '';
+          unknown-executor-rejected =
+            assert builtins.any (
+              message: nixpkgs.lib.hasInfix "references unknown executor missing-worker" message
+            ) unknownExecutorMessages;
+            assert !unknownExecutorAttempt.success;
+            pkgs.runCommand "tally-unknown-executor-rejected" { } ''
               touch "$out"
             '';
           producer-kind-required =

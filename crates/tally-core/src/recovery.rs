@@ -117,25 +117,48 @@ pub fn collect_durable_recovery_facts(
     Ok(facts)
 }
 
-pub fn collect_local_unit_facts(
+pub async fn collect_local_unit_facts(
     executor: &Executor,
     durable: &DurableRecoveryFacts,
 ) -> Result<BTreeMap<Uuid, LocalUnitFact>, RecoveryError> {
-    durable
-        .events
-        .iter()
-        .map(|event| {
-            let uuid = event.row.uuid;
-            let identity = ExecutionIdentity {
-                job_id: uuid,
-                task_uuid: Some(uuid),
-            };
+    let mut latest_verdicts = BTreeMap::new();
+    for record in &durable.witness {
+        let Some(task_uuid) = record
+            .task_uuid
+            .as_deref()
+            .and_then(|value| Uuid::parse_str(value).ok())
+        else {
+            continue;
+        };
+        latest_verdicts.insert(task_uuid, record.verdict);
+    }
+
+    let mut facts = BTreeMap::new();
+    for event in &durable.events {
+        let uuid = event.row.uuid;
+        let identity = ExecutionIdentity {
+            job_id: uuid,
+            task_uuid: Some(uuid),
+        };
+        // A non-retryable witness is already the canonical proof that this
+        // remote generation terminated. Probing it again cannot affect the
+        // recovery plan, but it would make every historical worker a startup
+        // dependency forever. Rows with no witness or a retryable verdict must
+        // still be probed because a later presentation may be in flight.
+        let remote_is_canonically_terminal = event.row.executor.is_some()
+            && latest_verdicts
+                .get(&uuid)
+                .is_some_and(|verdict| retry_trigger(*verdict).is_none());
+        let fact = if remote_is_canonically_terminal {
+            LocalUnitFact::absent(executor.unit_name(&identity))
+        } else {
             executor
-                .inspect_identity(&identity)
-                .map(|fact| (uuid, fact))
-                .map_err(RecoveryError::from)
-        })
-        .collect()
+                .inspect_identity_on(event.row.executor.as_deref(), &identity)
+                .await?
+        };
+        facts.insert(uuid, fact);
+    }
+    Ok(facts)
 }
 
 pub fn collect_rowless_unit_fact(
@@ -472,9 +495,19 @@ fn validate_history(
             )));
         }
         previous_verdict = Some(record.verdict);
-        if record.pool.as_deref().is_some_and(|pool| pool != row.pool) {
+        if record
+            .pools
+            .as_ref()
+            .is_some_and(|pools| pools != &row.pools)
+        {
             return Err(RecoveryError::InvalidFacts(format!(
                 "witness seq {} pool does not match durable row {}",
+                record.seq, row.uuid
+            )));
+        }
+        if record.executor != row.executor {
+            return Err(RecoveryError::InvalidFacts(format!(
+                "witness seq {} executor does not match durable row {}",
                 record.seq, row.uuid
             )));
         }
@@ -787,8 +820,14 @@ fn plan_witnessed_row(
     }
     let disposition = retry_disposition(record.verdict, policy.retry);
     let trigger_observed = match trigger {
-        RetryTrigger::PoolReturn => triggers.confirmed_pool_returns.contains(&row.pool),
-        RetryTrigger::ResourceReturn => triggers.resource_returns.contains(&row.pool),
+        RetryTrigger::PoolReturn => row
+            .pools
+            .iter()
+            .any(|pool| triggers.confirmed_pool_returns.contains(pool)),
+        RetryTrigger::ResourceReturn => row
+            .pools
+            .iter()
+            .any(|pool| triggers.resource_returns.contains(pool)),
         RetryTrigger::BoundedRequeue => triggers.bounded_requeues.contains(&row.uuid),
     };
     if disposition != RetryDisposition::Automatic(trigger) || !trigger_observed {
@@ -842,9 +881,17 @@ fn remember_stale_epoch(
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
+    use std::future::Future;
+    use std::path::{Path, PathBuf};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
-    use crate::config::Priority;
+    use crate::config::{ExecutionTargetConfig, Priority, SshExecutorConfig};
+    use crate::executor::{
+        RemoteExecutorReply, RemoteExecutorRequest, RemoteExecutorResult, RemoteTransport,
+        RemoteTransportError, REMOTE_EXECUTOR_PROTOCOL_VERSION,
+    };
     use crate::taskdb::{write_enqueue_event_atomic, EnqueueSource};
     use crate::witness::{build_record, ChainHead, WitnessBody};
 
@@ -857,7 +904,8 @@ mod tests {
             priority: Priority::High,
             source: EnqueueSource::EventsDir,
             adapter: "shell".to_owned(),
-            pool: pool.to_owned(),
+            pools: vec![pool.to_owned()],
+            executor: None,
             model: None,
             cwd: Some(PathBuf::from("/work")),
             dedup_key: Some(format!("dedup:{uuid}")),
@@ -905,7 +953,8 @@ mod tests {
                             LaborClass::Recovered
                         },
                         trace_ref: None,
-                        pool: Some(row.pool.clone()),
+                        pools: Some(row.pools.clone()),
+                        executor: row.executor.clone(),
                         charge: None,
                         model: None,
                         evidence_class: None,
@@ -986,12 +1035,98 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct ProbeTransport {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl RemoteTransport for ProbeTransport {
+        fn call<'a>(
+            &'a self,
+            _config: &'a SshExecutorConfig,
+            request: RemoteExecutorRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<RemoteExecutorReply, RemoteTransportError>> + Send + 'a>,
+        > {
+            let calls = self.calls.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let RemoteExecutorRequest::Probe { identity, .. } = request else {
+                    return Err(RemoteTransportError {
+                        detail: "expected a recovery probe".to_owned(),
+                    });
+                };
+                Ok(RemoteExecutorReply::Ok {
+                    protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                    result: Box::new(RemoteExecutorResult::Fact(LocalUnitFact::absent(format!(
+                        "tally-job-{}.service",
+                        identity.unit_uuid()
+                    )))),
+                })
+            })
+        }
+    }
+
+    fn executor_with_probe_transport(state_dir: &Path, calls: Arc<AtomicUsize>) -> Executor {
+        Executor::new(state_dir, "/bin/tally")
+            .with_remote_executors(BTreeMap::from([(
+                "worker".to_owned(),
+                ExecutionTargetConfig::Ssh(SshExecutorConfig {
+                    host: "worker.example".to_owned(),
+                    user: "tally-worker".to_owned(),
+                    port: 22,
+                    ssh_program: PathBuf::from("/bin/ssh"),
+                    identity_file: PathBuf::from("/key"),
+                    known_hosts_file: PathBuf::from("/known-hosts"),
+                    program: PathBuf::from("/bin/tally"),
+                    state_dir: PathBuf::from("/remote-state"),
+                    connect_timeout_sec: 1,
+                    server_alive_interval_sec: 1,
+                    server_alive_count_max: 1,
+                    retry_interval_ms: 10,
+                }),
+            )]))
+            .with_remote_transport(ProbeTransport { calls })
+    }
+
+    #[tokio::test]
+    async fn terminal_remote_history_is_not_a_permanent_startup_dependency() {
+        let temp = tempfile::tempdir().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let executor = executor_with_probe_transport(temp.path(), calls.clone());
+
+        let mut terminal = row(Uuid::new_v4(), "worker", 3);
+        terminal.executor = Some("worker".to_owned());
+        let terminal_facts = DurableRecoveryFacts::from_verified(
+            vec![event(terminal.clone())],
+            witness(&terminal, &[(Verdict::Pass, 3)]),
+        )
+        .unwrap();
+        let facts = collect_local_unit_facts(&executor, &terminal_facts)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(facts[&terminal.uuid].state, LocalUnitState::Absent);
+
+        let mut retryable = row(Uuid::new_v4(), "worker", 3);
+        retryable.executor = Some("worker".to_owned());
+        let retryable_facts = DurableRecoveryFacts::from_verified(
+            vec![event(retryable.clone())],
+            witness(&retryable, &[(Verdict::PoolVanished, 3)]),
+        )
+        .unwrap();
+        collect_local_unit_facts(&executor, &retryable_facts)
+            .await
+            .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
     fn confirmed_pool_return_represents_same_row_with_recovered_attempt() {
         let row = row(Uuid::new_v4(), "worker-gpu", 3);
         let witness = witness(&row, &[(Verdict::PoolVanished, 3)]);
         let mut triggers = empty_triggers();
-        triggers.confirmed_pool_returns.insert(row.pool.clone());
+        triggers.confirmed_pool_returns.extend(row.pools.clone());
         let mut facts = facts(
             row.clone(),
             witness,
@@ -1002,7 +1137,7 @@ mod tests {
         facts
             .advisory_return_attestations
             .push(AdvisoryReturnAttestation {
-                pool: row.pool.clone(),
+                pool: row.pools[0].clone(),
                 payload: serde_json::json!({"assessment": "advisory only"}),
             });
 
@@ -1046,7 +1181,7 @@ mod tests {
         let row = row(Uuid::new_v4(), "worker", 5);
         let records = witness(&row, &[(Verdict::PoolVanished, 5)]);
         let mut triggers = empty_triggers();
-        triggers.confirmed_pool_returns.insert(row.pool.clone());
+        triggers.confirmed_pool_returns.extend(row.pools.clone());
         let manual = facts(
             row.clone(),
             records.clone(),
@@ -1095,10 +1230,10 @@ mod tests {
             let mut triggers = empty_triggers();
             match expected_trigger {
                 RetryTrigger::PoolReturn => {
-                    triggers.confirmed_pool_returns.insert(row.pool.clone());
+                    triggers.confirmed_pool_returns.extend(row.pools.clone());
                 }
                 RetryTrigger::ResourceReturn => {
-                    triggers.resource_returns.insert(row.pool.clone());
+                    triggers.resource_returns.extend(row.pools.clone());
                 }
                 RetryTrigger::BoundedRequeue => {
                     triggers.bounded_requeues.insert(row.uuid);
@@ -1130,8 +1265,8 @@ mod tests {
         ] {
             let row = row(Uuid::new_v4(), "resource", 2);
             let mut triggers = empty_triggers();
-            triggers.confirmed_pool_returns.insert(row.pool.clone());
-            triggers.resource_returns.insert(row.pool.clone());
+            triggers.confirmed_pool_returns.extend(row.pools.clone());
+            triggers.resource_returns.extend(row.pools.clone());
             triggers.bounded_requeues.insert(row.uuid);
             let facts = facts(
                 row.clone(),
@@ -1203,7 +1338,7 @@ mod tests {
         );
 
         let mut triggers = empty_triggers();
-        triggers.confirmed_pool_returns.insert(row.pool.clone());
+        triggers.confirmed_pool_returns.extend(row.pools.clone());
         let stale = facts(
             row.clone(),
             witness(&row, &[(Verdict::PoolVanished, 3)]),

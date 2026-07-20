@@ -5,6 +5,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -300,14 +301,14 @@ pub struct RunOutcome<'a> {
     pub evidence: &'a EvidenceSpec,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CheckOutcome {
     pub spec: String,
     pub passed: bool,
     pub reason: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GateResult {
     pub verdict: Verdict,
     pub passed: bool,
@@ -630,7 +631,8 @@ mod tests {
             dedup_key: Some(dedup_key.to_owned()),
             labor_class: LaborClass::Fresh,
             trace_ref: None,
-            pool: Some("gpu".to_owned()),
+            pools: Some(vec!["gpu".to_owned()]),
+            executor: None,
             charge: None,
             model: None,
             evidence_class: None,

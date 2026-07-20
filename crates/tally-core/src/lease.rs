@@ -433,7 +433,8 @@ impl LeaseEngine {
     }
 
     pub fn validate_admission(&self, request: &LeaseRequest) -> Result<(), LeaseError> {
-        self.validate_request(request)
+        let mut request = request.clone();
+        self.canonicalize_request(&mut request)
     }
 
     pub fn budget_used_at(&mut self, pool: &str, now: DateTime<Utc>) -> Result<u64, LeaseError> {
@@ -473,10 +474,10 @@ impl LeaseEngine {
 
     pub fn admit_at(
         &mut self,
-        request: LeaseRequest,
+        mut request: LeaseRequest,
         now: DateTime<Utc>,
     ) -> Result<AdmitOutcome, LeaseError> {
-        self.validate_request(&request)?;
+        self.canonicalize_request(&mut request)?;
         let sequence = self.next_sequence;
         self.next_sequence =
             self.next_sequence
@@ -662,18 +663,7 @@ impl LeaseEngine {
                 "jobId and unit must not be empty".to_owned(),
             ));
         }
-        if request.pools.is_empty() {
-            return Err(LeaseError::InvalidRequest(
-                "at least one pool is required".to_owned(),
-            ));
-        }
-        let mut unique = HashSet::new();
         for pool in &request.pools {
-            if !unique.insert(pool) {
-                return Err(LeaseError::InvalidRequest(format!(
-                    "pool {pool:?} is requested more than once"
-                )));
-            }
             let state = self
                 .pools
                 .get(pool)
@@ -689,6 +679,12 @@ impl LeaseEngine {
             }
         }
         Ok(())
+    }
+
+    fn canonicalize_request(&self, request: &mut LeaseRequest) -> Result<(), LeaseError> {
+        crate::poolset::canonicalize(&mut request.pools)
+            .map_err(|error| LeaseError::InvalidRequest(error.to_string()))?;
+        self.validate_request(request)
     }
 
     fn can_grant(
@@ -1453,6 +1449,33 @@ mod tests {
     }
 
     #[test]
+    fn lease_admission_canonicalizes_pool_order_before_grant_and_event_persistence() {
+        let temp = tempfile::tempdir().unwrap();
+        let log = LeaseEventLog::in_state_dir(temp.path());
+        let mut engine = LeaseEngine::new(
+            3,
+            Duration::from_secs(20),
+            BTreeMap::from([("alpha".to_owned(), pool(1)), ("zeta".to_owned(), pool(1))]),
+            Some(log.clone()),
+        )
+        .unwrap();
+        let granted = grant(
+            engine
+                .admit_at(
+                    request("ordered", &["zeta", "alpha"], Priority::High),
+                    now(),
+                )
+                .unwrap(),
+        );
+        assert_eq!(granted.pools, ["alpha", "zeta"]);
+        let events = log.read().unwrap();
+        let LeaseEventKind::Granted { grant, .. } = &events[0].event else {
+            panic!("expected durable grant")
+        };
+        assert_eq!(grant.pools, ["alpha", "zeta"]);
+    }
+
+    #[test]
     fn window_estimate_is_authoritative_and_expires() {
         let mut engine = LeaseEngine::new(
             1,
@@ -1926,6 +1949,50 @@ mod tests {
     }
 
     #[test]
+    fn non_destructive_interrupt_waits_for_the_holder_then_runs_next() {
+        let mut engine = LeaseEngine::new(
+            9,
+            Duration::from_secs(20),
+            BTreeMap::from([("worker-gpu".to_owned(), pool(1))]),
+            None,
+        )
+        .unwrap();
+        let active_llm = grant(
+            engine
+                .admit_at(request("active-llm", &["worker-gpu"], Priority::Low), now())
+                .unwrap(),
+        );
+        assert!(matches!(
+            engine
+                .admit_at(
+                    request("thermal-cooldown", &["worker-gpu"], Priority::Interrupt),
+                    now(),
+                )
+                .unwrap(),
+            AdmitOutcome::Queued { position: 1, .. }
+        ));
+        assert!(
+            engine
+                .status(&active_llm.lease_id, active_llm.epoch)
+                .unwrap()
+                .yield_requested
+        );
+
+        let much_later = now() + chrono::Duration::hours(24);
+        let tick = engine.tick(much_later).unwrap();
+        assert!(tick.preempted.is_empty());
+        assert!(tick.promoted.is_empty());
+        assert_eq!(engine.held_len(), 1);
+        assert_eq!(engine.queue_len(), 1);
+
+        let released = engine
+            .release_at(&active_llm.lease_id, active_llm.epoch, much_later)
+            .unwrap();
+        assert_eq!(released.promoted.len(), 1);
+        assert_eq!(released.promoted[0].job_id, "thermal-cooldown");
+    }
+
+    #[test]
     fn failed_promotion_keeps_pending_ticket_retryable() {
         let mut engine = LeaseEngine::new(
             9,
@@ -2065,7 +2132,8 @@ mod tests {
             dedup_key: None,
             labor_class: LaborClass::Fresh,
             trace_ref: None,
-            pool: Some("api".to_owned()),
+            pools: Some(vec!["api".to_owned()]),
+            executor: None,
             charge: Some(crate::witness::Charge {
                 unit: "seconds".to_owned(),
                 amount: 99.0,

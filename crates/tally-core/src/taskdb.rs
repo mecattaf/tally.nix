@@ -25,6 +25,7 @@ pub const TALLY_UDA_NAMES: &[&str] = &[
     "adapter",
     "labor_class",
     "pool",
+    "executor",
     "session_ref",
     "model",
     "cwd",
@@ -130,7 +131,14 @@ pub struct RowSeed {
     pub priority: Priority,
     pub source: EnqueueSource,
     pub adapter: String,
-    pub pool: String,
+    #[serde(
+        rename = "pool",
+        serialize_with = "crate::poolset::serialize",
+        deserialize_with = "crate::poolset::deserialize"
+    )]
+    pub pools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -189,14 +197,28 @@ impl RowSeed {
                 "leaseEpoch must be positive".to_owned(),
             ));
         }
-        if self.pool.trim().is_empty() || self.pool.chars().any(char::is_control) {
-            return Err(TaskDbError::InvalidSeed(
-                "pool must be non-empty and contain no control characters".to_owned(),
-            ));
-        }
+        let mut pools = self.pools.clone();
+        crate::poolset::canonicalize(&mut pools)
+            .map_err(|error| TaskDbError::InvalidSeed(error.to_string()))?;
         if self.adapter.trim().is_empty() || self.adapter.chars().any(char::is_control) {
             return Err(TaskDbError::InvalidSeed(
                 "adapter must be non-empty and contain no control characters".to_owned(),
+            ));
+        }
+        if self.executor.as_ref().is_some_and(|executor| {
+            executor.is_empty()
+                || executor.len() > 96
+                || matches!(executor.as_str(), "." | "..")
+                || !executor
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                || !executor
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        }) {
+            return Err(TaskDbError::InvalidSeed(
+                "executor is not a safe registry component".to_owned(),
             ));
         }
         if self.runtime_max_sec == Some(0) {
@@ -237,6 +259,8 @@ impl RowSeed {
 
     pub fn canonicalize(&mut self) -> Result<(), TaskDbError> {
         self.validate()?;
+        crate::poolset::canonicalize(&mut self.pools)
+            .map_err(|error| TaskDbError::InvalidSeed(error.to_string()))?;
         self.evidence = parse_evidence_specs(&self.evidence)
             .map_err(|error| TaskDbError::InvalidSeed(format!("invalid evidence: {error}")))?
             .render();
@@ -685,7 +709,10 @@ fn populate_task(
     let mut attributes = BTreeMap::new();
     attributes.insert("adapter", seed.adapter);
     attributes.insert("labor_class", labor_class_name(labor_class).to_owned());
-    attributes.insert("pool", seed.pool);
+    attributes.insert("pool", crate::poolset::encoded(&seed.pools)?);
+    if let Some(executor) = seed.executor {
+        attributes.insert("executor", executor);
+    }
     attributes.insert("lease_epoch", seed.lease_epoch.to_string());
     attributes.insert("source", source_name(&seed.source).to_owned());
     attributes.insert("priority_class", priority_name(seed.priority).to_owned());
@@ -968,7 +995,8 @@ mod tests {
             priority: Priority::High,
             source: EnqueueSource::EventsDir,
             adapter: "shell".to_owned(),
-            pool: "worker-gpu".to_owned(),
+            pools: vec!["worker-gpu".to_owned()],
+            executor: None,
             model: None,
             cwd: Some(PathBuf::from("/work")),
             dedup_key: Some("ocr:paper-1".to_owned()),
@@ -999,6 +1027,29 @@ mod tests {
         row.validate().unwrap();
         row.argv.clear();
         assert!(row.validate().is_err());
+    }
+
+    #[test]
+    fn durable_pool_compatibility_migrates_legacy_scalars_and_canonicalizes_multi() {
+        let singleton = seed(Uuid::new_v4());
+        let scalar = serde_json::to_value(&singleton).unwrap();
+        assert_eq!(scalar["pool"], "worker-gpu");
+        let restored: RowSeed = serde_json::from_value(scalar).unwrap();
+        assert_eq!(restored.pools, ["worker-gpu"]);
+
+        let mut multi = seed(Uuid::new_v4());
+        multi.pools = vec!["zeta".to_owned(), "alpha".to_owned()];
+        let event = DurableEnqueueEvent::new(multi).unwrap();
+        assert_eq!(event.row.pools, ["alpha", "zeta"]);
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["row"]["pool"], serde_json::json!(["alpha", "zeta"]));
+        assert_eq!(
+            serde_json::from_value::<DurableEnqueueEvent>(encoded)
+                .unwrap()
+                .row
+                .pools,
+            ["alpha", "zeta"]
+        );
     }
 
     #[test]

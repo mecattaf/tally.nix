@@ -9,7 +9,9 @@ use serde_json::{json, Value};
 use tally_core::config::Priority;
 use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings};
 use tally_core::evidence::RetryPolicy;
-use tally_core::executor::{persist_exit_record_from_env, ExecutionPaths, UnitLimits};
+use tally_core::executor::{
+    persist_exit_record_from_env, serve_remote_executor_stdio, ExecutionPaths, UnitLimits,
+};
 use tally_core::producers::{GhCliIntake, GhObservation, ProducerEngine, ProducerObservation};
 use tally_core::recovery::RecoveryPolicy;
 use tally_core::taskdb::EnqueueSource;
@@ -47,11 +49,13 @@ struct Opts {
 enum Command {
     #[command(name = "__record-unit-exit", hide = true)]
     RecordUnitExit(RecordUnitExitArgs),
+    #[command(name = "__remote-executor", hide = true)]
+    RemoteExecutor,
     #[command(name = "__adapter-render", hide = true)]
     AdapterRender(AdapterRenderArgs),
     #[command(name = "__producer-dispatch", hide = true)]
     ProducerDispatch(ProducerDispatchArgs),
-    Enqueue(EnqueueArgs),
+    Enqueue(Box<EnqueueArgs>),
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
@@ -162,8 +166,10 @@ impl From<CliSource> for EnqueueSource {
 
 #[derive(Debug, Args)]
 struct EnqueueArgs {
+    #[arg(long = "pool", required = true, action = clap::ArgAction::Append)]
+    pools: Vec<String>,
     #[arg(long)]
-    pool: String,
+    executor: Option<String>,
     #[arg(long, value_enum, default_value = "medium")]
     priority: CliPriority,
     #[arg(long, default_value = "shell")]
@@ -245,9 +251,16 @@ enum WitnessCommand {
 
 #[derive(Debug, Subcommand)]
 enum LeaseCommand {
-    Acquire { pool: String },
-    Release { lease: String },
-    Status { lease: Option<String> },
+    Acquire {
+        #[arg(required = true, num_args = 1..)]
+        pools: Vec<String>,
+    },
+    Release {
+        lease: String,
+    },
+    Status {
+        lease: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -313,12 +326,16 @@ fn invalid(message: impl Into<String>) -> anyhow::Error {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let recorder_mode =
-        std::env::args_os().nth(1).as_deref() == Some(OsStr::new("__record-unit-exit"));
+    let helper_mode = std::env::args_os().nth(1).is_some_and(|argument| {
+        matches!(
+            argument.to_str(),
+            Some("__record-unit-exit" | "__remote-executor")
+        )
+    });
     match run().await {
         Ok(()) => {}
         Err(error) => {
-            if !recorder_mode {
+            if !helper_mode {
                 eprintln!("tally: {error:#}");
             }
             std::process::exit(error_exit_code(&error));
@@ -362,6 +379,10 @@ async fn execute(opts: Opts) -> Result<()> {
     match opts.command {
         Some(Command::RecordUnitExit(args)) => {
             persist_exit_record_from_env(&args.record, &args.unit)?;
+            Ok(())
+        }
+        Some(Command::RemoteExecutor) => {
+            serve_remote_executor_stdio().await?;
             Ok(())
         }
         Some(Command::AdapterRender(args)) => {
@@ -439,7 +460,7 @@ async fn execute(opts: Opts) -> Result<()> {
         Some(Command::Daemon {
             command: DaemonCommand::Drain,
         }) => print_rpc(&socket, "queue.drain", Some(json!({}))).await,
-        Some(Command::Enqueue(args)) => run_enqueue(&socket, args).await,
+        Some(Command::Enqueue(args)) => run_enqueue(&socket, *args).await,
         Some(Command::Queue {
             command: QueueCommand::Enqueue(args),
         }) => run_enqueue(&socket, *args).await,
@@ -629,7 +650,7 @@ where
         .map_err(|error| anyhow::anyhow!("{environment} has an invalid value: {error}"))
 }
 
-async fn run_enqueue(socket: &Path, args: EnqueueArgs) -> Result<()> {
+async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
     let has_invocation = args.invocation.is_some();
     let has_argv = !args.argv.is_empty();
     if has_invocation == has_argv {
@@ -640,10 +661,13 @@ async fn run_enqueue(socket: &Path, args: EnqueueArgs) -> Result<()> {
     if args.runtime_max_sec == Some(0) {
         return Err(invalid("--runtime-max-sec must be positive"));
     }
+    tally_core::poolset::canonicalize(&mut args.pools)
+        .map_err(|error| invalid(error.to_string()))?;
     let payload = EnqueuePayload {
         invocation: args.invocation,
         argv: has_argv.then_some(args.argv),
-        pool: Some(args.pool),
+        pools: Some(args.pools),
+        executor: args.executor,
         priority: Some(args.priority.into()),
         adapter: Some(args.adapter),
         source: Some(args.source.into()),
@@ -757,7 +781,13 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
 
 async fn run_lease(socket: &Path, command: LeaseCommand) -> Result<()> {
     match command {
-        LeaseCommand::Acquire { pool } => {
+        LeaseCommand::Acquire { mut pools } => {
+            tally_core::poolset::canonicalize(&mut pools)
+                .map_err(|error| invalid(error.to_string()))?;
+            let pool = match pools.as_slice() {
+                [pool] => Value::String(pool.clone()),
+                pools => serde_json::to_value(pools)?,
+            };
             print_rpc(socket, "lease.acquire", Some(json!({"pool": pool}))).await
         }
         LeaseCommand::Release { lease } => {

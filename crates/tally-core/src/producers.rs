@@ -68,7 +68,14 @@ pub struct ProducerEnqueue {
     pub argv: Vec<String>,
     #[serde(default = "default_adapter")]
     pub adapter: String,
-    pub pool: String,
+    #[serde(
+        rename = "pool",
+        serialize_with = "crate::poolset::serialize",
+        deserialize_with = "crate::poolset::deserialize"
+    )]
+    pub pools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     #[serde(default = "default_priority")]
     pub priority: Priority,
     #[serde(default)]
@@ -95,6 +102,10 @@ impl ProducerEnqueue {
         source: EnqueueSource,
         now: DateTime<Utc>,
     ) -> Result<EnqueuePayload, ProducerError> {
+        let mut pools = self.pools.clone();
+        crate::poolset::canonicalize(&mut pools).map_err(|error| {
+            ProducerError::InvalidConfig(format!("producer enqueue has invalid pool set: {error}"))
+        })?;
         let dedup_key = self
             .dedup_key
             .as_deref()
@@ -103,7 +114,8 @@ impl ProducerEnqueue {
         Ok(EnqueuePayload {
             invocation: None,
             argv: Some(self.argv.clone()),
-            pool: Some(self.pool.clone()),
+            pools: Some(pools),
+            executor: self.executor.clone(),
             priority: Some(self.priority),
             adapter: Some(self.adapter.clone()),
             source: Some(source),
@@ -234,6 +246,7 @@ pub fn validate_registry(
     producers: &BTreeMap<String, ProducerConfig>,
     pools: &BTreeSet<String>,
     adapters: &BTreeSet<String>,
+    executors: &BTreeSet<String>,
 ) -> Result<(), ProducerError> {
     let mut reachability_owners = BTreeMap::new();
     for (name, producer) in producers {
@@ -248,7 +261,7 @@ pub fn validate_registry(
                         "calendar producer {name:?} requires a non-empty onCalendar"
                     )));
                 }
-                validate_enqueue(name, "enqueue", &config.enqueue, pools, adapters)?;
+                validate_enqueue(name, "enqueue", &config.enqueue, pools, adapters, executors)?;
             }
             ProducerConfig::EventsDir(config) => {
                 if config.poll_interval_sec == 0 {
@@ -283,7 +296,7 @@ pub fn validate_registry(
                     }
                 }
                 validate_name(&config.actor_exclude, "GitHub actorExclude")?;
-                validate_enqueue(name, "enqueue", &config.enqueue, pools, adapters)?;
+                validate_enqueue(name, "enqueue", &config.enqueue, pools, adapters, executors)?;
             }
             ProducerConfig::BuildEffect(config) => {
                 if !config.path.is_absolute() {
@@ -295,7 +308,7 @@ pub fn validate_registry(
                     &config.path,
                     &format!("build-effect producer {name:?} path"),
                 )?;
-                validate_enqueue(name, "onKey", &config.on_key, pools, adapters)?;
+                validate_enqueue(name, "onKey", &config.on_key, pools, adapters, executors)?;
             }
             ProducerConfig::PoolReachability(config) => {
                 if config.interval_sec == 0 || config.hysteresis == 0 {
@@ -323,7 +336,7 @@ pub fn validate_registry(
                     ("onReturnAttest", config.on_return_attest.as_ref()),
                 ] {
                     if let Some(enqueue) = enqueue {
-                        validate_enqueue(name, field, enqueue, pools, adapters)?;
+                        validate_enqueue(name, field, enqueue, pools, adapters, executors)?;
                     }
                 }
                 if config
@@ -347,23 +360,38 @@ fn validate_enqueue(
     enqueue: &ProducerEnqueue,
     pools: &BTreeSet<String>,
     adapters: &BTreeSet<String>,
+    executors: &BTreeSet<String>,
 ) -> Result<(), ProducerError> {
     if enqueue.argv.is_empty() {
         return Err(ProducerError::InvalidConfig(format!(
             "producer {producer:?} {field} argv must not be empty"
         )));
     }
-    if !pools.contains(&enqueue.pool) {
-        return Err(ProducerError::InvalidConfig(format!(
-            "producer {producer:?} {field} references unknown pool {:?}",
-            enqueue.pool
-        )));
+    let mut canonical_pools = enqueue.pools.clone();
+    crate::poolset::canonicalize(&mut canonical_pools).map_err(|error| {
+        ProducerError::InvalidConfig(format!(
+            "producer {producer:?} {field} has invalid pool set: {error}"
+        ))
+    })?;
+    for pool in &canonical_pools {
+        if !pools.contains(pool) {
+            return Err(ProducerError::InvalidConfig(format!(
+                "producer {producer:?} {field} references unknown pool {pool:?}"
+            )));
+        }
     }
     if !adapters.contains(&enqueue.adapter) {
         return Err(ProducerError::InvalidConfig(format!(
             "producer {producer:?} {field} references unknown adapter {:?}",
             enqueue.adapter
         )));
+    }
+    if let Some(executor) = &enqueue.executor {
+        if !executors.contains(executor) {
+            return Err(ProducerError::InvalidConfig(format!(
+                "producer {producer:?} {field} references unknown executor {executor:?}"
+            )));
+        }
     }
     if enqueue
         .dedup_key
@@ -2419,7 +2447,8 @@ mod tests {
         ProducerEnqueue {
             argv: vec![command.to_owned()],
             adapter: "shell".to_owned(),
-            pool: "slot".to_owned(),
+            pools: vec!["slot".to_owned()],
+            executor: None,
             priority: Priority::Low,
             dedup_key: None,
             evidence: vec!["exit:0".to_owned()],
@@ -2504,6 +2533,7 @@ mod tests {
             &registry,
             &BTreeSet::from(["slot".to_owned()]),
             &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
         )
         .unwrap();
         assert_eq!(
@@ -2553,6 +2583,7 @@ mod tests {
             &invalid_attest,
             &BTreeSet::from(["slot".to_owned()]),
             &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
         )
         .unwrap_err()
         .to_string()
@@ -2565,6 +2596,7 @@ mod tests {
             &duplicate_reachability,
             &BTreeSet::from(["slot".to_owned()]),
             &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
         )
         .unwrap_err()
         .to_string()
@@ -2580,6 +2612,7 @@ mod tests {
                 &invalid_names,
                 &BTreeSet::from(["slot".to_owned()]),
                 &BTreeSet::from(["shell".to_owned()]),
+                &BTreeSet::new(),
             )
             .unwrap_err()
             .to_string()
@@ -2599,6 +2632,7 @@ mod tests {
             &relative_credential,
             &BTreeSet::from(["slot".to_owned()]),
             &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
         )
         .unwrap_err()
         .to_string()
@@ -2614,10 +2648,36 @@ mod tests {
             &invalid_strftime,
             &BTreeSet::from(["slot".to_owned()]),
             &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
         )
         .unwrap_err()
         .to_string()
         .contains("strftime"));
+    }
+
+    #[test]
+    fn producer_multi_pool_validation_rejects_empty_duplicate_and_unknown_sets() {
+        let temp = tempdir().unwrap();
+        let error_for = |requested: Vec<String>| {
+            let mut registry = registry(&temp.path().join("effects.jsonl"));
+            let ProducerConfig::Calendar(calendar) = registry.get_mut("daily").unwrap() else {
+                unreachable!()
+            };
+            calendar.enqueue.pools = requested;
+            validate_registry(
+                &registry,
+                &BTreeSet::from(["slot".to_owned()]),
+                &BTreeSet::from(["shell".to_owned()]),
+                &BTreeSet::new(),
+            )
+            .unwrap_err()
+            .to_string()
+        };
+
+        assert!(error_for(Vec::new()).contains("at least one"));
+        assert!(error_for(vec!["slot".to_owned(), "slot".to_owned()]).contains("duplicate"));
+        assert!(error_for(vec!["slot".to_owned(), "missing".to_owned()])
+            .contains("references unknown pool \"missing\""));
     }
 
     #[test]
@@ -2642,7 +2702,10 @@ mod tests {
         let payload: EnqueuePayload =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(payload.source, Some(EnqueueSource::Calendar));
-        assert_eq!(payload.pool.as_deref(), Some("slot"));
+        assert_eq!(
+            payload.pools.as_deref(),
+            Some(["slot".to_owned()].as_slice())
+        );
         assert_eq!(payload.adapter.as_deref(), Some("shell"));
         assert_eq!(payload.dedup_key.as_deref(), Some("daily-20260720"));
         assert_eq!(

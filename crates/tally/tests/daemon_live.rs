@@ -64,6 +64,7 @@ fn config() -> Config {
         lease: Default::default(),
         adapters: BTreeMap::from([("shell".to_owned(), AdapterConfig::default())]),
         producers: BTreeMap::new(),
+        executors: BTreeMap::new(),
         journald: JournaldConfig { native: false },
     }
 }

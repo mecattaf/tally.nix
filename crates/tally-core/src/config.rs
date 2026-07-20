@@ -7,6 +7,65 @@ use thiserror::Error;
 use crate::adapters::{AdapterConfig, AdapterEngine, AdapterError};
 use crate::producers::{validate_registry, ProducerConfig, ProducerError};
 
+fn default_ssh_port() -> u16 {
+    22
+}
+
+fn default_connect_timeout_sec() -> u64 {
+    10
+}
+
+fn default_server_alive_interval_sec() -> u64 {
+    15
+}
+
+fn default_server_alive_count_max() -> u32 {
+    3
+}
+
+fn default_retry_interval_ms() -> u64 {
+    1_000
+}
+
+/// A daemonless execution target reached through a single, explicitly
+/// configured OpenSSH identity. The remote side runs the same `tally` binary
+/// as a short-lived protocol helper; it does not run a tally daemon.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SshExecutorConfig {
+    pub host: String,
+    pub user: String,
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    pub ssh_program: PathBuf,
+    pub identity_file: PathBuf,
+    pub known_hosts_file: PathBuf,
+    pub program: PathBuf,
+    pub state_dir: PathBuf,
+    #[serde(default = "default_connect_timeout_sec")]
+    pub connect_timeout_sec: u64,
+    #[serde(default = "default_server_alive_interval_sec")]
+    pub server_alive_interval_sec: u64,
+    #[serde(default = "default_server_alive_count_max")]
+    pub server_alive_count_max: u32,
+    #[serde(default = "default_retry_interval_ms")]
+    pub retry_interval_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum ExecutionTargetConfig {
+    Ssh(SshExecutorConfig),
+}
+
+impl ExecutionTargetConfig {
+    pub const fn ssh(&self) -> &SshExecutorConfig {
+        match self {
+            Self::Ssh(config) => config,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Priority {
@@ -230,6 +289,8 @@ pub struct Config {
     #[serde(default)]
     pub producers: BTreeMap<String, ProducerConfig>,
     #[serde(default)]
+    pub executors: BTreeMap<String, ExecutionTargetConfig>,
+    #[serde(default)]
     pub journald: JournaldConfig,
 }
 
@@ -266,6 +327,8 @@ pub enum ConfigError {
     InvalidEnqueueGuardrail,
     #[error("lease graceSec, yieldPollSec, and yieldGraceSec must all be positive")]
     InvalidLeaseGuardrail,
+    #[error("executor {executor:?} is invalid: {detail}")]
+    InvalidExecutor { executor: String, detail: String },
     #[error("adapter configuration is invalid: {0}")]
     Adapter(#[from] AdapterError),
     #[error("producer configuration is invalid: {0}")]
@@ -344,13 +407,102 @@ impl Config {
                 })?;
             }
         }
+        for (name, target) in &self.executors {
+            validate_executor_name(name).map_err(|detail| ConfigError::InvalidExecutor {
+                executor: name.clone(),
+                detail,
+            })?;
+            validate_ssh_executor(target.ssh()).map_err(|detail| ConfigError::InvalidExecutor {
+                executor: name.clone(),
+                detail,
+            })?;
+        }
         validate_registry(
             &self.producers,
             &self.pools.keys().cloned().collect(),
             &self.adapters.keys().cloned().collect(),
+            &self.executors.keys().cloned().collect(),
         )?;
         Ok(())
     }
+}
+
+fn validate_executor_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name.len() > 96
+        || matches!(name, "." | "..")
+        || !name
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        return Err("name is not a safe registry component".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_ssh_executor(config: &SshExecutorConfig) -> Result<(), String> {
+    let safe_host = !config.host.is_empty()
+        && !config.host.starts_with('-')
+        && config
+            .host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_' | b':'));
+    if !safe_host {
+        return Err("host must be a non-option DNS name or IP literal".to_owned());
+    }
+    let safe_user = !config.user.is_empty()
+        && !config.user.starts_with('-')
+        && config
+            .user
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'));
+    if !safe_user {
+        return Err("user is not a safe OpenSSH login name".to_owned());
+    }
+    if config.port == 0 {
+        return Err("port must be positive".to_owned());
+    }
+    for (label, path) in [
+        ("sshProgram", &config.ssh_program),
+        ("identityFile", &config.identity_file),
+        ("knownHostsFile", &config.known_hosts_file),
+        ("program", &config.program),
+        ("stateDir", &config.state_dir),
+    ] {
+        let Some(value) = path.to_str() else {
+            return Err(format!("{label} must be valid UTF-8"));
+        };
+        if !path.is_absolute() || value.chars().any(char::is_control) || value.contains('\0') {
+            return Err(format!(
+                "{label} must be an absolute path without control characters"
+            ));
+        }
+    }
+    // OpenSSH joins the fixed remote helper argv into one remote command. The
+    // program path therefore uses a deliberately narrow shell-word alphabet;
+    // job argv itself is carried only in JSON stdin.
+    if !config.program.to_string_lossy().bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'/' | b'_' | b'.' | b'+' | b',' | b'@' | b'=' | b'-')
+    }) {
+        return Err(
+            "program contains characters unsafe for the fixed SSH helper command".to_owned(),
+        );
+    }
+    if config.connect_timeout_sec == 0
+        || config.server_alive_interval_sec == 0
+        || config.server_alive_count_max == 0
+        || !(10..=60_000).contains(&config.retry_interval_ms)
+    {
+        return Err(
+            "timeouts and retryIntervalMs must be positive (retryIntervalMs 10..=60000)".to_owned(),
+        );
+    }
+    Ok(())
 }
 
 fn validate_credential(name: &str, source: &Path) -> Result<(), String> {
@@ -468,6 +620,65 @@ mod tests {
     }
 
     #[test]
+    fn ssh_executors_are_explicit_strict_and_shell_safe() {
+        let valid: Config = serde_json::from_value(serde_json::json!({
+            "pools": {},
+            "executors": {
+                "worker": {
+                    "kind": "ssh",
+                    "host": "worker.example",
+                    "user": "tally-worker",
+                    "port": 2222,
+                    "sshProgram": "/run/current-system/sw/bin/ssh",
+                    "identityFile": "/run/credentials/tally-worker-key",
+                    "knownHostsFile": "/etc/tally/worker-known-hosts",
+                    "program": "/run/current-system/sw/bin/tally",
+                    "stateDir": "/var/lib/tally-remote"
+                }
+            }
+        }))
+        .unwrap();
+        valid.validate().unwrap();
+        let rendered = serde_json::to_value(&valid).unwrap();
+        assert_eq!(rendered["executors"]["worker"]["kind"], "ssh");
+        assert_eq!(rendered["executors"]["worker"]["port"], 2222);
+
+        for mutate in [
+            |config: &mut SshExecutorConfig| config.host = "-oProxyCommand=bad".to_owned(),
+            |config: &mut SshExecutorConfig| config.user = "bad user".to_owned(),
+            |config: &mut SshExecutorConfig| config.identity_file = PathBuf::from("relative"),
+            |config: &mut SshExecutorConfig| config.program = PathBuf::from("/run/tally;touch-bad"),
+            |config: &mut SshExecutorConfig| config.retry_interval_ms = 1,
+        ] {
+            let mut invalid = valid.clone();
+            let ExecutionTargetConfig::Ssh(target) = invalid.executors.get_mut("worker").unwrap();
+            mutate(target);
+            assert!(matches!(
+                invalid.validate(),
+                Err(ConfigError::InvalidExecutor { .. })
+            ));
+        }
+
+        assert!(serde_json::from_value::<Config>(serde_json::json!({
+            "pools": {},
+            "executors": {
+                "worker": {
+                    "kind": "ssh",
+                    "host": "worker.example",
+                    "user": "tally-worker",
+                    "sshProgram": "/bin/ssh",
+                    "identityFile": "/key",
+                    "knownHostsFile": "/known-hosts",
+                    "program": "/bin/tally",
+                    "stateDir": "/state",
+                    "ambientConfig": true
+                }
+            }
+        }))
+        .is_err());
+    }
+
+    #[test]
     fn producer_registry_is_strict_and_validates_the_reference_graph() {
         let valid: Config = serde_json::from_str(
             r#"{
@@ -551,5 +762,29 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unknown pool"));
+
+        let unknown_executor: Config = serde_json::from_str(
+            r#"{
+                "pools": {"slot": {}},
+                "adapters": {"shell": {"argv": []}},
+                "producers": {
+                    "daily": {
+                        "kind": "calendar",
+                        "onCalendar": "daily",
+                        "enqueue": {
+                            "argv": ["x"],
+                            "pool": "slot",
+                            "executor": "missing-worker"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(unknown_executor
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("unknown executor"));
     }
 }

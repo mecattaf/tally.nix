@@ -60,7 +60,7 @@ fn request(argv: Vec<String>) -> ExecutionRequest {
             task_uuid: Some(Uuid::new_v4()),
         },
         parent: Some(Uuid::new_v4()),
-        pool: "worker-live".to_owned(),
+        pools: vec!["worker-live".to_owned()],
         lease_epoch: 19,
         attempt: 1,
         priority: Priority::High,

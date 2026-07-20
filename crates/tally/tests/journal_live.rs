@@ -37,7 +37,7 @@ fn event(marker: &str, path: &str) -> EmitEvent {
     let mut event = EmitEvent::enqueued(marker, Priority::High, EnqueueSource::Manual);
     event.message = Some(format!("live-journal {path} {marker}"));
     event.job_id = Some(format!("job-{marker}"));
-    event.pool = Some("worker-live".to_owned());
+    event.pools = Some(vec!["worker-live".to_owned()]);
     event
 }
 
@@ -213,9 +213,15 @@ async fn real_user_manager_journal_paths() {
     let parsed_stdout = parsed_stdout.expect("stdout record was not queryable through journald");
     assert_eq!(parsed_native, native_fields);
     assert_eq!(parsed_native.event, TallyEvent::Enqueued);
-    assert_eq!(parsed_native.pool.as_deref(), Some("worker-live"));
+    assert_eq!(
+        parsed_native.pools.as_deref(),
+        Some(["worker-live".to_owned()].as_slice())
+    );
     assert_eq!(parsed_stdout.event, TallyEvent::Enqueued);
-    assert_eq!(parsed_stdout.pool.as_deref(), Some("worker-live"));
+    assert_eq!(
+        parsed_stdout.pools.as_deref(),
+        Some(["worker-live".to_owned()].as_slice())
+    );
     assert_eq!(parsed_stdout, expected_stdout_fields);
     assert_collected(&unit).await;
 }

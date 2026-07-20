@@ -618,46 +618,58 @@ impl DaemonHandler {
             .validate_gh_origin(origin)
             .map_err(|error| WireError::invalid(error.to_string()))?;
         }
-        let requested_pool = payload
-            .pool
-            .as_deref()
-            .ok_or_else(|| WireError::invalid("pool is required"))?;
-        if !context.config.pools.contains_key(requested_pool) {
-            return Err(WireError::invalid(format!(
-                "unknown pool {requested_pool:?}"
-            )));
+        let mut requested_pools = payload
+            .pools
+            .clone()
+            .ok_or_else(|| WireError::invalid("pool set is required"))?;
+        crate::poolset::canonicalize(&mut requested_pools)
+            .map_err(|error| WireError::invalid(error.to_string()))?;
+        for requested_pool in &requested_pools {
+            if !context.config.pools.contains_key(requested_pool) {
+                return Err(WireError::invalid(format!(
+                    "unknown pool {requested_pool:?}"
+                )));
+            }
         }
         if !context.config.adapters.contains_key(&requested_adapter) {
             return Err(WireError::invalid(format!(
                 "unknown adapter {requested_adapter:?}"
             )));
         }
+        if let Some(executor) = &payload.executor {
+            if !context.config.executors.contains_key(executor) {
+                return Err(WireError::invalid(format!("unknown executor {executor:?}")));
+            }
+        }
         let defaults = ProducerDefaults {
-            pool: payload.pool.clone().unwrap_or_default(),
+            pools: requested_pools,
+            executor: payload.executor.clone(),
             priority: payload.priority.unwrap_or(Priority::Medium),
             adapter: requested_adapter,
             source: payload.source.unwrap_or(EnqueueSource::Manual),
         };
         let mut resolved = context.guardrails.validate_enqueue(payload, &defaults)?;
-        let pool_credentials = context
-            .config
-            .pools
-            .get(&resolved.pool)
-            .expect("the requested pool was validated above")
-            .credentials
-            .clone();
-        for (name, source) in pool_credentials {
-            if resolved
+        for pool in &resolved.pools {
+            let pool_credentials = context
+                .config
+                .pools
+                .get(pool)
+                .expect("the requested pools were validated above")
                 .credentials
-                .get(&name)
-                .is_some_and(|existing| existing != &source)
-            {
-                rollback_child_charge(&mut context, caller_job_id.as_deref())?;
-                return Err(WireError::invalid(format!(
-                    "credential {name:?} has conflicting pool and enqueue sources"
-                )));
+                .clone();
+            for (name, source) in pool_credentials {
+                if resolved
+                    .credentials
+                    .get(&name)
+                    .is_some_and(|existing| existing != &source)
+                {
+                    rollback_child_charge(&mut context, caller_job_id.as_deref())?;
+                    return Err(WireError::invalid(format!(
+                        "credential {name:?} has conflicting pool and enqueue sources"
+                    )));
+                }
+                resolved.credentials.entry(name).or_insert(source);
             }
-            resolved.credentials.entry(name).or_insert(source);
         }
         let invocation = match AdapterEngine::new(&context.config.adapters)
             .launch(&resolved.adapter, &resolved.argv)
@@ -701,7 +713,8 @@ impl DaemonHandler {
             priority: resolved.priority,
             source: resolved.source,
             adapter: resolved.adapter.clone(),
-            pool: resolved.pool.clone(),
+            pools: resolved.pools.clone(),
+            executor: resolved.executor.clone(),
             model: None,
             cwd: None,
             dedup_key: resolved.dedup_key.clone(),
@@ -815,7 +828,8 @@ impl DaemonHandler {
                     dedup_key: row.dedup_key.clone(),
                     labor_class: LaborClass::Reused,
                     trace_ref: None,
-                    pool: Some(row.pool.clone()),
+                    pools: Some(row.pools.clone()),
+                    executor: row.executor.clone(),
                     charge: None,
                     model: row.model.clone(),
                     evidence_class: row.evidence_class.clone(),
@@ -918,10 +932,15 @@ impl DaemonHandler {
 
         let barrier = context.barriers.register_job(&stable_key, row.attempt);
         let mut launch = None;
-        if context.paused_pools.contains(&row.pool) || context.unreachable_pools.contains(&row.pool)
-        {
+        if row.pools.iter().any(|pool| {
+            context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
+        }) {
             job.state = JobState::Paused;
-            if context.unreachable_pools.contains(&row.pool) {
+            if row
+                .pools
+                .iter()
+                .any(|pool| context.unreachable_pools.contains(pool))
+            {
                 context.unreachable_paused_jobs.insert(job_id);
             }
         } else {
@@ -1156,7 +1175,10 @@ impl DaemonHandler {
         let queued = context
             .jobs
             .values()
-            .filter(|job| job.state == JobState::Queued && pools.contains(&job.row.pool))
+            .filter(|job| {
+                job.state == JobState::Queued
+                    && job.row.pools.iter().any(|pool| pools.contains(pool))
+            })
             .map(|job| (job.job_id, job.lease_id.clone()))
             .collect::<Vec<_>>();
         for (job_id, lease_id) in &queued {
@@ -1195,8 +1217,11 @@ impl DaemonHandler {
             .values()
             .filter(|job| {
                 job.state == JobState::Paused
-                    && pools.contains(&job.row.pool)
-                    && !context.unreachable_pools.contains(&job.row.pool)
+                    && job.row.pools.iter().any(|pool| pools.contains(pool))
+                    && !job.row.pools.iter().any(|pool| {
+                        context.paused_pools.contains(pool)
+                            || context.unreachable_pools.contains(pool)
+                    })
             })
             .map(|job| job.job_id)
             .collect::<Vec<_>>();
@@ -1307,7 +1332,9 @@ impl DaemonHandler {
         let queued = context
             .jobs
             .values()
-            .filter(|job| job.state == JobState::Queued && job.row.pool == pool)
+            .filter(|job| {
+                job.state == JobState::Queued && job.row.pools.iter().any(|name| name == pool)
+            })
             .map(|job| (job.job_id, job.lease_id.clone()))
             .collect::<Vec<_>>();
         for (job_id, lease_id) in queued {
@@ -1332,7 +1359,9 @@ impl DaemonHandler {
             .jobs
             .values()
             .filter(|job| {
-                job.state == JobState::Running && job.row.pool == pool && job.lease_id.is_some()
+                job.state == JobState::Running
+                    && job.row.pools.iter().any(|name| name == pool)
+                    && job.lease_id.is_some()
             })
             .map(|job| job.job_id)
             .collect::<Vec<_>>();
@@ -1347,7 +1376,13 @@ impl DaemonHandler {
                 .map_err(|error| self.fail_stop(error))?;
             if let Err(error) = self
                 .executor
-                .reclaim_identity_exact(&job.identity(), job.adopted_invocation_id.as_deref())
+                .reclaim_identity_exact_on(
+                    job.row.executor.as_deref(),
+                    &job.identity(),
+                    job.adopted_invocation_id.as_deref(),
+                    job.row.attempt,
+                    job.row.lease_epoch,
+                )
                 .await
             {
                 return Err(self.fail_stop(error.into()));
@@ -1408,6 +1443,7 @@ impl DaemonHandler {
                 collect_durable_recovery_facts(&paths.events_dir(), &paths.witness_path())
                     .map_err(|error| self.fail_stop(error.into()))?;
             let units = collect_local_unit_facts(&self.executor, &durable)
+                .await
                 .map_err(|error| self.fail_stop(error.into()))?;
             let facts = RecoveryFacts {
                 durable,
@@ -1469,7 +1505,14 @@ impl DaemonHandler {
                 context
                     .jobs
                     .get(job_id)
-                    .filter(|job| job.row.pool == pool)
+                    .filter(|job| {
+                        job.row.pools.iter().any(|name| name == pool)
+                            && !job
+                                .row
+                                .pools
+                                .iter()
+                                .any(|name| context.unreachable_pools.contains(name))
+                    })
                     .map(|_| *job_id)
             })
             .collect::<Vec<_>>();
@@ -1536,7 +1579,13 @@ impl DaemonHandler {
             let identity = job.identity();
             if let Err(error) = self
                 .executor
-                .reclaim_identity_exact(&identity, job.adopted_invocation_id.as_deref())
+                .reclaim_identity_exact_on(
+                    job.row.executor.as_deref(),
+                    &identity,
+                    job.adopted_invocation_id.as_deref(),
+                    job.row.attempt,
+                    job.row.lease_epoch,
+                )
                 .await
             {
                 return Err(internal_wire(error.to_string()));
@@ -1861,9 +1910,12 @@ impl DaemonHandler {
     async fn acquire(&self, params: Option<Value>) -> Result<Value, WireError> {
         #[derive(Deserialize)]
         struct Params {
-            pool: String,
+            #[serde(deserialize_with = "crate::poolset::deserialize")]
+            pool: Vec<String>,
         }
-        let params: Params = decode_params(params)?;
+        let mut params: Params = decode_params(params)?;
+        crate::poolset::canonicalize(&mut params.pool)
+            .map_err(|error| WireError::invalid(error.to_string()))?;
         let id = Uuid::new_v4();
         let mut context = self.context.write().await;
         let epoch = context.epoch;
@@ -1871,7 +1923,7 @@ impl DaemonHandler {
             LeaseRequest {
                 job_id: id.to_string(),
                 unit: format!("tally-job-{id}.service"),
-                pools: vec![params.pool],
+                pools: params.pool,
                 // The additive acquire/release surface is an explicit
                 // reservation token, not a daemon-owned execution. Keep
                 // it outside managed hard-preemption; only daemon jobs
@@ -2126,6 +2178,8 @@ impl DaemonHandler {
         let executor = self.executor.clone();
         let completion = self.completion.clone();
         let request = execution_request(&job, self.settings.unit_limits, &self.tally_socket);
+        let execution_target = job.row.executor.clone();
+        let evidence = job.row.evidence.clone();
         let mut shutdown = self.execution_shutdown.clone();
         let mut cancellation = self.execution_cancel.subscribe();
         tokio::task::spawn_local(async move {
@@ -2133,15 +2187,19 @@ impl DaemonHandler {
             let execution = async {
                 if job.adopted {
                     executor
-                        .adopt(
+                        .adopt_on(
+                            execution_target.as_deref(),
                             request,
                             job.adopted_invocation_id
                                 .as_deref()
                                 .expect("adopted recovery jobs retain their invocation ID"),
+                            evidence,
                         )
                         .await
                 } else {
-                    executor.execute(request).await
+                    executor
+                        .execute_on(execution_target.as_deref(), request, evidence)
+                        .await
                 }
             };
             tokio::pin!(execution);
@@ -2239,7 +2297,9 @@ fn pool_headroom_facts(context: &mut Context) -> Result<Vec<PoolHeadroomFact>, W
         .values()
         .filter(|job| job.state == JobState::Queued && job.lease_id.is_none())
         .fold(HashMap::<String, usize>::new(), |mut counts, job| {
-            *counts.entry(job.row.pool.clone()).or_default() += 1;
+            for pool in &job.row.pools {
+                *counts.entry(pool.clone()).or_default() += 1;
+            }
             counts
         });
     pools
@@ -2424,7 +2484,7 @@ fn lease_request(job: &Job, unit: String) -> LeaseRequest {
     LeaseRequest {
         job_id: job.job_id.to_string(),
         unit,
-        pools: vec![job.row.pool.clone()],
+        pools: job.row.pools.clone(),
         priority: job.row.priority,
         admission_key: Some(format!("{}:{}", job.stable_key(), job.row.attempt)),
         consumption_estimate: job.row.consumption_estimate,
@@ -2435,14 +2495,16 @@ fn execution_request(job: &Job, limits: UnitLimits, tally_socket: &str) -> Execu
     ExecutionRequest {
         identity: job.identity(),
         parent: job.row.parent_uuid,
-        pool: job.row.pool.clone(),
+        pools: job.row.pools.clone(),
         lease_epoch: job.row.lease_epoch,
         attempt: job.row.attempt,
         priority: job.row.priority,
         no_enqueue: job.row.no_enqueue,
         argv: job.invocation.argv.clone(),
         yield_hook: job.invocation.yield_hook.clone(),
-        tally_socket: Some(tally_socket.to_owned()),
+        // A remote worker has no tally daemon and cannot use the coordinator's
+        // Unix socket. The SSH transport itself never forwards ambient sockets.
+        tally_socket: job.row.executor.is_none().then(|| tally_socket.to_owned()),
         environment: job.invocation.env.clone(),
         cwd: job.row.cwd.clone(),
         credentials: job.row.credentials.clone(),
@@ -2476,7 +2538,8 @@ fn enqueued_event(job: &Job) -> EmitEvent {
     let mut event = EmitEvent::enqueued(job.stable_key(), job.row.priority, job.row.source);
     event.job_id = Some(job.job_id.to_string());
     event.parent = job.row.parent_uuid.map(|uuid| uuid.to_string());
-    event.pool = Some(job.row.pool.clone());
+    event.pools = Some(job.row.pools.clone());
+    event.executor = job.row.executor.clone();
     event
 }
 
@@ -2502,7 +2565,8 @@ fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
         dedup_key: job.row.dedup_key.clone(),
         labor_class: job.labor_class,
         trace_ref: None,
-        pool: Some(job.row.pool.clone()),
+        pools: Some(job.row.pools.clone()),
+        executor: job.row.executor.clone(),
         charge: None,
         model: canonical_job_model(job),
         evidence_class: job.row.evidence_class.clone(),
@@ -2606,7 +2670,8 @@ fn completed_event(job: &Job, result: &JobResult, evidence: String) -> EmitEvent
         labor_class: Some(job.labor_class),
         job_id: Some(job.job_id.to_string()),
         parent: job.row.parent_uuid.map(|uuid| uuid.to_string()),
-        pool: Some(job.row.pool.clone()),
+        pools: Some(job.row.pools.clone()),
+        executor: job.row.executor.clone(),
     }
 }
 
@@ -2641,7 +2706,9 @@ impl Daemon {
         settings: DaemonSettings,
         recorder_program: PathBuf,
     ) -> Result<Self, DaemonError> {
-        let executor = Executor::new(&paths.state_dir, recorder_program).require_systemd();
+        let executor = Executor::new(&paths.state_dir, recorder_program)
+            .with_remote_executors(config.executors.clone())
+            .require_systemd();
         Self::open_with_executor(config, paths, settings, executor).await
     }
 
@@ -2654,6 +2721,7 @@ impl Daemon {
         config
             .validate()
             .map_err(|error| DaemonError::Invalid(error.to_string()))?;
+        let executor = executor.with_remote_executors(config.executors.clone());
         let settings = settings.validate()?;
         prepare_paths(&paths)?;
         let state_lock = acquire_daemon_lock(&paths.state_dir)?;
@@ -2666,7 +2734,7 @@ impl Daemon {
             durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
         }
         drop(witness_ledger);
-        let units = collect_local_unit_facts(&executor, &durable)?;
+        let units = collect_local_unit_facts(&executor, &durable).await?;
         let producer_engine =
             ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir);
         let confirmed_pool_returns = producer_engine
@@ -3140,7 +3208,10 @@ impl Daemon {
         };
         let evidence_spec = parse_evidence_specs(&job.row.evidence)
             .map_err(|error| DaemonError::Invalid(error.to_string()))?;
-        let scrape_capture = matches!(&finished.outcome, Some(Ok(_)));
+        let scrape_capture = matches!(
+            &finished.outcome,
+            Some(Ok(outcome)) if outcome.captures_available
+        );
         let (computed_verdict, exit_code, artifact_hash) = match finished.outcome {
             None => {
                 return Err(DaemonError::Invalid(format!(
@@ -3151,18 +3222,22 @@ impl Daemon {
             Some(Ok(outcome)) => match outcome.termination {
                 ExecutionTermination::RuntimeExceeded => (Verdict::RuntimeExceeded, 1, None),
                 ExecutionTermination::Exited(code) => {
-                    let elapsed = finished.elapsed;
-                    let gate = tokio::task::spawn_blocking(move || {
-                        run_evidence_gate(RunOutcome {
-                            exit_code: code,
-                            wall_clock_seconds: elapsed.as_secs_f64(),
-                            evidence: &evidence_spec,
+                    let gate = if let Some(gate) = outcome.evidence_gate {
+                        gate
+                    } else {
+                        let elapsed = finished.elapsed;
+                        tokio::task::spawn_blocking(move || {
+                            run_evidence_gate(RunOutcome {
+                                exit_code: code,
+                                wall_clock_seconds: elapsed.as_secs_f64(),
+                                evidence: &evidence_spec,
+                            })
                         })
-                    })
-                    .await
-                    .map_err(|error| {
-                        DaemonError::Invalid(format!("evidence worker failed: {error}"))
-                    })?;
+                        .await
+                        .map_err(|error| {
+                            DaemonError::Invalid(format!("evidence worker failed: {error}"))
+                        })?
+                    };
                     (gate.verdict, code, gate.artifact_hash)
                 }
                 ExecutionTermination::Signaled { .. }
@@ -3172,9 +3247,13 @@ impl Daemon {
                 error @ (ExecutorError::UnitProbe { .. }
                 | ExecutorError::UnitControl { .. }
                 | ExecutorError::ExistingUnit { .. }
+                | ExecutorError::IndeterminatePriorLaunch { .. }
                 | ExecutorError::AdoptedUnitUnavailable { .. }
                 | ExecutorError::AdoptedInvocationMismatch { .. }
-                | ExecutorError::AdoptedGenerationMismatch { .. }),
+                | ExecutorError::AdoptedGenerationMismatch { .. }
+                | ExecutorError::UnknownRemoteExecutor(_)
+                | ExecutorError::RemoteExecution { .. }
+                | ExecutorError::RemoteProtocol { .. }),
             )) => return Err(error.into()),
             Some(Err(error)) => {
                 eprintln!("tally: executor failed for {}: {error}", job.stable_key());
@@ -3205,7 +3284,8 @@ impl Daemon {
                 dedup_key: job.row.dedup_key.clone(),
                 labor_class: job.labor_class,
                 trace_ref: None,
-                pool: Some(job.row.pool.clone()),
+                pools: Some(job.row.pools.clone()),
+                executor: job.row.executor.clone(),
                 charge: None,
                 model: canonical_job_model(&job),
                 evidence_class: job.row.evidence_class.clone(),
@@ -3285,6 +3365,9 @@ impl Daemon {
                     job_id,
                     job.identity(),
                     job.adopted_invocation_id.clone(),
+                    job.row.executor.clone(),
+                    job.row.attempt,
+                    job.row.lease_epoch,
                 ))
             })
             .collect::<Result<Vec<_>, DaemonError>>()?;
@@ -3293,10 +3376,18 @@ impl Daemon {
         // Pair each physical reclaim with its canonical witness before touching
         // the next victim. If a later reclaim fails, every already-stopped job
         // is still durably represented and restart recovery is unambiguous.
-        for (_, job_id, identity, expected_invocation_id) in &targets {
+        for (_, job_id, identity, expected_invocation_id, execution_target, attempt, lease_epoch) in
+            &targets
+        {
             handler
                 .executor
-                .reclaim_identity_exact(identity, expected_invocation_id.as_deref())
+                .reclaim_identity_exact_on(
+                    execution_target.as_deref(),
+                    identity,
+                    expected_invocation_id.as_deref(),
+                    *attempt,
+                    *lease_epoch,
+                )
                 .await?;
             let job = context.jobs.get(job_id).expect("preempted job exists");
             let scrape_capture = match handler.executor.capture_generation_matches(
@@ -3325,13 +3416,13 @@ impl Daemon {
         }
         let reclaimed = targets
             .iter()
-            .map(|(lease_id, _, _, _)| lease_id.clone())
+            .map(|(lease_id, ..)| lease_id.clone())
             .collect::<Vec<_>>();
         let outcome = context
             .lease
             .engine_mut()
             .commit_preemptions(&reclaimed, Utc::now())?;
-        for (lease_id, job_id, _, _) in &targets {
+        for (lease_id, job_id, ..) in &targets {
             context.lease_jobs.remove(lease_id);
             if let Some(job) = context.jobs.get_mut(job_id) {
                 job.lease_id = None;
@@ -3339,7 +3430,7 @@ impl Daemon {
         }
         launches.extend(promoted_jobs(&mut context, outcome.promoted));
         drop(context);
-        for (_, job_id, _, _) in targets {
+        for (_, job_id, ..) in targets {
             let _ = handler.execution_cancel.send(job_id);
         }
         for work in terminal {
@@ -3374,8 +3465,9 @@ fn retry_unleased_jobs(context: &mut Context, executor: &Executor) -> Vec<Job> {
         .filter(|job| {
             job.state == JobState::Queued
                 && job.lease_id.is_none()
-                && !context.paused_pools.contains(&job.row.pool)
-                && !context.unreachable_pools.contains(&job.row.pool)
+                && !job.row.pools.iter().any(|pool| {
+                    context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
+                })
         })
         .map(|job| job.job_id)
         .collect::<Vec<_>>();
@@ -3417,8 +3509,9 @@ fn resume_paused_jobs_locked(
             continue;
         };
         if job.state != JobState::Paused
-            || context.paused_pools.contains(&job.row.pool)
-            || context.unreachable_pools.contains(&job.row.pool)
+            || job.row.pools.iter().any(|pool| {
+                context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
+            })
         {
             continue;
         }
@@ -3461,7 +3554,7 @@ fn pool_representations(
         .iter()
         .filter_map(|action| match action {
             RecoveryAction::RePresent { row, .. }
-                if row.pool == pool && renderable.contains(&row.uuid) =>
+                if row.pools.iter().any(|name| name == pool) && renderable.contains(&row.uuid) =>
             {
                 Some(row.uuid)
             }
@@ -3794,7 +3887,13 @@ async fn reconcile_pool_loss_intents(
             task_uuid: Some(intent.row.uuid),
         };
         executor
-            .reclaim_identity_exact(&identity, intent.adopted_invocation_id.as_deref())
+            .reclaim_identity_exact_on(
+                intent.row.executor.as_deref(),
+                &identity,
+                intent.adopted_invocation_id.as_deref(),
+                intent.row.attempt,
+                intent.row.lease_epoch,
+            )
             .await?;
         let job = Job {
             job_id: intent.row.uuid,
@@ -4075,7 +4174,8 @@ fn reconcile_reuse_witnesses(
                     dedup_key: event.row.dedup_key.clone(),
                     labor_class: LaborClass::Reused,
                     trace_ref: None,
-                    pool: Some(event.row.pool.clone()),
+                    pools: Some(event.row.pools.clone()),
+                    executor: event.row.executor.clone(),
                     charge: None,
                     model: event.row.model.clone(),
                     evidence_class: event.row.evidence_class.clone(),
@@ -4109,7 +4209,8 @@ fn reuse_record_matches(
         && record.lease_epoch == event.row.lease_epoch
         && record.dedup_key == event.row.dedup_key
         && record.labor_class == LaborClass::Reused
-        && record.pool.as_deref() == Some(event.row.pool.as_str())
+        && record.pools.as_ref() == Some(&event.row.pools)
+        && record.executor == event.row.executor
 }
 
 fn recovery_query_rows(plan: &crate::recovery::RecoveryPlan) -> BTreeMap<Uuid, RowFact> {
@@ -4610,7 +4711,8 @@ fn query_row(row: &RowSeed, status: RowStatus) -> RowFact {
         description: row.description.clone(),
         status,
         priority: priority_name(row.priority).to_owned(),
-        pool: Some(row.pool.clone()),
+        pools: Some(row.pools.clone()),
+        executor: row.executor.clone(),
         source: Some(source_name(row.source).to_owned()),
         session_ref: row.session_ref.clone(),
         attempt: row.attempt,
@@ -4811,11 +4913,17 @@ fn install_recovery_jobs(
         };
         if needs_lease
             && !adopted
-            && (context.paused_pools.contains(&job.row.pool)
-                || context.unreachable_pools.contains(&job.row.pool))
+            && job.row.pools.iter().any(|pool| {
+                context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
+            })
         {
             job.state = JobState::Paused;
-            if context.unreachable_pools.contains(&job.row.pool) {
+            if job
+                .row
+                .pools
+                .iter()
+                .any(|pool| context.unreachable_pools.contains(pool))
+            {
                 context.unreachable_paused_jobs.insert(job_id);
             }
         } else if needs_lease {
@@ -4877,7 +4985,8 @@ fn recovery_action_already_installed(
         )));
     }
     if existing.row.lease_epoch != candidate.lease_epoch
-        || existing.row.pool != candidate.pool
+        || existing.row.pools != candidate.pools
+        || existing.row.executor != candidate.executor
         || existing.row.adapter != candidate.adapter
         || existing.row.argv != candidate.argv
         || existing.row.dedup_key != candidate.dedup_key
@@ -5211,13 +5320,15 @@ mod tests {
     use super::*;
     use crate::adapters::{AdapterConfig, ScrapeCapture, ScrapeMode, ScrapeStream};
     use crate::config::{
-        CoResidencyPredicate, JournaldConfig, MeterBudgetClass, PoolConfig, PoolPredicate,
-        ResourceKind, UsageMeterConfig,
+        CoResidencyPredicate, ExecutionTargetConfig, JournaldConfig, MeterBudgetClass, PoolConfig,
+        PoolPredicate, ResourceKind, SshExecutorConfig, UsageMeterConfig,
     };
     use crate::evidence::RetryPolicy;
     use crate::executor::{
         read_exit_record, write_exit_record, ExecutionPaths, LocalUnitFact, LocalUnitProbe,
-        LocalUnitState, UnitExitRecord,
+        LocalUnitState, RemoteCapture, RemoteCompletion, RemoteExecutorReply,
+        RemoteExecutorRequest, RemoteExecutorResult, RemoteTransport, RemoteTransportError,
+        UnitExitRecord, REMOTE_EXECUTOR_PROTOCOL_VERSION, UNIT_EXIT_SCHEMA_VERSION,
     };
     use crate::producers::{GhObservation, ProducerConfig, ProducerEngine, ReachabilityTransition};
     use crate::recovery::RecoveryPlan;
@@ -5244,6 +5355,29 @@ mod tests {
                 attempt: Some(record.attempt),
                 lease_epoch: Some(record.lease_epoch),
                 exit_record: Some(record),
+            })
+        }
+    }
+
+    struct RunningProbe {
+        attempt: u32,
+        lease_epoch: u64,
+    }
+
+    impl LocalUnitProbe for RunningProbe {
+        fn inspect(
+            &self,
+            unit: &str,
+            _paths: &ExecutionPaths,
+        ) -> Result<LocalUnitFact, ExecutorError> {
+            Ok(LocalUnitFact {
+                unit: unit.to_owned(),
+                loaded: true,
+                state: LocalUnitState::Running,
+                invocation_id: Some("restart-invocation".to_owned()),
+                attempt: Some(self.attempt),
+                lease_epoch: Some(self.lease_epoch),
+                exit_record: None,
             })
         }
     }
@@ -5314,8 +5448,22 @@ mod tests {
             lease: Default::default(),
             adapters: BTreeMap::from([("shell".to_owned(), AdapterConfig::default())]),
             producers: BTreeMap::new(),
+            executors: BTreeMap::new(),
             journald: JournaldConfig { native: false },
         }
+    }
+
+    fn two_pool_config() -> Config {
+        let mut config = one_pool_config();
+        config.pools.insert(
+            "zeta".to_owned(),
+            PoolConfig {
+                resource: ResourceKind::BuildSlot,
+                predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+                ..PoolConfig::default()
+            },
+        );
+        config
     }
 
     fn window_pool_config() -> Config {
@@ -5337,6 +5485,7 @@ mod tests {
             lease: Default::default(),
             adapters: BTreeMap::from([("shell".to_owned(), AdapterConfig::default())]),
             producers: BTreeMap::new(),
+            executors: BTreeMap::new(),
             journald: JournaldConfig { native: false },
         }
     }
@@ -5345,6 +5494,199 @@ mod tests {
         let mut config = one_pool_config();
         config.pools.get_mut("slot").unwrap().hard_preempt = true;
         config
+    }
+
+    fn remote_config() -> Config {
+        let mut config = one_pool_config();
+        config.executors.insert(
+            "worker".to_owned(),
+            ExecutionTargetConfig::Ssh(SshExecutorConfig {
+                host: "worker.example".to_owned(),
+                user: "tally-worker".to_owned(),
+                port: 22,
+                ssh_program: PathBuf::from("/run/current-system/sw/bin/ssh"),
+                identity_file: PathBuf::from("/run/credentials/tally-worker-key"),
+                known_hosts_file: PathBuf::from("/etc/tally/worker-known-hosts"),
+                program: PathBuf::from("/run/current-system/sw/bin/tally"),
+                state_dir: PathBuf::from("/var/lib/tally-remote"),
+                connect_timeout_sec: 3,
+                server_alive_interval_sec: 2,
+                server_alive_count_max: 2,
+                retry_interval_ms: 10,
+            }),
+        );
+        config
+    }
+
+    #[derive(Clone)]
+    struct RecoveringRemoteTransport {
+        calls: Arc<AtomicUsize>,
+        release: Arc<AtomicBool>,
+    }
+
+    impl RemoteTransport for RecoveringRemoteTransport {
+        fn call<'a>(
+            &'a self,
+            _config: &'a SshExecutorConfig,
+            request: RemoteExecutorRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<RemoteExecutorReply, RemoteTransportError>> + Send + 'a>,
+        > {
+            let calls = self.calls.clone();
+            let release = self.release.clone();
+            Box::pin(async move {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                if call == 0 {
+                    return Err(RemoteTransportError {
+                        detail: "simulated SSH interruption after launch".to_owned(),
+                    });
+                }
+                while !release.load(Ordering::Acquire) {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                let RemoteExecutorRequest::Ensure {
+                    request, evidence, ..
+                } = request
+                else {
+                    return Err(RemoteTransportError {
+                        detail: "unexpected remote operation".to_owned(),
+                    });
+                };
+                let unit = format!("tally-job-{}.service", request.identity.unit_uuid());
+                let evidence =
+                    parse_evidence_specs(&evidence).map_err(|error| RemoteTransportError {
+                        detail: error.to_string(),
+                    })?;
+                Ok(RemoteExecutorReply::Ok {
+                    protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                    result: Box::new(RemoteExecutorResult::Completion(RemoteCompletion {
+                        unit: unit.clone(),
+                        record: UnitExitRecord {
+                            schema_version: UNIT_EXIT_SCHEMA_VERSION,
+                            unit,
+                            invocation_id: "remote-long-job".to_owned(),
+                            attempt: request.attempt,
+                            lease_epoch: request.lease_epoch,
+                            service_result: "success".to_owned(),
+                            exit_code: Some("exited".to_owned()),
+                            exit_status: Some("0".to_owned()),
+                        },
+                        termination: ExecutionTermination::Exited(0),
+                        capture: RemoteCapture {
+                            attempt: request.attempt,
+                            lease_epoch: request.lease_epoch,
+                            stdout_base64: Some(String::new()),
+                            stderr_base64: Some(String::new()),
+                            error: None,
+                        },
+                        evidence_gate: Some(run_evidence_gate(RunOutcome {
+                            exit_code: 0,
+                            wall_clock_seconds: 1.0,
+                            evidence: &evidence,
+                        })),
+                    })),
+                })
+            })
+        }
+    }
+
+    #[derive(Clone)]
+    struct RestartRemoteTransport {
+        calls: Arc<std::sync::Mutex<Vec<RemoteExecutorRequest>>>,
+        attempt: u32,
+        lease_epoch: u64,
+    }
+
+    impl RemoteTransport for RestartRemoteTransport {
+        fn call<'a>(
+            &'a self,
+            _config: &'a SshExecutorConfig,
+            request: RemoteExecutorRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<RemoteExecutorReply, RemoteTransportError>> + Send + 'a>,
+        > {
+            let calls = self.calls.clone();
+            let attempt = self.attempt;
+            let lease_epoch = self.lease_epoch;
+            Box::pin(async move {
+                calls.lock().unwrap().push(request.clone());
+                let result = match request {
+                    RemoteExecutorRequest::Probe { identity, .. } => {
+                        let unit = format!("tally-job-{}.service", identity.unit_uuid());
+                        RemoteExecutorResult::Fact(LocalUnitFact {
+                            unit,
+                            loaded: true,
+                            state: LocalUnitState::Running,
+                            invocation_id: Some("restart-remote-invocation".to_owned()),
+                            attempt: Some(attempt),
+                            lease_epoch: Some(lease_epoch),
+                            exit_record: None,
+                        })
+                    }
+                    RemoteExecutorRequest::Adopt {
+                        request,
+                        expected_invocation_id,
+                        evidence,
+                        ..
+                    } => {
+                        if expected_invocation_id != "restart-remote-invocation" {
+                            return Ok(RemoteExecutorReply::Error {
+                                protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                                message: "unexpected adoption identity".to_owned(),
+                            });
+                        }
+                        let evidence = parse_evidence_specs(&evidence).map_err(|error| {
+                            RemoteTransportError {
+                                detail: error.to_string(),
+                            }
+                        })?;
+                        let unit = format!("tally-job-{}.service", request.identity.unit_uuid());
+                        RemoteExecutorResult::Completion(RemoteCompletion {
+                            unit: unit.clone(),
+                            record: UnitExitRecord {
+                                schema_version: UNIT_EXIT_SCHEMA_VERSION,
+                                unit,
+                                invocation_id: expected_invocation_id,
+                                attempt: request.attempt,
+                                lease_epoch: request.lease_epoch,
+                                service_result: "success".to_owned(),
+                                exit_code: Some("exited".to_owned()),
+                                exit_status: Some("0".to_owned()),
+                            },
+                            termination: ExecutionTermination::Exited(0),
+                            capture: RemoteCapture {
+                                attempt: request.attempt,
+                                lease_epoch: request.lease_epoch,
+                                stdout_base64: Some(String::new()),
+                                stderr_base64: Some(String::new()),
+                                error: None,
+                            },
+                            evidence_gate: Some(run_evidence_gate(RunOutcome {
+                                exit_code: 0,
+                                wall_clock_seconds: 1.0,
+                                evidence: &evidence,
+                            })),
+                        })
+                    }
+                    RemoteExecutorRequest::Ensure { .. } => {
+                        return Ok(RemoteExecutorReply::Error {
+                            protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                            message: "restart attempted a duplicate launch".to_owned(),
+                        });
+                    }
+                    RemoteExecutorRequest::Reclaim { .. } => {
+                        return Ok(RemoteExecutorReply::Error {
+                            protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                            message: "unexpected reclaim".to_owned(),
+                        });
+                    }
+                };
+                Ok(RemoteExecutorReply::Ok {
+                    protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                    result: Box::new(result),
+                })
+            })
+        }
     }
 
     fn structured_adapter(program: &Path) -> AdapterConfig {
@@ -5432,7 +5774,8 @@ mod tests {
             priority: Priority::High,
             source: EnqueueSource::Manual,
             adapter: "shell".to_owned(),
-            pool: "slot".to_owned(),
+            pools: vec!["slot".to_owned()],
+            executor: None,
             model: None,
             cwd: None,
             dedup_key: Some(dedup_key.to_owned()),
@@ -5480,7 +5823,8 @@ mod tests {
             anchor: "job-1".to_owned(),
             task_uuid: Some("job-1".to_owned()),
             description: None,
-            pool: Some("slot".to_owned()),
+            pools: Some(vec!["slot".to_owned()]),
+            executor: None,
             source: Some("manual".to_owned()),
             session_ref: None,
             model: None,
@@ -5642,7 +5986,7 @@ mod tests {
                     .row
                     .clone();
                 assert_eq!(file_row.argv, direct_row.argv);
-                assert_eq!(file_row.pool, direct_row.pool);
+                assert_eq!(file_row.pools, direct_row.pools);
                 assert_eq!(file_row.priority, direct_row.priority);
                 assert_eq!(file_row.adapter, direct_row.adapter);
                 assert_eq!(file_row.source, direct_row.source);
@@ -5750,13 +6094,14 @@ mod tests {
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(
-                    one_pool_config(),
+                    two_pool_config(),
                     paths.clone(),
                     settings(),
                     executor,
                 )
                 .await
                 .unwrap();
+                let daemon_context = daemon.handler.context.clone();
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
                 let mut client = RpcClient::connect(&paths.socket).await.unwrap();
@@ -5771,7 +6116,7 @@ mod tests {
                         "queue.enqueue",
                         Some(json!({
                             "argv": ["true"],
-                            "pool": "slot",
+                            "pool": ["zeta", "slot"],
                             "priority": "high",
                             "adapter": "shell",
                             "source": "manual",
@@ -5795,6 +6140,10 @@ mod tests {
                     .iter()
                     .find(|record| record.task_uuid.as_deref() == Some(&task_uuid))
                     .unwrap();
+                assert_eq!(
+                    record.pools.as_deref(),
+                    Some(["slot".to_owned(), "zeta".to_owned()].as_slice())
+                );
                 assert_eq!(record.evidence_class.as_ref(), Some(&evidence_class));
                 assert_eq!(
                     record.manifest_hash,
@@ -5827,13 +6176,36 @@ mod tests {
                     .unwrap();
                 assert_eq!(queried["evidenceClass"], evidence_class);
                 assert_eq!(queried["manifestHash"], manifest_hash);
+                assert_eq!(queried["pool"], json!(["slot", "zeta"]));
+
+                let events = read_acknowledged_events(&paths.events_dir()).unwrap();
+                let durable = events
+                    .iter()
+                    .find(|event| event.row.uuid.to_string() == task_uuid)
+                    .unwrap();
+                assert_eq!(durable.row.pools, ["slot", "zeta"]);
+                let status = client.call("query.status", Some(json!({}))).await.unwrap();
+                let projected = status["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|job| job["taskUuid"] == task_uuid)
+                    .unwrap();
+                assert_eq!(projected["pool"], json!(["slot", "zeta"]));
+                let context = daemon_context.read().await;
+                assert!(context.recent_journal.iter().any(|entry| {
+                    entry.fields.task_uuid == task_uuid
+                        && entry.fields.pools.as_deref()
+                            == Some(["slot".to_owned(), "zeta".to_owned()].as_slice())
+                }));
+                drop(context);
 
                 let absent = client
                     .call(
                         "queue.enqueue",
                         Some(json!({
                             "argv": ["true"],
-                            "pool": "slot",
+                            "pool": ["slot", "zeta"],
                             "priority": "high",
                             "adapter": "shell",
                             "source": "manual",
@@ -6246,7 +6618,8 @@ mod tests {
                         dedup_key: row.dedup_key.clone(),
                         labor_class: LaborClass::Fresh,
                         trace_ref: None,
-                        pool: Some("slot".to_owned()),
+                        pools: Some(vec!["slot".to_owned()]),
+                        executor: None,
                         charge: None,
                         model: None,
                         evidence_class: None,
@@ -7307,6 +7680,271 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn interrupt_cooldown_waits_for_active_work_then_holds_the_pool() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let active = client
+                    .call(
+                        "queue.enqueue",
+                        Some(json!({
+                            "argv": ["sleep", "0.12"],
+                            "pool": "slot",
+                            "priority": "low",
+                            "adapter": "shell",
+                            "source": "manual",
+                            "evidence": ["exit:0"]
+                        })),
+                    )
+                    .await
+                    .unwrap();
+                let cooldown = client
+                    .call(
+                        "queue.enqueue",
+                        Some(json!({
+                            "argv": ["sleep", "0.05"],
+                            "pool": "slot",
+                            "priority": "interrupt",
+                            "adapter": "shell",
+                            "source": "manual",
+                            "evidence": ["exit:0"],
+                            "noEnqueue": true
+                        })),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(active["state"], "running");
+                assert_eq!(cooldown["state"], "queued");
+
+                let active_result = client
+                    .call(
+                        "queue.await_job",
+                        Some(json!({"task_uuid": active["task_uuid"]})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(active_result["verdict"], "pass");
+                let cooldown_result = client
+                    .call(
+                        "queue.await_job",
+                        Some(json!({"task_uuid": cooldown["task_uuid"]})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(cooldown_result["verdict"], "pass");
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(records.len(), 2);
+                assert!(records.iter().all(|record| record.verdict == Verdict::Pass));
+                assert_eq!(
+                    records[0].task_uuid.as_deref(),
+                    active["task_uuid"].as_str()
+                );
+                assert_eq!(
+                    records[1].task_uuid.as_deref(),
+                    cooldown["task_uuid"].as_str()
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn remote_transport_loss_retains_the_lease_until_authoritative_completion() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let calls = Arc::new(AtomicUsize::new(0));
+                let release = Arc::new(AtomicBool::new(false));
+                let transport = RecoveringRemoteTransport {
+                    calls: calls.clone(),
+                    release: release.clone(),
+                };
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_remote_transport(transport);
+                let mut daemon = Daemon::open_with_executor(
+                    remote_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": ["opaque-worker-command", "two words", "$HOME"],
+                        "pool": "slot",
+                        "executor": "worker",
+                        "priority": "high",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(admitted["state"], "running");
+
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while calls.load(Ordering::SeqCst) < 2 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.lease.engine().held_in_pool("slot").unwrap(), 1);
+                    let job_id = Uuid::parse_str(admitted["job_id"].as_str().unwrap()).unwrap();
+                    assert_eq!(context.jobs[&job_id].state, JobState::Running);
+                }
+                assert!(daemon.completion_rx.try_recv().is_err());
+                let (_, witness_before) = read_verified_records(&paths.witness_path()).unwrap();
+                assert!(witness_before.is_empty());
+
+                release.store(true, Ordering::Release);
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(1), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                let result = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": admitted["task_uuid"]})))
+                    .await
+                    .unwrap();
+                assert_eq!(result["verdict"], "pass");
+                assert_eq!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .lease
+                        .engine()
+                        .held_in_pool("slot")
+                        .unwrap(),
+                    0
+                );
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].executor.as_deref(), Some("worker"));
+                assert_eq!(calls.load(Ordering::SeqCst), 2);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn coordinator_restart_probes_and_adopts_remote_work_without_an_ensure() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let task_uuid = Uuid::new_v4();
+                let mut row = durable_row(task_uuid, "restart-remote", 1);
+                row.executor = Some("worker".to_owned());
+                write_enqueue_event_atomic(
+                    &paths.events_dir(),
+                    &DurableEnqueueEvent::new(row).unwrap(),
+                )
+                .unwrap();
+
+                let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let transport = RestartRemoteTransport {
+                    calls: calls.clone(),
+                    attempt: 1,
+                    lease_epoch: 1,
+                };
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_remote_transport(transport);
+                let daemon = Daemon::open_with_executor(
+                    remote_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                assert_eq!(daemon.initial_jobs.len(), 1);
+                assert!(daemon.initial_jobs[0].adopted);
+                assert_eq!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .lease
+                        .engine()
+                        .held_in_pool("slot")
+                        .unwrap(),
+                    1
+                );
+
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let result = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    client.call(
+                        "queue.await_job",
+                        Some(json!({"task_uuid": task_uuid.to_string()})),
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(result["verdict"], "pass");
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+
+                let calls = calls.lock().unwrap();
+                assert_eq!(calls.len(), 2);
+                assert!(matches!(calls[0], RemoteExecutorRequest::Probe { .. }));
+                assert!(matches!(calls[1], RemoteExecutorRequest::Adopt { .. }));
+                assert!(!calls
+                    .iter()
+                    .any(|request| matches!(request, RemoteExecutorRequest::Ensure { .. })));
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].executor.as_deref(), Some("worker"));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn shutdown_joins_an_in_flight_lease_tick_before_releasing_the_lock() {
         let local = LocalSet::new();
         local
@@ -7565,6 +8203,64 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn restart_re_adopts_an_in_flight_multi_pool_job_with_the_complete_set() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                prepare_paths(&paths).unwrap();
+                assert_eq!(bump_epoch(&paths.state_dir).unwrap(), 1);
+                let mut row = durable_row(Uuid::new_v4(), "restart-multi-pool", 1);
+                row.pools = vec!["slot".to_owned(), "zeta".to_owned()];
+                write_enqueue_event_atomic(
+                    &paths.events_dir(),
+                    &DurableEnqueueEvent::new(row.clone()).unwrap(),
+                )
+                .unwrap();
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(RunningProbe {
+                        attempt: 1,
+                        lease_epoch: 1,
+                    });
+
+                let daemon = Daemon::open_with_executor(
+                    two_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                assert_eq!(daemon.handler.context.read().await.epoch, 2);
+                assert_eq!(daemon.initial_jobs.len(), 1);
+                assert!(daemon.initial_jobs[0].adopted);
+                assert_eq!(daemon.initial_jobs[0].row.pools, ["slot", "zeta"]);
+                let context = daemon.handler.context.read().await;
+                let recovered = &context.jobs[&row.uuid];
+                assert!(recovered.adopted);
+                assert_eq!(recovered.row.pools, ["slot", "zeta"]);
+                assert!(recovered.lease_id.is_some());
+                assert_eq!(context.lease.engine().held_in_pool("slot").unwrap(), 1);
+                assert_eq!(context.lease.engine().held_in_pool("zeta").unwrap(), 1);
+                assert_eq!(context.lease.engine().queue_len(), 0);
+                drop(context);
+
+                let lease_log =
+                    fs::read_to_string(paths.state_dir.join(crate::lease::LEASE_EVENTS_FILE))
+                        .unwrap();
+                assert!(lease_log.contains(r#""pools":["slot","zeta"]"#));
+                assert!(!lease_log.contains(r#""kind":"released""#));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn restart_rebuilds_cache_and_preserves_terminal_wait_without_reexecution() {
         let local = LocalSet::new();
         local
@@ -7696,7 +8392,8 @@ mod tests {
                         dedup_key: original.dedup_key.clone(),
                         labor_class: LaborClass::Fresh,
                         trace_ref: None,
-                        pool: Some("slot".to_owned()),
+                        pools: Some(vec!["slot".to_owned()]),
+                        executor: None,
                         charge: None,
                         model: None,
                         evidence_class: None,
@@ -7937,6 +8634,134 @@ mod tests {
                 assert_eq!(late_reused["verdict"], "reused");
                 reopened_shutdown.send(true).unwrap();
                 reopened_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_pool_admission_is_atomic_and_any_conflict_or_gate_blocks() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    two_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+
+                let held = daemon
+                    .handler
+                    .acquire(Some(json!({"pool": "slot"})))
+                    .await
+                    .unwrap();
+                let held_lease = held["outcome"]["granted"]["leaseId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let admitted = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": ["true"],
+                        "pool": ["zeta", "slot"],
+                        "priority": "low",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                assert_eq!(admitted["state"], "queued");
+                let task_uuid = Uuid::parse_str(admitted["task_uuid"].as_str().unwrap()).unwrap();
+
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].row.pools, ["slot", "zeta"]);
+                    assert_eq!(context.lease.engine().held_in_pool("slot").unwrap(), 1);
+                    assert_eq!(context.lease.engine().held_in_pool("zeta").unwrap(), 0);
+                    assert_eq!(context.lease.engine().queued_in_pool("slot").unwrap(), 1);
+                    assert_eq!(context.lease.engine().queued_in_pool("zeta").unwrap(), 1);
+                }
+                let events = read_acknowledged_events(&paths.events_dir()).unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].row.pools, ["slot", "zeta"]);
+                let status = daemon
+                    .handler
+                    .query("query.status", Some(json!({})))
+                    .await
+                    .unwrap();
+                let projected = status["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|job| job["taskUuid"] == task_uuid.to_string())
+                    .unwrap();
+                assert_eq!(projected["pool"], json!(["slot", "zeta"]));
+
+                let paused = daemon
+                    .handler
+                    .pause(Some(json!({"pool": "zeta"})))
+                    .await
+                    .unwrap();
+                assert_eq!(paused["affected"], 1);
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Paused);
+                    assert_eq!(context.lease.engine().queue_len(), 0);
+                }
+
+                daemon
+                    .handler
+                    .resume(Some(json!({"pool": "zeta"})))
+                    .await
+                    .unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Queued);
+                    assert_eq!(context.lease.engine().queued_in_pool("slot").unwrap(), 1);
+                    assert_eq!(context.lease.engine().queued_in_pool("zeta").unwrap(), 1);
+                }
+
+                assert_eq!(daemon.handler.apply_pool_loss("zeta").await.unwrap(), 0);
+                assert_eq!(daemon.handler.apply_pool_loss("slot").await.unwrap(), 0);
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Paused);
+                    assert!(context.unreachable_paused_jobs.contains(&task_uuid));
+                    assert_eq!(context.lease.engine().queue_len(), 0);
+                }
+                daemon.handler.apply_pool_return("zeta").await.unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Paused);
+                    assert!(context.unreachable_paused_jobs.contains(&task_uuid));
+                }
+                daemon.handler.apply_pool_return("slot").await.unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.jobs[&task_uuid].state, JobState::Queued);
+                    assert!(!context.unreachable_paused_jobs.contains(&task_uuid));
+                    assert_eq!(context.lease.engine().queued_in_pool("slot").unwrap(), 1);
+                    assert_eq!(context.lease.engine().queued_in_pool("zeta").unwrap(), 1);
+                }
+                let released = daemon
+                    .handler
+                    .release(Some(json!({"lease": held_lease})))
+                    .await
+                    .unwrap();
+                assert_eq!(released["promoted"].as_array().unwrap().len(), 1);
+                assert_eq!(released["promoted"][0]["pools"], json!(["slot", "zeta"]));
             })
             .await;
     }

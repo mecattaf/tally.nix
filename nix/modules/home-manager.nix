@@ -405,7 +405,13 @@ in
               (toString cfg.dataDir)
               (toString cfg.stateDir)
             ];
-            RestrictAddressFamilies = [ "AF_UNIX" ];
+            RestrictAddressFamilies = [
+              "AF_UNIX"
+            ]
+            ++ lib.optionals (cfg.executors != { }) [
+              "AF_INET"
+              "AF_INET6"
+            ];
             SystemCallFilter = [ "@system-service" ];
           };
           Install.WantedBy = [ "default.target" ];

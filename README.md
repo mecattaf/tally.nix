@@ -2,9 +2,9 @@
 
 **Contention arbitration and verifiable execution evidence for systemd-managed work.**
 
-tally accepts explicitly described jobs, leases the local resources they need, runs them as
-systemd transient units, and appends the outcome to a hash-chained witness ledger. It is useful
-when builds, agents, GPU jobs, or metered API work must not overrun a shared machine.
+tally accepts explicitly described jobs, leases the logical resource gates they need, runs them
+as systemd transient units, and appends the outcome to a hash-chained witness ledger. It is useful
+when builds, agents, GPU jobs, or metered API work must not overrun shared capacity.
 
 The governing rule is:
 
@@ -17,24 +17,29 @@ choose what work should happen next, or replace the program that already makes t
 
 tally provides:
 
-- atomic leases over named local resource pools;
+- atomic leases over named, coordinator-owned resource pools;
 - cooperative priority and optional hard reclaim after a grace period;
-- direct, shell-free execution through `systemd-run`;
+- direct, shell-free execution through local or daemonless remote `systemd-run`;
+- named SSH executors with fail-closed reconnect and exact-unit re-adoption;
 - evidence checks, deduplication, recovery, and durable outcome records;
 - a closed five-kind producer registry for declared intake mechanisms;
 - an open adapter map for rendering agent-specific argv and scraping captures;
 - Home Manager and NixOS modules; and
 - offline verification of verdict and attestation ledgers.
 
-tally is not a workflow scheduler, remote-execution service, container runtime, secrets manager,
-message bus, terminal manager, or model registry. In particular, a pool and its transient jobs are
-local to one daemon.
+tally is not a workflow scheduler, general-purpose remote shell, container runtime, secrets
+manager, message bus, terminal manager, or model registry. Each logical pool has one coordinator
+daemon; that ownership identifies where contention is arbitrated, not where work is physically
+placed. A named executor may place an admitted job on another host without moving lease ownership
+or running a second tally daemon there.
 
 ## Requirements
 
 - Nix with flakes enabled;
 - Linux with systemd for real job execution;
 - a user systemd manager for the Home Manager module, or a system manager for the NixOS module;
+- for a remote executor, OpenSSH on the coordinator plus the same `tally` binary and a reachable
+  user systemd manager on the worker;
 - `gh` only when an enabled `gh` producer is configured.
 
 Pure Rust tests use fakes where possible. The ordinary suite and both local scenarios need only
@@ -141,7 +146,14 @@ and supervised producer services.
 ## Resource pools
 
 A job requests one or more named pools. Grants are atomic: either every requested pool admits the
-job or none does. Pool resources are `vram`, `build-slot`, `cpu-slot`, `budget`, and `mutex`.
+job or none does. Repeat `--pool` on the CLI to request more than one. Pool sets are sorted
+lexically before admission and retain that canonical order in durable state, events, queries, and
+witnesses. Pool resources are `vram`, `build-slot`, `cpu-slot`, `budget`, and `mutex`.
+
+The serialized field remains named `pool` for compatibility. Existing singleton configuration,
+wire payloads, Taskwarrior rows, and witness records remain valid and keep their scalar encoding.
+Only a multi-pool request uses the canonical array form (or a JSON array string in string-only
+UDA and environment fields), so multi-pool clients require a daemon with multi-pool support.
 
 Two admission predicates exist:
 
@@ -152,6 +164,84 @@ Two admission predicates exist:
 
 `enforce` accepts exactly `cooperative`. Priorities are `interrupt`, `high`, `medium`, and `low`,
 with ranks 1000, 100, 50, and 10 respectively.
+
+## Central coordinator and remote workers
+
+Configure a named SSH executor on the one host running the daemon, then select it per enqueue or
+producer. Pools remain logical gates on the coordinator; they do not need to be local to the
+machine that executes the argv.
+
+```nix
+services.tally = {
+  enable = true;
+
+  pools.worker-gpu = {
+    resource = "vram";
+    capacity = 1;
+    hardPreempt = false;
+  };
+
+  executors.worker = {
+    host = "worker.example.net";
+    user = "tally-worker";
+    identityFile = "/etc/tally/worker-key";
+    knownHostsFile = "/etc/tally/worker-known-hosts";
+    program = "/run/current-system/sw/bin/tally";
+    stateDir = "/var/lib/tally-remote";
+  };
+};
+```
+
+```console
+$ tally --socket "$XDG_RUNTIME_DIR/tally/tally.sock" enqueue \
+    --pool worker-gpu --executor worker --evidence exit:0 -- \
+    /run/current-system/sw/bin/worker-command 'one argv element'
+```
+
+The coordinator invokes only the fixed `tally __remote-executor` helper over SSH. Job argv travels
+as bounded JSON on stdin and is passed directly to the worker's transient unit; it is never joined
+into the SSH command or interpreted by an implicit shell. Host, user, port, client binary, private
+key, pinned known-hosts file, worker binary, and worker state directory are explicit configuration.
+The key and known-hosts paths must be readable by the coordinator service. Job credential paths
+selected for remote work are worker-side paths and are passed to the worker's systemd manager by
+reference.
+
+The worker runs no tally daemon. It needs the configured binary, a usable user systemd manager,
+and a private writable `stateDir`. The unit name is derived from the durable task UUID. `Ensure`,
+`Probe`, and `Adopt` operations use that identity plus attempt, lease epoch, and systemd invocation
+ID, so retrying after an SSH interruption cannot launch a second copy. Evidence for remote artifact
+paths is evaluated on the worker; exit status, captures, evidence result, executor name, and pool
+set return to the coordinator for its canonical witness.
+
+Before creating a unit, the worker fsyncs its generation marker in `stateDir`. If that generation
+later has neither a live unit nor a durable exit record, tally treats the state as an interrupted
+prior launch and refuses to replay it. Keep `stateDir` on storage that survives worker restarts.
+
+Transport ambiguity fails closed. The coordinator keeps every logical lease and retries the same
+operation until the worker returns an authoritative state. On coordinator restart it probes every
+remote row that could still have work in flight, re-adopts an exact running invocation, and
+collects an exact durable exit without replaying argv. A final non-retryable witness needs no
+worker probe; its authoritative terminal result is already local, so an offline historical worker
+does not block coordinator startup forever. A missing or contradictory unit, generation,
+invocation, or protocol response for a live-capable row stops recovery rather than releasing
+capacity or starting a replacement.
+
+### Non-destructive thermal cooldown
+
+A sensor on the worker can use a fixed SSH command to enqueue a coordinator-local hold. This
+example gives the hold interrupt priority, waits behind any active `worker-gpu` holder, owns the
+pool for 30 minutes, and then releases it:
+
+```console
+$ ssh coordinator tally --socket /run/user/1000/tally/tally.sock enqueue \
+    --pool worker-gpu --priority interrupt --no-enqueue --evidence exit:0 -- \
+    /run/current-system/sw/bin/sleep 1800
+```
+
+Keep `pools.worker-gpu.hardPreempt = false`. Interrupt priority puts the cooldown first in line,
+but a non-hard-preempting pool never reclaims the active LLM unit, even after the yield grace. The
+cooldown command deliberately omits `--executor`: the sleep only holds the coordinator's logical
+gate, so no second daemon or worker process is needed for the hold itself.
 
 ## The five producer kinds
 

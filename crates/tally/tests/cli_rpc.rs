@@ -50,6 +50,37 @@ impl RpcHandler for CliHandler {
                         "job_id": "job-metadata"
                     }))
                 }
+                "queue.enqueue"
+                    if request
+                        .params
+                        .as_ref()
+                        .and_then(|value| value.get("pool"))
+                        .is_some_and(Value::is_array) =>
+                {
+                    assert_eq!(
+                        request.params.as_ref().unwrap()["pool"],
+                        serde_json::json!(["slot", "zeta"])
+                    );
+                    assert_eq!(
+                        request.params.as_ref().unwrap()["executor"],
+                        serde_json::json!("worker")
+                    );
+                    Ok(serde_json::json!({
+                        "task_uuid": "00000000-0000-4000-8000-000000000003",
+                        "job_id": "job-multi",
+                        "verdict": "pass"
+                    }))
+                }
+                "lease.acquire" => {
+                    assert_eq!(
+                        request.params.as_ref().unwrap()["pool"],
+                        serde_json::json!(["slot", "zeta"])
+                    );
+                    Ok(serde_json::json!({
+                        "epoch": 1,
+                        "outcome": {"granted": {"leaseId": "lease-multi", "pools": ["slot", "zeta"]}}
+                    }))
+                }
                 "queue.enqueue" => Ok(serde_json::json!({
                     "task_uuid": "00000000-0000-4000-8000-000000000001",
                     "job_id": "job-1",
@@ -131,6 +162,44 @@ async fn cli_forwards_opaque_evidence_metadata() {
             )
             .await;
             assert_eq!(output.status.code(), Some(0));
+            server.await.unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cli_carries_a_canonical_multi_pool_set_over_enqueue_and_acquire_rpc() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(stream, &CliHandler).await.unwrap();
+                }
+            });
+            let enqueued = run_tally(
+                &socket,
+                &[
+                    "enqueue",
+                    "--pool",
+                    "zeta",
+                    "--pool",
+                    "slot",
+                    "--executor",
+                    "worker",
+                    "--",
+                    "true",
+                ],
+            )
+            .await;
+            assert_eq!(enqueued.status.code(), Some(0));
+
+            let acquired = run_tally(&socket, &["lease", "acquire", "zeta", "slot"]).await;
+            assert_eq!(acquired.status.code(), Some(0));
             server.await.unwrap();
         })
         .await;

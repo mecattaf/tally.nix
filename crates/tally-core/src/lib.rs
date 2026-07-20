@@ -7,6 +7,7 @@ pub mod evidence;
 pub mod executor;
 pub mod journal;
 pub mod lease;
+pub mod poolset;
 pub mod producers;
 pub mod query;
 pub mod recovery;

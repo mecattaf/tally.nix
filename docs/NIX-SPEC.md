@@ -38,7 +38,8 @@ Both modules expose the same typed option tree.
 | `lease.graceSec` | positive integer | `90` | Epoch-keyed restart recovery grace. |
 | `lease.yieldPollSec` | positive integer | `5` | Cooperative-yield polling cadence. |
 | `lease.yieldGraceSec` | positive integer | `20` | Grace before an opted-in hard reclaim. |
-| `pools` | attribute set of pool submodules | `{}` | Named local resource gates. |
+| `pools` | attribute set of pool submodules | `{}` | Named logical gates owned by this coordinator. |
+| `executors` | attribute set of SSH executor submodules | `{}` | Named daemonless execution targets selected per job. |
 | `producers` | attribute set of producer submodules | `{}` | Closed five-kind intake registry. |
 | `adapters` | attribute set of adapter submodules | presets | Open structured process envelopes. |
 
@@ -87,6 +88,38 @@ Priorities are shared between Rust and Nix and are checked during the flake buil
 | `high` | 100 |
 | `medium` | 50 |
 | `low` | 10 |
+
+### 2.1. `executors.<name>`
+
+An executor is a daemonless worker reached by the central coordinator. It changes physical
+placement only: pools and leases remain owned by the coordinator daemon.
+
+| Option | Type | Default | Meaning |
+|---|---|---|---|
+| `kind` | `ssh` | `ssh` | Fail-closed transport discriminator. |
+| `host` | string | required | Explicit OpenSSH destination host or IP literal. |
+| `user` | string | required | Explicit remote login user. |
+| `port` | TCP port | `22` | Explicit destination port. |
+| `sshProgram` | absolute path | `${pkgs.openssh}/bin/ssh` | Coordinator-side OpenSSH client. |
+| `identityFile` | external absolute path | required | Coordinator-side private key; no agent is used. |
+| `knownHostsFile` | absolute path | required | Pinned host keys used with strict checking. |
+| `program` | string | required | Absolute worker-side path to the same `tally` binary. |
+| `stateDir` | string | required | Absolute private, persistent worker-side launch, capture, and exit-record directory. |
+| `connectTimeoutSec` | positive integer | `10` | OpenSSH connect timeout. |
+| `serverAliveIntervalSec` | positive integer | `15` | Liveness probe interval. |
+| `serverAliveCountMax` | positive integer | `3` | Missed probes before reconnect. |
+| `retryIntervalMs` | integer in `10..60000` | `1000` | Delay between fail-closed retries. |
+
+Names, host, user, and the fixed worker program path use restricted alphabets so they cannot add
+SSH options or remote shell syntax. The coordinator ignores ambient SSH configuration (`-F
+/dev/null`), disables password and keyboard-interactive authentication, uses only the configured
+identity and known-hosts file, and disables agent, X11, proxy-command, and port forwarding. Job
+argv is bounded JSON stdin to the fixed `tally __remote-executor` command, not part of that command.
+
+The worker needs no tally daemon. The login user needs a running user systemd manager, the
+configured program, and write access to a `stateDir` that survives worker restarts. `identityFile`
+and `knownHostsFile` must be readable by the coordinator daemon. Credential paths attached to a
+remotely executed producer are worker-side paths.
 
 ## 3. `producers.<name>`
 
@@ -140,9 +173,9 @@ five-second restart cadence.
 - `onReturn`: null or enqueue payload, default null.
 - `onReturnAttest`: null or enqueue payload, default null; when present, `noEnqueue` must be true.
 
-Only one reachability producer may own a pool. All enqueue payloads must reference known pools and
-adapters. Home Manager generates a supervised service with `Restart=always`, no start-rate limit,
-and `RestartSec=<intervalSec>`.
+Only one reachability producer may own a pool. All enqueue payloads must reference known pools,
+adapters, and executors. Home Manager generates a supervised service with `Restart=always`, no
+start-rate limit, and `RestartSec=<intervalSec>`.
 
 ## 4. Producer enqueue payloads
 
@@ -152,7 +185,8 @@ The `enqueue`, `onKey`, `onLost`, `onReturn`, and `onReturnAttest` fields share 
 |---|---|---|
 | `argv` | list of strings | `[]`, but must be nonempty |
 | `adapter` | string | `shell` |
-| `pool` | string | empty, but must name a configured pool |
+| `pool` | string or list of strings | `[]`; must be nonempty, duplicate-free, and name configured pools |
+| `executor` | null or string | `null`; when set, must name a configured executor |
 | `priority` | `interrupt`, `high`, `medium`, or `low` | `low` |
 | `dedupKey` | null or string | `null` |
 | `evidence` | list of strings | `[]` |
@@ -162,6 +196,10 @@ The `enqueue`, `onKey`, `onLost`, `onReturn`, and `onReturnAttest` fields share 
 | `runtimeMaxSec` | null or positive integer | `null` |
 | `noEnqueue` | boolean | `false` |
 | `credentials` | attribute set of absolute paths | `{}` |
+
+Nix accepts a legacy singleton string and coerces it to a one-element set. Rendering preserves the
+scalar form for that singleton and emits a lexically sorted array only for multiple pools. Empty,
+duplicate, and unknown pool sets fail checked configuration with distinct errors.
 
 `argv` remains an array through rendering and execution. There is no shell-string form.
 
@@ -209,8 +247,9 @@ fresh system and proves this timer and an `events-dir` producer timer fire witho
 start.
 
 The daemon service is hardened with a private runtime directory, `UMask=0077`, CPU and memory
-limits, `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, explicit writable paths, Unix-only
-address families, and a system-service syscall filter.
+limits, `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=strict`, explicit writable paths, and a
+system-service syscall filter. `RestrictAddressFamilies` contains only `AF_UNIX` without executors;
+configuring any executor adds `AF_INET` and `AF_INET6` for OpenSSH.
 
 ## 7. NixOS artifacts
 
@@ -223,13 +262,16 @@ When enabled, the NixOS module:
 - creates `tally-witness-emit@.service`.
 
 The NixOS module does not generate the Home Manager producer timers or supervised producer units.
-Its socket is `/run/tally/tally.sock`.
+Its socket is `/run/tally/tally.sock`. Its address-family hardening follows the same conditional
+Unix-only versus Unix-plus-IP rule as Home Manager.
 
 ## 8. Credentials, transient jobs, and witnesses
 
 Pool, producer, and enqueue credentials render as `LoadCredential=<name>:<absolute-source>`.
 Generated metadata contains credential names only. The process reads values through systemd's
-`CREDENTIALS_DIRECTORY`.
+`CREDENTIALS_DIRECTORY`. For a job selecting an executor, these source paths are resolved by the
+worker's systemd manager; the SSH identity itself is the separate coordinator-side
+`executors.<name>.identityFile` reference.
 
 Transient `tally-job-<uuid>.service` units receive the applicable variables from this matrix:
 
@@ -238,7 +280,7 @@ Transient `tally-job-<uuid>.service` units receive the applicable variables from
 | `TALLY_JOB_ID` | Unique execution identity. |
 | `TALLY_TASK_UUID` | Durable row identity when one exists. |
 | `TALLY_PARENT` | Job-originated enqueue provenance. |
-| `TALLY_POOL` | Granted pool. |
+| `TALLY_POOL` | Granted pool set: a singleton name or a canonical JSON array string. |
 | `TALLY_LEASE_EPOCH` | Restart fence. |
 | `TALLY_ATTEMPT` | Attempt number. |
 | `TALLY_CLASS` | Priority tier. |
@@ -296,6 +338,36 @@ NixOS module fragment:
 }
 ```
 
+Central coordinator with one daemonless worker:
+
+```nix
+services.tally = {
+  enable = true;
+  pools.worker-gpu = {
+    resource = "vram";
+    hardPreempt = false;
+  };
+  executors.worker = {
+    host = "worker.example.net";
+    user = "tally-worker";
+    identityFile = "/etc/tally/worker-key";
+    knownHostsFile = "/etc/tally/worker-known-hosts";
+    program = "/run/current-system/sw/bin/tally";
+    stateDir = "/var/lib/tally-remote";
+  };
+  producers.nightly = {
+    kind = "calendar";
+    onCalendar = "daily";
+    enqueue = {
+      argv = [ "/run/current-system/sw/bin/nightly-worker-step" ];
+      pool = "worker-gpu";
+      executor = "worker";
+      evidence = [ "exit:0" ];
+    };
+  };
+};
+```
+
 ## 10. Deferred—not implemented
 
 The following names describe one previously considered direction. They are not module options,
@@ -304,9 +376,12 @@ runtime variants, flake overlays, generated units, or compatibility placeholders
 - alternative enforcement values such as `enforce = "dmem"` or `"dmemcg-booster"`;
 - a patched-systemd overlay, device-memory controller properties, or automatic `Delegate=` wiring;
 - `servingSlice` and worker-side serving slices;
-- `remote`, `remoteSubmodule`, `remoteHeartbeatSec`, and `remoteReapSec`; and
-- cross-machine lease ownership or re-adoption.
+- legacy pool-local `remote`, `remoteSubmodule`, `remoteHeartbeatSec`, and `remoteReapSec` fields;
+  and
+- a worker-side tally daemon, decentralized lease ownership, or worker-owned scheduling policy.
 
-Configuration containing those fields or values is rejected. The implemented resource surface is
-local and `enforce` accepts exactly `cooperative`. This section documents scope only; it does not
-reserve an enum value or declare future compatibility.
+Configuration containing those fields or values is rejected. Cross-machine placement is expressed
+only by `executors.<name>` plus an enqueue's `executor` reference; the central daemon retains every
+logical lease and performs exact remote probe/re-adoption. `enforce` accepts exactly `cooperative`.
+This section documents scope only; it does not reserve an enum value or declare future
+compatibility.
