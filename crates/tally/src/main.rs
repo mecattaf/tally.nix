@@ -162,8 +162,8 @@ impl From<CliSource> for EnqueueSource {
 
 #[derive(Debug, Args)]
 struct EnqueueArgs {
-    #[arg(long)]
-    pool: String,
+    #[arg(long = "pool", required = true, action = clap::ArgAction::Append)]
+    pools: Vec<String>,
     #[arg(long, value_enum, default_value = "medium")]
     priority: CliPriority,
     #[arg(long, default_value = "shell")]
@@ -245,9 +245,16 @@ enum WitnessCommand {
 
 #[derive(Debug, Subcommand)]
 enum LeaseCommand {
-    Acquire { pool: String },
-    Release { lease: String },
-    Status { lease: Option<String> },
+    Acquire {
+        #[arg(required = true, num_args = 1..)]
+        pools: Vec<String>,
+    },
+    Release {
+        lease: String,
+    },
+    Status {
+        lease: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -643,7 +650,7 @@ async fn run_enqueue(socket: &Path, args: EnqueueArgs) -> Result<()> {
     let payload = EnqueuePayload {
         invocation: args.invocation,
         argv: has_argv.then_some(args.argv),
-        pool: Some(args.pool),
+        pools: Some(args.pools),
         priority: Some(args.priority.into()),
         adapter: Some(args.adapter),
         source: Some(args.source.into()),
@@ -757,7 +764,11 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
 
 async fn run_lease(socket: &Path, command: LeaseCommand) -> Result<()> {
     match command {
-        LeaseCommand::Acquire { pool } => {
+        LeaseCommand::Acquire { pools } => {
+            let pool = match pools.as_slice() {
+                [pool] => Value::String(pool.clone()),
+                pools => serde_json::to_value(pools)?,
+            };
             print_rpc(socket, "lease.acquire", Some(json!({"pool": pool}))).await
         }
         LeaseCommand::Release { lease } => {

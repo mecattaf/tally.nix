@@ -22,7 +22,7 @@ async fn stock_taskwarrior_reads_the_in_process_replica() {
             priority: Priority::Medium,
             source: EnqueueSource::Manual,
             adapter: "shell".to_owned(),
-            pool: "build-slot".to_owned(),
+            pools: vec!["build-slot".to_owned()],
             model: None,
             cwd: Some(PathBuf::from("/tmp")),
             dedup_key: Some("stock-viewer-1".to_owned()),
@@ -64,5 +64,6 @@ async fn stock_taskwarrior_reads_the_in_process_replica() {
     assert_eq!(rows[0]["uuid"], uuid.to_string());
     assert_eq!(rows[0]["description"], "stock viewer compatibility");
     assert_eq!(rows[0]["dedup_key"], "stock-viewer-1");
+    assert_eq!(rows[0]["pool"], "build-slot");
     assert_eq!(rows[0]["argv_json"], r#"["true"]"#);
 }

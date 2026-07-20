@@ -68,7 +68,12 @@ pub struct ProducerEnqueue {
     pub argv: Vec<String>,
     #[serde(default = "default_adapter")]
     pub adapter: String,
-    pub pool: String,
+    #[serde(
+        rename = "pool",
+        serialize_with = "crate::poolset::serialize",
+        deserialize_with = "crate::poolset::deserialize"
+    )]
+    pub pools: Vec<String>,
     #[serde(default = "default_priority")]
     pub priority: Priority,
     #[serde(default)]
@@ -95,6 +100,10 @@ impl ProducerEnqueue {
         source: EnqueueSource,
         now: DateTime<Utc>,
     ) -> Result<EnqueuePayload, ProducerError> {
+        let mut pools = self.pools.clone();
+        crate::poolset::canonicalize(&mut pools).map_err(|error| {
+            ProducerError::InvalidConfig(format!("producer enqueue has invalid pool set: {error}"))
+        })?;
         let dedup_key = self
             .dedup_key
             .as_deref()
@@ -103,7 +112,7 @@ impl ProducerEnqueue {
         Ok(EnqueuePayload {
             invocation: None,
             argv: Some(self.argv.clone()),
-            pool: Some(self.pool.clone()),
+            pools: Some(pools),
             priority: Some(self.priority),
             adapter: Some(self.adapter.clone()),
             source: Some(source),
@@ -353,11 +362,18 @@ fn validate_enqueue(
             "producer {producer:?} {field} argv must not be empty"
         )));
     }
-    if !pools.contains(&enqueue.pool) {
-        return Err(ProducerError::InvalidConfig(format!(
-            "producer {producer:?} {field} references unknown pool {:?}",
-            enqueue.pool
-        )));
+    let mut canonical_pools = enqueue.pools.clone();
+    crate::poolset::canonicalize(&mut canonical_pools).map_err(|error| {
+        ProducerError::InvalidConfig(format!(
+            "producer {producer:?} {field} has invalid pool set: {error}"
+        ))
+    })?;
+    for pool in &canonical_pools {
+        if !pools.contains(pool) {
+            return Err(ProducerError::InvalidConfig(format!(
+                "producer {producer:?} {field} references unknown pool {pool:?}"
+            )));
+        }
     }
     if !adapters.contains(&enqueue.adapter) {
         return Err(ProducerError::InvalidConfig(format!(
@@ -2419,7 +2435,7 @@ mod tests {
         ProducerEnqueue {
             argv: vec![command.to_owned()],
             adapter: "shell".to_owned(),
-            pool: "slot".to_owned(),
+            pools: vec!["slot".to_owned()],
             priority: Priority::Low,
             dedup_key: None,
             evidence: vec!["exit:0".to_owned()],
@@ -2642,7 +2658,10 @@ mod tests {
         let payload: EnqueuePayload =
             serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         assert_eq!(payload.source, Some(EnqueueSource::Calendar));
-        assert_eq!(payload.pool.as_deref(), Some("slot"));
+        assert_eq!(
+            payload.pools.as_deref(),
+            Some(["slot".to_owned()].as_slice())
+        );
         assert_eq!(payload.adapter.as_deref(), Some("shell"));
         assert_eq!(payload.dedup_key.as_deref(), Some("daily-20260720"));
         assert_eq!(

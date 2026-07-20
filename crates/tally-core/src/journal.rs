@@ -211,8 +211,14 @@ pub struct TallyFields {
     pub job_id: Option<String>,
     #[serde(rename = "TALLY_PARENT", skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
-    #[serde(rename = "TALLY_POOL", skip_serializing_if = "Option::is_none")]
-    pub pool: Option<String>,
+    #[serde(
+        rename = "TALLY_POOL",
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "crate::poolset::serialize_encoded_optional",
+        deserialize_with = "crate::poolset::deserialize_encoded_optional"
+    )]
+    pub pools: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -234,7 +240,7 @@ pub struct EmitEvent {
     pub labor_class: Option<LaborClass>,
     pub job_id: Option<String>,
     pub parent: Option<String>,
-    pub pool: Option<String>,
+    pub pools: Option<Vec<String>>,
 }
 
 impl EmitEvent {
@@ -257,7 +263,7 @@ impl EmitEvent {
             labor_class: None,
             job_id: None,
             parent: None,
-            pool: None,
+            pools: None,
         }
     }
 
@@ -285,7 +291,7 @@ impl EmitEvent {
             labor_class: self.labor_class,
             job_id: self.job_id,
             parent: self.parent,
-            pool: self.pool,
+            pools: self.pools,
         };
         validate_fields(&fields)?;
         Ok(fields)
@@ -392,10 +398,7 @@ fn field_present(fields: &TallyFields, name: &str) -> bool {
             .parent
             .as_deref()
             .is_some_and(|value| !value.is_empty()),
-        "TALLY_POOL" => fields
-            .pool
-            .as_deref()
-            .is_some_and(|value| !value.is_empty()),
+        "TALLY_POOL" => fields.pools.as_ref().is_some_and(|value| !value.is_empty()),
         _ => false,
     }
 }
@@ -464,11 +467,13 @@ fn string_fields(fields: &TallyFields) -> Vec<(&'static str, &str)> {
         ("TALLY_EVIDENCE", fields.evidence.as_deref()),
         ("TALLY_JOB_ID", fields.job_id.as_deref()),
         ("TALLY_PARENT", fields.parent.as_deref()),
-        ("TALLY_POOL", fields.pool.as_deref()),
     ] {
         if let Some(value) = value {
             values.push((name, value));
         }
+    }
+    if let Some(pools) = &fields.pools {
+        values.extend(pools.iter().map(|pool| ("TALLY_POOL", pool.as_str())));
     }
     values
 }
@@ -658,7 +663,9 @@ fn native_fields(fields: &TallyFields) -> Result<Vec<(&'static str, String)>, Jo
     }
     push_optional(&mut values, "TALLY_JOB_ID", fields.job_id.as_deref());
     push_optional(&mut values, "TALLY_PARENT", fields.parent.as_deref());
-    push_optional(&mut values, "TALLY_POOL", fields.pool.as_deref());
+    if let Some(pools) = &fields.pools {
+        values.push(("TALLY_POOL", crate::poolset::encoded(pools)?));
+    }
     Ok(values)
 }
 
@@ -827,7 +834,7 @@ mod tests {
             labor_class: Some(LaborClass::Fresh),
             job_id: Some("job-abc".to_owned()),
             parent: Some("parent-abc".to_owned()),
-            pool: Some("gpu".to_owned()),
+            pools: Some(vec!["gpu".to_owned()]),
         }
     }
 
@@ -955,7 +962,7 @@ mod tests {
         assert!(event.into_fields().is_err());
 
         let mut event = EmitEvent::enqueued("task", Priority::Low, EnqueueSource::Manual);
-        event.pool = Some("bad\npool".to_owned());
+        event.pools = Some(vec!["bad\npool".to_owned()]);
         assert!(event.into_fields().is_err());
     }
 

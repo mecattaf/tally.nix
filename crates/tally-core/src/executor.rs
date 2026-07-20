@@ -54,7 +54,7 @@ pub struct UnitLimits {
 pub struct ExecutionRequest {
     pub identity: ExecutionIdentity,
     pub parent: Option<Uuid>,
-    pub pool: String,
+    pub pools: Vec<String>,
     pub lease_epoch: u64,
     pub attempt: u32,
     pub priority: Priority,
@@ -1359,9 +1359,12 @@ impl Executor {
             ));
         }
         validate_systemd_path(&self.recorder_program, "exit recorder program")?;
-        if request.pool.trim().is_empty() || request.pool.chars().any(char::is_control) {
+        let mut canonical_pools = request.pools.clone();
+        crate::poolset::canonicalize(&mut canonical_pools)
+            .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+        if canonical_pools != request.pools {
             return Err(ExecutorError::InvalidRequest(
-                "pool must be non-empty and contain no control characters".to_owned(),
+                "pool set must be in canonical order".to_owned(),
             ));
         }
         if request.lease_epoch == 0 {
@@ -1709,7 +1712,10 @@ fn execution_environment(
         environment.push(("TALLY_PARENT".to_owned(), parent.to_string()));
     }
     environment.extend([
-        ("TALLY_POOL".to_owned(), request.pool.clone()),
+        (
+            "TALLY_POOL".to_owned(),
+            crate::poolset::encoded(&request.pools)?,
+        ),
         (
             "TALLY_LEASE_EPOCH".to_owned(),
             request.lease_epoch.to_string(),
@@ -2123,7 +2129,7 @@ mod tests {
                 task_uuid: Some(uuid("00000000-0000-4000-8000-000000000002")),
             },
             parent: Some(uuid("00000000-0000-4000-8000-000000000003")),
-            pool: "gpu".to_owned(),
+            pools: vec!["gpu".to_owned()],
             lease_epoch: 7,
             attempt: 1,
             priority: Priority::High,
@@ -3232,7 +3238,7 @@ mod tests {
                 task_uuid: None,
             },
             parent: None,
-            pool: pool.to_owned(),
+            pools: vec![pool.to_owned()],
             lease_epoch: 1,
             attempt: 1,
             priority: Priority::Low,

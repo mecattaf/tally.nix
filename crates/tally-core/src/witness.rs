@@ -57,7 +57,12 @@ pub struct WitnessRecord {
     pub labor_class: LaborClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_ref: Option<String>,
-    pub pool: Option<String>,
+    #[serde(
+        rename = "pool",
+        serialize_with = "crate::poolset::serialize_optional",
+        deserialize_with = "crate::poolset::deserialize_optional"
+    )]
+    pub pools: Option<Vec<String>>,
     pub charge: Option<Charge>,
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -83,7 +88,7 @@ pub struct WitnessBody {
     pub dedup_key: Option<String>,
     pub labor_class: LaborClass,
     pub trace_ref: Option<String>,
-    pub pool: Option<String>,
+    pub pools: Option<Vec<String>>,
     pub charge: Option<Charge>,
     pub model: Option<String>,
     pub evidence_class: Option<Value>,
@@ -192,7 +197,7 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
         dedup_key: body.dedup_key,
         labor_class: body.labor_class,
         trace_ref: body.trace_ref,
-        pool: body.pool,
+        pools: body.pools,
         charge: body.charge,
         model: body.model,
         evidence_class: body.evidence_class,
@@ -222,6 +227,13 @@ fn validate_record(raw: &Value) -> Result<WitnessRecord, String> {
     }
     let record: WitnessRecord =
         serde_json::from_value(raw.clone()).map_err(|error| error.to_string())?;
+    if let Some(pools) = &record.pools {
+        let mut canonical = pools.clone();
+        crate::poolset::canonicalize(&mut canonical).map_err(|error| error.to_string())?;
+        if &canonical != pools {
+            return Err("pool set is not in canonical order".to_owned());
+        }
+    }
     if record.seq == 0 {
         return Err("seq missing or not a positive integer".to_owned());
     }
@@ -780,7 +792,7 @@ mod tests {
             dedup_key: Some("ocr:paper-0001".to_owned()),
             labor_class: LaborClass::Fresh,
             trace_ref: None,
-            pool: Some("worker-gpu".to_owned()),
+            pools: Some(vec!["worker-gpu".to_owned()]),
             charge: Some(Charge {
                 unit: "gpu-seconds".to_owned(),
                 amount: 42.5,

@@ -130,7 +130,12 @@ pub struct RowSeed {
     pub priority: Priority,
     pub source: EnqueueSource,
     pub adapter: String,
-    pub pool: String,
+    #[serde(
+        rename = "pool",
+        serialize_with = "crate::poolset::serialize",
+        deserialize_with = "crate::poolset::deserialize"
+    )]
+    pub pools: Vec<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -189,11 +194,9 @@ impl RowSeed {
                 "leaseEpoch must be positive".to_owned(),
             ));
         }
-        if self.pool.trim().is_empty() || self.pool.chars().any(char::is_control) {
-            return Err(TaskDbError::InvalidSeed(
-                "pool must be non-empty and contain no control characters".to_owned(),
-            ));
-        }
+        let mut pools = self.pools.clone();
+        crate::poolset::canonicalize(&mut pools)
+            .map_err(|error| TaskDbError::InvalidSeed(error.to_string()))?;
         if self.adapter.trim().is_empty() || self.adapter.chars().any(char::is_control) {
             return Err(TaskDbError::InvalidSeed(
                 "adapter must be non-empty and contain no control characters".to_owned(),
@@ -237,6 +240,8 @@ impl RowSeed {
 
     pub fn canonicalize(&mut self) -> Result<(), TaskDbError> {
         self.validate()?;
+        crate::poolset::canonicalize(&mut self.pools)
+            .map_err(|error| TaskDbError::InvalidSeed(error.to_string()))?;
         self.evidence = parse_evidence_specs(&self.evidence)
             .map_err(|error| TaskDbError::InvalidSeed(format!("invalid evidence: {error}")))?
             .render();
@@ -685,7 +690,7 @@ fn populate_task(
     let mut attributes = BTreeMap::new();
     attributes.insert("adapter", seed.adapter);
     attributes.insert("labor_class", labor_class_name(labor_class).to_owned());
-    attributes.insert("pool", seed.pool);
+    attributes.insert("pool", crate::poolset::encoded(&seed.pools)?);
     attributes.insert("lease_epoch", seed.lease_epoch.to_string());
     attributes.insert("source", source_name(&seed.source).to_owned());
     attributes.insert("priority_class", priority_name(seed.priority).to_owned());
@@ -968,7 +973,7 @@ mod tests {
             priority: Priority::High,
             source: EnqueueSource::EventsDir,
             adapter: "shell".to_owned(),
-            pool: "worker-gpu".to_owned(),
+            pools: vec!["worker-gpu".to_owned()],
             model: None,
             cwd: Some(PathBuf::from("/work")),
             dedup_key: Some("ocr:paper-1".to_owned()),

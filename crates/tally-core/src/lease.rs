@@ -433,7 +433,8 @@ impl LeaseEngine {
     }
 
     pub fn validate_admission(&self, request: &LeaseRequest) -> Result<(), LeaseError> {
-        self.validate_request(request)
+        let mut request = request.clone();
+        self.canonicalize_request(&mut request)
     }
 
     pub fn budget_used_at(&mut self, pool: &str, now: DateTime<Utc>) -> Result<u64, LeaseError> {
@@ -473,10 +474,10 @@ impl LeaseEngine {
 
     pub fn admit_at(
         &mut self,
-        request: LeaseRequest,
+        mut request: LeaseRequest,
         now: DateTime<Utc>,
     ) -> Result<AdmitOutcome, LeaseError> {
-        self.validate_request(&request)?;
+        self.canonicalize_request(&mut request)?;
         let sequence = self.next_sequence;
         self.next_sequence =
             self.next_sequence
@@ -662,18 +663,7 @@ impl LeaseEngine {
                 "jobId and unit must not be empty".to_owned(),
             ));
         }
-        if request.pools.is_empty() {
-            return Err(LeaseError::InvalidRequest(
-                "at least one pool is required".to_owned(),
-            ));
-        }
-        let mut unique = HashSet::new();
         for pool in &request.pools {
-            if !unique.insert(pool) {
-                return Err(LeaseError::InvalidRequest(format!(
-                    "pool {pool:?} is requested more than once"
-                )));
-            }
             let state = self
                 .pools
                 .get(pool)
@@ -689,6 +679,12 @@ impl LeaseEngine {
             }
         }
         Ok(())
+    }
+
+    fn canonicalize_request(&self, request: &mut LeaseRequest) -> Result<(), LeaseError> {
+        crate::poolset::canonicalize(&mut request.pools)
+            .map_err(|error| LeaseError::InvalidRequest(error.to_string()))?;
+        self.validate_request(request)
     }
 
     fn can_grant(
@@ -2065,7 +2061,7 @@ mod tests {
             dedup_key: None,
             labor_class: LaborClass::Fresh,
             trace_ref: None,
-            pool: Some("api".to_owned()),
+            pools: Some(vec!["api".to_owned()]),
             charge: Some(crate::witness::Charge {
                 unit: "seconds".to_owned(),
                 amount: 99.0,

@@ -630,7 +630,7 @@ mod tests {
             dedup_key: Some(dedup_key.to_owned()),
             labor_class: LaborClass::Fresh,
             trace_ref: None,
-            pool: Some("gpu".to_owned()),
+            pools: Some(vec!["gpu".to_owned()]),
             charge: None,
             model: None,
             evidence_class: None,

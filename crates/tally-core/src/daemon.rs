@@ -618,14 +618,18 @@ impl DaemonHandler {
             .validate_gh_origin(origin)
             .map_err(|error| WireError::invalid(error.to_string()))?;
         }
-        let requested_pool = payload
-            .pool
-            .as_deref()
-            .ok_or_else(|| WireError::invalid("pool is required"))?;
-        if !context.config.pools.contains_key(requested_pool) {
-            return Err(WireError::invalid(format!(
-                "unknown pool {requested_pool:?}"
-            )));
+        let mut requested_pools = payload
+            .pools
+            .clone()
+            .ok_or_else(|| WireError::invalid("pool set is required"))?;
+        crate::poolset::canonicalize(&mut requested_pools)
+            .map_err(|error| WireError::invalid(error.to_string()))?;
+        for requested_pool in &requested_pools {
+            if !context.config.pools.contains_key(requested_pool) {
+                return Err(WireError::invalid(format!(
+                    "unknown pool {requested_pool:?}"
+                )));
+            }
         }
         if !context.config.adapters.contains_key(&requested_adapter) {
             return Err(WireError::invalid(format!(
@@ -633,31 +637,33 @@ impl DaemonHandler {
             )));
         }
         let defaults = ProducerDefaults {
-            pool: payload.pool.clone().unwrap_or_default(),
+            pools: requested_pools,
             priority: payload.priority.unwrap_or(Priority::Medium),
             adapter: requested_adapter,
             source: payload.source.unwrap_or(EnqueueSource::Manual),
         };
         let mut resolved = context.guardrails.validate_enqueue(payload, &defaults)?;
-        let pool_credentials = context
-            .config
-            .pools
-            .get(&resolved.pool)
-            .expect("the requested pool was validated above")
-            .credentials
-            .clone();
-        for (name, source) in pool_credentials {
-            if resolved
+        for pool in &resolved.pools {
+            let pool_credentials = context
+                .config
+                .pools
+                .get(pool)
+                .expect("the requested pools were validated above")
                 .credentials
-                .get(&name)
-                .is_some_and(|existing| existing != &source)
-            {
-                rollback_child_charge(&mut context, caller_job_id.as_deref())?;
-                return Err(WireError::invalid(format!(
-                    "credential {name:?} has conflicting pool and enqueue sources"
-                )));
+                .clone();
+            for (name, source) in pool_credentials {
+                if resolved
+                    .credentials
+                    .get(&name)
+                    .is_some_and(|existing| existing != &source)
+                {
+                    rollback_child_charge(&mut context, caller_job_id.as_deref())?;
+                    return Err(WireError::invalid(format!(
+                        "credential {name:?} has conflicting pool and enqueue sources"
+                    )));
+                }
+                resolved.credentials.entry(name).or_insert(source);
             }
-            resolved.credentials.entry(name).or_insert(source);
         }
         let invocation = match AdapterEngine::new(&context.config.adapters)
             .launch(&resolved.adapter, &resolved.argv)
@@ -701,7 +707,7 @@ impl DaemonHandler {
             priority: resolved.priority,
             source: resolved.source,
             adapter: resolved.adapter.clone(),
-            pool: resolved.pool.clone(),
+            pools: resolved.pools.clone(),
             model: None,
             cwd: None,
             dedup_key: resolved.dedup_key.clone(),
@@ -815,7 +821,7 @@ impl DaemonHandler {
                     dedup_key: row.dedup_key.clone(),
                     labor_class: LaborClass::Reused,
                     trace_ref: None,
-                    pool: Some(row.pool.clone()),
+                    pools: Some(row.pools.clone()),
                     charge: None,
                     model: row.model.clone(),
                     evidence_class: row.evidence_class.clone(),
@@ -918,10 +924,15 @@ impl DaemonHandler {
 
         let barrier = context.barriers.register_job(&stable_key, row.attempt);
         let mut launch = None;
-        if context.paused_pools.contains(&row.pool) || context.unreachable_pools.contains(&row.pool)
-        {
+        if row.pools.iter().any(|pool| {
+            context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
+        }) {
             job.state = JobState::Paused;
-            if context.unreachable_pools.contains(&row.pool) {
+            if row
+                .pools
+                .iter()
+                .any(|pool| context.unreachable_pools.contains(pool))
+            {
                 context.unreachable_paused_jobs.insert(job_id);
             }
         } else {
@@ -1156,7 +1167,10 @@ impl DaemonHandler {
         let queued = context
             .jobs
             .values()
-            .filter(|job| job.state == JobState::Queued && pools.contains(&job.row.pool))
+            .filter(|job| {
+                job.state == JobState::Queued
+                    && job.row.pools.iter().any(|pool| pools.contains(pool))
+            })
             .map(|job| (job.job_id, job.lease_id.clone()))
             .collect::<Vec<_>>();
         for (job_id, lease_id) in &queued {
@@ -1195,8 +1209,11 @@ impl DaemonHandler {
             .values()
             .filter(|job| {
                 job.state == JobState::Paused
-                    && pools.contains(&job.row.pool)
-                    && !context.unreachable_pools.contains(&job.row.pool)
+                    && job.row.pools.iter().any(|pool| pools.contains(pool))
+                    && !job.row.pools.iter().any(|pool| {
+                        context.paused_pools.contains(pool)
+                            || context.unreachable_pools.contains(pool)
+                    })
             })
             .map(|job| job.job_id)
             .collect::<Vec<_>>();
@@ -1307,7 +1324,9 @@ impl DaemonHandler {
         let queued = context
             .jobs
             .values()
-            .filter(|job| job.state == JobState::Queued && job.row.pool == pool)
+            .filter(|job| {
+                job.state == JobState::Queued && job.row.pools.iter().any(|name| name == pool)
+            })
             .map(|job| (job.job_id, job.lease_id.clone()))
             .collect::<Vec<_>>();
         for (job_id, lease_id) in queued {
@@ -1332,7 +1351,9 @@ impl DaemonHandler {
             .jobs
             .values()
             .filter(|job| {
-                job.state == JobState::Running && job.row.pool == pool && job.lease_id.is_some()
+                job.state == JobState::Running
+                    && job.row.pools.iter().any(|name| name == pool)
+                    && job.lease_id.is_some()
             })
             .map(|job| job.job_id)
             .collect::<Vec<_>>();
@@ -1469,7 +1490,7 @@ impl DaemonHandler {
                 context
                     .jobs
                     .get(job_id)
-                    .filter(|job| job.row.pool == pool)
+                    .filter(|job| job.row.pools.iter().any(|name| name == pool))
                     .map(|_| *job_id)
             })
             .collect::<Vec<_>>();
@@ -1861,9 +1882,12 @@ impl DaemonHandler {
     async fn acquire(&self, params: Option<Value>) -> Result<Value, WireError> {
         #[derive(Deserialize)]
         struct Params {
-            pool: String,
+            #[serde(deserialize_with = "crate::poolset::deserialize")]
+            pool: Vec<String>,
         }
-        let params: Params = decode_params(params)?;
+        let mut params: Params = decode_params(params)?;
+        crate::poolset::canonicalize(&mut params.pool)
+            .map_err(|error| WireError::invalid(error.to_string()))?;
         let id = Uuid::new_v4();
         let mut context = self.context.write().await;
         let epoch = context.epoch;
@@ -1871,7 +1895,7 @@ impl DaemonHandler {
             LeaseRequest {
                 job_id: id.to_string(),
                 unit: format!("tally-job-{id}.service"),
-                pools: vec![params.pool],
+                pools: params.pool,
                 // The additive acquire/release surface is an explicit
                 // reservation token, not a daemon-owned execution. Keep
                 // it outside managed hard-preemption; only daemon jobs
@@ -2239,7 +2263,9 @@ fn pool_headroom_facts(context: &mut Context) -> Result<Vec<PoolHeadroomFact>, W
         .values()
         .filter(|job| job.state == JobState::Queued && job.lease_id.is_none())
         .fold(HashMap::<String, usize>::new(), |mut counts, job| {
-            *counts.entry(job.row.pool.clone()).or_default() += 1;
+            for pool in &job.row.pools {
+                *counts.entry(pool.clone()).or_default() += 1;
+            }
             counts
         });
     pools
@@ -2424,7 +2450,7 @@ fn lease_request(job: &Job, unit: String) -> LeaseRequest {
     LeaseRequest {
         job_id: job.job_id.to_string(),
         unit,
-        pools: vec![job.row.pool.clone()],
+        pools: job.row.pools.clone(),
         priority: job.row.priority,
         admission_key: Some(format!("{}:{}", job.stable_key(), job.row.attempt)),
         consumption_estimate: job.row.consumption_estimate,
@@ -2435,7 +2461,7 @@ fn execution_request(job: &Job, limits: UnitLimits, tally_socket: &str) -> Execu
     ExecutionRequest {
         identity: job.identity(),
         parent: job.row.parent_uuid,
-        pool: job.row.pool.clone(),
+        pools: job.row.pools.clone(),
         lease_epoch: job.row.lease_epoch,
         attempt: job.row.attempt,
         priority: job.row.priority,
@@ -2476,7 +2502,7 @@ fn enqueued_event(job: &Job) -> EmitEvent {
     let mut event = EmitEvent::enqueued(job.stable_key(), job.row.priority, job.row.source);
     event.job_id = Some(job.job_id.to_string());
     event.parent = job.row.parent_uuid.map(|uuid| uuid.to_string());
-    event.pool = Some(job.row.pool.clone());
+    event.pools = Some(job.row.pools.clone());
     event
 }
 
@@ -2502,7 +2528,7 @@ fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
         dedup_key: job.row.dedup_key.clone(),
         labor_class: job.labor_class,
         trace_ref: None,
-        pool: Some(job.row.pool.clone()),
+        pools: Some(job.row.pools.clone()),
         charge: None,
         model: canonical_job_model(job),
         evidence_class: job.row.evidence_class.clone(),
@@ -2606,7 +2632,7 @@ fn completed_event(job: &Job, result: &JobResult, evidence: String) -> EmitEvent
         labor_class: Some(job.labor_class),
         job_id: Some(job.job_id.to_string()),
         parent: job.row.parent_uuid.map(|uuid| uuid.to_string()),
-        pool: Some(job.row.pool.clone()),
+        pools: Some(job.row.pools.clone()),
     }
 }
 
@@ -3205,7 +3231,7 @@ impl Daemon {
                 dedup_key: job.row.dedup_key.clone(),
                 labor_class: job.labor_class,
                 trace_ref: None,
-                pool: Some(job.row.pool.clone()),
+                pools: Some(job.row.pools.clone()),
                 charge: None,
                 model: canonical_job_model(&job),
                 evidence_class: job.row.evidence_class.clone(),
@@ -3374,8 +3400,9 @@ fn retry_unleased_jobs(context: &mut Context, executor: &Executor) -> Vec<Job> {
         .filter(|job| {
             job.state == JobState::Queued
                 && job.lease_id.is_none()
-                && !context.paused_pools.contains(&job.row.pool)
-                && !context.unreachable_pools.contains(&job.row.pool)
+                && !job.row.pools.iter().any(|pool| {
+                    context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
+                })
         })
         .map(|job| job.job_id)
         .collect::<Vec<_>>();
@@ -3417,8 +3444,9 @@ fn resume_paused_jobs_locked(
             continue;
         };
         if job.state != JobState::Paused
-            || context.paused_pools.contains(&job.row.pool)
-            || context.unreachable_pools.contains(&job.row.pool)
+            || job.row.pools.iter().any(|pool| {
+                context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
+            })
         {
             continue;
         }
@@ -3461,7 +3489,7 @@ fn pool_representations(
         .iter()
         .filter_map(|action| match action {
             RecoveryAction::RePresent { row, .. }
-                if row.pool == pool && renderable.contains(&row.uuid) =>
+                if row.pools.iter().any(|name| name == pool) && renderable.contains(&row.uuid) =>
             {
                 Some(row.uuid)
             }
@@ -4075,7 +4103,7 @@ fn reconcile_reuse_witnesses(
                     dedup_key: event.row.dedup_key.clone(),
                     labor_class: LaborClass::Reused,
                     trace_ref: None,
-                    pool: Some(event.row.pool.clone()),
+                    pools: Some(event.row.pools.clone()),
                     charge: None,
                     model: event.row.model.clone(),
                     evidence_class: event.row.evidence_class.clone(),
@@ -4109,7 +4137,7 @@ fn reuse_record_matches(
         && record.lease_epoch == event.row.lease_epoch
         && record.dedup_key == event.row.dedup_key
         && record.labor_class == LaborClass::Reused
-        && record.pool.as_deref() == Some(event.row.pool.as_str())
+        && record.pools.as_ref() == Some(&event.row.pools)
 }
 
 fn recovery_query_rows(plan: &crate::recovery::RecoveryPlan) -> BTreeMap<Uuid, RowFact> {
@@ -4610,7 +4638,7 @@ fn query_row(row: &RowSeed, status: RowStatus) -> RowFact {
         description: row.description.clone(),
         status,
         priority: priority_name(row.priority).to_owned(),
-        pool: Some(row.pool.clone()),
+        pools: Some(row.pools.clone()),
         source: Some(source_name(row.source).to_owned()),
         session_ref: row.session_ref.clone(),
         attempt: row.attempt,
@@ -4811,11 +4839,17 @@ fn install_recovery_jobs(
         };
         if needs_lease
             && !adopted
-            && (context.paused_pools.contains(&job.row.pool)
-                || context.unreachable_pools.contains(&job.row.pool))
+            && job.row.pools.iter().any(|pool| {
+                context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
+            })
         {
             job.state = JobState::Paused;
-            if context.unreachable_pools.contains(&job.row.pool) {
+            if job
+                .row
+                .pools
+                .iter()
+                .any(|pool| context.unreachable_pools.contains(pool))
+            {
                 context.unreachable_paused_jobs.insert(job_id);
             }
         } else if needs_lease {
@@ -4877,7 +4911,7 @@ fn recovery_action_already_installed(
         )));
     }
     if existing.row.lease_epoch != candidate.lease_epoch
-        || existing.row.pool != candidate.pool
+        || existing.row.pools != candidate.pools
         || existing.row.adapter != candidate.adapter
         || existing.row.argv != candidate.argv
         || existing.row.dedup_key != candidate.dedup_key
@@ -5432,7 +5466,7 @@ mod tests {
             priority: Priority::High,
             source: EnqueueSource::Manual,
             adapter: "shell".to_owned(),
-            pool: "slot".to_owned(),
+            pools: vec!["slot".to_owned()],
             model: None,
             cwd: None,
             dedup_key: Some(dedup_key.to_owned()),
@@ -5480,7 +5514,7 @@ mod tests {
             anchor: "job-1".to_owned(),
             task_uuid: Some("job-1".to_owned()),
             description: None,
-            pool: Some("slot".to_owned()),
+            pools: Some(vec!["slot".to_owned()]),
             source: Some("manual".to_owned()),
             session_ref: None,
             model: None,
@@ -5642,7 +5676,7 @@ mod tests {
                     .row
                     .clone();
                 assert_eq!(file_row.argv, direct_row.argv);
-                assert_eq!(file_row.pool, direct_row.pool);
+                assert_eq!(file_row.pools, direct_row.pools);
                 assert_eq!(file_row.priority, direct_row.priority);
                 assert_eq!(file_row.adapter, direct_row.adapter);
                 assert_eq!(file_row.source, direct_row.source);
@@ -6246,7 +6280,7 @@ mod tests {
                         dedup_key: row.dedup_key.clone(),
                         labor_class: LaborClass::Fresh,
                         trace_ref: None,
-                        pool: Some("slot".to_owned()),
+                        pools: Some(vec!["slot".to_owned()]),
                         charge: None,
                         model: None,
                         evidence_class: None,
@@ -7696,7 +7730,7 @@ mod tests {
                         dedup_key: original.dedup_key.clone(),
                         labor_class: LaborClass::Fresh,
                         trace_ref: None,
-                        pool: Some("slot".to_owned()),
+                        pools: Some(vec!["slot".to_owned()]),
                         charge: None,
                         model: None,
                         evidence_class: None,

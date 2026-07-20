@@ -472,7 +472,11 @@ fn validate_history(
             )));
         }
         previous_verdict = Some(record.verdict);
-        if record.pool.as_deref().is_some_and(|pool| pool != row.pool) {
+        if record
+            .pools
+            .as_ref()
+            .is_some_and(|pools| pools != &row.pools)
+        {
             return Err(RecoveryError::InvalidFacts(format!(
                 "witness seq {} pool does not match durable row {}",
                 record.seq, row.uuid
@@ -787,8 +791,14 @@ fn plan_witnessed_row(
     }
     let disposition = retry_disposition(record.verdict, policy.retry);
     let trigger_observed = match trigger {
-        RetryTrigger::PoolReturn => triggers.confirmed_pool_returns.contains(&row.pool),
-        RetryTrigger::ResourceReturn => triggers.resource_returns.contains(&row.pool),
+        RetryTrigger::PoolReturn => row
+            .pools
+            .iter()
+            .any(|pool| triggers.confirmed_pool_returns.contains(pool)),
+        RetryTrigger::ResourceReturn => row
+            .pools
+            .iter()
+            .any(|pool| triggers.resource_returns.contains(pool)),
         RetryTrigger::BoundedRequeue => triggers.bounded_requeues.contains(&row.uuid),
     };
     if disposition != RetryDisposition::Automatic(trigger) || !trigger_observed {
@@ -857,7 +867,7 @@ mod tests {
             priority: Priority::High,
             source: EnqueueSource::EventsDir,
             adapter: "shell".to_owned(),
-            pool: pool.to_owned(),
+            pools: vec![pool.to_owned()],
             model: None,
             cwd: Some(PathBuf::from("/work")),
             dedup_key: Some(format!("dedup:{uuid}")),
@@ -905,7 +915,7 @@ mod tests {
                             LaborClass::Recovered
                         },
                         trace_ref: None,
-                        pool: Some(row.pool.clone()),
+                        pools: Some(row.pools.clone()),
                         charge: None,
                         model: None,
                         evidence_class: None,
@@ -991,7 +1001,7 @@ mod tests {
         let row = row(Uuid::new_v4(), "worker-gpu", 3);
         let witness = witness(&row, &[(Verdict::PoolVanished, 3)]);
         let mut triggers = empty_triggers();
-        triggers.confirmed_pool_returns.insert(row.pool.clone());
+        triggers.confirmed_pool_returns.extend(row.pools.clone());
         let mut facts = facts(
             row.clone(),
             witness,
@@ -1002,7 +1012,7 @@ mod tests {
         facts
             .advisory_return_attestations
             .push(AdvisoryReturnAttestation {
-                pool: row.pool.clone(),
+                pool: row.pools[0].clone(),
                 payload: serde_json::json!({"assessment": "advisory only"}),
             });
 
@@ -1046,7 +1056,7 @@ mod tests {
         let row = row(Uuid::new_v4(), "worker", 5);
         let records = witness(&row, &[(Verdict::PoolVanished, 5)]);
         let mut triggers = empty_triggers();
-        triggers.confirmed_pool_returns.insert(row.pool.clone());
+        triggers.confirmed_pool_returns.extend(row.pools.clone());
         let manual = facts(
             row.clone(),
             records.clone(),
@@ -1095,10 +1105,10 @@ mod tests {
             let mut triggers = empty_triggers();
             match expected_trigger {
                 RetryTrigger::PoolReturn => {
-                    triggers.confirmed_pool_returns.insert(row.pool.clone());
+                    triggers.confirmed_pool_returns.extend(row.pools.clone());
                 }
                 RetryTrigger::ResourceReturn => {
-                    triggers.resource_returns.insert(row.pool.clone());
+                    triggers.resource_returns.extend(row.pools.clone());
                 }
                 RetryTrigger::BoundedRequeue => {
                     triggers.bounded_requeues.insert(row.uuid);
@@ -1130,8 +1140,8 @@ mod tests {
         ] {
             let row = row(Uuid::new_v4(), "resource", 2);
             let mut triggers = empty_triggers();
-            triggers.confirmed_pool_returns.insert(row.pool.clone());
-            triggers.resource_returns.insert(row.pool.clone());
+            triggers.confirmed_pool_returns.extend(row.pools.clone());
+            triggers.resource_returns.extend(row.pools.clone());
             triggers.bounded_requeues.insert(row.uuid);
             let facts = facts(
                 row.clone(),
@@ -1203,7 +1213,7 @@ mod tests {
         );
 
         let mut triggers = empty_triggers();
-        triggers.confirmed_pool_returns.insert(row.pool.clone());
+        triggers.confirmed_pool_returns.extend(row.pools.clone());
         let stale = facts(
             row.clone(),
             witness(&row, &[(Verdict::PoolVanished, 3)]),

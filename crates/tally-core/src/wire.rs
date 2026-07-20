@@ -333,8 +333,13 @@ pub struct EnqueuePayload {
     pub invocation: Option<String>,
     #[serde(default)]
     pub argv: Option<Vec<String>>,
-    #[serde(default)]
-    pub pool: Option<String>,
+    #[serde(
+        default,
+        rename = "pool",
+        serialize_with = "crate::poolset::serialize_optional",
+        deserialize_with = "crate::poolset::deserialize_optional"
+    )]
+    pub pools: Option<Vec<String>>,
     #[serde(default)]
     pub priority: Option<Priority>,
     #[serde(default)]
@@ -373,7 +378,7 @@ pub struct EnqueuePayload {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProducerDefaults {
-    pub pool: String,
+    pub pools: Vec<String>,
     pub priority: Priority,
     pub adapter: String,
     pub source: EnqueueSource,
@@ -383,7 +388,12 @@ pub struct ProducerDefaults {
 #[serde(rename_all = "camelCase")]
 pub struct ResolvedEnqueue {
     pub argv: Vec<String>,
-    pub pool: String,
+    #[serde(
+        rename = "pool",
+        serialize_with = "crate::poolset::serialize",
+        deserialize_with = "crate::poolset::deserialize"
+    )]
+    pub pools: Vec<String>,
     pub priority: Priority,
     pub adapter: String,
     pub source: EnqueueSource,
@@ -529,10 +539,12 @@ impl GuardrailState {
                 "GitHub event actor is excluded by actorExclude",
             ));
         }
-        let pool = payload.pool.unwrap_or_else(|| defaults.pool.clone());
+        let mut pools = payload.pools.unwrap_or_else(|| defaults.pools.clone());
+        crate::poolset::canonicalize(&mut pools)
+            .map_err(|error| WireError::invalid(error.to_string()))?;
         let adapter = payload.adapter.unwrap_or_else(|| defaults.adapter.clone());
-        if pool.trim().is_empty() || adapter.trim().is_empty() {
-            return Err(WireError::invalid("pool and adapter must not be empty"));
+        if adapter.trim().is_empty() {
+            return Err(WireError::invalid("adapter must not be empty"));
         }
 
         let mut parent = payload.parent;
@@ -575,7 +587,7 @@ impl GuardrailState {
 
         Ok(ResolvedEnqueue {
             argv,
-            pool,
+            pools,
             priority: payload.priority.unwrap_or(defaults.priority),
             adapter,
             source,
@@ -722,7 +734,7 @@ mod tests {
 
     fn defaults() -> ProducerDefaults {
         ProducerDefaults {
-            pool: "default-pool".to_owned(),
+            pools: vec!["default-pool".to_owned()],
             priority: Priority::Low,
             adapter: "shell".to_owned(),
             source: EnqueueSource::Calendar,
@@ -733,7 +745,7 @@ mod tests {
         EnqueuePayload {
             invocation: None,
             argv: Some(vec!["child".to_owned()]),
-            pool: None,
+            pools: None,
             priority: None,
             adapter: None,
             source: None,
@@ -772,13 +784,13 @@ mod tests {
             },
         );
         let mut payload = child_payload();
-        payload.pool = Some("payload-pool".to_owned());
+        payload.pools = Some(vec!["payload-pool".to_owned()]);
         payload.priority = Some(Priority::Interrupt);
         payload.adapter = Some("codex".to_owned());
         let resolved = state.validate_enqueue(payload, &defaults()).unwrap();
         assert_eq!(resolved.parent.as_deref(), Some("task-parent"));
         assert_eq!(resolved.depth, 2);
-        assert_eq!(resolved.pool, "payload-pool");
+        assert_eq!(resolved.pools, ["payload-pool"]);
         assert_eq!(resolved.priority, Priority::Interrupt);
         assert_eq!(resolved.adapter, "codex");
     }
