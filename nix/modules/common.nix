@@ -867,7 +867,7 @@ let
           yieldPollSec = 5;
           yieldGraceSec = 20;
         };
-        description = "Local lease and cooperative-yield timing guardrails.";
+        description = "Coordinator lease and cooperative-yield timing guardrails.";
       };
       pools = mkOption {
         type = types.attrsOf mkPoolType;
@@ -877,7 +877,7 @@ let
           capacity = 1;
           enforce = "cooperative";
         };
-        description = "Named local resource gates.";
+        description = "Named logical resource gates owned by this coordinator.";
       };
       producers = mkOption {
         type = types.attrsOf mkProducerType;
@@ -1085,7 +1085,8 @@ let
           else
             [ ]
         )
-        (map (enqueue:
+        (map (
+          enqueue:
           (map (pool: {
             assertion = builtins.hasAttr pool cfg.pools;
             message = "tally producer ${name} references unknown pool ${pool}";

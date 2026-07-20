@@ -38,7 +38,7 @@ Both modules expose the same typed option tree.
 | `lease.graceSec` | positive integer | `90` | Epoch-keyed restart recovery grace. |
 | `lease.yieldPollSec` | positive integer | `5` | Cooperative-yield polling cadence. |
 | `lease.yieldGraceSec` | positive integer | `20` | Grace before an opted-in hard reclaim. |
-| `pools` | attribute set of pool submodules | `{}` | Named local resource gates. |
+| `pools` | attribute set of pool submodules | `{}` | Named logical gates owned by this coordinator. |
 | `producers` | attribute set of producer submodules | `{}` | Closed five-kind intake registry. |
 | `adapters` | attribute set of adapter submodules | presets | Open structured process envelopes. |
 
@@ -152,7 +152,7 @@ The `enqueue`, `onKey`, `onLost`, `onReturn`, and `onReturnAttest` fields share 
 |---|---|---|
 | `argv` | list of strings | `[]`, but must be nonempty |
 | `adapter` | string | `shell` |
-| `pool` | string | empty, but must name a configured pool |
+| `pool` | string or list of strings | `[]`; must be nonempty, duplicate-free, and name configured pools |
 | `priority` | `interrupt`, `high`, `medium`, or `low` | `low` |
 | `dedupKey` | null or string | `null` |
 | `evidence` | list of strings | `[]` |
@@ -162,6 +162,10 @@ The `enqueue`, `onKey`, `onLost`, `onReturn`, and `onReturnAttest` fields share 
 | `runtimeMaxSec` | null or positive integer | `null` |
 | `noEnqueue` | boolean | `false` |
 | `credentials` | attribute set of absolute paths | `{}` |
+
+Nix accepts a legacy singleton string and coerces it to a one-element set. Rendering preserves the
+scalar form for that singleton and emits a lexically sorted array only for multiple pools. Empty,
+duplicate, and unknown pool sets fail checked configuration with distinct errors.
 
 `argv` remains an array through rendering and execution. There is no shell-string form.
 
@@ -238,7 +242,7 @@ Transient `tally-job-<uuid>.service` units receive the applicable variables from
 | `TALLY_JOB_ID` | Unique execution identity. |
 | `TALLY_TASK_UUID` | Durable row identity when one exists. |
 | `TALLY_PARENT` | Job-originated enqueue provenance. |
-| `TALLY_POOL` | Granted pool. |
+| `TALLY_POOL` | Granted pool set: a singleton name or a canonical JSON array string. |
 | `TALLY_LEASE_EPOCH` | Restart fence. |
 | `TALLY_ATTEMPT` | Attempt number. |
 | `TALLY_CLASS` | Priority tier. |

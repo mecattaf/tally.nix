@@ -51,6 +51,12 @@ An enqueue payload contains direct argv, one or more pool names, a priority, an 
 optional deduplication, provenance, evidence, runtime, consumption, credential, and advisory
 metadata. The daemon validates the complete payload before acknowledging it.
 
+The serialized key remains `pool`. A singleton is accepted and emitted as its legacy scalar;
+multiple pools are emitted as an array sorted lexically. The same scalar-or-array rule applies to
+persisted rows and ledger records, while string-only Taskwarrior UDA and environment values use a
+JSON array string for multiple pools. This preserves every previously expressible record byte for
+byte. Multi-pool payloads require a daemon that implements the array form.
+
 Job-originated enqueue is capability-limited:
 
 - `depthCap` limits parent-to-child depth;
@@ -63,8 +69,9 @@ adapter.
 
 ## 4. Resource pools and leases
 
-Pools are named local resource gates. Resource kinds are `vram`, `build-slot`, `cpu-slot`,
-`budget`, and `mutex`.
+Pools are named logical resource gates owned by one coordinator daemon. Ownership identifies the
+daemon that arbitrates contention; it is not an execution-placement attribute. Resource kinds are
+`vram`, `build-slot`, `cpu-slot`, `budget`, and `mutex`.
 
 The co-residency predicate admits at most `capacity` simultaneous holders. A VRAM pool with more
 than one holder may additionally constrain the sum of declared `budgetGb` demands. A mutex is a
@@ -76,8 +83,10 @@ Debits are keyed by stable admission identity so restart does not double-charge 
 optional external usage meter can reduce reported headroom; it cannot increase the authoritative
 cap.
 
-Multi-pool requests are atomic. tally either grants every requested pool or queues the request
-without holding a subset. Pool ordering is deterministic.
+Every request names a non-empty set of known pools with no duplicates. tally sorts that set
+lexically before admission and uses the canonical order in persistence, events, queries, and
+witness material. Multi-pool requests are atomic: tally either grants every requested pool or
+queues the request without holding a subset.
 
 Priorities have stable numeric ranks:
 
@@ -101,7 +110,7 @@ recovery.
 The production daemon requires systemd ownership. It launches direct argv with a deterministic
 transient unit using `systemd-run --wait --collect`; it does not turn argv into a shell string.
 
-Each unit receives proof-bearing environment such as the job ID, task UUID when present, pool,
+Each unit receives proof-bearing environment such as the job ID, task UUID when present, pool set,
 lease epoch, priority class, attempt, enqueue capability, socket, and credential names. Optional
 fields are explicitly unset when absent so inherited environment cannot impersonate them.
 

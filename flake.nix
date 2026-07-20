@@ -455,6 +455,49 @@
         unknownMultiPoolAttempt = builtins.tryEval (
           builtins.deepSeq unknownMultiPoolNixos.config.system.build.toplevel true
         );
+        unknownMultiPoolMessages = builtins.map (entry: entry.message) (
+          builtins.filter (entry: !entry.assertion) unknownMultiPoolNixos.config.assertions
+        );
+        invalidPoolSetNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            {
+              services.tally = {
+                enable = true;
+                pools.stock.resource = "build-slot";
+                producers = {
+                  empty = {
+                    kind = "calendar";
+                    onCalendar = "daily";
+                    enqueue = {
+                      argv = [ "empty-pool-job" ];
+                      pool = [ ];
+                    };
+                  };
+                  duplicate = {
+                    kind = "calendar";
+                    onCalendar = "daily";
+                    enqueue = {
+                      argv = [ "duplicate-pool-job" ];
+                      pool = [
+                        "stock"
+                        "stock"
+                      ];
+                    };
+                  };
+                };
+              };
+            }
+          ];
+        };
+        invalidPoolSetAttempt = builtins.tryEval (
+          builtins.deepSeq invalidPoolSetNixos.config.system.build.toplevel true
+        );
+        invalidPoolSetMessages = builtins.map (entry: entry.message) (
+          builtins.filter (entry: !entry.assertion) invalidPoolSetNixos.config.assertions
+        );
         forbiddenAttempt =
           module:
           builtins.tryEval (
@@ -604,8 +647,22 @@
               touch "$out"
             '';
           unknown-multi-pool-rejected =
+            assert builtins.any (
+              message: nixpkgs.lib.hasInfix "references unknown pool missing" message
+            ) unknownMultiPoolMessages;
             assert !unknownMultiPoolAttempt.success;
             pkgs.runCommand "tally-unknown-multi-pool-rejected" { } ''
+              touch "$out"
+            '';
+          invalid-pool-sets-rejected =
+            assert builtins.any (
+              message: nixpkgs.lib.hasInfix "requires a non-empty pool set" message
+            ) invalidPoolSetMessages;
+            assert builtins.any (
+              message: nixpkgs.lib.hasInfix "pool set contains duplicates" message
+            ) invalidPoolSetMessages;
+            assert !invalidPoolSetAttempt.success;
+            pkgs.runCommand "tally-invalid-pool-sets-rejected" { } ''
               touch "$out"
             '';
           producer-kind-required =

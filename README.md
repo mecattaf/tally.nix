@@ -2,9 +2,9 @@
 
 **Contention arbitration and verifiable execution evidence for systemd-managed work.**
 
-tally accepts explicitly described jobs, leases the local resources they need, runs them as
-systemd transient units, and appends the outcome to a hash-chained witness ledger. It is useful
-when builds, agents, GPU jobs, or metered API work must not overrun a shared machine.
+tally accepts explicitly described jobs, leases the logical resource gates they need, runs them
+as systemd transient units, and appends the outcome to a hash-chained witness ledger. It is useful
+when builds, agents, GPU jobs, or metered API work must not overrun shared capacity.
 
 The governing rule is:
 
@@ -17,7 +17,7 @@ choose what work should happen next, or replace the program that already makes t
 
 tally provides:
 
-- atomic leases over named local resource pools;
+- atomic leases over named, coordinator-owned resource pools;
 - cooperative priority and optional hard reclaim after a grace period;
 - direct, shell-free execution through `systemd-run`;
 - evidence checks, deduplication, recovery, and durable outcome records;
@@ -27,8 +27,8 @@ tally provides:
 - offline verification of verdict and attestation ledgers.
 
 tally is not a workflow scheduler, remote-execution service, container runtime, secrets manager,
-message bus, terminal manager, or model registry. In particular, a pool and its transient jobs are
-local to one daemon.
+message bus, terminal manager, or model registry. Each logical pool has one coordinator daemon;
+that ownership identifies where contention is arbitrated, not where work is physically placed.
 
 ## Requirements
 
@@ -141,7 +141,14 @@ and supervised producer services.
 ## Resource pools
 
 A job requests one or more named pools. Grants are atomic: either every requested pool admits the
-job or none does. Pool resources are `vram`, `build-slot`, `cpu-slot`, `budget`, and `mutex`.
+job or none does. Repeat `--pool` on the CLI to request more than one. Pool sets are sorted
+lexically before admission and retain that canonical order in durable state, events, queries, and
+witnesses. Pool resources are `vram`, `build-slot`, `cpu-slot`, `budget`, and `mutex`.
+
+The serialized field remains named `pool` for compatibility. Existing singleton configuration,
+wire payloads, Taskwarrior rows, and witness records remain valid and keep their scalar encoding.
+Only a multi-pool request uses the canonical array form (or a JSON array string in string-only
+UDA and environment fields), so multi-pool clients require a daemon with multi-pool support.
 
 Two admission predicates exist:
 
