@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["crates/tally-core", "crates/tally"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Contention arbitration and verifiable execution evidence for systemd-managed work"
+repository = "https://github.com/mecattaf/tally.nix"
+keywords = ["nix", "systemd", "contention", "provenance", "task-runner"]
+
+[workspace.dependencies]
+anyhow = "1.0"
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+clap = { version = "4.5", features = ["derive"] }
+fs2 = "0.4"
+libc = "0.2"
+regex = "1.11"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_json_path = "0.7.2"
+sha2 = "0.10"
+taskchampion = { version = "3.1", default-features = false, features = ["storage-sqlite", "bundled"] }
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["io-util", "macros", "net", "process", "rt", "signal", "sync", "time"] }
+
+[profile.release]
+lto = "thin"
+strip = true

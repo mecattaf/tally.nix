@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+: "${TALLY_TEST_REMOTE_HOST:?TALLY_TEST_REMOTE_HOST is required}"
+: "${TALLY_SCENARIO_ROOT:?TALLY_SCENARIO_ROOT is required}"
+
+unit=""
+attempt=""
+lease_epoch=""
+arguments=("$@")
+for ((index = 0; index < ${#arguments[@]}; index++)); do
+  argument="${arguments[$index]}"
+  case "$argument" in
+    --unit)
+      ((index += 1))
+      unit="${arguments[$index]}"
+      ;;
+    --unit=*)
+      unit="${argument#--unit=}"
+      ;;
+    --setenv)
+      ((index += 1))
+      environment="${arguments[$index]}"
+      case "$environment" in
+        TALLY_ATTEMPT=*) attempt="${environment#TALLY_ATTEMPT=}" ;;
+        TALLY_LEASE_EPOCH=*) lease_epoch="${environment#TALLY_LEASE_EPOCH=}" ;;
+      esac
+      ;;
+    --setenv=*)
+      environment="${argument#--setenv=}"
+      case "$environment" in
+        TALLY_ATTEMPT=*) attempt="${environment#TALLY_ATTEMPT=}" ;;
+        TALLY_LEASE_EPOCH=*) lease_epoch="${environment#TALLY_LEASE_EPOCH=}" ;;
+      esac
+      ;;
+  esac
+done
+unit="${unit%.service}.service"
+
+if [[ "$attempt" == 1 ]]; then
+  [[ "$unit" == tally-job-*.service && "$lease_epoch" =~ ^[1-9][0-9]*$ ]] || exit 71
+  mkdir -p "$TALLY_SCENARIO_ROOT/worker-launch"
+  marker="$TALLY_SCENARIO_ROOT/worker-launch/$unit"
+  printf '%s\n%s\n%s\n' "$$" "$attempt" "$lease_epoch" >"$marker"
+fi
+
+payload="$(printf '%s\0' "$@" | base64 -w0)"
+set +e
+ssh \
+  -o BatchMode=yes \
+  -o ConnectTimeout=2 \
+  -o ConnectionAttempts=1 \
+  "$TALLY_TEST_REMOTE_HOST" \
+  "printf '%s' '$payload' | base64 -d | xargs -0 systemd-run"
+status=$?
+set -e
+
+if [[ "$attempt" == 1 ]]; then
+  # NixOS shutdown can make worker systemd-run --wait return either success or
+  # a transport/unit error after stopping the active service. The harness has
+  # already pinned this as the first, long-lived attempt; hold its reservation
+  # so the explicit pool-loss transition owns the verdict. The represented
+  # attempt 2 must still return zero and copy its durable exit record.
+  exec sleep "${TALLY_SCENARIO_REBOOT_HOLD_SEC:-300}"
+fi
+
+mapfile -t exit_records < <(
+  ssh \
+    -o BatchMode=yes \
+    -o ConnectTimeout=2 \
+    -o ConnectionAttempts=1 \
+    "$TALLY_TEST_REMOTE_HOST" \
+    "find '$TALLY_SCENARIO_ROOT/state/unit-exit' -maxdepth 1 -type f -name '*.json' -print" 2>/dev/null
+)
+for record in "${exit_records[@]}"; do
+  scp \
+    -q \
+    -o BatchMode=yes \
+    -o ConnectTimeout=2 \
+    -o ConnectionAttempts=1 \
+    "$TALLY_TEST_REMOTE_HOST:$record" \
+    "$TALLY_SCENARIO_ROOT/state/unit-exit/"
+done
+
+exit "$status"

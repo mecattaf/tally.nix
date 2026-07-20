@@ -1,0 +1,24 @@
+[package]
+name = "tally-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description.workspace = true
+repository.workspace = true
+keywords.workspace = true
+
+[dependencies]
+chrono.workspace = true
+fs2.workspace = true
+libc.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_json_path.workspace = true
+sha2.workspace = true
+taskchampion.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile = "3.20"

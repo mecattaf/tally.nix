@@ -1,0 +1,699 @@
+{
+  description = "tally: contention and proof for impure labor";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-utils.url = "github:numtide/flake-utils";
+    home-manager = {
+      url = "github:nix-community/home-manager";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  outputs =
+    {
+      self,
+      nixpkgs,
+      flake-utils,
+      home-manager,
+    }:
+    let
+      adapterLibrary = import ./nix/lib/adapters.nix { lib = nixpkgs.lib; };
+      priorityRanks = import ./nix/lib/priority-ranks.nix;
+    in
+    {
+      lib.adapters = adapterLibrary;
+      lib.priorityRanks = priorityRanks;
+      lib.tallyWitnessUnitHooks = {
+        OnSuccess = [ "tally-witness-emit@success:%n.service" ];
+        OnFailure = [ "tally-witness-emit@failure:%n.service" ];
+      };
+      nixosModules.tally = import ./nix/modules/nixos.nix self;
+      homeManagerModules.tally = import ./nix/modules/home-manager.nix self;
+    }
+    // flake-utils.lib.eachDefaultSystem (
+      system:
+      let
+        pkgs = import nixpkgs { inherit system; };
+        adapterConfig = pkgs.writeText "tally-adapter-config.json" (
+          builtins.toJSON {
+            pools = { };
+            adapters = adapterLibrary.presets // {
+              nix-custom = adapterLibrary.mkAdapter {
+                argv = [
+                  "custom-agent"
+                  "--structured"
+                ];
+                resume = [
+                  "custom-agent"
+                  "--resume"
+                  "%<sessionRef>%"
+                ];
+                scrape.sessionRef = adapterLibrary.mkScrapeCapture {
+                  mode = "jsonPath";
+                  pattern = "$.session";
+                };
+                env.CUSTOM_AGENT_MODE = "batch";
+                extraConfig.origin = "pure-nix-check";
+              };
+            };
+          }
+        );
+        producerConfig = pkgs.writeText "tally-producer-config.json" (
+          builtins.toJSON {
+            pools.slot = {
+              resource = "build-slot";
+              capacity = 1;
+            };
+            adapters.shell = adapterLibrary.presets.shell;
+            producers = {
+              daily = {
+                kind = "calendar";
+                onCalendar = "daily";
+                enqueue = {
+                  argv = [ "calendar-job" ];
+                  pool = "slot";
+                  dedupKey = "daily-%Y%m%d";
+                };
+              };
+              drop.kind = "events-dir";
+              github = {
+                kind = "gh";
+                enable = true;
+                sources = [ "notifications" ];
+                postEvidence = true;
+                enqueue = {
+                  argv = [ "gh-job" ];
+                  pool = "slot";
+                };
+              };
+              effects = {
+                kind = "build-effect";
+                watch = "jsonl";
+                path = "/var/empty/tally-effects.jsonl";
+                onKey = {
+                  argv = [ "effect-job" ];
+                  pool = "slot";
+                };
+              };
+              health = {
+                kind = "pool-reachability";
+                probePool = "slot";
+                hysteresis = 3;
+                onLost = {
+                  argv = [ "pool-lost" ];
+                  pool = "slot";
+                };
+                onReturn = {
+                  argv = [ "pool-return" ];
+                  pool = "slot";
+                };
+                onReturnAttest = {
+                  argv = [ "assess-return" ];
+                  pool = "slot";
+                  noEnqueue = true;
+                };
+              };
+            };
+          }
+        );
+        tally = pkgs.rustPlatform.buildRustPackage {
+          pname = "tally";
+          version = "0.1.0";
+          src = self;
+          cargoLock.lockFile = ./Cargo.lock;
+          doCheck = true;
+          nativeCheckInputs = [ pkgs.taskwarrior3 ];
+          postInstall = ''
+            ln -s tally $out/bin/tallyd
+          '';
+          meta.mainProgram = "tally";
+        };
+        tallyWitnessEmit = import ./nix/lib/witness-emitter.nix {
+          lib = pkgs.lib;
+          inherit pkgs;
+          tallyPackage = tally;
+        };
+        stockHome = home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            self.homeManagerModules.tally
+            {
+              home = {
+                username = "tally-stock";
+                homeDirectory = "/tmp/tally-stock-home";
+                stateVersion = "26.11";
+              };
+              services.tally = {
+                enable = true;
+                pools = {
+                  stock = {
+                    resource = "build-slot";
+                    enforce = "cooperative";
+                  };
+                  programmatic = {
+                    resource = "budget";
+                    predicate.windowed-consumption = {
+                      windowSec = 604800;
+                      consumptionCap = 18000;
+                    };
+                    usageMeter.argv = [
+                      "${pkgs.coreutils}/bin/sleep"
+                      "infinity"
+                    ];
+                    credentials.METER_TOKEN = "/run/credentials/tally-meter";
+                  };
+                };
+                adapters.project-codex = {
+                  argv = [
+                    "codex"
+                    "exec"
+                    "-C"
+                    "/work/project"
+                    "--json"
+                    "--"
+                  ];
+                  resume = [
+                    "codex"
+                    "resume"
+                    "%<sessionRef>%"
+                    "--model"
+                    "%<model>%"
+                    "--"
+                  ];
+                  scrape.sessionRef = {
+                    mode = "jsonPath";
+                    pattern = "$..thread_id";
+                  };
+                  scrape.model = {
+                    mode = "jsonPath";
+                    pattern = "$..model";
+                  };
+                };
+                producers = {
+                  daily = {
+                    kind = "calendar";
+                    onCalendar = "daily";
+                    credentials.PRODUCER_TOKEN = "/run/credentials/tally-producer";
+                    enqueue = {
+                      argv = [ "calendar-job" ];
+                      pool = "stock";
+                      credentials.JOB_TOKEN = "/run/credentials/tally-job";
+                    };
+                  };
+                  effects = {
+                    kind = "build-effect";
+                    watch = "jsonl";
+                    path = "/var/empty/tally-effects.jsonl";
+                    onKey = {
+                      argv = [ "effect-job" ];
+                      pool = "stock";
+                    };
+                  };
+                  health = {
+                    kind = "pool-reachability";
+                    probePool = "stock";
+                    onReturnAttest = {
+                      argv = [ "assess-return" ];
+                      pool = "stock";
+                      noEnqueue = true;
+                    };
+                  };
+                  github = {
+                    kind = "gh";
+                    enable = true;
+                    sources = [ "notifications" ];
+                    enqueue = {
+                      argv = [ "gh-job" ];
+                      pool = "stock";
+                    };
+                  };
+                  drop.kind = "events-dir";
+                };
+              };
+            }
+          ];
+        };
+        disabledHome = home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            self.homeManagerModules.tally
+            {
+              home = {
+                username = "tally-disabled";
+                homeDirectory = "/tmp/tally-disabled-home";
+                stateVersion = "26.11";
+              };
+              services.tally.enable = false;
+            }
+          ];
+        };
+        invalidProducerHome = home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            self.homeManagerModules.tally
+            {
+              home = {
+                username = "tally-invalid-producer";
+                homeDirectory = "/tmp/tally-invalid-producer-home";
+                stateVersion = "26.11";
+              };
+              services.tally = {
+                enable = true;
+                producers = {
+                  missing = { };
+                  misspelled.kind = "event-directory";
+                };
+              };
+            }
+          ];
+        };
+        moduleCommon = import ./nix/modules/common.nix {
+          inherit self pkgs;
+          lib = pkgs.lib;
+        };
+        invalidProducerSchema = pkgs.lib.evalModules {
+          modules = [
+            {
+              options.services.tally = moduleCommon.mkOptions {
+                defaultPackage = tally;
+                defaultDataDir = "/tmp/tally-data";
+                defaultStateDir = "/tmp/tally-state";
+              };
+              config.services.tally.producers = {
+                missing = { };
+                misspelled.kind = "event-directory";
+              };
+            }
+          ];
+        };
+        invalidProducerAssertions = builtins.filter (entry: !entry.assertion) (
+          moduleCommon.mkAssertions invalidProducerSchema.config.services.tally
+        );
+        invalidProducerMessages = map (entry: entry.message) invalidProducerAssertions;
+        invalidProducerAttempt = builtins.tryEval (
+          builtins.deepSeq invalidProducerHome.activationPackage true
+        );
+        nixosBase = {
+          system.stateVersion = "26.11";
+          boot.loader.grub.enable = false;
+          fileSystems."/" = {
+            device = "none";
+            fsType = "tmpfs";
+          };
+        };
+        stockNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            {
+              services.tally = {
+                enable = true;
+                pools.stock = {
+                  resource = "build-slot";
+                  enforce = "cooperative";
+                };
+              };
+            }
+          ];
+        };
+        stockHostTest = pkgs.testers.runNixOSTest {
+          name = "tally-stock-host-activation";
+          nodes.machine =
+            { ... }:
+            {
+              imports = [
+                self.nixosModules.tally
+                home-manager.nixosModules.home-manager
+              ];
+
+              system.stateVersion = "26.11";
+              users.users.tally = {
+                isNormalUser = true;
+                uid = 1000;
+                createHome = true;
+                home = "/var/lib/tally-test-user";
+              };
+
+              services.tally = {
+                enable = true;
+                pools.stock = {
+                  resource = "build-slot";
+                  enforce = "cooperative";
+                };
+              };
+
+              home-manager = {
+                useGlobalPkgs = true;
+                useUserPackages = true;
+                users.tally = {
+                  imports = [ self.homeManagerModules.tally ];
+                  home = {
+                    username = "tally";
+                    homeDirectory = "/var/lib/tally-test-user";
+                    stateVersion = "26.11";
+                  };
+                  services.tally = {
+                    enable = true;
+                    pools.stock = {
+                      resource = "build-slot";
+                      enforce = "cooperative";
+                    };
+                    producers.drop.kind = "events-dir";
+                  };
+                };
+              };
+            };
+          testScript = ''
+            machine.start()
+            machine.wait_for_unit("multi-user.target")
+            machine.wait_for_unit("tally-daemon.service")
+            machine.succeed("systemctl is-active tally-daemon.service")
+            machine.succeed("test -d /var/lib/tally")
+            machine.succeed("test -d /var/log/tally")
+            machine.succeed("grep -F '\"enforce\":\"cooperative\"' /etc/tally/config.json")
+
+            machine.wait_for_unit("home-manager-tally.service")
+            machine.succeed("loginctl enable-linger tally")
+            machine.succeed("systemctl start user@1000.service")
+            machine.wait_until_succeeds(
+              "runuser -u tally -- env HOME=/var/lib/tally-test-user XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active tally-daemon.service"
+            )
+            machine.succeed("test -S /run/user/1000/tally/tally.sock")
+
+            user = "runuser -u tally -- env HOME=/var/lib/tally-test-user XDG_RUNTIME_DIR=/run/user/1000"
+            machine.wait_until_succeeds(
+              user + " systemctl --user show tally-clean-removed-producers.service --property=ExecMainStartTimestampMonotonic --value | grep -E '^[1-9][0-9]*$'"
+            )
+            machine.wait_until_succeeds(
+              user + " systemctl --user show tally-producer-drop.timer --property=LastTriggerUSec --value | grep -Ev '^(|n/a)$'"
+            )
+            machine.wait_until_succeeds(
+              user + " journalctl --user --unit=tally-producer-drop.service --output=cat --no-pager | grep -F '\"barrier\":\"barrier:drain:' | grep -F '\"rejected\":0'"
+            )
+            machine.wait_until_succeeds(
+              user + " systemctl --user show tally-drain.timer --property=LastTriggerUSec --value | grep -Ev '^(|n/a)$'"
+            )
+            machine.wait_until_succeeds(
+              user + " journalctl --user --unit=tally-drain.service --output=cat --no-pager | grep -F '\"barrier\":\"barrier:drain:' | grep -F '\"rejected\":0'"
+            )
+          '';
+        };
+        badPoolNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            {
+              services.tally = {
+                enable = true;
+                pools = {
+                  bad-vram = {
+                    resource = "build-slot";
+                    capacity = 2;
+                    budgetGb = 8;
+                  };
+                  bad-mutex = {
+                    resource = "mutex";
+                    capacity = 2;
+                  };
+                };
+              };
+            }
+          ];
+        };
+        badPoolAttempt = builtins.tryEval (builtins.deepSeq badPoolNixos.config.system.build.toplevel true);
+        forbiddenAttempt =
+          module:
+          builtins.tryEval (
+            builtins.deepSeq
+              (nixpkgs.lib.nixosSystem {
+                inherit system;
+                modules = [
+                  self.nixosModules.tally
+                  nixosBase
+                  {
+                    services.tally.enable = true;
+                  }
+                  module
+                ];
+              }).config.system.build.toplevel
+              true
+          );
+        forbiddenAttempts = [
+          (forbiddenAttempt { services.tally.pools.stock.enforce = "dmem"; })
+          (forbiddenAttempt { services.tally.pools.stock.enforce = "dmemcg-booster"; })
+          (forbiddenAttempt { services.tally.pools.stock.remote.host = "worker"; })
+          (forbiddenAttempt { services.tally.pools.stock.servingSlice = "worker.slice"; })
+          (forbiddenAttempt { services.tally.patchedSystemd.enable = true; })
+          (forbiddenAttempt { services.tally.lease.remoteHeartbeatSec = 15; })
+          (forbiddenAttempt { services.tally.lease.remoteReapSec = 45; })
+          (forbiddenAttempt { services.tally.conductorHost = "example-host"; })
+        ];
+        homeServices = stockHome.config.systemd.user.services;
+        homeTimers = stockHome.config.systemd.user.timers;
+        homeServiceExec =
+          name:
+          let
+            value = homeServices.${name}.Service.ExecStart;
+          in
+          if builtins.isList value then builtins.head value else value;
+        checkedHomeConfig = stockHome.config.xdg.configFile."tally/config.json".source;
+        systemDaemon = stockNixos.config.systemd.services.tally-daemon;
+        systemWitnessEmitter = stockNixos.config.systemd.services."tally-witness-emit@";
+        moduleContract =
+          assert homeTimers ? tally-producer-daily;
+          assert homeTimers.tally-producer-daily.Timer.OnCalendar == "daily";
+          assert homeServices.tally-producer-health.Service.Restart == "always";
+          assert homeServices.tally-producer-health.Unit.StartLimitIntervalSec == 0;
+          assert homeServices.tally-producer-effects.Service.Restart == "always";
+          assert homeServices.tally-producer-effects.Unit.StartLimitIntervalSec == 0;
+          assert homeServices.tally-producer-github.Service.Restart == "always";
+          assert homeServices.tally-producer-github.Unit.StartLimitIntervalSec == 0;
+          assert homeTimers ? tally-producer-drop;
+          assert homeTimers.tally-producer-drop.Timer.OnActiveSec == "1s";
+          assert homeTimers.tally-producer-drop.Timer.OnUnitActiveSec == "60s";
+          assert homeTimers.tally-drain.Timer.OnActiveSec == "1s";
+          assert homeTimers.tally-drain.Timer.OnUnitActiveSec == "5s";
+          assert homeServices ? tally-meter-programmatic;
+          assert homeServices.tally-meter-programmatic.Service.Restart == "always";
+          assert homeServices.tally-meter-programmatic.Unit.StartLimitIntervalSec == 0;
+          assert builtins.elem "TALLY_METER_BUDGET_CLASS=programmatic"
+            homeServices.tally-meter-programmatic.Service.Environment;
+          assert builtins.elem "TALLY_METER_POOL=programmatic"
+            homeServices.tally-meter-programmatic.Service.Environment;
+          assert builtins.elem "TALLY_METER_POLL_INTERVAL_SEC=120"
+            homeServices.tally-meter-programmatic.Service.Environment;
+          assert builtins.any (pkgs.lib.hasPrefix "TALLY_METER_EVENT_PATH=")
+            homeServices.tally-meter-programmatic.Service.Environment;
+          assert builtins.elem "METER_TOKEN:/run/credentials/tally-meter"
+            homeServices.tally-meter-programmatic.Service.LoadCredential;
+          assert builtins.elem "PRODUCER_TOKEN:/run/credentials/tally-producer"
+            homeServices.tally-producer-daily.Service.LoadCredential;
+          assert homeServices ? tally-clean-removed-producers;
+          assert !(homeServices.tally-clean-removed-producers.Unit ? Before);
+          assert disabledHome.config.home.activation ? tallyCleanRemovedProducers;
+          assert homeServices ? "tally-witness-emit@";
+          assert builtins.elem
+            "TALLY_ATTESTATION_LEDGER=/tmp/tally-stock-home/.local/share/tally/attestations.jsonl"
+            homeServices."tally-witness-emit@".Service.Environment;
+          assert builtins.elem tallyWitnessEmit stockHome.config.home.packages;
+          assert builtins.elem tallyWitnessEmit stockNixos.config.environment.systemPackages;
+          assert builtins.elem "TALLY_ATTESTATION_LEDGER=/var/lib/tally/data/attestations.jsonl"
+            systemWitnessEmitter.serviceConfig.Environment;
+          assert systemDaemon.serviceConfig.StateDirectory == "tally";
+          assert systemDaemon.serviceConfig.LogsDirectory == "tally";
+          assert !(systemDaemon.serviceConfig ? Delegate);
+          assert builtins.all (
+            service: !(service.Service ? Delegate) && !(service.Service ? DeviceMemoryMax)
+          ) (builtins.attrValues homeServices);
+          assert
+            self.lib.tallyWitnessUnitHooks.OnSuccess == [
+              "tally-witness-emit@success:%n.service"
+            ];
+          assert
+            self.lib.tallyWitnessUnitHooks.OnFailure == [
+              "tally-witness-emit@failure:%n.service"
+            ];
+          pkgs.runCommand "tally-module-contract" { nativeBuildInputs = [ pkgs.jq ]; } ''
+            grep -F -- '__producer-dispatch' ${homeServiceExec "tally-producer-daily"}
+            grep -F -- '"kind":"calendar"' ${homeServiceExec "tally-producer-daily"}
+            grep -F -- 'XDG_RUNTIME_DIR' ${homeServiceExec "tally-producer-daily"}
+            if grep -F -- '%t/tally/tally.sock' ${homeServiceExec "tally-producer-daily"}; then
+              echo 'producer script contains an unexpanded systemd specifier' >&2
+              exit 1
+            fi
+            grep -F -- '__producer-dispatch' ${homeServiceExec "tally-producer-health"}
+            grep -F -- 'pool-reachability' ${homeServiceExec "tally-producer-health"}
+            grep -F -- 'systemctl --user stop "$unit"' ${homeServiceExec "tally-clean-removed-producers"}
+            grep -F -- 'witness append --ledger "$ledger" --payload "$payload"' \
+              ${tallyWitnessEmit}/bin/tally-witness-emit
+            jq -e '
+              .enqueue.depthCap == 3 and
+              .enqueue.fanoutCap == 64 and
+              .lease.yieldGraceSec == 20 and
+              .pools.stock.enforce == "cooperative" and
+              .pools.programmatic.usageMeter.budgetClass == "programmatic" and
+              .pools.programmatic.credentials.METER_TOKEN == "/run/credentials/tally-meter" and
+              .producers.daily.enqueue.credentials.JOB_TOKEN == "/run/credentials/tally-job" and
+              .producers.health.onReturnAttest.noEnqueue == true and
+              .adapters["project-codex"].argv == ["codex", "exec", "-C", "/work/project", "--json", "--"] and
+              ([.. | objects | keys[]] | any(. == "remote" or . == "servingSlice" or . == "patchedSystemd") | not)
+            ' ${checkedHomeConfig}
+            touch "$out"
+          '';
+      in
+      {
+        packages = {
+          inherit tally;
+          tally-witness-emit = tallyWitnessEmit;
+          default = tally;
+        };
+        apps = {
+          default = flake-utils.lib.mkApp { drv = tally; };
+          dev = {
+            type = "app";
+            program = "${pkgs.writeShellScript "tally-dev" ''
+              exec ${tally}/bin/tally daemon run --mock
+            ''}";
+          };
+        };
+        checks = {
+          inherit tally;
+          stock-home-activation = stockHome.activationPackage;
+          stock-nixos-activation = stockNixos.config.system.build.toplevel;
+          stock-host-activation = stockHostTest;
+          module-layer = moduleContract;
+          bad-pool-rejected =
+            assert !badPoolAttempt.success;
+            pkgs.runCommand "tally-bad-pool-rejected" { } ''
+              touch "$out"
+            '';
+          producer-kind-required =
+            assert builtins.elem
+              "tally producer missing requires an explicit kind; expected one of calendar, build-effect, pool-reachability, gh, events-dir"
+              invalidProducerMessages;
+            assert builtins.elem
+              ''tally producer misspelled has unknown kind "event-directory"; expected one of calendar, build-effect, pool-reachability, gh, events-dir''
+              invalidProducerMessages;
+            assert !invalidProducerAttempt.success;
+            pkgs.runCommand "tally-producer-kind-required" { } ''
+              touch "$out"
+            '';
+          forbidden-options-absent =
+            assert builtins.all (attempt: !attempt.success) forbiddenAttempts;
+            pkgs.runCommand "tally-forbidden-options-absent" { } ''
+              touch "$out"
+            '';
+          malformed-config-rejected = pkgs.runCommand "tally-malformed-config-rejected" { } ''
+            printf '{"pools":{"bad":{"capacity":0}}}' > bad.json
+            if ${tally}/bin/tally --mode check-config --config bad.json; then
+              echo "malformed config was accepted" >&2
+              exit 1
+            fi
+            touch $out
+          '';
+          adapter-presets = pkgs.runCommand "tally-adapter-presets" { nativeBuildInputs = [ pkgs.jq ]; } ''
+            ${tally}/bin/tally --mode check-config --config ${adapterConfig}
+            grep -F '"nix-custom"' ${adapterConfig} >/dev/null
+            grep -F '"claude-code"' ${adapterConfig} >/dev/null
+            grep -F '"codex"' ${adapterConfig} >/dev/null
+            grep -F '"pi"' ${adapterConfig} >/dev/null
+            grep -F '"shell"' ${adapterConfig} >/dev/null
+            test "$(jq -c '.adapters.pi.argv' ${adapterConfig})" = '["pi","--mode","json","--"]'
+            test "$(jq -c '.adapters.pi.resume' ${adapterConfig})" = '["pi","--mode","json","--session","%<sessionRef>%","--model","%<model>%","--"]'
+            test "$(jq -c '.adapters["claude-code"].argv' ${adapterConfig})" = '["claude","--print","--verbose","--output-format","stream-json","--"]'
+            test "$(jq -c '.adapters["claude-code"].resume' ${adapterConfig})" = '["claude","--resume","%<sessionRef>%","--model","%<model>%","--print","--verbose","--output-format","stream-json","--"]'
+            test "$(jq -c '.adapters.codex.argv' ${adapterConfig})" = '["codex","exec","--json","--"]'
+            test "$(jq -c '.adapters.codex.resume' ${adapterConfig})" = '["codex","resume","%<sessionRef>%","--model","%<model>%","--"]'
+            test "$(jq -c '.adapters.shell' ${adapterConfig})" = '{"argv":[],"env":{},"extraConfig":{},"resume":null,"scrape":{},"yieldHook":null}'
+            for preset in pi claude-code codex; do
+              test "$(jq -c --arg preset "$preset" '.adapters[$preset].yieldHook' ${adapterConfig})" = '["tally","lease","status"]'
+              test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.sessionRef.mode' ${adapterConfig})" = jsonPath
+              test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.model.mode' ${adapterConfig})" = jsonPath
+              test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.usage.mode' ${adapterConfig})" = jsonPath
+            done
+            test "$(jq -r '.adapters.pi.scrape.sessionRef.pattern' ${adapterConfig})" = '$.id'
+            test "$(jq -r '.adapters["claude-code"].scrape.sessionRef.pattern' ${adapterConfig})" = '$..session_id'
+            test "$(jq -r '.adapters.codex.scrape.sessionRef.pattern' ${adapterConfig})" = '$..thread_id'
+            test "$(jq -r '.adapters.codex.extraConfig.modelFlag' ${adapterConfig})" = '--model'
+            test "$(jq -r '.adapters["nix-custom"].env.CUSTOM_AGENT_MODE' ${adapterConfig})" = batch
+            launch="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render nix-custom -- 'payload arg' "")"
+            test "$(printf '%s' "$launch" | jq -c '.argv')" = '["custom-agent","--structured","payload arg",""]'
+            test "$(printf '%s' "$launch" | jq -r '.env.CUSTOM_AGENT_MODE')" = batch
+            resume="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render nix-custom --captures '{"sessionRef":"nix-session"}' -- '--option-looking')"
+            test "$(printf '%s' "$resume" | jq -c '.argv')" = '["custom-agent","--resume","nix-session","--option-looking"]'
+            : > empty.err
+            printf '%s\n' \
+              '{"type":"session","id":"pi-session","model":"Pi/Exact.Model"}' \
+              '{"type":"message","model":"Pi/Exact.Model","usage":{"input_tokens":11}}' > pi.jsonl
+            pi_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render pi --scrape-stdout "$PWD/pi.jsonl" --scrape-stderr "$PWD/empty.err" -- work)"
+            test "$(printf '%s' "$pi_render" | jq -c '.argv')" = '["pi","--mode","json","--session","pi-session","--model","Pi/Exact.Model","--","work"]'
+            test "$(printf '%s' "$pi_render" | jq -c '.captures.usage')" = '{"input_tokens":11}'
+            printf '%s\n' \
+              '{"type":"system","subtype":"init","session_id":"claude-session","model":"Claude/Exact.Model"}' \
+              '{"type":"assistant","message":{"model":"Claude/Exact.Model","usage":{"input_tokens":12}}}' > claude.jsonl
+            claude_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render claude-code --scrape-stdout "$PWD/claude.jsonl" --scrape-stderr "$PWD/empty.err" -- work)"
+            test "$(printf '%s' "$claude_render" | jq -c '.argv')" = '["claude","--resume","claude-session","--model","Claude/Exact.Model","--print","--verbose","--output-format","stream-json","--","work"]'
+            test "$(printf '%s' "$claude_render" | jq -c '.captures.usage')" = '{"input_tokens":12}'
+            printf '%s\n' \
+              '{"type":"thread.started","thread_id":"codex-thread","model":"Codex/Exact.Model"}' \
+              '{"type":"turn.completed","model":"Codex/Exact.Model","usage":{"input_tokens":13}}' > codex.jsonl
+            codex_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render codex --scrape-stdout "$PWD/codex.jsonl" --scrape-stderr "$PWD/empty.err" -- work)"
+            test "$(printf '%s' "$codex_render" | jq -c '.argv')" = '["codex","resume","codex-thread","--model","Codex/Exact.Model","--","work"]'
+            test "$(printf '%s' "$codex_render" | jq -c '.captures.usage')" = '{"input_tokens":13}'
+            touch $out
+          '';
+          producer-registry =
+            pkgs.runCommand "tally-producer-registry" { nativeBuildInputs = [ pkgs.jq ]; }
+              ''
+                ${tally}/bin/tally --mode check-config --config ${producerConfig}
+                test "$(jq -r '.producers | keys | join(",")' ${producerConfig})" = 'daily,drop,effects,github,health'
+                test "$(jq -r '[.producers[] | select(has("pool") or has("priority") or has("adapter"))] | length' ${producerConfig})" = 0
+                producer_state="$PWD/state"
+                daily="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch daily --state-dir "$producer_state" --event '{"kind":"calendar"}')"
+                test "$(printf '%s' "$daily" | jq -r 'keys[0]')" = emitted
+                own="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event '{"kind":"gh","source":"notifications","itemId":"PR-self","actor":"tally-bot","selfActor":"tally-bot"}')"
+                test "$(printf '%s' "$own" | jq -r '.')" = filtered
+                gh="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event '{"kind":"gh","source":"notifications","itemId":"PR-1","actor":"contributor","selfActor":"tally-bot"}')"
+                test "$(printf '%s' "$gh" | jq -r 'keys[0]')" = emitted
+                effect="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"
+                test "$(printf '%s' "$effect" | jq -r '.[0] | keys[0]')" = emitted
+                duplicate="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"
+                test "$(printf '%s' "$duplicate" | jq -r '.[0]')" = duplicate
+                for probe in 1 2; do
+                  lost="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --event '{"kind":"pool-reachability","reachable":false}')"
+                  test "$(printf '%s' "$lost" | jq -r '.transition')" = null
+                done
+                lost="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --event '{"kind":"pool-reachability","reachable":false}')"
+                test "$(printf '%s' "$lost" | jq -r '.transition')" = lost
+                test "$(printf '%s' "$lost" | jq -r '.emitted | length')" = 1
+                for probe in 1 2; do
+                  returned="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --event '{"kind":"pool-reachability","reachable":true}')"
+                  test "$(printf '%s' "$returned" | jq -r '.transition')" = null
+                done
+                returned="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --event '{"kind":"pool-reachability","reachable":true}')"
+                test "$(printf '%s' "$returned" | jq -r '.transition')" = returned
+                test "$(printf '%s' "$returned" | jq -r '.emitted | length')" = 2
+                find "$producer_state/events" -maxdepth 1 -name '*.producer.json' -print0 \
+                  | xargs -0 jq -s 'map(select(.noEnqueue == true)) | length == 1' \
+                  | grep -Fx true >/dev/null
+                touch $out
+              '';
+        };
+        devShells.default = pkgs.mkShell {
+          packages = with pkgs; [
+            cargo
+            clippy
+            jq
+            rustc
+            rustfmt
+            sqlite
+            taskwarrior3
+          ];
+        };
+        formatter = pkgs.nixfmt-rfc-style;
+      }
+    );
+}

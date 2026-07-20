@@ -1,0 +1,1154 @@
+use std::io::Write;
+use std::os::unix::net::UnixDatagram;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
+
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
+use thiserror::Error;
+
+use crate::config::Priority;
+use crate::taskdb::EnqueueSource;
+use crate::witness::LaborClass;
+
+pub const JOURNAL_SOCKET: &str = "/run/systemd/journal/socket";
+pub const JOURNAL_IDENTIFIER: &str = "tally";
+pub const MAX_NATIVE_RECORD_BYTES: usize = 64 * 1024;
+// Includes the trailing newline and therefore stays below journald's default
+// 48 KiB LineMax for the JSON payload itself.
+pub const MAX_STDOUT_RECORD_BYTES: usize = 48 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TallyEvent {
+    Enqueued,
+    Dispatched,
+    Started,
+    Heartbeat,
+    Preempted,
+    Resumed,
+    Completed,
+    Failed,
+    EvidencePass,
+    EvidenceFail,
+    WitnessEmitted,
+}
+
+pub const TALLY_EVENTS: &[TallyEvent] = &[
+    TallyEvent::Enqueued,
+    TallyEvent::Dispatched,
+    TallyEvent::Started,
+    TallyEvent::Heartbeat,
+    TallyEvent::Preempted,
+    TallyEvent::Resumed,
+    TallyEvent::Completed,
+    TallyEvent::Failed,
+    TallyEvent::EvidencePass,
+    TallyEvent::EvidenceFail,
+    TallyEvent::WitnessEmitted,
+];
+
+impl TallyEvent {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enqueued => "enqueued",
+            Self::Dispatched => "dispatched",
+            Self::Started => "started",
+            Self::Heartbeat => "heartbeat",
+            Self::Preempted => "preempted",
+            Self::Resumed => "resumed",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::EvidencePass => "evidence_pass",
+            Self::EvidenceFail => "evidence_fail",
+            Self::WitnessEmitted => "witness_emitted",
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Enqueued => 0,
+            Self::Dispatched => 1,
+            Self::Started => 2,
+            Self::Heartbeat => 3,
+            Self::Preempted => 4,
+            Self::Resumed => 5,
+            Self::Completed => 6,
+            Self::Failed => 7,
+            Self::EvidencePass => 8,
+            Self::EvidenceFail => 9,
+            Self::WitnessEmitted => 10,
+        }
+    }
+
+    pub const fn is_evidence(self) -> bool {
+        matches!(self, Self::EvidencePass | Self::EvidenceFail)
+    }
+}
+
+impl std::fmt::Display for TallyEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for TallyEvent {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "enqueued" => Ok(Self::Enqueued),
+            "dispatched" => Ok(Self::Dispatched),
+            "started" => Ok(Self::Started),
+            "heartbeat" => Ok(Self::Heartbeat),
+            "preempted" => Ok(Self::Preempted),
+            "resumed" => Ok(Self::Resumed),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "evidence_pass" => Ok(Self::EvidencePass),
+            "evidence_fail" => Ok(Self::EvidenceFail),
+            "witness_emitted" => Ok(Self::WitnessEmitted),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldRequirement {
+    Always,
+    AtDispatch,
+    AtStart,
+    AtCompleted,
+    AtCompletedOrFailed,
+    AtEvidence,
+    Conditional,
+}
+
+pub const TALLY_FIELD_MATRIX: &[(&str, FieldRequirement)] = &[
+    ("SYSLOG_IDENTIFIER", FieldRequirement::Always),
+    ("TALLY_EVENT", FieldRequirement::Always),
+    ("TALLY_TASK_UUID", FieldRequirement::Always),
+    ("TALLY_CLASS", FieldRequirement::Always),
+    ("TALLY_SOURCE", FieldRequirement::Always),
+    ("MESSAGE", FieldRequirement::Always),
+    ("TALLY_AGENT", FieldRequirement::AtDispatch),
+    ("TALLY_ATTEMPT", FieldRequirement::AtDispatch),
+    ("TALLY_LEASE_EPOCH", FieldRequirement::AtDispatch),
+    ("TALLY_UNIT", FieldRequirement::AtStart),
+    ("TALLY_SESSION_REF", FieldRequirement::Conditional),
+    ("TALLY_EXIT_CODE", FieldRequirement::AtCompletedOrFailed),
+    ("TALLY_GPU_SECONDS", FieldRequirement::AtCompletedOrFailed),
+    ("TALLY_LABOR_CLASS", FieldRequirement::AtCompletedOrFailed),
+    ("TALLY_ARTIFACT_HASH", FieldRequirement::AtCompleted),
+    ("TALLY_EVIDENCE", FieldRequirement::AtEvidence),
+    ("TALLY_JOB_ID", FieldRequirement::Conditional),
+    ("TALLY_PARENT", FieldRequirement::Conditional),
+    ("TALLY_POOL", FieldRequirement::Conditional),
+];
+
+pub fn tally_agent_label(adapter: &str) -> Result<String, JournalError> {
+    if adapter.trim().is_empty() || adapter.chars().any(char::is_control) {
+        return Err(JournalError::Invalid(
+            "agent adapter label must be non-empty and contain no control characters".to_owned(),
+        ));
+    }
+    Ok(match adapter {
+        "claude-code" => "cc".to_owned(),
+        other => other.to_owned(),
+    })
+}
+
+pub fn adapter_from_tally_agent(label: &str) -> Result<String, JournalError> {
+    if label.trim().is_empty() || label.chars().any(char::is_control) {
+        return Err(JournalError::Invalid(
+            "TALLY_AGENT must be non-empty and contain no control characters".to_owned(),
+        ));
+    }
+    Ok(match label {
+        "cc" => "claude-code".to_owned(),
+        other => other.to_owned(),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TallyFields {
+    #[serde(rename = "SYSLOG_IDENTIFIER")]
+    pub syslog_identifier: String,
+    #[serde(rename = "TALLY_EVENT")]
+    pub event: TallyEvent,
+    #[serde(rename = "TALLY_TASK_UUID")]
+    pub task_uuid: String,
+    #[serde(rename = "TALLY_CLASS")]
+    pub class: Priority,
+    #[serde(rename = "TALLY_SOURCE")]
+    pub source: EnqueueSource,
+    #[serde(rename = "MESSAGE")]
+    pub message: String,
+    #[serde(rename = "TALLY_AGENT", skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(rename = "TALLY_SESSION_REF", skip_serializing_if = "Option::is_none")]
+    pub session_ref: Option<String>,
+    #[serde(rename = "TALLY_UNIT", skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    #[serde(rename = "TALLY_EXIT_CODE", skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    #[serde(rename = "TALLY_GPU_SECONDS", skip_serializing_if = "Option::is_none")]
+    pub gpu_seconds: Option<f64>,
+    #[serde(
+        rename = "TALLY_ARTIFACT_HASH",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub artifact_hash: Option<String>,
+    #[serde(rename = "TALLY_EVIDENCE", skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
+    #[serde(rename = "TALLY_ATTEMPT", skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<u32>,
+    #[serde(rename = "TALLY_LEASE_EPOCH", skip_serializing_if = "Option::is_none")]
+    pub lease_epoch: Option<u64>,
+    #[serde(rename = "TALLY_LABOR_CLASS", skip_serializing_if = "Option::is_none")]
+    pub labor_class: Option<LaborClass>,
+    #[serde(rename = "TALLY_JOB_ID", skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    #[serde(rename = "TALLY_PARENT", skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    #[serde(rename = "TALLY_POOL", skip_serializing_if = "Option::is_none")]
+    pub pool: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmitEvent {
+    pub event: TallyEvent,
+    pub task_uuid: String,
+    pub class: Priority,
+    pub source: EnqueueSource,
+    pub message: Option<String>,
+    pub agent: Option<String>,
+    pub session_ref: Option<String>,
+    pub unit: Option<String>,
+    pub exit_code: Option<i32>,
+    pub gpu_seconds: Option<f64>,
+    pub artifact_hash: Option<String>,
+    pub evidence: Option<String>,
+    pub attempt: Option<u32>,
+    pub lease_epoch: Option<u64>,
+    pub labor_class: Option<LaborClass>,
+    pub job_id: Option<String>,
+    pub parent: Option<String>,
+    pub pool: Option<String>,
+}
+
+impl EmitEvent {
+    pub fn enqueued(task_uuid: impl Into<String>, class: Priority, source: EnqueueSource) -> Self {
+        Self {
+            event: TallyEvent::Enqueued,
+            task_uuid: task_uuid.into(),
+            class,
+            source,
+            message: None,
+            agent: None,
+            session_ref: None,
+            unit: None,
+            exit_code: None,
+            gpu_seconds: None,
+            artifact_hash: None,
+            evidence: None,
+            attempt: None,
+            lease_epoch: None,
+            labor_class: None,
+            job_id: None,
+            parent: None,
+            pool: None,
+        }
+    }
+
+    pub fn into_fields(self) -> Result<TallyFields, JournalError> {
+        let message = self
+            .message
+            .clone()
+            .unwrap_or_else(|| synthesize_message(&self));
+        let fields = TallyFields {
+            syslog_identifier: JOURNAL_IDENTIFIER.to_owned(),
+            event: self.event,
+            task_uuid: self.task_uuid,
+            class: self.class,
+            source: self.source,
+            message,
+            agent: self.agent,
+            session_ref: self.session_ref,
+            unit: self.unit,
+            exit_code: self.exit_code,
+            gpu_seconds: self.gpu_seconds,
+            artifact_hash: self.artifact_hash,
+            evidence: self.evidence,
+            attempt: self.attempt,
+            lease_epoch: self.lease_epoch,
+            labor_class: self.labor_class,
+            job_id: self.job_id,
+            parent: self.parent,
+            pool: self.pool,
+        };
+        validate_fields(&fields)?;
+        Ok(fields)
+    }
+}
+
+fn synthesize_message(event: &EmitEvent) -> String {
+    let mut parts = vec![event.event.to_string(), event.task_uuid.clone()];
+    match event.event {
+        TallyEvent::Completed | TallyEvent::Failed => {
+            if let Some(exit_code) = event.exit_code {
+                parts.push(format!("exit={exit_code}"));
+            }
+            if let Some(gpu_seconds) = event.gpu_seconds {
+                parts.push(format!("gpu={gpu_seconds}s"));
+            }
+        }
+        TallyEvent::EvidencePass | TallyEvent::EvidenceFail => {
+            if let Some(evidence) = &event.evidence {
+                parts.push(evidence.clone());
+            }
+        }
+        TallyEvent::Dispatched | TallyEvent::Started => {
+            if let Some(unit) = &event.unit {
+                parts.push(unit.clone());
+            }
+            if let Some(attempt) = event.attempt {
+                parts.push(format!("attempt={attempt}"));
+            }
+        }
+        _ => {}
+    }
+    parts.join(" ")
+}
+
+#[derive(Debug, Error)]
+pub enum JournalError {
+    #[error("invalid journal record: {0}")]
+    Invalid(String),
+    #[error("journal JSON error: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("journal {action} failed at {path}: {source}")]
+    Io {
+        action: &'static str,
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("journal record is {size} bytes, exceeding the {limit}-byte limit")]
+    TooLarge { size: usize, limit: usize },
+    #[error("journald accepted only {sent} of {expected} datagram bytes")]
+    ShortDatagram { sent: usize, expected: usize },
+}
+
+fn required(requirement: FieldRequirement, event: TallyEvent) -> bool {
+    match requirement {
+        FieldRequirement::Always => true,
+        FieldRequirement::AtDispatch => event.rank() >= TallyEvent::Dispatched.rank(),
+        FieldRequirement::AtStart => event.rank() >= TallyEvent::Started.rank(),
+        FieldRequirement::AtCompleted => event == TallyEvent::Completed,
+        FieldRequirement::AtCompletedOrFailed => {
+            matches!(event, TallyEvent::Completed | TallyEvent::Failed)
+        }
+        FieldRequirement::AtEvidence => event.is_evidence(),
+        FieldRequirement::Conditional => false,
+    }
+}
+
+fn field_present(fields: &TallyFields, name: &str) -> bool {
+    match name {
+        "SYSLOG_IDENTIFIER" => !fields.syslog_identifier.is_empty(),
+        "TALLY_EVENT" | "TALLY_CLASS" | "TALLY_SOURCE" => true,
+        "TALLY_TASK_UUID" => !fields.task_uuid.is_empty(),
+        "MESSAGE" => !fields.message.is_empty(),
+        "TALLY_AGENT" => fields
+            .agent
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
+        "TALLY_SESSION_REF" => fields
+            .session_ref
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
+        "TALLY_UNIT" => fields
+            .unit
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
+        "TALLY_EXIT_CODE" => fields.exit_code.is_some(),
+        "TALLY_GPU_SECONDS" => fields.gpu_seconds.is_some(),
+        "TALLY_ARTIFACT_HASH" => fields
+            .artifact_hash
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
+        "TALLY_EVIDENCE" => fields
+            .evidence
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
+        "TALLY_ATTEMPT" => fields.attempt.is_some(),
+        "TALLY_LEASE_EPOCH" => fields.lease_epoch.is_some(),
+        "TALLY_LABOR_CLASS" => fields.labor_class.is_some(),
+        "TALLY_JOB_ID" => fields
+            .job_id
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
+        "TALLY_PARENT" => fields
+            .parent
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
+        "TALLY_POOL" => fields
+            .pool
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
+        _ => false,
+    }
+}
+
+pub fn validate_fields(fields: &TallyFields) -> Result<(), JournalError> {
+    if fields.syslog_identifier != JOURNAL_IDENTIFIER {
+        return Err(JournalError::Invalid(format!(
+            "SYSLOG_IDENTIFIER must be {JOURNAL_IDENTIFIER:?}"
+        )));
+    }
+    for (name, requirement) in TALLY_FIELD_MATRIX {
+        if required(*requirement, fields.event) && !field_present(fields, name) {
+            return Err(JournalError::Invalid(format!(
+                "event {:?} requires {name}",
+                fields.event.as_str()
+            )));
+        }
+    }
+    for (name, value) in string_fields(fields) {
+        if value.contains('\0') {
+            return Err(JournalError::Invalid(format!("{name} contains a NUL byte")));
+        }
+        if name != "MESSAGE" && value.chars().any(char::is_control) {
+            return Err(JournalError::Invalid(format!(
+                "{name} contains a control character"
+            )));
+        }
+    }
+    if fields.exit_code.is_some_and(|code| code < 0) {
+        return Err(JournalError::Invalid(
+            "TALLY_EXIT_CODE must be non-negative".to_owned(),
+        ));
+    }
+    if fields
+        .gpu_seconds
+        .is_some_and(|seconds| !seconds.is_finite() || seconds < 0.0)
+    {
+        return Err(JournalError::Invalid(
+            "TALLY_GPU_SECONDS must be finite and non-negative".to_owned(),
+        ));
+    }
+    if fields.attempt == Some(0) {
+        return Err(JournalError::Invalid(
+            "TALLY_ATTEMPT must be positive".to_owned(),
+        ));
+    }
+    if fields.lease_epoch == Some(0) {
+        return Err(JournalError::Invalid(
+            "TALLY_LEASE_EPOCH must be positive".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn string_fields(fields: &TallyFields) -> Vec<(&'static str, &str)> {
+    let mut values = vec![
+        ("SYSLOG_IDENTIFIER", fields.syslog_identifier.as_str()),
+        ("TALLY_TASK_UUID", fields.task_uuid.as_str()),
+        ("MESSAGE", fields.message.as_str()),
+    ];
+    for (name, value) in [
+        ("TALLY_AGENT", fields.agent.as_deref()),
+        ("TALLY_SESSION_REF", fields.session_ref.as_deref()),
+        ("TALLY_UNIT", fields.unit.as_deref()),
+        ("TALLY_ARTIFACT_HASH", fields.artifact_hash.as_deref()),
+        ("TALLY_EVIDENCE", fields.evidence.as_deref()),
+        ("TALLY_JOB_ID", fields.job_id.as_deref()),
+        ("TALLY_PARENT", fields.parent.as_deref()),
+        ("TALLY_POOL", fields.pool.as_deref()),
+    ] {
+        if let Some(value) = value {
+            values.push((name, value));
+        }
+    }
+    values
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JournalDestination {
+    Stdout,
+    Native,
+}
+
+#[derive(Debug, Clone)]
+pub struct JournalEmitter {
+    destination: JournalDestination,
+    socket_path: PathBuf,
+}
+
+impl JournalEmitter {
+    pub fn new(native: bool) -> Self {
+        Self {
+            destination: if native {
+                JournalDestination::Native
+            } else {
+                JournalDestination::Stdout
+            },
+            socket_path: PathBuf::from(JOURNAL_SOCKET),
+        }
+    }
+
+    pub fn from_config(config: &crate::config::JournaldConfig) -> Self {
+        Self::new(config.native)
+    }
+
+    pub fn with_native_socket(mut self, socket_path: impl Into<PathBuf>) -> Self {
+        self.socket_path = socket_path.into();
+        self
+    }
+
+    pub const fn destination(&self) -> JournalDestination {
+        self.destination
+    }
+
+    pub fn emit(&self, event: EmitEvent) -> Result<TallyFields, JournalError> {
+        let stdout = std::io::stdout();
+        self.emit_to(event, &mut stdout.lock())
+    }
+
+    pub fn emit_to(
+        &self,
+        event: EmitEvent,
+        stdout: &mut dyn Write,
+    ) -> Result<TallyFields, JournalError> {
+        let fields = event.into_fields()?;
+        match self.destination {
+            JournalDestination::Stdout => write_stdout_record(stdout, &fields)?,
+            JournalDestination::Native => send_native_record(&self.socket_path, &fields)?,
+        }
+        Ok(fields)
+    }
+}
+
+pub fn render_stdout_record(fields: &TallyFields) -> Result<Vec<u8>, JournalError> {
+    validate_fields(fields)?;
+    let mut bytes = serde_json::to_vec(fields)?;
+    if bytes.contains(&b'\n') || bytes.contains(&b'\r') {
+        return Err(JournalError::Invalid(
+            "stdout journal JSON contains a literal line break".to_owned(),
+        ));
+    }
+    bytes.push(b'\n');
+    if bytes.len() > MAX_STDOUT_RECORD_BYTES {
+        return Err(JournalError::TooLarge {
+            size: bytes.len(),
+            limit: MAX_STDOUT_RECORD_BYTES,
+        });
+    }
+    Ok(bytes)
+}
+
+pub fn write_stdout_record(
+    writer: &mut dyn Write,
+    fields: &TallyFields,
+) -> Result<(), JournalError> {
+    let bytes = render_stdout_record(fields)?;
+    writer.write_all(&bytes).map_err(|source| JournalError::Io {
+        action: "stdout write",
+        path: PathBuf::from("<stdout>"),
+        source,
+    })
+}
+
+pub fn encode_native_record(fields: &TallyFields) -> Result<Vec<u8>, JournalError> {
+    validate_fields(fields)?;
+    let mut packet = Vec::new();
+    for (name, value) in native_fields(fields)? {
+        if value.as_bytes().contains(&b'\n') {
+            packet.extend_from_slice(name.as_bytes());
+            packet.push(b'\n');
+            packet.extend_from_slice(&(value.len() as u64).to_le_bytes());
+            packet.extend_from_slice(value.as_bytes());
+            packet.push(b'\n');
+        } else {
+            packet.extend_from_slice(name.as_bytes());
+            packet.push(b'=');
+            packet.extend_from_slice(value.as_bytes());
+            packet.push(b'\n');
+        }
+    }
+    if packet.len() > MAX_NATIVE_RECORD_BYTES {
+        return Err(JournalError::TooLarge {
+            size: packet.len(),
+            limit: MAX_NATIVE_RECORD_BYTES,
+        });
+    }
+    Ok(packet)
+}
+
+pub fn send_native_record(path: &Path, fields: &TallyFields) -> Result<(), JournalError> {
+    let packet = encode_native_record(fields)?;
+    let socket = UnixDatagram::unbound().map_err(|source| JournalError::Io {
+        action: "socket creation",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    socket.connect(path).map_err(|source| JournalError::Io {
+        action: "socket connect",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let sent = socket.send(&packet).map_err(|source| JournalError::Io {
+        action: "datagram send",
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if sent != packet.len() {
+        return Err(JournalError::ShortDatagram {
+            sent,
+            expected: packet.len(),
+        });
+    }
+    Ok(())
+}
+
+fn enum_json_string<T: Serialize>(value: T) -> Result<String, JournalError> {
+    let value = serde_json::to_value(value)?;
+    value
+        .as_str()
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| JournalError::Invalid("enum did not serialize as a string".to_owned()))
+}
+
+fn native_fields(fields: &TallyFields) -> Result<Vec<(&'static str, String)>, JournalError> {
+    let mut values = vec![
+        ("SYSLOG_IDENTIFIER", fields.syslog_identifier.clone()),
+        ("TALLY_EVENT", fields.event.to_string()),
+        ("TALLY_TASK_UUID", fields.task_uuid.clone()),
+        ("TALLY_CLASS", enum_json_string(fields.class)?),
+        ("TALLY_SOURCE", enum_json_string(fields.source)?),
+        ("MESSAGE", fields.message.clone()),
+    ];
+    push_optional(&mut values, "TALLY_AGENT", fields.agent.as_deref());
+    push_optional(
+        &mut values,
+        "TALLY_SESSION_REF",
+        fields.session_ref.as_deref(),
+    );
+    push_optional(&mut values, "TALLY_UNIT", fields.unit.as_deref());
+    if let Some(value) = fields.exit_code {
+        values.push(("TALLY_EXIT_CODE", value.to_string()));
+    }
+    if let Some(value) = fields.gpu_seconds {
+        values.push(("TALLY_GPU_SECONDS", value.to_string()));
+    }
+    push_optional(
+        &mut values,
+        "TALLY_ARTIFACT_HASH",
+        fields.artifact_hash.as_deref(),
+    );
+    push_optional(&mut values, "TALLY_EVIDENCE", fields.evidence.as_deref());
+    if let Some(value) = fields.attempt {
+        values.push(("TALLY_ATTEMPT", value.to_string()));
+    }
+    if let Some(value) = fields.lease_epoch {
+        values.push(("TALLY_LEASE_EPOCH", value.to_string()));
+    }
+    if let Some(value) = fields.labor_class {
+        values.push(("TALLY_LABOR_CLASS", enum_json_string(value)?));
+    }
+    push_optional(&mut values, "TALLY_JOB_ID", fields.job_id.as_deref());
+    push_optional(&mut values, "TALLY_PARENT", fields.parent.as_deref());
+    push_optional(&mut values, "TALLY_POOL", fields.pool.as_deref());
+    Ok(values)
+}
+
+fn push_optional(
+    fields: &mut Vec<(&'static str, String)>,
+    name: &'static str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value {
+        fields.push((name, value.to_owned()));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct JournalEntry {
+    pub fields: TallyFields,
+    pub realtime_us: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JournalFilter {
+    pub task: Option<String>,
+    pub session: Option<String>,
+    pub event: Option<TallyEvent>,
+    pub since_realtime_us: Option<u64>,
+}
+
+impl JournalFilter {
+    pub fn matches(&self, entry: &JournalEntry) -> bool {
+        if self
+            .task
+            .as_deref()
+            .is_some_and(|task| entry.fields.task_uuid != task)
+        {
+            return false;
+        }
+        if self
+            .session
+            .as_deref()
+            .is_some_and(|session| entry.fields.session_ref.as_deref() != Some(session))
+        {
+            return false;
+        }
+        if self.event.is_some_and(|event| entry.fields.event != event) {
+            return false;
+        }
+        if self
+            .since_realtime_us
+            .is_some_and(|since| entry.realtime_us.is_some_and(|seen| seen < since))
+        {
+            return false;
+        }
+        true
+    }
+}
+
+pub fn parse_journal_json_line(line: &str) -> Result<Option<JournalEntry>, JournalError> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let outer: Value = serde_json::from_str(trimmed)?;
+    let outer = outer
+        .as_object()
+        .ok_or_else(|| JournalError::Invalid("journal JSON line is not an object".to_owned()))?;
+    let realtime_us = outer
+        .get("__REALTIME_TIMESTAMP")
+        .map(parse_u64_value)
+        .transpose()?;
+
+    let payload = outer
+        .get("MESSAGE")
+        .and_then(Value::as_str)
+        .and_then(|message| serde_json::from_str::<Value>(message).ok())
+        .and_then(|value| value.as_object().cloned())
+        .filter(|object| object.contains_key("TALLY_EVENT"));
+
+    let source = if outer.contains_key("TALLY_EVENT") {
+        outer
+    } else if let Some(payload) = payload.as_ref() {
+        payload
+    } else {
+        return Ok(None);
+    };
+    let fields = hydrate_fields(source)?;
+    validate_fields(&fields)?;
+    Ok(Some(JournalEntry {
+        fields,
+        realtime_us,
+    }))
+}
+
+pub fn parse_journal_json_lines(
+    input: &str,
+    filter: &JournalFilter,
+) -> Result<Vec<JournalEntry>, JournalError> {
+    let mut entries = Vec::new();
+    for line in input.lines() {
+        if let Some(entry) = parse_journal_json_line(line)? {
+            if filter.matches(&entry) {
+                entries.push(entry);
+            }
+        }
+    }
+    entries.sort_by_key(|entry| entry.realtime_us);
+    Ok(entries)
+}
+
+fn hydrate_fields(source: &Map<String, Value>) -> Result<TallyFields, JournalError> {
+    let mut normalized = source.clone();
+    for name in [
+        "TALLY_EXIT_CODE",
+        "TALLY_GPU_SECONDS",
+        "TALLY_ATTEMPT",
+        "TALLY_LEASE_EPOCH",
+    ] {
+        if let Some(value) = normalized.get(name).cloned() {
+            if let Some(value) = value.as_str() {
+                let number = value
+                    .parse::<serde_json::Number>()
+                    .map_err(|_| JournalError::Invalid(format!("{name} is not a JSON number")))?;
+                normalized.insert(name.to_owned(), Value::Number(number));
+            }
+        }
+    }
+    serde_json::from_value(Value::Object(normalized)).map_err(JournalError::Json)
+}
+
+fn parse_u64_value(value: &Value) -> Result<u64, JournalError> {
+    if let Some(value) = value.as_u64() {
+        return Ok(value);
+    }
+    value
+        .as_str()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| {
+            JournalError::Invalid("__REALTIME_TIMESTAMP is not a non-negative integer".to_owned())
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixDatagram;
+    use std::time::Duration;
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    fn full_event(event: TallyEvent) -> EmitEvent {
+        EmitEvent {
+            event,
+            task_uuid: "task-abc".to_owned(),
+            class: Priority::High,
+            source: EnqueueSource::Manual,
+            message: None,
+            agent: Some(tally_agent_label("claude-code").unwrap()),
+            session_ref: Some("session-1".to_owned()),
+            unit: Some("tally-job-task-abc.service".to_owned()),
+            exit_code: Some(0),
+            gpu_seconds: Some(12.5),
+            artifact_hash: Some("sha256:deadbeef".to_owned()),
+            evidence: Some("pass artifact:/out/result".to_owned()),
+            attempt: Some(1),
+            lease_epoch: Some(7),
+            labor_class: Some(LaborClass::Fresh),
+            job_id: Some("job-abc".to_owned()),
+            parent: Some("parent-abc".to_owned()),
+            pool: Some("gpu".to_owned()),
+        }
+    }
+
+    #[test]
+    fn event_vocabulary_and_always_fields_are_pinned() {
+        assert_eq!(
+            TALLY_EVENTS
+                .iter()
+                .copied()
+                .map(TallyEvent::as_str)
+                .collect::<Vec<_>>(),
+            [
+                "enqueued",
+                "dispatched",
+                "started",
+                "heartbeat",
+                "preempted",
+                "resumed",
+                "completed",
+                "failed",
+                "evidence_pass",
+                "evidence_fail",
+                "witness_emitted",
+            ]
+        );
+        assert_eq!(
+            TALLY_FIELD_MATRIX
+                .iter()
+                .filter_map(
+                    |(name, requirement)| (*requirement == FieldRequirement::Always)
+                        .then_some(*name)
+                )
+                .collect::<Vec<_>>(),
+            [
+                "SYSLOG_IDENTIFIER",
+                "TALLY_EVENT",
+                "TALLY_TASK_UUID",
+                "TALLY_CLASS",
+                "TALLY_SOURCE",
+                "MESSAGE",
+            ]
+        );
+    }
+
+    #[test]
+    fn every_event_accepts_a_complete_field_set() {
+        for event in TALLY_EVENTS {
+            full_event(*event).into_fields().unwrap();
+        }
+    }
+
+    #[test]
+    fn every_required_matrix_field_is_rejected_when_absent() {
+        for event in TALLY_EVENTS {
+            let fields = full_event(*event).into_fields().unwrap();
+            for (name, requirement) in TALLY_FIELD_MATRIX {
+                if !required(*requirement, *event) {
+                    continue;
+                }
+                let mut value = serde_json::to_value(&fields).unwrap();
+                value.as_object_mut().unwrap().remove(*name);
+                let rejected = serde_json::from_value::<TallyFields>(value)
+                    .map_or(true, |fields| validate_fields(&fields).is_err());
+                assert!(rejected, "{event} accepted missing required field {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn optional_fields_stay_absent_and_agent_vocabulary_is_canonical() {
+        let fields = EmitEvent::enqueued("task", Priority::Low, EnqueueSource::Manual)
+            .into_fields()
+            .unwrap();
+        let value = serde_json::to_value(fields).unwrap();
+        for optional in [
+            "TALLY_AGENT",
+            "TALLY_SESSION_REF",
+            "TALLY_JOB_ID",
+            "TALLY_PARENT",
+            "TALLY_POOL",
+        ] {
+            assert!(value.get(optional).is_none(), "unexpected {optional}");
+        }
+        assert_eq!(tally_agent_label("claude-code").unwrap(), "cc");
+        assert_eq!(tally_agent_label("pi").unwrap(), "pi");
+        assert_eq!(tally_agent_label("shell").unwrap(), "shell");
+        assert_eq!(tally_agent_label("codex").unwrap(), "codex");
+        assert_eq!(adapter_from_tally_agent("cc").unwrap(), "claude-code");
+        assert!(tally_agent_label("bad\nlabel").is_err());
+    }
+
+    #[test]
+    fn lifecycle_requirements_fail_closed() {
+        let dispatched = EmitEvent {
+            event: TallyEvent::Dispatched,
+            ..EmitEvent::enqueued("task", Priority::Low, EnqueueSource::Manual)
+        };
+        assert!(dispatched.into_fields().is_err());
+
+        let mut completed = full_event(TallyEvent::Completed);
+        completed.artifact_hash = None;
+        assert!(completed
+            .into_fields()
+            .unwrap_err()
+            .to_string()
+            .contains("TALLY_ARTIFACT_HASH"));
+
+        let mut failed = full_event(TallyEvent::Failed);
+        failed.artifact_hash = None;
+        failed.into_fields().unwrap();
+
+        let mut evidence = full_event(TallyEvent::EvidenceFail);
+        evidence.evidence = None;
+        assert!(evidence.into_fields().is_err());
+    }
+
+    #[test]
+    fn invalid_values_fail_before_emission() {
+        let mut event = full_event(TallyEvent::Completed);
+        event.gpu_seconds = Some(f64::NAN);
+        assert!(event.into_fields().is_err());
+
+        let mut event = full_event(TallyEvent::Started);
+        event.lease_epoch = Some(0);
+        assert!(event.into_fields().is_err());
+
+        let mut event = EmitEvent::enqueued("task", Priority::Low, EnqueueSource::Manual);
+        event.pool = Some("bad\npool".to_owned());
+        assert!(event.into_fields().is_err());
+    }
+
+    #[test]
+    fn stdout_is_one_json_line_and_preserves_message_newlines() {
+        let mut event = EmitEvent::enqueued("task", Priority::Low, EnqueueSource::Manual);
+        event.message = Some("line one\nline two".to_owned());
+        let fields = event.into_fields().unwrap();
+        let bytes = render_stdout_record(&fields).unwrap();
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let parsed: TallyFields = serde_json::from_slice(&bytes[..bytes.len() - 1]).unwrap();
+        assert_eq!(parsed.message, "line one\nline two");
+    }
+
+    #[test]
+    fn stdout_limit_cannot_cross_journalds_default_line_max() {
+        assert_eq!(MAX_STDOUT_RECORD_BYTES, 48 * 1024);
+        let mut event = EmitEvent::enqueued("task", Priority::Low, EnqueueSource::Manual);
+        event.message = Some("x".repeat(MAX_STDOUT_RECORD_BYTES));
+        let fields = event.into_fields().unwrap();
+        assert!(matches!(
+            render_stdout_record(&fields),
+            Err(JournalError::TooLarge {
+                limit: MAX_STDOUT_RECORD_BYTES,
+                ..
+            })
+        ));
+        assert!(encode_native_record(&fields).is_ok());
+    }
+
+    #[test]
+    fn native_protocol_uses_binary_framing_for_newlines() {
+        let mut event = EmitEvent::enqueued("task", Priority::Low, EnqueueSource::Manual);
+        event.message = Some("line one\nline two".to_owned());
+        let packet = encode_native_record(&event.into_fields().unwrap()).unwrap();
+        let marker = b"MESSAGE\n";
+        let index = packet
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .unwrap();
+        let length_start = index + marker.len();
+        let length = u64::from_le_bytes(packet[length_start..length_start + 8].try_into().unwrap());
+        assert_eq!(length, "line one\nline two".len() as u64);
+    }
+
+    #[test]
+    fn toggle_selects_stdout_or_one_native_datagram() {
+        let mut stdout = Vec::new();
+        let fallback = JournalEmitter::new(false);
+        assert_eq!(fallback.destination(), JournalDestination::Stdout);
+        fallback
+            .emit_to(
+                EmitEvent::enqueued("stdout-task", Priority::Low, EnqueueSource::Manual),
+                &mut stdout,
+            )
+            .unwrap();
+        assert!(!stdout.is_empty());
+
+        let directory = tempdir().unwrap();
+        let socket_path = directory.path().join("journal.sock");
+        let receiver = UnixDatagram::bind(&socket_path).unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let native = JournalEmitter::new(true).with_native_socket(&socket_path);
+        assert_eq!(native.destination(), JournalDestination::Native);
+        let mut ignored_stdout = Vec::new();
+        native
+            .emit_to(
+                EmitEvent::enqueued("native-task", Priority::High, EnqueueSource::Manual),
+                &mut ignored_stdout,
+            )
+            .unwrap();
+        assert!(ignored_stdout.is_empty());
+        let mut packet = vec![0_u8; MAX_NATIVE_RECORD_BYTES];
+        let received = receiver.recv(&mut packet).unwrap();
+        let packet = &packet[..received];
+        assert!(packet
+            .windows(b"TALLY_TASK_UUID=native-task".len())
+            .any(|window| window == b"TALLY_TASK_UUID=native-task"));
+    }
+
+    #[test]
+    fn native_failure_never_falls_back_to_stdout() {
+        let directory = tempdir().unwrap();
+        let missing = directory.path().join("absent.sock");
+        let emitter = JournalEmitter::new(true).with_native_socket(missing);
+        let mut stdout = Vec::new();
+        assert!(emitter
+            .emit_to(
+                EmitEvent::enqueued("task", Priority::Low, EnqueueSource::Manual),
+                &mut stdout,
+            )
+            .is_err());
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn parser_rehydrates_stdout_and_native_shapes() {
+        let fields = full_event(TallyEvent::Completed).into_fields().unwrap();
+        let payload = String::from_utf8(render_stdout_record(&fields).unwrap()).unwrap();
+        let stdout_line = serde_json::json!({
+            "__REALTIME_TIMESTAMP": "1720526400000000",
+            "SYSLOG_IDENTIFIER": "tally",
+            "MESSAGE": payload.trim_end(),
+        });
+        let stdout_entry = parse_journal_json_line(&stdout_line.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stdout_entry.fields, fields);
+        assert_eq!(stdout_entry.realtime_us, Some(1_720_526_400_000_000));
+
+        let mut native = serde_json::to_value(&fields).unwrap();
+        let native = native.as_object_mut().unwrap();
+        native.insert(
+            "__REALTIME_TIMESTAMP".to_owned(),
+            Value::String("1720526400000001".to_owned()),
+        );
+        for name in [
+            "TALLY_EXIT_CODE",
+            "TALLY_GPU_SECONDS",
+            "TALLY_ATTEMPT",
+            "TALLY_LEASE_EPOCH",
+        ] {
+            let value = native.get(name).unwrap().to_string();
+            native.insert(name.to_owned(), Value::String(value));
+        }
+        let native_entry = parse_journal_json_line(&Value::Object(native.clone()).to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(native_entry.fields, fields);
+    }
+
+    #[test]
+    fn native_top_level_fields_win_over_a_json_looking_message() {
+        let mut event = EmitEvent::enqueued("native-task", Priority::Low, EnqueueSource::Manual);
+        event.message = Some(r#"{"TALLY_EVENT":"failed"}"#.to_owned());
+        let fields = event.into_fields().unwrap();
+        let native = serde_json::to_value(&fields).unwrap();
+        let entry = parse_journal_json_line(&native.to_string())
+            .unwrap()
+            .unwrap();
+        assert_eq!(entry.fields, fields);
+    }
+
+    #[test]
+    fn parser_rejects_incomplete_tally_records_but_ignores_noise() {
+        assert!(
+            parse_journal_json_line(r#"{"MESSAGE":"ordinary daemon line"}"#)
+                .unwrap()
+                .is_none()
+        );
+        let incomplete =
+            r#"{"SYSLOG_IDENTIFIER":"tally","TALLY_EVENT":"completed","TALLY_TASK_UUID":"task"}"#;
+        assert!(parse_journal_json_line(incomplete).is_err());
+        assert!(parse_journal_json_line("{torn").is_err());
+    }
+
+    #[test]
+    fn parser_filters_and_orders_entries() {
+        let a = EmitEvent::enqueued("A", Priority::Low, EnqueueSource::Manual)
+            .into_fields()
+            .unwrap();
+        let b = EmitEvent::enqueued("B", Priority::High, EnqueueSource::Gh)
+            .into_fields()
+            .unwrap();
+        let lines = [
+            serde_json::json!({
+                "__REALTIME_TIMESTAMP": "20",
+                "MESSAGE": serde_json::to_string(&b).unwrap(),
+            })
+            .to_string(),
+            serde_json::json!({
+                "__REALTIME_TIMESTAMP": "10",
+                "MESSAGE": serde_json::to_string(&a).unwrap(),
+            })
+            .to_string(),
+        ]
+        .join("\n");
+        let entries = parse_journal_json_lines(
+            &lines,
+            &JournalFilter {
+                event: Some(TallyEvent::Enqueued),
+                ..JournalFilter::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.fields.task_uuid.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+    }
+}

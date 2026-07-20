@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+scenario_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+scenario="${1:-}"
+
+case "$scenario" in
+  fanout-guardrail)
+    exec "${BASH:-bash}" "$scenario_dir/fanout-guardrail.sh"
+    ;;
+  slow-sqlite)
+    exec "${BASH:-bash}" "$scenario_dir/slow-sqlite.sh"
+    ;;
+  pool-vanished/return)
+    exec "${BASH:-bash}" "$scenario_dir/pool-vanished-return.sh"
+    ;;
+  *)
+    printf 'usage: %s {fanout-guardrail|slow-sqlite|pool-vanished/return}\n' "$0" >&2
+    exit 2
+    ;;
+esac

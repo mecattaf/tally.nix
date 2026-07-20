@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+: "${TALLY_TEST_REMOTE_HOST:?TALLY_TEST_REMOTE_HOST is required}"
+: "${TALLY_SCENARIO_ROOT:?TALLY_SCENARIO_ROOT is required}"
+
+if [[ "${1:-}" == "--user" && ("${2:-}" == "show" || "${2:-}" == "stop") ]]; then
+  unit="${*: -1}"
+  marker="$TALLY_SCENARIO_ROOT/worker-launch/$unit"
+  if [[ "$unit" == tally-job-*.service && -f "$marker" ]]; then
+    mapfile -t metadata <"$marker"
+    [[ "${#metadata[@]}" -eq 3 && "${metadata[0]:-}" =~ ^[0-9]+$ ]] \
+      || exit 72
+    if [[ "$2" == "show" ]]; then
+      printf '%s\n' \
+        'LoadState=loaded' \
+        'ActiveState=active' \
+        'InvocationID=scenario-worker-reboot-proxy' \
+        "Environment=TALLY_ATTEMPT=${metadata[1]} TALLY_LEASE_EPOCH=${metadata[2]}"
+      exit 0
+    fi
+
+    # Let the daemon publish cancellation before the blocked launcher is
+    # released. This proxy represents only the live local reservation after
+    # the genuine worker unit vanished in the reboot.
+    (
+      sleep 0.2
+      kill -TERM "${metadata[0]}" 2>/dev/null || true
+      rm -f -- "$marker"
+    ) >/dev/null 2>&1 &
+    exit 0
+  fi
+fi
+
+payload="$(printf '%s\0' "$@" | base64 -w0)"
+exec ssh \
+  -o BatchMode=yes \
+  -o ConnectTimeout=2 \
+  -o ConnectionAttempts=1 \
+  "$TALLY_TEST_REMOTE_HOST" \
+  "printf '%s' '$payload' | base64 -d | xargs -0 systemctl"
