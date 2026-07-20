@@ -88,7 +88,7 @@ where
     }
 }
 
-pub fn canonicalize(pools: &mut Vec<String>) -> Result<(), PoolSetError> {
+pub fn canonicalize(pools: &mut [String]) -> Result<(), PoolSetError> {
     if pools.is_empty() {
         return Err(PoolSetError::Empty);
     }
@@ -151,11 +151,11 @@ mod tests {
     fn empty_duplicate_and_invalid_names_are_distinct() {
         assert_eq!(canonicalize(&mut Vec::new()), Err(PoolSetError::Empty));
         assert_eq!(
-            canonicalize(&mut vec!["slot".to_owned(), "slot".to_owned()]),
+            canonicalize(&mut ["slot".to_owned(), "slot".to_owned()]),
             Err(PoolSetError::Duplicate("slot".to_owned()))
         );
         assert_eq!(
-            canonicalize(&mut vec!["bad\nname".to_owned()]),
+            canonicalize(&mut ["bad\nname".to_owned()]),
             Err(PoolSetError::InvalidName("bad\nname".to_owned()))
         );
     }

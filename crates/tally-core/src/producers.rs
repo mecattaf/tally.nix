@@ -74,6 +74,8 @@ pub struct ProducerEnqueue {
         deserialize_with = "crate::poolset::deserialize"
     )]
     pub pools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     #[serde(default = "default_priority")]
     pub priority: Priority,
     #[serde(default)]
@@ -113,6 +115,7 @@ impl ProducerEnqueue {
             invocation: None,
             argv: Some(self.argv.clone()),
             pools: Some(pools),
+            executor: self.executor.clone(),
             priority: Some(self.priority),
             adapter: Some(self.adapter.clone()),
             source: Some(source),
@@ -243,6 +246,7 @@ pub fn validate_registry(
     producers: &BTreeMap<String, ProducerConfig>,
     pools: &BTreeSet<String>,
     adapters: &BTreeSet<String>,
+    executors: &BTreeSet<String>,
 ) -> Result<(), ProducerError> {
     let mut reachability_owners = BTreeMap::new();
     for (name, producer) in producers {
@@ -257,7 +261,7 @@ pub fn validate_registry(
                         "calendar producer {name:?} requires a non-empty onCalendar"
                     )));
                 }
-                validate_enqueue(name, "enqueue", &config.enqueue, pools, adapters)?;
+                validate_enqueue(name, "enqueue", &config.enqueue, pools, adapters, executors)?;
             }
             ProducerConfig::EventsDir(config) => {
                 if config.poll_interval_sec == 0 {
@@ -292,7 +296,7 @@ pub fn validate_registry(
                     }
                 }
                 validate_name(&config.actor_exclude, "GitHub actorExclude")?;
-                validate_enqueue(name, "enqueue", &config.enqueue, pools, adapters)?;
+                validate_enqueue(name, "enqueue", &config.enqueue, pools, adapters, executors)?;
             }
             ProducerConfig::BuildEffect(config) => {
                 if !config.path.is_absolute() {
@@ -304,7 +308,7 @@ pub fn validate_registry(
                     &config.path,
                     &format!("build-effect producer {name:?} path"),
                 )?;
-                validate_enqueue(name, "onKey", &config.on_key, pools, adapters)?;
+                validate_enqueue(name, "onKey", &config.on_key, pools, adapters, executors)?;
             }
             ProducerConfig::PoolReachability(config) => {
                 if config.interval_sec == 0 || config.hysteresis == 0 {
@@ -332,7 +336,7 @@ pub fn validate_registry(
                     ("onReturnAttest", config.on_return_attest.as_ref()),
                 ] {
                     if let Some(enqueue) = enqueue {
-                        validate_enqueue(name, field, enqueue, pools, adapters)?;
+                        validate_enqueue(name, field, enqueue, pools, adapters, executors)?;
                     }
                 }
                 if config
@@ -356,6 +360,7 @@ fn validate_enqueue(
     enqueue: &ProducerEnqueue,
     pools: &BTreeSet<String>,
     adapters: &BTreeSet<String>,
+    executors: &BTreeSet<String>,
 ) -> Result<(), ProducerError> {
     if enqueue.argv.is_empty() {
         return Err(ProducerError::InvalidConfig(format!(
@@ -380,6 +385,13 @@ fn validate_enqueue(
             "producer {producer:?} {field} references unknown adapter {:?}",
             enqueue.adapter
         )));
+    }
+    if let Some(executor) = &enqueue.executor {
+        if !executors.contains(executor) {
+            return Err(ProducerError::InvalidConfig(format!(
+                "producer {producer:?} {field} references unknown executor {executor:?}"
+            )));
+        }
     }
     if enqueue
         .dedup_key
@@ -2436,6 +2448,7 @@ mod tests {
             argv: vec![command.to_owned()],
             adapter: "shell".to_owned(),
             pools: vec!["slot".to_owned()],
+            executor: None,
             priority: Priority::Low,
             dedup_key: None,
             evidence: vec!["exit:0".to_owned()],
@@ -2520,6 +2533,7 @@ mod tests {
             &registry,
             &BTreeSet::from(["slot".to_owned()]),
             &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
         )
         .unwrap();
         assert_eq!(
@@ -2569,6 +2583,7 @@ mod tests {
             &invalid_attest,
             &BTreeSet::from(["slot".to_owned()]),
             &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
         )
         .unwrap_err()
         .to_string()
@@ -2581,6 +2596,7 @@ mod tests {
             &duplicate_reachability,
             &BTreeSet::from(["slot".to_owned()]),
             &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
         )
         .unwrap_err()
         .to_string()
@@ -2596,6 +2612,7 @@ mod tests {
                 &invalid_names,
                 &BTreeSet::from(["slot".to_owned()]),
                 &BTreeSet::from(["shell".to_owned()]),
+                &BTreeSet::new(),
             )
             .unwrap_err()
             .to_string()
@@ -2615,6 +2632,7 @@ mod tests {
             &relative_credential,
             &BTreeSet::from(["slot".to_owned()]),
             &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
         )
         .unwrap_err()
         .to_string()
@@ -2630,6 +2648,7 @@ mod tests {
             &invalid_strftime,
             &BTreeSet::from(["slot".to_owned()]),
             &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
         )
         .unwrap_err()
         .to_string()
@@ -2649,6 +2668,7 @@ mod tests {
                 &registry,
                 &BTreeSet::from(["slot".to_owned()]),
                 &BTreeSet::from(["shell".to_owned()]),
+                &BTreeSet::new(),
             )
             .unwrap_err()
             .to_string()

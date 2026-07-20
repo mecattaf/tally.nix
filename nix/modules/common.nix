@@ -196,6 +196,12 @@ let
           ];
           description = "Required non-empty set of target pool names; a legacy singleton string is accepted.";
         };
+        executor = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "worker";
+          description = "Optional named daemonless execution target; null executes on the coordinator.";
+        };
         priority = mkOption {
           type = types.enum [
             "interrupt"
@@ -288,6 +294,106 @@ let
           assertion = validCredentialName credential;
           message = "tally producer enqueue ${name} has invalid credential name ${credential}";
         }) config.credentials)
+      ];
+    }
+  );
+
+  mkExecutorType = types.submodule (
+    { config, name, ... }: {
+      options = {
+        kind = mkOption {
+          type = types.enum [ "ssh" ];
+          default = "ssh";
+          description = "Remote transport kind. SSH is the only supported fail-closed transport.";
+        };
+        host = mkOption {
+          type = types.str;
+          example = "worker.example.net";
+          description = "Explicit OpenSSH destination host or IP literal.";
+        };
+        user = mkOption {
+          type = types.str;
+          example = "tally-worker";
+          description = "Explicit remote login user.";
+        };
+        port = mkOption {
+          type = types.port;
+          default = 22;
+          description = "OpenSSH destination port.";
+        };
+        sshProgram = mkOption {
+          type = types.path;
+          default = "${pkgs.openssh}/bin/ssh";
+          defaultText = lib.literalExpression ''"${pkgs.openssh}/bin/ssh"'';
+          description = "Absolute OpenSSH client path used with an empty config and explicit options.";
+        };
+        identityFile = mkOption {
+          type = types.externalPath;
+          example = "/run/credentials/tally-worker-key";
+          description = "Absolute coordinator-side private-key path; no agent or ambient credential is used.";
+        };
+        knownHostsFile = mkOption {
+          type = types.path;
+          example = "/etc/ssh/tally-known-hosts";
+          description = "Absolute pinned known-hosts path used with strict host-key checking.";
+        };
+        program = mkOption {
+          type = types.str;
+          example = "/run/current-system/sw/bin/tally";
+          description = "Absolute tally executable path on the worker; only its fixed __remote-executor command is invoked.";
+        };
+        stateDir = mkOption {
+          type = types.str;
+          example = "/var/lib/tally-remote";
+          description = "Absolute worker-side directory for transient-unit exit records and captures.";
+        };
+        connectTimeoutSec = mkOption {
+          type = types.ints.positive;
+          default = 10;
+          description = "OpenSSH connection timeout.";
+        };
+        serverAliveIntervalSec = mkOption {
+          type = types.ints.positive;
+          default = 15;
+          description = "OpenSSH server-alive interval used to detect transport loss.";
+        };
+        serverAliveCountMax = mkOption {
+          type = types.ints.positive;
+          default = 3;
+          description = "Missed server-alive replies before reconnect and re-adoption.";
+        };
+        retryIntervalMs = mkOption {
+          type = types.ints.positive;
+          default = 1000;
+          description = "Delay between fail-closed transport retries.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions = [
+        {
+          assertion =
+            builtins.match "[A-Za-z0-9][A-Za-z0-9._:-]*" config.host != null
+            && !(lib.hasPrefix "-" config.host);
+          message = "tally executor ${name} host is not a safe explicit OpenSSH destination";
+        }
+        {
+          assertion =
+            builtins.match "[A-Za-z0-9][A-Za-z0-9_.-]*" config.user != null && !(lib.hasPrefix "-" config.user);
+          message = "tally executor ${name} user is not a safe OpenSSH login";
+        }
+        {
+          assertion = lib.hasPrefix "/" config.program && lib.hasPrefix "/" config.stateDir;
+          message = "tally executor ${name} program and stateDir must be absolute worker paths";
+        }
+        {
+          assertion = builtins.match "/[A-Za-z0-9/_+.,@=-]*" config.program != null;
+          message = "tally executor ${name} program is unsafe for the fixed remote helper command";
+        }
+        {
+          assertion = config.retryIntervalMs >= 10 && config.retryIntervalMs <= 60000;
+          message = "tally executor ${name} retryIntervalMs must be in 10..60000";
+        }
       ];
     }
   );
@@ -879,6 +985,19 @@ let
         };
         description = "Named logical resource gates owned by this coordinator.";
       };
+      executors = mkOption {
+        type = types.attrsOf mkExecutorType;
+        default = { };
+        example.worker = {
+          host = "worker.example.net";
+          user = "tally-worker";
+          identityFile = "/run/credentials/tally-worker-key";
+          knownHostsFile = "/etc/ssh/tally-known-hosts";
+          program = "/run/current-system/sw/bin/tally";
+          stateDir = "/var/lib/tally-remote";
+        };
+        description = "Named daemonless SSH execution targets owned by the central coordinator.";
+      };
       producers = mkOption {
         type = types.attrsOf mkProducerType;
         default = { };
@@ -939,6 +1058,7 @@ let
         consumptionEstimate
         runtimeMaxSec
         noEnqueue
+        executor
         ;
       pool = if builtins.length pools == 1 then builtins.head pools else pools;
       credentials = mapAttrs (_: toString) enqueue.credentials;
@@ -1025,6 +1145,24 @@ let
         };
   };
 
+  renderExecutor = _: executor: {
+    inherit (executor)
+      kind
+      host
+      user
+      port
+      program
+      stateDir
+      connectTimeoutSec
+      serverAliveIntervalSec
+      serverAliveCountMax
+      retryIntervalMs
+      ;
+    sshProgram = toString executor.sshProgram;
+    identityFile = toString executor.identityFile;
+    knownHostsFile = toString executor.knownHostsFile;
+  };
+
   mkRuntimeConfig = cfg: {
     enqueue = {
       inherit (cfg.enqueue) depthCap fanoutCap requireDedupKey;
@@ -1033,6 +1171,7 @@ let
       inherit (cfg.lease) graceSec yieldPollSec yieldGraceSec;
     };
     pools = mapAttrs renderPool cfg.pools;
+    executors = mapAttrs renderExecutor cfg.executors;
     producers = mapAttrs renderProducer cfg.producers;
     adapters = mapAttrs renderAdapter cfg.adapters;
     journald = { inherit (cfg.journald) native; };
@@ -1070,6 +1209,13 @@ let
         }
         adapter._tallyAssertions
       ]) cfg.adapters)
+      (mapAttrsToList (name: executor: [
+        {
+          assertion = validComponent name;
+          message = "tally executor name ${name} is not a safe registry component";
+        }
+        executor._tallyAssertions
+      ]) cfg.executors)
       (mapAttrsToList (name: producer: [
         {
           assertion = validComponent name;
@@ -1095,6 +1241,10 @@ let
             {
               assertion = builtins.hasAttr enqueue.adapter cfg.adapters;
               message = "tally producer ${name} references unknown adapter ${enqueue.adapter}";
+            }
+            {
+              assertion = enqueue.executor == null || builtins.hasAttr enqueue.executor cfg.executors;
+              message = "tally producer ${name} references unknown executor ${toString enqueue.executor}";
             }
           ]
         ) (producerEnqueues producer))

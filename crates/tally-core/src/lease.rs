@@ -1949,6 +1949,50 @@ mod tests {
     }
 
     #[test]
+    fn non_destructive_interrupt_waits_for_the_holder_then_runs_next() {
+        let mut engine = LeaseEngine::new(
+            9,
+            Duration::from_secs(20),
+            BTreeMap::from([("worker-gpu".to_owned(), pool(1))]),
+            None,
+        )
+        .unwrap();
+        let active_llm = grant(
+            engine
+                .admit_at(request("active-llm", &["worker-gpu"], Priority::Low), now())
+                .unwrap(),
+        );
+        assert!(matches!(
+            engine
+                .admit_at(
+                    request("thermal-cooldown", &["worker-gpu"], Priority::Interrupt),
+                    now(),
+                )
+                .unwrap(),
+            AdmitOutcome::Queued { position: 1, .. }
+        ));
+        assert!(
+            engine
+                .status(&active_llm.lease_id, active_llm.epoch)
+                .unwrap()
+                .yield_requested
+        );
+
+        let much_later = now() + chrono::Duration::hours(24);
+        let tick = engine.tick(much_later).unwrap();
+        assert!(tick.preempted.is_empty());
+        assert!(tick.promoted.is_empty());
+        assert_eq!(engine.held_len(), 1);
+        assert_eq!(engine.queue_len(), 1);
+
+        let released = engine
+            .release_at(&active_llm.lease_id, active_llm.epoch, much_later)
+            .unwrap();
+        assert_eq!(released.promoted.len(), 1);
+        assert_eq!(released.promoted[0].job_id, "thermal-cooldown");
+    }
+
+    #[test]
     fn failed_promotion_keeps_pending_ticket_retryable() {
         let mut engine = LeaseEngine::new(
             9,
@@ -2089,6 +2133,7 @@ mod tests {
             labor_class: LaborClass::Fresh,
             trace_ref: None,
             pools: Some(vec!["api".to_owned()]),
+            executor: None,
             charge: Some(crate::witness::Charge {
                 unit: "seconds".to_owned(),
                 amount: 99.0,

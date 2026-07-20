@@ -25,6 +25,7 @@ pub const TALLY_UDA_NAMES: &[&str] = &[
     "adapter",
     "labor_class",
     "pool",
+    "executor",
     "session_ref",
     "model",
     "cwd",
@@ -136,6 +137,8 @@ pub struct RowSeed {
         deserialize_with = "crate::poolset::deserialize"
     )]
     pub pools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
@@ -200,6 +203,22 @@ impl RowSeed {
         if self.adapter.trim().is_empty() || self.adapter.chars().any(char::is_control) {
             return Err(TaskDbError::InvalidSeed(
                 "adapter must be non-empty and contain no control characters".to_owned(),
+            ));
+        }
+        if self.executor.as_ref().is_some_and(|executor| {
+            executor.is_empty()
+                || executor.len() > 96
+                || matches!(executor.as_str(), "." | "..")
+                || !executor
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                || !executor
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+        }) {
+            return Err(TaskDbError::InvalidSeed(
+                "executor is not a safe registry component".to_owned(),
             ));
         }
         if self.runtime_max_sec == Some(0) {
@@ -691,6 +710,9 @@ fn populate_task(
     attributes.insert("adapter", seed.adapter);
     attributes.insert("labor_class", labor_class_name(labor_class).to_owned());
     attributes.insert("pool", crate::poolset::encoded(&seed.pools)?);
+    if let Some(executor) = seed.executor {
+        attributes.insert("executor", executor);
+    }
     attributes.insert("lease_epoch", seed.lease_epoch.to_string());
     attributes.insert("source", source_name(&seed.source).to_owned());
     attributes.insert("priority_class", priority_name(seed.priority).to_owned());
@@ -974,6 +996,7 @@ mod tests {
             source: EnqueueSource::EventsDir,
             adapter: "shell".to_owned(),
             pools: vec!["worker-gpu".to_owned()],
+            executor: None,
             model: None,
             cwd: Some(PathBuf::from("/work")),
             dedup_key: Some("ocr:paper-1".to_owned()),

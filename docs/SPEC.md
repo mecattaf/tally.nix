@@ -35,8 +35,9 @@ implementation.
 At runtime, the daemon owns:
 
 1. a Unix request/response socket;
-2. a local lease engine over configured pools;
-3. deterministic `tally-job-<uuid>.service` transient units;
+2. the sole lease engine over its configured logical pools;
+3. deterministic `tally-job-<uuid>.service` transient units, either local or on named daemonless
+   workers;
 4. durable enqueue events and lease events in the state directory;
 5. a canonical witness ledger and a separate attestation ledger in the data directory; and
 6. a TaskChampion SQLite projection that can be rebuilt from durable facts.
@@ -47,9 +48,11 @@ Configuration is strict JSON. Unknown fields fail decoding. Nix module configura
 to JSON and validated by the production parser during evaluation/build, so an invalid graph fails
 before activation.
 
-An enqueue payload contains direct argv, one or more pool names, a priority, an adapter name, and
-optional deduplication, provenance, evidence, runtime, consumption, credential, and advisory
-metadata. The daemon validates the complete payload before acknowledging it.
+An enqueue payload contains direct argv, one or more pool names, a priority, an adapter name, an
+optional named executor, and optional deduplication, provenance, evidence, runtime, consumption,
+credential, and advisory metadata. The daemon validates the complete payload and every pool,
+adapter, and executor reference before acknowledging it. Omitting the executor selects local
+execution on the coordinator.
 
 The serialized key remains `pool`. A singleton is accepted and emitted as its legacy scalar;
 multiple pools are emitted as an array sorted lexically. The same scalar-or-array rule applies to
@@ -102,6 +105,12 @@ request through `tally lease status` or an adapter yield hook. Pools are coopera
 When `hardPreempt` is enabled, a holder that does not yield within `yieldGraceSec` is reclaimed and
 receives a `preempted` verdict.
 
+An interrupt request against a pool with `hardPreempt = false` is non-destructive. It sorts ahead
+of lower-priority queued work but remains pending for any current holder, regardless of elapsed
+grace. A worker thermal sensor can therefore enqueue a coordinator-local `sleep 1800` against
+`worker-gpu`: it waits for active GPU work, holds the logical pool for 30 minutes, and releases on
+normal exit without terminating an LLM process.
+
 Each daemon start durably bumps the lease epoch. The epoch fences stale local facts during
 recovery.
 
@@ -121,6 +130,30 @@ metadata.
 
 A direct-process fallback exists for focused executor tests, but the crash-survivable daemon path
 refuses work it cannot later adopt or reclaim through systemd.
+
+A configured SSH executor places that same execution envelope on a worker without a worker tally
+daemon. The coordinator runs an explicitly configured OpenSSH binary with an explicit host, user,
+port, identity file, pinned known-hosts file, no ambient SSH configuration or agent, and all
+forwarding disabled. The only remote command is the configured tally binary's fixed hidden helper.
+Opaque job argv and execution metadata are carried in bounded JSON on stdin, never interpolated
+into the SSH command. Credential source paths in a remotely selected job refer to the worker
+filesystem and are still handed to systemd with `LoadCredential=`.
+
+The worker helper is a short-lived executor client for its user systemd manager. It implements
+idempotent ensure, exact probe/adopt, and exact reclaim operations over the deterministic unit name.
+An operation is correlated by unit UUID, attempt, lease epoch, and—after launch—systemd invocation
+ID. If a connection fails after dispatch, the coordinator retries the identical operation; the
+worker either observes the existing unit or its durable exit record instead of launching again.
+The worker fsyncs a generation marker before unit creation. An absent unit and absent exit record
+with that same marker is an indeterminate prior launch and is never replayed; `stateDir` therefore
+must survive worker restarts.
+
+The coordinator is always the admission authority and keeps the complete logical lease set while
+remote state is indeterminate. It releases leases only after a validated terminal reply. Remote
+artifact evidence is evaluated against worker paths, then the actual exit record, evidence result,
+bounded captures when available, and executor name are incorporated into the coordinator's
+canonical terminal processing. A malformed response, mismatched generation/invocation, or
+ambiguous unit state fails closed.
 
 ## 6. Evidence, verdicts, and deduplication
 
@@ -166,7 +199,9 @@ Its records are never read as canonical verdicts or authoritative usage.
 ## 8. Restart and return recovery
 
 Startup recovery joins durable enqueue events, witness records, the current lease epoch, systemd
-unit state, exit records, and confirmed producer transitions.
+unit state, exit records, and confirmed producer transitions. For a row with a named executor,
+the unit probe and any subsequent adoption or reconciliation run against that worker. Startup
+waits through transport loss rather than opening admission with unknown remote work.
 
 For each durable row, recovery can:
 
@@ -232,7 +267,9 @@ they do not mutate job state, and pruning journal history cannot erase a witness
 - Credential values remain outside argv, capture metadata, journals, and ledgers.
 - Unit adoption and reclaim pin the exact invocation ID rather than trusting only a reusable unit
   name.
-- Indeterminate unit state fails closed instead of launching duplicate work.
+- Remote ensure, probe, adoption, and reclaim retain deterministic task/generation identity across
+  transport retries; indeterminate state fails closed instead of releasing a lease or launching
+  duplicate work.
 - Bounded file and subprocess reads prevent an intake or helper from consuming unbounded memory.
 - A failed durability stage fails the request; it is never reported as acknowledged success.
 

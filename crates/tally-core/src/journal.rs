@@ -144,6 +144,7 @@ pub const TALLY_FIELD_MATRIX: &[(&str, FieldRequirement)] = &[
     ("TALLY_JOB_ID", FieldRequirement::Conditional),
     ("TALLY_PARENT", FieldRequirement::Conditional),
     ("TALLY_POOL", FieldRequirement::Conditional),
+    ("TALLY_EXECUTOR", FieldRequirement::Conditional),
 ];
 
 pub fn tally_agent_label(adapter: &str) -> Result<String, JournalError> {
@@ -219,6 +220,12 @@ pub struct TallyFields {
         deserialize_with = "crate::poolset::deserialize_encoded_optional"
     )]
     pub pools: Option<Vec<String>>,
+    #[serde(
+        rename = "TALLY_EXECUTOR",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub executor: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -241,6 +248,7 @@ pub struct EmitEvent {
     pub job_id: Option<String>,
     pub parent: Option<String>,
     pub pools: Option<Vec<String>>,
+    pub executor: Option<String>,
 }
 
 impl EmitEvent {
@@ -264,6 +272,7 @@ impl EmitEvent {
             job_id: None,
             parent: None,
             pools: None,
+            executor: None,
         }
     }
 
@@ -292,6 +301,7 @@ impl EmitEvent {
             job_id: self.job_id,
             parent: self.parent,
             pools: self.pools,
+            executor: self.executor,
         };
         validate_fields(&fields)?;
         Ok(fields)
@@ -399,6 +409,10 @@ fn field_present(fields: &TallyFields, name: &str) -> bool {
             .as_deref()
             .is_some_and(|value| !value.is_empty()),
         "TALLY_POOL" => fields.pools.as_ref().is_some_and(|value| !value.is_empty()),
+        "TALLY_EXECUTOR" => fields
+            .executor
+            .as_deref()
+            .is_some_and(|value| !value.is_empty()),
         _ => false,
     }
 }
@@ -477,6 +491,7 @@ fn string_fields(fields: &TallyFields) -> Vec<(&'static str, &str)> {
         ("TALLY_EVIDENCE", fields.evidence.as_deref()),
         ("TALLY_JOB_ID", fields.job_id.as_deref()),
         ("TALLY_PARENT", fields.parent.as_deref()),
+        ("TALLY_EXECUTOR", fields.executor.as_deref()),
     ] {
         if let Some(value) = value {
             values.push((name, value));
@@ -676,6 +691,7 @@ fn native_fields(fields: &TallyFields) -> Result<Vec<(&'static str, String)>, Jo
     if let Some(pools) = &fields.pools {
         values.push(("TALLY_POOL", crate::poolset::encoded(pools)?));
     }
+    push_optional(&mut values, "TALLY_EXECUTOR", fields.executor.as_deref());
     Ok(values)
 }
 
@@ -845,6 +861,7 @@ mod tests {
             job_id: Some("job-abc".to_owned()),
             parent: Some("parent-abc".to_owned()),
             pools: Some(vec!["gpu".to_owned()]),
+            executor: None,
         }
     }
 

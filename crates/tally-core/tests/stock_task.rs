@@ -23,6 +23,7 @@ async fn stock_taskwarrior_reads_the_in_process_replica() {
             source: EnqueueSource::Manual,
             adapter: "shell".to_owned(),
             pools: vec!["build-slot".to_owned()],
+            executor: None,
             model: None,
             cwd: Some(PathBuf::from("/tmp")),
             dedup_key: Some("stock-viewer-1".to_owned()),

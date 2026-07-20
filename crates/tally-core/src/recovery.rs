@@ -117,25 +117,23 @@ pub fn collect_durable_recovery_facts(
     Ok(facts)
 }
 
-pub fn collect_local_unit_facts(
+pub async fn collect_local_unit_facts(
     executor: &Executor,
     durable: &DurableRecoveryFacts,
 ) -> Result<BTreeMap<Uuid, LocalUnitFact>, RecoveryError> {
-    durable
-        .events
-        .iter()
-        .map(|event| {
-            let uuid = event.row.uuid;
-            let identity = ExecutionIdentity {
-                job_id: uuid,
-                task_uuid: Some(uuid),
-            };
-            executor
-                .inspect_identity(&identity)
-                .map(|fact| (uuid, fact))
-                .map_err(RecoveryError::from)
-        })
-        .collect()
+    let mut facts = BTreeMap::new();
+    for event in &durable.events {
+        let uuid = event.row.uuid;
+        let identity = ExecutionIdentity {
+            job_id: uuid,
+            task_uuid: Some(uuid),
+        };
+        let fact = executor
+            .inspect_identity_on(event.row.executor.as_deref(), &identity)
+            .await?;
+        facts.insert(uuid, fact);
+    }
+    Ok(facts)
 }
 
 pub fn collect_rowless_unit_fact(
@@ -479,6 +477,12 @@ fn validate_history(
         {
             return Err(RecoveryError::InvalidFacts(format!(
                 "witness seq {} pool does not match durable row {}",
+                record.seq, row.uuid
+            )));
+        }
+        if record.executor != row.executor {
+            return Err(RecoveryError::InvalidFacts(format!(
+                "witness seq {} executor does not match durable row {}",
                 record.seq, row.uuid
             )));
         }
@@ -868,6 +872,7 @@ mod tests {
             source: EnqueueSource::EventsDir,
             adapter: "shell".to_owned(),
             pools: vec![pool.to_owned()],
+            executor: None,
             model: None,
             cwd: Some(PathBuf::from("/work")),
             dedup_key: Some(format!("dedup:{uuid}")),
@@ -916,6 +921,7 @@ mod tests {
                         },
                         trace_ref: None,
                         pools: Some(row.pools.clone()),
+                        executor: row.executor.clone(),
                         charge: None,
                         model: None,
                         evidence_class: None,

@@ -63,6 +63,8 @@ pub struct WitnessRecord {
         deserialize_with = "crate::poolset::deserialize_optional"
     )]
     pub pools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     pub charge: Option<Charge>,
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +91,7 @@ pub struct WitnessBody {
     pub labor_class: LaborClass,
     pub trace_ref: Option<String>,
     pub pools: Option<Vec<String>>,
+    pub executor: Option<String>,
     pub charge: Option<Charge>,
     pub model: Option<String>,
     pub evidence_class: Option<Value>,
@@ -203,6 +206,7 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
         labor_class: body.labor_class,
         trace_ref: body.trace_ref,
         pools,
+        executor: body.executor,
         charge: body.charge,
         model: body.model,
         evidence_class: body.evidence_class,
@@ -238,6 +242,20 @@ fn validate_record(raw: &Value) -> Result<WitnessRecord, String> {
         if &canonical != pools {
             return Err("pool set is not in canonical order".to_owned());
         }
+    }
+    if record.executor.as_ref().is_some_and(|executor| {
+        executor.is_empty()
+            || executor.len() > 96
+            || matches!(executor.as_str(), "." | "..")
+            || !executor
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            || !executor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    }) {
+        return Err("executor is not a safe registry component".to_owned());
     }
     if record.seq == 0 {
         return Err("seq missing or not a positive integer".to_owned());
@@ -798,6 +816,7 @@ mod tests {
             labor_class: LaborClass::Fresh,
             trace_ref: None,
             pools: Some(vec!["worker-gpu".to_owned()]),
+            executor: None,
             charge: Some(Charge {
                 unit: "gpu-seconds".to_owned(),
                 amount: 42.5,

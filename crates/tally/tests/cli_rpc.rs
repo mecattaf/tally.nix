@@ -61,6 +61,10 @@ impl RpcHandler for CliHandler {
                         request.params.as_ref().unwrap()["pool"],
                         serde_json::json!(["slot", "zeta"])
                     );
+                    assert_eq!(
+                        request.params.as_ref().unwrap()["executor"],
+                        serde_json::json!("worker")
+                    );
                     Ok(serde_json::json!({
                         "task_uuid": "00000000-0000-4000-8000-000000000003",
                         "job_id": "job-multi",
@@ -179,7 +183,17 @@ async fn cli_carries_a_canonical_multi_pool_set_over_enqueue_and_acquire_rpc() {
             });
             let enqueued = run_tally(
                 &socket,
-                &["enqueue", "--pool", "zeta", "--pool", "slot", "--", "true"],
+                &[
+                    "enqueue",
+                    "--pool",
+                    "zeta",
+                    "--pool",
+                    "slot",
+                    "--executor",
+                    "worker",
+                    "--",
+                    "true",
+                ],
             )
             .await;
             assert_eq!(enqueued.status.code(), Some(0));

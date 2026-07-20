@@ -35,6 +35,8 @@ pub struct RowFact {
         deserialize_with = "crate::poolset::deserialize_optional"
     )]
     pub pools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     pub source: Option<String>,
     pub session_ref: Option<String>,
     #[serde(default = "default_query_attempt")]
@@ -63,6 +65,7 @@ impl From<&TaskRow> for RowFact {
             pools: row.value("pool").map(|value| {
                 crate::poolset::decoded(value).unwrap_or_else(|_| vec![value.to_owned()])
             }),
+            executor: row.value("executor").map(ToOwned::to_owned),
             source: row.value("source").map(ToOwned::to_owned),
             session_ref: row.value("session_ref").map(ToOwned::to_owned),
             attempt: row
@@ -272,6 +275,8 @@ pub struct JobProjection {
         deserialize_with = "crate::poolset::deserialize_optional"
     )]
     pub pools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     pub source: Option<String>,
     pub session_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -322,6 +327,7 @@ fn project_job_details(
                     task_uuid: Some(row.task_uuid.clone()),
                     description: Some(row.description.clone()),
                     pools: row.pools.clone(),
+                    executor: row.executor.clone(),
                     source: row.source.clone(),
                     session_ref: row.session_ref.clone(),
                     model: row.model.clone(),
@@ -350,6 +356,7 @@ fn project_job_details(
                 task_uuid: Some(anchor),
                 description: None,
                 pools: None,
+                executor: None,
                 source: None,
                 session_ref: None,
                 model: None,
@@ -380,6 +387,7 @@ fn project_job_details(
         if job.last_realtime_us <= entry.realtime_us {
             job.output.state = entry.fields.event.to_string();
             job.output.pools = entry.fields.pools.clone().or(job.output.pools.take());
+            job.output.executor = entry.fields.executor.clone().or(job.output.executor.take());
             if job.output.source.is_none() {
                 job.output.source = Some(source_name(entry.fields.source).to_owned());
             }
@@ -403,6 +411,7 @@ fn project_job_details(
                 task_uuid: record.task_uuid.clone(),
                 description: None,
                 pools: None,
+                executor: record.executor.clone(),
                 source: None,
                 session_ref: None,
                 model: record.model.clone(),
@@ -432,6 +441,7 @@ fn project_job_details(
         }
         job.output.task_uuid = record.task_uuid.clone();
         job.output.pools = record.pools.clone().or(job.output.pools.take());
+        job.output.executor = record.executor.clone().or(job.output.executor.take());
         job.output.session_ref = record.trace_ref.clone().or(job.output.session_ref.take());
         job.output.model = record.model.clone().or(job.output.model.take());
         job.output.state = "terminal".to_owned();
@@ -568,6 +578,8 @@ pub struct LogRecord {
         deserialize_with = "crate::poolset::deserialize_optional"
     )]
     pub pools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     pub source: Option<String>,
     pub gpu_seconds: Option<f64>,
     pub artifact_hash: Option<String>,
@@ -619,6 +631,11 @@ pub fn query_log(
                 .pools
                 .clone()
                 .or_else(|| row.and_then(|row| row.pools.clone())),
+            executor: entry
+                .fields
+                .executor
+                .clone()
+                .or_else(|| row.and_then(|row| row.executor.clone())),
             source: Some(source_name(entry.fields.source).to_owned()),
             gpu_seconds: entry.fields.gpu_seconds,
             artifact_hash: entry.fields.artifact_hash.clone(),
@@ -656,6 +673,10 @@ pub fn query_log(
                 .pools
                 .clone()
                 .or_else(|| row.and_then(|row| row.pools.clone())),
+            executor: record
+                .executor
+                .clone()
+                .or_else(|| row.and_then(|row| row.executor.clone())),
             source: row.and_then(|row| row.source.clone()),
             gpu_seconds: record.gpu_seconds,
             artifact_hash: record.artifact_content_hash.clone(),
@@ -954,6 +975,7 @@ mod tests {
             status: RowStatus::Pending,
             priority: "H".to_owned(),
             pools: Some(vec!["gpu".to_owned()]),
+            executor: None,
             source: Some("manual".to_owned()),
             session_ref: Some(session.to_owned()),
             attempt: 1,
@@ -984,6 +1006,7 @@ mod tests {
                 job_id: Some(format!("job-{task}")),
                 parent: None,
                 pools: Some(vec!["gpu".to_owned()]),
+                executor: None,
             }
         };
         JournalEntry {
@@ -1007,6 +1030,7 @@ mod tests {
             labor_class: labor,
             trace_ref: None,
             pools: Some(vec!["gpu".to_owned()]),
+            executor: None,
             charge: Some(Charge {
                 unit: "gpu-second".to_owned(),
                 amount: 10.0,

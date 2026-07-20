@@ -86,7 +86,13 @@ in
           NoNewPrivileges = true;
           PrivateTmp = true;
           ProtectSystem = "strict";
-          RestrictAddressFamilies = [ "AF_UNIX" ];
+          RestrictAddressFamilies = [
+            "AF_UNIX"
+          ]
+          ++ lib.optionals (cfg.executors != { }) [
+            "AF_INET"
+            "AF_INET6"
+          ];
           SystemCallFilter = [ "@system-service" ];
         };
       };

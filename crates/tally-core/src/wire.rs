@@ -340,6 +340,8 @@ pub struct EnqueuePayload {
         deserialize_with = "crate::poolset::deserialize_optional"
     )]
     pub pools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     #[serde(default)]
     pub priority: Option<Priority>,
     #[serde(default)]
@@ -379,6 +381,7 @@ pub struct EnqueuePayload {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ProducerDefaults {
     pub pools: Vec<String>,
+    pub executor: Option<String>,
     pub priority: Priority,
     pub adapter: String,
     pub source: EnqueueSource,
@@ -394,6 +397,8 @@ pub struct ResolvedEnqueue {
         deserialize_with = "crate::poolset::deserialize"
     )]
     pub pools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
     pub priority: Priority,
     pub adapter: String,
     pub source: EnqueueSource,
@@ -588,6 +593,7 @@ impl GuardrailState {
         Ok(ResolvedEnqueue {
             argv,
             pools,
+            executor: payload.executor.or_else(|| defaults.executor.clone()),
             priority: payload.priority.unwrap_or(defaults.priority),
             adapter,
             source,
@@ -778,6 +784,7 @@ mod tests {
     fn defaults() -> ProducerDefaults {
         ProducerDefaults {
             pools: vec!["default-pool".to_owned()],
+            executor: None,
             priority: Priority::Low,
             adapter: "shell".to_owned(),
             source: EnqueueSource::Calendar,
@@ -789,6 +796,7 @@ mod tests {
             invocation: None,
             argv: Some(vec!["child".to_owned()]),
             pools: None,
+            executor: None,
             priority: None,
             adapter: None,
             source: None,

@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::future::Future;
+use std::io::{Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,10 +15,12 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 pub use taskchampion::Uuid;
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::watch;
 
-use crate::config::Priority;
+use crate::config::{ExecutionTargetConfig, Priority, SshExecutorConfig};
+use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOutcome};
 
 pub const CAPTURE_DIRECTORY: &str = "capture";
 pub const UNIT_EXIT_DIRECTORY: &str = "unit-exit";
@@ -32,7 +36,8 @@ const OPTIONAL_TALLY_ENVIRONMENT: [&str; 6] = [
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecutionIdentity {
     pub job_id: Uuid,
     pub task_uuid: Option<Uuid>,
@@ -44,13 +49,15 @@ impl ExecutionIdentity {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UnitLimits {
     pub cpu_weight: u16,
     pub memory_max_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecutionRequest {
     pub identity: ExecutionIdentity,
     pub parent: Option<Uuid>,
@@ -73,7 +80,8 @@ pub struct ExecutionRequest {
     pub runtime_max_sec: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecutionPaths {
     pub stdout: PathBuf,
     pub stderr: PathBuf,
@@ -88,14 +96,17 @@ struct CaptureGeneration {
     lease_epoch: u64,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum ExecutionBackend {
     Systemd,
     Direct,
     Adopted,
+    Remote,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "detail", rename_all = "kebab-case")]
 pub enum ExecutionTermination {
     Exited(i32),
     Signaled {
@@ -110,13 +121,19 @@ pub enum ExecutionTermination {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ExecutionOutcome {
     pub unit: String,
     pub backend: ExecutionBackend,
     pub paths: ExecutionPaths,
     pub record: UnitExitRecord,
     pub termination: ExecutionTermination,
+    /// Canonical evidence computed on the worker that owns remote artifact
+    /// paths. Local executions leave this unset and the daemon computes it.
+    pub evidence_gate: Option<GateResult>,
+    /// Whether stdout/stderr for this exact generation are locally available
+    /// for advisory adapter scraping.
+    pub captures_available: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -279,7 +296,8 @@ impl UnitExitRecord {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum LocalUnitState {
     Absent,
     Running,
@@ -287,7 +305,8 @@ pub enum LocalUnitState {
     InactiveWithoutRecord,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LocalUnitFact {
     pub unit: String,
     pub loaded: bool,
@@ -309,6 +328,300 @@ impl LocalUnitFact {
             lease_epoch: None,
             exit_record: None,
         }
+    }
+}
+
+pub const REMOTE_EXECUTOR_PROTOCOL_VERSION: u32 = 1;
+const MAX_REMOTE_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_REMOTE_REPLY_BYTES: usize = 48 * 1024 * 1024;
+const MAX_REMOTE_STDERR_BYTES: usize = 64 * 1024;
+const MAX_REMOTE_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Wire protocol used only by the fixed `__remote-executor` helper command.
+/// Job argv is nested in the JSON request and is never interpolated into the
+/// OpenSSH remote command.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "kebab-case")]
+pub enum RemoteExecutorRequest {
+    Ensure {
+        state_dir: PathBuf,
+        request: ExecutionRequest,
+        evidence: Vec<String>,
+    },
+    Adopt {
+        state_dir: PathBuf,
+        request: ExecutionRequest,
+        expected_invocation_id: String,
+        evidence: Vec<String>,
+    },
+    Probe {
+        state_dir: PathBuf,
+        identity: ExecutionIdentity,
+    },
+    Reclaim {
+        state_dir: PathBuf,
+        identity: ExecutionIdentity,
+        #[serde(default)]
+        expected_invocation_id: Option<String>,
+        attempt: u32,
+        lease_epoch: u64,
+    },
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RemoteCapture {
+    pub attempt: u32,
+    pub lease_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stdout_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_base64: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RemoteCompletion {
+    pub unit: String,
+    pub record: UnitExitRecord,
+    pub termination: ExecutionTermination,
+    pub capture: RemoteCapture,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_gate: Option<GateResult>,
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
+pub enum RemoteExecutorResult {
+    Fact(LocalUnitFact),
+    Completion(RemoteCompletion),
+    Reclaimed(RemoteCapture),
+}
+
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+pub enum RemoteExecutorReply {
+    Ok {
+        protocol_version: u32,
+        result: Box<RemoteExecutorResult>,
+    },
+    Error {
+        protocol_version: u32,
+        message: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("{detail}")]
+pub struct RemoteTransportError {
+    pub detail: String,
+}
+
+pub trait RemoteTransport: Send + Sync {
+    fn call<'a>(
+        &'a self,
+        config: &'a SshExecutorConfig,
+        request: RemoteExecutorRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<RemoteExecutorReply, RemoteTransportError>> + Send + 'a>>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SshRemoteTransport;
+
+pub fn build_ssh_argv(config: &SshExecutorConfig) -> Vec<OsString> {
+    let option = |name: &str, value: String| -> OsString { format!("{name}={value}").into() };
+    vec![
+        "-T".into(),
+        "-F".into(),
+        "/dev/null".into(),
+        "-o".into(),
+        "BatchMode=yes".into(),
+        "-o".into(),
+        "PasswordAuthentication=no".into(),
+        "-o".into(),
+        "KbdInteractiveAuthentication=no".into(),
+        "-o".into(),
+        "PubkeyAuthentication=yes".into(),
+        "-o".into(),
+        "IdentitiesOnly=yes".into(),
+        "-o".into(),
+        "IdentityAgent=none".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=yes".into(),
+        "-o".into(),
+        option(
+            "UserKnownHostsFile",
+            config.known_hosts_file.to_string_lossy().into_owned(),
+        ),
+        "-o".into(),
+        "GlobalKnownHostsFile=/dev/null".into(),
+        "-o".into(),
+        option("ConnectTimeout", config.connect_timeout_sec.to_string()),
+        "-o".into(),
+        "ConnectionAttempts=1".into(),
+        "-o".into(),
+        option(
+            "ServerAliveInterval",
+            config.server_alive_interval_sec.to_string(),
+        ),
+        "-o".into(),
+        option(
+            "ServerAliveCountMax",
+            config.server_alive_count_max.to_string(),
+        ),
+        "-o".into(),
+        "ClearAllForwardings=yes".into(),
+        "-o".into(),
+        "ForwardAgent=no".into(),
+        "-o".into(),
+        "ForwardX11=no".into(),
+        "-o".into(),
+        "PermitLocalCommand=no".into(),
+        "-o".into(),
+        "ProxyCommand=none".into(),
+        "-o".into(),
+        "CanonicalizeHostname=no".into(),
+        "-o".into(),
+        "LogLevel=ERROR".into(),
+        "-i".into(),
+        config.identity_file.as_os_str().to_owned(),
+        "-p".into(),
+        config.port.to_string().into(),
+        "--".into(),
+        format!("{}@{}", config.user, config.host).into(),
+        config.program.as_os_str().to_owned(),
+        "__remote-executor".into(),
+    ]
+}
+
+async fn read_async_bounded<R>(
+    mut reader: R,
+    limit: usize,
+) -> Result<(Vec<u8>, bool), std::io::Error>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut retained = Vec::new();
+    let mut overflow = false;
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = limit.saturating_sub(retained.len());
+        if read <= remaining {
+            retained.extend_from_slice(&buffer[..read]);
+        } else {
+            retained.extend_from_slice(&buffer[..remaining]);
+            overflow = true;
+        }
+    }
+    Ok((retained, overflow))
+}
+
+impl RemoteTransport for SshRemoteTransport {
+    fn call<'a>(
+        &'a self,
+        config: &'a SshExecutorConfig,
+        request: RemoteExecutorRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<RemoteExecutorReply, RemoteTransportError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            let mut encoded =
+                serde_json::to_vec(&request).map_err(|error| RemoteTransportError {
+                    detail: format!("cannot encode request: {error}"),
+                })?;
+            encoded.push(b'\n');
+            if encoded.len() as u64 > MAX_REMOTE_REQUEST_BYTES {
+                return Err(RemoteTransportError {
+                    detail: format!(
+                        "request exceeds the {MAX_REMOTE_REQUEST_BYTES}-byte protocol limit"
+                    ),
+                });
+            }
+
+            let mut command = Command::new(&config.ssh_program);
+            command
+                .kill_on_drop(true)
+                .env_clear()
+                .env("LC_ALL", "C")
+                .args(build_ssh_argv(config))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut child = command.spawn().map_err(|error| RemoteTransportError {
+                detail: format!("cannot spawn {}: {error}", config.ssh_program.display()),
+            })?;
+            let mut stdin = child.stdin.take().ok_or_else(|| RemoteTransportError {
+                detail: "OpenSSH stdin pipe is unavailable".to_owned(),
+            })?;
+            let stdout = child.stdout.take().ok_or_else(|| RemoteTransportError {
+                detail: "OpenSSH stdout pipe is unavailable".to_owned(),
+            })?;
+            let stderr = child.stderr.take().ok_or_else(|| RemoteTransportError {
+                detail: "OpenSSH stderr pipe is unavailable".to_owned(),
+            })?;
+            let write = async move {
+                stdin.write_all(&encoded).await?;
+                stdin.shutdown().await
+            };
+            let wait = child.wait();
+            let (write_result, status_result, stdout_result, stderr_result) = tokio::join!(
+                write,
+                wait,
+                read_async_bounded(stdout, MAX_REMOTE_REPLY_BYTES),
+                read_async_bounded(stderr, MAX_REMOTE_STDERR_BYTES),
+            );
+            let status = status_result.map_err(|error| RemoteTransportError {
+                detail: format!("cannot wait for OpenSSH: {error}"),
+            })?;
+            let (stdout, stdout_overflow) =
+                stdout_result.map_err(|error| RemoteTransportError {
+                    detail: format!("cannot read OpenSSH stdout: {error}"),
+                })?;
+            let (stderr, stderr_overflow) =
+                stderr_result.map_err(|error| RemoteTransportError {
+                    detail: format!("cannot read OpenSSH stderr: {error}"),
+                })?;
+            if let Err(error) = write_result {
+                return Err(RemoteTransportError {
+                    detail: format!("cannot send remote request: {error}"),
+                });
+            }
+            if stdout_overflow {
+                return Err(RemoteTransportError {
+                    detail: format!("remote reply exceeds {MAX_REMOTE_REPLY_BYTES} bytes"),
+                });
+            }
+            let stderr_text = String::from_utf8_lossy(&stderr).trim().to_owned();
+            if !status.success() {
+                return Err(RemoteTransportError {
+                    detail: format!(
+                        "OpenSSH exited with status {:?}: {}{}",
+                        status.code(),
+                        stderr_text,
+                        if stderr_overflow {
+                            " (stderr truncated)"
+                        } else {
+                            ""
+                        }
+                    ),
+                });
+            }
+            serde_json::from_slice(&stdout).map_err(|error| RemoteTransportError {
+                detail: format!(
+                    "remote helper returned invalid JSON: {error}; stderr={stderr_text:?}"
+                ),
+            })
+        })
     }
 }
 
@@ -705,8 +1018,22 @@ pub enum ExecutorError {
     UnitProbe { unit: String, detail: String },
     #[error("cannot reclaim local execution unit {unit}: {detail}")]
     UnitControl { unit: String, detail: String },
+    #[error("unknown remote executor {0:?}")]
+    UnknownRemoteExecutor(String),
+    #[error("remote executor {executor:?} rejected the operation: {detail}")]
+    RemoteExecution { executor: String, detail: String },
+    #[error("remote executor protocol error for {executor:?}: {detail}")]
+    RemoteProtocol { executor: String, detail: String },
     #[error("local execution unit {unit} already exists in state {state:?}")]
     ExistingUnit { unit: String, state: LocalUnitState },
+    #[error(
+        "execution unit {unit} has a durable launch marker for attempt={attempt}, leaseEpoch={lease_epoch} but no unit or exit record; refusing ambiguous replay"
+    )]
+    IndeterminatePriorLaunch {
+        unit: String,
+        attempt: u32,
+        lease_epoch: u64,
+    },
     #[error(
         "recovered execution unit {unit} became unavailable in state {state:?}; refusing replay"
     )]
@@ -815,6 +1142,8 @@ pub struct Executor {
     unit_probe: Arc<dyn LocalUnitProbe>,
     direct_processes: Arc<Mutex<HashMap<Uuid, DirectProcess>>>,
     allow_direct_fallback: bool,
+    remote_executors: Arc<BTreeMap<String, ExecutionTargetConfig>>,
+    remote_transport: Arc<dyn RemoteTransport>,
 }
 
 impl std::fmt::Debug for Executor {
@@ -825,6 +1154,10 @@ impl std::fmt::Debug for Executor {
             .field("systemd_run", &self.systemd_run)
             .field("systemctl", &self.systemctl)
             .field("recorder_program", &self.recorder_program)
+            .field(
+                "remote_executors",
+                &self.remote_executors.keys().collect::<Vec<_>>(),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -839,6 +1172,8 @@ impl Executor {
             unit_probe: Arc::new(SystemdLocalUnitProbe::default()),
             direct_processes: Arc::new(Mutex::new(HashMap::new())),
             allow_direct_fallback: true,
+            remote_executors: Arc::new(BTreeMap::new()),
+            remote_transport: Arc::new(SshRemoteTransport),
         }
     }
 
@@ -857,6 +1192,23 @@ impl Executor {
     pub fn with_unit_probe(mut self, probe: impl LocalUnitProbe + 'static) -> Self {
         self.unit_probe = Arc::new(probe);
         self
+    }
+
+    pub fn with_remote_executors(
+        mut self,
+        executors: BTreeMap<String, ExecutionTargetConfig>,
+    ) -> Self {
+        self.remote_executors = Arc::new(executors);
+        self
+    }
+
+    pub fn with_remote_transport(mut self, transport: impl RemoteTransport + 'static) -> Self {
+        self.remote_transport = Arc::new(transport);
+        self
+    }
+
+    pub fn recorder_program(&self) -> &Path {
+        &self.recorder_program
     }
 
     /// Require durable systemd ownership. The direct fallback remains available
@@ -947,6 +1299,378 @@ impl Executor {
                 unit,
                 detail: format!("unit probe worker failed: {error}"),
             })?
+    }
+
+    fn remote_config(&self, name: &str) -> Result<SshExecutorConfig, ExecutorError> {
+        self.remote_executors
+            .get(name)
+            .map(ExecutionTargetConfig::ssh)
+            .cloned()
+            .ok_or_else(|| ExecutorError::UnknownRemoteExecutor(name.to_owned()))
+    }
+
+    async fn call_remote(
+        &self,
+        name: &str,
+        request: RemoteExecutorRequest,
+    ) -> Result<RemoteExecutorResult, ExecutorError> {
+        let config = self.remote_config(name)?;
+        let encoded_len = serde_json::to_vec(&request)
+            .map_err(|error| ExecutorError::RemoteProtocol {
+                executor: name.to_owned(),
+                detail: format!("cannot encode request: {error}"),
+            })?
+            .len()
+            .saturating_add(1);
+        if encoded_len as u64 > MAX_REMOTE_REQUEST_BYTES {
+            return Err(ExecutorError::RemoteProtocol {
+                executor: name.to_owned(),
+                detail: format!(
+                    "request exceeds the {MAX_REMOTE_REQUEST_BYTES}-byte protocol limit"
+                ),
+            });
+        }
+        let mut reported_loss = false;
+        loop {
+            match self.remote_transport.call(&config, request.clone()).await {
+                Ok(RemoteExecutorReply::Ok {
+                    protocol_version,
+                    result,
+                }) => {
+                    if protocol_version != REMOTE_EXECUTOR_PROTOCOL_VERSION {
+                        return Err(ExecutorError::RemoteProtocol {
+                            executor: name.to_owned(),
+                            detail: format!(
+                                "helper protocol version {protocol_version}, expected {REMOTE_EXECUTOR_PROTOCOL_VERSION}"
+                            ),
+                        });
+                    }
+                    if reported_loss {
+                        eprintln!("tally: remote executor {name:?} is reachable again");
+                    }
+                    return Ok(*result);
+                }
+                Ok(RemoteExecutorReply::Error {
+                    protocol_version,
+                    message,
+                }) => {
+                    if protocol_version != REMOTE_EXECUTOR_PROTOCOL_VERSION {
+                        return Err(ExecutorError::RemoteProtocol {
+                            executor: name.to_owned(),
+                            detail: format!(
+                                "helper error protocol version {protocol_version}, expected {REMOTE_EXECUTOR_PROTOCOL_VERSION}"
+                            ),
+                        });
+                    }
+                    return Err(ExecutorError::RemoteExecution {
+                        executor: name.to_owned(),
+                        detail: message,
+                    });
+                }
+                Err(error) => {
+                    if !reported_loss {
+                        eprintln!(
+                            "tally: remote executor {name:?} transport is unavailable; retaining leases and retrying: {error}"
+                        );
+                        reported_loss = true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(config.retry_interval_ms)).await;
+                }
+            }
+        }
+    }
+
+    fn materialize_remote_capture(
+        &self,
+        identity: &ExecutionIdentity,
+        expected_attempt: u32,
+        expected_lease_epoch: u64,
+        capture: &RemoteCapture,
+    ) -> Result<bool, ExecutorError> {
+        if capture.attempt != expected_attempt || capture.lease_epoch != expected_lease_epoch {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "remote capture generation attempt={} leaseEpoch={} does not match expected attempt={expected_attempt} leaseEpoch={expected_lease_epoch}",
+                capture.attempt, capture.lease_epoch
+            )));
+        }
+        if let Some(error) = &capture.error {
+            eprintln!(
+                "tally: remote capture for {} is unavailable: {error}",
+                identity.unit_uuid()
+            );
+            return Ok(false);
+        }
+        let (Some(stdout), Some(stderr)) = (
+            capture.stdout_base64.as_deref(),
+            capture.stderr_base64.as_deref(),
+        ) else {
+            return Err(ExecutorError::InvalidRequest(
+                "remote capture omitted data without an error".to_owned(),
+            ));
+        };
+        let stdout = decode_base64(stdout)?;
+        let stderr = decode_base64(stderr)?;
+        let paths = self.paths(identity);
+        replace_private_file(&paths.stdout, &stdout)?;
+        replace_private_file(&paths.stderr, &stderr)?;
+        write_capture_generation(
+            &paths.capture_generation,
+            CaptureGeneration {
+                attempt: expected_attempt,
+                lease_epoch: expected_lease_epoch,
+            },
+        )?;
+        Ok(true)
+    }
+
+    fn materialize_remote_completion(
+        &self,
+        executor_name: &str,
+        identity: &ExecutionIdentity,
+        expected_invocation_id: Option<&str>,
+        expected_attempt: u32,
+        expected_lease_epoch: u64,
+        completion: RemoteCompletion,
+    ) -> Result<ExecutionOutcome, ExecutorError> {
+        let expected_unit = self.unit_name(identity);
+        if completion.unit != expected_unit {
+            return Err(ExecutorError::RemoteProtocol {
+                executor: executor_name.to_owned(),
+                detail: format!(
+                    "helper returned unit {:?}, expected {expected_unit:?}",
+                    completion.unit
+                ),
+            });
+        }
+        completion
+            .record
+            .validate(&expected_unit)
+            .map_err(|error| ExecutorError::RemoteProtocol {
+                executor: executor_name.to_owned(),
+                detail: error.to_string(),
+            })?;
+        if let Some(expected) = expected_invocation_id {
+            if completion.record.invocation_id != expected {
+                return Err(ExecutorError::AdoptedInvocationMismatch {
+                    unit: expected_unit,
+                    expected: expected.to_owned(),
+                    observed: Some(completion.record.invocation_id),
+                });
+            }
+        }
+        if completion.record.attempt != expected_attempt
+            || completion.record.lease_epoch != expected_lease_epoch
+        {
+            return Err(ExecutorError::AdoptedGenerationMismatch {
+                unit: expected_unit,
+                expected_attempt,
+                expected_lease_epoch,
+                observed_attempt: completion.record.attempt,
+                observed_lease_epoch: completion.record.lease_epoch,
+            });
+        }
+        let classified = classify_termination(&completion.record).map_err(|error| {
+            ExecutorError::RemoteProtocol {
+                executor: executor_name.to_owned(),
+                detail: error.to_string(),
+            }
+        })?;
+        if completion.termination != classified {
+            return Err(ExecutorError::RemoteProtocol {
+                executor: executor_name.to_owned(),
+                detail: format!(
+                    "helper termination {:?} does not match durable exit record classification {:?}",
+                    completion.termination, classified
+                ),
+            });
+        }
+        if matches!(completion.termination, ExecutionTermination::Exited(_))
+            != completion.evidence_gate.is_some()
+        {
+            return Err(ExecutorError::RemoteProtocol {
+                executor: executor_name.to_owned(),
+                detail: "helper evidence result does not match the terminal state".to_owned(),
+            });
+        }
+        let captures_available = match self.materialize_remote_capture(
+            identity,
+            expected_attempt,
+            expected_lease_epoch,
+            &completion.capture,
+        ) {
+            Ok(available) => available,
+            Err(ExecutorError::InvalidRequest(detail)) => {
+                return Err(ExecutorError::RemoteProtocol {
+                    executor: executor_name.to_owned(),
+                    detail,
+                });
+            }
+            Err(error) => {
+                eprintln!(
+                    "tally: remote execution completed, but its local capture cache could not be written: {error}"
+                );
+                false
+            }
+        };
+        let paths = self.paths(identity);
+        if let Err(error) = write_exit_record(&paths.exit_record, &completion.record) {
+            eprintln!(
+                "tally: remote execution completed, but its local exit cache could not be written: {error}"
+            );
+        }
+        Ok(ExecutionOutcome {
+            unit: completion.unit,
+            backend: ExecutionBackend::Remote,
+            paths,
+            record: completion.record,
+            termination: completion.termination,
+            evidence_gate: completion.evidence_gate,
+            captures_available,
+        })
+    }
+
+    pub async fn inspect_identity_on(
+        &self,
+        executor: Option<&str>,
+        identity: &ExecutionIdentity,
+    ) -> Result<LocalUnitFact, ExecutorError> {
+        let Some(name) = executor else {
+            return self.inspect_identity_async(identity).await;
+        };
+        let config = self.remote_config(name)?;
+        let result = self
+            .call_remote(
+                name,
+                RemoteExecutorRequest::Probe {
+                    state_dir: config.state_dir,
+                    identity: identity.clone(),
+                },
+            )
+            .await?;
+        let RemoteExecutorResult::Fact(fact) = result else {
+            return Err(ExecutorError::RemoteProtocol {
+                executor: name.to_owned(),
+                detail: "probe returned a non-fact response".to_owned(),
+            });
+        };
+        let unit = self.unit_name(identity);
+        validate_local_unit_fact_shape(&unit, &fact)?;
+        Ok(fact)
+    }
+
+    pub async fn execute_on(
+        &self,
+        executor: Option<&str>,
+        request: ExecutionRequest,
+        evidence: Vec<String>,
+    ) -> Result<ExecutionOutcome, ExecutorError> {
+        let Some(name) = executor else {
+            return self.execute(request).await;
+        };
+        self.validate_request(&request)?;
+        parse_evidence_specs(&evidence)
+            .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+        let config = self.remote_config(name)?;
+        let identity = request.identity.clone();
+        let attempt = request.attempt;
+        let lease_epoch = request.lease_epoch;
+        let result = self
+            .call_remote(
+                name,
+                RemoteExecutorRequest::Ensure {
+                    state_dir: config.state_dir,
+                    request,
+                    evidence,
+                },
+            )
+            .await?;
+        let RemoteExecutorResult::Completion(completion) = result else {
+            return Err(ExecutorError::RemoteProtocol {
+                executor: name.to_owned(),
+                detail: "ensure returned a non-completion response".to_owned(),
+            });
+        };
+        self.materialize_remote_completion(name, &identity, None, attempt, lease_epoch, completion)
+    }
+
+    pub async fn adopt_on(
+        &self,
+        executor: Option<&str>,
+        request: ExecutionRequest,
+        expected_invocation_id: &str,
+        evidence: Vec<String>,
+    ) -> Result<ExecutionOutcome, ExecutorError> {
+        let Some(name) = executor else {
+            return self.adopt(request, expected_invocation_id).await;
+        };
+        self.validate_request(&request)?;
+        parse_evidence_specs(&evidence)
+            .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+        let config = self.remote_config(name)?;
+        let identity = request.identity.clone();
+        let attempt = request.attempt;
+        let lease_epoch = request.lease_epoch;
+        let result = self
+            .call_remote(
+                name,
+                RemoteExecutorRequest::Adopt {
+                    state_dir: config.state_dir,
+                    request,
+                    expected_invocation_id: expected_invocation_id.to_owned(),
+                    evidence,
+                },
+            )
+            .await?;
+        let RemoteExecutorResult::Completion(completion) = result else {
+            return Err(ExecutorError::RemoteProtocol {
+                executor: name.to_owned(),
+                detail: "adopt returned a non-completion response".to_owned(),
+            });
+        };
+        self.materialize_remote_completion(
+            name,
+            &identity,
+            Some(expected_invocation_id),
+            attempt,
+            lease_epoch,
+            completion,
+        )
+    }
+
+    pub async fn reclaim_identity_exact_on(
+        &self,
+        executor: Option<&str>,
+        identity: &ExecutionIdentity,
+        expected_invocation_id: Option<&str>,
+        attempt: u32,
+        lease_epoch: u64,
+    ) -> Result<(), ExecutorError> {
+        let Some(name) = executor else {
+            return self
+                .reclaim_identity_exact(identity, expected_invocation_id)
+                .await;
+        };
+        let config = self.remote_config(name)?;
+        let result = self
+            .call_remote(
+                name,
+                RemoteExecutorRequest::Reclaim {
+                    state_dir: config.state_dir,
+                    identity: identity.clone(),
+                    expected_invocation_id: expected_invocation_id.map(ToOwned::to_owned),
+                    attempt,
+                    lease_epoch,
+                },
+            )
+            .await?;
+        let RemoteExecutorResult::Reclaimed(capture) = result else {
+            return Err(ExecutorError::RemoteProtocol {
+                executor: name.to_owned(),
+                detail: "reclaim returned a non-reclaimed response".to_owned(),
+            });
+        };
+        self.materialize_remote_capture(identity, attempt, lease_epoch, &capture)?;
+        Ok(())
     }
 
     pub async fn reclaim_identity(
@@ -1172,8 +1896,8 @@ impl Executor {
     ) -> Result<ExecutionOutcome, ExecutorError> {
         self.validate_request(&request)?;
         let observed = self.inspect_identity_async(&request.identity).await?;
-        match observed.state {
-            LocalUnitState::Absent => {}
+        let absent_without_exit = match observed.state {
+            LocalUnitState::Absent => true,
             LocalUnitState::Exited => {
                 let record = observed
                     .exit_record
@@ -1190,6 +1914,8 @@ impl Executor {
                         paths: self.paths(&request.identity),
                         record,
                         termination,
+                        evidence_gate: None,
+                        captures_available: true,
                     });
                 }
                 if observed.loaded {
@@ -1209,6 +1935,7 @@ impl Executor {
                         state: LocalUnitState::Exited,
                     });
                 }
+                false
             }
             LocalUnitState::Running | LocalUnitState::InactiveWithoutRecord => {
                 return Err(ExecutorError::ExistingUnit {
@@ -1216,8 +1943,26 @@ impl Executor {
                     state: observed.state,
                 });
             }
-        }
+        };
         let _reservation = self.reserve(&request.identity)?;
+        // This marker is fsynced before systemd-run can create the unit. If a
+        // retry finds the same generation with neither a unit nor an exit
+        // record, the previous helper may have launched work that was lost
+        // with the worker. Replaying argv would be a possible duplicate, so
+        // preserve the coordinator's lease and require explicit recovery.
+        if absent_without_exit
+            && self.capture_generation_matches(
+                &request.identity,
+                request.attempt,
+                request.lease_epoch,
+            )?
+        {
+            return Err(ExecutorError::IndeterminatePriorLaunch {
+                unit: self.unit_name(&request.identity),
+                attempt: request.attempt,
+                lease_epoch: request.lease_epoch,
+            });
+        }
         let paths = self.prepare_paths(&request.identity)?;
         write_capture_generation(
             &paths.capture_generation,
@@ -1263,6 +2008,8 @@ impl Executor {
             paths,
             record,
             termination,
+            evidence_gate: None,
+            captures_available: true,
         })
     }
 
@@ -1340,6 +2087,8 @@ impl Executor {
                         paths: self.paths(&request.identity),
                         record,
                         termination,
+                        evidence_gate: None,
+                        captures_available: true,
                     });
                 }
             }
@@ -1655,6 +2404,8 @@ impl Executor {
             paths,
             record,
             termination,
+            evidence_gate: None,
+            captures_available: true,
         })
     }
 }
@@ -2110,6 +2861,393 @@ fn is_not_found(error: &ExecutorError) -> bool {
     )
 }
 
+fn encode_base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        output.push(ALPHABET[(first >> 2) as usize] as char);
+        output.push(ALPHABET[(((first & 0x03) << 4) | (second >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            output.push(ALPHABET[(((second & 0x0f) << 2) | (third >> 6)) as usize] as char);
+        } else {
+            output.push('=');
+        }
+        if chunk.len() > 2 {
+            output.push(ALPHABET[(third & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
+}
+
+fn decode_base64(value: &str) -> Result<Vec<u8>, ExecutorError> {
+    fn digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    if !value.len().is_multiple_of(4)
+        || value.len() > (MAX_REMOTE_CAPTURE_BYTES as usize).div_ceil(3) * 4
+    {
+        return Err(ExecutorError::InvalidRequest(
+            "remote capture has an invalid base64 length".to_owned(),
+        ));
+    }
+    let mut output = Vec::with_capacity(value.len() / 4 * 3);
+    for (index, chunk) in value.as_bytes().chunks_exact(4).enumerate() {
+        let last = index + 1 == value.len() / 4;
+        let a = digit(chunk[0]).ok_or_else(|| {
+            ExecutorError::InvalidRequest("remote capture contains invalid base64".to_owned())
+        })?;
+        let b = digit(chunk[1]).ok_or_else(|| {
+            ExecutorError::InvalidRequest("remote capture contains invalid base64".to_owned())
+        })?;
+        let c = if chunk[2] == b'=' {
+            if !last || chunk[3] != b'=' || b & 0x0f != 0 {
+                return Err(ExecutorError::InvalidRequest(
+                    "remote capture has non-canonical base64 padding".to_owned(),
+                ));
+            }
+            None
+        } else {
+            Some(digit(chunk[2]).ok_or_else(|| {
+                ExecutorError::InvalidRequest("remote capture contains invalid base64".to_owned())
+            })?)
+        };
+        let d = if chunk[3] == b'=' {
+            if !last || c.is_some_and(|value| value & 0x03 != 0) {
+                return Err(ExecutorError::InvalidRequest(
+                    "remote capture has non-canonical base64 padding".to_owned(),
+                ));
+            }
+            None
+        } else {
+            Some(digit(chunk[3]).ok_or_else(|| {
+                ExecutorError::InvalidRequest("remote capture contains invalid base64".to_owned())
+            })?)
+        };
+        output.push((a << 2) | (b >> 4));
+        if let Some(c) = c {
+            output.push((b << 4) | (c >> 2));
+            if let Some(d) = d {
+                output.push((c << 6) | d);
+            }
+        }
+    }
+    if output.len() as u64 > MAX_REMOTE_CAPTURE_BYTES {
+        return Err(ExecutorError::InvalidRequest(
+            "remote capture exceeds its decoded byte limit".to_owned(),
+        ));
+    }
+    Ok(output)
+}
+
+fn read_remote_capture(path: &Path) -> Result<Vec<u8>, ExecutorError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    if !metadata.file_type().is_file() || metadata.len() > MAX_REMOTE_CAPTURE_BYTES {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "capture {} is not a bounded regular file",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_REMOTE_CAPTURE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error(path, source))?;
+    if bytes.len() as u64 > MAX_REMOTE_CAPTURE_BYTES {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "capture {} exceeds {MAX_REMOTE_CAPTURE_BYTES} bytes",
+            path.display()
+        )));
+    }
+    Ok(bytes)
+}
+
+fn collect_remote_capture(paths: &ExecutionPaths, attempt: u32, lease_epoch: u64) -> RemoteCapture {
+    match (
+        read_remote_capture(&paths.stdout),
+        read_remote_capture(&paths.stderr),
+    ) {
+        (Ok(stdout), Ok(stderr)) => RemoteCapture {
+            attempt,
+            lease_epoch,
+            stdout_base64: Some(encode_base64(&stdout)),
+            stderr_base64: Some(encode_base64(&stderr)),
+            error: None,
+        },
+        (stdout, stderr) => RemoteCapture {
+            attempt,
+            lease_epoch,
+            stdout_base64: None,
+            stderr_base64: None,
+            error: Some(format!(
+                "stdout: {}; stderr: {}",
+                stdout
+                    .err()
+                    .map_or_else(|| "ok".to_owned(), |error| error.to_string()),
+                stderr
+                    .err()
+                    .map_or_else(|| "ok".to_owned(), |error| error.to_string())
+            )),
+        },
+    }
+}
+
+fn remote_completion(
+    outcome: ExecutionOutcome,
+    evidence: &[String],
+) -> Result<RemoteCompletion, ExecutorError> {
+    let gate = match &outcome.termination {
+        ExecutionTermination::Exited(exit_code) => {
+            let spec = parse_evidence_specs(evidence)
+                .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+            Some(run_evidence_gate(RunOutcome {
+                exit_code: *exit_code,
+                wall_clock_seconds: 0.0,
+                evidence: &spec,
+            }))
+        }
+        _ => None,
+    };
+    let capture = collect_remote_capture(
+        &outcome.paths,
+        outcome.record.attempt,
+        outcome.record.lease_epoch,
+    );
+    Ok(RemoteCompletion {
+        unit: outcome.unit,
+        record: outcome.record,
+        termination: outcome.termination,
+        capture,
+        evidence_gate: gate,
+    })
+}
+
+fn pin_remote_reclaim(
+    fact: &LocalUnitFact,
+    expected_invocation_id: Option<&str>,
+    expected_attempt: u32,
+    expected_lease_epoch: u64,
+) -> Result<Option<String>, ExecutorError> {
+    if matches!(fact.state, LocalUnitState::Running | LocalUnitState::Exited) {
+        let observed_attempt = fact.attempt.expect("validated present fact has an attempt");
+        let observed_lease_epoch = fact
+            .lease_epoch
+            .expect("validated present fact has a lease epoch");
+        if observed_attempt != expected_attempt || observed_lease_epoch != expected_lease_epoch {
+            return Err(ExecutorError::AdoptedGenerationMismatch {
+                unit: fact.unit.clone(),
+                expected_attempt,
+                expected_lease_epoch,
+                observed_attempt,
+                observed_lease_epoch,
+            });
+        }
+    }
+    if let Some(expected) = expected_invocation_id {
+        if fact.state != LocalUnitState::Absent && fact.invocation_id.as_deref() != Some(expected) {
+            return Err(ExecutorError::AdoptedInvocationMismatch {
+                unit: fact.unit.clone(),
+                expected: expected.to_owned(),
+                observed: fact.invocation_id.clone(),
+            });
+        }
+        return Ok(Some(expected.to_owned()));
+    }
+    Ok(fact.invocation_id.clone())
+}
+
+async fn ensure_local_execution(
+    executor: &Executor,
+    request: ExecutionRequest,
+) -> Result<ExecutionOutcome, ExecutorError> {
+    loop {
+        match executor.execute(request.clone()).await {
+            Ok(outcome) => return Ok(outcome),
+            Err(
+                error @ (ExecutorError::AlreadyRunning(_) | ExecutorError::ExistingUnit { .. }),
+            ) => {
+                let fact = executor.inspect_identity_async(&request.identity).await?;
+                match fact.state {
+                    LocalUnitState::Absent => {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    LocalUnitState::Running => {
+                        if fact.attempt != Some(request.attempt)
+                            || fact.lease_epoch != Some(request.lease_epoch)
+                        {
+                            return Err(ExecutorError::AdoptedGenerationMismatch {
+                                unit: fact.unit,
+                                expected_attempt: request.attempt,
+                                expected_lease_epoch: request.lease_epoch,
+                                observed_attempt: fact.attempt.unwrap_or_default(),
+                                observed_lease_epoch: fact.lease_epoch.unwrap_or_default(),
+                            });
+                        }
+                        let invocation =
+                            fact.invocation_id.ok_or_else(|| ExecutorError::UnitProbe {
+                                unit: fact.unit.clone(),
+                                detail: "running remote unit has no invocation identity".to_owned(),
+                            })?;
+                        return executor.adopt(request, &invocation).await;
+                    }
+                    LocalUnitState::InactiveWithoutRecord => {
+                        let invocation =
+                            fact.invocation_id.ok_or_else(|| ExecutorError::UnitProbe {
+                                unit: fact.unit.clone(),
+                                detail: "inactive remote unit has no invocation identity"
+                                    .to_owned(),
+                            })?;
+                        return executor.adopt(request, &invocation).await;
+                    }
+                    LocalUnitState::Exited
+                        if fact.exit_record.as_ref().is_some_and(|record| {
+                            record.attempt == request.attempt
+                                && record.lease_epoch == request.lease_epoch
+                        }) =>
+                    {
+                        // `execute` consumes a matching durable exit without
+                        // launching, so retrying here is idempotent.
+                    }
+                    LocalUnitState::Exited => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn handle_remote_executor_request(
+    request: RemoteExecutorRequest,
+) -> Result<RemoteExecutorResult, ExecutorError> {
+    let state_dir = match &request {
+        RemoteExecutorRequest::Ensure { state_dir, .. }
+        | RemoteExecutorRequest::Adopt { state_dir, .. }
+        | RemoteExecutorRequest::Probe { state_dir, .. }
+        | RemoteExecutorRequest::Reclaim { state_dir, .. } => state_dir.clone(),
+    };
+    if !state_dir.is_absolute() {
+        return Err(ExecutorError::InvalidRequest(
+            "remote stateDir must be absolute".to_owned(),
+        ));
+    }
+    validate_systemd_path(&state_dir, "remote stateDir")?;
+    let recorder = std::env::current_exe().map_err(|source| ExecutorError::Io {
+        path: PathBuf::from("/proc/self/exe"),
+        source,
+    })?;
+    let executor = Executor::new(state_dir, recorder).require_systemd();
+    match request {
+        RemoteExecutorRequest::Ensure {
+            request, evidence, ..
+        } => Ok(RemoteExecutorResult::Completion(remote_completion(
+            ensure_local_execution(&executor, request).await?,
+            &evidence,
+        )?)),
+        RemoteExecutorRequest::Adopt {
+            request,
+            expected_invocation_id,
+            evidence,
+            ..
+        } => Ok(RemoteExecutorResult::Completion(remote_completion(
+            executor.adopt(request, &expected_invocation_id).await?,
+            &evidence,
+        )?)),
+        RemoteExecutorRequest::Probe { identity, .. } => Ok(RemoteExecutorResult::Fact(
+            executor.inspect_identity_async(&identity).await?,
+        )),
+        RemoteExecutorRequest::Reclaim {
+            identity,
+            expected_invocation_id,
+            attempt,
+            lease_epoch,
+            ..
+        } => {
+            if attempt == 0 || lease_epoch == 0 {
+                return Err(ExecutorError::InvalidRequest(
+                    "remote reclaim generation must be positive".to_owned(),
+                ));
+            }
+            let fact = executor.inspect_identity_async(&identity).await?;
+            let pinned_invocation = pin_remote_reclaim(
+                &fact,
+                expected_invocation_id.as_deref(),
+                attempt,
+                lease_epoch,
+            )?;
+            executor
+                .reclaim_identity_exact(&identity, pinned_invocation.as_deref())
+                .await?;
+            Ok(RemoteExecutorResult::Reclaimed(collect_remote_capture(
+                &executor.paths(&identity),
+                attempt,
+                lease_epoch,
+            )))
+        }
+    }
+}
+
+/// Serve exactly one bounded remote-executor request over stdin/stdout.
+/// Errors are returned as structured protocol replies so the coordinator can
+/// fail closed without guessing whether stderr came from OpenSSH or tally.
+pub async fn serve_remote_executor_stdio() -> Result<(), ExecutorError> {
+    let request = (|| -> Result<RemoteExecutorRequest, ExecutorError> {
+        let mut bytes = Vec::new();
+        std::io::stdin()
+            .take(MAX_REMOTE_REQUEST_BYTES + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|source| ExecutorError::Io {
+                path: PathBuf::from("<stdin>"),
+                source,
+            })?;
+        if bytes.len() as u64 > MAX_REMOTE_REQUEST_BYTES {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "remote request exceeds {MAX_REMOTE_REQUEST_BYTES} bytes"
+            )));
+        }
+        serde_json::from_slice(&bytes).map_err(ExecutorError::from)
+    })();
+    let reply = match request {
+        Ok(request) => match handle_remote_executor_request(request).await {
+            Ok(result) => RemoteExecutorReply::Ok {
+                protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                result: Box::new(result),
+            },
+            Err(error) => RemoteExecutorReply::Error {
+                protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                message: error.to_string(),
+            },
+        },
+        Err(error) => RemoteExecutorReply::Error {
+            protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+            message: error.to_string(),
+        },
+    };
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &reply)?;
+    stdout
+        .write_all(b"\n")
+        .and_then(|()| stdout.flush())
+        .map_err(|source| ExecutorError::Io {
+            path: PathBuf::from("<stdout>"),
+            source,
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
@@ -2182,6 +3320,389 @@ mod tests {
         args.iter()
             .map(|value| value.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn ssh_config() -> SshExecutorConfig {
+        SshExecutorConfig {
+            host: "worker.example".to_owned(),
+            user: "tally-worker".to_owned(),
+            port: 2222,
+            ssh_program: PathBuf::from("/run/current-system/sw/bin/ssh"),
+            identity_file: PathBuf::from("/run/credentials/tally-worker-key"),
+            known_hosts_file: PathBuf::from("/etc/tally/worker-known-hosts"),
+            program: PathBuf::from("/run/current-system/sw/bin/tally"),
+            state_dir: PathBuf::from("/var/lib/tally-remote"),
+            connect_timeout_sec: 3,
+            server_alive_interval_sec: 2,
+            server_alive_count_max: 2,
+            retry_interval_ms: 10,
+        }
+    }
+
+    #[derive(Clone)]
+    struct ScriptedRemoteTransport {
+        calls: Arc<Mutex<Vec<RemoteExecutorRequest>>>,
+        replies: Arc<
+            Mutex<std::collections::VecDeque<Result<RemoteExecutorReply, RemoteTransportError>>>,
+        >,
+    }
+
+    impl ScriptedRemoteTransport {
+        fn new(
+            replies: impl IntoIterator<Item = Result<RemoteExecutorReply, RemoteTransportError>>,
+        ) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                replies: Arc::new(Mutex::new(replies.into_iter().collect())),
+            }
+        }
+    }
+
+    impl RemoteTransport for ScriptedRemoteTransport {
+        fn call<'a>(
+            &'a self,
+            _config: &'a SshExecutorConfig,
+            request: RemoteExecutorRequest,
+        ) -> Pin<
+            Box<dyn Future<Output = Result<RemoteExecutorReply, RemoteTransportError>> + Send + 'a>,
+        > {
+            let calls = self.calls.clone();
+            let replies = self.replies.clone();
+            Box::pin(async move {
+                calls.lock().unwrap().push(request);
+                replies.lock().unwrap().pop_front().unwrap_or_else(|| {
+                    Err(RemoteTransportError {
+                        detail: "scripted remote replies exhausted".to_owned(),
+                    })
+                })
+            })
+        }
+    }
+
+    fn remote_executor(state_dir: &Path, transport: ScriptedRemoteTransport) -> Executor {
+        Executor::new(state_dir, "/nix/store/example/bin/tally")
+            .with_remote_executors(BTreeMap::from([(
+                "worker".to_owned(),
+                ExecutionTargetConfig::Ssh(ssh_config()),
+            )]))
+            .with_remote_transport(transport)
+    }
+
+    fn remote_completion(request: &ExecutionRequest, stdout: &[u8]) -> RemoteCompletion {
+        let unit = format!("tally-job-{}.service", request.identity.unit_uuid());
+        let record = UnitExitRecord {
+            schema_version: UNIT_EXIT_SCHEMA_VERSION,
+            unit: unit.clone(),
+            invocation_id: "remote-invocation".to_owned(),
+            attempt: request.attempt,
+            lease_epoch: request.lease_epoch,
+            service_result: "success".to_owned(),
+            exit_code: Some("exited".to_owned()),
+            exit_status: Some("0".to_owned()),
+        };
+        let evidence = parse_evidence_specs(&["exit:0".to_owned()]).unwrap();
+        RemoteCompletion {
+            unit,
+            record,
+            termination: ExecutionTermination::Exited(0),
+            capture: RemoteCapture {
+                attempt: request.attempt,
+                lease_epoch: request.lease_epoch,
+                stdout_base64: Some(encode_base64(stdout)),
+                stderr_base64: Some(encode_base64(b"")),
+                error: None,
+            },
+            evidence_gate: Some(run_evidence_gate(RunOutcome {
+                exit_code: 0,
+                wall_clock_seconds: 1.0,
+                evidence: &evidence,
+            })),
+        }
+    }
+
+    #[test]
+    fn ssh_transport_is_fixed_and_never_contains_workload_argv() {
+        let config = ssh_config();
+        let args = strings(&build_ssh_argv(&config));
+        assert_eq!(
+            &args[args.len() - 4..],
+            [
+                "--",
+                "tally-worker@worker.example",
+                "/run/current-system/sw/bin/tally",
+                "__remote-executor",
+            ]
+        );
+        for required in [
+            "BatchMode=yes",
+            "PasswordAuthentication=no",
+            "KbdInteractiveAuthentication=no",
+            "IdentitiesOnly=yes",
+            "IdentityAgent=none",
+            "StrictHostKeyChecking=yes",
+            "UserKnownHostsFile=/etc/tally/worker-known-hosts",
+            "GlobalKnownHostsFile=/dev/null",
+            "ClearAllForwardings=yes",
+            "ForwardAgent=no",
+            "ForwardX11=no",
+            "ProxyCommand=none",
+        ] {
+            assert!(args.contains(&required.to_owned()), "missing {required}");
+        }
+        for workload_argument in &request().argv {
+            assert!(
+                !args.contains(workload_argument),
+                "workload argv leaked into the SSH command: {workload_argument:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_capture_base64_is_canonical_and_bounded() {
+        for bytes in [
+            b"".as_slice(),
+            b"f".as_slice(),
+            b"fo".as_slice(),
+            b"foo".as_slice(),
+            &[0, 1, 2, 253, 254, 255],
+        ] {
+            let encoded = encode_base64(bytes);
+            assert_eq!(decode_base64(&encoded).unwrap(), bytes);
+        }
+        for invalid in ["A===", "Zh==", "Zm9=", "Zm=v", "!!!!", "Zg==AAAA"] {
+            assert!(decode_base64(invalid).is_err(), "accepted {invalid:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_loss_retries_the_same_ensure_without_relaunching() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request();
+        let completion = remote_completion(&request, b"completed remotely\n");
+        let transport = ScriptedRemoteTransport::new([
+            Err(RemoteTransportError {
+                detail: "connection reset after dispatch".to_owned(),
+            }),
+            Ok(RemoteExecutorReply::Ok {
+                protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                result: Box::new(RemoteExecutorResult::Completion(completion.clone())),
+            }),
+        ]);
+        let calls = transport.calls.clone();
+        let executor = remote_executor(temp.path(), transport);
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            executor.execute_on(Some("worker"), request.clone(), vec!["exit:0".to_owned()]),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(outcome.backend, ExecutionBackend::Remote);
+        assert_eq!(outcome.record, completion.record);
+        assert_eq!(
+            std::fs::read(outcome.paths.stdout).unwrap(),
+            b"completed remotely\n"
+        );
+        assert!(outcome.evidence_gate.unwrap().passed);
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], calls[1]);
+        assert!(matches!(calls[0], RemoteExecutorRequest::Ensure { .. }));
+    }
+
+    #[tokio::test]
+    async fn durable_launch_marker_blocks_replay_after_worker_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request();
+        let executor = executor(temp.path());
+        let paths = executor.paths(&request.identity);
+        write_capture_generation(
+            &paths.capture_generation,
+            CaptureGeneration {
+                attempt: request.attempt,
+                lease_epoch: request.lease_epoch,
+            },
+        )
+        .unwrap();
+
+        let error = executor.execute(request.clone()).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ExecutorError::IndeterminatePriorLaunch {
+                attempt,
+                lease_epoch,
+                ..
+            } if attempt == request.attempt && lease_epoch == request.lease_epoch
+        ));
+        assert!(!paths.stdout.exists());
+        assert!(!paths.stderr.exists());
+        assert!(!paths.exit_record.exists());
+    }
+
+    #[tokio::test]
+    async fn restart_probe_and_adoption_survive_worker_loss() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request();
+        let completion = remote_completion(&request, b"adopted\n");
+        let fact = LocalUnitFact {
+            unit: completion.unit.clone(),
+            loaded: true,
+            state: LocalUnitState::Running,
+            invocation_id: Some(completion.record.invocation_id.clone()),
+            attempt: Some(request.attempt),
+            lease_epoch: Some(request.lease_epoch),
+            exit_record: None,
+        };
+        let transport = ScriptedRemoteTransport::new([
+            Ok(RemoteExecutorReply::Ok {
+                protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                result: Box::new(RemoteExecutorResult::Fact(fact.clone())),
+            }),
+            Err(RemoteTransportError {
+                detail: "worker temporarily offline".to_owned(),
+            }),
+            Ok(RemoteExecutorReply::Ok {
+                protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                result: Box::new(RemoteExecutorResult::Completion(completion)),
+            }),
+        ]);
+        let calls = transport.calls.clone();
+        let executor = remote_executor(temp.path(), transport);
+
+        assert_eq!(
+            executor
+                .inspect_identity_on(Some("worker"), &request.identity)
+                .await
+                .unwrap(),
+            fact
+        );
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            executor.adopt_on(
+                Some("worker"),
+                request,
+                "remote-invocation",
+                vec!["exit:0".to_owned()],
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(outcome.backend, ExecutionBackend::Remote);
+
+        let calls = calls.lock().unwrap();
+        assert!(matches!(calls[0], RemoteExecutorRequest::Probe { .. }));
+        assert_eq!(calls[1], calls[2]);
+        assert!(matches!(calls[1], RemoteExecutorRequest::Adopt { .. }));
+        assert!(
+            !calls
+                .iter()
+                .any(|call| matches!(call, RemoteExecutorRequest::Ensure { .. })),
+            "restart adoption must never issue a fresh launch"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_remote_completion_is_a_fail_closed_protocol_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request();
+        let mut completion = remote_completion(&request, b"");
+        completion.capture.attempt += 1;
+        let transport = ScriptedRemoteTransport::new([Ok(RemoteExecutorReply::Ok {
+            protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+            result: Box::new(RemoteExecutorResult::Completion(completion)),
+        })]);
+        let error = remote_executor(temp.path(), transport)
+            .execute_on(Some("worker"), request, vec!["exit:0".to_owned()])
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ExecutorError::RemoteProtocol { executor, .. } if executor == "worker"
+        ));
+    }
+
+    #[tokio::test]
+    async fn remote_reclaim_retries_the_exact_invocation_and_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let request = request();
+        let transport = ScriptedRemoteTransport::new([
+            Err(RemoteTransportError {
+                detail: "worker disappeared during stop".to_owned(),
+            }),
+            Ok(RemoteExecutorReply::Ok {
+                protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
+                result: Box::new(RemoteExecutorResult::Reclaimed(RemoteCapture {
+                    attempt: request.attempt,
+                    lease_epoch: request.lease_epoch,
+                    stdout_base64: Some(String::new()),
+                    stderr_base64: Some(String::new()),
+                    error: None,
+                })),
+            }),
+        ]);
+        let calls = transport.calls.clone();
+        let executor = remote_executor(temp.path(), transport);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            executor.reclaim_identity_exact_on(
+                Some("worker"),
+                &request.identity,
+                Some("remote-invocation"),
+                request.attempt,
+                request.lease_epoch,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0], calls[1]);
+        assert!(matches!(
+            &calls[0],
+            RemoteExecutorRequest::Reclaim {
+                expected_invocation_id: Some(invocation_id),
+                attempt: 1,
+                lease_epoch: 7,
+                ..
+            } if invocation_id == "remote-invocation"
+        ));
+    }
+
+    #[test]
+    fn worker_reclaim_pins_observed_generation_before_stopping() {
+        let request = request();
+        let unit = format!("tally-job-{}.service", request.identity.unit_uuid());
+        let mut fact = LocalUnitFact {
+            unit,
+            loaded: true,
+            state: LocalUnitState::Running,
+            invocation_id: Some("observed-invocation".to_owned()),
+            attempt: Some(request.attempt),
+            lease_epoch: Some(request.lease_epoch),
+            exit_record: None,
+        };
+        assert_eq!(
+            pin_remote_reclaim(&fact, None, request.attempt, request.lease_epoch).unwrap(),
+            Some("observed-invocation".to_owned())
+        );
+        assert!(matches!(
+            pin_remote_reclaim(
+                &fact,
+                Some("replacement-invocation"),
+                request.attempt,
+                request.lease_epoch,
+            ),
+            Err(ExecutorError::AdoptedInvocationMismatch { .. })
+        ));
+        fact.attempt = Some(request.attempt + 1);
+        assert!(matches!(
+            pin_remote_reclaim(&fact, None, request.attempt, request.lease_epoch),
+            Err(ExecutorError::AdoptedGenerationMismatch { .. })
+        ));
     }
 
     #[test]
