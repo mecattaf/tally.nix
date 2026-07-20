@@ -4986,6 +4986,7 @@ fn recovery_action_already_installed(
     }
     if existing.row.lease_epoch != candidate.lease_epoch
         || existing.row.pools != candidate.pools
+        || existing.row.executor != candidate.executor
         || existing.row.adapter != candidate.adapter
         || existing.row.argv != candidate.argv
         || existing.row.dedup_key != candidate.dedup_key

@@ -219,9 +219,12 @@ prior launch and refuses to replay it. Keep `stateDir` on storage that survives 
 
 Transport ambiguity fails closed. The coordinator keeps every logical lease and retries the same
 operation until the worker returns an authoritative state. On coordinator restart it probes every
-durable remote row before accepting work, re-adopts an exact running invocation, and collects an
-exact durable exit without replaying argv. A missing or contradictory unit, generation, invocation,
-or protocol response stops recovery rather than releasing capacity or starting a replacement.
+remote row that could still have work in flight, re-adopts an exact running invocation, and
+collects an exact durable exit without replaying argv. A final non-retryable witness needs no
+worker probe; its authoritative terminal result is already local, so an offline historical worker
+does not block coordinator startup forever. A missing or contradictory unit, generation,
+invocation, or protocol response for a live-capable row stops recovery rather than releasing
+capacity or starting a replacement.
 
 ### Non-destructive thermal cooldown
 

@@ -199,9 +199,11 @@ Its records are never read as canonical verdicts or authoritative usage.
 ## 8. Restart and return recovery
 
 Startup recovery joins durable enqueue events, witness records, the current lease epoch, systemd
-unit state, exit records, and confirmed producer transitions. For a row with a named executor,
-the unit probe and any subsequent adoption or reconciliation run against that worker. Startup
-waits through transport loss rather than opening admission with unknown remote work.
+unit state, exit records, and confirmed producer transitions. For a row with a named executor that
+could still have work in flight, the unit probe and any subsequent adoption or reconciliation run
+against that worker. A final non-retryable witness is already authoritative and does not require
+the historical worker to be reachable. For every other remote row, startup waits through transport
+loss rather than opening admission with unknown remote work.
 
 For each durable row, recovery can:
 
