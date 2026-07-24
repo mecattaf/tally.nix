@@ -157,20 +157,28 @@ Proof:
 
 `crates/tally-core/src/adapters.rs` validates open-map adapter definitions, substitutes named resume
 captures, scrapes regex or RFC 9535 JSONPath from bounded captures, and preserves model/session
-values verbatim. Adapter data may affect argv and advisory projections; it cannot affect evidence,
-verdicts, or accounting.
+values verbatim. Closed launch policies authorize direct cwd/pre-prompt/policy/model/effort argv,
+and the public continuation operation consumes durable session captures. Adapter data may affect
+argv and advisory projections; it cannot affect evidence, verdicts, or accounting.
 
 `crates/tally-core/src/producers.rs` implements exactly `calendar`, `build-effect`,
 `pool-reachability`, `gh`, and `events-dir`. Every emitted item becomes an ordinary ingress file and
 passes the same admission path. Claim/archive operations are bounded and durable; reachability
-transitions are hysteresis-confirmed; GitHub completion mutation follows durable success.
+transitions are hysteresis-confirmed; GitHub origin templates render into direct values; and
+receipt/evidence/gate/review/close mutations follow explicit idempotent policies.
+
+`crates/tally-core/src/completion.rs` evaluates a bounded versioned gate manifest independently
+from process termination and derives acceptance only through the declared policy. Optional
+semantic facts are carried through local/remote execution, witness, terminal responses, and query
+projections without changing legacy witness hash inputs.
 
 Proof:
 
-- adapter tests cover fresh/resume rendering, multi-capture substitution, both scrape modes,
-  reserved environment, and capture bounds;
+- adapter tests cover fresh/resume rendering, exact Codex systemd argv, public continuation,
+  multi-capture substitution, both scrape modes, reserved environment, and capture bounds;
 - producer tests cover strict registry validation, each observation type, global ingress locking,
-  GitHub narrowing/completion, and reachability transition ownership; and
+  shell-free GitHub origin templates, conservative semantic completion, and reachability
+  transition ownership; and
 - flake checks render and execute the Nix-defined presets and all five producer configurations.
 
 ## 9. Declarative modules and end-to-end gates

@@ -2142,6 +2142,7 @@ mod tests {
             model: None,
             evidence_class: None,
             manifest_hash: None,
+            completion: None,
         }
     }
 

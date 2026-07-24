@@ -19,20 +19,25 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::watch;
 
+use crate::completion::{evaluate_completion, ExecutionFact, GateManifestSpec, SemanticCompletion};
 use crate::config::{ExecutionTargetConfig, Priority, SshExecutorConfig};
 use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOutcome};
-use crate::taskdb::GhOrigin;
+use crate::taskdb::{GhOrigin, WorkspaceMetadata};
 
 pub const CAPTURE_DIRECTORY: &str = "capture";
 pub const UNIT_EXIT_DIRECTORY: &str = "unit-exit";
 pub const UNIT_EXIT_SCHEMA_VERSION: u32 = 2;
-const OPTIONAL_TALLY_ENVIRONMENT: [&str; 6] = [
+const OPTIONAL_TALLY_ENVIRONMENT: [&str; 10] = [
     "TALLY_TASK_UUID",
     "TALLY_PARENT",
     "TALLY_NO_ENQUEUE",
     "TALLY_CREDENTIALS",
     "TALLY_YIELD_HOOK",
     "TALLY_SOCKET",
+    "TALLY_WORKSPACE_REPO",
+    "TALLY_WORKSPACE_BASE_REV",
+    "TALLY_WORKSPACE_BRANCH",
+    "TALLY_WORKSPACE_PATH",
 ];
 const GH_TALLY_ENVIRONMENT: [&str; 11] = [
     "TALLY_GH_REPO",
@@ -92,6 +97,10 @@ pub struct ExecutionRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gh_origin: Option<GhOrigin>,
     pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_manifest: Option<GateManifestSpec>,
     pub credentials: BTreeMap<String, PathBuf>,
     pub limits: UnitLimits,
     pub runtime_max_sec: Option<u64>,
@@ -148,6 +157,9 @@ pub struct ExecutionOutcome {
     /// Canonical evidence computed on the worker that owns remote artifact
     /// paths. Local executions leave this unset and the daemon computes it.
     pub evidence_gate: Option<GateResult>,
+    /// Structured execution/gate/acceptance facts computed on the filesystem
+    /// that owns the declared gate manifest.
+    pub semantic_completion: Option<SemanticCompletion>,
     /// Whether stdout/stderr for this exact generation are locally available
     /// for advisory adapter scraping.
     pub captures_available: bool,
@@ -348,7 +360,7 @@ impl LocalUnitFact {
     }
 }
 
-pub const REMOTE_EXECUTOR_PROTOCOL_VERSION: u32 = 1;
+pub const REMOTE_EXECUTOR_PROTOCOL_VERSION: u32 = 2;
 const MAX_REMOTE_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_REMOTE_REPLY_BYTES: usize = 48 * 1024 * 1024;
 const MAX_REMOTE_STDERR_BYTES: usize = 64 * 1024;
@@ -410,6 +422,8 @@ pub struct RemoteCompletion {
     pub capture: RemoteCapture,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_gate: Option<GateResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_completion: Option<SemanticCompletion>,
 }
 
 #[doc(hidden)]
@@ -417,7 +431,7 @@ pub struct RemoteCompletion {
 #[serde(tag = "kind", content = "value", rename_all = "kebab-case")]
 pub enum RemoteExecutorResult {
     Fact(LocalUnitFact),
-    Completion(RemoteCompletion),
+    Completion(Box<RemoteCompletion>),
     Reclaimed(RemoteCapture),
 }
 
@@ -1548,6 +1562,7 @@ impl Executor {
             record: completion.record,
             termination: completion.termination,
             evidence_gate: completion.evidence_gate,
+            semantic_completion: completion.semantic_completion,
             captures_available,
         })
     }
@@ -1613,7 +1628,7 @@ impl Executor {
                 detail: "ensure returned a non-completion response".to_owned(),
             });
         };
-        self.materialize_remote_completion(name, &identity, None, attempt, lease_epoch, completion)
+        self.materialize_remote_completion(name, &identity, None, attempt, lease_epoch, *completion)
     }
 
     pub async fn adopt_on(
@@ -1656,7 +1671,7 @@ impl Executor {
             Some(expected_invocation_id),
             attempt,
             lease_epoch,
-            completion,
+            *completion,
         )
     }
 
@@ -1943,6 +1958,7 @@ impl Executor {
                         record,
                         termination,
                         evidence_gate: None,
+                        semantic_completion: None,
                         captures_available: true,
                     });
                 }
@@ -2038,6 +2054,7 @@ impl Executor {
             record,
             termination,
             evidence_gate: None,
+            semantic_completion: None,
             captures_available: true,
         })
     }
@@ -2117,6 +2134,7 @@ impl Executor {
                         record,
                         termination,
                         evidence_gate: None,
+                        semantic_completion: None,
                         captures_available: true,
                     });
                 }
@@ -2225,6 +2243,16 @@ impl Executor {
                 ));
             }
             validate_systemd_path(cwd, "working directory")?;
+        }
+        if let Some(gate_manifest) = &request.gate_manifest {
+            gate_manifest
+                .validate()
+                .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+        }
+        if let Some(workspace) = &request.workspace {
+            workspace
+                .validate()
+                .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
         }
         for (name, source) in &request.credentials {
             validate_credential_name(name)?;
@@ -2466,6 +2494,7 @@ impl Executor {
             record,
             termination,
             evidence_gate: None,
+            semantic_completion: None,
             captures_available: true,
         })
     }
@@ -2555,6 +2584,23 @@ fn execution_environment(
     if let Some(socket) = &request.tally_socket {
         environment.push(("TALLY_SOCKET".to_owned(), socket.clone()));
     }
+    if let Some(workspace) = &request.workspace {
+        environment.extend([
+            ("TALLY_WORKSPACE_REPO".to_owned(), workspace.repo.clone()),
+            (
+                "TALLY_WORKSPACE_BASE_REV".to_owned(),
+                workspace.base_rev.clone(),
+            ),
+            (
+                "TALLY_WORKSPACE_BRANCH".to_owned(),
+                workspace.branch.clone(),
+            ),
+            (
+                "TALLY_WORKSPACE_PATH".to_owned(),
+                workspace.worktree_path.to_string_lossy().into_owned(),
+            ),
+        ]);
+    }
     if let Some(origin) = request
         .gh_origin
         .as_ref()
@@ -2629,6 +2675,9 @@ fn environment_to_unset(request: &ExecutionRequest) -> Vec<&'static str> {
     }
     if request.tally_socket.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[5]);
+    }
+    if request.workspace.is_none() {
+        names.extend(OPTIONAL_TALLY_ENVIRONMENT[6..].iter().copied());
     }
     if request
         .gh_origin
@@ -3122,6 +3171,7 @@ fn collect_remote_capture(paths: &ExecutionPaths, attempt: u32, lease_epoch: u64
 fn remote_completion(
     outcome: ExecutionOutcome,
     evidence: &[String],
+    gate_manifest: Option<&GateManifestSpec>,
 ) -> Result<RemoteCompletion, ExecutorError> {
     let gate = match &outcome.termination {
         ExecutionTermination::Exited(exit_code) => {
@@ -3135,6 +3185,8 @@ fn remote_completion(
         }
         _ => None,
     };
+    let semantic_completion =
+        gate_manifest.map(|spec| evaluate_completion(execution_fact(&outcome.termination), spec));
     let capture = collect_remote_capture(
         &outcome.paths,
         outcome.record.attempt,
@@ -3146,7 +3198,23 @@ fn remote_completion(
         termination: outcome.termination,
         capture,
         evidence_gate: gate,
+        semantic_completion,
     })
+}
+
+fn execution_fact(termination: &ExecutionTermination) -> ExecutionFact {
+    match termination {
+        ExecutionTermination::Exited(exit_code) => ExecutionFact::exited(*exit_code),
+        ExecutionTermination::RuntimeExceeded => {
+            ExecutionFact::failed("process exceeded RuntimeMaxSec")
+        }
+        ExecutionTermination::Signaled { code, status } => {
+            ExecutionFact::failed(format!("process ended by {code} {status}"))
+        }
+        ExecutionTermination::ServiceFailed { service_result, .. } => {
+            ExecutionFact::failed(format!("systemd service failed with {service_result}"))
+        }
+    }
 }
 
 fn pin_remote_reclaim(
@@ -3266,19 +3334,31 @@ async fn handle_remote_executor_request(
     match request {
         RemoteExecutorRequest::Ensure {
             request, evidence, ..
-        } => Ok(RemoteExecutorResult::Completion(remote_completion(
-            ensure_local_execution(&executor, request).await?,
-            &evidence,
-        )?)),
+        } => {
+            let gate_manifest = request.gate_manifest.clone();
+            Ok(RemoteExecutorResult::Completion(Box::new(
+                remote_completion(
+                    ensure_local_execution(&executor, request).await?,
+                    &evidence,
+                    gate_manifest.as_ref(),
+                )?,
+            )))
+        }
         RemoteExecutorRequest::Adopt {
             request,
             expected_invocation_id,
             evidence,
             ..
-        } => Ok(RemoteExecutorResult::Completion(remote_completion(
-            executor.adopt(request, &expected_invocation_id).await?,
-            &evidence,
-        )?)),
+        } => {
+            let gate_manifest = request.gate_manifest.clone();
+            Ok(RemoteExecutorResult::Completion(Box::new(
+                remote_completion(
+                    executor.adopt(request, &expected_invocation_id).await?,
+                    &evidence,
+                    gate_manifest.as_ref(),
+                )?,
+            )))
+        }
         RemoteExecutorRequest::Probe { identity, .. } => Ok(RemoteExecutorResult::Fact(
             executor.inspect_identity_async(&identity).await?,
         )),
@@ -3404,6 +3484,8 @@ mod tests {
             environment: BTreeMap::from([("ADAPTER_COLOR".to_owned(), "never".to_owned())]),
             gh_origin: None,
             cwd: Some(PathBuf::from("/work tree")),
+            workspace: None,
+            gate_manifest: None,
             credentials: BTreeMap::from([
                 ("alpha".to_owned(), PathBuf::from("/run/keys/alpha")),
                 ("zeta".to_owned(), PathBuf::from("/run/keys/zeta")),
@@ -3576,6 +3658,7 @@ mod tests {
                 wall_clock_seconds: 1.0,
                 evidence: &evidence,
             })),
+            semantic_completion: None,
         }
     }
 
@@ -3644,7 +3727,9 @@ mod tests {
             }),
             Ok(RemoteExecutorReply::Ok {
                 protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
-                result: Box::new(RemoteExecutorResult::Completion(completion.clone())),
+                result: Box::new(RemoteExecutorResult::Completion(Box::new(
+                    completion.clone(),
+                ))),
             }),
         ]);
         let calls = transport.calls.clone();
@@ -3723,7 +3808,7 @@ mod tests {
             }),
             Ok(RemoteExecutorReply::Ok {
                 protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
-                result: Box::new(RemoteExecutorResult::Completion(completion)),
+                result: Box::new(RemoteExecutorResult::Completion(Box::new(completion))),
             }),
         ]);
         let calls = transport.calls.clone();
@@ -3770,7 +3855,7 @@ mod tests {
         completion.capture.attempt += 1;
         let transport = ScriptedRemoteTransport::new([Ok(RemoteExecutorReply::Ok {
             protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
-            result: Box::new(RemoteExecutorResult::Completion(completion)),
+            result: Box::new(RemoteExecutorResult::Completion(Box::new(completion))),
         })]);
         let error = remote_executor(temp.path(), transport)
             .execute_on(Some("worker"), request, vec!["exit:0".to_owned()])
@@ -5035,6 +5120,8 @@ mod tests {
             environment: BTreeMap::new(),
             gh_origin: None,
             cwd: None,
+            workspace: None,
+            gate_manifest: None,
             credentials: BTreeMap::new(),
             limits: UnitLimits {
                 cpu_weight: 100,

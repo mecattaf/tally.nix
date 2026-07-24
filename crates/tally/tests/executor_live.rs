@@ -71,6 +71,8 @@ fn request(argv: Vec<String>) -> ExecutionRequest {
         environment: BTreeMap::new(),
         gh_origin: None,
         cwd: None,
+        workspace: None,
+        gate_manifest: None,
         credentials: BTreeMap::new(),
         limits: UnitLimits {
             cpu_weight: 250,

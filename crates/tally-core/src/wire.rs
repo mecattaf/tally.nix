@@ -11,14 +11,19 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 
+use crate::adapters::AdapterJobOptions;
+use crate::completion::GateManifestSpec;
 use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
-use crate::taskdb::{gh_trigger_task_uuid, EnqueueSource, GhOrigin, RelatedTrigger};
+use crate::taskdb::{
+    gh_trigger_task_uuid, EnqueueSource, GhOrigin, RelatedTrigger, WorkspaceMetadata,
+};
 
 pub const FRAME_CAP_BYTES: usize = 64 * 1024;
 
 pub const RPC_METHODS: &[&str] = &[
     "queue.enqueue",
+    "queue.continue",
     "queue.cancel",
     "queue.pause",
     "queue.resume",
@@ -346,6 +351,16 @@ pub struct EnqueuePayload {
     pub priority: Option<Priority>,
     #[serde(default)]
     pub adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_options: Option<AdapterJobOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_manifest: Option<GateManifestSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_from: Option<String>,
     #[serde(default)]
     pub source: Option<EnqueueSource>,
     #[serde(default)]
@@ -389,6 +404,9 @@ pub struct ProducerDefaults {
     pub priority: Priority,
     pub adapter: String,
     pub source: EnqueueSource,
+    pub cwd: Option<PathBuf>,
+    pub workspace: Option<WorkspaceMetadata>,
+    pub adapter_options: AdapterJobOptions,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -405,6 +423,11 @@ pub struct ResolvedEnqueue {
     pub executor: Option<String>,
     pub priority: Priority,
     pub adapter: String,
+    pub cwd: Option<PathBuf>,
+    pub workspace: Option<WorkspaceMetadata>,
+    pub adapter_options: AdapterJobOptions,
+    pub gate_manifest: Option<GateManifestSpec>,
+    pub resume_from: Option<String>,
     pub source: EnqueueSource,
     pub dedup_key: Option<String>,
     pub parent: Option<String>,
@@ -511,6 +534,28 @@ impl GuardrailState {
             return Err(WireError::invalid(
                 "runtimeMaxSec must be positive when set",
             ));
+        }
+        if let Some(cwd) = &payload.cwd {
+            validate_path(cwd, "cwd")?;
+        }
+        if let Some(workspace) = &payload.workspace {
+            workspace
+                .validate()
+                .map_err(|error| WireError::invalid(error.to_string()))?;
+        }
+        if let Some(gate_manifest) = &payload.gate_manifest {
+            gate_manifest
+                .validate()
+                .map_err(|error| WireError::invalid(error.to_string()))?;
+        }
+        if let Some(resume_from) = &payload.resume_from {
+            taskchampion::Uuid::parse_str(resume_from)
+                .map_err(|_| WireError::invalid("resumeFrom must be a task UUID"))?;
+            if payload.task_uuid.is_some() {
+                return Err(WireError::invalid(
+                    "resumeFrom and a preassigned taskUuid are mutually exclusive",
+                ));
+            }
         }
         validate_credentials(&payload.credentials)?;
         let evidence = parse_evidence_specs(&payload.evidence)
@@ -635,6 +680,13 @@ impl GuardrailState {
             executor: payload.executor.or_else(|| defaults.executor.clone()),
             priority: payload.priority.unwrap_or(defaults.priority),
             adapter,
+            cwd: payload.cwd.or_else(|| defaults.cwd.clone()),
+            workspace: payload.workspace.or_else(|| defaults.workspace.clone()),
+            adapter_options: payload
+                .adapter_options
+                .unwrap_or_else(|| defaults.adapter_options.clone()),
+            gate_manifest: payload.gate_manifest,
+            resume_from: payload.resume_from,
             source,
             dedup_key: payload.dedup_key,
             parent,
@@ -652,6 +704,21 @@ impl GuardrailState {
             wait: payload.wait,
         })
     }
+}
+
+fn validate_path(path: &Path, label: &str) -> Result<(), WireError> {
+    if !path.is_absolute() {
+        return Err(WireError::invalid(format!("{label} must be absolute")));
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| WireError::invalid(format!("{label} must be valid UTF-8")))?;
+    if path.contains('%') || path.contains('\0') || path.chars().any(char::is_control) {
+        return Err(WireError::invalid(format!(
+            "{label} must contain no control characters or systemd specifiers"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_credentials(credentials: &BTreeMap<String, PathBuf>) -> Result<(), WireError> {
@@ -838,6 +905,9 @@ mod tests {
             priority: Priority::Low,
             adapter: "shell".to_owned(),
             source: EnqueueSource::Calendar,
+            cwd: None,
+            workspace: None,
+            adapter_options: AdapterJobOptions::default(),
         }
     }
 
@@ -849,6 +919,11 @@ mod tests {
             executor: None,
             priority: None,
             adapter: None,
+            cwd: None,
+            workspace: None,
+            adapter_options: None,
+            gate_manifest: None,
+            resume_from: None,
             source: None,
             dedup_key: Some("child-1".to_owned()),
             parent: None,

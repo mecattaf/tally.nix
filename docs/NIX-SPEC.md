@@ -157,9 +157,17 @@ no first firing on a fresh user manager.
 - `allowedActors`: unique list of trigger-actor logins, default empty; a nonempty list is an
   allowlist.
 - `pollIntervalSec`: positive integer, default `60`.
+- `postReceipt`: boolean, default `true`; post marker-tagged trigger acknowledgements.
 - `postEvidence`: boolean, default `false`; post marker-tagged completion evidence.
+- `postGateSummary`: boolean, default `false`; include declared gates and acceptance in the
+  completion update.
+- `requestReview`: boolean, default `false`; mark an unaccepted completion as requiring review.
+- `closeOnAcceptance`: boolean, default `false`; close only when the configured acceptance policy
+  derives `accepted`.
+- `neverMutate`: boolean, default `false`; suppress every GitHub acknowledgement, update, review
+  request, and close.
 - `closeOnPass`: boolean, default `false`; after posting evidence, also close an item for a
-  `Pass`/`Reused` verdict.
+  `Pass`/`Reused` verdict. When semantic completion is present, its gates must also pass.
 - `enqueue`: required enqueue payload.
 
 Every source constraint submodule supports:
@@ -183,6 +191,9 @@ limit, and the polling interval as `RestartSec`.
 Authorization, `allowedActors`, and `actorExclude` inspect `triggerActor`, never the item author.
 Self-triggered observations require `allowSelfTriggered = true`; there is no special
 `actorExclude` sentinel for this policy. `closeOnPass = true` requires `postEvidence = true`.
+`postGateSummary` and `closeOnAcceptance` require `enqueue.gateManifest`. `neverMutate` is an
+absolute policy override. A failed, missing, or explicitly `not-run` required gate cannot close an
+item through either close policy.
 Current Nix rendering always writes `closeOnPass`. A legacy serialized JSON configuration that
 omits the field retains the historical fused close behavior when `postEvidence` is true.
 Native intake never substitutes `itemAuthor` when the trigger actor is unknown. A notification's
@@ -226,6 +237,10 @@ The `enqueue`, `onKey`, `onLost`, `onReturn`, and `onReturnAttest` fields share 
 |---|---|---|
 | `argv` | list of strings | `[]`, but must be nonempty |
 | `adapter` | string | `shell` |
+| `cwd` | null or absolute string | `null` |
+| `workspace` | null or `{ repo, baseRev, branch, worktreePath }` | `null` |
+| `adapterOptions` | per-job adapter option submodule | `{}` |
+| `gateManifest` | null or gate-manifest declaration | `null` |
 | `pool` | string or list of strings | `[]`; must be nonempty, duplicate-free, and name configured pools |
 | `executor` | null or string | `null`; when set, must name a configured executor |
 | `priority` | `interrupt`, `high`, `medium`, or `low` | `low` |
@@ -244,6 +259,30 @@ duplicate, and unknown pool sets fail checked configuration with distinct errors
 
 `argv` remains an array through rendering and execution. There is no shell-string form.
 
+For a `gh` producer only, `argv` elements and `cwd` may use `${gh.field}` placeholders. The
+documented fields are `source`, `repo`, `repoName`, `number`, `url`, `type`, `headSha`, `nodeId`,
+`itemAuthor`, `triggerActor`, `selfActor`, `notificationReason`, `triggerKind`, `eventId`,
+`commentId`, `triggerTimestamp`, and `triggerValue`. Unknown, malformed, context-free, and absent
+optional fields fail closed. Expansion happens directly in each argv/path value; rendered text is
+never reparsed by a shell. The issue-25 cwd spelling `${repoName}` is also accepted as an explicit
+alias for `${gh.repoName}`.
+
+`adapterOptions` contains `prePromptArgv`, `environment`, `approvalPolicy`, `sandboxPolicy`,
+`model`, and `effort`. Environment names are checked against the same reserved namespace as
+adapter environment. The selected adapter must explicitly authorize every requested launch
+option.
+
+`workspace` records nonempty repository, base revision, branch, and absolute worktree path
+metadata supplied by an external resolver. It does not create or clean a worktree. The metadata is
+durable, queryable, and exported to the execution unit as `TALLY_WORKSPACE_REPO`,
+`TALLY_WORKSPACE_BASE_REV`, `TALLY_WORKSPACE_BRANCH`, and `TALLY_WORKSPACE_PATH`.
+
+`gateManifest` contains an absolute `path`, a nonempty unique `requiredGateIds` list, and
+`acceptancePolicy = "manual" | "execution-and-gates"` (default `manual`). The file itself is
+bounded, no-follow JSON with exactly `schemaVersion`, `artifact`, and `gates`. Gate entries have a
+unique ID, `status = "pass" | "fail" | "not-run"`, and optional command/reason; `not-run` requires
+a reason. Missing IDs and invalid manifests fail the gate summary.
+
 ## 5. `adapters.<name>`
 
 | Option | Type | Default | Meaning |
@@ -253,11 +292,21 @@ duplicate, and unknown pool sets fail checked configuration with distinct errors
 | `scrape` | attribute set of capture submodules | `{}` | Named capture extraction. |
 | `yieldHook` | null or list of strings | `null` | Direct cooperative checkpoint argv. |
 | `env` | attribute set of strings | `{}` | Non-reserved process environment. |
+| `launch` | launch-authorization submodule | `{}` | Closed per-job direct-argv authorization. |
 | `extraConfig` | JSON-serializable raw attribute set | `{}` | Adapter-specific data. |
 
 A scrape selects `stream = "stdout"` or `"stderr"`, `mode = "regex"` or `"jsonPath"`, and a
 nonempty `pattern`. Adapter environment names cannot begin with `TALLY_` and cannot replace
 `CREDENTIALS_DIRECTORY`.
+
+`launch` contains `allowPrePromptArgv`, optional `cwdArgv` using `%<cwd>%`, named
+`approvalPolicies` and `sandboxPolicies` maps to direct argv fragments, and optional `model` and
+`effort` overrides. Each value override has an argv template using `%<value>%` and a nonempty
+closed `allowedValues` list. Requested fragments are inserted immediately before the adapter
+template's final `--`; no shell string is introduced.
+
+A resume template may bind the typed `%<cwd>%` value directly when a resumed CLI requires cwd
+before its subcommand. The Codex preset uses this form to construct `codex -C <cwd> exec resume`.
 
 The preset names are `shell`, `pi`, `claude-code`, and `codex`. Their definitions live entirely in
 `nix/lib/adapters.nix`. In particular, the Codex fresh argv is frozen as:
@@ -265,6 +314,11 @@ The preset names are `shell`, `pi`, `claude-code`, and `codex`. Their definition
 ```json
 ["codex", "exec", "--json", "--"]
 ```
+
+Its launch policy authorizes direct pre-prompt argv, `-C %<cwd>%`, the Codex approval policies,
+and the Codex sandbox policies. Thus the preset can render
+`codex exec --json --dangerously-bypass-approvals-and-sandbox -C <cwd> -- <prompt>` directly.
+Model and effort values remain unauthorized until the operator declares a closed allowlist.
 
 Custom direct-argv integrations use `lib.adapters.mkAdapter`; custom captures use
 `lib.adapters.mkScrapeCapture`.

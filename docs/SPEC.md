@@ -49,10 +49,10 @@ to JSON and validated by the production parser during evaluation/build, so an in
 before activation.
 
 An enqueue payload contains direct argv, one or more pool names, a priority, an adapter name, an
-optional named executor, and optional deduplication, provenance, evidence, runtime, consumption,
-credential, and advisory metadata. The daemon validates the complete payload and every pool,
-adapter, and executor reference before acknowledging it. Omitting the executor selects local
-execution on the coordinator.
+optional named executor, and optional cwd, workspace, adapter launch options, gate manifest,
+deduplication, provenance, evidence, runtime, consumption, credential, and advisory metadata. The
+daemon validates the complete payload and every pool, adapter, and executor reference before
+acknowledging it. Omitting the executor selects local execution on the coordinator.
 
 The serialized key remains `pool`. A singleton is accepted and emitted as its legacy scalar;
 multiple pools are emitted as an array sorted lexically. The same scalar-or-array rule applies to
@@ -122,6 +122,10 @@ transient unit using `systemd-run --wait --collect`; it does not turn argv into 
 Each unit receives proof-bearing environment such as the job ID, task UUID when present, pool set,
 lease epoch, priority class, attempt, enqueue capability, socket, and credential names. Optional
 fields are explicitly unset when absent so inherited environment cannot impersonate them.
+An optional absolute cwd is both the unit working directory and, when authorized by the adapter,
+a direct argv value. Externally resolved workspace metadata—repository, base revision, branch, and
+absolute worktree path—is durable, queryable, and exported through bounded `TALLY_WORKSPACE_*`
+variables. tally records this handoff; it does not create, clean, or arbitrate Git worktrees.
 
 For producer-launched GitHub jobs, a versioned origin carries repository, item number and URL,
 item kind, immutable PR head SHA, node ID, trigger kind and actor, event/comment IDs, and distinct
@@ -180,6 +184,19 @@ hash only bytes read after execution. Multiple artifact hashes are combined dete
 Canonical verdicts are `pass`, `clean-exit-no-artifact`, `failed`, `cancelled`, `reused`,
 `pool-vanished`, `preempted`, and `runtime-exceeded`. A successful process does not imply `pass` if
 required evidence is absent.
+
+Semantic completion is separate from that legacy evidence verdict. A declared version-1 manifest
+contains an artifact value and uniquely named gates whose status is `pass`, `fail`, or `not-run`.
+Every configured required gate ID must occur, and `not-run` requires a reason. tally records:
+
+1. execution success or failure from the actual process termination;
+2. the validated gate summary, including missing IDs or manifest errors; and
+3. acceptance as `pending`, `accepted`, or `rejected` under an explicit policy.
+
+The `execution-and-gates` policy accepts only a successful execution with every declared gate
+passing. A failed/missing gate rejects; a reasoned `not-run` remains pending. Manual policy always
+remains pending. These facts are written into the witness only for jobs that declare the feature;
+the absent optional field preserves byte-identical legacy hash inputs.
 
 Deduplication is existence-based. A matching prior `pass` must have the same dedup key and the
 current artifact set must rehash to the witnessed value. A hit records `reused`; ambiguity or a
@@ -252,8 +269,15 @@ deterministic task identity use the comment ID for comment/mention triggers and 
 assignment/label triggers, independent of whether notifications or search observed it. Accepted,
 filtered, and first-duplicate outcomes receive idempotent marker-tagged acknowledgements; filtered
 remote text does not disclose policy detail. Self-trigger admission remains explicit. After durable
-`Pass`/`Reused`, evidence posting and item closing are separate policies; closing is impossible
-unless evidence posting is enabled.
+`Pass`/`Reused`, receipt posting, evidence posting, gate-summary posting, review request, and
+acceptance-based closing are separate policies. `neverMutate` suppresses every remote mutation.
+The compatibility `closeOnPass` path additionally requires semantic gates to pass when the job
+declared them; `closeOnAcceptance` requires an explicit accepted fact. Stable receipt/completion
+markers and durable local mutation markers make retries idempotent.
+
+GitHub producer argv and cwd may interpolate only the documented validated scalar origin fields.
+Expansion produces literal argv/path values and never invokes a shell. Unknown placeholders and
+origin fields absent for the current item fail closed.
 
 `producer preview`, `producer poll --once --no-enqueue`, and `producer explain --item` resolve and
 report candidates without writing receipts or ingress. `producer test --item --event --actor` is
@@ -268,12 +292,24 @@ narrower, and archived only after acknowledgement. There is no producer-specific
 ## 10. Adapters
 
 Adapters form an open named map. A fresh template is a direct argv prefix. A resume template may
-refer to any named `%<capture>%`. Captures select stdout or stderr and use either regex or RFC 9535
-JSONPath. Model and session values are preserved verbatim.
+refer to any named `%<capture>%` and to the typed per-job `%<cwd>%` value. Captures select stdout or
+stderr and use either regex or RFC 9535 JSONPath. Model and session values are preserved verbatim.
+
+An adapter's closed launch policy may authorize direct per-job pre-prompt argv, named
+approval/sandbox fragments, cwd argv using `%<cwd>%`, and model/effort values from explicit
+allowlists. These fragments are inserted before the template's final `--`. The Codex preset can
+therefore produce
+`codex exec --json --dangerously-bypass-approvals-and-sandbox -C <worktree> -- <prompt>` without a
+shell adapter.
 
 Adapter environment cannot override reserved proof-bearing variables. Scraped values are advisory:
 they can drive a later resume template or query projection, but they cannot alter admission,
 evidence, verdict, charge, or canonical usage.
+
+Session references survive extra options and wrapper argv. `tally queue continue <job> --
+<prompt...>` creates a new durable job through the original adapter's resume template using the
+recorded session reference (and recorded model when its template requires one); users do not need
+private capture access.
 
 The built-in Nix presets are `shell`, `pi`, `claude-code`, and `codex`. New programs that fit this
 structured envelope are configuration, not new Rust variants.
@@ -287,7 +323,9 @@ canonical witness facts precedence.
 The CLI exposes status, log, render, standup, and pool projections. Queries are observational:
 they do not mutate job state, and pruning journal history cannot erase a witnessed terminal result.
 GitHub-backed rows project captured repository, item number, and URL into `RowFact` and standup
-completed/in-flight entries without adding scheduling state or changing witness records.
+completed/in-flight entries. Rows also expose cwd, workspace metadata, continuation ancestry, and
+session reference; witnessed jobs expose semantic completion when declared. These projections add
+no scheduling authority and cannot change witness records.
 
 ## 12. Security and failure posture
 

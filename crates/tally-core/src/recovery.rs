@@ -908,6 +908,10 @@ mod tests {
             executor: None,
             model: None,
             cwd: Some(PathBuf::from("/work")),
+            workspace: None,
+            adapter_options: Default::default(),
+            gate_manifest: None,
+            resumed_from: None,
             dedup_key: Some(format!("dedup:{uuid}")),
             session_ref: None,
             lease_epoch,
@@ -960,6 +964,7 @@ mod tests {
                         model: None,
                         evidence_class: None,
                         manifest_hash: None,
+                        completion: None,
                     },
                     &head,
                 )

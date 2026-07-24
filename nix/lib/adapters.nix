@@ -30,6 +30,7 @@ let
       scrape ? { },
       yieldHook ? null,
       env ? { },
+      launch ? { },
       extraConfig ? { },
     }:
     assert lib.assertMsg (validArgv argv) "tally adapter argv must be a list of strings";
@@ -43,6 +44,7 @@ let
     assert lib.assertMsg (
       builtins.isAttrs env && builtins.all builtins.isString (builtins.attrValues env)
     ) "tally adapter env must be an attrset of strings";
+    assert lib.assertMsg (builtins.isAttrs launch) "tally adapter launch must be an attrset";
     assert lib.assertMsg (builtins.isAttrs extraConfig) "tally adapter extraConfig must be an attrset";
     {
       inherit
@@ -51,6 +53,7 @@ let
         scrape
         yieldHook
         env
+        launch
         extraConfig
         ;
     };
@@ -147,10 +150,14 @@ let
       ];
       resume = [
         "codex"
+        "-C"
+        "%<cwd>%"
+        "exec"
         "resume"
-        "%<sessionRef>%"
+        "--json"
         "--model"
         "%<model>%"
+        "%<sessionRef>%"
         "--"
       ];
       scrape = {
@@ -168,6 +175,46 @@ let
         };
       };
       yieldHook = checkpointHook;
+      launch = {
+        allowPrePromptArgv = true;
+        cwdArgv = [
+          "-C"
+          "%<cwd>%"
+        ];
+        approvalPolicies = {
+          untrusted = [
+            "--ask-for-approval"
+            "untrusted"
+          ];
+          on-failure = [
+            "--ask-for-approval"
+            "on-failure"
+          ];
+          on-request = [
+            "--ask-for-approval"
+            "on-request"
+          ];
+          never = [
+            "--ask-for-approval"
+            "never"
+          ];
+        };
+        sandboxPolicies = {
+          read-only = [
+            "--sandbox"
+            "read-only"
+          ];
+          workspace-write = [
+            "--sandbox"
+            "workspace-write"
+          ];
+          danger-full-access = [
+            "--sandbox"
+            "danger-full-access"
+          ];
+          dangerously-bypass = [ "--dangerously-bypass-approvals-and-sandbox" ];
+        };
+      };
       extraConfig.modelFlag = "--model";
     };
   };

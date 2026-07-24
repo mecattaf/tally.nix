@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -6,6 +7,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
+use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
 use tally_core::config::Priority;
 use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings};
 use tally_core::evidence::RetryPolicy;
@@ -16,11 +18,11 @@ use tally_core::producers::{
     GhCliAcknowledgementSink, GhCliIntake, GhObservation, ProducerEngine, ProducerObservation,
 };
 use tally_core::recovery::RecoveryPolicy;
-use tally_core::taskdb::{EnqueueSource, RelatedTrigger};
+use tally_core::taskdb::{EnqueueSource, RelatedTrigger, WorkspaceMetadata};
 use tally_core::wire::{EnqueuePayload, RpcClient, WireErrorCode, WireIoError};
 use tally_core::witness::{append_attestation, verify_attestations, verify_file};
 use tally_core::{
-    adapters::{AdapterEngine, ScrapeResult},
+    adapters::{AdapterEngine, AdapterJobOptions, ScrapeResult},
     Config,
 };
 
@@ -87,6 +89,8 @@ enum Command {
 #[derive(Debug, Args)]
 struct AdapterRenderArgs {
     adapter: String,
+    #[arg(long, value_name = "PATH")]
+    cwd: Option<PathBuf>,
     #[arg(long)]
     captures: Option<String>,
     #[arg(
@@ -180,6 +184,34 @@ struct EnqueueArgs {
     priority: CliPriority,
     #[arg(long, default_value = "shell")]
     adapter: String,
+    #[arg(long, value_name = "PATH")]
+    cwd: Option<PathBuf>,
+    #[arg(long = "env", value_parser = parse_environment, action = clap::ArgAction::Append)]
+    environment: Vec<(String, String)>,
+    #[arg(long = "pre-prompt-arg", allow_hyphen_values = true, action = clap::ArgAction::Append)]
+    pre_prompt_argv: Vec<String>,
+    #[arg(long)]
+    approval_policy: Option<String>,
+    #[arg(long)]
+    sandbox_policy: Option<String>,
+    #[arg(long)]
+    model: Option<String>,
+    #[arg(long)]
+    effort: Option<String>,
+    #[arg(long)]
+    workspace_repo: Option<String>,
+    #[arg(long)]
+    workspace_base_rev: Option<String>,
+    #[arg(long)]
+    workspace_branch: Option<String>,
+    #[arg(long, value_name = "PATH")]
+    workspace_worktree: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    gate_manifest: Option<PathBuf>,
+    #[arg(long = "required-gate", action = clap::ArgAction::Append)]
+    required_gate_ids: Vec<String>,
+    #[arg(long, value_enum)]
+    acceptance_policy: Option<CliAcceptancePolicy>,
     #[arg(long, value_enum, default_value = "manual")]
     source: CliSource,
     #[arg(long)]
@@ -206,6 +238,41 @@ struct EnqueueArgs {
     wait: bool,
     #[arg(last = true)]
     argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliAcceptancePolicy {
+    Manual,
+    ExecutionAndGates,
+}
+
+impl From<CliAcceptancePolicy> for AcceptancePolicy {
+    fn from(value: CliAcceptancePolicy) -> Self {
+        match value {
+            CliAcceptancePolicy::Manual => Self::Manual,
+            CliAcceptancePolicy::ExecutionAndGates => Self::ExecutionAndGates,
+        }
+    }
+}
+
+fn parse_environment(value: &str) -> Result<(String, String), String> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| "environment must use NAME=VALUE".to_owned())?;
+    let mut bytes = name.bytes();
+    if !bytes
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        || name.starts_with("TALLY_")
+        || name == "CREDENTIALS_DIRECTORY"
+    {
+        return Err(format!("environment name {name:?} is invalid or reserved"));
+    }
+    if value.contains('\0') {
+        return Err("environment value contains a NUL byte".to_owned());
+    }
+    Ok((name.to_owned(), value.to_owned()))
 }
 
 fn parse_opaque_json(value: &str) -> Result<Value, String> {
@@ -238,6 +305,13 @@ enum QueueCommand {
         pool: Option<String>,
         #[arg(long)]
         all: bool,
+    },
+    Continue {
+        job: String,
+        #[arg(long)]
+        wait: bool,
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
     },
     Drain,
     AwaitJob {
@@ -467,12 +541,22 @@ async fn execute(opts: Opts) -> Result<()> {
                 .context("__adapter-render requires --config PATH")?;
             let config = Config::from_path(&config_path)?;
             let engine = AdapterEngine::new(&config.adapters);
+            let options = AdapterJobOptions::default();
             let (invocation, scraped) = if let Some(captures) = args.captures {
                 let captures = ScrapeResult {
                     captures: serde_json::from_str(&captures)
                         .context("--captures must be a JSON object")?,
                 };
-                (engine.resume(&args.adapter, &args.argv, &captures)?, None)
+                (
+                    engine.resume_with_options(
+                        &args.adapter,
+                        &args.argv,
+                        &captures,
+                        &options,
+                        args.cwd.as_deref(),
+                    )?,
+                    None,
+                )
             } else if let (Some(stdout), Some(stderr)) = (args.scrape_stdout, args.scrape_stderr) {
                 let captures = engine.scrape_paths(
                     &args.adapter,
@@ -483,10 +567,24 @@ async fn execute(opts: Opts) -> Result<()> {
                         capture_generation: PathBuf::from("unused"),
                     },
                 )?;
-                let invocation = engine.resume(&args.adapter, &args.argv, &captures)?;
+                let invocation = engine.resume_with_options(
+                    &args.adapter,
+                    &args.argv,
+                    &captures,
+                    &options,
+                    args.cwd.as_deref(),
+                )?;
                 (invocation, Some(captures.captures))
             } else {
-                (engine.launch(&args.adapter, &args.argv)?, None)
+                (
+                    engine.launch_with_options(
+                        &args.adapter,
+                        &args.argv,
+                        &options,
+                        args.cwd.as_deref(),
+                    )?,
+                    None,
+                )
             };
             println!(
                 "{}",
@@ -904,6 +1002,67 @@ async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
     }
     tally_core::poolset::canonicalize(&mut args.pools)
         .map_err(|error| invalid(error.to_string()))?;
+    let workspace = match (
+        args.workspace_repo,
+        args.workspace_base_rev,
+        args.workspace_branch,
+        args.workspace_worktree,
+    ) {
+        (None, None, None, None) => None,
+        (Some(repo), Some(base_rev), Some(branch), Some(worktree_path)) => {
+            Some(WorkspaceMetadata {
+                repo,
+                base_rev,
+                branch,
+                worktree_path,
+            })
+        }
+        _ => {
+            return Err(invalid(
+                "workspace metadata requires --workspace-repo, --workspace-base-rev, --workspace-branch, and --workspace-worktree together",
+            ))
+        }
+    };
+    let cwd = args.cwd.or_else(|| {
+        workspace
+            .as_ref()
+            .map(|workspace| workspace.worktree_path.clone())
+    });
+    let gate_manifest = match (
+        args.gate_manifest,
+        args.required_gate_ids.is_empty(),
+        args.acceptance_policy,
+    ) {
+        (None, true, None) => None,
+        (Some(path), false, policy) => Some(GateManifestSpec {
+            path,
+            required_gate_ids: args.required_gate_ids,
+            acceptance_policy: policy
+                .map(Into::into)
+                .unwrap_or(AcceptancePolicy::Manual),
+        }),
+        _ => {
+            return Err(invalid(
+                "--gate-manifest requires at least one --required-gate; --required-gate and --acceptance-policy require --gate-manifest",
+            ))
+        }
+    };
+    let mut environment = BTreeMap::new();
+    for (name, value) in args.environment {
+        if environment.insert(name.clone(), value).is_some() {
+            return Err(invalid(format!(
+                "environment variable {name:?} is repeated"
+            )));
+        }
+    }
+    let adapter_options = AdapterJobOptions {
+        pre_prompt_argv: args.pre_prompt_argv,
+        environment,
+        approval_policy: args.approval_policy,
+        sandbox_policy: args.sandbox_policy,
+        model: args.model,
+        effort: args.effort,
+    };
     let payload = EnqueuePayload {
         invocation: args.invocation,
         argv: has_argv.then_some(args.argv),
@@ -911,6 +1070,11 @@ async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
         executor: args.executor,
         priority: Some(args.priority.into()),
         adapter: Some(args.adapter),
+        cwd,
+        workspace,
+        adapter_options: (!adapter_options.is_default()).then_some(adapter_options),
+        gate_manifest,
+        resume_from: None,
         source: Some(args.source.into()),
         dedup_key: args.dedup_key,
         parent: args.parent,
@@ -929,11 +1093,20 @@ async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
         related_trigger: args.related_trigger,
         wait: args.wait,
     };
+    submit_payload(socket, "queue.enqueue", payload, args.wait).await
+}
+
+async fn submit_payload(
+    socket: &Path,
+    method: &str,
+    payload: EnqueuePayload,
+    wait: bool,
+) -> Result<()> {
     let mut client = RpcClient::connect(socket).await?;
     let result = client
-        .call("queue.enqueue", Some(serde_json::to_value(payload)?))
+        .call(method, Some(serde_json::to_value(payload)?))
         .await?;
-    if !args.wait {
+    if !wait {
         println!("{}", serde_json::to_string(&result)?);
         return Ok(());
     }
@@ -1006,6 +1179,39 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
                 Some(json!({"pool": pool, "all": all})),
             )
             .await
+        }
+        QueueCommand::Continue { job, wait, argv } => {
+            let payload = EnqueuePayload {
+                invocation: None,
+                argv: Some(argv),
+                pools: None,
+                executor: None,
+                priority: None,
+                adapter: None,
+                cwd: None,
+                workspace: None,
+                adapter_options: None,
+                gate_manifest: None,
+                resume_from: Some(job),
+                source: None,
+                dedup_key: None,
+                parent: None,
+                evidence: Vec::new(),
+                evidence_class: None,
+                manifest_hash: None,
+                consumption_estimate: None,
+                runtime_max_sec: None,
+                no_enqueue: false,
+                credentials: BTreeMap::new(),
+                caller_job_id: None,
+                gh_trigger_actor: None,
+                gh_self_actor: None,
+                gh_origin: None,
+                task_uuid: None,
+                related_trigger: None,
+                wait,
+            };
+            submit_payload(socket, "queue.continue", payload, wait).await
         }
         QueueCommand::Drain => print_rpc(socket, "queue.drain", Some(json!({}))).await,
         QueueCommand::AwaitJob { job } => {
@@ -1366,6 +1572,81 @@ mod tests {
         };
         assert_eq!(args.evidence_class, Some(Value::from(-1)));
         assert_eq!(args.manifest_hash.as_deref(), Some("-opaque-manifest"));
+    }
+
+    #[test]
+    fn enqueue_wave_three_options_and_public_continuation_parse_directly() {
+        let options = Opts::try_parse_from([
+            "tally",
+            "enqueue",
+            "--pool",
+            "build",
+            "--adapter",
+            "codex",
+            "--cwd",
+            "/worktrees/tally",
+            "--env",
+            "NO_COLOR=1",
+            "--pre-prompt-arg",
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--approval-policy",
+            "never",
+            "--sandbox-policy",
+            "danger-full-access",
+            "--model",
+            "gpt-5-codex",
+            "--effort",
+            "high",
+            "--workspace-repo",
+            "mecattaf/tally.nix",
+            "--workspace-base-rev",
+            "origin/main",
+            "--workspace-branch",
+            "wave-3-ergonomics",
+            "--workspace-worktree",
+            "/worktrees/tally",
+            "--gate-manifest",
+            "/worktrees/tally/.tally/gates.json",
+            "--required-gate",
+            "tests",
+            "--acceptance-policy",
+            "execution-and-gates",
+            "--",
+            "implement issue 28",
+        ])
+        .unwrap();
+        let Some(Command::Enqueue(args)) = options.command else {
+            panic!("expected enqueue command");
+        };
+        assert_eq!(
+            args.pre_prompt_argv,
+            ["--dangerously-bypass-approvals-and-sandbox"]
+        );
+        assert_eq!(args.environment, [("NO_COLOR".to_owned(), "1".to_owned())]);
+        assert_eq!(args.workspace_repo.as_deref(), Some("mecattaf/tally.nix"));
+        assert_eq!(args.required_gate_ids, ["tests"]);
+
+        let continuation = Opts::try_parse_from([
+            "tally",
+            "queue",
+            "continue",
+            "00000000-0000-4000-8000-000000000028",
+            "--wait",
+            "--",
+            "address review",
+        ])
+        .unwrap();
+        assert!(matches!(
+            continuation.command,
+            Some(Command::Queue {
+                command: QueueCommand::Continue {
+                    job,
+                    wait: true,
+                    argv,
+                }
+            }) if job == "00000000-0000-4000-8000-000000000028"
+                && argv == ["address review"]
+        ));
     }
 
     #[test]

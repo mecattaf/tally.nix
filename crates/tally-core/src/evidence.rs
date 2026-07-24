@@ -637,6 +637,7 @@ mod tests {
             model: None,
             evidence_class: None,
             manifest_hash: None,
+            completion: None,
             seq,
             prev_hash: String::new(),
             hash: String::new(),

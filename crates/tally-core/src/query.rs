@@ -6,8 +6,9 @@ use serde_json::Value;
 use taskchampion::Status;
 use thiserror::Error;
 
+use crate::completion::SemanticCompletion;
 use crate::journal::{JournalEntry, TallyEvent};
-use crate::taskdb::{GhOrigin, RelatedTrigger, TaskRow};
+use crate::taskdb::{GhOrigin, RelatedTrigger, TaskRow, WorkspaceMetadata};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
 pub const QUERY_PROTOCOL_VERSION: u32 = 1;
@@ -57,6 +58,12 @@ pub struct RowFact {
     pub executor: Option<String>,
     pub source: Option<String>,
     pub session_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<String>,
     #[serde(default = "default_query_attempt")]
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -90,6 +97,11 @@ impl From<&TaskRow> for RowFact {
             executor: row.value("executor").map(ToOwned::to_owned),
             source: row.value("source").map(ToOwned::to_owned),
             session_ref: row.value("session_ref").map(ToOwned::to_owned),
+            cwd: row.value("cwd").map(ToOwned::to_owned),
+            workspace: row
+                .value("workspace_json")
+                .and_then(|workspace| serde_json::from_str(workspace).ok()),
+            resumed_from: row.value("resumed_from").map(ToOwned::to_owned),
             attempt: row
                 .value("attempt")
                 .and_then(|attempt| attempt.parse().ok())
@@ -310,6 +322,12 @@ pub struct JobProjection {
     pub source: Option<String>,
     pub session_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     pub state: String,
     pub verdict: Option<Verdict>,
@@ -317,6 +335,8 @@ pub struct JobProjection {
     pub canonical_gpu_seconds: Option<f64>,
     pub last_event_at: Option<String>,
     pub witness_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<SemanticCompletion>,
 }
 
 #[derive(Debug, Clone)]
@@ -360,6 +380,9 @@ fn project_job_details(
                     executor: row.executor.clone(),
                     source: row.source.clone(),
                     session_ref: row.session_ref.clone(),
+                    cwd: row.cwd.clone(),
+                    workspace: row.workspace.clone(),
+                    resumed_from: row.resumed_from.clone(),
                     model: row.model.clone(),
                     state: row_status_name(row.status).to_owned(),
                     verdict: None,
@@ -367,6 +390,7 @@ fn project_job_details(
                     canonical_gpu_seconds: None,
                     last_event_at: None,
                     witness_seq: None,
+                    completion: None,
                 },
                 row_status: Some(row.status),
                 last_realtime_us: None,
@@ -389,6 +413,9 @@ fn project_job_details(
                 executor: None,
                 source: None,
                 session_ref: None,
+                cwd: None,
+                workspace: None,
+                resumed_from: None,
                 model: None,
                 state: "observed".to_owned(),
                 verdict: None,
@@ -396,6 +423,7 @@ fn project_job_details(
                 canonical_gpu_seconds: None,
                 last_event_at: None,
                 witness_seq: None,
+                completion: None,
             },
             row_status: None,
             last_realtime_us: None,
@@ -444,6 +472,9 @@ fn project_job_details(
                 executor: record.executor.clone(),
                 source: None,
                 session_ref: None,
+                cwd: None,
+                workspace: None,
+                resumed_from: None,
                 model: record.model.clone(),
                 state: "witnessed".to_owned(),
                 verdict: None,
@@ -451,6 +482,7 @@ fn project_job_details(
                 canonical_gpu_seconds: None,
                 last_event_at: None,
                 witness_seq: None,
+                completion: None,
             },
             row_status: None,
             last_realtime_us: None,
@@ -482,6 +514,7 @@ fn project_job_details(
             .flatten();
         job.output.last_event_at = Some(record.transition_timestamp.clone());
         job.output.witness_seq = Some(record.seq);
+        job.output.completion.clone_from(&record.completion);
         job.witness_attempt = Some(record.attempt);
         job.labor_class = Some(record.labor_class);
     }
@@ -1029,6 +1062,9 @@ mod tests {
             executor: None,
             source: Some("manual".to_owned()),
             session_ref: Some(session.to_owned()),
+            cwd: None,
+            workspace: None,
+            resumed_from: None,
             attempt: 1,
             model: None,
             gh_origin: None,
@@ -1092,6 +1128,7 @@ mod tests {
             model: None,
             evidence_class: None,
             manifest_hash: None,
+            completion: None,
             seq,
             prev_hash: GENESIS_PREV_HASH.to_owned(),
             hash: format!("sha256:{seq:064x}"),
