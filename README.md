@@ -379,10 +379,41 @@ Verify either ledger offline:
 
 ```console
 $ tally witness verify /path/to/witness.jsonl
+$ tally witness verify /path/to/witness.jsonl --format json
 ```
 
 The TaskChampion SQLite database is a rebuildable query cache. Durable enqueue events and the
 witness ledger remain authoritative across restart recovery.
+
+## Durable query projections
+
+Query protocol 2 adds versioned `jobs`, `job`, `log`, and `proof` projections:
+
+```console
+$ tally query jobs --state running --adapter codex
+$ tally query job <task-or-job-uuid>
+$ tally query log --task <task-uuid> --attempt 2
+$ tally query proof --task <task-uuid> --attempt 2
+```
+
+`jobs` and `log` return a common JSON envelope with `schemaVersion`, `protocolVersion`, `items`,
+`nextCursor`, and snapshot metadata. Protocol 2 establishes this envelope; cursor pagination and
+watching are intentionally deferred, so `nextCursor` is currently `null`. `job` retains every
+observed `(taskUuid, attempt, leaseEpoch)` lane. `proof` embeds the complete verified
+`WitnessRecord`, evidence observations, separate advisory attestation references, verification
+report, and the chain head used for the response. It distinguishes `no-witness-expected-yet` from
+`proof-missing`.
+
+Lifecycle observations are appended to the private, versioned `lifecycle.jsonl` store in the data
+directory before journald is used as a secondary sink. The current retention policy is explicitly
+`unbounded`; responses report `complete`, retained cursor bounds, and any repaired truncation
+boundary. Restarting the daemon therefore does not erase attempt history. Canonical witness facts
+still win for terminal verdicts and canonical usage, while provider-scraped model/session values
+remain marked `advisory-adapter-scrape`. Credential names may be projected; credential values are
+never stored in lifecycle history or query output.
+
+Protocol 2 is the compatibility boundary for existing `status`, `render`, `standup`, and `pools`
+JSON. Those views now read the same durable lifecycle source and include schema/protocol metadata.
 
 ## Tests and scenarios
 

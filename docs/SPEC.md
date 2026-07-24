@@ -319,15 +319,38 @@ structured envelope are configuration, not new Rust variants.
 ## 11. Journald and queries
 
 Lifecycle events can be emitted as one bounded JSON line on stdout or, when `journald.native` is
-enabled, as a native journal-protocol datagram. Read-time parsing accepts both forms but gives
-canonical witness facts precedence.
+enabled, as a native journal-protocol datagram. Journald is a secondary observational sink. The
+query source of record is the private append-only `lifecycle.jsonl` store in the data directory.
+Every lifecycle record has a schema version, monotonic sequence, stable event ID/cursor, timestamp,
+and the complete validated tally field set. The store is currently unbounded. Query snapshots
+therefore report `complete: true`, retained cursor bounds, and policy `unbounded`; an interrupted
+tail repair persists `complete: false`, a truncation boundary, and a reason rather than silently
+forgetting the gap.
 
-The CLI exposes status, log, render, standup, and pool projections. Queries are observational:
-they do not mutate job state, and pruning journal history cannot erase a witnessed terminal result.
-GitHub-backed rows project captured repository, item number, and URL into `RowFact` and standup
-completed/in-flight entries. Rows also expose cwd, workspace metadata, continuation ancestry, and
-session reference; witnessed jobs expose semantic completion when declared. These projections add
-no scheduling authority and cannot change witness records.
+Query protocol 2 exposes `jobs`, `job`, `log`, and `proof`. Collection responses carry
+`schemaVersion`, `protocolVersion`, `items`, `nextCursor`, and snapshot metadata. Protocol 2 fixes
+the envelope shape while leaving cursor pagination and watch mechanics to the next protocol slice,
+so `nextCursor` is null. Existing status, render, standup, and pool commands are compatibility
+views over the same durable lifecycle and witness projections.
+
+Each job summary keeps row status, live daemon state, latest lifecycle event, evidence result,
+terminal witness verdict, and per-pool GO/SLOW/STOP signal as separate fields. Detail groups events
+and witnesses by `(taskUuid, attempt, leaseEpoch)` and retains parent/child lineage. Admission,
+lifecycle, canonical witness, advisory attestation, and advisory adapter-scrape facts carry
+distinct authority/provenance. A canonical witness always wins for terminal verdict, exit,
+artifact, charge, and canonical GPU usage; disagreement with an observation remains visible rather
+than rewriting the observation.
+
+`query proof` returns the complete verified `WitnessRecord` field-for-field, evidence specs and
+per-attempt observations, separate advisory attestation references, the verification report, and
+the global chain head used for the response. Its state is `verified`,
+`no-witness-expected-yet`, or `proof-missing`. `witness verify --format json` reports both requested
+chains and exits successfully only when all verify.
+
+Queries are observational and cannot mutate job state. GitHub-backed rows still project captured
+repository, item number, and URL. Provider-scraped model and session values are explicitly
+advisory and cannot alter admission, evidence, verdict, charge, or canonical usage. Credential
+names may be projected; credential values remain absent.
 
 ## 12. Security and failure posture
 
