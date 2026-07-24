@@ -923,6 +923,7 @@ mod tests {
             runtime_max_sec: Some(30),
             no_enqueue: false,
             credentials: BTreeMap::new(),
+            origin: None,
             gh_origin: None,
             related_trigger: None,
             evidence_class: None,

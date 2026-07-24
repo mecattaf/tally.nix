@@ -25,6 +25,7 @@ pub const MAX_GH_ORIGIN_FIELD_BYTES: usize = 4096;
 pub const MAX_GH_CONTEXT_BYTES: usize = 256 * 1024;
 pub const GH_ORIGIN_SCHEMA_VERSION: u32 = 2;
 pub const GH_CONTEXT_SCHEMA_VERSION: u32 = 2;
+pub const ADMISSION_ORIGIN_SCHEMA_VERSION: u32 = 1;
 const MAX_GH_PRODUCER_BYTES: usize = 96;
 const MAX_GH_TITLE_BYTES: usize = 16 * 1024;
 const MAX_GH_BODY_BYTES: usize = 128 * 1024;
@@ -56,6 +57,7 @@ pub const TALLY_UDA_NAMES: &[&str] = &[
     "runtime_max_sec",
     "no_enqueue",
     "credentials_json",
+    "origin_json",
     "gh_origin_json",
     "related_trigger_json",
     "evidence_class",
@@ -72,6 +74,135 @@ pub enum EnqueueSource {
     Gh,
     BuildEffect,
     PoolReachability,
+}
+
+impl EnqueueSource {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Manual => "manual",
+            Self::Orchestrator => "orchestrator",
+            Self::Calendar => "calendar",
+            Self::EventsDir => "events-dir",
+            Self::Gh => "gh",
+            Self::BuildEffect => "build-effect",
+            Self::PoolReachability => "pool-reachability",
+        }
+    }
+
+    pub const fn is_producer(self) -> bool {
+        matches!(
+            self,
+            Self::Calendar
+                | Self::EventsDir
+                | Self::Gh
+                | Self::BuildEffect
+                | Self::PoolReachability
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ProducerOrigin {
+    pub name: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AdmissionOrigin {
+    pub schema_version: u32,
+    pub source: EnqueueSource,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<ProducerOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<GhOrigin>,
+}
+
+impl AdmissionOrigin {
+    pub fn direct(source: EnqueueSource) -> Self {
+        Self {
+            schema_version: ADMISSION_ORIGIN_SCHEMA_VERSION,
+            source,
+            producer: None,
+            github: None,
+        }
+    }
+
+    pub fn producer(name: impl Into<String>, source: EnqueueSource) -> Self {
+        Self {
+            schema_version: ADMISSION_ORIGIN_SCHEMA_VERSION,
+            source,
+            producer: Some(ProducerOrigin {
+                name: name.into(),
+                kind: source.as_str().to_owned(),
+            }),
+            github: None,
+        }
+    }
+
+    pub fn github(name: impl Into<String>, github: GhOrigin) -> Self {
+        let mut origin = Self::producer(name, EnqueueSource::Gh);
+        origin.github = Some(github);
+        origin
+    }
+
+    pub fn validate(&self) -> Result<(), TaskDbError> {
+        if self.schema_version != ADMISSION_ORIGIN_SCHEMA_VERSION {
+            return Err(TaskDbError::InvalidSeed(format!(
+                "origin has unsupported schema version {}",
+                self.schema_version
+            )));
+        }
+        if let Some(producer) = &self.producer {
+            let valid_name = !producer.name.is_empty()
+                && producer.name.len() <= MAX_GH_PRODUCER_BYTES
+                && producer.name != "."
+                && producer.name != ".."
+                && producer
+                    .name
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                && producer
+                    .name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'));
+            if !valid_name {
+                return Err(TaskDbError::InvalidSeed(
+                    "origin producer name is not a safe registry component".to_owned(),
+                ));
+            }
+            if !self.source.is_producer() || producer.kind != self.source.as_str() {
+                return Err(TaskDbError::InvalidSeed(
+                    "origin producer kind does not match its admission source".to_owned(),
+                ));
+            }
+        }
+        if let Some(github) = &self.github {
+            if self.source != EnqueueSource::Gh {
+                return Err(TaskDbError::InvalidSeed(
+                    "origin github detail is valid only for source=gh".to_owned(),
+                ));
+            }
+            if self.producer.is_none() {
+                return Err(TaskDbError::InvalidSeed(
+                    "origin github detail requires its generic producer identity".to_owned(),
+                ));
+            }
+            github.validate()?;
+            if self
+                .producer
+                .as_ref()
+                .is_some_and(|producer| producer.name != github.producer)
+            {
+                return Err(TaskDbError::InvalidSeed(
+                    "origin producer and nested GitHub producer disagree".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -754,6 +885,10 @@ pub struct RowSeed {
     #[serde(default)]
     pub credentials: BTreeMap<String, PathBuf>,
     #[serde(default)]
+    pub origin: Option<AdmissionOrigin>,
+    /// Protocol-2 compatibility input. Current rows also carry this identity
+    /// beneath `origin.github`.
+    #[serde(default)]
     pub gh_origin: Option<GhOrigin>,
     #[serde(default)]
     pub related_trigger: Option<RelatedTrigger>,
@@ -869,6 +1004,19 @@ impl RowSeed {
                 )));
             }
         }
+        if let Some(origin) = &self.origin {
+            if origin.source != self.source {
+                return Err(TaskDbError::InvalidSeed(
+                    "origin source does not match row source".to_owned(),
+                ));
+            }
+            origin.validate()?;
+            if self.gh_origin.as_ref() != origin.github.as_ref() {
+                return Err(TaskDbError::InvalidSeed(
+                    "legacy ghOrigin and nested origin github detail disagree".to_owned(),
+                ));
+            }
+        }
         if let Some(origin) = &self.gh_origin {
             if self.source != EnqueueSource::Gh {
                 return Err(TaskDbError::InvalidSeed(
@@ -891,6 +1039,18 @@ impl RowSeed {
     }
 
     pub fn canonicalize(&mut self) -> Result<(), TaskDbError> {
+        if self.origin.is_none() {
+            self.origin = Some(match &self.gh_origin {
+                Some(github) => AdmissionOrigin::github(&github.producer, github.clone()),
+                None => AdmissionOrigin::direct(self.source),
+            });
+        }
+        if self.gh_origin.is_none() {
+            self.gh_origin = self
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.github.clone());
+        }
         self.validate()?;
         crate::poolset::canonicalize(&mut self.pools)
             .map_err(|error| TaskDbError::InvalidSeed(error.to_string()))?;
@@ -1357,6 +1517,9 @@ fn populate_task(
         "credentials_json",
         serde_json::to_string(&seed.credentials)?,
     );
+    if let Some(origin) = seed.origin {
+        attributes.insert("origin_json", serde_json::to_string(&origin)?);
+    }
     if let Some(gh_origin) = seed.gh_origin {
         attributes.insert("gh_origin_json", serde_json::to_string(&gh_origin)?);
     }
@@ -1668,6 +1831,7 @@ mod tests {
             runtime_max_sec: Some(300),
             no_enqueue: false,
             credentials: BTreeMap::new(),
+            origin: None,
             gh_origin: None,
             related_trigger: None,
             evidence_class: Some(Value::String("artifact".to_owned())),
@@ -1909,6 +2073,8 @@ mod tests {
             receipt_id: Some("receipt-42".to_owned()),
         };
         row_seed.related_trigger = Some(related_trigger.clone());
+        let origin = AdmissionOrigin::producer("drop", EnqueueSource::EventsDir);
+        row_seed.origin = Some(origin.clone());
         let mut db = TaskDb::open(temp.path()).await.unwrap();
         let admission = db
             .prepare_admission(&durable(EnqueueSource::EventsDir), row_seed)
@@ -1929,6 +2095,10 @@ mod tests {
             serde_json::from_str::<RelatedTrigger>(row.value("related_trigger_json").unwrap())
                 .unwrap(),
             related_trigger
+        );
+        assert_eq!(
+            serde_json::from_str::<AdmissionOrigin>(row.value("origin_json").unwrap()).unwrap(),
+            origin
         );
     }
 

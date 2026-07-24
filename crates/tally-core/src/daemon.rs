@@ -43,6 +43,8 @@ use crate::lease::{
     bump_epoch, AdmitOutcome, LeaseBackend, LeaseEngine, LeaseError, LeaseEventLog, LeaseGrant,
     LeaseRequest, LocalLease, SystemdUnitLiveness,
 };
+use crate::pagination::{PageCache, PaginationError};
+use crate::producer_query::query_producers;
 use crate::producers::{
     acknowledged_ingress_ids, archive_ingress_claim, claim_ingress_files, read_ingress_payload,
     GhCliMutationSink, IngressOutcome, ProducerEngine, ReachabilityTransition,
@@ -53,7 +55,8 @@ use crate::query::{
 };
 use crate::query_v2::{
     query_job as query_job_v2, query_jobs as query_jobs_v2, query_lifecycle_log, query_proof,
-    JobsFilter, LifecycleLogFilter, LiveJobFact, ObservabilityError, RowDetailFact,
+    snapshot_metadata, JobsFilter, LifecycleLogFilter, LiveJobFact, ObservabilityError,
+    RowDetailFact,
 };
 use crate::recovery::{
     collect_durable_recovery_facts, collect_local_unit_facts, recover, DurableRecoveryFacts,
@@ -62,8 +65,10 @@ use crate::recovery::{
 };
 use crate::taskdb::{
     admits_durable_row, read_acknowledged_events, write_enqueue_event_atomic, AdmissionInput,
-    DurableEnqueueEvent, EnqueueSource, RowSeed, TaskDb, TaskDbError,
+    AdmissionOrigin, DurableEnqueueEvent, EnqueueSource, RowSeed, TaskDb, TaskDbError,
 };
+use crate::trace::{query_trace, trace_availability, TraceError, TraceLane};
+use crate::watch::{ChangeError, ChangeKind, ChangeStore};
 use crate::wire::{
     serve_connection, EnqueuePayload, GuardrailConfig, GuardrailState, ParentInfo,
     ProducerDefaults, RequestFrame, RpcHandler, WireError, WireErrorCode, WireIoError,
@@ -151,6 +156,8 @@ pub enum DaemonError {
     Witness(#[from] WitnessError),
     #[error("lifecycle history error: {0}")]
     History(#[from] HistoryError),
+    #[error("change log error: {0}")]
+    Change(#[from] ChangeError),
     #[error("recovery error: {0}")]
     Recovery(#[from] crate::recovery::RecoveryError),
     #[error("executor error: {0}")]
@@ -566,6 +573,9 @@ struct DaemonHandler {
     commits: mpsc::UnboundedSender<CommitCommand>,
     journal: JournalEmitter,
     history: Rc<RefCell<LifecycleStore>>,
+    changes: Rc<RefCell<ChangeStore>>,
+    trace_adapters: Rc<BTreeSet<String>>,
+    pages: Rc<RefCell<PageCache>>,
     execution_shutdown: watch::Receiver<bool>,
     execution_cancel: broadcast::Sender<Uuid>,
     fatal: mpsc::UnboundedSender<DaemonError>,
@@ -588,16 +598,20 @@ impl RpcHandler for DaemonHandler {
                 "queue.continue" => self.continue_job(request.params).await,
                 "queue.await_job" => self.await_job(request.params).await,
                 "queue.await_barrier" => self.await_barrier(request.params).await,
-                "queue.drain" => self.drain().await,
+                "queue.drain" => self.drain(request.params).await,
                 "queue.pause" => self.pause(request.params).await,
                 "queue.resume" => self.resume(request.params).await,
                 "queue.cancel" => self.cancel(request.params).await,
                 "__producer.pool-transition" => self.pool_transition(request.params).await,
+                "__producer.runtime-observed" => {
+                    self.producer_runtime_observed(request.params).await
+                }
                 "lease.acquire" => self.acquire(request.params).await,
                 "lease.release" => self.release(request.params).await,
                 "lease.status" => self.lease_status(request.params).await,
                 "query.jobs" | "query.job" | "query.status" | "query.log" | "query.proof"
-                | "query.render" | "query.standup" | "query.pools" => {
+                | "query.trace" | "query.producers" | "query.watch" | "query.render"
+                | "query.standup" | "query.pools" => {
                     self.query(&request.method, request.params).await
                 }
                 other => Err(WireError::new(
@@ -614,6 +628,14 @@ impl DaemonHandler {
         let message = error.to_string();
         let _ = self.fatal.send(error);
         internal_wire(message)
+    }
+
+    fn append_change(&self, kind: ChangeKind, payload: Value) -> Result<(), WireError> {
+        self.changes
+            .borrow_mut()
+            .append_now(kind, payload)
+            .map(|_| ())
+            .map_err(|error| self.fail_stop(error.into()))
     }
 
     async fn enqueue(&self, params: Option<Value>) -> Result<Value, WireError> {
@@ -661,6 +683,9 @@ impl DaemonHandler {
                 .adapter
                 .get_or_insert_with(|| previous.row.adapter.clone());
             payload.source.get_or_insert(previous.row.source);
+            if payload.origin.is_none() {
+                payload.origin.clone_from(&previous.row.origin);
+            }
             if payload.cwd.is_none() {
                 payload.cwd.clone_from(&previous.row.cwd);
             }
@@ -860,6 +885,7 @@ impl DaemonHandler {
             runtime_max_sec: resolved.runtime_max_sec,
             no_enqueue: resolved.no_enqueue,
             credentials: resolved.credentials,
+            origin: Some(resolved.origin),
             gh_origin: resolved.gh_origin,
             related_trigger: resolved.related_trigger,
             evidence_class: resolved.evidence_class,
@@ -1203,7 +1229,27 @@ impl DaemonHandler {
         await_registration(registration).await
     }
 
-    async fn drain(&self) -> Result<Value, WireError> {
+    async fn drain(&self, params: Option<Value>) -> Result<Value, WireError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            #[serde(default)]
+            producer: Option<String>,
+        }
+        let params: Params = decode_params(params)?;
+        if let Some(producer) = &params.producer {
+            let context = self.context.read().await;
+            let configured = context
+                .config
+                .producers
+                .get(producer)
+                .ok_or_else(|| WireError::invalid(format!("unknown producer {producer:?}")))?;
+            if configured.kind() != "events-dir" {
+                return Err(WireError::invalid(format!(
+                    "producer {producer:?} is not an events-dir producer"
+                )));
+            }
+        }
         let _sweep = self.ingress_sweep.lock().await;
         let events_dir = self.context.read().await.paths.events_dir();
         let claims = claim_ingress_files(&events_dir).map_err(internal_wire)?;
@@ -1225,7 +1271,7 @@ impl DaemonHandler {
                 });
                 continue;
             }
-            let payload = match read_ingress_payload(&claim) {
+            let mut payload = match read_ingress_payload(&claim) {
                 Ok(payload) => payload,
                 Err(error @ crate::producers::ProducerError::Io { .. }) => {
                     return Err(internal_wire(error));
@@ -1248,6 +1294,17 @@ impl DaemonHandler {
                     continue;
                 }
             };
+            if payload.origin.is_none() {
+                if payload.source.is_none() && params.producer.is_some() {
+                    payload.source = Some(EnqueueSource::EventsDir);
+                }
+                if payload.source == Some(EnqueueSource::EventsDir) {
+                    payload.origin = Some(params.producer.as_ref().map_or_else(
+                        || AdmissionOrigin::direct(EnqueueSource::EventsDir),
+                        |producer| AdmissionOrigin::producer(producer, EnqueueSource::EventsDir),
+                    ));
+                }
+            }
             match self
                 .enqueue_payload(payload, Some(claim.ingress_id.clone()))
                 .await
@@ -1342,7 +1399,15 @@ impl DaemonHandler {
             job.lease_id = None;
             job.state = JobState::Paused;
         }
-        Ok(json!({"paused": pools, "affected": queued.len()}))
+        let affected = queued.len();
+        drop(context);
+        for pool in &pools {
+            self.append_change(
+                ChangeKind::Pool,
+                json!({"pool": pool, "update": "paused", "affected": affected}),
+            )?;
+        }
+        Ok(json!({"paused": pools, "affected": affected}))
     }
 
     async fn resume(&self, params: Option<Value>) -> Result<Value, WireError> {
@@ -1380,7 +1445,40 @@ impl DaemonHandler {
         for job in launches {
             self.spawn_execution(job);
         }
+        for pool in &pools {
+            self.append_change(ChangeKind::Pool, json!({"pool": pool, "update": "resumed"}))?;
+        }
         Ok(json!({"resumed": pools}))
+    }
+
+    async fn producer_runtime_observed(&self, params: Option<Value>) -> Result<Value, WireError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            producer: String,
+        }
+        let params: Params = decode_params(params)?;
+        if !self
+            .context
+            .read()
+            .await
+            .config
+            .producers
+            .contains_key(&params.producer)
+        {
+            return Err(WireError::invalid(format!(
+                "unknown producer {:?}",
+                params.producer
+            )));
+        }
+        self.append_change(
+            ChangeKind::Producer,
+            json!({
+                "name": params.producer,
+                "update": "runtime-observation-recorded",
+            }),
+        )?;
+        Ok(json!({"observed": true}))
     }
 
     async fn pool_transition(&self, params: Option<Value>) -> Result<Value, WireError> {
@@ -1463,6 +1561,16 @@ impl DaemonHandler {
             .await
             .applied_pool_transitions
             .insert(key);
+        self.append_change(
+            ChangeKind::Pool,
+            json!({
+                "pool": pool,
+                "producer": params.producer,
+                "update": params.transition,
+                "generation": params.generation,
+                "affected": affected,
+            }),
+        )?;
         Ok(json!({
             "applied": true,
             "alreadyApplied": false,
@@ -2172,6 +2280,50 @@ impl DaemonHandler {
     }
 
     async fn query(&self, method: &str, params: Option<Value>) -> Result<Value, WireError> {
+        if method == "query.watch" {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                #[serde(default)]
+                after: Option<String>,
+                #[serde(default)]
+                limit: Option<usize>,
+            }
+            let params: Params = decode_params(params)?;
+            return serde_json::to_value(
+                self.changes
+                    .borrow()
+                    .watch(params.after.as_deref(), params.limit)
+                    .map_err(change_wire)?,
+            )
+            .map_err(internal_wire);
+        }
+        if method == "query.producers" {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {
+                #[serde(default)]
+                name: Option<String>,
+                #[serde(default)]
+                kind: Option<String>,
+            }
+            let params: Params = decode_params(params)?;
+            let (registry, state_dir) = {
+                let context = self.context.read().await;
+                (
+                    context.config.producers.clone(),
+                    context.paths.state_dir.clone(),
+                )
+            };
+            return serde_json::to_value(query_producers(
+                &registry,
+                &state_dir,
+                params.name.as_deref(),
+                params.kind.as_deref(),
+            ))
+            .map_err(internal_wire);
+        }
+
         let history = self.history.borrow().snapshot();
         let journal = history
             .records
@@ -2238,6 +2390,8 @@ impl DaemonHandler {
                     #[serde(default)]
                     source: Option<String>,
                     #[serde(default)]
+                    origin: Option<String>,
+                    #[serde(default)]
                     parent: Option<String>,
                     #[serde(default)]
                     session: Option<String>,
@@ -2245,19 +2399,42 @@ impl DaemonHandler {
                     since: Option<String>,
                     #[serde(default)]
                     until: Option<String>,
+                    #[serde(default)]
+                    limit: Option<usize>,
+                    #[serde(default)]
+                    cursor: Option<String>,
                 }
                 let params: Params = decode_params(params)?;
-                let pool_signals = {
-                    let mut context = self.context.write().await;
-                    query_pools(&pool_headroom_facts(&mut context)?)
-                        .map_err(query_wire)?
-                        .pools
-                        .into_iter()
-                        .map(|pool| (pool.pool, pool.signal))
-                        .collect::<BTreeMap<_, _>>()
-                };
-                serde_json::to_value(
-                    query_jobs_v2(
+                let fingerprint = serde_json::to_string(&json!({
+                    "liveState": params.live_state.clone(),
+                    "terminalVerdict": params.terminal_verdict,
+                    "pool": params.pool.clone(),
+                    "executor": params.executor.clone(),
+                    "adapter": params.adapter.clone(),
+                    "source": params.source.clone(),
+                    "origin": params.origin.clone(),
+                    "parent": params.parent.clone(),
+                    "session": params.session.clone(),
+                    "since": params.since.clone(),
+                    "until": params.until.clone(),
+                }))
+                .map_err(internal_wire)?;
+                let envelope = if params.cursor.is_none() {
+                    let pool_signals = {
+                        let mut context = self.context.write().await;
+                        query_pools(&pool_headroom_facts(&mut context)?)
+                            .map_err(query_wire)?
+                            .pools
+                            .into_iter()
+                            .map(|pool| (pool.pool, pool.signal))
+                            .collect::<BTreeMap<_, _>>()
+                    };
+                    let lanes = trace_lanes(&details, &live, &history);
+                    let adapters = {
+                        let context = self.context.read().await;
+                        context.config.adapters.clone()
+                    };
+                    let mut result = query_jobs_v2(
                         &details,
                         &live,
                         &history,
@@ -2270,15 +2447,32 @@ impl DaemonHandler {
                             executor: params.executor,
                             adapter: params.adapter,
                             source: params.source,
+                            origin: params.origin,
                             parent: params.parent,
                             session: params.session,
                             since: params.since,
                             until: params.until,
                         },
                     )
-                    .map_err(observability_wire)?,
-                )
-                .map_err(internal_wire)
+                    .map_err(observability_wire)?;
+                    for item in &mut result.items {
+                        item.trace =
+                            trace_availability(&item.anchor, &lanes, &adapters, &self.executor);
+                    }
+                    Some(serde_json::to_value(result).map_err(internal_wire)?)
+                } else {
+                    None
+                };
+                self.pages
+                    .borrow_mut()
+                    .page(
+                        method,
+                        &fingerprint,
+                        params.limit,
+                        params.cursor.as_deref(),
+                        envelope,
+                    )
+                    .map_err(pagination_wire)
             }
             "query.job" => {
                 #[derive(Deserialize)]
@@ -2299,18 +2493,23 @@ impl DaemonHandler {
                         .map(|pool| (pool.pool, pool.signal))
                         .collect::<BTreeMap<_, _>>()
                 };
-                serde_json::to_value(
-                    query_job_v2(
-                        &params.id,
-                        &details,
-                        &live,
-                        &history,
-                        &witness,
-                        &pool_signals,
-                    )
-                    .map_err(observability_wire)?,
+                let lanes = trace_lanes(&details, &live, &history);
+                let adapters = {
+                    let context = self.context.read().await;
+                    context.config.adapters.clone()
+                };
+                let mut result = query_job_v2(
+                    &params.id,
+                    &details,
+                    &live,
+                    &history,
+                    &witness,
+                    &pool_signals,
                 )
-                .map_err(internal_wire)
+                .map_err(observability_wire)?;
+                result.job.trace =
+                    trace_availability(&result.job.anchor, &lanes, &adapters, &self.executor);
+                serde_json::to_value(result).map_err(internal_wire)
             }
             "query.status" => {
                 #[derive(Deserialize)]
@@ -2348,25 +2547,55 @@ impl DaemonHandler {
                     since: Option<String>,
                     #[serde(default)]
                     until: Option<String>,
+                    #[serde(default)]
+                    limit: Option<usize>,
+                    #[serde(default)]
+                    cursor: Option<String>,
                 }
                 let params: Params = decode_params(params)?;
-                serde_json::to_value(
-                    query_lifecycle_log(
-                        &history,
-                        &witness,
-                        &LifecycleLogFilter {
-                            task: params.task,
-                            attempt: params.attempt,
-                            session: params.session,
-                            event: params.event,
-                            source: params.source,
-                            since: params.since,
-                            until: params.until,
-                        },
+                let fingerprint = serde_json::to_string(&json!({
+                    "task": params.task.clone(),
+                    "attempt": params.attempt,
+                    "session": params.session.clone(),
+                    "event": params.event,
+                    "source": params.source.clone(),
+                    "since": params.since.clone(),
+                    "until": params.until.clone(),
+                }))
+                .map_err(internal_wire)?;
+                let envelope = if params.cursor.is_none() {
+                    Some(
+                        serde_json::to_value(
+                            query_lifecycle_log(
+                                &history,
+                                &witness,
+                                &LifecycleLogFilter {
+                                    task: params.task,
+                                    attempt: params.attempt,
+                                    session: params.session,
+                                    event: params.event,
+                                    source: params.source,
+                                    since: params.since,
+                                    until: params.until,
+                                },
+                            )
+                            .map_err(observability_wire)?,
+                        )
+                        .map_err(internal_wire)?,
                     )
-                    .map_err(observability_wire)?,
-                )
-                .map_err(internal_wire)
+                } else {
+                    None
+                };
+                self.pages
+                    .borrow_mut()
+                    .page(
+                        method,
+                        &fingerprint,
+                        params.limit,
+                        params.cursor.as_deref(),
+                        envelope,
+                    )
+                    .map_err(pagination_wire)
             }
             "query.proof" => {
                 #[derive(Deserialize)]
@@ -2406,6 +2635,64 @@ impl DaemonHandler {
                     .map_err(observability_wire)?,
                 )
                 .map_err(internal_wire)
+            }
+            "query.trace" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    task: String,
+                    #[serde(default)]
+                    attempt: Option<u32>,
+                    #[serde(default)]
+                    limit: Option<usize>,
+                    #[serde(default)]
+                    cursor: Option<String>,
+                }
+                let params: Params = decode_params(params)?;
+                if params.task.trim().is_empty() {
+                    return Err(WireError::invalid("query trace task must not be empty"));
+                }
+                let fingerprint = serde_json::to_string(&json!({
+                    "task": params.task.clone(),
+                    "attempt": params.attempt,
+                }))
+                .map_err(internal_wire)?;
+                let envelope = if params.cursor.is_none() {
+                    let lanes = trace_lanes(&details, &live, &history);
+                    let adapters = {
+                        let context = self.context.read().await;
+                        context.config.adapters.clone()
+                    };
+                    Some(
+                        serde_json::to_value(
+                            query_trace(
+                                &params.task,
+                                params.attempt,
+                                &lanes,
+                                &adapters,
+                                &self.executor,
+                                snapshot_metadata(&history, &witness),
+                            )
+                            .map_err(trace_wire)?,
+                        )
+                        .map_err(internal_wire)?,
+                    )
+                } else {
+                    None
+                };
+                self.pages
+                    .borrow_mut()
+                    .page(
+                        method,
+                        &fingerprint,
+                        params.limit,
+                        params.cursor.as_deref(),
+                        envelope,
+                    )
+                    .map_err(pagination_wire)
+            }
+            "query.producers" | "query.watch" => {
+                unreachable!("early read-only query paths return before projection setup")
             }
             "query.render" => {
                 #[derive(Deserialize)]
@@ -2563,8 +2850,67 @@ impl DaemonHandler {
                 return;
             }
         };
-        if let Err(error) = self.history.borrow_mut().append_now(fields.clone()) {
-            eprintln!("tally: lifecycle history append failed after ack: {error}");
+        let lifecycle = match self.history.borrow_mut().append_now(fields.clone()) {
+            Ok(record) => record,
+            Err(error) => {
+                eprintln!("tally: lifecycle history append failed after ack: {error}");
+                let _ = self.fatal.send(error.into());
+                return;
+            }
+        };
+        let change_payload = json!({
+            "taskUuid": fields.task_uuid,
+            "attempt": fields.attempt,
+            "leaseEpoch": fields.lease_epoch,
+            "event": fields.event,
+            "lifecycleCursor": lifecycle.cursor,
+        });
+        let mut changes = self.changes.borrow_mut();
+        let mut append_change = |kind, payload| changes.append_now(kind, payload);
+        let changed = append_change(ChangeKind::Lifecycle, change_payload.clone())
+            .and_then(|_| {
+                append_change(
+                    ChangeKind::Job,
+                    json!({
+                        "taskUuid": fields.task_uuid,
+                        "attempt": fields.attempt,
+                        "leaseEpoch": fields.lease_epoch,
+                        "reason": fields.event,
+                    }),
+                )
+            })
+            .and_then(|_| {
+                if matches!(
+                    fields.event,
+                    TallyEvent::Completed
+                        | TallyEvent::Failed
+                        | TallyEvent::Preempted
+                        | TallyEvent::WitnessEmitted
+                ) {
+                    append_change(ChangeKind::Proof, change_payload.clone())?;
+                }
+                Ok(())
+            })
+            .and_then(|_| {
+                if fields
+                    .agent
+                    .as_ref()
+                    .is_some_and(|adapter| self.trace_adapters.contains(adapter))
+                    && matches!(
+                        fields.event,
+                        TallyEvent::Started
+                            | TallyEvent::Completed
+                            | TallyEvent::Failed
+                            | TallyEvent::Preempted
+                    )
+                {
+                    append_change(ChangeKind::Trace, change_payload)?;
+                }
+                Ok(())
+            });
+        drop(changes);
+        if let Err(error) = changed {
+            eprintln!("tally: change log append failed after ack: {error}");
             let _ = self.fatal.send(error.into());
             return;
         }
@@ -2622,6 +2968,94 @@ fn observability_wire(error: ObservabilityError) -> WireError {
             WireError::not_found(error.to_string())
         }
     }
+}
+
+fn pagination_wire(error: PaginationError) -> WireError {
+    match error {
+        PaginationError::InvalidLimit
+        | PaginationError::InvalidCursor
+        | PaginationError::CursorMismatch => WireError::invalid(error.to_string()),
+        PaginationError::CursorExpired => WireError::not_found(error.to_string()),
+        PaginationError::InvalidEnvelope | PaginationError::ItemTooLarge => internal_wire(error),
+    }
+}
+
+fn trace_wire(error: TraceError) -> WireError {
+    match error {
+        TraceError::UnknownJob(_) | TraceError::UnknownAttempt { .. } => {
+            WireError::not_found(error.to_string())
+        }
+        TraceError::Io { .. } => internal_wire(error),
+    }
+}
+
+fn change_wire(error: ChangeError) -> WireError {
+    match error {
+        ChangeError::Invalid(_) => WireError::invalid(error.to_string()),
+        ChangeError::Io { .. } | ChangeError::Json(_) => internal_wire(error),
+    }
+}
+
+fn trace_lanes(
+    details: &[RowDetailFact],
+    live: &[LiveJobFact],
+    history: &crate::history::LifecycleSnapshot,
+) -> Vec<TraceLane> {
+    let mut lanes = BTreeMap::<(String, u32, u64), TraceLane>::new();
+    for detail in details {
+        lanes.insert(
+            (detail.task_uuid.clone(), detail.attempt, detail.lease_epoch),
+            TraceLane {
+                task_uuid: detail.task_uuid.clone(),
+                job_id: None,
+                attempt: detail.attempt,
+                lease_epoch: detail.lease_epoch,
+                adapter: detail.adapter.clone(),
+                session_ref: detail.session_ref.clone(),
+                running: false,
+                remote: detail.executor.is_some(),
+            },
+        );
+    }
+    for record in &history.records {
+        let (Some(attempt), Some(lease_epoch)) = (record.fields.attempt, record.fields.lease_epoch)
+        else {
+            continue;
+        };
+        let key = (record.fields.task_uuid.clone(), attempt, lease_epoch);
+        let lane = lanes.entry(key).or_insert_with(|| TraceLane {
+            task_uuid: record.fields.task_uuid.clone(),
+            job_id: record.fields.job_id.clone(),
+            attempt,
+            lease_epoch,
+            adapter: record
+                .fields
+                .agent
+                .clone()
+                .unwrap_or_else(|| "unknown".to_owned()),
+            session_ref: record.fields.session_ref.clone(),
+            running: false,
+            remote: record.fields.executor.is_some(),
+        });
+        if record.fields.job_id.is_some() {
+            lane.job_id.clone_from(&record.fields.job_id);
+        }
+        if record.fields.agent.is_some() {
+            lane.adapter = record.fields.agent.clone().unwrap();
+        }
+        if record.fields.session_ref.is_some() {
+            lane.session_ref.clone_from(&record.fields.session_ref);
+        }
+        lane.remote |= record.fields.executor.is_some();
+    }
+    for live in live {
+        let key = (live.anchor.clone(), live.attempt, live.lease_epoch);
+        if let Some(lane) = lanes.get_mut(&key) {
+            lane.running = live.live_state == "running";
+            lane.job_id = Some(live.job_id.clone());
+        }
+    }
+    lanes.into_values().collect()
 }
 
 fn pool_headroom_facts(context: &mut Context) -> Result<Vec<PoolHeadroomFact>, WireError> {
@@ -3352,6 +3786,29 @@ impl Daemon {
             .to_str()
             .ok_or_else(|| DaemonError::Invalid("daemon socket path must be Unicode".to_owned()))?
             .to_owned();
+        let mut changes = ChangeStore::open(&paths.data_dir)?;
+        for (name, producer) in &config.producers {
+            changes.append_now(
+                ChangeKind::Producer,
+                json!({
+                    "name": name,
+                    "kind": producer.kind(),
+                    "update": "effective-registry-loaded",
+                }),
+            )?;
+        }
+        for pool in config.pools.keys() {
+            changes.append_now(
+                ChangeKind::Pool,
+                json!({"pool": pool, "update": "effective-registry-loaded"}),
+            )?;
+        }
+        let trace_adapters = config
+            .adapters
+            .iter()
+            .filter(|(_, adapter)| adapter.trace.is_some())
+            .map(|(name, _)| name.clone())
+            .collect::<BTreeSet<_>>();
         let handler = DaemonHandler {
             context: Rc::new(RwLock::new(context)),
             settings,
@@ -3360,6 +3817,9 @@ impl Daemon {
             commits: commit_tx,
             journal: JournalEmitter::from_config(&config.journald),
             history: Rc::new(RefCell::new(LifecycleStore::open(&paths.data_dir)?)),
+            changes: Rc::new(RefCell::new(changes)),
+            trace_adapters: Rc::new(trace_adapters),
+            pages: Rc::new(RefCell::new(PageCache::default())),
             execution_shutdown: execution_shutdown_rx,
             execution_cancel,
             fatal: fatal_tx,
@@ -5895,7 +6355,9 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::adapters::{AdapterConfig, ScrapeCapture, ScrapeMode, ScrapeStream};
+    use crate::adapters::{
+        AdapterConfig, AdapterTrace, ScrapeCapture, ScrapeMode, ScrapeStream, TraceFraming,
+    };
     use crate::config::{
         CoResidencyPredicate, ExecutionTargetConfig, JournaldConfig, MeterBudgetClass, PoolConfig,
         PoolPredicate, ResourceKind, SshExecutorConfig, UsageMeterConfig,
@@ -6323,6 +6785,7 @@ mod tests {
                     },
                 ),
             ]),
+            trace: None,
             yield_hook: Some(vec![
                 "tally".to_owned(),
                 "lease".to_owned(),
@@ -6381,6 +6844,7 @@ mod tests {
             runtime_max_sec: None,
             no_enqueue: false,
             credentials: BTreeMap::new(),
+            origin: None,
             gh_origin: None,
             related_trigger: None,
             evidence_class: None,
@@ -6813,7 +7277,7 @@ mod tests {
                 .unwrap();
                 let direct_error = daemon.handler.enqueue(Some(malformed)).await.unwrap_err();
 
-                let drained = daemon.handler.drain().await.unwrap();
+                let drained = daemon.handler.drain(None).await.unwrap();
                 assert_eq!(drained["enqueued"], 1);
                 assert_eq!(drained["rejected"], 3);
                 assert_eq!(drained["repaired"], 0);
@@ -6906,7 +7370,7 @@ mod tests {
                     .unwrap();
                 assert!(claims[0].path.exists());
 
-                let repaired = daemon.handler.drain().await.unwrap();
+                let repaired = daemon.handler.drain(None).await.unwrap();
                 assert_eq!(repaired["enqueued"], 0);
                 assert_eq!(repaired["rejected"], 0);
                 assert_eq!(repaired["repaired"], 1);
@@ -6936,13 +7400,13 @@ mod tests {
                 let transient_claim = claim_ingress_files(&paths.events_dir()).unwrap().remove(0);
                 fs::set_permissions(&transient_claim.path, fs::Permissions::from_mode(0o000))
                     .unwrap();
-                let transient_error = daemon.handler.drain().await.unwrap_err();
+                let transient_error = daemon.handler.drain(None).await.unwrap_err();
                 assert_eq!(transient_error.code, WireErrorCode::Internal);
                 assert!(transient_claim.path.exists());
                 assert!(!paths.events_dir().join("rejected/transient.json").exists());
                 fs::set_permissions(&transient_claim.path, fs::Permissions::from_mode(0o600))
                     .unwrap();
-                let retried = daemon.handler.drain().await.unwrap();
+                let retried = daemon.handler.drain(None).await.unwrap();
                 assert_eq!(retried["enqueued"], 1);
                 assert!(paths.events_dir().join("done/transient.json").is_file());
             })
@@ -7161,6 +7625,7 @@ mod tests {
                                 pattern: "$..session_id".to_owned(),
                             },
                         )]),
+                        trace: None,
                         yield_hook: None,
                         env: BTreeMap::new(),
                         launch: crate::adapters::AdapterLaunchConfig::default(),
@@ -7381,7 +7846,7 @@ mod tests {
                     .any(|event| event["attempt"] == 1 && event["event"] == "failed"));
                 assert!(log["items"].as_array().unwrap().iter().any(|event| {
                     event["attempt"] == 2
-                        && event["authority"] == "canonical-witness"
+                        && event["authority"] == "canonical-witness-fact"
                         && event["terminalVerdict"] == "pass"
                 }));
                 let proof = restarted
@@ -7765,7 +8230,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn every_in_scope_enqueuing_producer_converges_on_the_one_daemon_path() {
+    async fn acceptance_24_7_producer_origin_survives_restart_and_joins_inventory() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -7854,26 +8319,44 @@ mod tests {
                     config.producers["drop"],
                     ProducerConfig::EventsDir(_)
                 ));
+                fs::write(
+                    paths.events_dir().join("drop-fixture.producer.json"),
+                    serde_json::to_vec(&json!({
+                        "argv": ["event"],
+                        "pool": "slot"
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
 
                 let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
-                let daemon =
-                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
-                        .await
-                        .unwrap();
+                let daemon = Daemon::open_with_executor(
+                    config.clone(),
+                    paths.clone(),
+                    settings(),
+                    executor.clone(),
+                )
+                .await
+                .unwrap();
                 daemon
                     .handler
                     .pause(Some(json!({"all": true})))
                     .await
                     .unwrap();
-                let drained = daemon.handler.drain().await.unwrap();
-                assert_eq!(drained["enqueued"], 6);
+                let drained = daemon
+                    .handler
+                    .drain(Some(json!({"producer": "drop"})))
+                    .await
+                    .unwrap();
+                assert_eq!(drained["enqueued"], 7);
                 assert_eq!(drained["rejected"], 0);
 
                 let context = daemon.handler.context.read().await;
                 for (source, expected) in [
                     (EnqueueSource::Calendar, 1),
+                    (EnqueueSource::EventsDir, 1),
                     (EnqueueSource::Gh, 1),
                     (EnqueueSource::BuildEffect, 1),
                     (EnqueueSource::PoolReachability, 3),
@@ -7895,11 +8378,104 @@ mod tests {
                         .count(),
                     1
                 );
+                let expected_origins = context
+                    .jobs
+                    .values()
+                    .map(|job| {
+                        (
+                            job.row.uuid.to_string(),
+                            job.row
+                                .origin
+                                .as_ref()
+                                .and_then(|origin| origin.producer.as_ref())
+                                .map(|producer| producer.name.clone())
+                                .unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(expected_origins.len(), 7);
+                assert_eq!(
+                    expected_origins.values().fold(
+                        BTreeMap::<String, usize>::new(),
+                        |mut counts, name| {
+                            *counts.entry(name.clone()).or_default() += 1;
+                            counts
+                        }
+                    ),
+                    BTreeMap::from([
+                        ("daily".to_owned(), 1),
+                        ("drop".to_owned(), 1),
+                        ("effects".to_owned(), 1),
+                        ("github".to_owned(), 1),
+                        ("health".to_owned(), 3),
+                    ])
+                );
                 drop(context);
                 assert!(crate::taskdb::read_acknowledged_events(&paths.events_dir())
                     .unwrap()
                     .iter()
                     .all(|event| event.ingress_id.is_some()));
+
+                drop(daemon);
+                let restarted =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                let jobs = restarted
+                    .handler
+                    .query("query.jobs", Some(json!({"limit": 100})))
+                    .await
+                    .unwrap();
+                let observed_origins = jobs["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|job| {
+                        (
+                            job["taskUuid"].as_str().unwrap().to_owned(),
+                            job["origin"]["value"]["producer"]["name"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(observed_origins, expected_origins);
+
+                let producers = restarted
+                    .handler
+                    .query("query.producers", Some(json!({"name": "daily"})))
+                    .await
+                    .unwrap();
+                assert_eq!(producers["items"][0]["name"], "daily");
+                assert_eq!(producers["items"][0]["kind"], "calendar");
+                assert_eq!(
+                    producers["items"][0]["schedule"]["calendarExpression"],
+                    "daily"
+                );
+                let watch_tail = restarted
+                    .handler
+                    .query("query.watch", Some(json!({})))
+                    .await
+                    .unwrap()["nextCursor"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                restarted
+                    .handler
+                    .producer_runtime_observed(Some(json!({"producer": "daily"})))
+                    .await
+                    .unwrap();
+                let changes = restarted
+                    .handler
+                    .query(
+                        "query.watch",
+                        Some(json!({"after": watch_tail, "limit": 100})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(changes["items"][0]["kind"], "producer");
+                assert_eq!(changes["items"][0]["payload"]["name"], "daily");
             })
             .await;
     }
@@ -8015,7 +8591,7 @@ mod tests {
                     .pause(Some(json!({"all": true})))
                     .await
                     .unwrap();
-                assert_eq!(daemon.handler.drain().await.unwrap()["enqueued"], 1);
+                assert_eq!(daemon.handler.drain(None).await.unwrap()["enqueued"], 1);
 
                 let job = daemon
                     .handler
@@ -8539,7 +9115,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn custom_adapter_launch_scrapes_post_ack_and_usage_is_attestation_only() {
+    async fn acceptance_24_5_trace_and_scraped_usage_are_advisory_only() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -8561,7 +9137,7 @@ mod tests {
                         "test -S \"$TALLY_SOCKET\" || exit 45\n",
                         "test \"$3\" = '' || exit 46\n",
                         "test \"$4\" = --option-looking || exit 47\n",
-                        "printf '%s\\n' '{\"event\":{\"session_id\":\"session-opaque\",\"model\":\"Provider/Model.Exact-CASE\",\"usage\":{\"input_tokens\":999999}}}'\n",
+                        "printf '%s\\n' '{\"event\":{\"session_id\":\"session-opaque\",\"model\":\"Provider/Model.Exact-CASE\",\"usage\":{\"input_tokens\":999999},\"claimed_verdict\":\"fail\",\"claimed_evidence\":\"fail\",\"claimed_charge\":999999,\"claimed_gpu_seconds\":999999}}'\n",
                         "printf '%s\\n' 'branch=adapter-test' >&2\n",
                         "sleep 0.1\n"
                     ),
@@ -8569,9 +9145,12 @@ mod tests {
                 .unwrap();
                 fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
                 let mut config = one_pool_config();
-                config
-                    .adapters
-                    .insert("from-nix".to_owned(), structured_adapter(&program));
+                let mut adapter = structured_adapter(&program);
+                adapter.trace = Some(AdapterTrace {
+                    stream: ScrapeStream::Stdout,
+                    framing: TraceFraming::JsonLines,
+                });
+                config.adapters.insert("from-nix".to_owned(), adapter);
                 let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
@@ -8687,6 +9266,71 @@ mod tests {
                         .as_deref(),
                     Some("Provider/Model.Exact-CASE")
                 );
+                let task_uuid = admitted["task_uuid"].as_str().unwrap();
+                let before = daemon
+                    .handler
+                    .query("query.job", Some(json!({"id": task_uuid})))
+                    .await
+                    .unwrap();
+                let canonical_before = json!({
+                    "priority": before["job"]["priority"],
+                    "pool": before["job"]["pool"],
+                    "evidenceSpecs": before["job"]["evidenceSpecs"],
+                    "evidenceResult": before["job"]["evidenceResult"],
+                    "terminalVerdict": before["job"]["terminalVerdict"],
+                    "charge": before["job"]["charge"],
+                    "gpuSeconds": before["job"]["gpuSeconds"],
+                    "canonicalGpuSeconds": before["job"]["canonicalGpuSeconds"],
+                });
+                assert_eq!(canonical_before["priority"], "high");
+                assert_eq!(canonical_before["pool"], "slot");
+                assert_eq!(canonical_before["evidenceSpecs"], json!(["exit:0"]));
+                assert_eq!(canonical_before["evidenceResult"], "pass");
+                assert_eq!(canonical_before["terminalVerdict"], "pass");
+                assert_eq!(canonical_before["charge"], Value::Null);
+                assert_eq!(canonical_before["gpuSeconds"], Value::Null);
+                assert_eq!(canonical_before["canonicalGpuSeconds"], Value::Null);
+
+                let trace = daemon
+                    .handler
+                    .query(
+                        "query.trace",
+                        Some(json!({"task": task_uuid, "limit": 100})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(trace["items"].as_array().unwrap().len(), 1);
+                assert_eq!(
+                    trace["items"][0]["authority"],
+                    "advisory-provider-capture"
+                );
+                assert_eq!(trace["items"][0]["provenance"], "provider-capture");
+                assert_eq!(
+                    trace["items"][0]["payload"]["event"]["claimed_verdict"],
+                    "fail"
+                );
+                assert_eq!(
+                    trace["items"][0]["payload"]["event"]["claimed_charge"],
+                    999999
+                );
+                let after = daemon
+                    .handler
+                    .query("query.job", Some(json!({"id": task_uuid})))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    canonical_before,
+                    json!({
+                        "priority": after["job"]["priority"],
+                        "pool": after["job"]["pool"],
+                        "evidenceSpecs": after["job"]["evidenceSpecs"],
+                        "evidenceResult": after["job"]["evidenceResult"],
+                        "terminalVerdict": after["job"]["terminalVerdict"],
+                        "charge": after["job"]["charge"],
+                        "gpuSeconds": after["job"]["gpuSeconds"],
+                        "canonicalGpuSeconds": after["job"]["canonicalGpuSeconds"],
+                    })
+                );
 
                 drop(daemon);
                 tokio::task::yield_now().await;
@@ -8757,6 +9401,178 @@ mod tests {
                     1
                 );
                 drop(deduplicated);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_24_9_queries_and_trace_never_project_credential_values() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let credential = temp.path().join("provider-token");
+                let credential_value = "wave-five-super-secret-value";
+                fs::write(&credential, credential_value).unwrap();
+                fs::set_permissions(&credential, fs::Permissions::from_mode(0o600)).unwrap();
+
+                let mut config = one_pool_config();
+                config
+                    .pools
+                    .get_mut("slot")
+                    .unwrap()
+                    .credentials
+                    .insert("provider-token".to_owned(), credential.clone());
+                config.adapters.get_mut("shell").unwrap().trace = Some(AdapterTrace {
+                    stream: ScrapeStream::Stdout,
+                    framing: TraceFraming::JsonLines,
+                });
+                config.validate().unwrap();
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                let watch_tail = daemon
+                    .handler
+                    .query("query.watch", Some(json!({})))
+                    .await
+                    .unwrap()["nextCursor"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let pool_change = daemon
+                    .handler
+                    .query(
+                        "query.watch",
+                        Some(json!({"after": watch_tail, "limit": 100})),
+                    )
+                    .await
+                    .unwrap();
+                assert!(pool_change["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|change| {
+                        change["kind"] == "pool" && change["payload"]["update"] == "paused"
+                    }));
+                let admitted = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": ["/bin/true"],
+                        "pool": "slot",
+                        "priority": "high",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap();
+                let proxy_attempt = daemon
+                    .handler
+                    .query(
+                        "query.watch",
+                        Some(json!({"method": "queue.resume", "params": {"all": true}})),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(proxy_attempt.code, WireErrorCode::InvalidParams);
+                assert!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .paused_pools
+                        .contains("slot"),
+                    "read-only query RPC changed queue state"
+                );
+
+                let responses = vec![
+                    daemon
+                        .handler
+                        .query("query.jobs", Some(json!({})))
+                        .await
+                        .unwrap(),
+                    daemon
+                        .handler
+                        .query("query.job", Some(json!({"id": task_uuid})))
+                        .await
+                        .unwrap(),
+                    daemon
+                        .handler
+                        .query("query.log", Some(json!({"task": task_uuid})))
+                        .await
+                        .unwrap(),
+                    daemon
+                        .handler
+                        .query("query.proof", Some(json!({"task": task_uuid})))
+                        .await
+                        .unwrap(),
+                    daemon
+                        .handler
+                        .query("query.trace", Some(json!({"task": task_uuid})))
+                        .await
+                        .unwrap(),
+                    daemon
+                        .handler
+                        .query("query.producers", Some(json!({})))
+                        .await
+                        .unwrap(),
+                    daemon
+                        .handler
+                        .query("query.status", Some(json!({})))
+                        .await
+                        .unwrap(),
+                    daemon
+                        .handler
+                        .query("query.render", Some(json!({"format": "json"})))
+                        .await
+                        .unwrap(),
+                    daemon
+                        .handler
+                        .query("query.standup", Some(json!({})))
+                        .await
+                        .unwrap(),
+                    daemon
+                        .handler
+                        .query("query.pools", Some(json!({})))
+                        .await
+                        .unwrap(),
+                    daemon
+                        .handler
+                        .query("query.watch", Some(json!({})))
+                        .await
+                        .unwrap(),
+                ];
+                assert_eq!(
+                    responses[0]["items"][0]["credentialNames"],
+                    json!(["provider-token"])
+                );
+                assert_eq!(
+                    responses[4]["generations"][0]["reason"],
+                    "capture-not-retained-for-generation"
+                );
+                let encoded = serde_json::to_string(&responses).unwrap();
+                assert!(!encoded.contains(credential_value));
+                assert!(!encoded.contains(credential.to_string_lossy().as_ref()));
+                assert_eq!(
+                    fs::metadata(&credential).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
             })
             .await;
     }
@@ -10154,7 +10970,7 @@ mod tests {
                     .call("query.status", Some(json!({"pool": "slot"})))
                     .await
                     .unwrap();
-                assert_eq!(status["protocolVersion"], 2);
+                assert_eq!(status["protocolVersion"], 3);
                 assert_eq!(status["pools"][0]["pool"], "slot");
                 assert!(status["jobs"].as_array().unwrap().iter().any(|job| {
                     job["taskUuid"].as_str() == Some(task_uuid) && job["verdict"] == "pass"
@@ -10167,12 +10983,12 @@ mod tests {
                     .unwrap();
                 assert!(render_text
                     .as_str()
-                    .is_some_and(|text| text.contains("\"protocolVersion\": 2")));
+                    .is_some_and(|text| text.contains("\"protocolVersion\": 3")));
                 let render_json = client
                     .call("query.render", Some(json!({"format": "json"})))
                     .await
                     .unwrap();
-                assert_eq!(render_json["protocolVersion"], 2);
+                assert_eq!(render_json["protocolVersion"], 3);
 
                 let reused = client.call("queue.enqueue", Some(payload)).await.unwrap();
                 assert_eq!(reused["state"], "reused");
@@ -10697,7 +11513,7 @@ mod tests {
                     .query("query.jobs", Some(json!({})))
                     .await
                     .unwrap();
-                assert_eq!(jobs["protocolVersion"], 2);
+                assert_eq!(jobs["protocolVersion"], 3);
                 assert_eq!(jobs["nextCursor"], Value::Null);
                 assert_eq!(jobs["snapshot"]["history"]["complete"], true);
                 let parent = jobs["items"]

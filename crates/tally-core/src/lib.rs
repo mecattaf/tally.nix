@@ -9,12 +9,16 @@ pub mod executor;
 pub mod history;
 pub mod journal;
 pub mod lease;
+pub mod pagination;
 pub mod poolset;
+pub mod producer_query;
 pub mod producers;
 pub mod query;
 pub mod query_v2;
 pub mod recovery;
 pub mod taskdb;
+pub mod trace;
+pub mod watch;
 pub mod wire;
 pub mod witness;
 

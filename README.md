@@ -387,33 +387,71 @@ witness ledger remain authoritative across restart recovery.
 
 ## Durable query projections
 
-Query protocol 2 adds versioned `jobs`, `job`, `log`, and `proof` projections:
+Query protocol 3 exposes the complete durable read-only surface:
 
 ```console
-$ tally query jobs --state running --adapter codex
+$ tally query jobs --state running --adapter codex --limit 100
 $ tally query job <task-or-job-uuid>
-$ tally query log --task <task-uuid> --attempt 2
+$ tally query log --task <task-uuid> --attempt 2 --limit 100
 $ tally query proof --task <task-uuid> --attempt 2
+$ tally query trace --task <task-uuid> --attempt 2 --limit 100
+$ tally query producers --kind calendar
+$ tally query watch
+$ tally query watch --after <change-cursor>
 ```
 
-`jobs` and `log` return a common JSON envelope with `schemaVersion`, `protocolVersion`, `items`,
-`nextCursor`, and snapshot metadata. Protocol 2 establishes this envelope; cursor pagination and
-watching are intentionally deferred, so `nextCursor` is currently `null`. `job` retains every
-observed `(taskUuid, attempt, leaseEpoch)` lane. `proof` embeds the complete verified
-`WitnessRecord`, evidence observations, separate advisory attestation references, verification
-report, and the chain head used for the response. It distinguishes `no-witness-expected-yet` from
+`jobs`, `log`, and `trace` return bounded pages in a common JSON envelope with `schemaVersion`,
+`protocolVersion`, `items`, `nextCursor`, and immutable snapshot metadata. Cursors are opaque and
+bound to the original method and filter set; following `nextCursor` returns each snapshot item
+exactly once even when the collection exceeds the wire-frame cap. `job` retains every observed
+`(taskUuid, attempt, leaseEpoch)` lane. `proof` embeds the complete verified `WitnessRecord`,
+evidence observations, separate advisory attestation references, verification report, and the
+chain head used for the response. It distinguishes `no-witness-expected-yet` from
 `proof-missing`.
+
+Only an adapter that declares a trace stream and framing exposes provider output. The built-in
+Claude Code and Codex adapters declare stdout JSONL; arbitrary shell stdout is not inferred as a
+transcript. Captures are retained by stable job anchor, attempt, and lease epoch, so a resumed
+attempt cannot overwrite its predecessor. Trace records preserve provider order, raw text, parsed
+JSON when valid, exact `rawBase64` bytes for non-UTF-8 input, and an explicit malformed parse
+status; unknown event payloads remain untouched. Generation metadata reports capability,
+completeness, byte count, retained record range, redaction policy, truncation, and an
+unavailability reason. A running local or remote job with no readable capture therefore returns an
+explicit generation state, never a silently empty success. Every record has
+`authority: "advisory-provider-capture"` and can never change admission, evidence, verdict,
+charge, or canonical GPU usage.
+
+`query producers` is an inventory over the effective Nix registry and durable runtime
+observations. It reports unit/timer identity, schedule or cadence, last and next trigger (or an
+explicit reason), enqueue summaries, and last emission/outcome/error. Each producer-admitted row
+stores a generic `origin` with source and exact producer name/kind; GitHub item identity is nested
+under that origin rather than projected as a competing provenance mechanism.
+
+`query watch` tails the private versioned change log and writes one versioned change record per
+line. With no `--after` it starts at the current tail. Reconnecting with the last printed cursor
+returns only later job, lifecycle, trace, proof, pool, and producer changes. Retention is bounded;
+falling behind returns `status: "cursor-expired"`, `earliestAvailableCursor`,
+`resumeAfterCursor`, and an explicit gap termination instead of silently skipping records.
+Query/watch RPC methods accept only their typed read-only parameters and cannot proxy queue or
+lease mutations.
 
 Lifecycle observations are appended to the private, versioned `lifecycle.jsonl` store in the data
 directory before journald is used as a secondary sink. The current retention policy is explicitly
 `unbounded`; responses report `complete`, retained cursor bounds, and any repaired truncation
 boundary. Restarting the daemon therefore does not erase attempt history. Canonical witness facts
 still win for terminal verdicts and canonical usage, while provider-scraped model/session values
-remain marked `advisory-adapter-scrape`. Credential names may be projected; credential values are
-never stored in lifecycle history or query output.
+remain advisory. The protocol uses one authority vocabulary: `durable-admission-fact`,
+`tally-lifecycle-observation`, `canonical-witness-fact`, `advisory-attestation`, and
+`advisory-provider-capture`. Conflicting observations remain visible; they are not rewritten to
+match the winning canonical witness. Credential names may be projected; credential values are
+never stored in lifecycle history, trace metadata, or query output.
 
-Protocol 2 is the compatibility boundary for existing `status`, `render`, `standup`, and `pools`
-JSON. Those views now read the same durable lifecycle source and include schema/protocol metadata.
+Protocol 3 deliberately supersedes protocol 2. The boundary adds cursor pagination, trace,
+producer inventory, watch, nested generic origin, and trace availability; it also renames
+`durable-admission`, `canonical-witness`, and `advisory-adapter-scrape` to the vocabulary above.
+Existing `status`, `render`, `standup`, and `pools` views keep their practical shapes but now carry
+`protocolVersion: 3` and read the same durable sources. Clients that validate protocol versions
+must negotiate or reject version 3 rather than assuming protocol-2 authority strings.
 
 ## Tests and scenarios
 

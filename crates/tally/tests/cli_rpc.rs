@@ -91,11 +91,20 @@ impl RpcHandler for CliHandler {
                     let params = request.params.as_ref().unwrap();
                     assert_eq!(params["liveState"], "running");
                     assert_eq!(params["terminalVerdict"], "pass");
+                    assert_eq!(params["pool"], "slot");
+                    assert_eq!(params["executor"], "worker");
                     assert_eq!(params["adapter"], "codex");
+                    assert_eq!(params["source"], "calendar");
+                    assert_eq!(params["origin"], "nightly");
+                    assert_eq!(params["parent"], "parent-24");
                     assert_eq!(params["session"], "session-24");
+                    assert_eq!(params["since"], "2026-07-24T00:00:00Z");
+                    assert_eq!(params["until"], "2026-07-25T00:00:00Z");
+                    assert_eq!(params["limit"], 17);
+                    assert_eq!(params["cursor"], "page-v1:jobs");
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
-                        "protocolVersion": 2,
+                        "protocolVersion": 3,
                         "items": [],
                         "nextCursor": null,
                         "snapshot": {}
@@ -106,16 +115,21 @@ impl RpcHandler for CliHandler {
                         request.params.as_ref().unwrap()["id"],
                         "00000000-0000-4000-8000-000000000024"
                     );
-                    Ok(serde_json::json!({"schemaVersion": 1, "protocolVersion": 2}))
+                    Ok(serde_json::json!({"schemaVersion": 1, "protocolVersion": 3}))
                 }
                 "query.log" => {
                     let params = request.params.as_ref().unwrap();
                     assert_eq!(params["attempt"], 2);
+                    assert_eq!(params["session"], "session-24");
                     assert_eq!(params["event"], "evidence_pass");
                     assert_eq!(params["source"], "manual");
+                    assert_eq!(params["since"], "2026-07-24T00:00:00Z");
+                    assert_eq!(params["until"], "2026-07-25T00:00:00Z");
+                    assert_eq!(params["limit"], 23);
+                    assert_eq!(params["cursor"], "page-v1:log");
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
-                        "protocolVersion": 2,
+                        "protocolVersion": 3,
                         "items": [],
                         "nextCursor": null,
                         "snapshot": {}
@@ -127,8 +141,55 @@ impl RpcHandler for CliHandler {
                     assert_eq!(params["attempt"], 2);
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
-                        "protocolVersion": 2,
+                        "protocolVersion": 3,
                         "status": "verified"
+                    }))
+                }
+                "query.trace" => {
+                    let params = request.params.as_ref().unwrap();
+                    assert_eq!(params["task"], "00000000-0000-4000-8000-000000000024");
+                    assert_eq!(params["attempt"], 2);
+                    assert_eq!(params["limit"], 29);
+                    assert_eq!(params["cursor"], "page-v1:trace");
+                    Ok(serde_json::json!({
+                        "schemaVersion": 1,
+                        "protocolVersion": 3,
+                        "items": [],
+                        "nextCursor": null,
+                        "snapshot": {},
+                        "generations": []
+                    }))
+                }
+                "query.producers" => {
+                    let params = request.params.as_ref().unwrap();
+                    assert_eq!(params["name"], "nightly");
+                    assert_eq!(params["kind"], "calendar");
+                    Ok(serde_json::json!({
+                        "schemaVersion": 1,
+                        "protocolVersion": 3,
+                        "items": [],
+                        "nextCursor": null,
+                        "snapshot": {}
+                    }))
+                }
+                "query.watch" => {
+                    let params = request.params.as_ref().unwrap();
+                    assert_eq!(params["after"], "change:00000000000000000024");
+                    assert_eq!(params["limit"], 100);
+                    Ok(serde_json::json!({
+                        "schemaVersion": 1,
+                        "protocolVersion": 3,
+                        "status": "ok",
+                        "items": [{
+                            "schemaVersion": 1,
+                            "protocolVersion": 3,
+                            "sequence": 25,
+                            "cursor": "change:00000000000000000025",
+                            "observedAt": "2026-07-24T00:00:00Z",
+                            "kind": "job",
+                            "payload": {}
+                        }],
+                        "nextCursor": "change:00000000000000000025"
                     }))
                 }
                 method => Err(WireError::invalid(format!("unexpected method {method}"))),
@@ -300,7 +361,7 @@ async fn internal_exit_recorder_is_silent_and_fail_closed() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn query_v2_cli_forwards_jobs_job_log_and_proof_without_text_parsing() {
+async fn query_v3_cli_forwards_all_durable_observability_commands() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("tally.sock");
     let listener = UnixListener::bind(&socket).unwrap();
@@ -308,7 +369,7 @@ async fn query_v2_cli_forwards_jobs_job_log_and_proof_without_text_parsing() {
     local
         .run_until(async {
             let server = tokio::task::spawn_local(async move {
-                for _ in 0..4 {
+                for _ in 0..7 {
                     let (stream, _) = listener.accept().await.unwrap();
                     serve_connection(stream, &CliHandler).await.unwrap();
                 }
@@ -324,10 +385,28 @@ async fn query_v2_cli_forwards_jobs_job_log_and_proof_without_text_parsing() {
                         "running",
                         "--verdict",
                         "pass",
+                        "--pool",
+                        "slot",
+                        "--executor",
+                        "worker",
                         "--adapter",
                         "codex",
+                        "--source",
+                        "calendar",
+                        "--origin",
+                        "nightly",
+                        "--parent",
+                        "parent-24",
                         "--session",
                         "session-24",
+                        "--since",
+                        "2026-07-24T00:00:00Z",
+                        "--until",
+                        "2026-07-25T00:00:00Z",
+                        "--limit",
+                        "17",
+                        "--cursor",
+                        "page-v1:jobs",
                     ],
                 )
                 .await,
@@ -341,10 +420,20 @@ async fn query_v2_cli_forwards_jobs_job_log_and_proof_without_text_parsing() {
                         task,
                         "--attempt",
                         "2",
+                        "--session",
+                        "session-24",
                         "--event",
                         "evidence_pass",
                         "--source",
                         "manual",
+                        "--since",
+                        "2026-07-24T00:00:00Z",
+                        "--until",
+                        "2026-07-25T00:00:00Z",
+                        "--limit",
+                        "23",
+                        "--cursor",
+                        "page-v1:log",
                     ],
                 )
                 .await,
@@ -353,10 +442,49 @@ async fn query_v2_cli_forwards_jobs_job_log_and_proof_without_text_parsing() {
                     &["query", "proof", "--task", task, "--attempt", "2"],
                 )
                 .await,
+                run_tally(
+                    &socket,
+                    &[
+                        "query",
+                        "trace",
+                        "--task",
+                        task,
+                        "--attempt",
+                        "2",
+                        "--limit",
+                        "29",
+                        "--cursor",
+                        "page-v1:trace",
+                    ],
+                )
+                .await,
+                run_tally(
+                    &socket,
+                    &[
+                        "query",
+                        "producers",
+                        "--name",
+                        "nightly",
+                        "--kind",
+                        "calendar",
+                    ],
+                )
+                .await,
+                run_tally(
+                    &socket,
+                    &[
+                        "query",
+                        "watch",
+                        "--after",
+                        "change:00000000000000000024",
+                        "--once",
+                    ],
+                )
+                .await,
             ] {
                 assert!(output.status.success(), "{:?}", output);
                 let value: Value = serde_json::from_slice(&output.stdout).unwrap();
-                assert_eq!(value["protocolVersion"], 2);
+                assert_eq!(value["protocolVersion"], 3);
             }
             server.await.unwrap();
         })
@@ -389,7 +517,7 @@ async fn witness_verify_json_is_complete_and_red_exits_nonzero() {
     assert!(valid.status.success());
     let valid_json: Value = serde_json::from_slice(&valid.stdout).unwrap();
     assert_eq!(valid_json["schemaVersion"], 1);
-    assert_eq!(valid_json["protocolVersion"], 2);
+    assert_eq!(valid_json["protocolVersion"], 3);
     assert_eq!(valid_json["ok"], true);
     assert_eq!(valid_json["chains"]["verdict"]["report"]["records"], 4);
     assert_eq!(valid_json["chains"]["verdict"]["chainHead"]["seq"], 4);

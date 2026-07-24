@@ -383,7 +383,7 @@ mod tests {
     }
 
     #[test]
-    fn more_than_4096_events_survive_reopen_without_truncation() {
+    fn acceptance_24_2_more_than_4096_events_survive_reopen_without_truncation() {
         let temp = tempfile::tempdir().unwrap();
         {
             let mut store = LifecycleStore::open(temp.path()).unwrap();

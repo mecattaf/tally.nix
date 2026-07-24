@@ -15,7 +15,8 @@ use tally_core::executor::{
     persist_exit_record_from_env, serve_remote_executor_stdio, ExecutionPaths, UnitLimits,
 };
 use tally_core::producers::{
-    GhCliAcknowledgementSink, GhCliIntake, GhObservation, ProducerEngine, ProducerObservation,
+    record_producer_runtime, GhCliAcknowledgementSink, GhCliIntake, GhObservation, ProducerEngine,
+    ProducerObservation,
 };
 use tally_core::recovery::RecoveryPolicy;
 use tally_core::taskdb::{EnqueueSource, RelatedTrigger, WorkspaceMetadata};
@@ -458,6 +459,8 @@ enum QueryCommand {
         #[arg(long)]
         source: Option<String>,
         #[arg(long)]
+        origin: Option<String>,
+        #[arg(long)]
         parent: Option<String>,
         #[arg(long)]
         session: Option<String>,
@@ -465,6 +468,10 @@ enum QueryCommand {
         since: Option<String>,
         #[arg(long)]
         until: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        cursor: Option<String>,
     },
     Job {
         id: String,
@@ -488,12 +495,38 @@ enum QueryCommand {
         since: Option<String>,
         #[arg(long)]
         until: Option<String>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        cursor: Option<String>,
     },
     Proof {
         #[arg(long)]
         task: String,
         #[arg(long)]
         attempt: Option<u32>,
+    },
+    Trace {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        attempt: Option<u32>,
+        #[arg(long)]
+        limit: Option<usize>,
+        #[arg(long)]
+        cursor: Option<String>,
+    },
+    Producers {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+    },
+    Watch {
+        #[arg(long)]
+        after: Option<String>,
+        #[arg(long, hide = true)]
+        once: bool,
     },
     Render {
         #[arg(long, default_value = "text")]
@@ -823,13 +856,20 @@ async fn run_producer_dispatch(
         );
     }
     let now = Utc::now();
-    let result = match event {
+    let producer_name = args.producer.clone();
+    let dispatched: Result<Value> = async {
+        let result = match event {
         ProducerObservation::Calendar => {
             serde_json::to_value(engine.emit_calendar(&args.producer, now)?)?
         }
         ProducerObservation::EventsDir => {
             let mut client = RpcClient::connect(socket).await?;
-            client.call("queue.drain", Some(json!({}))).await?
+            client
+                .call(
+                    "queue.drain",
+                    Some(json!({"producer": args.producer.clone()})),
+                )
+                .await?
         }
         ProducerObservation::Gh(observation) => {
             let tally_core::producers::GhObservationInput {
@@ -956,7 +996,7 @@ async fn run_producer_dispatch(
                         .call(
                             "__producer.pool-transition",
                             Some(json!({
-                                "producer": args.producer,
+                                "producer": args.producer.clone(),
                                 "transition": transition,
                                 "generation": outcome.generation,
                             })),
@@ -968,7 +1008,51 @@ async fn run_producer_dispatch(
             }
             serde_json::to_value(outcome)?
         }
+        };
+        Ok(result)
+    }
+    .await;
+    let runtime = match &dispatched {
+        Ok(result) => {
+            record_producer_runtime(&state_dir, &producer_name, now, Some(result.clone()), None)
+        }
+        Err(error) => record_producer_runtime(
+            &state_dir,
+            &producer_name,
+            now,
+            None,
+            Some(format!("{error:#}")),
+        ),
     };
+    let runtime_recorded = runtime.is_ok();
+    if let Err(error) = runtime {
+        eprintln!(
+            "tally: producer runtime state for {producer_name:?} could not be recorded: {error}"
+        );
+    }
+    if runtime_recorded && !args.engine_only {
+        match RpcClient::connect(socket).await {
+            Ok(mut client) => {
+                if let Err(error) = client
+                    .call(
+                        "__producer.runtime-observed",
+                        Some(json!({"producer": producer_name.clone()})),
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "tally: producer runtime update for {producer_name:?} could not notify the daemon: {error}"
+                    );
+                }
+            }
+            Err(error) => {
+                eprintln!(
+                    "tally: producer runtime update for {producer_name:?} could not reach the daemon: {error}"
+                );
+            }
+        }
+    }
+    let result = dispatched?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
@@ -1138,6 +1222,7 @@ async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
         runtime_max_sec: args.runtime_max_sec,
         no_enqueue: args.no_enqueue,
         credentials: Default::default(),
+        origin: None,
         caller_job_id: std::env::var("TALLY_JOB_ID").ok(),
         gh_trigger_actor: None,
         gh_self_actor: None,
@@ -1256,6 +1341,7 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
                 runtime_max_sec: None,
                 no_enqueue: false,
                 credentials: BTreeMap::new(),
+                origin: None,
                 caller_job_id: None,
                 gh_trigger_actor: None,
                 gh_self_actor: None,
@@ -1318,10 +1404,13 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
             executor,
             adapter,
             source,
+            origin,
             parent,
             session,
             since,
             until,
+            limit,
+            cursor,
         } => {
             print_rpc(
                 socket,
@@ -1333,10 +1422,13 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
                     "executor": executor,
                     "adapter": adapter,
                     "source": source,
+                    "origin": origin,
                     "parent": parent,
                     "session": session,
                     "since": since,
                     "until": until,
+                    "limit": limit,
+                    "cursor": cursor,
                 })),
             )
             .await
@@ -1353,6 +1445,8 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
             source,
             since,
             until,
+            limit,
+            cursor,
         } => {
             print_rpc(
                 socket,
@@ -1365,6 +1459,8 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
                     "source": source,
                     "since": since,
                     "until": until,
+                    "limit": limit,
+                    "cursor": cursor,
                 })),
             )
             .await
@@ -1377,6 +1473,33 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
             )
             .await
         }
+        QueryCommand::Trace {
+            task,
+            attempt,
+            limit,
+            cursor,
+        } => {
+            print_rpc(
+                socket,
+                "query.trace",
+                Some(json!({
+                    "task": task,
+                    "attempt": attempt,
+                    "limit": limit,
+                    "cursor": cursor,
+                })),
+            )
+            .await
+        }
+        QueryCommand::Producers { name, kind } => {
+            print_rpc(
+                socket,
+                "query.producers",
+                Some(json!({"name": name, "kind": kind})),
+            )
+            .await
+        }
+        QueryCommand::Watch { after, once } => run_query_watch(socket, after, once).await,
         QueryCommand::Render { format } => {
             let mut client = RpcClient::connect(socket).await?;
             let result = client
@@ -1406,6 +1529,36 @@ async fn print_rpc(socket: &Path, method: &str, params: Option<Value>) -> Result
     let result = client.call(method, params).await?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
+}
+
+async fn run_query_watch(socket: &Path, mut after: Option<String>, once: bool) -> Result<()> {
+    let mut client = RpcClient::connect(socket).await?;
+    loop {
+        let result = client
+            .call(
+                "query.watch",
+                Some(json!({"after": after.clone(), "limit": 100})),
+            )
+            .await?;
+        if result["status"] == "cursor-expired" {
+            println!("{}", serde_json::to_string(&result)?);
+            return Err(invalid(format!(
+                "query watch cursor expired; earliest available is {}",
+                result["earliestAvailableCursor"]
+            )));
+        }
+        let items = result["items"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid watch response"))?;
+        for item in items {
+            println!("{}", serde_json::to_string(item)?);
+        }
+        after = result["nextCursor"].as_str().map(ToOwned::to_owned);
+        if once {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
 }
 
 fn run_witness(command: WitnessCommand) -> Result<()> {

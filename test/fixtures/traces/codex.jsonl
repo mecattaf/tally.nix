@@ -1,0 +1,7 @@
+{"type":"thread.started","thread_id":"codex-thread-1"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"Inspecting the workspace."}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/true","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"turn.completed","usage":{"input_tokens":42,"cached_input_tokens":7,"output_tokens":17}}
+{"type":"future.codex.event","extension":{"preserve":"verbatim"}}
+{malformed-codex

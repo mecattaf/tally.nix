@@ -12,7 +12,7 @@ use crate::taskdb::{GhOrigin, RelatedTrigger, TaskRow, WorkspaceMetadata};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
 pub const QUERY_SCHEMA_VERSION: u32 = 1;
-pub const QUERY_PROTOCOL_VERSION: u32 = 2;
+pub const QUERY_PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

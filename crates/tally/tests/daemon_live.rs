@@ -195,7 +195,7 @@ async fn real_type_notify_daemon_survives_watchdog_periods() {
         .call("query.status", Some(serde_json::json!({})))
         .await
         .unwrap();
-    assert_eq!(query["protocolVersion"], 2);
+    assert_eq!(query["protocolVersion"], 3);
     drop(client);
     assert!(systemctl(&[
         OsStr::new("--user"),
@@ -397,6 +397,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                             },
                         ),
                     ]),
+                    trace: None,
                     yield_hook: Some(vec![
                         env!("CARGO_BIN_EXE_tally").to_owned(),
                         "lease".to_owned(),

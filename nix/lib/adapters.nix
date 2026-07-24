@@ -28,6 +28,7 @@ let
       argv ? [ ],
       resume ? null,
       scrape ? { },
+      trace ? null,
       yieldHook ? null,
       env ? { },
       launch ? { },
@@ -42,6 +43,17 @@ let
     ) "tally adapter yieldHook must be null or a list of strings";
     assert lib.assertMsg (builtins.isAttrs scrape) "tally adapter scrape must be an attrset";
     assert lib.assertMsg (
+      trace == null
+      || (
+        builtins.isAttrs trace
+        && builtins.elem (trace.stream or "stdout") [
+          "stdout"
+          "stderr"
+        ]
+        && (trace.framing or "json-lines") == "json-lines"
+      )
+    ) "tally adapter trace must declare stdout/stderr with json-lines framing";
+    assert lib.assertMsg (
       builtins.isAttrs env && builtins.all builtins.isString (builtins.attrValues env)
     ) "tally adapter env must be an attrset of strings";
     assert lib.assertMsg (builtins.isAttrs launch) "tally adapter launch must be an attrset";
@@ -51,6 +63,7 @@ let
         argv
         resume
         scrape
+        trace
         yieldHook
         env
         launch
@@ -101,6 +114,10 @@ let
     };
 
     claude-code = mkAdapter {
+      trace = {
+        stream = "stdout";
+        framing = "json-lines";
+      };
       argv = [
         "claude"
         "--print"
@@ -142,6 +159,10 @@ let
     shell = mkAdapter { };
 
     codex = mkAdapter {
+      trace = {
+        stream = "stdout";
+        framing = "json-lines";
+      };
       argv = [
         "codex"
         "exec"

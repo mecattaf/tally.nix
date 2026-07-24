@@ -10,7 +10,7 @@ use crate::journal::TallyEvent;
 use crate::query::{
     GhOriginProjection, HeadroomSignal, RowStatus, QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
 };
-use crate::taskdb::RowSeed;
+use crate::taskdb::{AdmissionOrigin, ProducerOrigin, RowSeed};
 use crate::witness::{
     counts_toward_canonical_gpu_seconds, AttestationRecord, Charge, LaborClass, Verdict,
     VerifyReport, WitnessRecord,
@@ -19,11 +19,11 @@ use crate::witness::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum FactAuthority {
-    DurableAdmission,
+    DurableAdmissionFact,
     TallyLifecycleObservation,
-    CanonicalWitness,
+    CanonicalWitnessFact,
     AdvisoryAttestation,
-    AdvisoryAdapterScrape,
+    AdvisoryProviderCapture,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,11 +68,21 @@ pub struct RowDetailFact {
     pub credential_names: Vec<String>,
     pub evidence_class: Option<Value>,
     pub manifest_hash: Option<Value>,
-    pub gh_origin: Option<GhOriginProjection>,
+    pub origin: OriginProjection,
 }
 
 impl RowDetailFact {
     pub fn from_seed(row: &RowSeed, row_status: RowStatus, labor_class: LaborClass) -> Self {
+        let fallback_origin;
+        let origin = if let Some(origin) = row.origin.as_ref() {
+            origin
+        } else {
+            fallback_origin = row.gh_origin.as_ref().map_or_else(
+                || AdmissionOrigin::direct(row.source),
+                |github| AdmissionOrigin::github(&github.producer, github.clone()),
+            );
+            &fallback_origin
+        };
         Self {
             task_uuid: row.uuid.to_string(),
             description: row.description.clone(),
@@ -96,8 +106,26 @@ impl RowDetailFact {
             credential_names: row.credentials.keys().cloned().collect(),
             evidence_class: row.evidence_class.clone(),
             manifest_hash: row.manifest_hash.clone(),
-            gh_origin: row
-                .gh_origin
+            origin: OriginProjection::from_admission(origin),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct OriginProjection {
+    pub source: String,
+    pub producer: Option<ProducerOrigin>,
+    pub github: Option<GhOriginProjection>,
+}
+
+impl OriginProjection {
+    fn from_admission(origin: &AdmissionOrigin) -> Self {
+        Self {
+            source: origin.source.as_str().to_owned(),
+            producer: origin.producer.clone(),
+            github: origin
+                .github
                 .as_ref()
                 .and_then(GhOriginProjection::from_origin),
         }
@@ -158,7 +186,7 @@ impl Default for TraceAvailability {
             byte_count: None,
             retained_range: None,
             truncation: None,
-            reason: "provider-trace-query-is-not-part-of-protocol-v2".to_owned(),
+            reason: "trace-capability-not-evaluated".to_owned(),
         }
     }
 }
@@ -196,6 +224,7 @@ pub struct JobSummary {
     pub executor: Option<String>,
     pub adapter: Option<String>,
     pub source: Option<String>,
+    pub origin: Option<SourcedValue<OriginProjection>>,
     pub model: Vec<SourcedValue<String>>,
     pub session_ref: Option<SourcedValue<String>>,
     pub current_attempt: Option<u32>,
@@ -220,7 +249,6 @@ pub struct JobSummary {
     pub canonical_gpu_seconds: Option<f64>,
     pub credential_names: Vec<String>,
     pub trace: TraceAvailability,
-    pub gh_origin: Option<GhOriginProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -257,6 +285,7 @@ pub struct JobsFilter {
     pub executor: Option<String>,
     pub adapter: Option<String>,
     pub source: Option<String>,
+    pub origin: Option<String>,
     pub parent: Option<String>,
     pub session: Option<String>,
     pub since: Option<String>,
@@ -815,21 +844,21 @@ fn build_summary(
     if let Some(value) = detail.and_then(|detail| detail.requested_model.clone()) {
         model.push(SourcedValue::new(
             value,
-            FactAuthority::DurableAdmission,
+            FactAuthority::DurableAdmissionFact,
             "adapter-options",
         ));
     }
     if let Some(value) = latest_witness.and_then(|record| record.model.clone()) {
         model.push(SourcedValue::new(
             value,
-            FactAuthority::CanonicalWitness,
+            FactAuthority::CanonicalWitnessFact,
             "witness-ledger",
         ));
     }
     if let Some(value) = detail.and_then(|detail| detail.observed_model.clone()) {
         model.push(SourcedValue::new(
             value,
-            FactAuthority::AdvisoryAdapterScrape,
+            FactAuthority::AdvisoryProviderCapture,
             "adapter-scrape",
         ));
     }
@@ -866,12 +895,19 @@ fn build_summary(
         source: detail
             .map(|detail| detail.source.clone())
             .or_else(|| current_event.map(|event| source_name(event.fields.source).to_owned())),
+        origin: detail.map(|detail| {
+            SourcedValue::new(
+                detail.origin.clone(),
+                FactAuthority::DurableAdmissionFact,
+                "durable-task-admission",
+            )
+        }),
         model,
         session_ref: detail.and_then(|detail| {
             detail.session_ref.clone().map(|value| {
                 SourcedValue::new(
                     value,
-                    FactAuthority::AdvisoryAdapterScrape,
+                    FactAuthority::AdvisoryProviderCapture,
                     "adapter-scrape",
                 )
             })
@@ -917,7 +953,7 @@ fn build_summary(
         termination: latest_witness.map(|record| TerminationProjection {
             verdict: record.verdict,
             exit_code: record.exit_code,
-            authority: FactAuthority::CanonicalWitness,
+            authority: FactAuthority::CanonicalWitnessFact,
             provenance: "witness-ledger".to_owned(),
         }),
         gpu_seconds: latest_witness.and_then(|record| record.gpu_seconds),
@@ -929,7 +965,6 @@ fn build_summary(
         }),
         credential_names: detail.map_or_else(Vec::new, |detail| detail.credential_names.clone()),
         trace: TraceAvailability::default(),
-        gh_origin: detail.and_then(|detail| detail.gh_origin.clone()),
     }
 }
 
@@ -980,6 +1015,16 @@ fn matches_jobs_filter(
             .source
             .as_deref()
             .is_some_and(|value| job.source.as_deref() != Some(value))
+        || filter.origin.as_deref().is_some_and(|value| {
+            job.origin.as_ref().is_none_or(|origin| {
+                origin.value.source != value
+                    && origin
+                        .value
+                        .producer
+                        .as_ref()
+                        .is_none_or(|producer| producer.name != value)
+            })
+        })
         || filter
             .parent
             .as_deref()
@@ -1129,7 +1174,7 @@ fn witness_lifecycle_projection(record: &WitnessRecord) -> LifecycleEventProject
         evidence_class: record.evidence_class.clone(),
         manifest_hash: record.manifest_hash.clone(),
         message: format!("canonical witness {}", record.seq),
-        authority: FactAuthority::CanonicalWitness,
+        authority: FactAuthority::CanonicalWitnessFact,
         provenance: "witness-ledger".to_owned(),
         witness_seq: Some(record.seq),
         terminal_verdict: Some(record.verdict),
@@ -1255,7 +1300,7 @@ fn terminal_event(event: TallyEvent) -> bool {
     )
 }
 
-fn snapshot_metadata(
+pub fn snapshot_metadata(
     history: &LifecycleSnapshot,
     witness: &[WitnessRecord],
 ) -> QuerySnapshotMetadata {
@@ -1424,7 +1469,11 @@ mod tests {
             credential_names: vec!["token".to_owned()],
             evidence_class: None,
             manifest_hash: None,
-            gh_origin: None,
+            origin: OriginProjection {
+                source: "manual".to_owned(),
+                producer: None,
+                github: None,
+            },
         }
     }
 
@@ -1436,6 +1485,28 @@ mod tests {
             last_seq: None,
             problems: Vec::new(),
         }
+    }
+
+    #[test]
+    fn acceptance_24_10_protocol_3_authority_vocabulary_is_byte_stable() {
+        assert_eq!(QUERY_PROTOCOL_VERSION, 3);
+        assert_eq!(
+            [
+                FactAuthority::DurableAdmissionFact,
+                FactAuthority::TallyLifecycleObservation,
+                FactAuthority::CanonicalWitnessFact,
+                FactAuthority::AdvisoryAttestation,
+                FactAuthority::AdvisoryProviderCapture,
+            ]
+            .map(|authority| serde_json::to_string(&authority).unwrap()),
+            [
+                "\"durable-admission-fact\"",
+                "\"tally-lifecycle-observation\"",
+                "\"canonical-witness-fact\"",
+                "\"advisory-attestation\"",
+                "\"advisory-provider-capture\"",
+            ]
+        );
     }
 
     #[test]
@@ -1486,11 +1557,14 @@ mod tests {
         let job = &jobs.items[0];
         assert_eq!(job.credential_names, ["token"]);
         assert_eq!(job.model.len(), 2);
-        assert_eq!(job.model[0].authority, FactAuthority::DurableAdmission);
-        assert_eq!(job.model[1].authority, FactAuthority::AdvisoryAdapterScrape);
+        assert_eq!(job.model[0].authority, FactAuthority::DurableAdmissionFact);
+        assert_eq!(
+            job.model[1].authority,
+            FactAuthority::AdvisoryProviderCapture
+        );
         assert_eq!(
             job.session_ref.as_ref().unwrap().authority,
-            FactAuthority::AdvisoryAdapterScrape
+            FactAuthority::AdvisoryProviderCapture
         );
         let encoded = serde_json::to_string(job).unwrap();
         assert!(!encoded.contains("/run/credentials"));

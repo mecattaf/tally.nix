@@ -3,7 +3,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
@@ -25,6 +25,7 @@ use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOu
 use crate::taskdb::{GhOrigin, WorkspaceMetadata};
 
 pub const CAPTURE_DIRECTORY: &str = "capture";
+pub const CAPTURE_ARCHIVE_DIRECTORY: &str = "capture/archive";
 pub const UNIT_EXIT_DIRECTORY: &str = "unit-exit";
 pub const UNIT_EXIT_SCHEMA_VERSION: u32 = 2;
 const OPTIONAL_TALLY_ENVIRONMENT: [&str; 10] = [
@@ -113,6 +114,13 @@ pub struct ExecutionPaths {
     pub stderr: PathBuf,
     pub exit_record: PathBuf,
     pub capture_generation: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedCapturePaths {
+    pub stdout: PathBuf,
+    pub stderr: PathBuf,
+    pub current: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1313,6 +1321,121 @@ impl Executor {
         Ok(generation.attempt == attempt && generation.lease_epoch == lease_epoch)
     }
 
+    pub fn retained_capture_paths(
+        &self,
+        identity: &ExecutionIdentity,
+        attempt: u32,
+        lease_epoch: u64,
+    ) -> Result<Option<RetainedCapturePaths>, ExecutorError> {
+        if self.capture_generation_matches(identity, attempt, lease_epoch)? {
+            let paths = self.paths(identity);
+            return Ok(Some(RetainedCapturePaths {
+                stdout: paths.stdout,
+                stderr: paths.stderr,
+                current: true,
+            }));
+        }
+        let paths = self.archived_capture_paths(identity, attempt, lease_epoch);
+        if paths.stdout.exists() || paths.stderr.exists() {
+            Ok(Some(paths))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn archived_capture_paths(
+        &self,
+        identity: &ExecutionIdentity,
+        attempt: u32,
+        lease_epoch: u64,
+    ) -> RetainedCapturePaths {
+        let directory = self
+            .state_dir
+            .join(CAPTURE_ARCHIVE_DIRECTORY)
+            .join(identity.unit_uuid().to_string());
+        let stem = format!("attempt-{attempt:010}-epoch-{lease_epoch:020}");
+        RetainedCapturePaths {
+            stdout: directory.join(format!("{stem}.out")),
+            stderr: directory.join(format!("{stem}.err")),
+            current: false,
+        }
+    }
+
+    fn archive_current_capture(&self, identity: &ExecutionIdentity) -> Result<(), ExecutorError> {
+        let current = self.paths(identity);
+        for path in [
+            &current.stdout,
+            &current.stderr,
+            &current.capture_generation,
+        ] {
+            let metadata = match std::fs::symlink_metadata(path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(source) => return Err(io_error(path, source)),
+            };
+            if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+                // A partial or replaced capture set has no trustworthy generation.
+                // prepare_paths will atomically replace it without following links.
+                return Ok(());
+            }
+        }
+        let Some(generation) = read_capture_generation(&current.capture_generation)? else {
+            return Ok(());
+        };
+        let archived =
+            self.archived_capture_paths(identity, generation.attempt, generation.lease_epoch);
+        let archive_directory = archived
+            .stdout
+            .parent()
+            .expect("archive capture paths always have a parent");
+        create_private_directory(archive_directory)?;
+        for (source, destination) in [
+            (&current.stdout, &archived.stdout),
+            (&current.stderr, &archived.stderr),
+        ] {
+            match std::fs::symlink_metadata(destination) {
+                Ok(metadata) => {
+                    if !metadata.file_type().is_file()
+                        || metadata.nlink() != 1
+                        || metadata.permissions().mode() & 0o077 != 0
+                    {
+                        return Err(ExecutorError::InvalidRequest(format!(
+                            "attempt capture archive {} is not a private regular file",
+                            destination.display()
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    copy_private_file_exclusive(source, destination)?;
+                }
+                Err(source_error) => return Err(io_error(destination, source_error)),
+            }
+        }
+        sync_directory(archive_directory)?;
+        std::fs::remove_file(&current.capture_generation)
+            .map_err(|source| io_error(&current.capture_generation, source))?;
+        sync_directory(
+            current
+                .capture_generation
+                .parent()
+                .expect("capture generation always has a parent"),
+        )?;
+        for source in [&current.stdout, &current.stderr] {
+            match std::fs::remove_file(source) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source_error) => return Err(io_error(source, source_error)),
+            }
+        }
+        sync_directory(
+            current
+                .stdout
+                .parent()
+                .expect("capture stream always has a parent"),
+        )?;
+        Ok(())
+    }
+
     pub fn inspect_identity(
         &self,
         identity: &ExecutionIdentity,
@@ -1447,6 +1570,9 @@ impl Executor {
         };
         let stdout = decode_base64(stdout)?;
         let stderr = decode_base64(stderr)?;
+        if !self.capture_generation_matches(identity, expected_attempt, expected_lease_epoch)? {
+            self.archive_current_capture(identity)?;
+        }
         let paths = self.paths(identity);
         replace_private_file(&paths.stdout, &stdout)?;
         replace_private_file(&paths.stderr, &stderr)?;
@@ -2337,6 +2463,7 @@ impl Executor {
     }
 
     fn prepare_paths(&self, identity: &ExecutionIdentity) -> Result<ExecutionPaths, ExecutorError> {
+        self.archive_current_capture(identity)?;
         let paths = self.paths(identity);
         let capture = paths
             .stdout
@@ -2773,6 +2900,26 @@ fn write_capture_generation(
     replace_private_file(path, &serde_json::to_vec(&generation)?)
 }
 
+fn read_capture_generation(path: &Path) -> Result<Option<CaptureGeneration>, ExecutorError> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(io_error(path, source)),
+    };
+    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    if !metadata.file_type().is_file() || metadata.len() > 1024 {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "capture generation {} is not a bounded regular file",
+            path.display()
+        )));
+    }
+    serde_json::from_reader(file).map(Some).map_err(Into::into)
+}
+
 fn replace_private_file(path: &Path, contents: &[u8]) -> Result<(), ExecutorError> {
     let parent = path.parent().ok_or_else(|| {
         ExecutorError::InvalidRequest("private file path has no parent".to_owned())
@@ -2802,6 +2949,58 @@ fn replace_private_file(path: &Path, contents: &[u8]) -> Result<(), ExecutorErro
         file.sync_all()
             .map_err(|source| io_error(&temporary, source))?;
         std::fs::rename(&temporary, path).map_err(|source| io_error(path, source))?;
+        sync_directory(parent)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn copy_private_file_exclusive(source: &Path, destination: &Path) -> Result<(), ExecutorError> {
+    let mut input = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(source)
+        .map_err(|error| io_error(source, error))?;
+    let metadata = input.metadata().map_err(|error| io_error(source, error))?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "capture {} is not a private regular file",
+            source.display()
+        )));
+    }
+    let parent = destination.parent().ok_or_else(|| {
+        ExecutorError::InvalidRequest("capture archive path has no parent".to_owned())
+    })?;
+    create_private_directory(parent)?;
+    let file_name = destination
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            ExecutorError::InvalidRequest("capture archive name is not valid UTF-8".to_owned())
+        })?;
+    let sequence = TEMPORARY_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary = parent.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let result = (|| {
+        let mut output = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)
+            .map_err(|error| io_error(&temporary, error))?;
+        std::io::copy(&mut input, &mut output).map_err(|error| io_error(&temporary, error))?;
+        output
+            .sync_all()
+            .map_err(|error| io_error(&temporary, error))?;
+        std::fs::hard_link(&temporary, destination)
+            .map_err(|error| io_error(destination, error))?;
+        std::fs::remove_file(&temporary).map_err(|error| io_error(&temporary, error))?;
         sync_directory(parent)
     })();
     if result.is_err() {
@@ -3022,7 +3221,7 @@ fn is_not_found(error: &ExecutorError) -> bool {
     )
 }
 
-fn encode_base64(bytes: &[u8]) -> String {
+pub(crate) fn encode_base64(bytes: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
     for chunk in bytes.chunks(3) {
@@ -4313,6 +4512,125 @@ mod tests {
                 attempt: request.attempt,
                 lease_epoch: request.lease_epoch,
             }
+        );
+    }
+
+    #[test]
+    fn wave_5_red_case_two_attempt_provider_captures_are_distinct_and_queryable() {
+        use crate::adapters::{AdapterConfig, AdapterTrace, ScrapeStream, TraceFraming};
+        use crate::history::RetentionMetadata;
+        use crate::query_v2::{QueryChainHead, QuerySnapshotMetadata};
+        use crate::trace::{query_trace, TraceCapability, TraceLane};
+
+        let temp = tempfile::tempdir().unwrap();
+        let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+        let request = request();
+        let paths = executor.prepare_paths(&request.identity).unwrap();
+        std::fs::write(&paths.stdout, b"{\"attempt\":1,\"message\":\"first\"}\n").unwrap();
+        write_capture_generation(
+            &paths.capture_generation,
+            CaptureGeneration {
+                attempt: 1,
+                lease_epoch: 7,
+            },
+        )
+        .unwrap();
+
+        let second = executor.prepare_paths(&request.identity).unwrap();
+        std::fs::write(&second.stdout, b"{\"attempt\":2,\"message\":\"second\"}\n").unwrap();
+        write_capture_generation(
+            &second.capture_generation,
+            CaptureGeneration {
+                attempt: 2,
+                lease_epoch: 8,
+            },
+        )
+        .unwrap();
+
+        let task_uuid = request.identity.task_uuid.unwrap().to_string();
+        let job_id = request.identity.job_id.to_string();
+        let lanes = [
+            TraceLane {
+                task_uuid: task_uuid.clone(),
+                job_id: Some(job_id.clone()),
+                attempt: 1,
+                lease_epoch: 7,
+                adapter: "codex".to_owned(),
+                session_ref: Some("thread-1".to_owned()),
+                running: false,
+                remote: false,
+            },
+            TraceLane {
+                task_uuid: task_uuid.clone(),
+                job_id: Some(job_id),
+                attempt: 2,
+                lease_epoch: 8,
+                adapter: "codex".to_owned(),
+                session_ref: Some("thread-2".to_owned()),
+                running: false,
+                remote: false,
+            },
+        ];
+        let adapters = BTreeMap::from([(
+            "codex".to_owned(),
+            AdapterConfig {
+                trace: Some(AdapterTrace {
+                    stream: ScrapeStream::Stdout,
+                    framing: TraceFraming::JsonLines,
+                }),
+                ..AdapterConfig::default()
+            },
+        )]);
+        let result = query_trace(
+            &task_uuid,
+            None,
+            &lanes,
+            &adapters,
+            &executor,
+            QuerySnapshotMetadata {
+                created_at: chrono::Utc::now().to_rfc3339(),
+                cursor: None,
+                history: RetentionMetadata {
+                    complete: true,
+                    policy: "unbounded".to_owned(),
+                    earliest_cursor: None,
+                    latest_cursor: None,
+                    truncation_boundary: None,
+                    reason: None,
+                },
+                witness_head: QueryChainHead {
+                    seq: 0,
+                    hash: "genesis".to_owned(),
+                },
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            result
+                .generations
+                .iter()
+                .map(|generation| (
+                    generation.attempt,
+                    generation.lease_epoch,
+                    generation.capability
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, 7, TraceCapability::Available),
+                (2, 8, TraceCapability::Available)
+            ]
+        );
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .map(|record| (record.attempt, record.raw.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, "{\"attempt\":1,\"message\":\"first\"}"),
+                (2, "{\"attempt\":2,\"message\":\"second\"}")
+            ]
         );
     }
 

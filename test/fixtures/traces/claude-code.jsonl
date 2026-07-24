@@ -1,0 +1,7 @@
+{"type":"system","subtype":"init","session_id":"claude-session-1"}
+{"type":"assistant","message":{"content":[{"type":"text","text":"Inspecting the workspace."}]}}
+{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-1","name":"Read","input":{"file_path":"README.md"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"fixture result"}]}}
+{"type":"result","subtype":"success","usage":{"input_tokens":42,"output_tokens":17}}
+{"type":"future_claude_event","extension":{"preserve":"verbatim"}}
+{malformed-claude
