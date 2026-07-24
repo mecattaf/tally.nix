@@ -6,6 +6,7 @@ pub mod config;
 pub mod daemon;
 pub mod evidence;
 pub mod executor;
+pub mod history;
 pub mod journal;
 pub mod lease;
 pub mod poolset;
