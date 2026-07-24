@@ -7,7 +7,7 @@ use taskchampion::Status;
 use thiserror::Error;
 
 use crate::journal::{JournalEntry, TallyEvent};
-use crate::taskdb::{GhOrigin, TaskRow};
+use crate::taskdb::{GhOrigin, RelatedTrigger, TaskRow};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
 pub const QUERY_PROTOCOL_VERSION: u32 = 1;
@@ -63,6 +63,8 @@ pub struct RowFact {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gh_origin: Option<GhOriginProjection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_trigger: Option<RelatedTrigger>,
 }
 
 const fn default_query_attempt() -> u32 {
@@ -98,6 +100,9 @@ impl From<&TaskRow> for RowFact {
                 .and_then(|origin| serde_json::from_str::<GhOrigin>(origin).ok())
                 .as_ref()
                 .and_then(GhOriginProjection::from_origin),
+            related_trigger: row
+                .value("related_trigger_json")
+                .and_then(|related| serde_json::from_str(related).ok()),
         }
     }
 }
@@ -1027,6 +1032,7 @@ mod tests {
             attempt: 1,
             model: None,
             gh_origin: None,
+            related_trigger: None,
         }
     }
 

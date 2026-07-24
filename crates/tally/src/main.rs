@@ -12,9 +12,11 @@ use tally_core::evidence::RetryPolicy;
 use tally_core::executor::{
     persist_exit_record_from_env, serve_remote_executor_stdio, ExecutionPaths, UnitLimits,
 };
-use tally_core::producers::{GhCliIntake, GhObservation, ProducerEngine, ProducerObservation};
+use tally_core::producers::{
+    GhCliAcknowledgementSink, GhCliIntake, GhObservation, ProducerEngine, ProducerObservation,
+};
 use tally_core::recovery::RecoveryPolicy;
-use tally_core::taskdb::EnqueueSource;
+use tally_core::taskdb::{EnqueueSource, RelatedTrigger};
 use tally_core::wire::{EnqueuePayload, RpcClient, WireErrorCode, WireIoError};
 use tally_core::witness::{append_attestation, verify_attestations, verify_file};
 use tally_core::{
@@ -59,6 +61,10 @@ enum Command {
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
+    },
+    Producer {
+        #[command(subcommand)]
+        command: ProducerCommand,
     },
     Witness {
         #[command(subcommand)]
@@ -194,6 +200,8 @@ struct EnqueueArgs {
     runtime_max_sec: Option<u64>,
     #[arg(long)]
     no_enqueue: bool,
+    #[arg(long, value_parser = parse_related_trigger, allow_hyphen_values = true)]
+    related_trigger: Option<RelatedTrigger>,
     #[arg(long)]
     wait: bool,
     #[arg(last = true)]
@@ -202,6 +210,15 @@ struct EnqueueArgs {
 
 fn parse_opaque_json(value: &str) -> Result<Value, String> {
     serde_json::from_str(value).map_err(|error| format!("invalid JSON value: {error}"))
+}
+
+fn parse_related_trigger(value: &str) -> Result<RelatedTrigger, String> {
+    let related: RelatedTrigger = serde_json::from_str(value)
+        .map_err(|error| format!("invalid related trigger JSON: {error}"))?;
+    related
+        .validate()
+        .map_err(|error| format!("invalid related trigger: {error}"))?;
+    Ok(related)
 }
 
 #[derive(Debug, Subcommand)]
@@ -228,6 +245,65 @@ enum QueueCommand {
     },
     AwaitBarrier {
         barrier: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum GhDiagnosticEvent {
+    CommandComment,
+    Mention,
+    Assignment,
+    Label,
+}
+
+impl GhDiagnosticEvent {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandComment => "command-comment",
+            Self::Mention => "mention",
+            Self::Assignment => "assignment",
+            Self::Label => "label",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum ProducerCommand {
+    Preview {
+        name: String,
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<PathBuf>,
+    },
+    Poll {
+        name: String,
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        no_enqueue: bool,
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<PathBuf>,
+    },
+    Explain {
+        name: String,
+        #[arg(long)]
+        item: String,
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<PathBuf>,
+    },
+    Test {
+        name: String,
+        #[arg(long)]
+        item: String,
+        #[arg(long, value_enum)]
+        event: GhDiagnosticEvent,
+        #[arg(long)]
+        actor: String,
+        #[arg(long, conflicts_with = "promote")]
+        no_enqueue: bool,
+        #[arg(long)]
+        promote: bool,
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<PathBuf>,
     },
 }
 
@@ -465,6 +541,7 @@ async fn execute(opts: Opts) -> Result<()> {
             command: QueueCommand::Enqueue(args),
         }) => run_enqueue(&socket, *args).await,
         Some(Command::Queue { command }) => run_queue(&socket, command).await,
+        Some(Command::Producer { command }) => run_producer(opts.config, command),
         Some(Command::Witness { command }) => run_witness(command),
         Some(Command::Lease { command }) => run_lease(&socket, command).await,
         Some(Command::Query { command }) => run_query(&socket, command).await,
@@ -474,6 +551,96 @@ async fn execute(opts: Opts) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Result<()> {
+    let config_path = config_path.map_or_else(default_config_path, Ok)?;
+    let config = Config::from_path(&config_path)?;
+    let intake = GhCliIntake::default();
+    let now = Utc::now();
+    let result = match command {
+        ProducerCommand::Preview { name, state_dir } => {
+            let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
+            let engine =
+                ProducerEngine::new(&config.producers, state_dir.join("events"), &state_dir);
+            serde_json::to_value(engine.preview_gh(&name, &intake, now)?)?
+        }
+        ProducerCommand::Poll {
+            name,
+            once,
+            no_enqueue,
+            state_dir,
+        } => {
+            if !once {
+                return Err(invalid("producer poll currently requires --once"));
+            }
+            let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
+            let engine =
+                ProducerEngine::new(&config.producers, state_dir.join("events"), &state_dir);
+            if no_enqueue {
+                serde_json::to_value(engine.preview_gh(&name, &intake, now)?)?
+            } else {
+                let mut acknowledgements = GhCliAcknowledgementSink::default();
+                serde_json::to_value(engine.poll_gh_with_acknowledgements(
+                    &name,
+                    &intake,
+                    now,
+                    &mut acknowledgements,
+                )?)?
+            }
+        }
+        ProducerCommand::Explain {
+            name,
+            item,
+            state_dir,
+        } => {
+            let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
+            let engine =
+                ProducerEngine::new(&config.producers, state_dir.join("events"), &state_dir);
+            serde_json::to_value(engine.explain_gh(&name, &intake, &item, now)?)?
+        }
+        ProducerCommand::Test {
+            name,
+            item,
+            event,
+            actor,
+            no_enqueue,
+            promote,
+            state_dir,
+        } => {
+            let dry_run = no_enqueue || !promote;
+            let state_dir = if promote {
+                state_dir.map_or_else(default_state_dir, Ok)?
+            } else {
+                state_dir.unwrap_or_else(|| {
+                    std::env::temp_dir().join(format!("tally-producer-test-{}", std::process::id()))
+                })
+            };
+            let engine =
+                ProducerEngine::new(&config.producers, state_dir.join("events"), &state_dir);
+            let observation = engine.diagnostic_gh_observation(
+                &name,
+                &intake,
+                &item,
+                event.as_str(),
+                &actor,
+                now,
+            )?;
+            if dry_run {
+                serde_json::to_value(engine.preview_gh_observation(&name, &observation, now)?)?
+            } else {
+                let mut acknowledgements = GhCliAcknowledgementSink::default();
+                serde_json::to_value(engine.admit_gh_observation(
+                    &name,
+                    &observation,
+                    now,
+                    &mut acknowledgements,
+                )?)?
+            }
+        }
+    };
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
 }
 
 async fn run_producer_dispatch(
@@ -529,6 +696,8 @@ async fn run_producer_dispatch(
                 trigger_kind,
                 event_id,
                 comment_id,
+                trigger_timestamp,
+                trigger_value,
                 context,
             } = *observation;
             let is_poll = source.is_none()
@@ -545,12 +714,16 @@ async fn run_producer_dispatch(
                 && trigger_kind.is_none()
                 && event_id.is_none()
                 && comment_id.is_none()
+                && trigger_timestamp.is_none()
+                && trigger_value.is_none()
                 && context.is_none();
             if is_poll {
-                serde_json::to_value(engine.poll_gh(
+                let mut acknowledgements = GhCliAcknowledgementSink::default();
+                serde_json::to_value(engine.poll_gh_with_acknowledgements(
                     &args.producer,
                     &GhCliIntake::default(),
                     now,
+                    &mut acknowledgements,
                 )?)?
             } else if let (
                 Some(source),
@@ -563,6 +736,7 @@ async fn run_producer_dispatch(
                 Some(trigger_actor),
                 Some(self_actor),
                 Some(trigger_kind),
+                Some(trigger_timestamp),
                 Some(context),
             ) = (
                 source,
@@ -575,6 +749,7 @@ async fn run_producer_dispatch(
                 trigger_actor,
                 self_actor,
                 trigger_kind,
+                trigger_timestamp,
                 context,
             ) {
                 serde_json::to_value(engine.emit_gh(
@@ -594,6 +769,8 @@ async fn run_producer_dispatch(
                         trigger_kind,
                         event_id,
                         comment_id,
+                        trigger_timestamp,
+                        trigger_value,
                         context,
                     },
                     now,
@@ -748,6 +925,8 @@ async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
         gh_trigger_actor: None,
         gh_self_actor: None,
         gh_origin: None,
+        task_uuid: None,
+        related_trigger: args.related_trigger,
         wait: args.wait,
     };
     let mut client = RpcClient::connect(socket).await?;
@@ -1038,7 +1217,9 @@ mod tests {
     #[test]
     fn full_top_level_surface_is_visible() {
         let help = Opts::command().render_long_help().to_string();
-        for verb in ["enqueue", "queue", "witness", "lease", "daemon", "query"] {
+        for verb in [
+            "enqueue", "queue", "producer", "witness", "lease", "daemon", "query",
+        ] {
             assert!(help.contains(verb), "missing {verb} from help");
         }
         assert!(!help.contains("__record-unit-exit"));
@@ -1185,5 +1366,56 @@ mod tests {
         };
         assert_eq!(args.evidence_class, Some(Value::from(-1)));
         assert_eq!(args.manifest_hash.as_deref(), Some("-opaque-manifest"));
+    }
+
+    #[test]
+    fn producer_diagnostics_and_related_trigger_fallback_parse_strictly() {
+        let test = Opts::try_parse_from([
+            "tally",
+            "producer",
+            "test",
+            "github",
+            "--item",
+            "https://github.com/acme/widgets/issues/42",
+            "--event",
+            "command-comment",
+            "--actor",
+            "maintainer",
+            "--no-enqueue",
+        ])
+        .unwrap();
+        assert!(matches!(
+            test.command,
+            Some(Command::Producer {
+                command: ProducerCommand::Test {
+                    name,
+                    event: GhDiagnosticEvent::CommandComment,
+                    no_enqueue: true,
+                    promote: false,
+                    ..
+                }
+            }) if name == "github"
+        ));
+
+        let fallback = Opts::try_parse_from([
+            "tally",
+            "enqueue",
+            "--pool",
+            "gpu",
+            "--source",
+            "orchestrator",
+            "--related-trigger",
+            r#"{"producer":"github","eventId":"comment-42","outcome":"filtered","receiptId":"receipt-42"}"#,
+            "--",
+            "true",
+        ])
+        .unwrap();
+        let Some(Command::Enqueue(args)) = fallback.command else {
+            panic!("expected enqueue command");
+        };
+        let related = args.related_trigger.unwrap();
+        assert_eq!(related.producer, "github");
+        assert_eq!(related.event_id, "comment-42");
+        assert_eq!(related.receipt_id.as_deref(), Some("receipt-42"));
     }
 }

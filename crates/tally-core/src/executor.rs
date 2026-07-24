@@ -3368,7 +3368,8 @@ mod tests {
 
     use super::*;
     use crate::taskdb::{
-        GhContextSnapshot, GhItemType, GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
+        GhContextSnapshot, GhItemState, GhItemType, GH_CONTEXT_SCHEMA_VERSION,
+        GH_ORIGIN_SCHEMA_VERSION,
     };
 
     fn uuid(value: &str) -> Uuid {
@@ -3435,13 +3436,16 @@ mod tests {
             trigger_actor: "trusted-maintainer".to_owned(),
             self_actor: "tally-bot".to_owned(),
             notification_reason: Some("mention".to_owned()),
-            trigger_kind: "notification".to_owned(),
+            trigger_kind: "assignment".to_owned(),
             event_id: Some("notification-77".to_owned()),
             comment_id: None,
+            trigger_timestamp: Some("2026-07-20T12:30:00Z".to_owned()),
+            trigger_value: Some("tally-bot".to_owned()),
             context: Some(GhContextSnapshot {
                 schema_version: GH_CONTEXT_SCHEMA_VERSION,
                 title: "Untrusted title".to_owned(),
                 body: "$(touch /tmp/must-not-run); ${SECRET}".to_owned(),
+                state: Some(GhItemState::Open),
                 head_sha: (item_type == GhItemType::PullRequest)
                     .then(|| "7777777777777777777777777777777777777777".to_owned()),
                 labels: vec!["build".to_owned()],
@@ -3967,7 +3971,7 @@ mod tests {
         assert_eq!(github["TALLY_GH_TYPE"], "issue");
         assert_eq!(github["TALLY_GH_HEAD_SHA"], "");
         assert_eq!(github["TALLY_GH_NODE_ID"], "I_kwDO_origin");
-        assert_eq!(github["TALLY_GH_TRIGGER_KIND"], "notification");
+        assert_eq!(github["TALLY_GH_TRIGGER_KIND"], "assignment");
         assert_eq!(github["TALLY_GH_TRIGGER_ACTOR"], "trusted-maintainer");
         assert_eq!(github["TALLY_GH_EVENT_ID"], "notification-77");
         assert_eq!(github["TALLY_GH_COMMENT_ID"], "");

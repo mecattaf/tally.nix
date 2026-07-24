@@ -694,7 +694,8 @@ mod tests {
                     "github": {
                         "kind": "gh",
                         "enable": true,
-                        "sources": ["notifications"],
+                        "sources": [{"notifications": {"repo": "acme/widgets"}}],
+                        "triggers": {"assignments": ["tally-bot"]},
                         "enqueue": {"argv": ["gh-job"], "pool": "slot"}
                     },
                     "effect": {
