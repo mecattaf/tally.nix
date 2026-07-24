@@ -18,12 +18,18 @@ use sha2::{Digest, Sha256};
 use taskchampion::Uuid;
 use thiserror::Error;
 
+use crate::adapters::AdapterJobOptions;
+use crate::completion::{
+    AcceptanceFact, AcceptanceStatus, GateManifestSpec, GateSummary, GateSummaryStatus,
+    SemanticCompletion,
+};
 use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::taskdb::{
     gh_trigger_dedup_key, gh_trigger_receipt_id, gh_trigger_task_uuid, read_acknowledged_events,
     EnqueueSource, GhContextSnapshot, GhItemState, GhItemType, GhOrigin, GhTriggeringComment,
-    GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION, MAX_GH_ORIGIN_FIELD_BYTES,
+    WorkspaceMetadata, GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
+    MAX_GH_ORIGIN_FIELD_BYTES,
 };
 use crate::wire::EnqueuePayload;
 use crate::witness::Verdict;
@@ -65,6 +71,14 @@ fn default_actor_exclude() -> String {
     "self".to_owned()
 }
 
+const fn default_true() -> bool {
+    true
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProducerEnqueue {
@@ -72,6 +86,14 @@ pub struct ProducerEnqueue {
     pub argv: Vec<String>,
     #[serde(default = "default_adapter")]
     pub adapter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMetadata>,
+    #[serde(default, skip_serializing_if = "AdapterJobOptions::is_default")]
+    pub adapter_options: AdapterJobOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_manifest: Option<GateManifestSpec>,
     #[serde(
         rename = "pool",
         serialize_with = "crate::poolset::serialize",
@@ -105,6 +127,7 @@ impl ProducerEnqueue {
         &self,
         source: EnqueueSource,
         now: DateTime<Utc>,
+        origin: Option<&GhOrigin>,
     ) -> Result<EnqueuePayload, ProducerError> {
         let mut pools = self.pools.clone();
         crate::poolset::canonicalize(&mut pools).map_err(|error| {
@@ -115,13 +138,39 @@ impl ProducerEnqueue {
             .as_deref()
             .map(|key| expand_dedup_key(key, now))
             .transpose()?;
+        let argv = self
+            .argv
+            .iter()
+            .map(|argument| render_origin_template(argument, origin))
+            .collect::<Result<Vec<_>, _>>()?;
+        let cwd = self
+            .cwd
+            .as_ref()
+            .map(|path| {
+                let path = path.to_str().ok_or_else(|| {
+                    ProducerError::InvalidObservation(
+                        "producer cwd template must be valid UTF-8".to_owned(),
+                    )
+                })?;
+                let rendered = render_origin_template(path, origin)?;
+                let rendered = PathBuf::from(rendered);
+                validate_resolved_path(&rendered, "producer cwd")?;
+                Ok::<PathBuf, ProducerError>(rendered)
+            })
+            .transpose()?;
         Ok(EnqueuePayload {
             invocation: None,
-            argv: Some(self.argv.clone()),
+            argv: Some(argv),
             pools: Some(pools),
             executor: self.executor.clone(),
             priority: Some(self.priority),
             adapter: Some(self.adapter.clone()),
+            cwd,
+            workspace: self.workspace.clone(),
+            adapter_options: (!self.adapter_options.is_default())
+                .then(|| self.adapter_options.clone()),
+            gate_manifest: self.gate_manifest.clone(),
+            resume_from: None,
             source: Some(source),
             dedup_key,
             parent: None,
@@ -264,8 +313,18 @@ pub struct GhProducer {
     pub allowed_actors: Vec<String>,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_sec: u64,
+    #[serde(default = "default_true")]
+    pub post_receipt: bool,
     #[serde(default)]
     pub post_evidence: bool,
+    #[serde(default)]
+    pub post_gate_summary: bool,
+    #[serde(default)]
+    pub request_review: bool,
+    #[serde(default)]
+    pub close_on_acceptance: bool,
+    #[serde(default)]
+    pub never_mutate: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_on_pass: Option<bool>,
     pub enqueue: ProducerEnqueue,
@@ -369,7 +428,15 @@ pub fn validate_registry(
                         "calendar producer {name:?} requires a non-empty onCalendar"
                     )));
                 }
-                validate_enqueue(name, "enqueue", &config.enqueue, pools, adapters, executors)?;
+                validate_enqueue(
+                    name,
+                    "enqueue",
+                    &config.enqueue,
+                    pools,
+                    adapters,
+                    executors,
+                    false,
+                )?;
             }
             ProducerConfig::EventsDir(config) => {
                 if config.poll_interval_sec == 0 {
@@ -415,7 +482,22 @@ pub fn validate_registry(
                         "gh producer {name:?} closeOnPass=true requires postEvidence=true"
                     )));
                 }
-                validate_enqueue(name, "enqueue", &config.enqueue, pools, adapters, executors)?;
+                if (config.post_gate_summary || config.close_on_acceptance)
+                    && config.enqueue.gate_manifest.is_none()
+                {
+                    return Err(ProducerError::InvalidConfig(format!(
+                        "gh producer {name:?} postGateSummary/closeOnAcceptance requires enqueue.gateManifest"
+                    )));
+                }
+                validate_enqueue(
+                    name,
+                    "enqueue",
+                    &config.enqueue,
+                    pools,
+                    adapters,
+                    executors,
+                    true,
+                )?;
             }
             ProducerConfig::BuildEffect(config) => {
                 if !config.path.is_absolute() {
@@ -427,7 +509,15 @@ pub fn validate_registry(
                     &config.path,
                     &format!("build-effect producer {name:?} path"),
                 )?;
-                validate_enqueue(name, "onKey", &config.on_key, pools, adapters, executors)?;
+                validate_enqueue(
+                    name,
+                    "onKey",
+                    &config.on_key,
+                    pools,
+                    adapters,
+                    executors,
+                    false,
+                )?;
             }
             ProducerConfig::PoolReachability(config) => {
                 if config.interval_sec == 0 || config.hysteresis == 0 {
@@ -455,7 +545,7 @@ pub fn validate_registry(
                     ("onReturnAttest", config.on_return_attest.as_ref()),
                 ] {
                     if let Some(enqueue) = enqueue {
-                        validate_enqueue(name, field, enqueue, pools, adapters, executors)?;
+                        validate_enqueue(name, field, enqueue, pools, adapters, executors, false)?;
                     }
                 }
                 if config
@@ -480,6 +570,7 @@ fn validate_enqueue(
     pools: &BTreeSet<String>,
     adapters: &BTreeSet<String>,
     executors: &BTreeSet<String>,
+    allow_origin_templates: bool,
 ) -> Result<(), ProducerError> {
     if enqueue.argv.is_empty() {
         return Err(ProducerError::InvalidConfig(format!(
@@ -535,6 +626,44 @@ fn validate_enqueue(
             "producer {producer:?} {field} runtimeMaxSec must be positive"
         )));
     }
+    for argument in &enqueue.argv {
+        validate_origin_template(argument, allow_origin_templates).map_err(|detail| {
+            ProducerError::InvalidConfig(format!(
+                "producer {producer:?} {field} argv template is invalid: {detail}"
+            ))
+        })?;
+    }
+    if let Some(cwd) = &enqueue.cwd {
+        let cwd = cwd.to_str().ok_or_else(|| {
+            ProducerError::InvalidConfig(format!(
+                "producer {producer:?} {field} cwd must be valid UTF-8"
+            ))
+        })?;
+        validate_origin_template(cwd, allow_origin_templates).map_err(|detail| {
+            ProducerError::InvalidConfig(format!(
+                "producer {producer:?} {field} cwd template is invalid: {detail}"
+            ))
+        })?;
+        validate_resolved_path_template(cwd).map_err(|detail| {
+            ProducerError::InvalidConfig(format!(
+                "producer {producer:?} {field} cwd is invalid: {detail}"
+            ))
+        })?;
+    }
+    if let Some(workspace) = &enqueue.workspace {
+        workspace.validate().map_err(|error| {
+            ProducerError::InvalidConfig(format!(
+                "producer {producer:?} {field} workspace is invalid: {error}"
+            ))
+        })?;
+    }
+    if let Some(gate_manifest) = &enqueue.gate_manifest {
+        gate_manifest.validate().map_err(|error| {
+            ProducerError::InvalidConfig(format!(
+                "producer {producer:?} {field} gateManifest is invalid: {error}"
+            ))
+        })?;
+    }
     parse_evidence_specs(&enqueue.evidence).map_err(|error| {
         ProducerError::InvalidConfig(format!(
             "producer {producer:?} {field} evidence is invalid: {error}"
@@ -545,6 +674,151 @@ fn validate_enqueue(
         &format!("producer {producer:?} {field}"),
     )?;
     Ok(())
+}
+
+const ORIGIN_TEMPLATE_FIELDS: &[&str] = &[
+    "repoName",
+    "gh.source",
+    "gh.repo",
+    "gh.repoName",
+    "gh.number",
+    "gh.url",
+    "gh.type",
+    "gh.headSha",
+    "gh.nodeId",
+    "gh.itemAuthor",
+    "gh.triggerActor",
+    "gh.selfActor",
+    "gh.notificationReason",
+    "gh.triggerKind",
+    "gh.eventId",
+    "gh.commentId",
+    "gh.triggerTimestamp",
+    "gh.triggerValue",
+];
+
+fn validate_origin_template(template: &str, allowed: bool) -> Result<(), String> {
+    if template.contains('\0') {
+        return Err("template contains a NUL byte".to_owned());
+    }
+    let fields = origin_template_fields(template)?;
+    if !allowed && !fields.is_empty() {
+        return Err(
+            "GitHub origin placeholders are valid only in a gh producer enqueue".to_owned(),
+        );
+    }
+    for field in fields {
+        if !ORIGIN_TEMPLATE_FIELDS.contains(&field) {
+            return Err(format!("unknown placeholder {field:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn origin_template_fields(mut template: &str) -> Result<Vec<&str>, String> {
+    let mut fields = Vec::new();
+    while let Some(start) = template.find("${") {
+        template = &template[start + 2..];
+        let end = template
+            .find('}')
+            .ok_or_else(|| "unclosed '${field}' placeholder".to_owned())?;
+        let field = &template[..end];
+        if field.is_empty()
+            || !field
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_'))
+        {
+            return Err(format!("invalid placeholder name {field:?}"));
+        }
+        fields.push(field);
+        template = &template[end + 1..];
+    }
+    Ok(fields)
+}
+
+fn render_origin_template(
+    template: &str,
+    origin: Option<&GhOrigin>,
+) -> Result<String, ProducerError> {
+    validate_origin_template(template, origin.is_some())
+        .map_err(ProducerError::InvalidObservation)?;
+    let mut rendered = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find("${") {
+        rendered.push_str(&rest[..start]);
+        rest = &rest[start + 2..];
+        let end = rest
+            .find('}')
+            .expect("validated origin templates have closing braces");
+        let field = &rest[..end];
+        let origin = origin.ok_or_else(|| {
+            ProducerError::InvalidObservation(
+                "GitHub origin placeholder has no GitHub observation".to_owned(),
+            )
+        })?;
+        rendered.push_str(origin_template_value(origin, field)?.as_str());
+        rest = &rest[end + 1..];
+    }
+    rendered.push_str(rest);
+    if rendered.len() > 64 * 1024 {
+        return Err(ProducerError::InvalidObservation(
+            "rendered origin template exceeds 65536 bytes".to_owned(),
+        ));
+    }
+    Ok(rendered)
+}
+
+fn origin_template_value(origin: &GhOrigin, field: &str) -> Result<String, ProducerError> {
+    let value = match field {
+        "gh.source" => Some(origin.source.clone()),
+        "gh.repo" => Some(origin.repo.clone()),
+        "repoName" | "gh.repoName" => origin
+            .repo
+            .rsplit_once('/')
+            .map(|(_, name)| name.to_owned()),
+        "gh.number" => Some(origin.number.to_string()),
+        "gh.url" => Some(origin.html_url.clone()),
+        "gh.type" => origin.item_type.map(|kind| kind.as_str().to_owned()),
+        "gh.headSha" => origin.head_sha.clone(),
+        "gh.nodeId" => Some(origin.node_id.clone()),
+        "gh.itemAuthor" => Some(origin.item_author.clone()),
+        "gh.triggerActor" => Some(origin.trigger_actor.clone()),
+        "gh.selfActor" => Some(origin.self_actor.clone()),
+        "gh.notificationReason" => origin.notification_reason.clone(),
+        "gh.triggerKind" => Some(origin.trigger_kind.clone()),
+        "gh.eventId" => origin.event_id.clone(),
+        "gh.commentId" => origin.comment_id.clone(),
+        "gh.triggerTimestamp" => origin.trigger_timestamp.clone(),
+        "gh.triggerValue" => origin.trigger_value.clone(),
+        _ => None,
+    };
+    value.ok_or_else(|| {
+        ProducerError::InvalidObservation(format!(
+            "origin field {field:?} is absent for this GitHub item"
+        ))
+    })
+}
+
+fn validate_resolved_path_template(path: &str) -> Result<(), String> {
+    if !path.starts_with('/')
+        || path.contains('%')
+        || path.contains('\0')
+        || path.chars().any(char::is_control)
+    {
+        return Err(
+            "path must be absolute and contain no control characters or systemd specifiers"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_resolved_path(path: &Path, label: &str) -> Result<(), ProducerError> {
+    let path = path
+        .to_str()
+        .ok_or_else(|| ProducerError::InvalidObservation(format!("{label} must be valid UTF-8")))?;
+    validate_resolved_path_template(path)
+        .map_err(|detail| ProducerError::InvalidObservation(format!("{label}: {detail}")))
 }
 
 fn validate_name(value: &str, label: &str) -> Result<(), ProducerError> {
@@ -887,6 +1161,12 @@ pub struct GhCompletedMutation {
     pub state: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_summary: Option<GateSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<AcceptanceFact>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub request_review: bool,
 }
 
 pub trait GhMutationSink {
@@ -2424,6 +2704,14 @@ pub struct GhEnqueuePreview {
     pub pools: Vec<String>,
     pub adapter: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMetadata>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adapter_options: Option<AdapterJobOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_manifest: Option<GateManifestSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
     pub priority: Priority,
     pub dedup_key: String,
@@ -2583,7 +2871,7 @@ impl<'a> ProducerEngine<'a> {
         let ProducerConfig::Calendar(config) = self.get(producer)? else {
             return Err(self.kind_mismatch(producer, "calendar"));
         };
-        let payload = config.enqueue.payload(EnqueueSource::Calendar, now)?;
+        let payload = config.enqueue.payload(EnqueueSource::Calendar, now, None)?;
         let name = format!("{producer}-calendar-{}{}", Uuid::new_v4(), INGRESS_SUFFIX);
         self.emit_named(&name, &payload)
     }
@@ -2605,7 +2893,9 @@ impl<'a> ProducerEngine<'a> {
             return Ok(EmitOutcome::Filtered { reason });
         }
         let origin = gh_origin(producer, config, observation);
-        let mut payload = config.enqueue.payload(EnqueueSource::Gh, now)?;
+        let mut payload = config
+            .enqueue
+            .payload(EnqueueSource::Gh, now, Some(&origin))?;
         payload.dedup_key = Some(gh_trigger_dedup_key(&origin)?);
         payload.gh_trigger_actor = Some(observation.trigger_actor.clone());
         payload.gh_self_actor = Some(observation.self_actor.clone());
@@ -2915,9 +3205,11 @@ impl<'a> ProducerEngine<'a> {
         };
         write_json_atomic(&receipt_path, &receipt)?;
         if needs_acknowledgement {
-            let acknowledgement = acknowledgement_for_decision(&decision, observation)?;
-            sink.post_acknowledgement(&acknowledgement)
-                .map_err(ProducerError::Acknowledgement)?;
+            if config.post_receipt && !config.never_mutate {
+                let acknowledgement = acknowledgement_for_decision(&decision, observation)?;
+                sink.post_acknowledgement(&acknowledgement)
+                    .map_err(ProducerError::Acknowledgement)?;
+            }
             match decision.decision {
                 GhDecisionStatus::Duplicate => receipt.duplicate_acknowledged = true,
                 GhDecisionStatus::Accepted | GhDecisionStatus::Filtered => {
@@ -3046,7 +3338,18 @@ impl<'a> ProducerEngine<'a> {
         evidence: Option<Value>,
         sink: &mut dyn GhMutationSink,
     ) -> Result<bool, ProducerError> {
-        self.complete_gh_with_id(origin, None, verdict, evidence, sink)
+        self.complete_gh_with_id(origin, None, verdict, evidence, None, sink)
+    }
+
+    pub fn complete_gh_with_completion(
+        &self,
+        origin: &GhOrigin,
+        verdict: Verdict,
+        evidence: Option<Value>,
+        completion: Option<SemanticCompletion>,
+        sink: &mut dyn GhMutationSink,
+    ) -> Result<bool, ProducerError> {
+        self.complete_gh_with_id(origin, None, verdict, evidence, completion, sink)
     }
 
     pub fn complete_gh_once(
@@ -3055,6 +3358,18 @@ impl<'a> ProducerEngine<'a> {
         completion_id: &str,
         verdict: Verdict,
         evidence: Option<Value>,
+        sink: &mut dyn GhMutationSink,
+    ) -> Result<bool, ProducerError> {
+        self.complete_gh_once_with_completion(origin, completion_id, verdict, evidence, None, sink)
+    }
+
+    pub fn complete_gh_once_with_completion(
+        &self,
+        origin: &GhOrigin,
+        completion_id: &str,
+        verdict: Verdict,
+        evidence: Option<Value>,
+        completion: Option<SemanticCompletion>,
         sink: &mut dyn GhMutationSink,
     ) -> Result<bool, ProducerError> {
         if completion_id.trim().is_empty()
@@ -3098,7 +3413,14 @@ impl<'a> ProducerEngine<'a> {
             }
             return Ok(false);
         }
-        if !self.complete_gh_with_id(origin, Some(completion_id), verdict, evidence, sink)? {
+        if !self.complete_gh_with_id(
+            origin,
+            Some(completion_id),
+            verdict,
+            evidence,
+            completion,
+            sink,
+        )? {
             return Ok(false);
         }
         write_json_atomic(
@@ -3123,16 +3445,44 @@ impl<'a> ProducerEngine<'a> {
         completion_id: Option<&str>,
         verdict: Verdict,
         evidence: Option<Value>,
+        completion: Option<SemanticCompletion>,
         sink: &mut dyn GhMutationSink,
     ) -> Result<bool, ProducerError> {
         let ProducerConfig::Gh(config) = self.get(&origin.producer)? else {
             return Err(self.kind_mismatch(&origin.producer, "gh"));
         };
-        if !config.enable || !config.post_evidence {
+        if !config.enable || config.never_mutate {
             return Ok(false);
         }
         self.validate_gh_origin(origin)?;
-        if !matches!(verdict, Verdict::Pass | Verdict::Reused) {
+        let execution_passed = matches!(verdict, Verdict::Pass | Verdict::Reused);
+        let evidence = (config.post_evidence && execution_passed)
+            .then_some(evidence)
+            .flatten();
+        let gate_summary = config
+            .post_gate_summary
+            .then(|| completion.as_ref().map(|facts| facts.gates.clone()))
+            .flatten();
+        let acceptance =
+            (config.post_gate_summary || config.request_review || config.close_on_acceptance)
+                .then(|| completion.as_ref().map(|facts| facts.acceptance.clone()))
+                .flatten();
+        let request_review = config.request_review
+            && acceptance
+                .as_ref()
+                .is_none_or(|fact| fact.status != AcceptanceStatus::Accepted);
+        let close_on_pass = config.close_on_pass()
+            && execution_passed
+            && completion
+                .as_ref()
+                .is_none_or(|facts| facts.gates.status == GateSummaryStatus::Pass);
+        let close_on_acceptance = config.close_on_acceptance
+            && completion
+                .as_ref()
+                .is_some_and(|facts| facts.acceptance.status == AcceptanceStatus::Accepted);
+        let should_post =
+            evidence.is_some() || gate_summary.is_some() || acceptance.is_some() || request_review;
+        if !should_post && !close_on_pass && !close_on_acceptance {
             return Ok(false);
         }
         let mutation = GhCompletedMutation {
@@ -3142,10 +3492,15 @@ impl<'a> ProducerEngine<'a> {
             completion_id: completion_id.map(str::to_owned),
             state: "COMPLETED".to_owned(),
             evidence,
+            gate_summary,
+            acceptance,
+            request_review,
         };
-        sink.post_evidence(&mutation)
-            .map_err(ProducerError::Mutation)?;
-        if config.close_on_pass() {
+        if should_post {
+            sink.post_evidence(&mutation)
+                .map_err(ProducerError::Mutation)?;
+        }
+        if close_on_pass || close_on_acceptance {
             sink.close_item(&mutation)
                 .map_err(ProducerError::Mutation)?;
         }
@@ -3172,7 +3527,9 @@ impl<'a> ProducerEngine<'a> {
         {
             return Ok(EmitOutcome::Duplicate);
         }
-        let mut payload = config.on_key.payload(EnqueueSource::BuildEffect, now)?;
+        let mut payload = config
+            .on_key
+            .payload(EnqueueSource::BuildEffect, now, None)?;
         payload.dedup_key = Some(dedup_key);
         let key = stable_key(&["build-effect", producer, &store_path]);
         self.emit_named(
@@ -3281,7 +3638,7 @@ impl<'a> ProducerEngine<'a> {
                 }
             };
             for (action, enqueue) in actions {
-                let payload = enqueue.payload(EnqueueSource::PoolReachability, now)?;
+                let payload = enqueue.payload(EnqueueSource::PoolReachability, now, None)?;
                 let name = format!(
                     "{producer}-reach-{}-{action}{INGRESS_SUFFIX}",
                     state.generation
@@ -3626,7 +3983,9 @@ fn gh_enqueue_preview(
     task_uuid: &str,
     now: DateTime<Utc>,
 ) -> Result<GhEnqueuePreview, ProducerError> {
-    let payload = config.enqueue.payload(EnqueueSource::Gh, now)?;
+    let payload = config
+        .enqueue
+        .payload(EnqueueSource::Gh, now, Some(&origin))?;
     Ok(GhEnqueuePreview {
         task_uuid: task_uuid.to_owned(),
         argv: payload
@@ -3638,6 +3997,10 @@ fn gh_enqueue_preview(
         adapter: payload
             .adapter
             .expect("producer enqueue payloads always contain an adapter"),
+        cwd: payload.cwd,
+        workspace: payload.workspace,
+        adapter_options: payload.adapter_options,
+        gate_manifest: payload.gate_manifest,
         executor: payload.executor,
         priority: payload
             .priority
@@ -4748,6 +5111,10 @@ mod tests {
         ProducerEnqueue {
             argv: vec![command.to_owned()],
             adapter: "shell".to_owned(),
+            cwd: None,
+            workspace: None,
+            adapter_options: AdapterJobOptions::default(),
+            gate_manifest: None,
             pools: vec!["slot".to_owned()],
             executor: None,
             priority: Priority::Low,
@@ -4808,7 +5175,12 @@ mod tests {
                     allow_self_triggered: false,
                     allowed_actors: Vec::new(),
                     poll_interval_sec: 60,
+                    post_receipt: true,
                     post_evidence: true,
+                    post_gate_summary: false,
+                    request_review: false,
+                    close_on_acceptance: false,
+                    never_mutate: false,
                     close_on_pass: Some(true),
                     enqueue: enqueue("gh-job"),
                 }),
@@ -5288,6 +5660,92 @@ mod tests {
         );
     }
 
+    #[test]
+    fn github_origin_templates_render_into_literal_argv_and_cwd_without_a_shell() {
+        let temp = tempdir().unwrap();
+        let marker = temp.path().join("must-not-exist");
+        let mut registry = registry(&temp.path().join("effects.jsonl"));
+        let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        github.enqueue.argv = vec![
+            "review".to_owned(),
+            "${gh.url}".to_owned(),
+            "${gh.headSha}".to_owned(),
+            format!("$(touch {})", marker.display()),
+        ];
+        github.enqueue.cwd = Some(PathBuf::from("/worktrees/${repoName}"));
+        validate_registry(
+            &registry,
+            &BTreeSet::from(["slot".to_owned()]),
+            &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+
+        let engine = ProducerEngine::new(
+            &registry,
+            temp.path().join("events"),
+            temp.path().join("state"),
+        );
+        let observation = gh_observation("PR_template", "author", "contributor");
+        let EmitOutcome::Emitted(path) =
+            engine.emit_gh("github", &observation, fixed_now()).unwrap()
+        else {
+            panic!("GitHub observation did not emit")
+        };
+        let payload: EnqueuePayload =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        assert_eq!(
+            payload.argv.unwrap(),
+            vec![
+                "review".to_owned(),
+                "https://github.com/acme/widgets/pull/128".to_owned(),
+                "0123456789abcdef0123456789abcdef01234567".to_owned(),
+                format!("$(touch {})", marker.display()),
+            ]
+        );
+        assert_eq!(
+            payload.cwd.as_deref(),
+            Some(Path::new("/worktrees/widgets"))
+        );
+        assert!(!marker.exists());
+
+        let mut unknown = registry.clone();
+        let ProducerConfig::Gh(github) = unknown.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        github.enqueue.argv = vec!["${gh.body}".to_owned()];
+        assert!(validate_registry(
+            &unknown,
+            &BTreeSet::from(["slot".to_owned()]),
+            &BTreeSet::from(["shell".to_owned()]),
+            &BTreeSet::new(),
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("unknown placeholder"));
+
+        let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        github
+            .triggers
+            .command_comments
+            .push("/tally run".to_owned());
+        let issue = gh_command_observation("missing-head", "contributor");
+        let missing_engine = ProducerEngine::new(
+            &registry,
+            temp.path().join("missing-events"),
+            temp.path().join("missing-state"),
+        );
+        let error = missing_engine
+            .emit_gh("github", &issue, fixed_now())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gh.headSha"), "{error}");
+    }
+
     struct RecordingMutation {
         comments: Vec<GhCompletedMutation>,
         closes: Vec<GhCompletedMutation>,
@@ -5315,6 +5773,114 @@ mod tests {
             self.item_open = false;
             Ok(())
         }
+    }
+
+    fn semantic_completion(
+        gate_status: GateSummaryStatus,
+        acceptance_status: AcceptanceStatus,
+    ) -> SemanticCompletion {
+        SemanticCompletion {
+            schema_version: crate::completion::GATE_MANIFEST_SCHEMA_VERSION,
+            execution: crate::completion::ExecutionFact::exited(0),
+            gates: GateSummary {
+                status: gate_status,
+                artifact: Some(serde_json::json!({"commit": "abc"})),
+                gates: Vec::new(),
+                missing_required_gate_ids: if gate_status == GateSummaryStatus::Fail {
+                    vec!["live".to_owned()]
+                } else {
+                    Vec::new()
+                },
+                manifest_error: None,
+            },
+            acceptance: AcceptanceFact {
+                status: acceptance_status,
+                policy: crate::completion::AcceptancePolicy::ExecutionAndGates,
+                reason: "test policy result".to_owned(),
+            },
+        }
+    }
+
+    #[test]
+    fn github_gate_failure_and_not_run_remain_open_and_never_mutate_wins() {
+        let temp = tempdir().unwrap();
+        let mut registry = registry(&temp.path().join("effects.jsonl"));
+        let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        github.post_gate_summary = true;
+        github.request_review = true;
+        github.close_on_acceptance = true;
+        github.close_on_pass = Some(true);
+        let observation = gh_observation("PR_policy", "author", "contributor");
+        let origin = gh_origin("github", github, &observation);
+        let engine = ProducerEngine::new(
+            &registry,
+            temp.path().join("events"),
+            temp.path().join("state"),
+        );
+
+        for completion in [
+            semantic_completion(GateSummaryStatus::Fail, AcceptanceStatus::Rejected),
+            semantic_completion(GateSummaryStatus::NotRun, AcceptanceStatus::Pending),
+        ] {
+            let mut sink = RecordingMutation::default();
+            assert!(engine
+                .complete_gh_with_completion(
+                    &origin,
+                    Verdict::Pass,
+                    Some(serde_json::json!({"witnessSeq": 28})),
+                    Some(completion),
+                    &mut sink,
+                )
+                .unwrap());
+            assert_eq!(sink.comments.len(), 1);
+            assert!(sink.comments[0].request_review);
+            assert!(sink.closes.is_empty());
+            assert!(sink.item_open);
+        }
+
+        let mut accepted_sink = RecordingMutation::default();
+        assert!(engine
+            .complete_gh_with_completion(
+                &origin,
+                Verdict::Pass,
+                Some(serde_json::json!({"witnessSeq": 29})),
+                Some(semantic_completion(
+                    GateSummaryStatus::Pass,
+                    AcceptanceStatus::Accepted,
+                )),
+                &mut accepted_sink,
+            )
+            .unwrap());
+        assert_eq!(accepted_sink.closes.len(), 1);
+        assert!(!accepted_sink.comments[0].request_review);
+
+        let mut inert_registry = registry;
+        let ProducerConfig::Gh(github) = inert_registry.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        github.never_mutate = true;
+        let inert_engine = ProducerEngine::new(
+            &inert_registry,
+            temp.path().join("inert-events"),
+            temp.path().join("inert-state"),
+        );
+        let mut inert_sink = RecordingMutation::default();
+        assert!(!inert_engine
+            .complete_gh_with_completion(
+                &origin,
+                Verdict::Pass,
+                None,
+                Some(semantic_completion(
+                    GateSummaryStatus::Pass,
+                    AcceptanceStatus::Accepted,
+                )),
+                &mut inert_sink,
+            )
+            .unwrap());
+        assert!(inert_sink.comments.is_empty());
+        assert!(inert_sink.closes.is_empty());
     }
 
     #[test]
@@ -6351,7 +6917,7 @@ mod tests {
         let events = temp.path().join("events");
         std::fs::create_dir(&events).unwrap();
         let payload = enqueue("from-file")
-            .payload(EnqueueSource::EventsDir, fixed_now())
+            .payload(EnqueueSource::EventsDir, fixed_now(), None)
             .unwrap();
         std::fs::write(
             events.join("valid.json"),

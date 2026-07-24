@@ -12,6 +12,8 @@ use taskchampion::storage::AccessMode;
 use taskchampion::{Operations, Replica, SqliteStorage, Status, Task, Uuid};
 use thiserror::Error;
 
+use crate::adapters::AdapterJobOptions;
+use crate::completion::GateManifestSpec;
 use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::recovery::{RecoveryPlan, RecoveryRowState};
@@ -38,6 +40,10 @@ pub const TALLY_UDA_NAMES: &[&str] = &[
     "session_ref",
     "model",
     "cwd",
+    "workspace_json",
+    "adapter_options_json",
+    "gate_manifest_json",
+    "resumed_from",
     "dedup_key",
     "lease_epoch",
     "source",
@@ -66,6 +72,36 @@ pub enum EnqueueSource {
     Gh,
     BuildEffect,
     PoolReachability,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct WorkspaceMetadata {
+    pub repo: String,
+    pub base_rev: String,
+    pub branch: String,
+    pub worktree_path: PathBuf,
+}
+
+impl WorkspaceMetadata {
+    pub fn validate(&self) -> Result<(), TaskDbError> {
+        for (label, value) in [
+            ("repo", self.repo.as_str()),
+            ("baseRev", self.base_rev.as_str()),
+            ("branch", self.branch.as_str()),
+        ] {
+            if value.trim().is_empty()
+                || value.len() > MAX_GH_ORIGIN_FIELD_BYTES
+                || value.contains('\0')
+                || value.chars().any(char::is_control)
+            {
+                return Err(TaskDbError::InvalidSeed(format!(
+                    "workspace {label} must be non-empty, bounded, and contain no control characters"
+                )));
+            }
+        }
+        validate_absolute_path(&self.worktree_path, "workspace worktreePath")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -689,6 +725,14 @@ pub struct RowSeed {
     pub model: Option<String>,
     #[serde(default)]
     pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<WorkspaceMetadata>,
+    #[serde(default, skip_serializing_if = "AdapterJobOptions::is_default")]
+    pub adapter_options: AdapterJobOptions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate_manifest: Option<GateManifestSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumed_from: Option<String>,
     #[serde(default)]
     pub dedup_key: Option<String>,
     #[serde(default)]
@@ -721,6 +765,23 @@ pub struct RowSeed {
 
 const fn default_attempt() -> u32 {
     1
+}
+
+fn validate_absolute_path(path: &Path, label: &str) -> Result<(), TaskDbError> {
+    if !path.is_absolute() {
+        return Err(TaskDbError::InvalidSeed(format!(
+            "{label} must be absolute"
+        )));
+    }
+    let path = path
+        .to_str()
+        .ok_or_else(|| TaskDbError::InvalidSeed(format!("{label} must be valid UTF-8")))?;
+    if path.contains('%') || path.contains('\0') || path.chars().any(char::is_control) {
+        return Err(TaskDbError::InvalidSeed(format!(
+            "{label} must contain no control characters or systemd specifiers"
+        )));
+    }
+    Ok(())
 }
 
 impl RowSeed {
@@ -773,6 +834,22 @@ impl RowSeed {
             return Err(TaskDbError::InvalidSeed(
                 "runtimeMaxSec must be positive when set".to_owned(),
             ));
+        }
+        if let Some(cwd) = &self.cwd {
+            validate_absolute_path(cwd, "cwd")?;
+        }
+        if let Some(workspace) = &self.workspace {
+            workspace.validate()?;
+        }
+        if let Some(gate_manifest) = &self.gate_manifest {
+            gate_manifest
+                .validate()
+                .map_err(|error| TaskDbError::InvalidSeed(error.to_string()))?;
+        }
+        if let Some(resumed_from) = &self.resumed_from {
+            Uuid::parse_str(resumed_from).map_err(|_| {
+                TaskDbError::InvalidSeed("resumedFrom must be a task UUID".to_owned())
+            })?;
         }
         for (name, source) in &self.credentials {
             let valid_name = !name.is_empty()
@@ -1295,6 +1372,21 @@ fn populate_task(
     if let Some(cwd) = seed.cwd {
         attributes.insert("cwd", cwd.to_string_lossy().into_owned());
     }
+    if let Some(workspace) = seed.workspace {
+        attributes.insert("workspace_json", serde_json::to_string(&workspace)?);
+    }
+    if !seed.adapter_options.is_default() {
+        attributes.insert(
+            "adapter_options_json",
+            serde_json::to_string(&seed.adapter_options)?,
+        );
+    }
+    if let Some(gate_manifest) = seed.gate_manifest {
+        attributes.insert("gate_manifest_json", serde_json::to_string(&gate_manifest)?);
+    }
+    if let Some(resumed_from) = seed.resumed_from {
+        attributes.insert("resumed_from", resumed_from);
+    }
     if let Some(dedup_key) = seed.dedup_key {
         attributes.insert("dedup_key", dedup_key);
     }
@@ -1561,6 +1653,10 @@ mod tests {
             executor: None,
             model: None,
             cwd: Some(PathBuf::from("/work")),
+            workspace: None,
+            adapter_options: Default::default(),
+            gate_manifest: None,
+            resumed_from: None,
             dedup_key: Some("ocr:paper-1".to_owned()),
             session_ref: None,
             lease_epoch: 7,

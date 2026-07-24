@@ -43,6 +43,54 @@ pub struct ScrapeCapture {
     pub pattern: String,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AdapterValueOverride {
+    pub argv: Vec<String>,
+    #[serde(default)]
+    pub allowed_values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AdapterLaunchConfig {
+    #[serde(default)]
+    pub allow_pre_prompt_argv: bool,
+    #[serde(default)]
+    pub cwd_argv: Option<Vec<String>>,
+    #[serde(default)]
+    pub approval_policies: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub sandbox_policies: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub model: Option<AdapterValueOverride>,
+    #[serde(default)]
+    pub effort: Option<AdapterValueOverride>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AdapterJobOptions {
+    #[serde(default)]
+    pub pre_prompt_argv: Vec<String>,
+    #[serde(default)]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+}
+
+impl AdapterJobOptions {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AdapterConfig {
@@ -56,6 +104,8 @@ pub struct AdapterConfig {
     pub yield_hook: Option<Vec<String>>,
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub launch: AdapterLaunchConfig,
     #[serde(default)]
     pub extra_config: BTreeMap<String, Value>,
 }
@@ -145,8 +195,19 @@ impl<'a> AdapterEngine<'a> {
         name: &str,
         workload_argv: &[String],
     ) -> Result<AdapterInvocation, AdapterError> {
+        self.launch_with_options(name, workload_argv, &AdapterJobOptions::default(), None)
+    }
+
+    pub fn launch_with_options(
+        &self,
+        name: &str,
+        workload_argv: &[String],
+        options: &AdapterJobOptions,
+        cwd: Option<&Path>,
+    ) -> Result<AdapterInvocation, AdapterError> {
         let adapter = self.adapter(name)?;
-        invocation(name, adapter, compose_argv(&adapter.argv, workload_argv))
+        let prefix = render_launch_prefix(name, adapter, &adapter.argv, options, cwd)?;
+        invocation(name, adapter, options, compose_argv(&prefix, workload_argv))
     }
 
     pub fn resume(
@@ -155,16 +216,77 @@ impl<'a> AdapterEngine<'a> {
         workload_argv: &[String],
         captures: &ScrapeResult,
     ) -> Result<AdapterInvocation, AdapterError> {
+        self.resume_with_options(
+            name,
+            workload_argv,
+            captures,
+            &AdapterJobOptions::default(),
+            None,
+        )
+    }
+
+    pub fn resume_with_options(
+        &self,
+        name: &str,
+        workload_argv: &[String],
+        captures: &ScrapeResult,
+        options: &AdapterJobOptions,
+        cwd: Option<&Path>,
+    ) -> Result<AdapterInvocation, AdapterError> {
         let adapter = self.adapter(name)?;
         let template = adapter
             .resume
             .as_deref()
             .ok_or_else(|| AdapterError::NoResume(name.to_owned()))?;
+        validate_requested_value(
+            name,
+            "model",
+            options.model.as_deref(),
+            adapter.launch.model.as_ref(),
+        )?;
+        validate_requested_value(
+            name,
+            "effort",
+            options.effort.as_deref(),
+            adapter.launch.effort.as_ref(),
+        )?;
+        let mut resume_captures = captures.captures.clone();
+        if let Some(model) = &options.model {
+            resume_captures.insert("model".to_owned(), Value::String(model.clone()));
+        }
+        let template_has_cwd = template.iter().any(|argument| argument.contains("%<cwd>%"));
+        if let Some(cwd) = cwd.filter(|_| template_has_cwd) {
+            let cwd = cwd.to_str().ok_or_else(|| AdapterError::InvalidConfig {
+                adapter: name.to_owned(),
+                detail: "cwd must be valid UTF-8 for adapter argv rendering".to_owned(),
+            })?;
+            resume_captures.insert("cwd".to_owned(), Value::String(cwd.to_owned()));
+        }
         let rendered = template
             .iter()
-            .map(|argument| render_argument(name, argument, &captures.captures))
+            .map(|argument| render_argument(name, argument, &resume_captures))
             .collect::<Result<Vec<_>, _>>()?;
-        invocation(name, adapter, compose_argv(&rendered, workload_argv))
+        let mut inserted_options = options.clone();
+        if template
+            .iter()
+            .any(|argument| argument.contains("%<model>%"))
+        {
+            inserted_options.model = None;
+        }
+        if template
+            .iter()
+            .any(|argument| argument.contains("%<effort>%"))
+        {
+            inserted_options.effort = None;
+        }
+        let prefix = render_launch_prefix(
+            name,
+            adapter,
+            &rendered,
+            &inserted_options,
+            (!template_has_cwd).then_some(cwd).flatten(),
+        )?;
+        invocation(name, adapter, options, compose_argv(&prefix, workload_argv))
     }
 
     pub fn scrape_text(
@@ -229,6 +351,7 @@ impl<'a> AdapterEngine<'a> {
 fn invocation(
     name: &str,
     adapter: &AdapterConfig,
+    options: &AdapterJobOptions,
     argv: Vec<String>,
 ) -> Result<AdapterInvocation, AdapterError> {
     if argv.is_empty() || argv[0].is_empty() {
@@ -243,15 +366,191 @@ fn invocation(
             detail: "rendered argv must not contain NUL bytes".to_owned(),
         });
     }
+    let mut env = adapter.env.clone();
+    for (environment, value) in &options.environment {
+        if !valid_environment_name(environment)
+            || environment.starts_with("TALLY_")
+            || environment == "CREDENTIALS_DIRECTORY"
+        {
+            return Err(AdapterError::InvalidConfig {
+                adapter: name.to_owned(),
+                detail: format!("job environment name {environment:?} is invalid or reserved"),
+            });
+        }
+        if value.contains('\0') {
+            return Err(AdapterError::InvalidConfig {
+                adapter: name.to_owned(),
+                detail: format!("job environment {environment:?} contains a NUL byte"),
+            });
+        }
+        env.insert(environment.clone(), value.clone());
+    }
     Ok(AdapterInvocation {
         argv,
-        env: adapter.env.clone(),
+        env,
         yield_hook: adapter.yield_hook.clone(),
     })
 }
 
 fn compose_argv(prefix: &[String], workload: &[String]) -> Vec<String> {
     prefix.iter().chain(workload).cloned().collect()
+}
+
+fn render_launch_prefix(
+    name: &str,
+    adapter: &AdapterConfig,
+    base: &[String],
+    options: &AdapterJobOptions,
+    cwd: Option<&Path>,
+) -> Result<Vec<String>, AdapterError> {
+    if !options.pre_prompt_argv.is_empty() && !adapter.launch.allow_pre_prompt_argv {
+        return invalid_config(
+            name,
+            "job prePromptArgv is not authorized by this adapter".to_owned(),
+        );
+    }
+    if options
+        .pre_prompt_argv
+        .iter()
+        .any(|argument| argument.contains('\0'))
+    {
+        return invalid_config(
+            name,
+            "job prePromptArgv must contain no NUL bytes".to_owned(),
+        );
+    }
+    let mut inserted = options.pre_prompt_argv.clone();
+    inserted.extend(render_policy(
+        name,
+        "approvalPolicy",
+        options.approval_policy.as_deref(),
+        &adapter.launch.approval_policies,
+    )?);
+    inserted.extend(render_policy(
+        name,
+        "sandboxPolicy",
+        options.sandbox_policy.as_deref(),
+        &adapter.launch.sandbox_policies,
+    )?);
+    if let (Some(template), Some(cwd)) = (&adapter.launch.cwd_argv, cwd) {
+        let cwd = cwd.to_str().ok_or_else(|| AdapterError::InvalidConfig {
+            adapter: name.to_owned(),
+            detail: "cwd must be valid UTF-8 for adapter argv rendering".to_owned(),
+        })?;
+        inserted.extend(render_named_template(name, template, "cwd", cwd)?);
+    }
+    inserted.extend(render_value_override(
+        name,
+        "model",
+        options.model.as_deref(),
+        adapter.launch.model.as_ref(),
+    )?);
+    inserted.extend(render_value_override(
+        name,
+        "effort",
+        options.effort.as_deref(),
+        adapter.launch.effort.as_ref(),
+    )?);
+
+    if inserted.is_empty() {
+        return Ok(base.to_vec());
+    }
+    let Some((delimiter, prefix)) = base.split_last() else {
+        return invalid_config(
+            name,
+            "pre-prompt options require an adapter prefix ending in '--'".to_owned(),
+        );
+    };
+    if delimiter != "--" {
+        return invalid_config(
+            name,
+            "pre-prompt options require an adapter prefix ending in '--'".to_owned(),
+        );
+    }
+    let mut rendered = prefix.to_vec();
+    rendered.extend(inserted);
+    rendered.push(delimiter.clone());
+    Ok(rendered)
+}
+
+fn render_policy(
+    adapter: &str,
+    field: &str,
+    requested: Option<&str>,
+    policies: &BTreeMap<String, Vec<String>>,
+) -> Result<Vec<String>, AdapterError> {
+    let Some(requested) = requested else {
+        return Ok(Vec::new());
+    };
+    policies
+        .get(requested)
+        .cloned()
+        .ok_or_else(|| AdapterError::InvalidConfig {
+            adapter: adapter.to_owned(),
+            detail: format!("{field} value {requested:?} is not authorized by this adapter"),
+        })
+}
+
+fn render_value_override(
+    adapter: &str,
+    field: &str,
+    requested: Option<&str>,
+    config: Option<&AdapterValueOverride>,
+) -> Result<Vec<String>, AdapterError> {
+    validate_requested_value(adapter, field, requested, config)?;
+    match (requested, config) {
+        (Some(value), Some(config)) => render_named_template(adapter, &config.argv, "value", value),
+        (None, _) => Ok(Vec::new()),
+        (Some(_), None) => unreachable!("requested values were validated above"),
+    }
+}
+
+fn validate_requested_value(
+    adapter: &str,
+    field: &str,
+    requested: Option<&str>,
+    config: Option<&AdapterValueOverride>,
+) -> Result<(), AdapterError> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    let config = config.ok_or_else(|| AdapterError::InvalidConfig {
+        adapter: adapter.to_owned(),
+        detail: format!("{field} override is not authorized by this adapter"),
+    })?;
+    if !config
+        .allowed_values
+        .iter()
+        .any(|allowed| allowed == requested)
+    {
+        return invalid_config(
+            adapter,
+            format!("{field} value {requested:?} is not authorized by this adapter"),
+        );
+    }
+    Ok(())
+}
+
+fn render_named_template(
+    adapter: &str,
+    template: &[String],
+    name: &str,
+    value: &str,
+) -> Result<Vec<String>, AdapterError> {
+    let token = format!("%<{name}>%");
+    template
+        .iter()
+        .map(|argument| {
+            let rendered = argument.replace(&token, value);
+            if rendered.contains('\0') {
+                return Err(AdapterError::InvalidConfig {
+                    adapter: adapter.to_owned(),
+                    detail: format!("rendered {name} argv contains a NUL byte"),
+                });
+            }
+            Ok(rendered)
+        })
+        .collect()
 }
 
 fn validate_adapter_name(name: &str) -> Result<(), AdapterError> {
@@ -289,6 +588,7 @@ fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterEr
             );
         }
     }
+    validate_launch_config(name, &adapter.launch)?;
     let mut names = BTreeSet::new();
     for (capture_name, capture) in &adapter.scrape {
         if !valid_capture_name(capture_name) {
@@ -324,12 +624,84 @@ fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterEr
                 adapter: name.to_owned(),
                 detail: format!("invalid resume argument {argument:?}: {detail}"),
             })? {
-                if !names.contains(capture.as_str()) {
+                if capture != "cwd" && !names.contains(capture.as_str()) {
                     return invalid_config(
                         name,
                         format!("resume references unknown capture {capture:?}"),
                     );
                 }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_launch_config(adapter: &str, launch: &AdapterLaunchConfig) -> Result<(), AdapterError> {
+    if let Some(cwd_argv) = &launch.cwd_argv {
+        validate_argv(adapter, "launch.cwdArgv", cwd_argv, false)?;
+        if !cwd_argv.iter().any(|argument| argument.contains("%<cwd>%")) {
+            return invalid_config(adapter, "launch.cwdArgv must reference %<cwd>%".to_owned());
+        }
+    }
+    for (field, policies) in [
+        ("approvalPolicies", &launch.approval_policies),
+        ("sandboxPolicies", &launch.sandbox_policies),
+    ] {
+        for (policy, argv) in policies {
+            if policy.trim().is_empty()
+                || policy.contains('\0')
+                || policy.chars().any(char::is_control)
+            {
+                return invalid_config(
+                    adapter,
+                    format!("launch.{field} has invalid policy name {policy:?}"),
+                );
+            }
+            validate_argv(adapter, &format!("launch.{field}.{policy}"), argv, true)?;
+        }
+    }
+    for (field, option) in [
+        ("model", launch.model.as_ref()),
+        ("effort", launch.effort.as_ref()),
+    ] {
+        let Some(option) = option else {
+            continue;
+        };
+        validate_argv(
+            adapter,
+            &format!("launch.{field}.argv"),
+            &option.argv,
+            false,
+        )?;
+        if !option
+            .argv
+            .iter()
+            .any(|argument| argument.contains("%<value>%"))
+        {
+            return invalid_config(
+                adapter,
+                format!("launch.{field}.argv must reference %<value>%"),
+            );
+        }
+        if option.allowed_values.is_empty() {
+            return invalid_config(
+                adapter,
+                format!("launch.{field}.allowedValues must not be empty"),
+            );
+        }
+        let mut unique = BTreeSet::new();
+        for value in &option.allowed_values {
+            if value.trim().is_empty()
+                || value.contains('\0')
+                || value.chars().any(char::is_control)
+                || !unique.insert(value)
+            {
+                return invalid_config(
+                    adapter,
+                    format!(
+                        "launch.{field}.allowedValues must contain unique non-empty values without control characters"
+                    ),
+                );
             }
         }
     }
@@ -625,6 +997,7 @@ mod tests {
                 "status".to_owned(),
             ]),
             env: BTreeMap::from([("AGENT_COLOR".to_owned(), "never".to_owned())]),
+            launch: AdapterLaunchConfig::default(),
             extra_config: BTreeMap::from([(
                 "modelFlag".to_owned(),
                 Value::String("--model".to_owned()),
@@ -856,5 +1229,155 @@ mod tests {
                 .argv,
             ["/bin/echo", "literal;value"]
         );
+    }
+
+    #[test]
+    fn codex_pre_prompt_cwd_policies_and_overrides_are_direct_and_resumable() {
+        let codex = AdapterConfig {
+            argv: vec![
+                "codex".to_owned(),
+                "exec".to_owned(),
+                "--json".to_owned(),
+                "--".to_owned(),
+            ],
+            resume: Some(vec![
+                "codex".to_owned(),
+                "-C".to_owned(),
+                "%<cwd>%".to_owned(),
+                "exec".to_owned(),
+                "resume".to_owned(),
+                "--json".to_owned(),
+                "--model".to_owned(),
+                "%<model>%".to_owned(),
+                "%<sessionRef>%".to_owned(),
+                "--".to_owned(),
+            ]),
+            scrape: BTreeMap::from([
+                (
+                    "model".to_owned(),
+                    ScrapeCapture {
+                        stream: ScrapeStream::Stdout,
+                        mode: ScrapeMode::JsonPath,
+                        pattern: "$..model".to_owned(),
+                    },
+                ),
+                (
+                    "sessionRef".to_owned(),
+                    ScrapeCapture {
+                        stream: ScrapeStream::Stdout,
+                        mode: ScrapeMode::JsonPath,
+                        pattern: "$..thread_id".to_owned(),
+                    },
+                ),
+            ]),
+            launch: AdapterLaunchConfig {
+                allow_pre_prompt_argv: true,
+                cwd_argv: Some(vec!["-C".to_owned(), "%<cwd>%".to_owned()]),
+                approval_policies: BTreeMap::from([("never".to_owned(), Vec::new())]),
+                sandbox_policies: BTreeMap::from([("danger-full-access".to_owned(), Vec::new())]),
+                model: Some(AdapterValueOverride {
+                    argv: vec!["--model".to_owned(), "%<value>%".to_owned()],
+                    allowed_values: vec!["gpt-5-codex".to_owned()],
+                }),
+                effort: Some(AdapterValueOverride {
+                    argv: vec![
+                        "-c".to_owned(),
+                        "model_reasoning_effort=%<value>%".to_owned(),
+                    ],
+                    allowed_values: vec!["high".to_owned()],
+                }),
+            },
+            ..AdapterConfig::default()
+        };
+        let adapters = BTreeMap::from([("codex".to_owned(), codex)]);
+        let engine = engine(&adapters);
+        engine.validate_all().unwrap();
+        let options = AdapterJobOptions {
+            pre_prompt_argv: vec!["--dangerously-bypass-approvals-and-sandbox".to_owned()],
+            environment: BTreeMap::from([("NO_COLOR".to_owned(), "1".to_owned())]),
+            approval_policy: Some("never".to_owned()),
+            sandbox_policy: Some("danger-full-access".to_owned()),
+            model: Some("gpt-5-codex".to_owned()),
+            effort: Some("high".to_owned()),
+        };
+        let cwd = Path::new("/worktrees/issue-28");
+        let launch = engine
+            .launch_with_options("codex", &["author wave 3".to_owned()], &options, Some(cwd))
+            .unwrap();
+        assert_eq!(
+            launch.argv,
+            [
+                "codex",
+                "exec",
+                "--json",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-C",
+                "/worktrees/issue-28",
+                "--model",
+                "gpt-5-codex",
+                "-c",
+                "model_reasoning_effort=high",
+                "--",
+                "author wave 3",
+            ]
+        );
+        assert_eq!(launch.env["NO_COLOR"], "1");
+
+        let scraped = engine
+            .scrape_text(
+                "codex",
+                "{\"type\":\"thread.started\",\"thread_id\":\"thread-28\",\"model\":\"gpt-5-codex\"}\n",
+                "",
+            )
+            .unwrap();
+        assert_eq!(scraped.session_ref().unwrap(), Some("thread-28"));
+        let resumed = engine
+            .resume_with_options(
+                "codex",
+                &["continue".to_owned()],
+                &scraped,
+                &options,
+                Some(cwd),
+            )
+            .unwrap();
+        assert_eq!(
+            resumed.argv,
+            [
+                "codex",
+                "-C",
+                "/worktrees/issue-28",
+                "exec",
+                "resume",
+                "--json",
+                "--model",
+                "gpt-5-codex",
+                "thread-28",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "-c",
+                "model_reasoning_effort=high",
+                "--",
+                "continue",
+            ]
+        );
+    }
+
+    #[test]
+    fn unconfigured_pre_prompt_and_unauthorized_values_fail_closed() {
+        let adapters = BTreeMap::from([(
+            "closed".to_owned(),
+            AdapterConfig {
+                argv: vec!["agent".to_owned(), "--".to_owned()],
+                ..AdapterConfig::default()
+            },
+        )]);
+        let options = AdapterJobOptions {
+            pre_prompt_argv: vec!["--unsafe".to_owned()],
+            ..AdapterJobOptions::default()
+        };
+        assert!(engine(&adapters)
+            .launch_with_options("closed", &["work".to_owned()], &options, None)
+            .unwrap_err()
+            .to_string()
+            .contains("not authorized"));
     }
 }

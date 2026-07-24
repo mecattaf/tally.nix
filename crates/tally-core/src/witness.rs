@@ -10,6 +10,8 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::completion::SemanticCompletion;
+
 pub const GENESIS_PREV_HASH: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
@@ -71,6 +73,8 @@ pub struct WitnessRecord {
     pub evidence_class: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub manifest_hash: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<SemanticCompletion>,
     pub seq: u64,
     pub prev_hash: String,
     pub hash: String,
@@ -96,6 +100,7 @@ pub struct WitnessBody {
     pub model: Option<String>,
     pub evidence_class: Option<Value>,
     pub manifest_hash: Option<Value>,
+    pub completion: Option<SemanticCompletion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +216,7 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
         model: body.model,
         evidence_class: body.evidence_class,
         manifest_hash: body.manifest_hash,
+        completion: body.completion,
         seq: head.seq + 1,
         prev_hash: head.hash.clone(),
         hash: String::new(),
@@ -825,6 +831,7 @@ mod tests {
             model: Some("vllm/qwen2-vl-ocr".to_owned()),
             evidence_class: None,
             manifest_hash: None,
+            completion: None,
         }
     }
 
@@ -840,6 +847,32 @@ mod tests {
             .problems
             .iter()
             .any(|problem| problem.kind == VerifyProblemKind::HashMismatch));
+    }
+
+    #[test]
+    fn legacy_job_without_wave_three_features_keeps_identical_hash_input() {
+        let record = build_record(body(), &ChainHead::default()).unwrap();
+        assert!(record.completion.is_none());
+        let raw = serde_json::to_value(&record).unwrap();
+        assert_eq!(
+            canonical_hash_input(&raw).unwrap(),
+            concat!(
+                "{\"task_uuid\":\"b2c40001-0000-4000-8000-000000000001\",",
+                "\"transition_timestamp\":\"2026-07-09T10:00:01.100Z\",",
+                "\"verdict\":\"pass\",\"exit_code\":0,",
+                "\"artifact_content_hash\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
+                "\"gpu_seconds\":42.5,\"wall_clock\":44.0,\"attempt\":1,\"lease_epoch\":42,",
+                "\"dedup_key\":\"ocr:paper-0001\",\"labor_class\":\"fresh\",",
+                "\"pool\":\"worker-gpu\",",
+                "\"charge\":{\"unit\":\"gpu-seconds\",\"amount\":42.5,\"class\":\"verifiable\"},",
+                "\"model\":\"vllm/qwen2-vl-ocr\",\"seq\":1,",
+                "\"prev_hash\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",",
+                "\"hash\":\"\"}"
+            )
+        );
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains("\"completion\""));
     }
 
     #[test]

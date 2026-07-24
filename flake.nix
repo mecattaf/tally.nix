@@ -180,8 +180,6 @@
                   argv = [
                     "codex"
                     "exec"
-                    "-C"
-                    "/work/project"
                     "--json"
                     "--"
                   ];
@@ -200,6 +198,27 @@
                   scrape.model = {
                     mode = "jsonPath";
                     pattern = "$..model";
+                  };
+                  launch = {
+                    allowPrePromptArgv = true;
+                    cwdArgv = [
+                      "-C"
+                      "%<cwd>%"
+                    ];
+                    model = {
+                      argv = [
+                        "--model"
+                        "%<value>%"
+                      ];
+                      allowedValues = [ "gpt-5-codex" ];
+                    };
+                    effort = {
+                      argv = [
+                        "-c"
+                        "model_reasoning_effort=%<value>%"
+                      ];
+                      allowedValues = [ "high" ];
+                    };
                   };
                 };
                 executors.worker = {
@@ -257,8 +276,33 @@
                       }
                     ];
                     triggers.commandComments = [ "/tally run" ];
+                    postGateSummary = true;
+                    requestReview = true;
+                    closeOnAcceptance = true;
                     enqueue = {
-                      argv = [ "gh-job" ];
+                      argv = [ "Review \${gh.url}" ];
+                      adapter = "project-codex";
+                      cwd = "/worktrees/\${gh.repoName}";
+                      workspace = {
+                        repo = "agency-agency/spec";
+                        baseRev = "origin/main";
+                        branch = "tally-intake";
+                        worktreePath = "/worktrees/spec";
+                      };
+                      adapterOptions = {
+                        prePromptArgv = [ "--dangerously-bypass-approvals-and-sandbox" ];
+                        environment.NO_COLOR = "1";
+                        model = "gpt-5-codex";
+                        effort = "high";
+                      };
+                      gateManifest = {
+                        path = "/worktrees/spec/.tally/gates.json";
+                        requiredGateIds = [
+                          "tests"
+                          "clippy"
+                        ];
+                        acceptancePolicy = "execution-and-gates";
+                      };
                       pool = "stock";
                     };
                   };
@@ -703,7 +747,20 @@
               .producers.github.triggers.commandComments == ["/tally run"] and
               .producers.github.allowSelfTriggered == false and
               .producers.github.allowedActors == [] and
+              .producers.github.postReceipt == true and
+              .producers.github.postGateSummary == true and
+              .producers.github.requestReview == true and
+              .producers.github.closeOnAcceptance == true and
+              .producers.github.neverMutate == false and
               .producers.github.closeOnPass == false and
+              .producers.github.enqueue.argv == ["Review ''${gh.url}"] and
+              .producers.github.enqueue.cwd == "/worktrees/''${gh.repoName}" and
+              .producers.github.enqueue.workspace.repo == "agency-agency/spec" and
+              .producers.github.enqueue.workspace.worktreePath == "/worktrees/spec" and
+              .producers.github.enqueue.adapterOptions.prePromptArgv == ["--dangerously-bypass-approvals-and-sandbox"] and
+              .producers.github.enqueue.adapterOptions.environment.NO_COLOR == "1" and
+              .producers.github.enqueue.gateManifest.requiredGateIds == ["tests", "clippy"] and
+              .producers.github.enqueue.gateManifest.acceptancePolicy == "execution-and-gates" and
               .executors.worker.kind == "ssh" and
               .executors.worker.host == "worker.example" and
               .executors.worker.user == "tally-worker" and
@@ -711,7 +768,9 @@
               .executors.worker.knownHostsFile == "/etc/tally/worker-known-hosts" and
               .executors.worker.program == "/run/current-system/sw/bin/tally" and
               .executors.worker.stateDir == "/var/lib/tally-remote" and
-              .adapters["project-codex"].argv == ["codex", "exec", "-C", "/work/project", "--json", "--"] and
+              .adapters["project-codex"].argv == ["codex", "exec", "--json", "--"] and
+              .adapters["project-codex"].launch.cwdArgv == ["-C", "%<cwd>%"] and
+              .adapters["project-codex"].launch.model.allowedValues == ["gpt-5-codex"] and
               ([.. | objects | keys[]] | any(. == "remote" or . == "servingSlice" or . == "patchedSystemd") | not)
             ' ${checkedHomeConfig}
             touch "$out"
@@ -808,8 +867,10 @@
             test "$(jq -c '.adapters["claude-code"].argv' ${adapterConfig})" = '["claude","--print","--verbose","--output-format","stream-json","--"]'
             test "$(jq -c '.adapters["claude-code"].resume' ${adapterConfig})" = '["claude","--resume","%<sessionRef>%","--model","%<model>%","--print","--verbose","--output-format","stream-json","--"]'
             test "$(jq -c '.adapters.codex.argv' ${adapterConfig})" = '["codex","exec","--json","--"]'
-            test "$(jq -c '.adapters.codex.resume' ${adapterConfig})" = '["codex","resume","%<sessionRef>%","--model","%<model>%","--"]'
-            test "$(jq -c '.adapters.shell' ${adapterConfig})" = '{"argv":[],"env":{},"extraConfig":{},"resume":null,"scrape":{},"yieldHook":null}'
+            test "$(jq -c '.adapters.codex.resume' ${adapterConfig})" = '["codex","-C","%<cwd>%","exec","resume","--json","--model","%<model>%","%<sessionRef>%","--"]'
+            test "$(jq -c '.adapters.codex.launch.cwdArgv' ${adapterConfig})" = '["-C","%<cwd>%"]'
+            test "$(jq -c '.adapters.codex.launch.sandboxPolicies["dangerously-bypass"]' ${adapterConfig})" = '["--dangerously-bypass-approvals-and-sandbox"]'
+            test "$(jq -c '.adapters.shell' ${adapterConfig})" = '{"argv":[],"env":{},"extraConfig":{},"launch":{},"resume":null,"scrape":{},"yieldHook":null}'
             for preset in pi claude-code codex; do
               test "$(jq -c --arg preset "$preset" '.adapters[$preset].yieldHook' ${adapterConfig})" = '["tally","lease","status"]'
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.sessionRef.mode' ${adapterConfig})" = jsonPath
@@ -842,8 +903,9 @@
             printf '%s\n' \
               '{"type":"thread.started","thread_id":"codex-thread","model":"Codex/Exact.Model"}' \
               '{"type":"turn.completed","model":"Codex/Exact.Model","usage":{"input_tokens":13}}' > codex.jsonl
-            codex_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render codex --scrape-stdout "$PWD/codex.jsonl" --scrape-stderr "$PWD/empty.err" -- work)"
-            test "$(printf '%s' "$codex_render" | jq -c '.argv')" = '["codex","resume","codex-thread","--model","Codex/Exact.Model","--","work"]'
+            codex_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render codex --cwd "$PWD" --scrape-stdout "$PWD/codex.jsonl" --scrape-stderr "$PWD/empty.err" -- work)"
+            expected_codex="$(jq -cn --arg cwd "$PWD" '["codex","-C",$cwd,"exec","resume","--json","--model","Codex/Exact.Model","codex-thread","--","work"]')"
+            test "$(printf '%s' "$codex_render" | jq -c '.argv')" = "$expected_codex"
             test "$(printf '%s' "$codex_render" | jq -c '.captures.usage')" = '{"input_tokens":13}'
             touch $out
           '';

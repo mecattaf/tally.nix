@@ -26,6 +26,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tokio::task::{JoinHandle, JoinSet, LocalSet};
 
 use crate::adapters::{AdapterEngine, AdapterError, AdapterInvocation, ScrapeResult};
+use crate::completion::{evaluate_completion, ExecutionFact, SemanticCompletion};
 use crate::config::{Config, PoolPredicate, Priority};
 use crate::evidence::{
     parse_evidence_specs, probe_dedup, run_evidence_gate, RetryTrigger, RunOutcome,
@@ -180,11 +181,12 @@ pub struct JobResult {
     pub attempt: u32,
     pub lease_epoch: u64,
     pub witness_seq: u64,
+    pub completion: Option<SemanticCompletion>,
 }
 
 impl JobResult {
     fn value(&self) -> Value {
-        json!({
+        let mut value = json!({
             "task_uuid": self.task_uuid,
             "job_id": self.job_id,
             "verdict": self.verdict,
@@ -193,7 +195,12 @@ impl JobResult {
             "attempt": self.attempt,
             "lease_epoch": self.lease_epoch,
             "witness_seq": self.witness_seq,
-        })
+        });
+        if let Some(completion) = &self.completion {
+            value["completion"] =
+                serde_json::to_value(completion).expect("semantic completion always serializes");
+        }
+        value
     }
 }
 
@@ -564,6 +571,7 @@ impl RpcHandler for DaemonHandler {
         Box::pin(async move {
             match request.method.as_str() {
                 "queue.enqueue" => self.enqueue(request.params).await,
+                "queue.continue" => self.continue_job(request.params).await,
                 "queue.await_job" => self.await_job(request.params).await,
                 "queue.await_barrier" => self.await_barrier(request.params).await,
                 "queue.drain" => self.drain().await,
@@ -598,17 +606,70 @@ impl DaemonHandler {
         self.enqueue_payload(payload, None).await
     }
 
+    async fn continue_job(&self, params: Option<Value>) -> Result<Value, WireError> {
+        let payload: EnqueuePayload = decode_params(params)?;
+        if payload.resume_from.is_none() {
+            return Err(WireError::invalid(
+                "queue.continue requires a resumeFrom task UUID",
+            ));
+        }
+        self.enqueue_payload(payload, None).await
+    }
+
     async fn enqueue_payload(
         &self,
-        payload: EnqueuePayload,
+        mut payload: EnqueuePayload,
         ingress_id: Option<String>,
     ) -> Result<Value, WireError> {
         let caller_job_id = payload.caller_job_id.clone();
+        let mut context = self.context.write().await;
+        let resumed_job = if let Some(resume_from) = payload.resume_from.as_deref() {
+            let previous = find_job(&context, resume_from)?.clone();
+            if previous.state != JobState::Completed {
+                return Err(WireError::invalid(format!(
+                    "job {resume_from} is not terminal and cannot be continued"
+                )));
+            }
+            if previous.row.session_ref.is_none() {
+                return Err(WireError::invalid(format!(
+                    "job {resume_from} has no scraped session reference"
+                )));
+            }
+            payload
+                .pools
+                .get_or_insert_with(|| previous.row.pools.clone());
+            if payload.executor.is_none() {
+                payload.executor.clone_from(&previous.row.executor);
+            }
+            payload.priority.get_or_insert(previous.row.priority);
+            payload
+                .adapter
+                .get_or_insert_with(|| previous.row.adapter.clone());
+            payload.source.get_or_insert(previous.row.source);
+            if payload.cwd.is_none() {
+                payload.cwd.clone_from(&previous.row.cwd);
+            }
+            if payload.workspace.is_none() {
+                payload.workspace.clone_from(&previous.row.workspace);
+            }
+            if payload.adapter_options.is_none() {
+                payload.adapter_options = Some(previous.row.adapter_options.clone());
+            }
+            if previous.row.source == EnqueueSource::Gh {
+                payload.gh_origin.clone_from(&previous.row.gh_origin);
+                if let Some(origin) = &previous.row.gh_origin {
+                    payload.gh_trigger_actor = Some(origin.trigger_actor.clone());
+                    payload.gh_self_actor = Some(origin.self_actor.clone());
+                }
+            }
+            Some(previous)
+        } else {
+            None
+        };
         let requested_adapter = payload
             .adapter
             .clone()
             .unwrap_or_else(|| "shell".to_owned());
-        let mut context = self.context.write().await;
         if let Some(origin) = &payload.gh_origin {
             ProducerEngine::new(
                 &context.config.producers,
@@ -647,6 +708,9 @@ impl DaemonHandler {
             priority: payload.priority.unwrap_or(Priority::Medium),
             adapter: requested_adapter,
             source: payload.source.unwrap_or(EnqueueSource::Manual),
+            cwd: None,
+            workspace: None,
+            adapter_options: Default::default(),
         };
         let mut resolved = context.guardrails.validate_enqueue(payload, &defaults)?;
         for pool in &resolved.pools {
@@ -671,9 +735,44 @@ impl DaemonHandler {
                 resolved.credentials.entry(name).or_insert(source);
             }
         }
-        let invocation = match AdapterEngine::new(&context.config.adapters)
-            .launch(&resolved.adapter, &resolved.argv)
-        {
+        let engine = AdapterEngine::new(&context.config.adapters);
+        let rendered = if let Some(previous) = &resumed_job {
+            if resolved.adapter != previous.row.adapter {
+                Err(AdapterError::InvalidConfig {
+                    adapter: resolved.adapter.clone(),
+                    detail: "a continuation must use the original adapter".to_owned(),
+                })
+            } else {
+                let mut captures = BTreeMap::from([(
+                    "sessionRef".to_owned(),
+                    Value::String(
+                        previous
+                            .row
+                            .session_ref
+                            .clone()
+                            .expect("continued jobs were checked for a session reference"),
+                    ),
+                )]);
+                if let Some(model) = &previous.row.model {
+                    captures.insert("model".to_owned(), Value::String(model.clone()));
+                }
+                engine.resume_with_options(
+                    &resolved.adapter,
+                    &resolved.argv,
+                    &ScrapeResult { captures },
+                    &resolved.adapter_options,
+                    resolved.cwd.as_deref(),
+                )
+            }
+        } else {
+            engine.launch_with_options(
+                &resolved.adapter,
+                &resolved.argv,
+                &resolved.adapter_options,
+                resolved.cwd.as_deref(),
+            )
+        };
+        let invocation = match rendered {
             Ok(invocation) => invocation,
             Err(error) => {
                 rollback_child_charge(&mut context, caller_job_id.as_deref())?;
@@ -727,10 +826,16 @@ impl DaemonHandler {
             adapter: resolved.adapter.clone(),
             pools: resolved.pools.clone(),
             executor: resolved.executor.clone(),
-            model: None,
-            cwd: None,
+            model: resumed_job.as_ref().and_then(|job| job.row.model.clone()),
+            cwd: resolved.cwd,
+            workspace: resolved.workspace,
+            adapter_options: resolved.adapter_options,
+            gate_manifest: resolved.gate_manifest,
+            resumed_from: resolved.resume_from,
             dedup_key: resolved.dedup_key.clone(),
-            session_ref: None,
+            session_ref: resumed_job
+                .as_ref()
+                .and_then(|job| job.row.session_ref.clone()),
             lease_epoch: epoch,
             attempt: 1,
             argv: resolved.argv,
@@ -750,7 +855,11 @@ impl DaemonHandler {
             return Err(WireError::invalid(error.to_string()));
         }
 
-        if let Some(dedup_key) = row.dedup_key.clone() {
+        if let Some(dedup_key) = row
+            .dedup_key
+            .clone()
+            .filter(|_| row.gate_manifest.is_none())
+        {
             let evidence = parse_evidence_specs(&row.evidence)
                 .expect("guardrail validation canonicalized evidence before charging fanout");
             let witness_path = context.paths.witness_path();
@@ -847,6 +956,7 @@ impl DaemonHandler {
                     model: row.model.clone(),
                     evidence_class: row.evidence_class.clone(),
                     manifest_hash: row.manifest_hash.clone(),
+                    completion: None,
                 }) {
                     Ok(record) => record,
                     Err(error) => return Err(self.fail_stop(error.into())),
@@ -860,6 +970,7 @@ impl DaemonHandler {
                     attempt: row.attempt,
                     lease_epoch: row.lease_epoch,
                     witness_seq: record.seq,
+                    completion: None,
                 };
                 context.barriers.complete_job(&stable_key, result.value());
                 context.aliases.insert(job_id.to_string(), job_id);
@@ -1689,13 +1800,17 @@ impl DaemonHandler {
                 )
             };
             let completion_id = format!("{}:{}:{}", row.uuid, result.attempt, result.witness_seq);
-            let evidence = json!({
+            let mut evidence = json!({
                 "taskUuid": row.uuid.to_string(),
                 "witnessSeq": result.witness_seq,
                 "verdict": result.verdict,
                 "exitCode": result.exit_code,
                 "artifactContentHash": result.artifact_content_hash,
             });
+            if let Some(completion) = &result.completion {
+                evidence["completion"] = serde_json::to_value(completion)
+                    .expect("semantic completion always serializes");
+            }
             let mut retry_delay = Duration::from_secs(1);
             loop {
                 let registry = registry.clone();
@@ -1705,15 +1820,17 @@ impl DaemonHandler {
                 let origin = origin.clone();
                 let completion_id = completion_id.clone();
                 let evidence = evidence.clone();
+                let semantic_completion = result.completion.clone();
                 let verdict = result.verdict;
                 let completed = tokio::task::spawn_blocking(move || {
                     let engine = ProducerEngine::new(&registry, events_dir, state_dir);
                     let mut sink = GhCliMutationSink::with_program(gh_program);
-                    engine.complete_gh_once(
+                    engine.complete_gh_once_with_completion(
                         &origin,
                         &completion_id,
                         verdict,
                         Some(evidence),
+                        semantic_completion,
                         &mut sink,
                     )
                 })
@@ -2521,9 +2638,26 @@ fn execution_request(job: &Job, limits: UnitLimits, tally_socket: &str) -> Execu
         environment: job.invocation.env.clone(),
         gh_origin: job.row.gh_origin.clone(),
         cwd: job.row.cwd.clone(),
+        workspace: job.row.workspace.clone(),
+        gate_manifest: job.row.gate_manifest.clone(),
         credentials: job.row.credentials.clone(),
         limits,
         runtime_max_sec: job.row.runtime_max_sec,
+    }
+}
+
+fn execution_fact_for_termination(termination: &ExecutionTermination) -> ExecutionFact {
+    match termination {
+        ExecutionTermination::Exited(exit_code) => ExecutionFact::exited(*exit_code),
+        ExecutionTermination::RuntimeExceeded => {
+            ExecutionFact::failed("process exceeded RuntimeMaxSec")
+        }
+        ExecutionTermination::Signaled { code, status } => {
+            ExecutionFact::failed(format!("process ended by {code} {status}"))
+        }
+        ExecutionTermination::ServiceFailed { service_result, .. } => {
+            ExecutionFact::failed(format!("systemd service failed with {service_result}"))
+        }
     }
 }
 
@@ -2585,6 +2719,7 @@ fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
         model: canonical_job_model(job),
         evidence_class: job.row.evidence_class.clone(),
         manifest_hash: job.row.manifest_hash.clone(),
+        completion: None,
     }
 }
 
@@ -2613,6 +2748,7 @@ fn finalize_forced_locked(
         attempt: job.row.attempt,
         lease_epoch: job.row.lease_epoch,
         witness_seq: record.seq,
+        completion: None,
     };
     context
         .barriers
@@ -3226,6 +3362,50 @@ impl Daemon {
             &finished.outcome,
             Some(Ok(outcome)) if outcome.captures_available
         );
+        let semantic_completion = match (&job.row.gate_manifest, &finished.outcome) {
+            (None, Some(Ok(outcome))) if outcome.semantic_completion.is_some() => {
+                return Err(DaemonError::Invalid(format!(
+                    "job {} returned semantic completion without a declared gate manifest",
+                    job.stable_key()
+                )))
+            }
+            (None, _) => None,
+            (Some(spec), Some(Ok(outcome))) => {
+                if let Some(completion) = &outcome.semantic_completion {
+                    Some(completion.clone())
+                } else {
+                    if job.row.executor.is_some() {
+                        return Err(DaemonError::Invalid(format!(
+                            "remote job {} omitted its gate-manifest result",
+                            job.stable_key()
+                        )));
+                    }
+                    let execution = execution_fact_for_termination(&outcome.termination);
+                    let spec = spec.clone();
+                    Some(
+                        tokio::task::spawn_blocking(move || evaluate_completion(execution, &spec))
+                            .await
+                            .map_err(|error| {
+                                DaemonError::Invalid(format!(
+                                    "gate manifest worker failed: {error}"
+                                ))
+                            })?,
+                    )
+                }
+            }
+            (Some(spec), Some(Err(error))) => {
+                let execution = ExecutionFact::failed(format!("executor failed: {error}"));
+                let spec = spec.clone();
+                Some(
+                    tokio::task::spawn_blocking(move || evaluate_completion(execution, &spec))
+                        .await
+                        .map_err(|error| {
+                            DaemonError::Invalid(format!("gate manifest worker failed: {error}"))
+                        })?,
+                )
+            }
+            (Some(_), None) => None,
+        };
         let (computed_verdict, exit_code, artifact_hash) = match finished.outcome {
             None => {
                 return Err(DaemonError::Invalid(format!(
@@ -3304,6 +3484,7 @@ impl Daemon {
                 model: canonical_job_model(&job),
                 evidence_class: job.row.evidence_class.clone(),
                 manifest_hash: job.row.manifest_hash.clone(),
+                completion: semantic_completion.clone(),
             })?;
             let result = JobResult {
                 task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
@@ -3314,6 +3495,7 @@ impl Daemon {
                 attempt: job.row.attempt,
                 lease_epoch: job.row.lease_epoch,
                 witness_seq: record.seq,
+                completion: semantic_completion,
             };
             let stable = job.stable_key();
             context.barriers.complete_job(&stable, result.value());
@@ -4129,6 +4311,7 @@ fn recovery_gh_completions(
                 attempt: record.attempt,
                 lease_epoch: record.lease_epoch,
                 witness_seq: record.seq,
+                completion: record.completion.clone(),
             },
         })
         .collect())
@@ -4194,6 +4377,7 @@ fn reconcile_reuse_witnesses(
                     model: event.row.model.clone(),
                     evidence_class: event.row.evidence_class.clone(),
                     manifest_hash: event.row.manifest_hash.clone(),
+                    completion: None,
                 })?;
                 appended = true;
             }
@@ -4729,6 +4913,12 @@ fn query_row(row: &RowSeed, status: RowStatus) -> RowFact {
         executor: row.executor.clone(),
         source: Some(source_name(row.source).to_owned()),
         session_ref: row.session_ref.clone(),
+        cwd: row
+            .cwd
+            .as_ref()
+            .map(|cwd| cwd.to_string_lossy().into_owned()),
+        workspace: row.workspace.clone(),
+        resumed_from: row.resumed_from.clone(),
         attempt: row.attempt,
         model: row.model.clone(),
         gh_origin: row
@@ -4777,6 +4967,7 @@ fn restore_completed_results(
             attempt: record.attempt,
             lease_epoch: record.lease_epoch,
             witness_seq: record.seq,
+            completion: record.completion,
         }
         .value();
         context.barriers.register_job(&task_uuid, record.attempt);
@@ -5009,6 +5200,11 @@ fn recovery_action_already_installed(
         || existing.row.adapter != candidate.adapter
         || existing.row.argv != candidate.argv
         || existing.row.dedup_key != candidate.dedup_key
+        || existing.row.cwd != candidate.cwd
+        || existing.row.workspace != candidate.workspace
+        || existing.row.adapter_options != candidate.adapter_options
+        || existing.row.gate_manifest != candidate.gate_manifest
+        || existing.row.resumed_from != candidate.resumed_from
     {
         return Err(DaemonError::Invalid(format!(
             "recovery action for {} attempt {} conflicts with the installed generation",
@@ -5072,10 +5268,51 @@ fn recovery_adapter_invocation(
                     }
                 }
             };
-            let invocation = engine.resume(&row.adapter, &row.argv, &captures)?;
+            let invocation = engine.resume_with_options(
+                &row.adapter,
+                &row.argv,
+                &captures,
+                &row.adapter_options,
+                row.cwd.as_deref(),
+            )?;
             Ok((invocation, Some(captures)))
         }
-        RecoveryAction::QueueExisting { .. } => Ok((engine.launch(&row.adapter, &row.argv)?, None)),
+        RecoveryAction::QueueExisting { .. } => {
+            if row.resumed_from.is_some() {
+                let session_ref = row.session_ref.clone().ok_or_else(|| {
+                    DaemonError::Invalid(format!(
+                        "continued row {} omitted its durable session reference",
+                        row.uuid
+                    ))
+                })?;
+                let mut captures =
+                    BTreeMap::from([("sessionRef".to_owned(), Value::String(session_ref))]);
+                if let Some(model) = &row.model {
+                    captures.insert("model".to_owned(), Value::String(model.clone()));
+                }
+                let captures = ScrapeResult { captures };
+                Ok((
+                    engine.resume_with_options(
+                        &row.adapter,
+                        &row.argv,
+                        &captures,
+                        &row.adapter_options,
+                        row.cwd.as_deref(),
+                    )?,
+                    Some(captures),
+                ))
+            } else {
+                Ok((
+                    engine.launch_with_options(
+                        &row.adapter,
+                        &row.argv,
+                        &row.adapter_options,
+                        row.cwd.as_deref(),
+                    )?,
+                    None,
+                ))
+            }
+        }
         RecoveryAction::AdoptRunning { .. } | RecoveryAction::ReconcileExit { .. } => Ok((
             AdapterInvocation {
                 argv: row.argv.clone(),
@@ -5584,32 +5821,35 @@ mod tests {
                     })?;
                 Ok(RemoteExecutorReply::Ok {
                     protocol_version: REMOTE_EXECUTOR_PROTOCOL_VERSION,
-                    result: Box::new(RemoteExecutorResult::Completion(RemoteCompletion {
-                        unit: unit.clone(),
-                        record: UnitExitRecord {
-                            schema_version: UNIT_EXIT_SCHEMA_VERSION,
-                            unit,
-                            invocation_id: "remote-long-job".to_owned(),
-                            attempt: request.attempt,
-                            lease_epoch: request.lease_epoch,
-                            service_result: "success".to_owned(),
-                            exit_code: Some("exited".to_owned()),
-                            exit_status: Some("0".to_owned()),
+                    result: Box::new(RemoteExecutorResult::Completion(Box::new(
+                        RemoteCompletion {
+                            unit: unit.clone(),
+                            record: UnitExitRecord {
+                                schema_version: UNIT_EXIT_SCHEMA_VERSION,
+                                unit,
+                                invocation_id: "remote-long-job".to_owned(),
+                                attempt: request.attempt,
+                                lease_epoch: request.lease_epoch,
+                                service_result: "success".to_owned(),
+                                exit_code: Some("exited".to_owned()),
+                                exit_status: Some("0".to_owned()),
+                            },
+                            termination: ExecutionTermination::Exited(0),
+                            capture: RemoteCapture {
+                                attempt: request.attempt,
+                                lease_epoch: request.lease_epoch,
+                                stdout_base64: Some(String::new()),
+                                stderr_base64: Some(String::new()),
+                                error: None,
+                            },
+                            evidence_gate: Some(run_evidence_gate(RunOutcome {
+                                exit_code: 0,
+                                wall_clock_seconds: 1.0,
+                                evidence: &evidence,
+                            })),
+                            semantic_completion: None,
                         },
-                        termination: ExecutionTermination::Exited(0),
-                        capture: RemoteCapture {
-                            attempt: request.attempt,
-                            lease_epoch: request.lease_epoch,
-                            stdout_base64: Some(String::new()),
-                            stderr_base64: Some(String::new()),
-                            error: None,
-                        },
-                        evidence_gate: Some(run_evidence_gate(RunOutcome {
-                            exit_code: 0,
-                            wall_clock_seconds: 1.0,
-                            evidence: &evidence,
-                        })),
-                    })),
+                    ))),
                 })
             })
         }
@@ -5666,7 +5906,7 @@ mod tests {
                             }
                         })?;
                         let unit = format!("tally-job-{}.service", request.identity.unit_uuid());
-                        RemoteExecutorResult::Completion(RemoteCompletion {
+                        RemoteExecutorResult::Completion(Box::new(RemoteCompletion {
                             unit: unit.clone(),
                             record: UnitExitRecord {
                                 schema_version: UNIT_EXIT_SCHEMA_VERSION,
@@ -5691,7 +5931,8 @@ mod tests {
                                 wall_clock_seconds: 1.0,
                                 evidence: &evidence,
                             })),
-                        })
+                            semantic_completion: None,
+                        }))
                     }
                     RemoteExecutorRequest::Ensure { .. } => {
                         return Ok(RemoteExecutorReply::Error {
@@ -5767,6 +6008,7 @@ mod tests {
                 "status".to_owned(),
             ]),
             env: BTreeMap::from([("CUSTOM_AGENT_MODE".to_owned(), "batch".to_owned())]),
+            launch: crate::adapters::AdapterLaunchConfig::default(),
             extra_config: BTreeMap::from([(
                 "modelFlag".to_owned(),
                 Value::String("--model".to_owned()),
@@ -5803,6 +6045,10 @@ mod tests {
             executor: None,
             model: None,
             cwd: None,
+            workspace: None,
+            adapter_options: Default::default(),
+            gate_manifest: None,
+            resumed_from: None,
             dedup_key: Some(dedup_key.to_owned()),
             session_ref: None,
             lease_epoch,
@@ -5918,6 +6164,9 @@ mod tests {
             executor: None,
             source: Some("manual".to_owned()),
             session_ref: None,
+            cwd: None,
+            workspace: None,
+            resumed_from: None,
             model: None,
             state: "completed".to_owned(),
             verdict: witness_seq.map(|_| Verdict::Pass),
@@ -5925,6 +6174,7 @@ mod tests {
             canonical_gpu_seconds: None,
             last_event_at: None,
             witness_seq,
+            completion: None,
         };
         let live = HashMap::from([("job-1".to_owned(), "running".to_owned())]);
         let mut terminal = vec![projection(Some(7))];
@@ -6380,6 +6630,7 @@ mod tests {
                         )]),
                         yield_hook: None,
                         env: BTreeMap::new(),
+                        launch: crate::adapters::AdapterLaunchConfig::default(),
                         extra_config: BTreeMap::new(),
                     },
                 );
@@ -6715,6 +6966,7 @@ mod tests {
                         model: None,
                         evidence_class: None,
                         manifest_hash: None,
+                        completion: None,
                     })
                     .unwrap();
                 let mut config = one_pool_config();
@@ -6827,6 +7079,7 @@ mod tests {
                     attempt: 1,
                     lease_epoch: 1,
                     witness_seq: 9,
+                    completion: None,
                 };
                 daemon
                     .handler
@@ -7213,6 +7466,362 @@ mod tests {
                 );
                 assert_eq!(standup.in_flight.len(), 1);
                 assert_eq!(standup.in_flight[0].gh_origin, Some(expected_projection));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn codex_job_options_cwd_and_workspace_reach_systemd_as_exact_direct_values() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let mut config = one_pool_config();
+                config.adapters.insert(
+                    "codex".to_owned(),
+                    AdapterConfig {
+                        argv: vec![
+                            "codex".to_owned(),
+                            "exec".to_owned(),
+                            "--json".to_owned(),
+                            "--".to_owned(),
+                        ],
+                        launch: crate::adapters::AdapterLaunchConfig {
+                            allow_pre_prompt_argv: true,
+                            cwd_argv: Some(vec!["-C".to_owned(), "%<cwd>%".to_owned()]),
+                            approval_policies: BTreeMap::from([("never".to_owned(), Vec::new())]),
+                            sandbox_policies: BTreeMap::from([(
+                                "danger-full-access".to_owned(),
+                                Vec::new(),
+                            )]),
+                            ..crate::adapters::AdapterLaunchConfig::default()
+                        },
+                        ..AdapterConfig::default()
+                    },
+                );
+                config.validate().unwrap();
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon =
+                    Daemon::open_with_executor(config, paths, settings(), executor.clone())
+                        .await
+                        .unwrap();
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": ["author wave 3"],
+                        "pool": "slot",
+                        "adapter": "codex",
+                        "cwd": "/worktrees/issue-28",
+                        "workspace": {
+                            "repo": "mecattaf/tally.nix",
+                            "baseRev": "origin/main",
+                            "branch": "wave-3-ergonomics",
+                            "worktreePath": "/worktrees/issue-28"
+                        },
+                        "adapterOptions": {
+                            "prePromptArgv": ["--dangerously-bypass-approvals-and-sandbox"],
+                            "environment": {"NO_COLOR": "1"},
+                            "approvalPolicy": "never",
+                            "sandboxPolicy": "danger-full-access"
+                        }
+                    })))
+                    .await
+                    .unwrap();
+                let job_id = Uuid::parse_str(admitted["job_id"].as_str().unwrap()).unwrap();
+                let job = daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&job_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    job.invocation.argv,
+                    [
+                        "codex",
+                        "exec",
+                        "--json",
+                        "--dangerously-bypass-approvals-and-sandbox",
+                        "-C",
+                        "/worktrees/issue-28",
+                        "--",
+                        "author wave 3",
+                    ]
+                );
+                assert_eq!(job.invocation.env["NO_COLOR"], "1");
+                assert_eq!(
+                    job.row.workspace.as_ref().unwrap().repo,
+                    "mecattaf/tally.nix"
+                );
+
+                let request =
+                    execution_request(&job, settings().unit_limits, "/run/tally/tally.sock");
+                let args = executor
+                    .build_systemd_argv(&request)
+                    .unwrap()
+                    .into_iter()
+                    .map(|argument| argument.into_string().unwrap())
+                    .collect::<Vec<_>>();
+                assert!(args
+                    .windows(2)
+                    .any(|pair| { pair == ["--working-directory", "/worktrees/issue-28"] }));
+                for expected in [
+                    "NO_COLOR=1",
+                    "TALLY_WORKSPACE_REPO=mecattaf/tally.nix",
+                    "TALLY_WORKSPACE_BASE_REV=origin/main",
+                    "TALLY_WORKSPACE_BRANCH=wave-3-ergonomics",
+                    "TALLY_WORKSPACE_PATH=/worktrees/issue-28",
+                ] {
+                    assert!(args.windows(2).any(|pair| pair == ["--setenv", expected]));
+                }
+                assert!(args.ends_with(&[
+                    "--".to_owned(),
+                    "codex".to_owned(),
+                    "exec".to_owned(),
+                    "--json".to_owned(),
+                    "--dangerously-bypass-approvals-and-sandbox".to_owned(),
+                    "-C".to_owned(),
+                    "/worktrees/issue-28".to_owned(),
+                    "--".to_owned(),
+                    "author wave 3".to_owned(),
+                ]));
+                assert_eq!(
+                    query_row(&job.row, RowStatus::Pending)
+                        .workspace
+                        .unwrap()
+                        .worktree_path,
+                    PathBuf::from("/worktrees/issue-28")
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn public_continuation_uses_the_scraped_session_without_manual_captures() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let program = temp.path().join("resumable-agent");
+                fs::write(
+                    &program,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"thread_id\":\"session-28\"}'\n",
+                )
+                .unwrap();
+                fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+                let mut config = one_pool_config();
+                config.adapters.insert(
+                    "resumable".to_owned(),
+                    AdapterConfig {
+                        argv: vec![
+                            program.to_string_lossy().into_owned(),
+                            "fresh".to_owned(),
+                            "--".to_owned(),
+                        ],
+                        resume: Some(vec![
+                            program.to_string_lossy().into_owned(),
+                            "resume".to_owned(),
+                            "%<sessionRef>%".to_owned(),
+                            "--".to_owned(),
+                        ]),
+                        scrape: BTreeMap::from([(
+                            "sessionRef".to_owned(),
+                            ScrapeCapture {
+                                stream: ScrapeStream::Stdout,
+                                mode: ScrapeMode::JsonPath,
+                                pattern: "$..thread_id".to_owned(),
+                            },
+                        )]),
+                        ..AdapterConfig::default()
+                    },
+                );
+                config.validate().unwrap();
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(config, paths, settings(), executor)
+                    .await
+                    .unwrap();
+                let first = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": ["initial request"],
+                        "pool": "slot",
+                        "adapter": "resumable"
+                    })))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                daemon.handler.drain_post_ack_tasks().await;
+                let first_id = first["job_id"].as_str().unwrap();
+                assert_eq!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .jobs
+                        .get(&Uuid::parse_str(first_id).unwrap())
+                        .unwrap()
+                        .row
+                        .session_ref
+                        .as_deref(),
+                    Some("session-28")
+                );
+
+                let continued = daemon
+                    .handler
+                    .continue_job(Some(json!({
+                        "resumeFrom": first_id,
+                        "argv": ["address review"]
+                    })))
+                    .await
+                    .unwrap();
+                let continued_id = Uuid::parse_str(continued["job_id"].as_str().unwrap()).unwrap();
+                let continued_job = daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&continued_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    continued_job.invocation.argv,
+                    [
+                        program.to_string_lossy().into_owned(),
+                        "resume".to_owned(),
+                        "session-28".to_owned(),
+                        "--".to_owned(),
+                        "address review".to_owned(),
+                    ]
+                );
+                assert_eq!(continued_job.row.resumed_from.as_deref(), Some(first_id));
+                assert_eq!(continued_job.row.session_ref.as_deref(), Some("session-28"));
+
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                let terminal = daemon
+                    .handler
+                    .await_job(Some(json!({"job_id": continued_id.to_string()})))
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["verdict"], "pass");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn zero_exit_with_failed_and_missing_declared_gates_is_semantically_rejected() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let manifest = temp.path().join("gates.json");
+                fs::write(
+                    &manifest,
+                    r#"{"schemaVersion":1,"artifact":{"commit":"abc"},"gates":[{"id":"tests","status":"fail","command":"cargo test","reason":"one test failed"}]}"#,
+                )
+                .unwrap();
+                let program = temp.path().join("successful-job");
+                fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+                fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": [program],
+                        "pool": "slot",
+                        "gateManifest": {
+                            "path": manifest,
+                            "requiredGateIds": ["tests", "live"],
+                            "acceptancePolicy": "execution-and-gates"
+                        }
+                    })))
+                    .await
+                    .unwrap();
+                let finished = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    daemon.completion_rx.recv(),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                let terminal = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": admitted["task_uuid"]})))
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["exit_code"], 0);
+                assert_eq!(terminal["completion"]["execution"]["status"], "success");
+                assert_eq!(terminal["completion"]["gates"]["status"], "fail");
+                assert_eq!(
+                    terminal["completion"]["gates"]["missingRequiredGateIds"],
+                    json!(["live"])
+                );
+                assert_eq!(
+                    terminal["completion"]["acceptance"]["status"],
+                    "rejected"
+                );
+                let (_, witness) = read_verified_records(&paths.witness_path()).unwrap();
+                let completion = witness[0].completion.as_ref().unwrap();
+                assert_eq!(
+                    completion.execution.status,
+                    crate::completion::ExecutionStatus::Success
+                );
+                assert_eq!(
+                    completion.gates.status,
+                    crate::completion::GateSummaryStatus::Fail
+                );
+                assert_eq!(
+                    completion.acceptance.status,
+                    crate::completion::AcceptanceStatus::Rejected
+                );
             })
             .await;
     }
@@ -8679,6 +9288,7 @@ mod tests {
                         model: None,
                         evidence_class: None,
                         manifest_hash: None,
+                        completion: None,
                     })
                     .unwrap();
                 drop(ledger);

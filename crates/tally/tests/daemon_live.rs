@@ -410,6 +410,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                         ),
                         ("LIVE_JQ".to_owned(), jq.to_string_lossy().into_owned()),
                     ]),
+                    launch: tally_core::adapters::AdapterLaunchConfig::default(),
                     extra_config: BTreeMap::from([(
                         "modelFlag".to_owned(),
                         serde_json::Value::String("--model".to_owned()),

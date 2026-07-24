@@ -78,6 +78,122 @@ let
     }
   );
 
+  mkAdapterValueOverrideType =
+    field:
+    types.submodule (
+      { config, ... }: {
+        options = {
+          argv = mkOption {
+            type = types.listOf types.str;
+            default = [ ];
+            example =
+              if field == "model" then
+                [
+                  "--model"
+                  "%<value>%"
+                ]
+              else
+                [
+                  "-c"
+                  "model_reasoning_effort=%<value>%"
+                ];
+            description = "Direct argv template for an authorized per-job ${field} value.";
+          };
+          allowedValues = mkOption {
+            type = types.listOf types.str;
+            default = [ ];
+            example = if field == "model" then [ "gpt-5-codex" ] else [ "high" ];
+            description = "Closed set of per-job ${field} values accepted by this adapter.";
+          };
+          _tallyAssertions = internalAssertionsOption;
+        };
+
+        config._tallyAssertions = [
+          {
+            assertion = config.argv != [ ] && lib.any (argument: lib.hasInfix "%<value>%" argument) config.argv;
+            message = "tally adapter launch.${field}.argv must be non-empty and reference %<value>%";
+          }
+          {
+            assertion =
+              config.allowedValues != [ ]
+              && builtins.length config.allowedValues == builtins.length (unique config.allowedValues)
+              && lib.all (value: value != "") config.allowedValues;
+            message = "tally adapter launch.${field}.allowedValues must contain unique non-empty values";
+          }
+        ];
+      }
+    );
+
+  mkAdapterLaunchType = types.submodule (
+    { config, ... }: {
+      options = {
+        allowPrePromptArgv = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Authorize direct per-job argv insertion before the adapter's final -- delimiter.";
+        };
+        cwdArgv = mkOption {
+          type = types.nullOr (types.listOf types.str);
+          default = null;
+          example = [
+            "-C"
+            "%<cwd>%"
+          ];
+          description = "Optional direct argv template used to pass a job cwd to the adapter.";
+        };
+        approvalPolicies = mkOption {
+          type = types.attrsOf (types.listOf types.str);
+          default = { };
+          example.never = [
+            "--ask-for-approval"
+            "never"
+          ];
+          description = "Named approval policies mapped to exact direct argv fragments.";
+        };
+        sandboxPolicies = mkOption {
+          type = types.attrsOf (types.listOf types.str);
+          default = { };
+          example.workspace-write = [
+            "--sandbox"
+            "workspace-write"
+          ];
+          description = "Named sandbox policies mapped to exact direct argv fragments.";
+        };
+        model = mkOption {
+          type = types.nullOr (mkAdapterValueOverrideType "model");
+          default = null;
+          description = "Optional closed authorization for per-job model overrides.";
+        };
+        effort = mkOption {
+          type = types.nullOr (mkAdapterValueOverrideType "effort");
+          default = null;
+          description = "Optional closed authorization for per-job effort overrides.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions = flatten [
+        {
+          assertion =
+            config.cwdArgv == null
+            || (config.cwdArgv != [ ] && lib.any (argument: lib.hasInfix "%<cwd>%" argument) config.cwdArgv);
+          message = "tally adapter launch.cwdArgv must be null or a non-empty argv referencing %<cwd>%";
+        }
+        (mapAttrsToList (policy: _: {
+          assertion = policy != "";
+          message = "tally adapter approvalPolicies contains an empty policy name";
+        }) config.approvalPolicies)
+        (mapAttrsToList (policy: _: {
+          assertion = policy != "";
+          message = "tally adapter sandboxPolicies contains an empty policy name";
+        }) config.sandboxPolicies)
+        (if config.model == null then [ ] else config.model._tallyAssertions)
+        (if config.effort == null then [ ] else config.effort._tallyAssertions)
+      ];
+    }
+  );
+
   mkAdapterType = types.submodule (
     { config, name, ... }: {
       options = {
@@ -127,6 +243,11 @@ let
           example.NO_COLOR = "1";
           description = "Non-reserved environment added to adapter invocations.";
         };
+        launch = mkOption {
+          type = mkAdapterLaunchType;
+          default = { };
+          description = "Closed per-job direct-argv, cwd, policy, model, and effort authorization.";
+        };
         extraConfig = mkOption {
           type = types.attrsOf types.raw;
           default = { };
@@ -165,6 +286,160 @@ let
             && environment != "CREDENTIALS_DIRECTORY";
           message = "tally adapter ${name} environment name ${environment} is invalid or reserved";
         }) config.env)
+        config.launch._tallyAssertions
+      ];
+    }
+  );
+
+  mkAdapterJobOptionsType = types.submodule (
+    { config, name, ... }: {
+      options = {
+        prePromptArgv = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "--dangerously-bypass-approvals-and-sandbox" ];
+          description = "Per-job direct argv inserted before the adapter's final -- delimiter.";
+        };
+        environment = mkOption {
+          type = types.attrsOf types.str;
+          default = { };
+          example.NO_COLOR = "1";
+          description = "Per-job non-reserved environment merged over the adapter environment.";
+        };
+        approvalPolicy = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "never";
+          description = "Named approval policy authorized by the selected adapter.";
+        };
+        sandboxPolicy = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "danger-full-access";
+          description = "Named sandbox policy authorized by the selected adapter.";
+        };
+        model = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "gpt-5-codex";
+          description = "Per-job model override, accepted only from the adapter's closed allowlist.";
+        };
+        effort = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "high";
+          description = "Per-job effort override, accepted only from the adapter's closed allowlist.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions = flatten [
+        (mapAttrsToList (environment: _: {
+          assertion =
+            validEnvironmentName environment
+            && !(lib.hasPrefix "TALLY_" environment)
+            && environment != "CREDENTIALS_DIRECTORY";
+          message = "tally producer enqueue ${name} environment name ${environment} is invalid or reserved";
+        }) config.environment)
+        (map
+          (field: {
+            assertion = config.${field} == null || config.${field} != "";
+            message = "tally producer enqueue ${name} ${field} must be null or non-empty";
+          })
+          [
+            "approvalPolicy"
+            "sandboxPolicy"
+            "model"
+            "effort"
+          ]
+        )
+      ];
+    }
+  );
+
+  mkWorkspaceMetadataType = types.submodule (
+    { config, name, ... }: {
+      options = {
+        repo = mkOption {
+          type = types.str;
+          example = "mecattaf/tally.nix";
+          description = "Stable repository identity.";
+        };
+        baseRev = mkOption {
+          type = types.str;
+          example = "origin/main";
+          description = "Base revision from which this workspace was prepared.";
+        };
+        branch = mkOption {
+          type = types.str;
+          example = "wave-3-ergonomics";
+          description = "Workspace branch identity.";
+        };
+        worktreePath = mkOption {
+          type = types.str;
+          example = "/worktrees/tally-wave-3";
+          description = "Absolute worktree path recorded as job metadata.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions = [
+        {
+          assertion = lib.all (value: value != "") [
+            config.repo
+            config.baseRev
+            config.branch
+            config.worktreePath
+          ];
+          message = "tally producer enqueue ${name} workspace fields must be non-empty";
+        }
+        {
+          assertion = lib.hasPrefix "/" config.worktreePath && !(lib.hasInfix "%" config.worktreePath);
+          message = "tally producer enqueue ${name} workspace.worktreePath must be absolute and contain no systemd specifier";
+        }
+      ];
+    }
+  );
+
+  mkGateManifestType = types.submodule (
+    { config, name, ... }: {
+      options = {
+        path = mkOption {
+          type = types.str;
+          example = "/worktrees/tally-wave-3/.tally/gates.json";
+          description = "Absolute path to the versioned completion artifact written by the job.";
+        };
+        requiredGateIds = mkOption {
+          type = types.listOf types.str;
+          example = [
+            "tests"
+            "clippy"
+          ];
+          description = "Required IDs that must occur exactly once in the completion artifact.";
+        };
+        acceptancePolicy = mkOption {
+          type = types.enum [
+            "manual"
+            "execution-and-gates"
+          ];
+          default = "manual";
+          description = "Explicit policy that derives acceptance from execution and declared gates, or leaves it pending.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions = [
+        {
+          assertion = lib.hasPrefix "/" config.path && !(lib.hasInfix "%" config.path);
+          message = "tally producer enqueue ${name} gateManifest.path must be absolute and contain no systemd specifier";
+        }
+        {
+          assertion =
+            config.requiredGateIds != [ ]
+            && builtins.length config.requiredGateIds == builtins.length (unique config.requiredGateIds)
+            && lib.all (gate: gate != "") config.requiredGateIds;
+          message = "tally producer enqueue ${name} gateManifest.requiredGateIds must contain unique non-empty IDs";
+        }
       ];
     }
   );
@@ -186,6 +461,27 @@ let
           default = "shell";
           example = "codex-project";
           description = "Open-map adapter name.";
+        };
+        cwd = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "/worktrees/\${gh.repoName}";
+          description = "Absolute job cwd; gh enqueue values may use documented origin placeholders.";
+        };
+        workspace = mkOption {
+          type = types.nullOr mkWorkspaceMetadataType;
+          default = null;
+          description = "Optional durable repository/base/branch/worktree metadata.";
+        };
+        adapterOptions = mkOption {
+          type = mkAdapterJobOptionsType;
+          default = { };
+          description = "Per-job adapter options constrained by the selected adapter.";
+        };
+        gateManifest = mkOption {
+          type = types.nullOr mkGateManifestType;
+          default = null;
+          description = "Optional versioned completion artifact declaration and acceptance policy.";
         };
         pool = mkOption {
           type = types.coercedTo types.str (pool: [ pool ]) (types.listOf types.str);
@@ -287,6 +583,10 @@ let
           message = "tally producer enqueue ${name} requires an adapter";
         }
         {
+          assertion = config.cwd == null || (lib.hasPrefix "/" config.cwd && !(lib.hasInfix "%" config.cwd));
+          message = "tally producer enqueue ${name} cwd must be absolute and contain no systemd specifier";
+        }
+        {
           assertion = config.dedupKey == null || config.dedupKey != "";
           message = "tally producer enqueue ${name} dedupKey must be null or non-empty";
         }
@@ -294,6 +594,9 @@ let
           assertion = validCredentialName credential;
           message = "tally producer enqueue ${name} has invalid credential name ${credential}";
         }) config.credentials)
+        (if config.workspace == null then [ ] else config.workspace._tallyAssertions)
+        config.adapterOptions._tallyAssertions
+        (if config.gateManifest == null then [ ] else config.gateManifest._tallyAssertions)
       ];
     }
   );
@@ -707,11 +1010,41 @@ let
           example = 120;
           description = "GitHub polling cadence.";
         };
+        postReceipt = mkOption {
+          type = types.bool;
+          default = true;
+          example = false;
+          description = "Post an idempotent acknowledgement for accepted, filtered, and duplicate triggers.";
+        };
         postEvidence = mkOption {
           type = types.bool;
           default = false;
           example = true;
           description = "Post an idempotent evidence comment after a passing or reused verdict.";
+        };
+        postGateSummary = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Post the declared gate summary and derived acceptance fact.";
+        };
+        requestReview = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Request human review while semantic acceptance remains pending or rejected.";
+        };
+        closeOnAcceptance = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Close only after the explicit acceptance policy derives accepted.";
+        };
+        neverMutate = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Absolute policy override that disables every GitHub acknowledgement, comment, review request, and close.";
         };
         closeOnPass = mkOption {
           type = types.bool;
@@ -754,6 +1087,11 @@ let
           {
             assertion = !config.closeOnPass || config.postEvidence;
             message = "gh producer ${name} closeOnPass=true requires postEvidence=true";
+          }
+          {
+            assertion =
+              !(config.postGateSummary || config.closeOnAcceptance) || config.enqueue.gateManifest != null;
+            message = "gh producer ${name} postGateSummary/closeOnAcceptance requires enqueue.gateManifest";
           }
           (map (source: source._tallyAssertions) config.sources)
           config.triggers._tallyAssertions
@@ -1265,6 +1603,44 @@ let
       };
     };
 
+  renderAdapterJobOptions = options: {
+    inherit (options)
+      prePromptArgv
+      environment
+      approvalPolicy
+      sandboxPolicy
+      model
+      effort
+      ;
+  };
+
+  renderWorkspace =
+    workspace:
+    if workspace == null then
+      null
+    else
+      {
+        inherit (workspace)
+          repo
+          baseRev
+          branch
+          worktreePath
+          ;
+      };
+
+  renderGateManifest =
+    manifest:
+    if manifest == null then
+      null
+    else
+      {
+        inherit (manifest)
+          path
+          requiredGateIds
+          acceptancePolicy
+          ;
+      };
+
   renderEnqueue =
     enqueue:
     let
@@ -1274,6 +1650,7 @@ let
       inherit (enqueue)
         argv
         adapter
+        cwd
         priority
         dedupKey
         evidence
@@ -1284,6 +1661,9 @@ let
         noEnqueue
         executor
         ;
+      workspace = renderWorkspace enqueue.workspace;
+      adapterOptions = renderAdapterJobOptions enqueue.adapterOptions;
+      gateManifest = renderGateManifest enqueue.gateManifest;
       pool = if builtins.length pools == 1 then builtins.head pools else pools;
       credentials = mapAttrs (_: toString) enqueue.credentials;
     };
@@ -1346,7 +1726,12 @@ let
               allowSelfTriggered
               allowedActors
               pollIntervalSec
+              postReceipt
               postEvidence
+              postGateSummary
+              requestReview
+              closeOnAcceptance
+              neverMutate
               closeOnPass
               ;
             sources = map renderGhSource producer.sources;
@@ -1370,6 +1755,26 @@ let
       )
     );
 
+  renderAdapterValueOverride =
+    value:
+    if value == null then
+      null
+    else
+      {
+        inherit (value) argv allowedValues;
+      };
+
+  renderAdapterLaunch = launch: {
+    inherit (launch)
+      allowPrePromptArgv
+      cwdArgv
+      approvalPolicies
+      sandboxPolicies
+      ;
+    model = renderAdapterValueOverride launch.model;
+    effort = renderAdapterValueOverride launch.effort;
+  };
+
   renderAdapter = _: adapter: {
     inherit (adapter)
       argv
@@ -1378,6 +1783,7 @@ let
       env
       extraConfig
       ;
+    launch = renderAdapterLaunch adapter.launch;
     scrape = mapAttrs (_: capture: {
       inherit (capture) stream mode pattern;
     }) adapter.scrape;
