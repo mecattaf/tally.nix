@@ -316,6 +316,9 @@ enum QueueCommand {
         #[arg(last = true, required = true)]
         argv: Vec<String>,
     },
+    Retry {
+        job: String,
+    },
     Drain,
     AwaitJob {
         job: String,
@@ -1214,6 +1217,7 @@ async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
         resume_from: None,
         source: Some(args.source.into()),
         dedup_key: args.dedup_key,
+        submission: None,
         parent: args.parent,
         evidence: args.evidence,
         evidence_class: args.evidence_class,
@@ -1333,6 +1337,7 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
                 resume_from: Some(job),
                 source: None,
                 dedup_key: None,
+                submission: None,
                 parent: None,
                 evidence: Vec::new(),
                 evidence_class: None,
@@ -1351,6 +1356,9 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
                 wait,
             };
             submit_payload(socket, "queue.continue", payload, wait).await
+        }
+        QueueCommand::Retry { job } => {
+            print_rpc(socket, "queue.retry", Some(json!({"task_uuid": job}))).await
         }
         QueueCommand::Drain => print_rpc(socket, "queue.drain", Some(json!({}))).await,
         QueueCommand::AwaitJob { job } => {
@@ -1950,6 +1958,20 @@ mod tests {
                 }
             }) if job == "00000000-0000-4000-8000-000000000028"
                 && argv == ["address review"]
+        ));
+
+        let retry = Opts::try_parse_from([
+            "tally",
+            "queue",
+            "retry",
+            "00000000-0000-4000-8000-000000000028",
+        ])
+        .unwrap();
+        assert!(matches!(
+            retry.command,
+            Some(Command::Queue {
+                command: QueueCommand::Retry { job }
+            }) if job == "00000000-0000-4000-8000-000000000028"
         ));
     }
 

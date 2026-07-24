@@ -1140,6 +1140,7 @@ mod tests {
             attempt: 1,
             lease_epoch: 7,
             dedup_key: None,
+            payload_hash: None,
             labor_class: labor,
             trace_ref: None,
             pools: Some(vec!["gpu".to_owned()]),

@@ -6,6 +6,7 @@ use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
@@ -25,6 +26,7 @@ pub const FRAME_CAP_BYTES: usize = 64 * 1024;
 pub const RPC_METHODS: &[&str] = &[
     "queue.enqueue",
     "queue.continue",
+    "queue.retry",
     "queue.cancel",
     "queue.pause",
     "queue.resume",
@@ -75,6 +77,8 @@ pub enum WireErrorCode {
     Internal,
     Timeout,
     EpochChanged,
+    #[serde(rename = "dedup-key-conflict")]
+    DedupKeyConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -339,6 +343,18 @@ pub fn split_invocation(invocation: &str) -> Result<Vec<String>, WireError> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SubmissionMode {
+    Full,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct SubmissionOptions {
+    pub mode: SubmissionMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct EnqueuePayload {
     #[serde(default)]
@@ -372,6 +388,8 @@ pub struct EnqueuePayload {
     pub source: Option<EnqueueSource>,
     #[serde(default)]
     pub dedup_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<SubmissionOptions>,
     #[serde(default)]
     pub parent: Option<String>,
     #[serde(default)]
@@ -455,6 +473,57 @@ pub struct ResolvedEnqueue {
     pub wait: bool,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CanonicalPayload<'a> {
+    argv: &'a [String],
+    #[serde(rename = "pool", serialize_with = "crate::poolset::serialize")]
+    pools: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    executor: Option<&'a str>,
+    adapter: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<&'a Path>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<&'a WorkspaceMetadata>,
+    adapter_options: &'a AdapterJobOptions,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    gate_manifest: Option<&'a GateManifestSpec>,
+    evidence: &'a [String],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_class: Option<&'a Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    manifest_hash: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_max_sec: Option<u64>,
+    no_enqueue: bool,
+    credentials: &'a BTreeMap<String, PathBuf>,
+}
+
+pub fn canonical_payload(resolved: &ResolvedEnqueue) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&CanonicalPayload {
+        argv: &resolved.argv,
+        pools: &resolved.pools,
+        executor: resolved.executor.as_deref(),
+        adapter: &resolved.adapter,
+        cwd: resolved.cwd.as_deref(),
+        workspace: resolved.workspace.as_ref(),
+        adapter_options: &resolved.adapter_options,
+        gate_manifest: resolved.gate_manifest.as_ref(),
+        evidence: &resolved.evidence,
+        evidence_class: resolved.evidence_class.as_ref(),
+        manifest_hash: resolved.manifest_hash.as_deref(),
+        runtime_max_sec: resolved.runtime_max_sec,
+        no_enqueue: resolved.no_enqueue,
+        credentials: &resolved.credentials,
+    })
+}
+
+pub fn canonical_payload_hash(resolved: &ResolvedEnqueue) -> Result<String, serde_json::Error> {
+    let bytes = canonical_payload(resolved)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParentInfo {
     pub parent_uuid: String,
@@ -518,6 +587,21 @@ impl GuardrailState {
                 format!("parent job {job_id} has no child charge to roll back"),
             )
         })?;
+        Ok(())
+    }
+
+    pub fn charge_child(&mut self, job_id: &str) -> Result<(), WireError> {
+        let info = self
+            .parents
+            .get_mut(job_id)
+            .ok_or_else(|| WireError::not_found(format!("unknown parent job {job_id}")))?;
+        if info.children >= self.config.fanout_cap {
+            return Err(WireError::invalid(format!(
+                "parent fanout would exceed fanoutCap {}",
+                self.config.fanout_cap
+            )));
+        }
+        info.children += 1;
         Ok(())
     }
 
@@ -671,6 +755,10 @@ impl GuardrailState {
             return Err(WireError::invalid("adapter must not be empty"));
         }
 
+        let full_submission = payload
+            .submission
+            .as_ref()
+            .is_some_and(|submission| submission.mode == SubmissionMode::Full);
         let mut parent = payload.parent;
         let mut depth = 0;
         if let Some(caller_job_id) = payload.caller_job_id {
@@ -699,14 +787,16 @@ impl GuardrailState {
                     self.config.depth_cap
                 )));
             }
-            if info.children >= self.config.fanout_cap {
+            if !full_submission && info.children >= self.config.fanout_cap {
                 return Err(WireError::invalid(format!(
                     "parent fanout would exceed fanoutCap {}",
                     self.config.fanout_cap
                 )));
             }
             parent = Some(info.parent_uuid.clone());
-            info.children += 1;
+            if !full_submission {
+                info.children += 1;
+            }
         }
 
         Ok(ResolvedEnqueue {
@@ -962,6 +1052,7 @@ mod tests {
             resume_from: None,
             source: None,
             dedup_key: Some("child-1".to_owned()),
+            submission: None,
             parent: None,
             evidence: Vec::new(),
             evidence_class: None,
@@ -1209,5 +1300,117 @@ mod tests {
             "consumptionEstimate": -1
         });
         assert!(serde_json::from_value::<EnqueuePayload>(payload).is_err());
+    }
+
+    #[test]
+    fn canonical_payload_is_exact_ordered_and_excludes_admission_metadata() {
+        let mut payload = child_payload();
+        payload.caller_job_id = None;
+        payload.argv = Some(vec!["tool".to_owned(), "--flag".to_owned()]);
+        payload.pools = Some(vec!["zeta".to_owned(), "alpha".to_owned()]);
+        payload.executor = Some("worker".to_owned());
+        payload.adapter = Some("codex".to_owned());
+        payload.cwd = Some(PathBuf::from("/work/tree"));
+        payload.workspace = Some(WorkspaceMetadata {
+            repo: "acme/widgets".to_owned(),
+            base_rev: "origin/main".to_owned(),
+            branch: "fs-1".to_owned(),
+            worktree_path: PathBuf::from("/work/tree"),
+        });
+        payload.adapter_options = Some(AdapterJobOptions {
+            pre_prompt_argv: vec!["--json".to_owned()],
+            environment: BTreeMap::from([("NO_COLOR".to_owned(), "1".to_owned())]),
+            approval_policy: Some("never".to_owned()),
+            sandbox_policy: None,
+            model: Some("gpt-5".to_owned()),
+            effort: None,
+        });
+        payload.gate_manifest = Some(GateManifestSpec {
+            path: PathBuf::from("/work/tree/gates.json"),
+            required_gate_ids: vec!["tests".to_owned()],
+            acceptance_policy: Default::default(),
+        });
+        payload.evidence = vec!["exit:0".to_owned(), "artifact:/work/tree/out".to_owned()];
+        payload.evidence_class = Some(serde_json::json!({"kind": "build", "level": 2}));
+        payload.manifest_hash = Some("opaque-manifest".to_owned());
+        payload.runtime_max_sec = Some(300);
+        payload.no_enqueue = true;
+        payload
+            .credentials
+            .insert("token".to_owned(), PathBuf::from("/run/credentials/token"));
+        payload.priority = Some(Priority::Interrupt);
+        payload.dedup_key = Some("excluded-key".to_owned());
+        payload.consumption_estimate = Some(99);
+        payload.wait = true;
+
+        let mut state = GuardrailState::new(GuardrailConfig::default()).unwrap();
+        let resolved = state.validate_enqueue(payload, &defaults()).unwrap();
+        let canonical = String::from_utf8(canonical_payload(&resolved).unwrap()).unwrap();
+        assert_eq!(
+            canonical,
+            concat!(
+                r#"{"argv":["tool","--flag"],"pool":["alpha","zeta"],"executor":"worker","#,
+                r#""adapter":"codex","cwd":"/work/tree","workspace":{"repo":"acme/widgets","#,
+                r#""baseRev":"origin/main","branch":"fs-1","worktreePath":"/work/tree"},"#,
+                r#""adapterOptions":{"prePromptArgv":["--json"],"environment":{"NO_COLOR":"1"},"#,
+                r#""approvalPolicy":"never","model":"gpt-5"},"gateManifest":{"path":"#,
+                r#""/work/tree/gates.json","requiredGateIds":["tests"],"acceptancePolicy":"manual"},"#,
+                r#""evidence":["exit:0","artifact:/work/tree/out"],"evidenceClass":{"kind":"#,
+                r#""build","level":2},"manifestHash":"opaque-manifest","runtimeMaxSec":300,"#,
+                r#""noEnqueue":true,"credentials":{"token":"/run/credentials/token"}}"#
+            )
+        );
+        assert_eq!(
+            canonical_payload_hash(&resolved).unwrap(),
+            "sha256:3c5f2f51481120aa7cf11dd05410a4b521e0cc25e793b8cd73a1a9d0fdd02fc4"
+        );
+
+        let mut metadata_only = resolved.clone();
+        metadata_only.priority = Priority::Low;
+        metadata_only.source = EnqueueSource::Manual;
+        metadata_only.dedup_key = Some("another-key".to_owned());
+        metadata_only.parent = Some("00000000-0000-4000-8000-000000000001".to_owned());
+        metadata_only.consumption_estimate = Some(1);
+        metadata_only.resume_from = Some("00000000-0000-4000-8000-000000000002".to_owned());
+        metadata_only.task_uuid = Some("00000000-0000-4000-8000-000000000003".to_owned());
+        metadata_only.depth = 3;
+        metadata_only.wait = false;
+        assert_eq!(
+            canonical_payload_hash(&metadata_only).unwrap(),
+            canonical_payload_hash(&resolved).unwrap()
+        );
+
+        metadata_only.argv.push("different-work".to_owned());
+        assert_ne!(
+            canonical_payload_hash(&metadata_only).unwrap(),
+            canonical_payload_hash(&resolved).unwrap()
+        );
+    }
+
+    #[test]
+    fn full_submission_defers_fanout_charge_until_created_is_known() {
+        let mut state = GuardrailState::new(GuardrailConfig {
+            depth_cap: 3,
+            fanout_cap: 1,
+            require_dedup_key: true,
+        })
+        .unwrap();
+        state.register_parent(
+            "job-parent",
+            ParentInfo {
+                parent_uuid: "task-parent".to_owned(),
+                depth: 0,
+                children: 1,
+                no_enqueue: false,
+            },
+        );
+        let mut payload = child_payload();
+        payload.submission = Some(SubmissionOptions {
+            mode: SubmissionMode::Full,
+        });
+        let resolved = state.validate_enqueue(payload, &defaults()).unwrap();
+        assert_eq!(resolved.parent.as_deref(), Some("task-parent"));
+        assert_eq!(state.parent("job-parent").unwrap().children, 1);
+        assert!(state.charge_child("job-parent").is_err());
     }
 }

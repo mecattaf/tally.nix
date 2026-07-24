@@ -546,6 +546,66 @@ pub fn probe_dedup(
     }
 }
 
+pub fn probe_full_pass(evidence: &EvidenceSpec, matched: &WitnessRecord) -> DedupResult {
+    let dedup_key = matched.dedup_key.clone();
+    let paths: Vec<&Path> = evidence.artifact_paths().collect();
+    if paths.is_empty() {
+        return DedupResult {
+            hit: true,
+            dedup_key,
+            artifact_hash: matched.artifact_content_hash.clone(),
+            matched_witness_seq: Some(matched.seq),
+            rehashed: false,
+            miss_reason: None,
+        };
+    }
+
+    let mut hashes = Vec::with_capacity(paths.len());
+    for path in paths {
+        match hash_artifact_file(path) {
+            Ok(hash) => hashes.push(hash),
+            Err(_) => {
+                return dedup_miss(
+                    dedup_key.as_deref(),
+                    DedupMissReason::ArtifactUnavailable(path.to_owned()),
+                    true,
+                );
+            }
+        }
+    }
+    let current_hash = combine_artifact_hashes(&hashes)
+        .expect("at least one artifact hash was collected before combination");
+    if evidence
+        .hash_check()
+        .and_then(|check| match check {
+            EvidenceCheck::HashSha256 { expected } => expected.as_ref(),
+            _ => None,
+        })
+        .is_some_and(|expected| expected != &current_hash)
+    {
+        return dedup_miss(
+            dedup_key.as_deref(),
+            DedupMissReason::DeclaredHashMismatch,
+            true,
+        );
+    }
+    if matched.artifact_content_hash.as_deref() != Some(current_hash.as_str()) {
+        return dedup_miss(
+            dedup_key.as_deref(),
+            DedupMissReason::WitnessHashMismatch,
+            true,
+        );
+    }
+    DedupResult {
+        hit: true,
+        dedup_key,
+        artifact_hash: Some(current_hash),
+        matched_witness_seq: Some(matched.seq),
+        rehashed: true,
+        miss_reason: None,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RetryTrigger {
     PoolReturn,
@@ -629,6 +689,7 @@ mod tests {
             attempt: 1,
             lease_epoch: 1,
             dedup_key: Some(dedup_key.to_owned()),
+            payload_hash: None,
             labor_class: LaborClass::Fresh,
             trace_ref: None,
             pools: Some(vec!["gpu".to_owned()]),

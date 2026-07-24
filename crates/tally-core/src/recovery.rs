@@ -121,7 +121,7 @@ pub async fn collect_local_unit_facts(
     executor: &Executor,
     durable: &DurableRecoveryFacts,
 ) -> Result<BTreeMap<Uuid, LocalUnitFact>, RecoveryError> {
-    let mut latest_verdicts = BTreeMap::new();
+    let mut latest_records = BTreeMap::new();
     for record in &durable.witness {
         let Some(task_uuid) = record
             .task_uuid
@@ -130,7 +130,7 @@ pub async fn collect_local_unit_facts(
         else {
             continue;
         };
-        latest_verdicts.insert(task_uuid, record.verdict);
+        latest_records.insert(task_uuid, (record.verdict, record.attempt, record.seq));
     }
 
     let mut facts = BTreeMap::new();
@@ -145,10 +145,16 @@ pub async fn collect_local_unit_facts(
         // recovery plan, but it would make every historical worker a startup
         // dependency forever. Rows with no witness or a retryable verdict must
         // still be probed because a later presentation may be in flight.
+        let pending_explicit_retry = latest_records.get(&uuid).is_some_and(|(_, attempt, seq)| {
+            event.retries.iter().any(|retry| {
+                retry.previous_witness_seq == *seq && retry.attempt == attempt.saturating_add(1)
+            })
+        });
         let remote_is_canonically_terminal = event.row.executor.is_some()
-            && latest_verdicts
+            && latest_records
                 .get(&uuid)
-                .is_some_and(|verdict| retry_trigger(*verdict).is_none());
+                .is_some_and(|(verdict, _, _)| retry_trigger(*verdict).is_none())
+            && !pending_explicit_retry;
         let fact = if remote_is_canonically_terminal {
             LocalUnitFact::absent(executor.unit_name(&identity))
         } else {
@@ -358,8 +364,14 @@ pub fn recover(
             )));
         }
         let history = histories.get(&row.uuid).map(Vec::as_slice).unwrap_or(&[]);
-        validate_history(&row, history, facts.current_lease_epoch)?;
+        validate_history(&row, history, &event.retries, facts.current_lease_epoch)?;
         let latest = history.last().copied();
+        let explicit_retry = latest.is_some_and(|record| {
+            event.retries.iter().any(|retry| {
+                retry.attempt == record.attempt.saturating_add(1)
+                    && retry.previous_witness_seq == record.seq
+            })
+        });
         let unit = facts.units.get(&row.uuid).ok_or_else(|| {
             RecoveryError::InvalidFacts(format!(
                 "local unit fact is missing for durable row {}",
@@ -389,6 +401,7 @@ pub fn recover(
             &mut row,
             event.guardrail_depth,
             latest,
+            explicit_retry,
             unit,
             &mut rows,
             &mut actions,
@@ -408,6 +421,23 @@ pub fn recover(
                     row,
                     state: RecoveryRowState::Pending,
                     labor_class: LaborClass::Fresh,
+                    guardrail_depth: event.guardrail_depth,
+                });
+            }
+            Some(record) if explicit_retry => {
+                row.attempt = record.attempt.checked_add(1).ok_or_else(|| {
+                    RecoveryError::InvalidFacts(format!("attempt overflow for row {}", row.uuid))
+                })?;
+                row.lease_epoch = facts.current_lease_epoch;
+                actions.push(RecoveryAction::QueueExisting {
+                    task_uuid: row.uuid,
+                    attempt: row.attempt,
+                    lease_epoch: row.lease_epoch,
+                });
+                rows.push(RecoveryRow {
+                    row,
+                    state: RecoveryRowState::Pending,
+                    labor_class: LaborClass::Recovered,
                     guardrail_depth: event.guardrail_depth,
                 });
             }
@@ -454,13 +484,23 @@ pub fn recover(
 fn validate_history(
     row: &RowSeed,
     history: &[&WitnessRecord],
+    retries: &[crate::taskdb::DurableRetry],
     current_epoch: u64,
 ) -> Result<(), RecoveryError> {
     let mut expected_attempt = row.attempt;
     let mut previous_epoch = row.lease_epoch;
-    let mut previous_verdict = None;
+    let mut previous_record: Option<&WitnessRecord> = None;
     for record in history {
-        if previous_verdict.is_some_and(|verdict| retry_trigger(verdict).is_none()) {
+        let explicit_retry = previous_record.is_some_and(|previous| {
+            retries.iter().any(|retry| {
+                retry.attempt == record.attempt
+                    && retry.previous_witness_seq == previous.seq
+                    && record.attempt == previous.attempt.saturating_add(1)
+            })
+        });
+        if previous_record.is_some_and(|previous| retry_trigger(previous.verdict).is_none())
+            && !explicit_retry
+        {
             return Err(RecoveryError::InvalidFacts(format!(
                 "witness seq {} replays row {} after a terminal outcome",
                 record.seq, row.uuid
@@ -488,13 +528,13 @@ fn validate_history(
             )));
         }
         previous_epoch = record.lease_epoch;
-        if previous_verdict.is_some() && record.labor_class != LaborClass::Recovered {
+        if previous_record.is_some() && record.labor_class != LaborClass::Recovered {
             return Err(RecoveryError::InvalidFacts(format!(
                 "witness seq {} for re-presented row {} is not recovered labor",
                 record.seq, row.uuid
             )));
         }
-        previous_verdict = Some(record.verdict);
+        previous_record = Some(record);
         if record
             .pools
             .as_ref()
@@ -509,6 +549,50 @@ fn validate_history(
             return Err(RecoveryError::InvalidFacts(format!(
                 "witness seq {} executor does not match durable row {}",
                 record.seq, row.uuid
+            )));
+        }
+        if record.payload_hash != row.payload_hash {
+            return Err(RecoveryError::InvalidFacts(format!(
+                "witness seq {} payload hash does not match durable row {}",
+                record.seq, row.uuid
+            )));
+        }
+    }
+    for retry in retries {
+        let previous = history
+            .iter()
+            .copied()
+            .find(|record| record.seq == retry.previous_witness_seq)
+            .ok_or_else(|| {
+                RecoveryError::InvalidFacts(format!(
+                    "retry attempt {} for row {} references missing witness seq {}",
+                    retry.attempt, row.uuid, retry.previous_witness_seq
+                ))
+            })?;
+        if previous.verdict == Verdict::Pass {
+            return Err(RecoveryError::InvalidFacts(format!(
+                "retry attempt {} for row {} follows a pass verdict",
+                retry.attempt, row.uuid
+            )));
+        }
+        if previous
+            .attempt
+            .checked_add(1)
+            .is_none_or(|attempt| attempt != retry.attempt)
+        {
+            return Err(RecoveryError::InvalidFacts(format!(
+                "retry attempt {} for row {} does not follow witness attempt {}",
+                retry.attempt, row.uuid, previous.attempt
+            )));
+        }
+        let has_result = history.iter().any(|record| record.attempt == retry.attempt);
+        let is_pending_latest = history.last().is_some_and(|latest| {
+            latest.seq == previous.seq && latest.attempt.saturating_add(1) == retry.attempt
+        });
+        if !has_result && !is_pending_latest {
+            return Err(RecoveryError::InvalidFacts(format!(
+                "retry attempt {} for row {} has no terminal result and is not the live frontier",
+                retry.attempt, row.uuid
             )));
         }
     }
@@ -651,6 +735,7 @@ fn handle_present_unit(
     row: &mut RowSeed,
     guardrail_depth: u32,
     latest: Option<&WitnessRecord>,
+    explicit_retry: bool,
     unit: &LocalUnitFact,
     rows: &mut Vec<RecoveryRow>,
     actions: &mut Vec<RecoveryAction>,
@@ -713,7 +798,9 @@ fn handle_present_unit(
             let expected_attempt = record.attempt.checked_add(1).ok_or_else(|| {
                 RecoveryError::InvalidFacts(format!("attempt overflow for row {}", row.uuid))
             })?;
-            if attempt != expected_attempt || retry_trigger(record.verdict).is_none() {
+            if attempt != expected_attempt
+                || (retry_trigger(record.verdict).is_none() && !explicit_retry)
+            {
                 return Err(RecoveryError::InvalidFacts(format!(
                     "unit {} attempt {} is not the next eligible presentation after witness seq {}",
                     unit.unit, attempt, record.seq
@@ -892,7 +979,7 @@ mod tests {
         RemoteExecutorReply, RemoteExecutorRequest, RemoteExecutorResult, RemoteTransport,
         RemoteTransportError, REMOTE_EXECUTOR_PROTOCOL_VERSION,
     };
-    use crate::taskdb::{write_enqueue_event_atomic, EnqueueSource};
+    use crate::taskdb::{write_enqueue_event_atomic, DurableRetry, EnqueueSource};
     use crate::witness::{build_record, ChainHead, WitnessBody};
 
     use super::*;
@@ -913,6 +1000,7 @@ mod tests {
             gate_manifest: None,
             resumed_from: None,
             dedup_key: Some(format!("dedup:{uuid}")),
+            payload_hash: None,
             session_ref: None,
             lease_epoch,
             attempt: 1,
@@ -953,6 +1041,7 @@ mod tests {
                         attempt: row.attempt + index as u32,
                         lease_epoch: *lease_epoch,
                         dedup_key: row.dedup_key.clone(),
+                        payload_hash: row.payload_hash.clone(),
                         labor_class: if index == 0 {
                             LaborClass::Fresh
                         } else {
@@ -1126,6 +1215,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut explicitly_retried = row(Uuid::new_v4(), "worker", 3);
+        explicitly_retried.executor = Some("worker".to_owned());
+        let records = witness(&explicitly_retried, &[(Verdict::Failed, 3)]);
+        let mut retried_event = event(explicitly_retried.clone());
+        retried_event.retries.push(DurableRetry {
+            attempt: 2,
+            previous_witness_seq: records[0].seq,
+        });
+        let retried_facts =
+            DurableRecoveryFacts::from_verified(vec![retried_event], records).unwrap();
+        collect_local_unit_facts(&executor, &retried_facts)
+            .await
+            .unwrap();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a pending explicit retry must probe its remote execution unit"
+        );
     }
 
     #[test]
@@ -1526,6 +1634,75 @@ mod tests {
             empty_triggers(),
         );
         assert!(recover(&wrong_labor, retry_policy(true, 3)).is_err());
+    }
+
+    #[test]
+    fn explicit_retry_is_a_durable_pending_lane_and_only_non_pass_can_open_it() {
+        let row = row(Uuid::new_v4(), "worker", 2);
+        let failed = witness(&row, &[(Verdict::Failed, 2)]);
+        let mut retried = event(row.clone());
+        retried.retries.push(DurableRetry {
+            attempt: 2,
+            previous_witness_seq: failed[0].seq,
+        });
+        let facts = RecoveryFacts {
+            durable: DurableRecoveryFacts::from_verified(vec![retried.clone()], failed.clone())
+                .unwrap(),
+            current_lease_epoch: 3,
+            units: BTreeMap::from([(row.uuid, LocalUnitFact::absent(unit_name(&row)))]),
+            rowless_units: BTreeMap::new(),
+            triggers: empty_triggers(),
+            advisory_return_attestations: Vec::new(),
+        };
+        let plan = recover(&facts, retry_policy(false, 1)).unwrap();
+        assert!(matches!(
+            plan.actions.as_slice(),
+            [RecoveryAction::QueueExisting {
+                task_uuid,
+                attempt: 2,
+                lease_epoch: 3,
+            }] if *task_uuid == row.uuid
+        ));
+        assert_eq!(plan.rows[0].row.attempt, 2);
+        assert_eq!(plan.rows[0].state, RecoveryRowState::Pending);
+        assert_eq!(plan.rows[0].labor_class, LaborClass::Recovered);
+
+        let settled = witness(
+            &row,
+            &[(Verdict::Failed, 2), (Verdict::CleanExitNoArtifact, 3)],
+        );
+        let settled_facts = RecoveryFacts {
+            durable: DurableRecoveryFacts::from_verified(vec![retried], settled).unwrap(),
+            current_lease_epoch: 3,
+            units: BTreeMap::from([(row.uuid, LocalUnitFact::absent(unit_name(&row)))]),
+            rowless_units: BTreeMap::new(),
+            triggers: empty_triggers(),
+            advisory_return_attestations: Vec::new(),
+        };
+        let settled_plan = recover(&settled_facts, retry_policy(false, 1)).unwrap();
+        assert!(settled_plan.actions.is_empty());
+        assert_eq!(settled_plan.rows[0].row.attempt, 2);
+        assert_eq!(settled_plan.rows[0].state, RecoveryRowState::Completed);
+
+        let passed = witness(&row, &[(Verdict::Pass, 2)]);
+        let mut invalid = event(row.clone());
+        invalid.retries.push(DurableRetry {
+            attempt: 2,
+            previous_witness_seq: passed[0].seq,
+        });
+        let invalid_facts = RecoveryFacts {
+            durable: DurableRecoveryFacts::from_verified(vec![invalid], passed).unwrap(),
+            current_lease_epoch: 2,
+            units: BTreeMap::from([(row.uuid, LocalUnitFact::absent(unit_name(&row)))]),
+            rowless_units: BTreeMap::new(),
+            triggers: empty_triggers(),
+            advisory_return_attestations: Vec::new(),
+        };
+        assert!(matches!(
+            recover(&invalid_facts, retry_policy(false, 9)),
+            Err(RecoveryError::InvalidFacts(reason))
+                if reason.contains("follows a pass verdict")
+        ));
     }
 
     #[test]

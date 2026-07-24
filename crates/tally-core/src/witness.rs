@@ -56,6 +56,8 @@ pub struct WitnessRecord {
     pub attempt: u32,
     pub lease_epoch: u64,
     pub dedup_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_hash: Option<String>,
     pub labor_class: LaborClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_ref: Option<String>,
@@ -92,6 +94,7 @@ pub struct WitnessBody {
     pub attempt: u32,
     pub lease_epoch: u64,
     pub dedup_key: Option<String>,
+    pub payload_hash: Option<String>,
     pub labor_class: LaborClass,
     pub trace_ref: Option<String>,
     pub pools: Option<Vec<String>>,
@@ -208,6 +211,7 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
         attempt: body.attempt,
         lease_epoch: body.lease_epoch,
         dedup_key: body.dedup_key,
+        payload_hash: body.payload_hash,
         labor_class: body.labor_class,
         trace_ref: body.trace_ref,
         pools,
@@ -262,6 +266,15 @@ fn validate_record(raw: &Value) -> Result<WitnessRecord, String> {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
     }) {
         return Err("executor is not a safe registry component".to_owned());
+    }
+    if record.payload_hash.as_ref().is_some_and(|payload_hash| {
+        payload_hash.len() != 71
+            || !payload_hash.starts_with("sha256:")
+            || !payload_hash[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err("payload_hash is not lowercase sha256 hex".to_owned());
     }
     if record.seq == 0 {
         return Err("seq missing or not a positive integer".to_owned());
@@ -875,6 +888,7 @@ mod tests {
             attempt: 1,
             lease_epoch: 42,
             dedup_key: Some("ocr:paper-0001".to_owned()),
+            payload_hash: None,
             labor_class: LaborClass::Fresh,
             trace_ref: None,
             pools: Some(vec!["worker-gpu".to_owned()]),
@@ -929,6 +943,9 @@ mod tests {
         assert!(!serde_json::to_string(&record)
             .unwrap()
             .contains("\"completion\""));
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains("\"payload_hash\""));
     }
 
     #[test]
@@ -937,12 +954,15 @@ mod tests {
         let absent_json = serde_json::to_string(&absent).unwrap();
         assert!(!absent_json.contains("evidence_class"));
         assert!(!absent_json.contains("manifest_hash"));
+        assert!(!absent_json.contains("payload_hash"));
 
         let mut present_body = body();
+        present_body.payload_hash = Some(format!("sha256:{}", "b".repeat(64)));
         present_body.evidence_class = Some(Value::String("opaque/class".to_owned()));
         present_body.manifest_hash = Some(Value::String("urn:manifest:anything".to_owned()));
         let present = build_record(present_body, &ChainHead::default()).unwrap();
         let json = serde_json::to_string(&present).unwrap();
+        assert!(json.find("payload_hash").unwrap() < json.find("labor_class").unwrap());
         assert!(json.find("evidence_class").unwrap() < json.find("manifest_hash").unwrap());
         assert!(json.find("manifest_hash").unwrap() < json.find("\"seq\"").unwrap());
         let report = verify_reader(BufReader::new(json.as_bytes()));

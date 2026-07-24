@@ -46,6 +46,7 @@ pub const TALLY_UDA_NAMES: &[&str] = &[
     "gate_manifest_json",
     "resumed_from",
     "dedup_key",
+    "payload_hash",
     "lease_epoch",
     "source",
     "priority_class",
@@ -866,6 +867,8 @@ pub struct RowSeed {
     pub resumed_from: Option<String>,
     #[serde(default)]
     pub dedup_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_hash: Option<String>,
     #[serde(default)]
     pub session_ref: Option<String>,
     pub lease_epoch: u64,
@@ -934,6 +937,17 @@ impl RowSeed {
         if self.attempt == 0 {
             return Err(TaskDbError::InvalidSeed(
                 "attempt must be positive".to_owned(),
+            ));
+        }
+        if self.payload_hash.as_ref().is_some_and(|payload_hash| {
+            payload_hash.len() != 71
+                || !payload_hash.starts_with("sha256:")
+                || !payload_hash[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err(TaskDbError::InvalidSeed(
+                "payloadHash must be lowercase sha256 hex".to_owned(),
             ));
         }
         if self.lease_epoch == 0 {
@@ -1068,6 +1082,13 @@ pub struct DurableReuse {
     pub artifact_content_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DurableRetry {
+    pub attempt: u32,
+    pub previous_witness_seq: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DurableEnqueueEvent {
@@ -1080,6 +1101,8 @@ pub struct DurableEnqueueEvent {
     pub reuse: Option<DurableReuse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ingress_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub retries: Vec<DurableRetry>,
     pub row: RowSeed,
 }
 
@@ -1097,6 +1120,7 @@ impl DurableEnqueueEvent {
             guardrail_depth,
             reuse: None,
             ingress_id: None,
+            retries: Vec::new(),
             row,
         })
     }
@@ -1118,6 +1142,7 @@ impl DurableEnqueueEvent {
                 artifact_content_hash,
             }),
             ingress_id: None,
+            retries: Vec::new(),
             row,
         };
         event.validate()?;
@@ -1171,6 +1196,26 @@ impl DurableEnqueueEvent {
                     version,
                 });
             }
+        }
+        let mut previous_attempt = self.row.attempt;
+        let mut previous_witness_seq = 0;
+        for retry in &self.retries {
+            if retry.attempt <= previous_attempt {
+                return Err(TaskDbError::InvalidEvent {
+                    path: PathBuf::from(format!("event: {}", self.event_id)),
+                    reason: "retry attempts must be positive and increasing".to_owned(),
+                });
+            }
+            if retry.previous_witness_seq == 0 || retry.previous_witness_seq <= previous_witness_seq
+            {
+                return Err(TaskDbError::InvalidEvent {
+                    path: PathBuf::from(format!("event: {}", self.event_id)),
+                    reason: "retry previousWitnessSeq values must be positive and increasing"
+                        .to_owned(),
+                });
+            }
+            previous_attempt = retry.attempt;
+            previous_witness_seq = retry.previous_witness_seq;
         }
         self.row.validate()
     }
@@ -1553,6 +1598,9 @@ fn populate_task(
     if let Some(dedup_key) = seed.dedup_key {
         attributes.insert("dedup_key", dedup_key);
     }
+    if let Some(payload_hash) = seed.payload_hash {
+        attributes.insert("payload_hash", payload_hash);
+    }
     if let Some(session_ref) = seed.session_ref {
         attributes.insert("session_ref", session_ref);
     }
@@ -1666,6 +1714,58 @@ pub fn write_enqueue_event_atomic(
             .and_then(|file| file.sync_all())
             .map_err(|source| io_error(directory, source))
     })
+}
+
+pub fn update_enqueue_event_atomic(
+    events_dir: &Path,
+    event: &DurableEnqueueEvent,
+) -> Result<PathBuf, TaskDbError> {
+    let mut event = event.clone();
+    event.row.canonicalize()?;
+    event.validate()?;
+    let bytes = serde_json::to_vec(&event)?;
+    if bytes.len().saturating_add(1) > MAX_DURABLE_EVENT_BYTES as usize {
+        return Err(TaskDbError::InvalidEvent {
+            path: events_dir.to_owned(),
+            reason: format!("event exceeds the {MAX_DURABLE_EVENT_BYTES} byte durable-event limit"),
+        });
+    }
+    std::fs::create_dir_all(events_dir).map_err(|source| io_error(events_dir, source))?;
+    let final_path = events_dir.join(format!("{}.enqueue.json", event.event_id));
+    if !final_path.exists() {
+        return Err(TaskDbError::InvalidEvent {
+            path: final_path,
+            reason: "cannot update a missing acknowledged enqueue event".to_owned(),
+        });
+    }
+    let temporary_path = events_dir.join(format!(
+        ".{}.{}.enqueue.tmp",
+        event.event_id,
+        Uuid::new_v4()
+    ));
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary_path)
+            .map_err(|source| io_error(&temporary_path, source))?;
+        file.write_all(&bytes)
+            .map_err(|source| io_error(&temporary_path, source))?;
+        file.write_all(b"\n")
+            .map_err(|source| io_error(&temporary_path, source))?;
+        file.sync_all()
+            .map_err(|source| io_error(&temporary_path, source))?;
+        std::fs::rename(&temporary_path, &final_path)
+            .map_err(|source| io_error(&final_path, source))?;
+        File::open(events_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| io_error(events_dir, source))?;
+        Ok(final_path.clone())
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary_path);
+    }
+    write_result
 }
 
 fn write_enqueue_event_atomic_with_sync(
@@ -1821,6 +1921,7 @@ mod tests {
             gate_manifest: None,
             resumed_from: None,
             dedup_key: Some("ocr:paper-1".to_owned()),
+            payload_hash: None,
             session_ref: None,
             lease_epoch: 7,
             attempt: 1,
@@ -1866,6 +1967,8 @@ mod tests {
         assert_eq!(event.row.pools, ["alpha", "zeta"]);
         let encoded = serde_json::to_value(&event).unwrap();
         assert_eq!(encoded["row"]["pool"], serde_json::json!(["alpha", "zeta"]));
+        assert!(encoded["row"].get("payloadHash").is_none());
+        assert!(encoded.get("retries").is_none());
         assert_eq!(
             serde_json::from_value::<DurableEnqueueEvent>(encoded)
                 .unwrap()
@@ -2066,6 +2169,8 @@ mod tests {
         let parent = seed(uuid).parent_uuid.unwrap();
         let mut row_seed = seed(uuid);
         row_seed.parent_uuid = Some(parent);
+        let payload_hash = format!("sha256:{}", "c".repeat(64));
+        row_seed.payload_hash = Some(payload_hash.clone());
         let related_trigger = RelatedTrigger {
             producer: "github".to_owned(),
             event_id: "comment-42".to_owned(),
@@ -2091,6 +2196,7 @@ mod tests {
         assert_eq!(row.argv().unwrap(), ["ocr", "paper.pdf"]);
         assert_eq!(row.evidence().unwrap(), ["artifact:/work/paper.txt"]);
         assert_eq!(row.value("consumption_estimate"), Some("60"));
+        assert_eq!(row.value("payload_hash"), Some(payload_hash.as_str()));
         assert_eq!(
             serde_json::from_str::<RelatedTrigger>(row.value("related_trigger_json").unwrap())
                 .unwrap(),
@@ -2212,6 +2318,26 @@ mod tests {
         assert!(!events
             .join(format!(".{}.enqueue.tmp", second.event_id))
             .exists());
+    }
+
+    #[test]
+    fn acknowledged_enqueue_event_retry_frontier_is_replaced_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let events = temp.path().join("events");
+        let mut event = DurableEnqueueEvent::new(seed(Uuid::new_v4())).unwrap();
+        let path = write_enqueue_event_atomic(&events, &event).unwrap();
+        event.retries.push(DurableRetry {
+            attempt: 2,
+            previous_witness_seq: 7,
+        });
+        assert_eq!(update_enqueue_event_atomic(&events, &event).unwrap(), path);
+        let restored = read_acknowledged_events(&events).unwrap();
+        assert_eq!(restored, [event]);
+        assert!(events.read_dir().unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with('.')));
     }
 
     #[test]

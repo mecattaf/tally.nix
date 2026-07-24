@@ -31,7 +31,8 @@ use crate::completion::{
 };
 use crate::config::{Config, PoolPredicate, Priority};
 use crate::evidence::{
-    parse_evidence_specs, probe_dedup, run_evidence_gate, CheckOutcome, RetryTrigger, RunOutcome,
+    parse_evidence_specs, probe_dedup, probe_full_pass, run_evidence_gate, CheckOutcome,
+    DedupMissReason, RetryTrigger, RunOutcome,
 };
 use crate::executor::{
     ExecutionIdentity, ExecutionOutcome, ExecutionRequest, ExecutionTermination, Executor,
@@ -64,14 +65,16 @@ use crate::recovery::{
     RecoveryTriggers,
 };
 use crate::taskdb::{
-    admits_durable_row, read_acknowledged_events, write_enqueue_event_atomic, AdmissionInput,
-    AdmissionOrigin, DurableEnqueueEvent, EnqueueSource, RowSeed, TaskDb, TaskDbError,
+    admits_durable_row, read_acknowledged_events, update_enqueue_event_atomic,
+    write_enqueue_event_atomic, AdmissionInput, AdmissionOrigin, DurableEnqueueEvent, DurableRetry,
+    EnqueueSource, RowSeed, TaskDb, TaskDbError,
 };
 use crate::trace::{query_trace, trace_availability, TraceError, TraceLane};
 use crate::watch::{ChangeError, ChangeKind, ChangeStore};
 use crate::wire::{
-    serve_connection, EnqueuePayload, GuardrailConfig, GuardrailState, ParentInfo,
-    ProducerDefaults, RequestFrame, RpcHandler, WireError, WireErrorCode, WireIoError,
+    canonical_payload_hash, serve_connection, EnqueuePayload, GuardrailConfig, GuardrailState,
+    ParentInfo, ProducerDefaults, RequestFrame, RpcHandler, SubmissionMode, WireError,
+    WireErrorCode, WireIoError,
 };
 use crate::witness::{
     append_attestation, read_verified_attestations, read_verified_records, repair_attestation_tail,
@@ -400,6 +403,8 @@ pub struct Context {
     unreachable_paused_jobs: HashSet<Uuid>,
     applied_pool_transitions: HashSet<(String, u64)>,
     barriers: BarrierTracker,
+    rows: BTreeMap<Uuid, RowSeed>,
+    guardrail_depths: BTreeMap<Uuid, u32>,
     query_rows: BTreeMap<Uuid, RowFact>,
     query_details: BTreeMap<Uuid, RowDetailFact>,
 }
@@ -596,6 +601,7 @@ impl RpcHandler for DaemonHandler {
             match request.method.as_str() {
                 "queue.enqueue" => self.enqueue(request.params).await,
                 "queue.continue" => self.continue_job(request.params).await,
+                "queue.retry" => self.retry_job(request.params).await,
                 "queue.await_job" => self.await_job(request.params).await,
                 "queue.await_barrier" => self.await_barrier(request.params).await,
                 "queue.drain" => self.drain(request.params).await,
@@ -653,11 +659,292 @@ impl DaemonHandler {
         self.enqueue_payload(payload, None).await
     }
 
+    async fn retry_job(&self, params: Option<Value>) -> Result<Value, WireError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            #[serde(alias = "taskUuid")]
+            task_uuid: String,
+        }
+
+        let params: Params = decode_params(params)?;
+        let task_uuid = Uuid::parse_str(&params.task_uuid)
+            .map_err(|_| WireError::invalid("task_uuid must be a UUID"))?;
+        let mut context = self.context.write().await;
+        if context.jobs.get(&task_uuid).is_some_and(|job| {
+            matches!(
+                job.state,
+                JobState::Paused | JobState::Queued | JobState::Running
+            )
+        }) {
+            return Err(WireError::invalid(format!(
+                "job {task_uuid} is not terminal and cannot be retried"
+            )));
+        }
+        let mut row = context
+            .rows
+            .get(&task_uuid)
+            .cloned()
+            .ok_or_else(|| WireError::invalid(format!("job {task_uuid} was not found")))?;
+        let (report, records) =
+            read_verified_records(&context.paths.witness_path()).map_err(internal_wire)?;
+        if !report.ok {
+            return Err(internal_wire(
+                "witness verification failed while admitting retry",
+            ));
+        }
+        let canonical_task_uuid = task_uuid.to_string();
+        let terminal = records
+            .iter()
+            .filter(|record| record.task_uuid.as_deref() == Some(canonical_task_uuid.as_str()))
+            .max_by_key(|record| record.seq)
+            .cloned()
+            .ok_or_else(|| {
+                WireError::invalid(format!(
+                    "job {task_uuid} has no terminal witness and cannot be retried"
+                ))
+            })?;
+        if terminal.attempt != row.attempt {
+            return Err(internal_wire(format!(
+                "job {task_uuid} row attempt {} disagrees with terminal witness attempt {}",
+                row.attempt, terminal.attempt
+            )));
+        }
+        if terminal.payload_hash != row.payload_hash {
+            return Err(internal_wire(format!(
+                "job {task_uuid} durable row and terminal witness payload hashes disagree"
+            )));
+        }
+        if terminal.verdict == Verdict::Pass {
+            return Err(WireError::invalid(format!(
+                "job {task_uuid} passed and cannot be retried"
+            )));
+        }
+        let next_attempt = row
+            .attempt
+            .checked_add(1)
+            .ok_or_else(|| WireError::invalid(format!("job {task_uuid} attempt overflow")))?;
+        row.attempt = next_attempt;
+        row.lease_epoch = context.epoch;
+
+        let engine = AdapterEngine::new(&context.config.adapters);
+        let invocation = if row.resumed_from.is_some() {
+            let session_ref = row.session_ref.clone().ok_or_else(|| {
+                WireError::invalid(format!(
+                    "continued job {task_uuid} has no durable session reference"
+                ))
+            })?;
+            let mut captures =
+                BTreeMap::from([("sessionRef".to_owned(), Value::String(session_ref))]);
+            if let Some(model) = &row.model {
+                captures.insert("model".to_owned(), Value::String(model.clone()));
+            }
+            engine.resume_with_options(
+                &row.adapter,
+                &row.argv,
+                &ScrapeResult { captures },
+                &row.adapter_options,
+                row.cwd.as_deref(),
+            )
+        } else {
+            engine.launch_with_options(
+                &row.adapter,
+                &row.argv,
+                &row.adapter_options,
+                row.cwd.as_deref(),
+            )
+        }
+        .map_err(|error| WireError::invalid(error.to_string()))?;
+        row.validate()
+            .map_err(|error| WireError::invalid(error.to_string()))?;
+
+        let mut job = Job {
+            job_id: task_uuid,
+            task_uuid: Some(task_uuid),
+            row: row.clone(),
+            invocation,
+            labor_class: LaborClass::Recovered,
+            state: JobState::Queued,
+            lease_id: None,
+            adopted: false,
+            adopted_invocation_id: None,
+            model_is_advisory: false,
+        };
+        let unit = self.executor.unit_name(&job.identity());
+        let request = lease_request(&job, unit);
+        context
+            .lease
+            .engine()
+            .validate_admission(&request)
+            .map_err(lease_wire)?;
+
+        let parent_charge = row.payload_hash.is_some()
+            && row.parent_uuid.is_some()
+            && context
+                .guardrail_depths
+                .get(&task_uuid)
+                .is_some_and(|depth| *depth > 0);
+        if let Some(parent_uuid) = row.parent_uuid.filter(|_| parent_charge) {
+            context.guardrails.charge_child(&parent_uuid.to_string())?;
+        }
+
+        let events_dir = context.paths.events_dir();
+        let mut matching_events = read_acknowledged_events(&events_dir)
+            .map_err(internal_wire)?
+            .into_iter()
+            .filter(|event| event.row.uuid == task_uuid)
+            .collect::<Vec<_>>();
+        if matching_events.len() != 1 {
+            if let Some(parent_uuid) = row.parent_uuid.filter(|_| parent_charge) {
+                context
+                    .guardrails
+                    .rollback_child_charge(&parent_uuid.to_string())?;
+            }
+            return Err(internal_wire(format!(
+                "job {task_uuid} has {} acknowledged enqueue events",
+                matching_events.len()
+            )));
+        }
+        let mut event = matching_events
+            .pop()
+            .expect("exactly one matching event was checked");
+        event.retries.push(DurableRetry {
+            attempt: next_attempt,
+            previous_witness_seq: terminal.seq,
+        });
+        if let Err(error) = update_enqueue_event_atomic(&events_dir, &event) {
+            // Atomic replacement can fail after the rename made the retry
+            // durable. Stop serving so recovery, rather than this generation,
+            // decides whether the new attempt is pending.
+            return Err(self.fail_stop(error.into()));
+        }
+
+        let stable_key = task_uuid.to_string();
+        let barrier = context.barriers.register_job(&stable_key, next_attempt);
+        let mut launch = None;
+        if row.pools.iter().any(|pool| {
+            context.paused_pools.contains(pool) || context.unreachable_pools.contains(pool)
+        }) {
+            job.state = JobState::Paused;
+            if row
+                .pools
+                .iter()
+                .any(|pool| context.unreachable_pools.contains(pool))
+            {
+                context.unreachable_paused_jobs.insert(task_uuid);
+            }
+        } else {
+            match context.lease.admit(request, Utc::now()) {
+                Ok(AdmitOutcome::Granted(grant)) => {
+                    job.lease_id = Some(grant.lease_id.clone());
+                    job.state = JobState::Running;
+                    context.lease_jobs.insert(grant.lease_id, task_uuid);
+                    launch = Some(job.clone());
+                }
+                Ok(AdmitOutcome::Queued { ticket_id, .. }) => {
+                    job.lease_id = Some(ticket_id.clone());
+                    context.lease_jobs.insert(ticket_id, task_uuid);
+                }
+                Err(error) => {
+                    eprintln!(
+                        "tally: retried job {} is waiting for lease retry: {error}",
+                        job.stable_key()
+                    );
+                }
+            }
+        }
+        context.aliases.insert(stable_key.clone(), task_uuid);
+        let guardrail_depth = context
+            .guardrail_depths
+            .get(&task_uuid)
+            .copied()
+            .unwrap_or(0);
+        if context.guardrails.parent(&stable_key).is_none() {
+            let child_count = context
+                .rows
+                .values()
+                .filter(|child| child.parent_uuid == Some(task_uuid))
+                .filter(|child| {
+                    child.payload_hash.is_none()
+                        || context
+                            .jobs
+                            .get(&child.uuid)
+                            .is_some_and(|job| job.state != JobState::Completed)
+                })
+                .count();
+            let children = u32::try_from(child_count)
+                .map_err(|_| internal_wire("retry child guardrail count overflow"))?;
+            context.guardrails.register_parent(
+                stable_key.clone(),
+                ParentInfo {
+                    parent_uuid: stable_key.clone(),
+                    depth: guardrail_depth,
+                    children,
+                    no_enqueue: row.no_enqueue,
+                },
+            );
+        }
+        context.rows.insert(task_uuid, row.clone());
+        context
+            .query_rows
+            .insert(task_uuid, query_row(&row, RowStatus::Pending));
+        context.query_details.insert(
+            task_uuid,
+            RowDetailFact::from_seed(&row, RowStatus::Pending, LaborClass::Recovered),
+        );
+        if let Some(parent) = context.guardrails.parent(&stable_key).cloned() {
+            context.guardrails.register_parent(
+                stable_key.clone(),
+                ParentInfo {
+                    depth: guardrail_depth,
+                    ..parent
+                },
+            );
+        }
+        context.jobs.insert(task_uuid, job.clone());
+        drop(context);
+
+        if self
+            .commits
+            .send(CommitCommand::Upsert {
+                row: Box::new(row.clone()),
+                status: Status::Pending,
+                labor_class: LaborClass::Recovered,
+            })
+            .is_err()
+        {
+            eprintln!("tally: post-ack replica worker stopped before retry projection");
+        }
+        self.emit_post_ack(enqueued_event(&job));
+        if let Some(job) = launch {
+            self.spawn_execution(job);
+        }
+        let mut response = json!({
+            "schemaVersion": 1,
+            "retried": true,
+            "task_uuid": stable_key,
+            "taskUuid": stable_key,
+            "job_id": stable_key,
+            "barrier": barrier,
+            "state": state_name(job.state),
+            "status": state_name(job.state),
+            "attempt": next_attempt,
+        });
+        if let Some(payload_hash) = row.payload_hash {
+            response["payloadHash"] = Value::String(payload_hash);
+        }
+        Ok(response)
+    }
+
     async fn enqueue_payload(
         &self,
         mut payload: EnqueuePayload,
         ingress_id: Option<String>,
     ) -> Result<Value, WireError> {
+        let full_mode = payload
+            .submission
+            .as_ref()
+            .is_some_and(|submission| submission.mode == SubmissionMode::Full);
         let caller_job_id = payload.caller_job_id.clone();
         let mut context = self.context.write().await;
         let resumed_job = if let Some(resume_from) = payload.resume_from.as_deref() {
@@ -753,6 +1040,7 @@ impl DaemonHandler {
             adapter_options: Default::default(),
         };
         let mut resolved = context.guardrails.validate_enqueue(payload, &defaults)?;
+        let mut child_charged = caller_job_id.is_some() && !full_mode;
         for pool in &resolved.pools {
             let pool_credentials = context
                 .config
@@ -767,7 +1055,7 @@ impl DaemonHandler {
                     .get(&name)
                     .is_some_and(|existing| existing != &source)
                 {
-                    rollback_child_charge(&mut context, caller_job_id.as_deref())?;
+                    rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
                     return Err(WireError::invalid(format!(
                         "credential {name:?} has conflicting pool and enqueue sources"
                     )));
@@ -815,7 +1103,7 @@ impl DaemonHandler {
         let invocation = match rendered {
             Ok(invocation) => invocation,
             Err(error) => {
-                rollback_child_charge(&mut context, caller_job_id.as_deref())?;
+                rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
                 return Err(WireError::invalid(error.to_string()));
             }
         };
@@ -832,11 +1120,24 @@ impl DaemonHandler {
             needs_cross_source_urgency: resolved.priority.rank() >= Priority::High.rank(),
         });
         if !durable {
-            rollback_child_charge(&mut context, caller_job_id.as_deref())?;
+            rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
             return Err(internal_wire(
                 "RPC admissions must always have a durable recovery row",
             ));
         }
+        let payload_hash = if full_mode {
+            match canonical_payload_hash(&resolved) {
+                Ok(payload_hash) => Some(payload_hash),
+                Err(error) => {
+                    rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
+                    return Err(internal_wire(format!(
+                        "cannot serialize canonical enqueue payload: {error}"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
         let job_id = resolved
             .task_uuid
             .as_deref()
@@ -844,8 +1145,10 @@ impl DaemonHandler {
             .transpose()
             .map_err(|_| WireError::invalid("taskUuid must be a UUID"))?
             .unwrap_or_else(Uuid::new_v4);
-        if context.jobs.contains_key(&job_id) || context.query_rows.contains_key(&job_id) {
-            rollback_child_charge(&mut context, caller_job_id.as_deref())?;
+        if !full_mode
+            && (context.jobs.contains_key(&job_id) || context.query_rows.contains_key(&job_id))
+        {
+            rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
             return Err(WireError::invalid(format!(
                 "task UUID {job_id} is already admitted"
             )));
@@ -873,6 +1176,7 @@ impl DaemonHandler {
             gate_manifest: resolved.gate_manifest,
             resumed_from: resolved.resume_from,
             dedup_key: resolved.dedup_key.clone(),
+            payload_hash,
             session_ref: resumed_job
                 .as_ref()
                 .and_then(|job| job.row.session_ref.clone()),
@@ -892,166 +1196,323 @@ impl DaemonHandler {
             manifest_hash: resolved.manifest_hash.map(Value::String),
         };
         if let Err(error) = row.validate() {
-            rollback_child_charge(&mut context, caller_job_id.as_deref())?;
+            rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
             return Err(WireError::invalid(error.to_string()));
         }
 
-        if let Some(dedup_key) = row
-            .dedup_key
-            .clone()
-            .filter(|_| row.gate_manifest.is_none())
-        {
-            let evidence = parse_evidence_specs(&row.evidence)
-                .expect("guardrail validation canonicalized evidence before charging fanout");
-            let witness_path = context.paths.witness_path();
-            drop(context);
-            let probe = tokio::task::spawn_blocking(move || {
-                let (report, witness) = read_verified_records(&witness_path)?;
-                if !report.ok {
-                    return Err(WitnessError::Corrupt(
-                        "witness verification failed during dedup probe".to_owned(),
-                    ));
-                }
-                Ok(probe_dedup(Some(&dedup_key), &evidence, &witness))
-            })
-            .await;
-            context = self.context.write().await;
-            let dedup = match probe {
-                Ok(Ok(dedup)) => dedup,
-                Ok(Err(error)) => {
-                    rollback_child_charge(&mut context, caller_job_id.as_deref())?;
-                    return Err(internal_wire(error));
-                }
-                Err(error) => {
-                    rollback_child_charge(&mut context, caller_job_id.as_deref())?;
-                    return Err(internal_wire(format!("dedup worker failed: {error}")));
-                }
-            };
-            if dedup.hit {
-                let artifact_hash = dedup
-                    .artifact_hash
-                    .clone()
-                    .expect("a dedup hit always carries an artifact hash");
-                let matched_witness_seq = dedup
-                    .matched_witness_seq
-                    .expect("a dedup hit always carries a matched witness");
-                let event = match DurableEnqueueEvent::new_reuse_with_depth(
-                    row.clone(),
-                    resolved.depth,
-                    matched_witness_seq,
-                    artifact_hash.clone(),
-                )
-                .and_then(|event| event.with_ingress_id(ingress_id.clone()))
-                {
-                    Ok(event) => event,
-                    Err(error) => {
-                        rollback_child_charge(&mut context, caller_job_id.as_deref())?;
-                        return Err(WireError::invalid(error.to_string()));
+        let mut reused_rejected = None;
+        let mut reuse_error_detail = None;
+        if full_mode {
+            if let (Some(dedup_key), Some(payload_hash)) = (
+                row.dedup_key
+                    .as_deref()
+                    .filter(|key| !key.trim().is_empty()),
+                row.payload_hash.as_deref(),
+            ) {
+                loop {
+                    if let Some(response) =
+                        full_live_disposition(&context, dedup_key, payload_hash)?
+                    {
+                        return Ok(response);
                     }
-                };
-                let job = Job {
-                    job_id,
-                    task_uuid,
-                    row: row.clone(),
-                    invocation: invocation.clone(),
-                    labor_class: LaborClass::Reused,
-                    state: JobState::Completed,
-                    lease_id: None,
-                    adopted: false,
-                    adopted_invocation_id: None,
-                    model_is_advisory: false,
-                };
-                let stable_key = job.stable_key();
-                let barrier = context.barriers.register_job(&stable_key, row.attempt);
-                // The durable reuse disposition is the crash-repair marker for
-                // the following canonical verdict append. Recovery completes
-                // exactly this witness and can never execute the row as Fresh.
-                let events_dir = context.paths.events_dir();
-                if let Err(error) = write_enqueue_event_atomic(&events_dir, &event) {
-                    let renamed = events_dir.join(format!("{}.enqueue.json", event.event_id));
-                    if renamed.exists() {
-                        return Err(self.fail_stop(error.into()));
+                    let witness_path = context.paths.witness_path();
+                    let probe_dedup_key = dedup_key.to_owned();
+                    let probe_payload_hash = payload_hash.to_owned();
+                    let evidence_specs = row.evidence.clone();
+                    drop(context);
+                    let probe = tokio::task::spawn_blocking(move || {
+                        let (report, witness) = read_verified_records(&witness_path)?;
+                        if !report.ok {
+                            return Err(WitnessError::Corrupt(
+                                "witness verification failed during full dedup probe".to_owned(),
+                            ));
+                        }
+                        let governing = witness
+                            .iter()
+                            .filter(|record| {
+                                record.dedup_key.as_deref() == Some(probe_dedup_key.as_str())
+                            })
+                            .max_by_key(|record| record.seq)
+                            .cloned();
+                        let pass_probe = governing.as_ref().and_then(|record| {
+                            (record.payload_hash.as_deref() == Some(probe_payload_hash.as_str())
+                                && record.verdict == Verdict::Pass)
+                                .then(|| {
+                                    let evidence = parse_evidence_specs(&evidence_specs)
+                                        .expect("validated row evidence remains canonical");
+                                    probe_full_pass(&evidence, record)
+                                })
+                        });
+                        Ok((report.last_seq.unwrap_or(0), governing, pass_probe))
+                    })
+                    .await;
+                    context = self.context.write().await;
+                    let (loaded_head, governing, pass_probe) = match probe {
+                        Ok(Ok(probe)) => probe,
+                        Ok(Err(error)) => return Err(internal_wire(error)),
+                        Err(error) => {
+                            return Err(internal_wire(format!(
+                                "full dedup worker failed: {error}"
+                            )));
+                        }
+                    };
+                    if let Some(response) =
+                        full_live_disposition(&context, dedup_key, payload_hash)?
+                    {
+                        return Ok(response);
                     }
-                    rollback_child_charge(&mut context, caller_job_id.as_deref())?;
-                    if matches!(&error, TaskDbError::InvalidEvent { .. }) {
-                        return Err(WireError::invalid(error.to_string()));
+                    if context.witness.head().seq != loaded_head {
+                        continue;
                     }
-                    return Err(internal_wire(error));
+                    let Some(governing) = governing else {
+                        break;
+                    };
+                    let Some(existing_payload_hash) = governing.payload_hash.as_deref() else {
+                        reused_rejected = Some("payload-hash-unrecorded");
+                        break;
+                    };
+                    if existing_payload_hash != payload_hash {
+                        let task_uuid = governing
+                            .task_uuid
+                            .clone()
+                            .unwrap_or_else(|| format!("witness:{}", governing.seq));
+                        return Err(dedup_conflict(
+                            dedup_key,
+                            payload_hash,
+                            vec![(task_uuid, Some(existing_payload_hash.to_owned()))],
+                        ));
+                    }
+                    if governing.verdict != Verdict::Pass {
+                        return full_terminal_response(&governing, payload_hash, "terminal");
+                    }
+                    let pass_probe = pass_probe.expect(
+                        "matching pass governing records are artifact-probed in the worker",
+                    );
+                    if pass_probe.hit {
+                        return full_terminal_response(&governing, payload_hash, "reused");
+                    }
+                    match pass_probe.miss_reason {
+                        Some(DedupMissReason::WitnessHashMismatch) => {
+                            reused_rejected = Some("artifact-drift");
+                        }
+                        Some(DedupMissReason::DeclaredHashMismatch) => {
+                            reused_rejected = Some("declared-hash-mismatch");
+                        }
+                        Some(DedupMissReason::ArtifactUnavailable(path)) => {
+                            reused_rejected = Some("artifact-unavailable");
+                            reuse_error_detail = Some(path.to_string_lossy().into_owned());
+                        }
+                        Some(reason) => {
+                            return Err(internal_wire(format!(
+                                "unexpected full dedup miss: {reason:?}"
+                            )));
+                        }
+                        None => {
+                            return Err(internal_wire(
+                                "full dedup miss omitted its rejection reason",
+                            ));
+                        }
+                    }
+                    break;
                 }
-                let record = match context.witness.append(WitnessBody {
-                    task_uuid: task_uuid.map(|uuid| uuid.to_string()),
-                    transition_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                    verdict: Verdict::Reused,
-                    exit_code: 0,
-                    artifact_content_hash: Some(artifact_hash.clone()),
-                    gpu_seconds: None,
-                    wall_clock: 0.0,
-                    attempt: row.attempt,
-                    lease_epoch: row.lease_epoch,
-                    dedup_key: row.dedup_key.clone(),
-                    labor_class: LaborClass::Reused,
-                    trace_ref: None,
-                    pools: Some(row.pools.clone()),
-                    executor: row.executor.clone(),
-                    charge: None,
-                    model: row.model.clone(),
-                    evidence_class: row.evidence_class.clone(),
-                    manifest_hash: row.manifest_hash.clone(),
-                    completion: None,
-                }) {
-                    Ok(record) => record,
-                    Err(error) => return Err(self.fail_stop(error.into())),
-                };
-                let result = JobResult {
-                    task_uuid: task_uuid.map(|uuid| uuid.to_string()),
-                    job_id: job_id.to_string(),
-                    verdict: Verdict::Reused,
-                    exit_code: 0,
-                    artifact_content_hash: Some(artifact_hash.clone()),
-                    attempt: row.attempt,
-                    lease_epoch: row.lease_epoch,
-                    witness_seq: record.seq,
-                    completion: None,
-                };
-                context.barriers.complete_job(&stable_key, result.value());
-                context.aliases.insert(job_id.to_string(), job_id);
-                context.aliases.insert(stable_key.clone(), job_id);
-                context.guardrails.register_parent(
-                    job_id.to_string(),
-                    ParentInfo {
-                        parent_uuid: stable_key.clone(),
-                        depth: resolved.depth,
-                        children: 0,
-                        no_enqueue: row.no_enqueue,
-                    },
-                );
-                context
-                    .query_rows
-                    .insert(row_uuid, query_row(&row, RowStatus::Completed));
-                context.query_details.insert(
-                    row_uuid,
-                    RowDetailFact::from_seed(&row, RowStatus::Completed, LaborClass::Reused),
-                );
-                context.jobs.insert(job_id, job.clone());
-                let evidence = serde_json::to_string(&row.evidence).map_err(internal_wire)?;
+            }
+        }
+
+        if !full_mode {
+            if let Some(dedup_key) = row
+                .dedup_key
+                .clone()
+                .filter(|_| row.gate_manifest.is_none())
+            {
+                let evidence = parse_evidence_specs(&row.evidence)
+                    .expect("guardrail validation canonicalized evidence before charging fanout");
+                let witness_path = context.paths.witness_path();
                 drop(context);
-                if self.commits.send(CommitCommand::Rebuild).is_err() {
-                    eprintln!("tally: post-ack replica worker stopped before reuse projection");
+                let probe = tokio::task::spawn_blocking(move || {
+                    let (report, witness) = read_verified_records(&witness_path)?;
+                    if !report.ok {
+                        return Err(WitnessError::Corrupt(
+                            "witness verification failed during dedup probe".to_owned(),
+                        ));
+                    }
+                    Ok(probe_dedup(Some(&dedup_key), &evidence, &witness))
+                })
+                .await;
+                context = self.context.write().await;
+                let dedup = match probe {
+                    Ok(Ok(dedup)) => dedup,
+                    Ok(Err(error)) => {
+                        rollback_child_charge(
+                            &mut context,
+                            caller_job_id.as_deref(),
+                            child_charged,
+                        )?;
+                        return Err(internal_wire(error));
+                    }
+                    Err(error) => {
+                        rollback_child_charge(
+                            &mut context,
+                            caller_job_id.as_deref(),
+                            child_charged,
+                        )?;
+                        return Err(internal_wire(format!("dedup worker failed: {error}")));
+                    }
+                };
+                if dedup.hit {
+                    let artifact_hash = dedup
+                        .artifact_hash
+                        .clone()
+                        .expect("a dedup hit always carries an artifact hash");
+                    let matched_witness_seq = dedup
+                        .matched_witness_seq
+                        .expect("a dedup hit always carries a matched witness");
+                    let event = match DurableEnqueueEvent::new_reuse_with_depth(
+                        row.clone(),
+                        resolved.depth,
+                        matched_witness_seq,
+                        artifact_hash.clone(),
+                    )
+                    .and_then(|event| event.with_ingress_id(ingress_id.clone()))
+                    {
+                        Ok(event) => event,
+                        Err(error) => {
+                            rollback_child_charge(
+                                &mut context,
+                                caller_job_id.as_deref(),
+                                child_charged,
+                            )?;
+                            return Err(WireError::invalid(error.to_string()));
+                        }
+                    };
+                    let job = Job {
+                        job_id,
+                        task_uuid,
+                        row: row.clone(),
+                        invocation: invocation.clone(),
+                        labor_class: LaborClass::Reused,
+                        state: JobState::Completed,
+                        lease_id: None,
+                        adopted: false,
+                        adopted_invocation_id: None,
+                        model_is_advisory: false,
+                    };
+                    let stable_key = job.stable_key();
+                    let barrier = context.barriers.register_job(&stable_key, row.attempt);
+                    // The durable reuse disposition is the crash-repair marker for
+                    // the following canonical verdict append. Recovery completes
+                    // exactly this witness and can never execute the row as Fresh.
+                    let events_dir = context.paths.events_dir();
+                    if let Err(error) = write_enqueue_event_atomic(&events_dir, &event) {
+                        let renamed = events_dir.join(format!("{}.enqueue.json", event.event_id));
+                        if renamed.exists() {
+                            return Err(self.fail_stop(error.into()));
+                        }
+                        rollback_child_charge(
+                            &mut context,
+                            caller_job_id.as_deref(),
+                            child_charged,
+                        )?;
+                        if matches!(&error, TaskDbError::InvalidEvent { .. }) {
+                            return Err(WireError::invalid(error.to_string()));
+                        }
+                        return Err(internal_wire(error));
+                    }
+                    let record = match context.witness.append(WitnessBody {
+                        task_uuid: task_uuid.map(|uuid| uuid.to_string()),
+                        transition_timestamp: Utc::now()
+                            .to_rfc3339_opts(SecondsFormat::Millis, true),
+                        verdict: Verdict::Reused,
+                        exit_code: 0,
+                        artifact_content_hash: Some(artifact_hash.clone()),
+                        gpu_seconds: None,
+                        wall_clock: 0.0,
+                        attempt: row.attempt,
+                        lease_epoch: row.lease_epoch,
+                        dedup_key: row.dedup_key.clone(),
+                        payload_hash: row.payload_hash.clone(),
+                        labor_class: LaborClass::Reused,
+                        trace_ref: None,
+                        pools: Some(row.pools.clone()),
+                        executor: row.executor.clone(),
+                        charge: None,
+                        model: row.model.clone(),
+                        evidence_class: row.evidence_class.clone(),
+                        manifest_hash: row.manifest_hash.clone(),
+                        completion: None,
+                    }) {
+                        Ok(record) => record,
+                        Err(error) => return Err(self.fail_stop(error.into())),
+                    };
+                    let result = JobResult {
+                        task_uuid: task_uuid.map(|uuid| uuid.to_string()),
+                        job_id: job_id.to_string(),
+                        verdict: Verdict::Reused,
+                        exit_code: 0,
+                        artifact_content_hash: Some(artifact_hash.clone()),
+                        attempt: row.attempt,
+                        lease_epoch: row.lease_epoch,
+                        witness_seq: record.seq,
+                        completion: None,
+                    };
+                    context.barriers.complete_job(&stable_key, result.value());
+                    context.aliases.insert(job_id.to_string(), job_id);
+                    context.aliases.insert(stable_key.clone(), job_id);
+                    context.guardrails.register_parent(
+                        job_id.to_string(),
+                        ParentInfo {
+                            parent_uuid: stable_key.clone(),
+                            depth: resolved.depth,
+                            children: 0,
+                            no_enqueue: row.no_enqueue,
+                        },
+                    );
+                    context
+                        .query_rows
+                        .insert(row_uuid, query_row(&row, RowStatus::Completed));
+                    context.rows.insert(row_uuid, row.clone());
+                    context.guardrail_depths.insert(row_uuid, resolved.depth);
+                    context.query_details.insert(
+                        row_uuid,
+                        RowDetailFact::from_seed(&row, RowStatus::Completed, LaborClass::Reused),
+                    );
+                    context.jobs.insert(job_id, job.clone());
+                    let evidence = serde_json::to_string(&row.evidence).map_err(internal_wire)?;
+                    drop(context);
+                    if self.commits.send(CommitCommand::Rebuild).is_err() {
+                        eprintln!("tally: post-ack replica worker stopped before reuse projection");
+                    }
+                    self.complete_gh_post_ack(job.row.clone(), result.clone());
+                    self.emit_post_ack(enqueued_event(&job));
+                    self.emit_post_ack(completed_event(&job, &result, evidence));
+                    return Ok(json!({
+                        "schemaVersion": 1,
+                        "disposition": "reused",
+                        "task_uuid": task_uuid.map(|uuid| uuid.to_string()),
+                        "job_id": job_id.to_string(),
+                        "barrier": barrier,
+                        "state": "reused",
+                        "status": "reused",
+                        "verdict": Verdict::Reused,
+                        "dedup_key": dedup.dedup_key,
+                        "artifact_content_hash": dedup.artifact_hash,
+                        "witness_lsn": dedup.matched_witness_seq,
+                    }));
                 }
-                self.complete_gh_post_ack(job.row.clone(), result.clone());
-                self.emit_post_ack(enqueued_event(&job));
-                self.emit_post_ack(completed_event(&job, &result, evidence));
-                return Ok(json!({
-                    "task_uuid": task_uuid.map(|uuid| uuid.to_string()),
-                    "job_id": job_id.to_string(),
-                    "barrier": barrier,
-                    "state": "reused",
-                    "status": "reused",
-                    "verdict": Verdict::Reused,
-                    "dedup_key": dedup.dedup_key,
-                    "artifact_content_hash": dedup.artifact_hash,
-                    "witness_lsn": dedup.matched_witness_seq,
-                }));
+            }
+        }
+
+        if full_mode
+            && (context.jobs.contains_key(&job_id) || context.query_rows.contains_key(&job_id))
+        {
+            return Err(WireError::invalid(format!(
+                "task UUID {job_id} is already admitted"
+            )));
+        }
+
+        if full_mode {
+            if let Some(caller_job_id) = caller_job_id.as_deref() {
+                context.guardrails.charge_child(caller_job_id)?;
+                child_charged = true;
             }
         }
 
@@ -1071,7 +1532,7 @@ impl DaemonHandler {
         let unit = self.executor.unit_name(&job.identity());
         let request = lease_request(&job, unit);
         if let Err(error) = context.lease.engine().validate_admission(&request) {
-            rollback_child_charge(&mut context, caller_job_id.as_deref())?;
+            rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
             return Err(lease_wire(error));
         }
 
@@ -1081,7 +1542,7 @@ impl DaemonHandler {
             {
                 Ok(event) => event,
                 Err(error) => {
-                    rollback_child_charge(&mut context, caller_job_id.as_deref())?;
+                    rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
                     return Err(WireError::invalid(error.to_string()));
                 }
             };
@@ -1091,7 +1552,7 @@ impl DaemonHandler {
                 if renamed.exists() {
                     return Err(self.fail_stop(error.into()));
                 }
-                rollback_child_charge(&mut context, caller_job_id.as_deref())?;
+                rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
                 if matches!(&error, TaskDbError::InvalidEvent { .. }) {
                     return Err(WireError::invalid(error.to_string()));
                 }
@@ -1150,6 +1611,8 @@ impl DaemonHandler {
             context
                 .query_rows
                 .insert(row_uuid, query_row(&row, RowStatus::Pending));
+            context.rows.insert(row_uuid, row.clone());
+            context.guardrail_depths.insert(row_uuid, resolved.depth);
             context.query_details.insert(
                 row_uuid,
                 RowDetailFact::from_seed(&row, RowStatus::Pending, LaborClass::Fresh),
@@ -1174,12 +1637,29 @@ impl DaemonHandler {
         if let Some(job) = launch {
             self.spawn_execution(job);
         }
-        Ok(json!({
+        let mut response = json!({
+            "schemaVersion": 1,
+            "disposition": "created",
             "task_uuid": task_uuid.map(|uuid| uuid.to_string()),
             "job_id": job_id.to_string(),
             "barrier": barrier,
             "state": state_name(job.state),
-        }))
+        });
+        if full_mode {
+            response["payloadHash"] = Value::String(
+                row.payload_hash
+                    .clone()
+                    .expect("full-mode rows always carry a payload hash"),
+            );
+            response["attempt"] = json!(row.attempt);
+            if let Some(reason) = reused_rejected {
+                response["reusedRejected"] = Value::String(reason.to_owned());
+            }
+            if let Some(detail) = reuse_error_detail {
+                response["errorDetail"] = Value::String(detail);
+            }
+        }
+        Ok(response)
     }
 
     async fn await_job(&self, params: Option<Value>) -> Result<Value, WireError> {
@@ -1748,6 +2228,10 @@ impl DaemonHandler {
         context.unreachable_pools.remove(pool);
         for recovery in &plan.rows {
             let row = &recovery.row;
+            context.rows.insert(row.uuid, row.clone());
+            context
+                .guardrail_depths
+                .insert(row.uuid, recovery.guardrail_depth);
             context
                 .query_rows
                 .insert(row.uuid, query_row(row, RowStatus::Pending));
@@ -2936,8 +3420,15 @@ fn internal_wire(error: impl ToString) -> WireError {
 fn rollback_child_charge(
     context: &mut Context,
     caller_job_id: Option<&str>,
+    charged: bool,
 ) -> Result<(), WireError> {
-    if let Some(caller_job_id) = caller_job_id {
+    if charged {
+        let caller_job_id = caller_job_id.ok_or_else(|| {
+            WireError::new(
+                WireErrorCode::Internal,
+                "child charge is set without a caller job",
+            )
+        })?;
         context.guardrails.rollback_child_charge(caller_job_id)?;
     }
     Ok(())
@@ -3309,6 +3800,136 @@ fn state_name(state: JobState) -> &'static str {
     }
 }
 
+fn dedup_conflict(
+    dedup_key: &str,
+    payload_hash: &str,
+    mut existing: Vec<(String, Option<String>)>,
+) -> WireError {
+    existing.sort_by(|left, right| left.0.cmp(&right.0));
+    let existing_values = existing
+        .iter()
+        .map(|(task_uuid, existing_payload_hash)| {
+            json!({
+                "taskUuid": task_uuid,
+                "payloadHash": existing_payload_hash,
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut data = json!({
+        "dedupKey": dedup_key,
+        "payloadHash": payload_hash,
+        "existing": existing_values,
+        "liveTaskUuids": existing
+            .iter()
+            .map(|(task_uuid, _)| task_uuid)
+            .collect::<Vec<_>>(),
+    });
+    if let [(task_uuid, existing_payload_hash)] = existing.as_slice() {
+        data["existingTaskUuid"] = Value::String(task_uuid.clone());
+        data["existingPayloadHash"] = existing_payload_hash
+            .as_ref()
+            .map_or(Value::Null, |hash| Value::String(hash.clone()));
+    }
+    WireError {
+        code: WireErrorCode::DedupKeyConflict,
+        message: format!("dedup-key-conflict for key {dedup_key:?}"),
+        data: Some(data),
+    }
+}
+
+fn full_live_disposition(
+    context: &Context,
+    dedup_key: &str,
+    payload_hash: &str,
+) -> Result<Option<Value>, WireError> {
+    let live = context
+        .jobs
+        .values()
+        .filter(|job| {
+            job.state != JobState::Completed && job.row.dedup_key.as_deref() == Some(dedup_key)
+        })
+        .collect::<Vec<_>>();
+    if live.is_empty() {
+        return Ok(None);
+    }
+    if live.len() != 1 {
+        return Err(dedup_conflict(
+            dedup_key,
+            payload_hash,
+            live.into_iter()
+                .map(|job| {
+                    (
+                        job.stable_key(),
+                        job.row.payload_hash.as_ref().map(ToOwned::to_owned),
+                    )
+                })
+                .collect(),
+        ));
+    }
+    let job = live[0];
+    if job.row.payload_hash.as_deref() != Some(payload_hash) {
+        return Err(dedup_conflict(
+            dedup_key,
+            payload_hash,
+            vec![(job.stable_key(), job.row.payload_hash.clone())],
+        ));
+    }
+    let task_uuid = job.stable_key();
+    let state = state_name(job.state);
+    Ok(Some(json!({
+        "schemaVersion": 1,
+        "disposition": "attached",
+        "task_uuid": task_uuid,
+        "taskUuid": task_uuid,
+        "job_id": job.job_id.to_string(),
+        "barrier": format!("barrier:{task_uuid}:{}", job.row.attempt),
+        "state": state,
+        "status": state,
+        "dedup_key": dedup_key,
+        "payloadHash": payload_hash,
+        "attempt": job.row.attempt,
+    })))
+}
+
+fn full_terminal_response(
+    record: &WitnessRecord,
+    payload_hash: &str,
+    disposition: &str,
+) -> Result<Value, WireError> {
+    let task_uuid = record.task_uuid.clone().ok_or_else(|| {
+        WireError::new(
+            WireErrorCode::Internal,
+            format!(
+                "governing witness seq {} has no durable task UUID",
+                record.seq
+            ),
+        )
+    })?;
+    let mut response = json!({
+        "schemaVersion": 1,
+        "disposition": disposition,
+        "task_uuid": task_uuid,
+        "taskUuid": task_uuid,
+        "job_id": task_uuid,
+        "barrier": format!("barrier:{task_uuid}:{}", record.attempt),
+        "state": disposition,
+        "status": disposition,
+        "verdict": record.verdict,
+        "exit_code": record.exit_code,
+        "dedup_key": record.dedup_key,
+        "artifact_content_hash": record.artifact_content_hash,
+        "witness_lsn": record.seq,
+        "witnessSeq": record.seq,
+        "payloadHash": payload_hash,
+        "attempt": record.attempt,
+        "lease_epoch": record.lease_epoch,
+    });
+    if let Some(completion) = &record.completion {
+        response["completion"] = serde_json::to_value(completion).map_err(internal_wire)?;
+    }
+    Ok(response)
+}
+
 fn overlay_live_states(jobs: &mut [JobProjection], live_states: &HashMap<String, String>) {
     for job in jobs {
         // A witness read happens after the live snapshot. If the job completed
@@ -3380,6 +4001,7 @@ fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
         attempt: job.row.attempt,
         lease_epoch: job.row.lease_epoch,
         dedup_key: job.row.dedup_key.clone(),
+        payload_hash: job.row.payload_hash.clone(),
         labor_class: job.labor_class,
         trace_ref: None,
         pools: Some(job.row.pools.clone()),
@@ -3390,6 +4012,23 @@ fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
         manifest_hash: job.row.manifest_hash.clone(),
         completion: None,
     }
+}
+
+fn release_full_child_charge(context: &mut Context, job: &Job) -> Result<(), DaemonError> {
+    if job.row.payload_hash.is_some()
+        && context
+            .guardrail_depths
+            .get(&job.row.uuid)
+            .is_some_and(|depth| *depth > 0)
+    {
+        if let Some(parent_uuid) = job.row.parent_uuid {
+            context
+                .guardrails
+                .rollback_child_charge(&parent_uuid.to_string())
+                .map_err(|error| DaemonError::Invalid(error.message))?;
+        }
+    }
+    Ok(())
 }
 
 fn finalize_forced_locked(
@@ -3427,6 +4066,7 @@ fn finalize_forced_locked(
     if release_lease {
         stored.lease_id = None;
     }
+    release_full_child_charge(context, &job)?;
     if let Some(task_uuid) = job.task_uuid {
         if let Some(row) = context.query_rows.get_mut(&task_uuid) {
             row.status = if verdict == Verdict::Cancelled {
@@ -3741,6 +4381,16 @@ impl Daemon {
                 .collect::<Vec<_>>();
         let query_rows = recovery_query_rows(&plan);
         let query_details = recovery_query_details(&plan);
+        let rows = plan
+            .rows
+            .iter()
+            .map(|recovery| (recovery.row.uuid, recovery.row.clone()))
+            .collect();
+        let guardrail_depths = plan
+            .rows
+            .iter()
+            .map(|recovery| (recovery.row.uuid, recovery.guardrail_depth))
+            .collect();
         let mut context = Context {
             config: config.clone(),
             paths: paths.clone(),
@@ -3761,11 +4411,14 @@ impl Daemon {
             unreachable_paused_jobs: HashSet::new(),
             applied_pool_transitions: HashSet::new(),
             barriers: BarrierTracker::with_namespace(epoch),
+            rows,
+            guardrail_depths,
             query_rows,
             query_details,
         };
         restore_completed_results(&mut context, completed_witness)?;
         let initial_jobs = install_recovery_jobs(&mut context, &plan, &executor)?;
+        restore_guardrail_parents(&mut context, &plan)?;
 
         let notifier = SystemdNotifier::from_environment()?;
         if paths.socket.exists() {
@@ -4227,6 +4880,7 @@ impl Daemon {
                 attempt: job.row.attempt,
                 lease_epoch: job.row.lease_epoch,
                 dedup_key: job.row.dedup_key.clone(),
+                payload_hash: job.row.payload_hash.clone(),
                 labor_class: job.labor_class,
                 trace_ref: None,
                 pools: Some(job.row.pools.clone()),
@@ -4252,6 +4906,7 @@ impl Daemon {
             context.barriers.complete_job(&stable, result.value());
             let stored = context.jobs.get_mut(&finished.job_id).expect("job exists");
             stored.state = JobState::Completed;
+            release_full_child_charge(&mut context, &job)?;
             if let Some(task_uuid) = job.task_uuid {
                 if let Some(row) = context.query_rows.get_mut(&task_uuid) {
                     row.status = RowStatus::Completed;
@@ -5124,6 +5779,7 @@ fn reconcile_reuse_witnesses(
                     attempt: event.row.attempt,
                     lease_epoch: event.row.lease_epoch,
                     dedup_key: event.row.dedup_key.clone(),
+                    payload_hash: event.row.payload_hash.clone(),
                     labor_class: LaborClass::Reused,
                     trace_ref: None,
                     pools: Some(event.row.pools.clone()),
@@ -5161,6 +5817,7 @@ fn reuse_record_matches(
         && record.attempt == event.row.attempt
         && record.lease_epoch == event.row.lease_epoch
         && record.dedup_key == event.row.dedup_key
+        && record.payload_hash == event.row.payload_hash
         && record.labor_class == LaborClass::Reused
         && record.pools.as_ref() == Some(&event.row.pools)
         && record.executor == event.row.executor
@@ -5755,6 +6412,42 @@ fn restore_completed_results(
     Ok(())
 }
 
+fn restore_guardrail_parents(
+    context: &mut Context,
+    plan: &crate::recovery::RecoveryPlan,
+) -> Result<(), DaemonError> {
+    let mut child_counts = HashMap::<Uuid, u32>::new();
+    for recovery in &plan.rows {
+        let charged = recovery.row.payload_hash.is_none()
+            || !matches!(
+                recovery.state,
+                RecoveryRowState::Completed | RecoveryRowState::Deleted
+            );
+        if !charged || recovery.guardrail_depth == 0 {
+            continue;
+        }
+        if let Some(parent) = recovery.row.parent_uuid {
+            let count = child_counts.entry(parent).or_default();
+            *count = count
+                .checked_add(1)
+                .ok_or_else(|| DaemonError::Invalid("recovered child count overflow".to_owned()))?;
+        }
+    }
+    for recovery in &plan.rows {
+        let task_uuid = recovery.row.uuid;
+        context.guardrails.register_parent(
+            task_uuid.to_string(),
+            ParentInfo {
+                parent_uuid: task_uuid.to_string(),
+                depth: recovery.guardrail_depth,
+                children: child_counts.get(&task_uuid).copied().unwrap_or(0),
+                no_enqueue: recovery.row.no_enqueue,
+            },
+        );
+    }
+    Ok(())
+}
+
 fn install_recovery_jobs(
     context: &mut Context,
     plan: &crate::recovery::RecoveryPlan,
@@ -5981,6 +6674,7 @@ fn recovery_action_already_installed(
         || existing.row.adapter != candidate.adapter
         || existing.row.argv != candidate.argv
         || existing.row.dedup_key != candidate.dedup_key
+        || existing.row.payload_hash != candidate.payload_hash
         || existing.row.cwd != candidate.cwd
         || existing.row.workspace != candidate.workspace
         || existing.row.adapter_options != candidate.adapter_options
@@ -6362,7 +7056,7 @@ mod tests {
         CoResidencyPredicate, ExecutionTargetConfig, JournaldConfig, MeterBudgetClass, PoolConfig,
         PoolPredicate, ResourceKind, SshExecutorConfig, UsageMeterConfig,
     };
-    use crate::evidence::RetryPolicy;
+    use crate::evidence::{hash_artifact_file, RetryPolicy};
     use crate::executor::{
         read_exit_record, write_exit_record, ExecutionPaths, LocalUnitFact, LocalUnitProbe,
         LocalUnitState, RemoteCapture, RemoteCompletion, RemoteExecutorReply,
@@ -6818,6 +7512,57 @@ mod tests {
         }
     }
 
+    fn fs1_paths(root: &Path) -> DaemonPaths {
+        DaemonPaths {
+            socket: root.join("run/tally.sock"),
+            state_dir: root.join("state"),
+            data_dir: root.join("data"),
+        }
+    }
+
+    async fn fs1_daemon(paths: &DaemonPaths) -> Daemon {
+        let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+            .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+            .with_unit_probe(ExitFileProbe);
+        Daemon::open_with_executor(one_pool_config(), paths.clone(), settings(), executor)
+            .await
+            .unwrap()
+    }
+
+    fn fs1_full_payload(
+        dedup_key: &str,
+        argv: &[&str],
+        evidence: impl IntoIterator<Item = String>,
+    ) -> Value {
+        json!({
+            "argv": argv,
+            "pool": "slot",
+            "priority": "high",
+            "adapter": "shell",
+            "source": "manual",
+            "dedupKey": dedup_key,
+            "submission": {"mode": "full"},
+            "evidence": evidence.into_iter().collect::<Vec<_>>(),
+        })
+    }
+
+    async fn fs1_wait(client: &mut RpcClient, response: &Value) -> Value {
+        client
+            .call(
+                "queue.await_job",
+                Some(json!({"task_uuid": response["task_uuid"]})),
+            )
+            .await
+            .unwrap()
+    }
+
+    fn fs1_conflict(error: WireIoError) -> Value {
+        match error {
+            WireIoError::Rpc(WireErrorCode::DedupKeyConflict, _, Some(data)) => data,
+            other => panic!("expected dedup-key-conflict, got {other:?}"),
+        }
+    }
+
     fn durable_row(uuid: Uuid, dedup_key: &str, lease_epoch: u64) -> RowSeed {
         RowSeed {
             uuid,
@@ -6834,6 +7579,7 @@ mod tests {
             gate_manifest: None,
             resumed_from: None,
             dedup_key: Some(dedup_key.to_owned()),
+            payload_hash: None,
             session_ref: None,
             lease_epoch,
             attempt: 1,
@@ -6914,6 +7660,7 @@ mod tests {
                 attempt,
                 lease_epoch,
                 dedup_key: row.dedup_key.clone(),
+                payload_hash: row.payload_hash.clone(),
                 labor_class: if attempt == 1 {
                     LaborClass::Fresh
                 } else {
@@ -8057,6 +8804,7 @@ mod tests {
                         attempt: 1,
                         lease_epoch: 1,
                         dedup_key: row.dedup_key.clone(),
+                        payload_hash: row.payload_hash.clone(),
                         labor_class: LaborClass::Fresh,
                         trace_ref: None,
                         pools: Some(vec!["slot".to_owned()]),
@@ -10808,6 +11556,7 @@ mod tests {
                         attempt: 1,
                         lease_epoch: 1,
                         dedup_key: original.dedup_key.clone(),
+                        payload_hash: original.payload_hash.clone(),
                         labor_class: LaborClass::Fresh,
                         trace_ref: None,
                         pools: Some(vec!["slot".to_owned()]),
@@ -11636,6 +12385,750 @@ mod tests {
                     proof["ledger"]["chainHead"],
                     json!({"seq": expected_head.seq, "hash": expected_head.hash})
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fs1_concurrent_full_duplicate_creates_once_then_attaches_both_waiters() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"pool": "slot", "all": false})))
+                    .await
+                    .unwrap();
+                let context = daemon.handler.context.clone();
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let mut first_client = RpcClient::connect(&paths.socket).await.unwrap();
+                let mut second_client = RpcClient::connect(&paths.socket).await.unwrap();
+                let payload = fs1_full_payload("fs1-concurrent", &["true"], ["exit:0".to_owned()]);
+                let mut metadata_variant = payload.clone();
+                metadata_variant["priority"] = json!("low");
+                metadata_variant["consumptionEstimate"] = json!(99);
+                metadata_variant["parent"] = json!("00000000-0000-4000-8000-000000000044");
+                metadata_variant["wait"] = json!(true);
+                let (first, second) = tokio::join!(
+                    first_client.call("queue.enqueue", Some(payload.clone())),
+                    second_client.call("queue.enqueue", Some(metadata_variant))
+                );
+                let first = first.unwrap();
+                let second = second.unwrap();
+                let dispositions = [
+                    first["disposition"].as_str(),
+                    second["disposition"].as_str(),
+                ];
+                assert!(dispositions.contains(&Some("created")));
+                assert!(dispositions.contains(&Some("attached")));
+                assert_eq!(first["task_uuid"], second["task_uuid"]);
+                assert_eq!(first["payloadHash"], second["payloadHash"]);
+                assert_eq!(first["schemaVersion"], 1);
+                assert_eq!(second["schemaVersion"], 1);
+                assert_eq!(first["attempt"], 1);
+                assert_eq!(second["attempt"], 1);
+                assert_eq!(context.read().await.jobs.len(), 1);
+                let events = read_acknowledged_events(&paths.events_dir()).unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(
+                    events[0].row.payload_hash.as_deref(),
+                    first["payloadHash"].as_str()
+                );
+
+                first_client
+                    .call("queue.resume", Some(json!({"pool": "slot", "all": false})))
+                    .await
+                    .unwrap();
+                let wait_params = json!({"task_uuid": first["task_uuid"]});
+                let (first_wait, second_wait) = tokio::join!(
+                    first_client.call("queue.await_job", Some(wait_params.clone())),
+                    second_client.call("queue.await_job", Some(wait_params))
+                );
+                let first_wait = first_wait.unwrap();
+                let second_wait = second_wait.unwrap();
+                assert_eq!(first_wait["verdict"], "pass");
+                assert_eq!(first_wait, second_wait);
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(records.len(), 1);
+                assert_eq!(
+                    records[0].payload_hash.as_deref(),
+                    first["payloadHash"].as_str()
+                );
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fs1_full_conflicts_fail_closed_for_running_queued_and_duplicate_live_rows() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let running = client
+                    .call(
+                        "queue.enqueue",
+                        Some(fs1_full_payload(
+                            "fs1-running-conflict",
+                            &["sleep", "0.2"],
+                            ["exit:0".to_owned()],
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(running["state"], "running");
+                let running_error = client
+                    .call(
+                        "queue.enqueue",
+                        Some(fs1_full_payload(
+                            "fs1-running-conflict",
+                            &["true"],
+                            ["exit:0".to_owned()],
+                        )),
+                    )
+                    .await
+                    .unwrap_err();
+                let running_data = fs1_conflict(running_error);
+                assert_eq!(running_data["existingTaskUuid"], running["task_uuid"]);
+                assert_ne!(
+                    running_data["payloadHash"],
+                    running_data["existingPayloadHash"]
+                );
+
+                let queued = client
+                    .call(
+                        "queue.enqueue",
+                        Some(fs1_full_payload(
+                            "fs1-queued-conflict",
+                            &["true"],
+                            ["exit:0".to_owned()],
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(queued["state"], "queued");
+                let queued_error = client
+                    .call(
+                        "queue.enqueue",
+                        Some(fs1_full_payload(
+                            "fs1-queued-conflict",
+                            &["false"],
+                            ["exit:0".to_owned()],
+                        )),
+                    )
+                    .await
+                    .unwrap_err();
+                let queued_data = fs1_conflict(queued_error);
+                assert_eq!(queued_data["existingTaskUuid"], queued["task_uuid"]);
+
+                client
+                    .call("queue.pause", Some(json!({"pool": "slot", "all": false})))
+                    .await
+                    .unwrap();
+                let legacy = json!({
+                    "argv": ["true"],
+                    "pool": "slot",
+                    "adapter": "shell",
+                    "source": "manual",
+                    "dedupKey": "fs1-legacy-live-residue",
+                    "evidence": ["exit:0"],
+                });
+                let legacy_one = client
+                    .call("queue.enqueue", Some(legacy.clone()))
+                    .await
+                    .unwrap();
+                let legacy_two = client
+                    .call("queue.enqueue", Some(legacy.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(legacy_one["disposition"], "created");
+                assert_eq!(legacy_two["disposition"], "created");
+                assert_ne!(legacy_one["task_uuid"], legacy_two["task_uuid"]);
+                let residue_error = client
+                    .call(
+                        "queue.enqueue",
+                        Some(fs1_full_payload(
+                            "fs1-legacy-live-residue",
+                            &["true"],
+                            ["exit:0".to_owned()],
+                        )),
+                    )
+                    .await
+                    .unwrap_err();
+                let residue_data = fs1_conflict(residue_error);
+                assert_eq!(residue_data["existing"].as_array().unwrap().len(), 2);
+                assert_eq!(
+                    read_acknowledged_events(&paths.events_dir()).unwrap().len(),
+                    4
+                );
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fs1_full_terminal_pass_with_no_artifacts_reuses_purely_even_with_manifest() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                let context = daemon.handler.context.clone();
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let mut payload =
+                    fs1_full_payload("fs1-vacuous-reuse", &["true"], ["exit:0".to_owned()]);
+                let manifest = temp.path().join("gates.json");
+                fs::write(
+                    &manifest,
+                    r#"{"schemaVersion":1,"artifact":null,"gates":[{"id":"tests","status":"pass"}]}"#,
+                )
+                .unwrap();
+                payload["gateManifest"] = json!({
+                    "path": manifest,
+                    "requiredGateIds": ["tests"],
+                    "acceptancePolicy": "manual",
+                });
+                let created = client
+                    .call("queue.enqueue", Some(payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(created["disposition"], "created");
+                let terminal = fs1_wait(&mut client, &created).await;
+                assert_eq!(terminal["verdict"], "pass");
+                let (_, before) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(before.len(), 1);
+                assert!(before[0].artifact_content_hash.is_none());
+
+                let reused = client.call("queue.enqueue", Some(payload)).await.unwrap();
+                assert_eq!(reused["disposition"], "reused");
+                assert_eq!(reused["task_uuid"], created["task_uuid"]);
+                assert_eq!(reused["verdict"], "pass");
+                assert_eq!(reused["witnessSeq"], terminal["witness_seq"]);
+                assert_eq!(reused["payloadHash"], created["payloadHash"]);
+                assert_eq!(context.read().await.jobs.len(), 1);
+                assert_eq!(
+                    read_acknowledged_events(&paths.events_dir()).unwrap().len(),
+                    1
+                );
+                let (_, after) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(after, before);
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fs1_full_pass_rehashes_clean_and_discloses_every_rerun_reason() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let clean_path = temp.path().join("clean.txt");
+                let drift_path = temp.path().join("drift.txt");
+                let declared_path = temp.path().join("declared.txt");
+                let unavailable_path = temp.path().join("unavailable.txt");
+                for path in [&clean_path, &drift_path, &declared_path, &unavailable_path] {
+                    fs::write(path, b"original\n").unwrap();
+                }
+                let declared_hash = hash_artifact_file(&declared_path).unwrap();
+
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let clean_payload = fs1_full_payload(
+                    "fs1-clean-artifact",
+                    &["true"],
+                    [
+                        format!("artifact:{}", clean_path.display()),
+                        "exit:0".to_owned(),
+                    ],
+                );
+                let clean = client
+                    .call("queue.enqueue", Some(clean_payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(fs1_wait(&mut client, &clean).await["verdict"], "pass");
+                let clean_reused = client
+                    .call("queue.enqueue", Some(clean_payload))
+                    .await
+                    .unwrap();
+                assert_eq!(clean_reused["disposition"], "reused");
+
+                let drift_payload = fs1_full_payload(
+                    "fs1-artifact-drift",
+                    &["true"],
+                    [
+                        format!("artifact:{}", drift_path.display()),
+                        "exit:0".to_owned(),
+                    ],
+                );
+                let drift = client
+                    .call("queue.enqueue", Some(drift_payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(fs1_wait(&mut client, &drift).await["verdict"], "pass");
+                fs::write(&drift_path, b"changed\n").unwrap();
+                let drift_rerun = client
+                    .call("queue.enqueue", Some(drift_payload))
+                    .await
+                    .unwrap();
+                assert_eq!(drift_rerun["disposition"], "created");
+                assert_eq!(drift_rerun["reusedRejected"], "artifact-drift");
+                assert_eq!(fs1_wait(&mut client, &drift_rerun).await["verdict"], "pass");
+
+                let declared_payload = fs1_full_payload(
+                    "fs1-declared-mismatch",
+                    &["true"],
+                    [
+                        format!("artifact:{}", declared_path.display()),
+                        format!(
+                            "hash:sha256:{}",
+                            declared_hash.trim_start_matches("sha256:")
+                        ),
+                        "exit:0".to_owned(),
+                    ],
+                );
+                let declared = client
+                    .call("queue.enqueue", Some(declared_payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(fs1_wait(&mut client, &declared).await["verdict"], "pass");
+                fs::write(&declared_path, b"changed\n").unwrap();
+                let declared_rerun = client
+                    .call("queue.enqueue", Some(declared_payload))
+                    .await
+                    .unwrap();
+                assert_eq!(declared_rerun["disposition"], "created");
+                assert_eq!(declared_rerun["reusedRejected"], "declared-hash-mismatch");
+                assert_eq!(
+                    fs1_wait(&mut client, &declared_rerun).await["verdict"],
+                    "clean-exit-no-artifact"
+                );
+
+                let unavailable_payload = fs1_full_payload(
+                    "fs1-artifact-unavailable",
+                    &["true"],
+                    [
+                        format!("artifact:{}", unavailable_path.display()),
+                        "exit:0".to_owned(),
+                    ],
+                );
+                let unavailable = client
+                    .call("queue.enqueue", Some(unavailable_payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(fs1_wait(&mut client, &unavailable).await["verdict"], "pass");
+                fs::remove_file(&unavailable_path).unwrap();
+                let unavailable_rerun = client
+                    .call("queue.enqueue", Some(unavailable_payload))
+                    .await
+                    .unwrap();
+                assert_eq!(unavailable_rerun["disposition"], "created");
+                assert_eq!(unavailable_rerun["reusedRejected"], "artifact-unavailable");
+                assert_eq!(
+                    unavailable_rerun["errorDetail"],
+                    unavailable_path.to_string_lossy().as_ref()
+                );
+                assert_eq!(
+                    fs1_wait(&mut client, &unavailable_rerun).await["verdict"],
+                    "clean-exit-no-artifact"
+                );
+
+                assert_eq!(
+                    read_acknowledged_events(&paths.events_dir()).unwrap().len(),
+                    7
+                );
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(records.len(), 7);
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fs1_terminal_failure_is_memoized_retry_is_durable_and_pass_retry_is_invalid() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let mut attached_client = RpcClient::connect(&paths.socket).await.unwrap();
+                let failed_payload =
+                    fs1_full_payload("fs1-memoized-failure", &["false"], ["exit:0".to_owned()]);
+                let created = client
+                    .call("queue.enqueue", Some(failed_payload.clone()))
+                    .await
+                    .unwrap();
+                let failed = fs1_wait(&mut client, &created).await;
+                assert_eq!(failed["verdict"], "failed");
+                let terminal = client
+                    .call("queue.enqueue", Some(failed_payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["disposition"], "terminal");
+                assert_eq!(terminal["task_uuid"], created["task_uuid"]);
+                assert_eq!(terminal["verdict"], "failed");
+                assert_eq!(terminal["witnessSeq"], failed["witness_seq"]);
+                assert_eq!(
+                    read_acknowledged_events(&paths.events_dir()).unwrap().len(),
+                    1
+                );
+
+                let terminal_conflict = client
+                    .call(
+                        "queue.enqueue",
+                        Some(fs1_full_payload(
+                            "fs1-memoized-failure",
+                            &["true"],
+                            ["exit:0".to_owned()],
+                        )),
+                    )
+                    .await
+                    .unwrap_err();
+                let conflict_data = fs1_conflict(terminal_conflict);
+                assert_eq!(conflict_data["existingTaskUuid"], created["task_uuid"]);
+
+                client
+                    .call("queue.pause", Some(json!({"pool": "slot", "all": false})))
+                    .await
+                    .unwrap();
+                let retry = client
+                    .call(
+                        "queue.retry",
+                        Some(json!({"task_uuid": created["task_uuid"]})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(retry["schemaVersion"], 1);
+                assert_eq!(retry["retried"], true);
+                assert_eq!(retry["task_uuid"], created["task_uuid"]);
+                assert_eq!(retry["attempt"], 2);
+                assert_eq!(retry["payloadHash"], created["payloadHash"]);
+                assert!(retry.get("disposition").is_none());
+                let (_, before_retry_terminal) =
+                    read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(before_retry_terminal.len(), 1);
+                let events = read_acknowledged_events(&paths.events_dir()).unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].retries.len(), 1);
+                assert_eq!(events[0].retries[0].attempt, 2);
+                assert_eq!(
+                    events[0].retries[0].previous_witness_seq,
+                    failed["witness_seq"].as_u64().unwrap()
+                );
+
+                let attached = attached_client
+                    .call("queue.enqueue", Some(failed_payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(attached["disposition"], "attached");
+                assert_eq!(attached["task_uuid"], created["task_uuid"]);
+                assert_eq!(attached["attempt"], 2);
+                client
+                    .call("queue.resume", Some(json!({"pool": "slot", "all": false})))
+                    .await
+                    .unwrap();
+                let wait_params = json!({"task_uuid": created["task_uuid"]});
+                let (retried_wait, attached_wait) = tokio::join!(
+                    client.call("queue.await_job", Some(wait_params.clone())),
+                    attached_client.call("queue.await_job", Some(wait_params))
+                );
+                let retried_wait = retried_wait.unwrap();
+                assert_eq!(retried_wait, attached_wait.unwrap());
+                assert_eq!(retried_wait["attempt"], 2);
+                assert_eq!(retried_wait["verdict"], "failed");
+                let latest_terminal = client
+                    .call("queue.enqueue", Some(failed_payload))
+                    .await
+                    .unwrap();
+                assert_eq!(latest_terminal["disposition"], "terminal");
+                assert_eq!(latest_terminal["witnessSeq"], retried_wait["witness_seq"]);
+
+                let passing_payload =
+                    fs1_full_payload("fs1-pass-no-retry", &["true"], ["exit:0".to_owned()]);
+                let passing = client
+                    .call("queue.enqueue", Some(passing_payload))
+                    .await
+                    .unwrap();
+                assert_eq!(fs1_wait(&mut client, &passing).await["verdict"], "pass");
+                let pass_retry = client
+                    .call(
+                        "queue.retry",
+                        Some(json!({"task_uuid": passing["task_uuid"]})),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    pass_retry,
+                    WireIoError::Rpc(WireErrorCode::InvalidParams, _, _)
+                ));
+                let missing_retry = client
+                    .call(
+                        "queue.retry",
+                        Some(json!({"task_uuid": Uuid::new_v4().to_string()})),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    missing_retry,
+                    WireIoError::Rpc(WireErrorCode::InvalidParams, _, _)
+                ));
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fs1_explicit_retry_survives_restart_on_the_same_row_and_next_attempt() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let payload =
+                    fs1_full_payload("fs1-retry-restart", &["false"], ["exit:0".to_owned()]);
+                let created = client
+                    .call("queue.enqueue", Some(payload.clone()))
+                    .await
+                    .unwrap();
+                let task_uuid = created["task_uuid"].as_str().unwrap().to_owned();
+                assert_eq!(fs1_wait(&mut client, &created).await["attempt"], 1);
+                client
+                    .call("queue.pause", Some(json!({"pool": "slot", "all": false})))
+                    .await
+                    .unwrap();
+                let retry = client
+                    .call("queue.retry", Some(json!({"task_uuid": task_uuid.clone()})))
+                    .await
+                    .unwrap();
+                assert_eq!(retry["attempt"], 2);
+                assert_eq!(retry["state"], "paused");
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+
+                let restarted = fs1_daemon(&paths).await;
+                let (restart_shutdown_tx, restart_shutdown_rx) = watch::channel(false);
+                let restarted_task =
+                    tokio::task::spawn_local(restarted.run_until(restart_shutdown_rx));
+                let mut restarted_client = RpcClient::connect(&paths.socket).await.unwrap();
+                let terminal = restarted_client
+                    .call(
+                        "queue.await_job",
+                        Some(json!({"task_uuid": task_uuid.clone()})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["task_uuid"], task_uuid);
+                assert_eq!(terminal["attempt"], 2);
+                assert_eq!(terminal["verdict"], "failed");
+                let latest = restarted_client
+                    .call("queue.enqueue", Some(payload))
+                    .await
+                    .unwrap();
+                assert_eq!(latest["disposition"], "terminal");
+                assert_eq!(latest["attempt"], 2);
+                assert_eq!(latest["witnessSeq"], terminal["witness_seq"]);
+
+                let events = read_acknowledged_events(&paths.events_dir()).unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].retries.len(), 1);
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(
+                    records
+                        .iter()
+                        .map(|record| record.attempt)
+                        .collect::<Vec<_>>(),
+                    [1, 2]
+                );
+                assert_eq!(records[0].task_uuid, records[1].task_uuid);
+                assert_eq!(records[0].payload_hash, records[1].payload_hash);
+
+                restart_shutdown_tx.send(true).unwrap();
+                restarted_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fs1_legacy_behavior_stays_pass_only_row_materializing_and_manifest_excluding() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let artifact = temp.path().join("legacy-artifact.txt");
+                fs::write(&artifact, b"legacy\n").unwrap();
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let legacy = json!({
+                    "argv": ["true"],
+                    "pool": "slot",
+                    "adapter": "shell",
+                    "source": "manual",
+                    "dedupKey": "fs1-legacy-reuse",
+                    "evidence": [
+                        format!("artifact:{}", artifact.display()),
+                        "exit:0"
+                    ],
+                });
+                let first = client
+                    .call("queue.enqueue", Some(legacy.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(first["schemaVersion"], 1);
+                assert_eq!(first["disposition"], "created");
+                assert!(first.get("payloadHash").is_none());
+                assert_eq!(fs1_wait(&mut client, &first).await["verdict"], "pass");
+                let reused = client
+                    .call("queue.enqueue", Some(legacy.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(reused["disposition"], "reused");
+                assert_eq!(reused["verdict"], "reused");
+                assert_ne!(reused["task_uuid"], first["task_uuid"]);
+
+                let manifest = temp.path().join("legacy-gates.json");
+                fs::write(
+                    &manifest,
+                    r#"{"schemaVersion":1,"artifact":null,"gates":[{"id":"tests","status":"pass"}]}"#,
+                )
+                .unwrap();
+                let manifest_payload = json!({
+                    "argv": ["true"],
+                    "pool": "slot",
+                    "adapter": "shell",
+                    "source": "manual",
+                    "dedupKey": "fs1-legacy-manifest",
+                    "evidence": [
+                        format!("artifact:{}", artifact.display()),
+                        "exit:0"
+                    ],
+                    "gateManifest": {
+                        "path": manifest,
+                        "requiredGateIds": ["tests"],
+                        "acceptancePolicy": "manual"
+                    }
+                });
+                let manifest_first = client
+                    .call("queue.enqueue", Some(manifest_payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fs1_wait(&mut client, &manifest_first).await["verdict"],
+                    "pass"
+                );
+                let manifest_second = client
+                    .call("queue.enqueue", Some(manifest_payload))
+                    .await
+                    .unwrap();
+                assert_eq!(manifest_second["disposition"], "created");
+                assert_ne!(manifest_second["task_uuid"], manifest_first["task_uuid"]);
+                assert_eq!(
+                    fs1_wait(&mut client, &manifest_second).await["verdict"],
+                    "pass"
+                );
+
+                let failed_legacy = json!({
+                    "argv": ["false"],
+                    "pool": "slot",
+                    "adapter": "shell",
+                    "source": "manual",
+                    "dedupKey": "fs1-legacy-failure",
+                    "evidence": ["exit:0"],
+                });
+                let failed_first = client
+                    .call("queue.enqueue", Some(failed_legacy.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    fs1_wait(&mut client, &failed_first).await["verdict"],
+                    "failed"
+                );
+                let failed_second = client
+                    .call("queue.enqueue", Some(failed_legacy))
+                    .await
+                    .unwrap();
+                assert_eq!(failed_second["disposition"], "created");
+                assert_ne!(failed_second["task_uuid"], failed_first["task_uuid"]);
+                assert_eq!(
+                    fs1_wait(&mut client, &failed_second).await["verdict"],
+                    "failed"
+                );
+
+                let mut unrecorded_legacy = json!({
+                    "argv": ["true"],
+                    "pool": "slot",
+                    "adapter": "shell",
+                    "source": "manual",
+                    "dedupKey": "fs1-unrecorded-terminal",
+                    "evidence": ["exit:0"],
+                });
+                let unrecorded = client
+                    .call("queue.enqueue", Some(unrecorded_legacy.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(fs1_wait(&mut client, &unrecorded).await["verdict"], "pass");
+                unrecorded_legacy["submission"] = json!({"mode": "full"});
+                let full_after_legacy = client
+                    .call("queue.enqueue", Some(unrecorded_legacy))
+                    .await
+                    .unwrap();
+                assert_eq!(full_after_legacy["disposition"], "created");
+                assert_eq!(
+                    full_after_legacy["reusedRejected"],
+                    "payload-hash-unrecorded"
+                );
+                assert_ne!(full_after_legacy["task_uuid"], unrecorded["task_uuid"]);
+                assert_eq!(
+                    fs1_wait(&mut client, &full_after_legacy).await["verdict"],
+                    "pass"
+                );
+
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(records[0].payload_hash, None);
+                assert_eq!(records[1].verdict, Verdict::Reused);
+                assert_eq!(records[1].payload_hash, None);
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
             })
             .await;
     }

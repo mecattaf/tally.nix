@@ -257,6 +257,7 @@ impl ProducerEnqueue {
             resume_from: None,
             source: Some(source),
             dedup_key,
+            submission: None,
             parent: None,
             evidence: self.evidence.clone(),
             evidence_class: self.evidence_class.clone(),
