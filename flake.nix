@@ -81,7 +81,10 @@
                 kind = "gh";
                 enable = true;
                 sources = [ "notifications" ];
+                allowSelfTriggered = true;
+                allowedActors = [ "tally-bot" ];
                 postEvidence = true;
+                closeOnPass = true;
                 enqueue = {
                   argv = [ "gh-job" ];
                   pool = "slot";
@@ -273,9 +276,19 @@
               };
               services.tally = {
                 enable = true;
+                pools.slot.resource = "build-slot";
                 producers = {
                   missing = { };
                   misspelled.kind = "event-directory";
+                  bad-close = {
+                    kind = "gh";
+                    postEvidence = false;
+                    closeOnPass = true;
+                    enqueue = {
+                      argv = [ "gh-job" ];
+                      pool = "slot";
+                    };
+                  };
                 };
               };
             }
@@ -293,9 +306,19 @@
                 defaultDataDir = "/tmp/tally-data";
                 defaultStateDir = "/tmp/tally-state";
               };
+              config.services.tally.pools.slot.resource = "build-slot";
               config.services.tally.producers = {
                 missing = { };
                 misspelled.kind = "event-directory";
+                bad-close = {
+                  kind = "gh";
+                  postEvidence = false;
+                  closeOnPass = true;
+                  enqueue = {
+                    argv = [ "gh-job" ];
+                    pool = "slot";
+                  };
+                };
               };
             }
           ];
@@ -656,6 +679,9 @@
               .producers.daily.enqueue.credentials.JOB_TOKEN == "/run/credentials/tally-job" and
               .producers.effects.onKey.pool == "stock" and
               .producers.health.onReturnAttest.noEnqueue == true and
+              .producers.github.allowSelfTriggered == false and
+              .producers.github.allowedActors == [] and
+              .producers.github.closeOnPass == false and
               .executors.worker.kind == "ssh" and
               .executors.worker.host == "worker.example" and
               .executors.worker.user == "tally-worker" and
@@ -728,6 +754,8 @@
               invalidProducerMessages;
             assert builtins.elem
               ''tally producer misspelled has unknown kind "event-directory"; expected one of calendar, build-effect, pool-reachability, gh, events-dir''
+              invalidProducerMessages;
+            assert builtins.elem "gh producer bad-close closeOnPass=true requires postEvidence=true"
               invalidProducerMessages;
             assert !invalidProducerAttempt.success;
             pkgs.runCommand "tally-producer-kind-required" { } ''
@@ -806,10 +834,12 @@
                 producer_state="$PWD/state"
                 daily="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch daily --state-dir "$producer_state" --event '{"kind":"calendar"}')"
                 test "$(printf '%s' "$daily" | jq -r 'keys[0]')" = emitted
-                own="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event '{"kind":"gh","source":"notifications","itemId":"PR-self","actor":"tally-bot","selfActor":"tally-bot"}')"
-                test "$(printf '%s' "$own" | jq -r '.')" = filtered
-                gh="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event '{"kind":"gh","source":"notifications","itemId":"PR-1","actor":"contributor","selfActor":"tally-bot"}')"
-                test "$(printf '%s' "$gh" | jq -r 'keys[0]')" = emitted
+                own_event='{"kind":"gh","source":"notifications","repo":"acme/widgets","number":42,"htmlUrl":"https://github.com/acme/widgets/issues/42","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"tally-bot","selfActor":"tally-bot","notificationReason":"mention","triggerKind":"notification","eventId":"notification-42","commentId":"comment-42","context":{"schemaVersion":1,"title":"Self-authored issue","body":"untrusted $(must-not-run)","labels":["build"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-42","author":"tally-bot","body":"please run"}}}'
+                own="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event "$own_event")"
+                test "$(printf '%s' "$own" | jq -r 'keys[0]')" = emitted
+                rejected_event='{"kind":"gh","source":"notifications","repo":"acme/widgets","number":42,"htmlUrl":"https://github.com/acme/widgets/issues/42","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"untrusted-user","selfActor":"tally-bot","notificationReason":"mention","triggerKind":"notification","eventId":"notification-43","commentId":"comment-43","context":{"schemaVersion":1,"title":"Self-authored issue","body":"untrusted","labels":["build"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-43","author":"untrusted-user","body":"please run"}}}'
+                rejected="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event "$rejected_event")"
+                test "$(printf '%s' "$rejected" | jq -r '.filtered.reason')" = trigger-actor-not-allowed
                 effect="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"
                 test "$(printf '%s' "$effect" | jq -r '.[0] | keys[0]')" = emitted
                 duplicate="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"

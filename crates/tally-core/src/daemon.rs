@@ -2506,6 +2506,7 @@ fn execution_request(job: &Job, limits: UnitLimits, tally_socket: &str) -> Execu
         // Unix socket. The SSH transport itself never forwards ambient sockets.
         tally_socket: job.row.executor.is_none().then(|| tally_socket.to_owned()),
         environment: job.invocation.env.clone(),
+        gh_origin: job.row.gh_origin.clone(),
         cwd: job.row.cwd.clone(),
         credentials: job.row.credentials.clone(),
         limits,
@@ -4717,6 +4718,10 @@ fn query_row(row: &RowSeed, status: RowStatus) -> RowFact {
         session_ref: row.session_ref.clone(),
         attempt: row.attempt,
         model: row.model.clone(),
+        gh_origin: row
+            .gh_origin
+            .as_ref()
+            .and_then(crate::query::GhOriginProjection::from_origin),
     }
 }
 
@@ -5330,9 +5335,15 @@ mod tests {
         RemoteExecutorRequest, RemoteExecutorResult, RemoteTransport, RemoteTransportError,
         UnitExitRecord, REMOTE_EXECUTOR_PROTOCOL_VERSION, UNIT_EXIT_SCHEMA_VERSION,
     };
-    use crate::producers::{GhObservation, ProducerConfig, ProducerEngine, ReachabilityTransition};
+    use crate::producers::{
+        EmitOutcome, GhCliIntake, GhObservation, ProducerConfig, ProducerEngine,
+        ReachabilityTransition,
+    };
     use crate::recovery::RecoveryPlan;
-    use crate::taskdb::GhOrigin;
+    use crate::taskdb::{
+        GhContextSnapshot, GhItemType, GhOrigin, GH_CONTEXT_SCHEMA_VERSION,
+        GH_ORIGIN_SCHEMA_VERSION,
+    };
     use crate::wire::RpcClient;
 
     struct ExitFileProbe;
@@ -5792,6 +5803,66 @@ mod tests {
             gh_origin: None,
             evidence_class: None,
             manifest_hash: None,
+        }
+    }
+
+    fn gh_test_observation(node_id: &str, item_type: GhItemType) -> GhObservation {
+        GhObservation {
+            source: "notifications".to_owned(),
+            repo: "acme/widgets".to_owned(),
+            number: 42,
+            html_url: match item_type {
+                GhItemType::Issue => "https://github.com/acme/widgets/issues/42",
+                GhItemType::PullRequest => "https://github.com/acme/widgets/pull/42",
+            }
+            .to_owned(),
+            item_type,
+            head_sha: (item_type == GhItemType::PullRequest)
+                .then(|| "4242424242424242424242424242424242424242".to_owned()),
+            node_id: node_id.to_owned(),
+            item_author: "issue-author".to_owned(),
+            trigger_actor: "contributor".to_owned(),
+            self_actor: "tally-bot".to_owned(),
+            notification_reason: Some("mention".to_owned()),
+            trigger_kind: "notification".to_owned(),
+            event_id: Some("event-42".to_owned()),
+            comment_id: None,
+            context: GhContextSnapshot {
+                schema_version: GH_CONTEXT_SCHEMA_VERSION,
+                title: "Origin fixture".to_owned(),
+                body: "untrusted body".to_owned(),
+                head_sha: (item_type == GhItemType::PullRequest)
+                    .then(|| "4242424242424242424242424242424242424242".to_owned()),
+                labels: vec!["build".to_owned()],
+                assignees: Vec::new(),
+                triggering_comment: None,
+            },
+        }
+    }
+
+    fn gh_test_origin(node_id: &str, item_type: GhItemType) -> GhOrigin {
+        let observation = gh_test_observation(node_id, item_type);
+        GhOrigin {
+            schema_version: GH_ORIGIN_SCHEMA_VERSION,
+            producer: "github".to_owned(),
+            source: observation.source,
+            repo: observation.repo,
+            number: observation.number,
+            html_url: observation.html_url,
+            item_type: Some(observation.item_type),
+            head_sha: observation.head_sha,
+            node_id: observation.node_id,
+            item_author: observation.item_author,
+            trigger_actor: observation.trigger_actor,
+            self_actor: observation.self_actor,
+            notification_reason: observation.notification_reason,
+            trigger_kind: observation.trigger_kind,
+            event_id: observation.event_id,
+            comment_id: observation.comment_id,
+            context: Some(observation.context),
+            actor_exclude: "self".to_owned(),
+            allow_self_triggered: false,
+            allowed_actors: Vec::new(),
         }
     }
 
@@ -6725,14 +6796,7 @@ mod tests {
 
                 let mut row = durable_row(Uuid::new_v4(), "gh:github:item-1", 1);
                 row.source = EnqueueSource::Gh;
-                row.gh_origin = Some(GhOrigin {
-                    producer: "github".to_owned(),
-                    source: "notifications".to_owned(),
-                    item_id: "item-1".to_owned(),
-                    actor: "contributor".to_owned(),
-                    self_actor: "tally-bot".to_owned(),
-                    actor_exclude: "self".to_owned(),
-                });
+                row.gh_origin = Some(gh_test_origin("item-1", GhItemType::Issue));
                 let result = JobResult {
                     task_uuid: Some(row.uuid.to_string()),
                     job_id: row.uuid.to_string(),
@@ -6751,7 +6815,7 @@ mod tests {
                     .complete_gh_post_ack(row.clone(), result.clone());
                 daemon.handler.drain_post_ack_tasks().await;
 
-                assert_eq!(fs::read(&calls).unwrap(), b"xxx");
+                assert_eq!(fs::read(&calls).unwrap(), b"xxxx");
                 let requests = fs::read_to_string(&requests)
                     .unwrap()
                     .lines()
@@ -6787,7 +6851,7 @@ mod tests {
                 failed.verdict = Verdict::Failed;
                 daemon.handler.complete_gh_post_ack(row, failed);
                 daemon.handler.drain_post_ack_tasks().await;
-                assert_eq!(fs::read(calls).unwrap(), b"xxx");
+                assert_eq!(fs::read(calls).unwrap(), b"xxxx");
             })
             .await;
     }
@@ -6846,12 +6910,7 @@ mod tests {
                 engine
                     .emit_gh(
                         "github",
-                        &GhObservation {
-                            source: "notifications".to_owned(),
-                            item_id: "PR-live-producer".to_owned(),
-                            actor: "contributor".to_owned(),
-                            self_actor: "tally-bot".to_owned(),
-                        },
+                        &gh_test_observation("PR-live-producer", GhItemType::PullRequest),
                         now,
                     )
                     .unwrap();
@@ -6932,6 +6991,205 @@ mod tests {
                     .unwrap()
                     .iter()
                     .all(|event| event.ingress_id.is_some()));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn hydrated_github_pr_origin_reaches_launch_environment_and_query_projection() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let mut config = one_pool_config();
+                config.producers = serde_json::from_value(json!({
+                    "github": {
+                        "kind": "gh",
+                        "enable": true,
+                        "sources": ["notifications"],
+                        "allowedActors": ["maintainer"],
+                        "postEvidence": false,
+                        "closeOnPass": false,
+                        "enqueue": {"argv": ["handle-origin"], "pool": "slot"}
+                    }
+                }))
+                .unwrap();
+                config.validate().unwrap();
+
+                let gh = temp.path().join("fake-gh-origin");
+                fs::write(
+                    &gh,
+                    concat!(
+                        "#!/bin/sh\n",
+                        "case \"$*\" in\n",
+                        "  'api user') printf '{\"login\":\"tally-bot\"}' ;;\n",
+                        "  'api --method GET notifications -f all=false -f participating=false -f per_page=100')\n",
+                        "    printf '[{\"id\":\"notification-42\",\"reason\":\"mention\",\"updated_at\":\"2026-07-24T08:00:00Z\",\"repository\":{\"full_name\":\"acme/widgets\"},\"subject\":{\"type\":\"PullRequest\",\"url\":\"https://api.github.com/repos/acme/widgets/pulls/42\",\"latest_comment_url\":\"https://api.github.com/repos/acme/widgets/issues/comments/4200\"}}]' ;;\n",
+                        "  'api /repos/acme/widgets/pulls/42')\n",
+                        "    printf '{\"node_id\":\"PR_origin_42\",\"number\":42,\"html_url\":\"https://github.com/acme/widgets/pull/42\",\"title\":\"Hydrated PR\",\"body\":\"untrusted $(never-executed)\",\"user\":{\"login\":\"item-author\"},\"head\":{\"sha\":\"4242424242424242424242424242424242424242\"},\"labels\":[{\"name\":\"build\"}],\"assignees\":[{\"login\":\"tally-bot\"}]}' ;;\n",
+                        "  'api /repos/acme/widgets/issues/comments/4200')\n",
+                        "    printf '{\"id\":4200,\"body\":\"@tally-bot inspect this\",\"created_at\":\"2026-07-24T08:00:00Z\",\"updated_at\":\"2026-07-24T08:00:00Z\",\"user\":{\"login\":\"maintainer\"}}' ;;\n",
+                        "  *) exit 91 ;;\n",
+                        "esac\n",
+                    ),
+                )
+                .unwrap();
+                fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+                let engine =
+                    ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir);
+                let outcomes = engine
+                    .poll_gh("github", &GhCliIntake::with_program(&gh), Utc::now())
+                    .unwrap();
+                let emitted = match outcomes.as_slice() {
+                    [EmitOutcome::Emitted(path)] => path,
+                    other => panic!("expected one emitted hydrated PR origin, got {other:?}"),
+                };
+                let payload: EnqueuePayload =
+                    serde_json::from_slice(&fs::read(emitted).unwrap()).unwrap();
+                let captured_origin = payload.gh_origin.unwrap();
+                assert_eq!(captured_origin.repo, "acme/widgets");
+                assert_eq!(captured_origin.number, 42);
+                assert_eq!(
+                    captured_origin.html_url,
+                    "https://github.com/acme/widgets/pull/42"
+                );
+                assert_eq!(captured_origin.item_type, Some(GhItemType::PullRequest));
+                assert_eq!(
+                    captured_origin.head_sha.as_deref(),
+                    Some("4242424242424242424242424242424242424242")
+                );
+                assert_eq!(captured_origin.node_id, "PR_origin_42");
+                assert_eq!(captured_origin.item_author, "item-author");
+                assert_eq!(captured_origin.trigger_actor, "maintainer");
+                assert_eq!(captured_origin.self_actor, "tally-bot");
+                assert_eq!(
+                    captured_origin.notification_reason.as_deref(),
+                    Some("mention")
+                );
+                assert_eq!(captured_origin.trigger_kind, "notification");
+                assert_eq!(
+                    captured_origin.event_id.as_deref(),
+                    Some("notification-42")
+                );
+                assert_eq!(captured_origin.comment_id.as_deref(), Some("4200"));
+                assert_eq!(
+                    captured_origin
+                        .context
+                        .as_ref()
+                        .unwrap()
+                        .triggering_comment
+                        .as_ref()
+                        .unwrap()
+                        .author,
+                    "maintainer"
+                );
+
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon =
+                    Daemon::open_with_executor(config, paths, settings(), executor.clone())
+                        .await
+                        .unwrap();
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                assert_eq!(daemon.handler.drain().await.unwrap()["enqueued"], 1);
+
+                let job = daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .values()
+                    .find(|job| job.row.source == EnqueueSource::Gh)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(job.row.gh_origin.as_ref(), Some(&captured_origin));
+                let request =
+                    execution_request(&job, settings().unit_limits, "/run/tally/tally.sock");
+                let args = executor
+                    .build_systemd_argv(&request)
+                    .unwrap()
+                    .into_iter()
+                    .map(|arg| arg.into_string().unwrap())
+                    .collect::<Vec<_>>();
+                let launched_environment = args
+                    .windows(2)
+                    .filter(|pair| pair[0] == "--setenv")
+                    .filter_map(|pair| pair[1].split_once('='))
+                    .map(|(name, value)| (name.to_owned(), value.to_owned()))
+                    .collect::<BTreeMap<_, _>>();
+                let github_environment = launched_environment
+                    .into_iter()
+                    .filter(|(name, _)| name.starts_with("TALLY_GH_"))
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(
+                    github_environment,
+                    BTreeMap::from([
+                        ("TALLY_GH_REPO".to_owned(), "acme/widgets".to_owned()),
+                        ("TALLY_GH_NUMBER".to_owned(), "42".to_owned()),
+                        (
+                            "TALLY_GH_URL".to_owned(),
+                            "https://github.com/acme/widgets/pull/42".to_owned()
+                        ),
+                        ("TALLY_GH_TYPE".to_owned(), "pull_request".to_owned()),
+                        (
+                            "TALLY_GH_HEAD_SHA".to_owned(),
+                            "4242424242424242424242424242424242424242".to_owned()
+                        ),
+                        ("TALLY_GH_NODE_ID".to_owned(), "PR_origin_42".to_owned()),
+                        (
+                            "TALLY_GH_TRIGGER_KIND".to_owned(),
+                            "notification".to_owned()
+                        ),
+                        (
+                            "TALLY_GH_TRIGGER_ACTOR".to_owned(),
+                            "maintainer".to_owned()
+                        ),
+                        (
+                            "TALLY_GH_EVENT_ID".to_owned(),
+                            "notification-42".to_owned()
+                        ),
+                        ("TALLY_GH_COMMENT_ID".to_owned(), "4200".to_owned()),
+                        (
+                            "TALLY_GH_CONTEXT".to_owned(),
+                            executor
+                                .gh_context_path(&request.identity)
+                                .to_string_lossy()
+                                .into_owned()
+                        ),
+                    ])
+                );
+
+                let row = query_row(&job.row, RowStatus::Pending);
+                let expected_projection = crate::query::GhOriginProjection {
+                    repo: "acme/widgets".to_owned(),
+                    number: 42,
+                    url: "https://github.com/acme/widgets/pull/42".to_owned(),
+                };
+                assert_eq!(row.gh_origin, Some(expected_projection.clone()));
+                let standup = query_standup(
+                    &[row],
+                    &[],
+                    &[],
+                    &StandupOptions {
+                        since: None,
+                        since_realtime_us: None,
+                        until: "2026-07-24T00:00:00Z".to_owned(),
+                        source: Some("gh".to_owned()),
+                    },
+                );
+                assert_eq!(standup.in_flight.len(), 1);
+                assert_eq!(standup.in_flight[0].gh_origin, Some(expected_projection));
             })
             .await;
     }

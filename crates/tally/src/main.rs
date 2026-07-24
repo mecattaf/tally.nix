@@ -491,7 +491,7 @@ async fn run_producer_dispatch(
     let expected_kind = match &event {
         ProducerObservation::Calendar => "calendar",
         ProducerObservation::EventsDir => "events-dir",
-        ProducerObservation::Gh { .. } => "gh",
+        ProducerObservation::Gh(_) => "gh",
         ProducerObservation::BuildEffect { .. } => "build-effect",
         ProducerObservation::PoolReachability { .. } => "pool-reachability",
     };
@@ -513,33 +513,97 @@ async fn run_producer_dispatch(
             let mut client = RpcClient::connect(socket).await?;
             client.call("queue.drain", Some(json!({}))).await?
         }
-        ProducerObservation::Gh {
-            source,
-            item_id,
-            actor,
-            self_actor,
-        } => match (source, item_id, actor, self_actor) {
-            (None, None, None, None) => serde_json::to_value(engine.poll_gh(
-                &args.producer,
-                &GhCliIntake::default(),
-                now,
-            )?)?,
-            (Some(source), Some(item_id), Some(actor), Some(self_actor)) => {
+        ProducerObservation::Gh(observation) => {
+            let tally_core::producers::GhObservationInput {
+                source,
+                repo,
+                number,
+                html_url,
+                item_type,
+                head_sha,
+                node_id,
+                item_author,
+                trigger_actor,
+                self_actor,
+                notification_reason,
+                trigger_kind,
+                event_id,
+                comment_id,
+                context,
+            } = *observation;
+            let is_poll = source.is_none()
+                && repo.is_none()
+                && number.is_none()
+                && html_url.is_none()
+                && item_type.is_none()
+                && head_sha.is_none()
+                && node_id.is_none()
+                && item_author.is_none()
+                && trigger_actor.is_none()
+                && self_actor.is_none()
+                && notification_reason.is_none()
+                && trigger_kind.is_none()
+                && event_id.is_none()
+                && comment_id.is_none()
+                && context.is_none();
+            if is_poll {
+                serde_json::to_value(engine.poll_gh(
+                    &args.producer,
+                    &GhCliIntake::default(),
+                    now,
+                )?)?
+            } else if let (
+                Some(source),
+                Some(repo),
+                Some(number),
+                Some(html_url),
+                Some(item_type),
+                Some(node_id),
+                Some(item_author),
+                Some(trigger_actor),
+                Some(self_actor),
+                Some(trigger_kind),
+                Some(context),
+            ) = (
+                source,
+                repo,
+                number,
+                html_url,
+                item_type,
+                node_id,
+                item_author,
+                trigger_actor,
+                self_actor,
+                trigger_kind,
+                context,
+            ) {
                 serde_json::to_value(engine.emit_gh(
                     &args.producer,
                     &GhObservation {
                         source,
-                        item_id,
-                        actor,
+                        repo,
+                        number,
+                        html_url,
+                        item_type,
+                        head_sha,
+                        node_id,
+                        item_author,
+                        trigger_actor,
                         self_actor,
+                        notification_reason,
+                        trigger_kind,
+                        event_id,
+                        comment_id,
+                        context,
                     },
                     now,
                 )?)?
+            } else {
+                bail!(
+                    "gh observation requires either no fields for a configured poll or complete origin identity and context fields"
+                )
             }
-            _ => bail!(
-                "gh observation requires either no fields for a configured poll or all of source, itemId, actor, and selfActor"
-            ),
-        },
+        }
         ProducerObservation::BuildEffect { store_path } => {
             let store_paths = if let Some(store_path) = store_path {
                 vec![store_path]
@@ -681,8 +745,8 @@ async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
         no_enqueue: args.no_enqueue,
         credentials: Default::default(),
         caller_job_id: std::env::var("TALLY_JOB_ID").ok(),
-        gh_actor: std::env::var("TALLY_GH_ACTOR").ok(),
-        gh_self_actor: std::env::var("TALLY_GH_SELF_ACTOR").ok(),
+        gh_trigger_actor: None,
+        gh_self_actor: None,
         gh_origin: None,
         wait: args.wait,
     };

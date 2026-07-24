@@ -69,6 +69,7 @@ fn request(argv: Vec<String>) -> ExecutionRequest {
         yield_hook: None,
         tally_socket: None,
         environment: BTreeMap::new(),
+        gh_origin: None,
         cwd: None,
         credentials: BTreeMap::new(),
         limits: UnitLimits {

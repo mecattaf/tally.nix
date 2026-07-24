@@ -495,7 +495,19 @@ let
           type = types.str;
           default = "self";
           example = "tally-bot";
-          description = "Actor refused by the GitHub intake narrower.";
+          description = "Literal trigger actor refused by the GitHub intake narrower.";
+        };
+        allowSelfTriggered = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Explicitly allow a trigger whose actor is the authenticated GitHub identity.";
+        };
+        allowedActors = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "trusted-maintainer" ];
+          description = "Optional trigger-actor allowlist; an empty list preserves unrestricted external actors.";
         };
         pollIntervalSec = mkOption {
           type = types.ints.positive;
@@ -507,7 +519,13 @@ let
           type = types.bool;
           default = false;
           example = true;
-          description = "Enable the idempotent COMPLETED mutation half.";
+          description = "Post an idempotent evidence comment after a passing or reused verdict.";
+        };
+        closeOnPass = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Close the GitHub item after posting evidence for a passing or reused verdict.";
         };
         enqueue = mkOption {
           type = mkEnqueueType;
@@ -532,6 +550,16 @@ let
           {
             assertion = config.actorExclude != "";
             message = "gh producer ${name} actorExclude must be non-empty";
+          }
+          {
+            assertion =
+              builtins.length config.allowedActors == builtins.length (unique config.allowedActors)
+              && lib.all (actor: actor != "") config.allowedActors;
+            message = "gh producer ${name} allowedActors must contain unique non-empty actors";
+          }
+          {
+            assertion = !config.closeOnPass || config.postEvidence;
+            message = "gh producer ${name} closeOnPass=true requires postEvidence=true";
           }
           config.enqueue._tallyAssertions
         ]
@@ -1089,8 +1117,11 @@ let
               enable
               sources
               actorExclude
+              allowSelfTriggered
+              allowedActors
               pollIntervalSec
               postEvidence
+              closeOnPass
               ;
             enqueue = renderEnqueue producer.enqueue;
           }

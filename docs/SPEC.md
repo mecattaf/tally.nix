@@ -123,6 +123,16 @@ Each unit receives proof-bearing environment such as the job ID, task UUID when 
 lease epoch, priority class, attempt, enqueue capability, socket, and credential names. Optional
 fields are explicitly unset when absent so inherited environment cannot impersonate them.
 
+For producer-launched GitHub jobs, a versioned origin carries repository, item number and URL,
+item kind, immutable PR head SHA, node ID, trigger kind and actor, event/comment IDs, and distinct
+item-author/self-actor/notification-reason fields. The executor exposes only bounded scalar
+identity as `TALLY_GH_*`; arbitrary title, body, label, assignee, and comment text stays in a
+validated private JSON context file. Direct enqueue has no GitHub environment.
+Native intake never substitutes the item author for an unavailable trigger actor. It attributes a
+notification's latest comment only when the API comment identity and timestamp link it to that
+notification; candidates without authoritative actor data fail closed as
+`trigger-actor-unavailable` without stopping unrelated candidates.
+
 The executor applies CPU and memory limits, an optional `RuntimeMaxSec`, private capture files for
 stdout and stderr, and an `ExecStopPost` helper that writes a durable invocation-linked exit
 record. Credential sources are passed to systemd through `LoadCredential=`; only names enter tally
@@ -231,9 +241,12 @@ The producer registry is closed over exactly five kinds: `calendar`, `build-effe
 Calendar producers emit a configured payload for a systemd calendar event. Build-effect producers
 observe bounded Nix store-path feeds. Pool-reachability producers confirm loss and return through
 hysteresis and can emit declared transition work. GitHub producers use explicit notification or
-search sources, exclude the configured actor, deduplicate immutable item IDs, and optionally make
-an idempotent completion mutation only after durable success. Events-directory producers accept
-ordinary files from external scanners.
+search sources, authorize and exclude the captured trigger actor, and deduplicate immutable item
+IDs. The current search surface lacks authoritative trigger-actor data and therefore filters its
+candidates closed. Self-trigger admission is explicit. After durable `Pass`/`Reused`, evidence
+posting and item closing are separate policies; closing is impossible unless evidence posting is
+enabled.
+Events-directory producers accept ordinary files from external scanners.
 
 Ingress files are claimed without following links, bounded, parsed through the same enqueue
 narrower, and archived only after acknowledgement. There is no producer-specific execution lane.
@@ -259,6 +272,8 @@ canonical witness facts precedence.
 
 The CLI exposes status, log, render, standup, and pool projections. Queries are observational:
 they do not mutate job state, and pruning journal history cannot erase a witnessed terminal result.
+GitHub-backed rows project captured repository, item number, and URL into `RowFact` and standup
+completed/in-flight entries without adding scheduling state or changing witness records.
 
 ## 12. Security and failure posture
 

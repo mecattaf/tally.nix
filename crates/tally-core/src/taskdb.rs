@@ -19,7 +19,15 @@ use crate::witness::{read_verified_records, LaborClass, Verdict, WitnessError, W
 pub const TASKDATA_DIRECTORY: &str = "taskdata";
 const MAX_DURABLE_EVENT_BYTES: u64 = 1024 * 1024;
 pub const MAX_GH_ORIGIN_FIELD_BYTES: usize = 4096;
+pub const MAX_GH_CONTEXT_BYTES: usize = 256 * 1024;
+pub const GH_ORIGIN_SCHEMA_VERSION: u32 = 1;
+pub const GH_CONTEXT_SCHEMA_VERSION: u32 = 1;
 const MAX_GH_PRODUCER_BYTES: usize = 96;
+const MAX_GH_TITLE_BYTES: usize = 16 * 1024;
+const MAX_GH_BODY_BYTES: usize = 128 * 1024;
+const MAX_GH_COMMENT_BODY_BYTES: usize = 64 * 1024;
+const MAX_GH_LIST_ITEMS: usize = 100;
+const MAX_GH_LIST_ITEM_BYTES: usize = 1024;
 
 pub const TALLY_UDA_NAMES: &[&str] = &[
     "adapter",
@@ -58,18 +66,199 @@ pub enum EnqueueSource {
     PoolReachability,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GhItemType {
+    Issue,
+    PullRequest,
+}
+
+impl GhItemType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Issue => "issue",
+            Self::PullRequest => "pull_request",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GhTriggeringComment {
+    pub id: String,
+    pub author: String,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GhContextSnapshot {
+    pub schema_version: u32,
+    pub title: String,
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default)]
+    pub assignees: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triggering_comment: Option<GhTriggeringComment>,
+}
+
+impl GhContextSnapshot {
+    pub fn validate(&self) -> Result<(), TaskDbError> {
+        if self.schema_version != GH_CONTEXT_SCHEMA_VERSION {
+            return Err(TaskDbError::InvalidSeed(format!(
+                "GitHub context has unsupported schema version {}",
+                self.schema_version
+            )));
+        }
+        validate_gh_text("context title", &self.title, MAX_GH_TITLE_BYTES, false)?;
+        validate_gh_text("context body", &self.body, MAX_GH_BODY_BYTES, true)?;
+        if self
+            .head_sha
+            .as_deref()
+            .is_some_and(|sha| !valid_gh_sha(sha))
+        {
+            return Err(TaskDbError::InvalidSeed(
+                "GitHub context headSha must be a 40- to 64-character hexadecimal commit SHA"
+                    .to_owned(),
+            ));
+        }
+        validate_gh_list("context labels", &self.labels)?;
+        validate_gh_list("context assignees", &self.assignees)?;
+        if let Some(comment) = &self.triggering_comment {
+            validate_gh_scalar("context triggeringComment id", &comment.id)?;
+            validate_gh_scalar("context triggeringComment author", &comment.author)?;
+            validate_gh_text(
+                "context triggeringComment body",
+                &comment.body,
+                MAX_GH_COMMENT_BODY_BYTES,
+                true,
+            )?;
+        }
+        let encoded = serde_json::to_vec(self)?;
+        if encoded.len() > MAX_GH_CONTEXT_BYTES {
+            return Err(TaskDbError::InvalidSeed(format!(
+                "GitHub context exceeds the {MAX_GH_CONTEXT_BYTES} byte limit"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct GhOrigin {
+    pub schema_version: u32,
     pub producer: String,
     pub source: String,
-    pub item_id: String,
-    pub actor: String,
+    pub repo: String,
+    pub number: u64,
+    pub html_url: String,
+    pub item_type: Option<GhItemType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head_sha: Option<String>,
+    pub node_id: String,
+    pub item_author: String,
+    pub trigger_actor: String,
     pub self_actor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notification_reason: Option<String>,
+    pub trigger_kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<GhContextSnapshot>,
     pub actor_exclude: String,
+    pub allow_self_triggered: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_actors: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct GhOriginWire {
+    #[serde(default)]
+    schema_version: u32,
+    producer: String,
+    source: String,
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    number: u64,
+    #[serde(default)]
+    html_url: String,
+    #[serde(default)]
+    item_type: Option<GhItemType>,
+    #[serde(default)]
+    head_sha: Option<String>,
+    #[serde(default, alias = "itemId")]
+    node_id: String,
+    #[serde(default)]
+    item_author: Option<String>,
+    #[serde(default)]
+    trigger_actor: Option<String>,
+    #[serde(default)]
+    actor: Option<String>,
+    self_actor: String,
+    #[serde(default)]
+    notification_reason: Option<String>,
+    #[serde(default)]
+    trigger_kind: String,
+    #[serde(default)]
+    event_id: Option<String>,
+    #[serde(default)]
+    comment_id: Option<String>,
+    #[serde(default)]
+    context: Option<GhContextSnapshot>,
+    actor_exclude: String,
+    #[serde(default)]
+    allow_self_triggered: bool,
+    #[serde(default)]
+    allowed_actors: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for GhOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = GhOriginWire::deserialize(deserializer)?;
+        let legacy_actor = wire.actor.unwrap_or_default();
+        Ok(Self {
+            schema_version: wire.schema_version,
+            producer: wire.producer,
+            source: wire.source,
+            repo: wire.repo,
+            number: wire.number,
+            html_url: wire.html_url,
+            item_type: wire.item_type,
+            head_sha: wire.head_sha,
+            node_id: wire.node_id,
+            item_author: wire.item_author.unwrap_or_else(|| legacy_actor.clone()),
+            trigger_actor: wire.trigger_actor.unwrap_or(legacy_actor),
+            self_actor: wire.self_actor,
+            notification_reason: wire.notification_reason,
+            trigger_kind: wire.trigger_kind,
+            event_id: wire.event_id,
+            comment_id: wire.comment_id,
+            context: wire.context,
+            actor_exclude: wire.actor_exclude,
+            allow_self_triggered: wire.allow_self_triggered,
+            allowed_actors: wire.allowed_actors,
+        })
+    }
 }
 
 impl GhOrigin {
+    pub const fn is_current(&self) -> bool {
+        self.schema_version == GH_ORIGIN_SCHEMA_VERSION
+    }
+
     pub fn validate(&self) -> Result<(), TaskDbError> {
         let producer_valid = !self.producer.is_empty()
             && self.producer.len() <= MAX_GH_PRODUCER_BYTES
@@ -91,22 +280,200 @@ impl GhOrigin {
         }
         for (label, value) in [
             ("source", &self.source),
-            ("itemId", &self.item_id),
-            ("actor", &self.actor),
+            ("nodeId", &self.node_id),
+            ("itemAuthor", &self.item_author),
+            ("triggerActor", &self.trigger_actor),
             ("selfActor", &self.self_actor),
             ("actorExclude", &self.actor_exclude),
         ] {
-            if value.trim().is_empty()
-                || value.len() > MAX_GH_ORIGIN_FIELD_BYTES
-                || value.chars().any(char::is_control)
-            {
-                return Err(TaskDbError::InvalidSeed(format!(
-                    "GitHub origin {label} must be non-empty, at most {MAX_GH_ORIGIN_FIELD_BYTES} bytes, and contain no control characters"
-                )));
+            validate_gh_scalar(&format!("origin {label}"), value)?;
+        }
+        if self.schema_version == 0 {
+            return Ok(());
+        }
+        if self.schema_version != GH_ORIGIN_SCHEMA_VERSION {
+            return Err(TaskDbError::InvalidSeed(format!(
+                "GitHub origin has unsupported schema version {}",
+                self.schema_version
+            )));
+        }
+        validate_gh_repo(&self.repo)?;
+        if self.number == 0 {
+            return Err(TaskDbError::InvalidSeed(
+                "GitHub origin number must be positive".to_owned(),
+            ));
+        }
+        validate_gh_scalar("origin triggerKind", &self.trigger_kind)?;
+        for (label, value) in [
+            ("notificationReason", self.notification_reason.as_deref()),
+            ("eventId", self.event_id.as_deref()),
+            ("commentId", self.comment_id.as_deref()),
+        ] {
+            if let Some(value) = value {
+                validate_gh_scalar(&format!("origin {label}"), value)?;
             }
+        }
+        if self.source == "notifications"
+            && (self.notification_reason.is_none() || self.event_id.is_none())
+        {
+            return Err(TaskDbError::InvalidSeed(
+                "GitHub notification origin requires notificationReason and eventId".to_owned(),
+            ));
+        }
+        let item_type = self.item_type.ok_or_else(|| {
+            TaskDbError::InvalidSeed("GitHub origin requires an item type".to_owned())
+        })?;
+        match (item_type, self.head_sha.as_deref()) {
+            (GhItemType::Issue, None) => {}
+            (GhItemType::PullRequest, Some(sha)) if valid_gh_sha(sha) => {}
+            (GhItemType::Issue, Some(_)) => {
+                return Err(TaskDbError::InvalidSeed(
+                    "GitHub issue origin must not carry a PR head SHA".to_owned(),
+                ));
+            }
+            (GhItemType::PullRequest, _) => {
+                return Err(TaskDbError::InvalidSeed(
+                    "GitHub pull request origin requires a valid head SHA".to_owned(),
+                ));
+            }
+        }
+        validate_gh_url(&self.html_url, &self.repo, self.number, item_type)?;
+        if self.allowed_actors.len() > MAX_GH_LIST_ITEMS {
+            return Err(TaskDbError::InvalidSeed(format!(
+                "GitHub origin allowedActors exceeds {MAX_GH_LIST_ITEMS} entries"
+            )));
+        }
+        let mut actors = self.allowed_actors.clone();
+        for actor in &actors {
+            validate_gh_scalar("origin allowedActors entry", actor)?;
+        }
+        actors.sort();
+        if actors.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(TaskDbError::InvalidSeed(
+                "GitHub origin allowedActors contains duplicates".to_owned(),
+            ));
+        }
+        let context = self.context.as_ref().ok_or_else(|| {
+            TaskDbError::InvalidSeed("GitHub origin requires a context snapshot".to_owned())
+        })?;
+        context.validate()?;
+        if context.head_sha != self.head_sha {
+            return Err(TaskDbError::InvalidSeed(
+                "GitHub origin and context headSha must match".to_owned(),
+            ));
+        }
+        match (&self.comment_id, &context.triggering_comment) {
+            (Some(comment_id), Some(comment))
+                if comment_id == &comment.id && self.trigger_actor == comment.author => {}
+            (None, None) => {}
+            _ => {
+                return Err(TaskDbError::InvalidSeed(
+                    "GitHub origin commentId and triggerActor must match the triggering context comment"
+                        .to_owned(),
+                ));
+            }
+        }
+        let encoded = serde_json::to_vec(self)?;
+        if encoded.len() > MAX_DURABLE_EVENT_BYTES as usize {
+            return Err(TaskDbError::InvalidSeed(format!(
+                "GitHub origin exceeds the {MAX_DURABLE_EVENT_BYTES} byte durable-event limit"
+            )));
         }
         Ok(())
     }
+}
+
+fn validate_gh_scalar(label: &str, value: &str) -> Result<(), TaskDbError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_GH_ORIGIN_FIELD_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err(TaskDbError::InvalidSeed(format!(
+            "GitHub {label} must be non-empty, at most {MAX_GH_ORIGIN_FIELD_BYTES} bytes, and contain no control characters"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_gh_text(
+    label: &str,
+    value: &str,
+    limit: usize,
+    allow_empty: bool,
+) -> Result<(), TaskDbError> {
+    if (!allow_empty && value.trim().is_empty()) || value.len() > limit || value.contains('\0') {
+        let empty_requirement = if allow_empty { "" } else { "non-empty, " };
+        return Err(TaskDbError::InvalidSeed(format!(
+            "GitHub {label} must be {empty_requirement}at most {limit} bytes and contain no NUL bytes"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_gh_list(label: &str, values: &[String]) -> Result<(), TaskDbError> {
+    if values.len() > MAX_GH_LIST_ITEMS {
+        return Err(TaskDbError::InvalidSeed(format!(
+            "GitHub {label} exceeds {MAX_GH_LIST_ITEMS} entries"
+        )));
+    }
+    for value in values {
+        validate_gh_text(label, value, MAX_GH_LIST_ITEM_BYTES, false)?;
+    }
+    Ok(())
+}
+
+fn validate_gh_repo(repo: &str) -> Result<(), TaskDbError> {
+    validate_gh_scalar("origin repo", repo)?;
+    let Some((owner, name)) = repo.split_once('/') else {
+        return Err(TaskDbError::InvalidSeed(
+            "GitHub origin repo must be owner/name".to_owned(),
+        ));
+    };
+    let valid_component = |component: &str| {
+        !component.is_empty()
+            && component
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    };
+    if !valid_component(owner) || !valid_component(name) || name.contains('/') {
+        return Err(TaskDbError::InvalidSeed(
+            "GitHub origin repo must be a safe owner/name pair".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_gh_url(
+    url: &str,
+    repo: &str,
+    number: u64,
+    item_type: GhItemType,
+) -> Result<(), TaskDbError> {
+    validate_gh_scalar("origin htmlUrl", url)?;
+    let Some(location) = url.strip_prefix("https://") else {
+        return Err(TaskDbError::InvalidSeed(
+            "GitHub origin htmlUrl must be an absolute HTTPS URL".to_owned(),
+        ));
+    };
+    let Some((host, path)) = location.split_once('/') else {
+        return Err(TaskDbError::InvalidSeed(
+            "GitHub origin htmlUrl must be an absolute HTTPS URL".to_owned(),
+        ));
+    };
+    let item_segment = match item_type {
+        GhItemType::Issue => "issues",
+        GhItemType::PullRequest => "pull",
+    };
+    if host.is_empty() || path != format!("{repo}/{item_segment}/{number}") {
+        return Err(TaskDbError::InvalidSeed(
+            "GitHub origin htmlUrl does not match repo, number, and itemType".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_gh_sha(sha: &str) -> bool {
+    (40..=64).contains(&sha.len()) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1050,6 +1417,73 @@ mod tests {
                 .pools,
             ["alpha", "zeta"]
         );
+    }
+
+    #[test]
+    fn legacy_github_origin_state_deserializes_without_inventing_current_identity() {
+        let origin: GhOrigin = serde_json::from_value(serde_json::json!({
+            "producer": "github",
+            "source": "notifications",
+            "itemId": "I_legacy",
+            "actor": "contributor",
+            "selfActor": "tally-bot",
+            "actorExclude": "self"
+        }))
+        .unwrap();
+        origin.validate().unwrap();
+        assert_eq!(origin.schema_version, 0);
+        assert_eq!(origin.node_id, "I_legacy");
+        assert_eq!(origin.item_author, "contributor");
+        assert_eq!(origin.trigger_actor, "contributor");
+        assert!(origin.repo.is_empty());
+        assert!(origin.item_type.is_none());
+        assert!(origin.context.is_none());
+    }
+
+    #[test]
+    fn github_context_is_versioned_bounded_and_revision_consistent() {
+        let context = GhContextSnapshot {
+            schema_version: GH_CONTEXT_SCHEMA_VERSION,
+            title: "PR context".to_owned(),
+            body: "untrusted".to_owned(),
+            head_sha: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
+            labels: vec!["build".to_owned()],
+            assignees: vec!["tally-bot".to_owned()],
+            triggering_comment: None,
+        };
+        context.validate().unwrap();
+
+        let mut oversized = context.clone();
+        oversized.body = "x".repeat(MAX_GH_BODY_BYTES + 1);
+        assert!(oversized.validate().is_err());
+
+        let origin = GhOrigin {
+            schema_version: GH_ORIGIN_SCHEMA_VERSION,
+            producer: "github".to_owned(),
+            source: "notifications".to_owned(),
+            repo: "acme/widgets".to_owned(),
+            number: 42,
+            html_url: "https://github.com/acme/widgets/pull/42".to_owned(),
+            item_type: Some(GhItemType::PullRequest),
+            head_sha: Some("fedcba9876543210fedcba9876543210fedcba98".to_owned()),
+            node_id: "PR_current".to_owned(),
+            item_author: "author".to_owned(),
+            trigger_actor: "maintainer".to_owned(),
+            self_actor: "tally-bot".to_owned(),
+            notification_reason: Some("review-requested".to_owned()),
+            trigger_kind: "notification".to_owned(),
+            event_id: Some("event-42".to_owned()),
+            comment_id: None,
+            context: Some(context),
+            actor_exclude: "self".to_owned(),
+            allow_self_triggered: false,
+            allowed_actors: Vec::new(),
+        };
+        assert!(origin
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("headSha must match"));
     }
 
     #[test]
