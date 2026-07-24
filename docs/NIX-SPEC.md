@@ -147,13 +147,28 @@ no first firing on a fresh user manager.
 
 - `enable`: boolean, default `false`.
 - `sources`: list containing `notifications` and/or `search`, default empty.
-- `actorExclude`: nonempty string, default `self`.
+- `actorExclude`: nonempty literal trigger-actor login, default `self`.
+- `allowSelfTriggered`: boolean, default `false`.
+- `allowedActors`: unique list of trigger-actor logins, default empty; a nonempty list is an
+  allowlist.
 - `pollIntervalSec`: positive integer, default `60`.
-- `postEvidence`: boolean, default `false`.
+- `postEvidence`: boolean, default `false`; post marker-tagged completion evidence.
+- `closeOnPass`: boolean, default `false`; after posting evidence, also close an item for a
+  `Pass`/`Reused` verdict.
 - `enqueue`: required enqueue payload.
 
 An enabled producer requires at least one unique source. Home Manager generates a supervised
 service with `Restart=always`, no start-rate limit, and the polling interval as `RestartSec`.
+Authorization, `allowedActors`, and `actorExclude` inspect `triggerActor`, never the item author.
+Self-triggered observations require `allowSelfTriggered = true`; there is no special
+`actorExclude` sentinel for this policy. `closeOnPass = true` requires `postEvidence = true`.
+Current Nix rendering always writes `closeOnPass`. A legacy serialized JSON configuration that
+omits the field retains the historical fused close behavior when `postEvidence` is true.
+Native intake never substitutes `itemAuthor` when the trigger actor is unknown. A notification's
+latest comment supplies the actor only when its ID and timestamp link it to that notification;
+otherwise that candidate is recorded as filtered with `trigger-actor-unavailable`, without
+stopping unrelated candidates. The current search surface has no authoritative trigger actor and
+therefore fails closed the same way.
 
 ### `build-effect`
 
@@ -288,8 +303,25 @@ Transient `tally-job-<uuid>.service` units receive the applicable variables from
 | `TALLY_CREDENTIALS` | JSON list of credential names. |
 | `TALLY_SOCKET` | Socket used by cooperative hooks. |
 | `TALLY_YIELD_HOOK` | Serialized direct hook argv when configured. |
+| `TALLY_GH_REPO` | Captured GitHub repository as `owner/name`. |
+| `TALLY_GH_NUMBER` | Captured issue or pull-request number. |
+| `TALLY_GH_URL` | Captured GitHub HTML URL. |
+| `TALLY_GH_TYPE` | `issue` or `pull_request`. |
+| `TALLY_GH_HEAD_SHA` | Immutable PR head SHA; present and empty for issue-origin jobs. |
+| `TALLY_GH_NODE_ID` | Immutable GitHub node ID. |
+| `TALLY_GH_TRIGGER_KIND` | Captured trigger classification. |
+| `TALLY_GH_TRIGGER_ACTOR` | Authoritatively identified actor that caused the captured trigger. |
+| `TALLY_GH_EVENT_ID` | Captured event/notification ID, or empty when unavailable. |
+| `TALLY_GH_COMMENT_ID` | Triggering comment ID, or empty when inapplicable. |
+| `TALLY_GH_CONTEXT` | Path to the versioned, bounded GitHub context JSON snapshot. |
 
-Optional proof-bearing variables are explicitly unset when absent.
+GitHub variables exist only for jobs launched from a current GitHub producer origin. They are all
+absent for direct `tally enqueue` jobs, rather than present with empty values. The context file
+contains title, body, labels, assignees, an optional triggering comment, and the immutable PR
+revision where applicable. It is atomically materialized before launch in the job's durable state,
+with a `0700` directory and `0600` file, and remains tied to that execution identity for recovery.
+Arbitrary GitHub text never enters argv or environment values. Other optional proof-bearing
+variables are explicitly unset when absent.
 
 `lib.tallyWitnessUnitHooks` expands to:
 

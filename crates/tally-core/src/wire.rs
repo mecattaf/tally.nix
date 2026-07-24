@@ -368,8 +368,8 @@ pub struct EnqueuePayload {
     pub credentials: BTreeMap<String, PathBuf>,
     #[serde(default)]
     pub caller_job_id: Option<String>,
-    #[serde(default)]
-    pub gh_actor: Option<String>,
+    #[serde(default, rename = "ghTriggerActor", alias = "ghActor")]
+    pub gh_trigger_actor: Option<String>,
     #[serde(default)]
     pub gh_self_actor: Option<String>,
     #[serde(default)]
@@ -519,29 +519,39 @@ impl GuardrailState {
             origin
                 .validate()
                 .map_err(|error| WireError::invalid(error.to_string()))?;
-            if payload.gh_actor.as_deref() != Some(origin.actor.as_str())
+            if payload.gh_trigger_actor.as_deref() != Some(origin.trigger_actor.as_str())
                 || payload.gh_self_actor.as_deref() != Some(origin.self_actor.as_str())
             {
                 return Err(WireError::invalid(
-                    "GitHub actor fields do not match the durable ghOrigin",
+                    "GitHub trigger actor fields do not match the durable ghOrigin",
                 ));
             }
         }
         let excluded = payload.gh_origin.as_ref().is_some_and(|origin| {
-            if origin.actor_exclude == "self" {
-                origin.actor == origin.self_actor
+            if origin.schema_version == 0 {
+                if origin.actor_exclude == "self" {
+                    origin.trigger_actor == origin.self_actor
+                } else {
+                    origin.trigger_actor == origin.actor_exclude
+                }
             } else {
-                origin.actor == origin.actor_exclude
+                (!origin.allowed_actors.is_empty()
+                    && !origin
+                        .allowed_actors
+                        .iter()
+                        .any(|actor| actor == &origin.trigger_actor))
+                    || (origin.trigger_actor == origin.self_actor && !origin.allow_self_triggered)
+                    || origin.trigger_actor == origin.actor_exclude
             }
         }) || payload.gh_origin.is_none()
             && payload
-                .gh_actor
+                .gh_trigger_actor
                 .as_deref()
                 .zip(payload.gh_self_actor.as_deref())
                 .is_some_and(|(actor, own)| actor == own);
         if source == EnqueueSource::Gh && excluded {
             return Err(WireError::invalid(
-                "GitHub event actor is excluded by actorExclude",
+                "GitHub trigger actor is filtered by producer policy",
             ));
         }
         let mut pools = payload.pools.unwrap_or_else(|| defaults.pools.clone());
@@ -728,6 +738,15 @@ mod tests {
     }
 
     #[test]
+    fn legacy_github_actor_wire_name_maps_to_trigger_actor() {
+        let mut encoded = serde_json::to_value(child_payload()).unwrap();
+        encoded.as_object_mut().unwrap().remove("ghTriggerActor");
+        encoded["ghActor"] = Value::String("legacy-trigger".to_owned());
+        let decoded: EnqueuePayload = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.gh_trigger_actor.as_deref(), Some("legacy-trigger"));
+    }
+
+    #[test]
     fn enqueue_pool_set_rejections_are_actionable_and_canonicalization_is_stable() {
         let mut state = GuardrailState::new(GuardrailConfig::default()).unwrap();
         let mut payload = child_payload();
@@ -810,7 +829,7 @@ mod tests {
             no_enqueue: false,
             credentials: BTreeMap::new(),
             caller_job_id: Some("job-parent".to_owned()),
-            gh_actor: None,
+            gh_trigger_actor: None,
             gh_self_actor: None,
             gh_origin: None,
             wait: false,
@@ -957,7 +976,7 @@ mod tests {
         let mut payload = child_payload();
         payload.caller_job_id = None;
         payload.source = Some(EnqueueSource::Gh);
-        payload.gh_actor = Some("bot".to_owned());
+        payload.gh_trigger_actor = Some("bot".to_owned());
         payload.gh_self_actor = Some("bot".to_owned());
         assert!(state.validate_enqueue(payload, &defaults()).is_err());
     }

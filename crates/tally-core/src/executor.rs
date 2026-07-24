@@ -21,6 +21,7 @@ use tokio::sync::watch;
 
 use crate::config::{ExecutionTargetConfig, Priority, SshExecutorConfig};
 use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOutcome};
+use crate::taskdb::GhOrigin;
 
 pub const CAPTURE_DIRECTORY: &str = "capture";
 pub const UNIT_EXIT_DIRECTORY: &str = "unit-exit";
@@ -33,6 +34,20 @@ const OPTIONAL_TALLY_ENVIRONMENT: [&str; 6] = [
     "TALLY_YIELD_HOOK",
     "TALLY_SOCKET",
 ];
+const GH_TALLY_ENVIRONMENT: [&str; 11] = [
+    "TALLY_GH_REPO",
+    "TALLY_GH_NUMBER",
+    "TALLY_GH_URL",
+    "TALLY_GH_TYPE",
+    "TALLY_GH_HEAD_SHA",
+    "TALLY_GH_NODE_ID",
+    "TALLY_GH_TRIGGER_KIND",
+    "TALLY_GH_TRIGGER_ACTOR",
+    "TALLY_GH_EVENT_ID",
+    "TALLY_GH_COMMENT_ID",
+    "TALLY_GH_CONTEXT",
+];
+const GH_CONTEXT_DIRECTORY: &str = "github-context";
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -74,6 +89,8 @@ pub struct ExecutionRequest {
     /// from adapter-controlled environment so it cannot be redirected there.
     pub tally_socket: Option<String>,
     pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh_origin: Option<GhOrigin>,
     pub cwd: Option<PathBuf>,
     pub credentials: BTreeMap<String, PathBuf>,
     pub limits: UnitLimits,
@@ -1249,6 +1266,12 @@ impl Executor {
         }
     }
 
+    pub fn gh_context_path(&self, identity: &ExecutionIdentity) -> PathBuf {
+        self.state_dir
+            .join(GH_CONTEXT_DIRECTORY)
+            .join(format!("{}.json", identity.unit_uuid()))
+    }
+
     pub fn capture_generation_matches(
         &self,
         identity: &ExecutionIdentity,
@@ -1874,7 +1897,12 @@ impl Executor {
         if let Some(cwd) = &request.cwd {
             push_pair(&mut args, "--working-directory", cwd.as_os_str());
         }
-        for (name, value) in execution_environment(request)? {
+        let gh_context_path = request
+            .gh_origin
+            .as_ref()
+            .filter(|origin| origin.is_current())
+            .map(|_| self.gh_context_path(&request.identity));
+        for (name, value) in execution_environment(request, gh_context_path.as_deref())? {
             push_pair(&mut args, "--setenv", format!("{name}={value}"));
         }
         let unset_environment = environment_to_unset(request);
@@ -1971,6 +1999,7 @@ impl Executor {
                 lease_epoch: request.lease_epoch,
             },
         )?;
+        self.materialize_gh_context(&request)?;
         let args = self.build_systemd_argv(&request)?;
         let output = match Command::new(&self.systemd_run).args(&args).output().await {
             Ok(output) => output,
@@ -2206,7 +2235,34 @@ impl Executor {
             }
             validate_systemd_path(source, "credential source")?;
         }
+        if let Some(origin) = &request.gh_origin {
+            origin
+                .validate()
+                .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+        }
         Ok(())
+    }
+
+    fn materialize_gh_context(
+        &self,
+        request: &ExecutionRequest,
+    ) -> Result<Option<PathBuf>, ExecutorError> {
+        let Some(origin) = request
+            .gh_origin
+            .as_ref()
+            .filter(|origin| origin.is_current())
+        else {
+            return Ok(None);
+        };
+        let context = origin.context.as_ref().ok_or_else(|| {
+            ExecutorError::InvalidRequest("current GitHub origin omitted context".to_owned())
+        })?;
+        context
+            .validate()
+            .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+        let path = self.gh_context_path(&request.identity);
+        replace_private_file(&path, &serde_json::to_vec(context)?)?;
+        Ok(Some(path))
     }
 
     fn exec_stop_post(&self, record: &Path, unit: &str) -> Result<String, ExecutorError> {
@@ -2303,7 +2359,12 @@ impl Executor {
         for name in environment_to_unset(&request) {
             command.env_remove(name);
         }
-        for (name, value) in execution_environment(&request)? {
+        let gh_context_path = request
+            .gh_origin
+            .as_ref()
+            .filter(|origin| origin.is_current())
+            .map(|_| self.gh_context_path(&request.identity));
+        for (name, value) in execution_environment(&request, gh_context_path.as_deref())? {
             command.env(name, value);
         }
         let mut child = command.spawn().map_err(|source| ExecutorError::Spawn {
@@ -2446,6 +2507,7 @@ fn priority_name(priority: Priority) -> &'static str {
 
 fn execution_environment(
     request: &ExecutionRequest,
+    gh_context_path: Option<&Path>,
 ) -> Result<Vec<(String, String)>, ExecutorError> {
     let mut environment = request
         .environment
@@ -2493,6 +2555,49 @@ fn execution_environment(
     if let Some(socket) = &request.tally_socket {
         environment.push(("TALLY_SOCKET".to_owned(), socket.clone()));
     }
+    if let Some(origin) = request
+        .gh_origin
+        .as_ref()
+        .filter(|origin| origin.is_current())
+    {
+        let item_type = origin.item_type.ok_or_else(|| {
+            ExecutorError::InvalidRequest("current GitHub origin omitted itemType".to_owned())
+        })?;
+        let context_path = gh_context_path.ok_or_else(|| {
+            ExecutorError::InvalidRequest("current GitHub origin omitted context path".to_owned())
+        })?;
+        environment.extend([
+            ("TALLY_GH_REPO".to_owned(), origin.repo.clone()),
+            ("TALLY_GH_NUMBER".to_owned(), origin.number.to_string()),
+            ("TALLY_GH_URL".to_owned(), origin.html_url.clone()),
+            ("TALLY_GH_TYPE".to_owned(), item_type.as_str().to_owned()),
+            (
+                "TALLY_GH_HEAD_SHA".to_owned(),
+                origin.head_sha.clone().unwrap_or_default(),
+            ),
+            ("TALLY_GH_NODE_ID".to_owned(), origin.node_id.clone()),
+            (
+                "TALLY_GH_TRIGGER_KIND".to_owned(),
+                origin.trigger_kind.clone(),
+            ),
+            (
+                "TALLY_GH_TRIGGER_ACTOR".to_owned(),
+                origin.trigger_actor.clone(),
+            ),
+            (
+                "TALLY_GH_EVENT_ID".to_owned(),
+                origin.event_id.clone().unwrap_or_default(),
+            ),
+            (
+                "TALLY_GH_COMMENT_ID".to_owned(),
+                origin.comment_id.clone().unwrap_or_default(),
+            ),
+            (
+                "TALLY_GH_CONTEXT".to_owned(),
+                display_path(context_path)?.to_owned(),
+            ),
+        ]);
+    }
     Ok(environment)
 }
 
@@ -2524,6 +2629,13 @@ fn environment_to_unset(request: &ExecutionRequest) -> Vec<&'static str> {
     }
     if request.tally_socket.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[5]);
+    }
+    if request
+        .gh_origin
+        .as_ref()
+        .is_none_or(|origin| !origin.is_current())
+    {
+        names.extend(GH_TALLY_ENVIRONMENT);
     }
     names
 }
@@ -3255,6 +3367,9 @@ mod tests {
     use std::os::unix::ffi::OsStrExt;
 
     use super::*;
+    use crate::taskdb::{
+        GhContextSnapshot, GhItemType, GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
+    };
 
     fn uuid(value: &str) -> Uuid {
         Uuid::parse_str(value).unwrap()
@@ -3286,6 +3401,7 @@ mod tests {
             ]),
             tally_socket: Some("/run/user/1000/tally.sock".to_owned()),
             environment: BTreeMap::from([("ADAPTER_COLOR".to_owned(), "never".to_owned())]),
+            gh_origin: None,
             cwd: Some(PathBuf::from("/work tree")),
             credentials: BTreeMap::from([
                 ("alpha".to_owned(), PathBuf::from("/run/keys/alpha")),
@@ -3296,6 +3412,45 @@ mod tests {
                 memory_max_bytes: 1_073_741_824,
             },
             runtime_max_sec: Some(30),
+        }
+    }
+
+    fn gh_origin(item_type: GhItemType) -> GhOrigin {
+        GhOrigin {
+            schema_version: GH_ORIGIN_SCHEMA_VERSION,
+            producer: "github".to_owned(),
+            source: "notifications".to_owned(),
+            repo: "acme/widgets".to_owned(),
+            number: 77,
+            html_url: match item_type {
+                GhItemType::Issue => "https://github.com/acme/widgets/issues/77",
+                GhItemType::PullRequest => "https://github.com/acme/widgets/pull/77",
+            }
+            .to_owned(),
+            item_type: Some(item_type),
+            head_sha: (item_type == GhItemType::PullRequest)
+                .then(|| "7777777777777777777777777777777777777777".to_owned()),
+            node_id: "I_kwDO_origin".to_owned(),
+            item_author: "issue-author".to_owned(),
+            trigger_actor: "trusted-maintainer".to_owned(),
+            self_actor: "tally-bot".to_owned(),
+            notification_reason: Some("mention".to_owned()),
+            trigger_kind: "notification".to_owned(),
+            event_id: Some("notification-77".to_owned()),
+            comment_id: None,
+            context: Some(GhContextSnapshot {
+                schema_version: GH_CONTEXT_SCHEMA_VERSION,
+                title: "Untrusted title".to_owned(),
+                body: "$(touch /tmp/must-not-run); ${SECRET}".to_owned(),
+                head_sha: (item_type == GhItemType::PullRequest)
+                    .then(|| "7777777777777777777777777777777777777777".to_owned()),
+                labels: vec!["build".to_owned()],
+                assignees: vec!["tally-bot".to_owned()],
+                triggering_comment: None,
+            }),
+            actor_exclude: "self".to_owned(),
+            allow_self_triggered: false,
+            allowed_actors: vec!["trusted-maintainer".to_owned()],
         }
     }
 
@@ -3773,17 +3928,96 @@ mod tests {
     #[test]
     fn execution_environment_preserves_scalar_compatibility_and_encodes_multi_pool_sets() {
         let singleton = request();
-        let singleton_environment = execution_environment(&singleton).unwrap();
+        let singleton_environment = execution_environment(&singleton, None).unwrap();
         assert!(singleton_environment
             .iter()
             .any(|(name, value)| name == "TALLY_POOL" && value == "gpu"));
 
         let mut multi = request();
         multi.pools = vec!["alpha".to_owned(), "zeta".to_owned()];
-        let multi_environment = execution_environment(&multi).unwrap();
+        let multi_environment = execution_environment(&multi, None).unwrap();
         assert!(multi_environment
             .iter()
             .any(|(name, value)| { name == "TALLY_POOL" && value == r#"["alpha","zeta"]"# }));
+    }
+
+    #[test]
+    fn github_origin_materializes_private_context_and_exact_identity_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let executor = executor(&state_dir);
+        let mut request = request();
+        request.gh_origin = Some(gh_origin(GhItemType::Issue));
+        let original_argv = request.argv.clone();
+
+        let context_path = executor.materialize_gh_context(&request).unwrap().unwrap();
+        let environment = execution_environment(&request, Some(&context_path)).unwrap();
+        let github = environment
+            .iter()
+            .filter(|(name, _)| name.starts_with("TALLY_GH_"))
+            .cloned()
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(github.len(), GH_TALLY_ENVIRONMENT.len());
+        assert_eq!(github["TALLY_GH_REPO"], "acme/widgets");
+        assert_eq!(github["TALLY_GH_NUMBER"], "77");
+        assert_eq!(
+            github["TALLY_GH_URL"],
+            "https://github.com/acme/widgets/issues/77"
+        );
+        assert_eq!(github["TALLY_GH_TYPE"], "issue");
+        assert_eq!(github["TALLY_GH_HEAD_SHA"], "");
+        assert_eq!(github["TALLY_GH_NODE_ID"], "I_kwDO_origin");
+        assert_eq!(github["TALLY_GH_TRIGGER_KIND"], "notification");
+        assert_eq!(github["TALLY_GH_TRIGGER_ACTOR"], "trusted-maintainer");
+        assert_eq!(github["TALLY_GH_EVENT_ID"], "notification-77");
+        assert_eq!(github["TALLY_GH_COMMENT_ID"], "");
+        assert_eq!(github["TALLY_GH_CONTEXT"], context_path.to_string_lossy());
+        assert_eq!(request.argv, original_argv);
+        assert!(github
+            .values()
+            .all(|value| !value.contains("touch /tmp/must-not-run")));
+
+        let context: GhContextSnapshot =
+            serde_json::from_slice(&std::fs::read(&context_path).unwrap()).unwrap();
+        assert_eq!(context.schema_version, GH_CONTEXT_SCHEMA_VERSION);
+        assert_eq!(context.body, "$(touch /tmp/must-not-run); ${SECRET}");
+        assert_eq!(
+            std::fs::metadata(&context_path)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(context_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let mut pull_request = request;
+        pull_request.gh_origin = Some(gh_origin(GhItemType::PullRequest));
+        let pull_path = executor.gh_context_path(&pull_request.identity);
+        let environment = execution_environment(&pull_request, Some(&pull_path)).unwrap();
+        assert!(environment.iter().any(|(name, value)| {
+            name == "TALLY_GH_HEAD_SHA" && value == "7777777777777777777777777777777777777777"
+        }));
+    }
+
+    #[test]
+    fn jobs_without_github_origin_unset_every_github_identity_variable() {
+        let request = request();
+        let environment = execution_environment(&request, None).unwrap();
+        assert!(environment
+            .iter()
+            .all(|(name, _)| !name.starts_with("TALLY_GH_")));
+        let unset = environment_to_unset(&request);
+        for name in GH_TALLY_ENVIRONMENT {
+            assert!(unset.contains(&name), "missing unset for {name}");
+        }
     }
 
     #[test]
@@ -3816,13 +4050,18 @@ mod tests {
         ] {
             assert!(!joined.contains(absent));
         }
-        assert!(args.windows(2).any(|pair| {
-            pair
-                == [
-                    "--property",
-                    "UnsetEnvironment=TALLY_TASK_UUID TALLY_PARENT TALLY_NO_ENQUEUE TALLY_CREDENTIALS CREDENTIALS_DIRECTORY TALLY_YIELD_HOOK TALLY_SOCKET",
-                ]
-        }));
+        let unset = args
+            .windows(2)
+            .find(|pair| pair[0] == "--property" && pair[1].starts_with("UnsetEnvironment="))
+            .unwrap();
+        let unset_names = unset[1].strip_prefix("UnsetEnvironment=").unwrap();
+        for name in OPTIONAL_TALLY_ENVIRONMENT
+            .into_iter()
+            .chain(["CREDENTIALS_DIRECTORY"])
+            .chain(GH_TALLY_ENVIRONMENT)
+        {
+            assert!(unset_names.split_whitespace().any(|word| word == name));
+        }
     }
 
     #[test]
@@ -4790,6 +5029,7 @@ mod tests {
             yield_hook: None,
             tally_socket: None,
             environment: BTreeMap::new(),
+            gh_origin: None,
             cwd: None,
             credentials: BTreeMap::new(),
             limits: UnitLimits {

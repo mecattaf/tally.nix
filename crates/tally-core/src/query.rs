@@ -7,7 +7,7 @@ use taskchampion::Status;
 use thiserror::Error;
 
 use crate::journal::{JournalEntry, TallyEvent};
-use crate::taskdb::TaskRow;
+use crate::taskdb::{GhOrigin, TaskRow};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
 pub const QUERY_PROTOCOL_VERSION: u32 = 1;
@@ -20,6 +20,24 @@ pub enum RowStatus {
     Deleted,
     Recurring,
     Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GhOriginProjection {
+    pub repo: String,
+    pub number: u64,
+    pub url: String,
+}
+
+impl GhOriginProjection {
+    pub fn from_origin(origin: &GhOrigin) -> Option<Self> {
+        origin.is_current().then(|| Self {
+            repo: origin.repo.clone(),
+            number: origin.number,
+            url: origin.html_url.clone(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +61,8 @@ pub struct RowFact {
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh_origin: Option<GhOriginProjection>,
 }
 
 const fn default_query_attempt() -> u32 {
@@ -73,6 +93,11 @@ impl From<&TaskRow> for RowFact {
                 .and_then(|attempt| attempt.parse().ok())
                 .unwrap_or(1),
             model: row.value("model").map(ToOwned::to_owned),
+            gh_origin: row
+                .value("gh_origin_json")
+                .and_then(|origin| serde_json::from_str::<GhOrigin>(origin).ok())
+                .as_ref()
+                .and_then(GhOriginProjection::from_origin),
         }
     }
 }
@@ -750,6 +775,8 @@ pub struct CompletedEntry {
     pub gpu_seconds: Option<f64>,
     pub verdict: Verdict,
     pub session_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh_origin: Option<GhOriginProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -759,6 +786,8 @@ pub struct InFlightEntry {
     pub session_ref: Option<String>,
     pub state: String,
     pub last_event_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh_origin: Option<GhOriginProjection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -812,6 +841,14 @@ pub fn query_standup(
                 .map(|source| (row.task_uuid.as_str(), source))
         })
         .collect::<HashMap<_, _>>();
+    let gh_origin_by_task = rows
+        .iter()
+        .filter_map(|row| {
+            row.gh_origin
+                .as_ref()
+                .map(|origin| (row.task_uuid.as_str(), origin))
+        })
+        .collect::<HashMap<_, _>>();
     let mut completed = Vec::new();
     let mut gate_fails = Vec::new();
     let mut cancelled = Vec::new();
@@ -843,6 +880,12 @@ pub fn query_standup(
             .witness_attempt
             .or(job.last_attempt)
             .is_some_and(|attempt| job.evidence_fail_attempts.contains(&attempt));
+        let gh_origin = job
+            .output
+            .task_uuid
+            .as_deref()
+            .and_then(|task| gh_origin_by_task.get(task).copied())
+            .cloned();
         if let Some(verdict) = job.output.verdict {
             if job.labor_class == Some(LaborClass::Reused) {
                 reused += 1;
@@ -852,6 +895,7 @@ pub fn query_standup(
                 gpu_seconds: job.output.gpu_seconds,
                 verdict,
                 session_ref: job.output.session_ref,
+                gh_origin,
             };
             if verdict == Verdict::Cancelled {
                 cancelled.push(entry);
@@ -873,6 +917,7 @@ pub fn query_standup(
                 gpu_seconds: job.output.gpu_seconds,
                 verdict,
                 session_ref: job.output.session_ref,
+                gh_origin,
             };
             if saw_evidence_fail {
                 gate_fails.push(entry);
@@ -890,6 +935,7 @@ pub fn query_standup(
                 session_ref: job.output.session_ref,
                 state: job.output.state,
                 last_event_at: job.output.last_event_at,
+                gh_origin,
             });
         }
     }
@@ -980,6 +1026,7 @@ mod tests {
             session_ref: Some(session.to_owned()),
             attempt: 1,
             model: None,
+            gh_origin: None,
         }
     }
 
@@ -1254,6 +1301,42 @@ mod tests {
             .completed
             .iter()
             .any(|entry| entry.task_uuid.as_deref() == Some("pass")));
+    }
+
+    #[test]
+    fn standup_projects_github_origin_for_completed_and_in_flight_rows() {
+        let origin = GhOriginProjection {
+            repo: "acme/widgets".to_owned(),
+            number: 42,
+            url: "https://github.com/acme/widgets/issues/42".to_owned(),
+        };
+        let mut completed = row("completed", "drive");
+        completed.source = Some("gh".to_owned());
+        completed.gh_origin = Some(origin.clone());
+        let mut running = row("running", "drive");
+        running.source = Some("gh".to_owned());
+        running.gh_origin = Some(origin.clone());
+
+        let digest = query_standup(
+            &[completed, running],
+            &[],
+            &[witness(
+                Some("completed"),
+                Verdict::Pass,
+                LaborClass::Fresh,
+                1,
+            )],
+            &StandupOptions {
+                since: None,
+                since_realtime_us: None,
+                until: "2026-07-19T13:00:00Z".to_owned(),
+                source: Some("gh".to_owned()),
+            },
+        );
+        assert_eq!(digest.completed.len(), 1);
+        assert_eq!(digest.completed[0].gh_origin, Some(origin.clone()));
+        assert_eq!(digest.in_flight.len(), 1);
+        assert_eq!(digest.in_flight[0].gh_origin, Some(origin));
     }
 
     #[test]
