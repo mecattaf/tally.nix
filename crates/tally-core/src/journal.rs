@@ -545,17 +545,30 @@ impl JournalEmitter {
         self.emit_to(event, &mut stdout.lock())
     }
 
+    pub fn emit_fields(&self, fields: &TallyFields) -> Result<(), JournalError> {
+        let stdout = std::io::stdout();
+        self.emit_fields_to(fields, &mut stdout.lock())
+    }
+
     pub fn emit_to(
         &self,
         event: EmitEvent,
         stdout: &mut dyn Write,
     ) -> Result<TallyFields, JournalError> {
         let fields = event.into_fields()?;
-        match self.destination {
-            JournalDestination::Stdout => write_stdout_record(stdout, &fields)?,
-            JournalDestination::Native => send_native_record(&self.socket_path, &fields)?,
-        }
+        self.emit_fields_to(&fields, stdout)?;
         Ok(fields)
+    }
+
+    pub fn emit_fields_to(
+        &self,
+        fields: &TallyFields,
+        stdout: &mut dyn Write,
+    ) -> Result<(), JournalError> {
+        match self.destination {
+            JournalDestination::Stdout => write_stdout_record(stdout, fields),
+            JournalDestination::Native => send_native_record(&self.socket_path, fields),
+        }
     }
 }
 

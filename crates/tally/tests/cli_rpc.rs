@@ -87,6 +87,50 @@ impl RpcHandler for CliHandler {
                     "verdict": "pass"
                 })),
                 "query.status" => Err(WireError::not_found("status row not found")),
+                "query.jobs" => {
+                    let params = request.params.as_ref().unwrap();
+                    assert_eq!(params["liveState"], "running");
+                    assert_eq!(params["terminalVerdict"], "pass");
+                    assert_eq!(params["adapter"], "codex");
+                    assert_eq!(params["session"], "session-24");
+                    Ok(serde_json::json!({
+                        "schemaVersion": 1,
+                        "protocolVersion": 2,
+                        "items": [],
+                        "nextCursor": null,
+                        "snapshot": {}
+                    }))
+                }
+                "query.job" => {
+                    assert_eq!(
+                        request.params.as_ref().unwrap()["id"],
+                        "00000000-0000-4000-8000-000000000024"
+                    );
+                    Ok(serde_json::json!({"schemaVersion": 1, "protocolVersion": 2}))
+                }
+                "query.log" => {
+                    let params = request.params.as_ref().unwrap();
+                    assert_eq!(params["attempt"], 2);
+                    assert_eq!(params["event"], "evidence_pass");
+                    assert_eq!(params["source"], "manual");
+                    Ok(serde_json::json!({
+                        "schemaVersion": 1,
+                        "protocolVersion": 2,
+                        "items": [],
+                        "nextCursor": null,
+                        "snapshot": {}
+                    }))
+                }
+                "query.proof" => {
+                    let params = request.params.as_ref().unwrap();
+                    assert_eq!(params["task"], "00000000-0000-4000-8000-000000000024");
+                    assert_eq!(params["attempt"], 2);
+                    Ok(serde_json::json!({
+                        "schemaVersion": 1,
+                        "protocolVersion": 2,
+                        "status": "verified"
+                    }))
+                }
                 method => Err(WireError::invalid(format!("unexpected method {method}"))),
             }
         })
@@ -253,4 +297,108 @@ async fn internal_exit_recorder_is_silent_and_fail_closed() {
     assert!(failure.stdout.is_empty());
     assert!(failure.stderr.is_empty());
     assert!(!missing.exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn query_v2_cli_forwards_jobs_job_log_and_proof_without_text_parsing() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                for _ in 0..4 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(stream, &CliHandler).await.unwrap();
+                }
+            });
+            let task = "00000000-0000-4000-8000-000000000024";
+            for output in [
+                run_tally(
+                    &socket,
+                    &[
+                        "query",
+                        "jobs",
+                        "--state",
+                        "running",
+                        "--verdict",
+                        "pass",
+                        "--adapter",
+                        "codex",
+                        "--session",
+                        "session-24",
+                    ],
+                )
+                .await,
+                run_tally(&socket, &["query", "job", task]).await,
+                run_tally(
+                    &socket,
+                    &[
+                        "query",
+                        "log",
+                        "--task",
+                        task,
+                        "--attempt",
+                        "2",
+                        "--event",
+                        "evidence_pass",
+                        "--source",
+                        "manual",
+                    ],
+                )
+                .await,
+                run_tally(
+                    &socket,
+                    &["query", "proof", "--task", task, "--attempt", "2"],
+                )
+                .await,
+            ] {
+                assert!(output.status.success(), "{:?}", output);
+                let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(value["protocolVersion"], 2);
+            }
+            server.await.unwrap();
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn witness_verify_json_is_complete_and_red_exits_nonzero() {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test/fixtures/ledger");
+    let temp = tempfile::tempdir().unwrap();
+    let attestations = temp.path().join("attestations.jsonl");
+    let verify = |name: &str| {
+        let fixtures = fixtures.clone();
+        let attestations = attestations.clone();
+        let name = name.to_owned();
+        async move {
+            Command::new(env!("CARGO_BIN_EXE_tally"))
+                .args(["witness", "verify"])
+                .arg(fixtures.join(name))
+                .arg("--attestations")
+                .arg(attestations)
+                .args(["--format", "json"])
+                .output()
+                .await
+                .unwrap()
+        }
+    };
+
+    let valid = verify("valid.jsonl").await;
+    assert!(valid.status.success());
+    let valid_json: Value = serde_json::from_slice(&valid.stdout).unwrap();
+    assert_eq!(valid_json["schemaVersion"], 1);
+    assert_eq!(valid_json["protocolVersion"], 2);
+    assert_eq!(valid_json["ok"], true);
+    assert_eq!(valid_json["chains"]["verdict"]["report"]["records"], 4);
+    assert_eq!(valid_json["chains"]["verdict"]["chainHead"]["seq"], 4);
+
+    let tampered = verify("tampered.jsonl").await;
+    assert!(!tampered.status.success());
+    let tampered_json: Value = serde_json::from_slice(&tampered.stdout).unwrap();
+    assert_eq!(tampered_json["ok"], false);
+    assert!(tampered_json["chains"]["verdict"]["report"]["problems"]
+        .as_array()
+        .is_some_and(|problems| !problems.is_empty()));
 }

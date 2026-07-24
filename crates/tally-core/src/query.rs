@@ -11,7 +11,8 @@ use crate::journal::{JournalEntry, TallyEvent};
 use crate::taskdb::{GhOrigin, RelatedTrigger, TaskRow, WorkspaceMetadata};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
-pub const QUERY_PROTOCOL_VERSION: u32 = 1;
+pub const QUERY_SCHEMA_VERSION: u32 = 1;
+pub const QUERY_PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -180,6 +181,7 @@ pub struct PoolHeadroom {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PoolsView {
+    pub schema_version: u32,
     pub protocol_version: u32,
     pub pools: Vec<PoolHeadroom>,
 }
@@ -300,6 +302,7 @@ pub fn query_pools(pool_facts: &[PoolHeadroomFact]) -> Result<PoolsView, QueryEr
         .collect::<Result<Vec<_>, _>>()?;
     pools.sort_by(|left, right| left.pool.cmp(&right.pool));
     Ok(PoolsView {
+        schema_version: QUERY_SCHEMA_VERSION,
         protocol_version: QUERY_PROTOCOL_VERSION,
         pools,
     })
@@ -559,6 +562,7 @@ fn timestamp_from_micros(micros: u64) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StatusView {
+    pub schema_version: u32,
     pub protocol_version: u32,
     pub pools: Vec<PoolHeadroom>,
     pub jobs: Vec<JobProjection>,
@@ -583,6 +587,7 @@ pub fn query_status(
     }
     pools.sort_by(|left, right| left.pool.cmp(&right.pool));
     Ok(StatusView {
+        schema_version: QUERY_SCHEMA_VERSION,
         protocol_version: QUERY_PROTOCOL_VERSION,
         pools,
         jobs: project_jobs(rows, journal, witness),
@@ -601,6 +606,7 @@ pub enum RenderScope {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RenderView {
+    pub schema_version: u32,
     pub protocol_version: u32,
     pub scope: RenderScope,
     pub jobs: Vec<JobProjection>,
@@ -619,6 +625,7 @@ pub fn query_render(
         RenderScope::Witness => jobs.retain(|job| job.witness_seq.is_some()),
     }
     RenderView {
+        schema_version: QUERY_SCHEMA_VERSION,
         protocol_version: QUERY_PROTOCOL_VERSION,
         scope,
         jobs,
@@ -836,6 +843,8 @@ pub struct InFlightEntry {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StandupDigest {
+    pub schema_version: u32,
+    pub protocol_version: u32,
     pub window: StandupWindow,
     pub completed: Vec<CompletedEntry>,
     pub in_flight: Vec<InFlightEntry>,
@@ -995,6 +1004,8 @@ pub fn query_standup(
     sort_completed(&mut cancelled);
     in_flight.sort_by(|left, right| left.task_uuid.cmp(&right.task_uuid));
     StandupDigest {
+        schema_version: QUERY_SCHEMA_VERSION,
+        protocol_version: QUERY_PROTOCOL_VERSION,
         window: StandupWindow {
             since: options.since.clone(),
             until: options.until.clone(),

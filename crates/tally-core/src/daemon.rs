@@ -31,12 +31,13 @@ use crate::completion::{
 };
 use crate::config::{Config, PoolPredicate, Priority};
 use crate::evidence::{
-    parse_evidence_specs, probe_dedup, run_evidence_gate, RetryTrigger, RunOutcome,
+    parse_evidence_specs, probe_dedup, run_evidence_gate, CheckOutcome, RetryTrigger, RunOutcome,
 };
 use crate::executor::{
     ExecutionIdentity, ExecutionOutcome, ExecutionRequest, ExecutionTermination, Executor,
     ExecutorError, UnitLimits, Uuid,
 };
+use crate::history::{HistoryError, LifecycleStore};
 use crate::journal::{EmitEvent, JournalEmitter, JournalEntry, TallyEvent};
 use crate::lease::{
     bump_epoch, AdmitOutcome, LeaseBackend, LeaseEngine, LeaseError, LeaseEventLog, LeaseGrant,
@@ -47,8 +48,12 @@ use crate::producers::{
     GhCliMutationSink, IngressOutcome, ProducerEngine, ReachabilityTransition,
 };
 use crate::query::{
-    query_log, query_pools, query_render, query_standup, query_status, JobProjection, LogFilter,
-    PoolHeadroomFact, RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
+    query_pools, query_render, query_standup, query_status, JobProjection, PoolHeadroomFact,
+    RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
+};
+use crate::query_v2::{
+    query_job as query_job_v2, query_jobs as query_jobs_v2, query_lifecycle_log, query_proof,
+    JobsFilter, LifecycleLogFilter, LiveJobFact, ObservabilityError, RowDetailFact,
 };
 use crate::recovery::{
     collect_durable_recovery_facts, collect_local_unit_facts, recover, DurableRecoveryFacts,
@@ -64,13 +69,12 @@ use crate::wire::{
     ProducerDefaults, RequestFrame, RpcHandler, WireError, WireErrorCode, WireIoError,
 };
 use crate::witness::{
-    append_attestation, read_verified_records, repair_attestation_tail, verify_attestations,
-    AttestationRecord, LaborClass, Verdict, WitnessBody, WitnessError, WitnessLedger,
-    WitnessRecord,
+    append_attestation, read_verified_attestations, read_verified_records, repair_attestation_tail,
+    verify_attestations, AttestationRecord, LaborClass, Verdict, WitnessBody, WitnessError,
+    WitnessLedger, WitnessRecord,
 };
 
 const LEASE_TICK: Duration = Duration::from_millis(100);
-const MAX_RECENT_JOURNAL_ENTRIES: usize = 4_096;
 const MAX_METER_EVENT_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, Clone)]
@@ -91,6 +95,10 @@ impl DaemonPaths {
 
     pub fn attestations_path(&self) -> PathBuf {
         self.data_dir.join("attestations.jsonl")
+    }
+
+    pub fn lifecycle_path(&self) -> PathBuf {
+        self.data_dir.join(crate::history::LIFECYCLE_FILE)
     }
 }
 
@@ -141,6 +149,8 @@ pub enum DaemonError {
     TaskDb(#[from] TaskDbError),
     #[error("witness error: {0}")]
     Witness(#[from] WitnessError),
+    #[error("lifecycle history error: {0}")]
+    History(#[from] HistoryError),
     #[error("recovery error: {0}")]
     Recovery(#[from] crate::recovery::RecoveryError),
     #[error("executor error: {0}")]
@@ -384,7 +394,7 @@ pub struct Context {
     applied_pool_transitions: HashSet<(String, u64)>,
     barriers: BarrierTracker,
     query_rows: BTreeMap<Uuid, RowFact>,
-    recent_journal: Vec<JournalEntry>,
+    query_details: BTreeMap<Uuid, RowDetailFact>,
 }
 
 type SharedContext = Rc<RwLock<Context>>;
@@ -524,6 +534,7 @@ struct TerminalWork {
     job: Job,
     result: JobResult,
     evidence: String,
+    evidence_checks: Vec<CheckOutcome>,
     launches: Vec<Job>,
     scrape_capture: bool,
 }
@@ -554,6 +565,7 @@ struct DaemonHandler {
     completion: mpsc::UnboundedSender<ExecutionFinished>,
     commits: mpsc::UnboundedSender<CommitCommand>,
     journal: JournalEmitter,
+    history: Rc<RefCell<LifecycleStore>>,
     execution_shutdown: watch::Receiver<bool>,
     execution_cancel: broadcast::Sender<Uuid>,
     fatal: mpsc::UnboundedSender<DaemonError>,
@@ -584,7 +596,8 @@ impl RpcHandler for DaemonHandler {
                 "lease.acquire" => self.acquire(request.params).await,
                 "lease.release" => self.release(request.params).await,
                 "lease.status" => self.lease_status(request.params).await,
-                "query.status" | "query.log" | "query.render" | "query.standup" | "query.pools" => {
+                "query.jobs" | "query.job" | "query.status" | "query.log" | "query.proof"
+                | "query.render" | "query.standup" | "query.pools" => {
                     self.query(&request.method, request.params).await
                 }
                 other => Err(WireError::new(
@@ -989,6 +1002,10 @@ impl DaemonHandler {
                 context
                     .query_rows
                     .insert(row_uuid, query_row(&row, RowStatus::Completed));
+                context.query_details.insert(
+                    row_uuid,
+                    RowDetailFact::from_seed(&row, RowStatus::Completed, LaborClass::Reused),
+                );
                 context.jobs.insert(job_id, job.clone());
                 let evidence = serde_json::to_string(&row.evidence).map_err(internal_wire)?;
                 drop(context);
@@ -1107,6 +1124,10 @@ impl DaemonHandler {
             context
                 .query_rows
                 .insert(row_uuid, query_row(&row, RowStatus::Pending));
+            context.query_details.insert(
+                row_uuid,
+                RowDetailFact::from_seed(&row, RowStatus::Pending, LaborClass::Fresh),
+            );
         }
         context.jobs.insert(job_id, job.clone());
         drop(context);
@@ -1617,10 +1638,15 @@ impl DaemonHandler {
 
         let mut context = self.context.write().await;
         context.unreachable_pools.remove(pool);
-        for row in &represented_rows {
+        for recovery in &plan.rows {
+            let row = &recovery.row;
             context
                 .query_rows
                 .insert(row.uuid, query_row(row, RowStatus::Pending));
+            context.query_details.insert(
+                row.uuid,
+                RowDetailFact::from_seed(row, RowStatus::Pending, recovery.labor_class),
+            );
         }
         let mut launches = install_recovery_jobs(&mut context, &plan, &self.executor)
             .map_err(|error| self.fail_stop(error))?;
@@ -1779,6 +1805,9 @@ impl DaemonHandler {
             eprintln!("tally: post-ack replica worker stopped before terminal row projection");
         }
         self.complete_gh_post_ack(work.job.row.clone(), work.result.clone());
+        for check in &work.evidence_checks {
+            self.emit_post_ack(evidence_event(&work.job, check));
+        }
         self.emit_scraped_completion(work.job, work.result, work.evidence, work.scrape_capture);
         for job in work.launches {
             self.spawn_execution(job);
@@ -1974,6 +2003,10 @@ impl DaemonHandler {
                         row.session_ref.clone_from(&enriched.row.session_ref);
                         row.model.clone_from(&enriched.row.model);
                     }
+                    if let Some(detail) = context.query_details.get_mut(&task_uuid) {
+                        detail.session_ref.clone_from(&enriched.row.session_ref);
+                        detail.observed_model.clone_from(&enriched.row.model);
+                    }
                 }
             }
             if enriched.task_uuid.is_some()
@@ -2139,18 +2172,42 @@ impl DaemonHandler {
     }
 
     async fn query(&self, method: &str, params: Option<Value>) -> Result<Value, WireError> {
-        let (rows, journal, witness_path, live_states) = {
+        let history = self.history.borrow().snapshot();
+        let journal = history
+            .records
+            .iter()
+            .map(|record| JournalEntry {
+                fields: record.fields.clone(),
+                realtime_us: Some(record.realtime_us),
+            })
+            .collect::<Vec<_>>();
+        let (rows, details, witness_path, attestations_path, live_states, live) = {
             let context = self.context.read().await;
             (
                 context.query_rows.values().cloned().collect::<Vec<_>>(),
-                context.recent_journal.clone(),
+                context.query_details.values().cloned().collect::<Vec<_>>(),
                 context.paths.witness_path(),
+                context.paths.attestations_path(),
                 context
                     .jobs
                     .values()
                     .filter(|job| job.state != JobState::Completed)
                     .map(|job| (job.stable_key(), state_name(job.state).to_owned()))
                     .collect::<HashMap<_, _>>(),
+                context
+                    .jobs
+                    .values()
+                    .filter(|job| job.state != JobState::Completed)
+                    .map(|job| LiveJobFact {
+                        anchor: job.stable_key(),
+                        job_id: job.job_id.to_string(),
+                        live_state: state_name(job.state).to_owned(),
+                        attempt: job.row.attempt,
+                        lease_epoch: job.row.lease_epoch,
+                        unit: format!("tally-job-{}.service", job.stable_key()),
+                        labor_class: job.labor_class,
+                    })
+                    .collect::<Vec<_>>(),
             )
         };
         let (report, witness) = tokio::task::spawn_blocking(move || {
@@ -2164,6 +2221,97 @@ impl DaemonHandler {
         }
 
         match method {
+            "query.jobs" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields, rename_all = "camelCase")]
+                struct Params {
+                    #[serde(default, alias = "state")]
+                    live_state: Option<String>,
+                    #[serde(default, alias = "verdict")]
+                    terminal_verdict: Option<Verdict>,
+                    #[serde(default)]
+                    pool: Option<String>,
+                    #[serde(default)]
+                    executor: Option<String>,
+                    #[serde(default)]
+                    adapter: Option<String>,
+                    #[serde(default)]
+                    source: Option<String>,
+                    #[serde(default)]
+                    parent: Option<String>,
+                    #[serde(default)]
+                    session: Option<String>,
+                    #[serde(default)]
+                    since: Option<String>,
+                    #[serde(default)]
+                    until: Option<String>,
+                }
+                let params: Params = decode_params(params)?;
+                let pool_signals = {
+                    let mut context = self.context.write().await;
+                    query_pools(&pool_headroom_facts(&mut context)?)
+                        .map_err(query_wire)?
+                        .pools
+                        .into_iter()
+                        .map(|pool| (pool.pool, pool.signal))
+                        .collect::<BTreeMap<_, _>>()
+                };
+                serde_json::to_value(
+                    query_jobs_v2(
+                        &details,
+                        &live,
+                        &history,
+                        &witness,
+                        &pool_signals,
+                        &JobsFilter {
+                            live_state: params.live_state,
+                            terminal_verdict: params.terminal_verdict,
+                            pool: params.pool,
+                            executor: params.executor,
+                            adapter: params.adapter,
+                            source: params.source,
+                            parent: params.parent,
+                            session: params.session,
+                            since: params.since,
+                            until: params.until,
+                        },
+                    )
+                    .map_err(observability_wire)?,
+                )
+                .map_err(internal_wire)
+            }
+            "query.job" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    id: String,
+                }
+                let params: Params = decode_params(params)?;
+                if params.id.trim().is_empty() {
+                    return Err(WireError::invalid("query job ID must not be empty"));
+                }
+                let pool_signals = {
+                    let mut context = self.context.write().await;
+                    query_pools(&pool_headroom_facts(&mut context)?)
+                        .map_err(query_wire)?
+                        .pools
+                        .into_iter()
+                        .map(|pool| (pool.pool, pool.signal))
+                        .collect::<BTreeMap<_, _>>()
+                };
+                serde_json::to_value(
+                    query_job_v2(
+                        &params.id,
+                        &details,
+                        &live,
+                        &history,
+                        &witness,
+                        &pool_signals,
+                    )
+                    .map_err(observability_wire)?,
+                )
+                .map_err(internal_wire)
+            }
             "query.status" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -2184,10 +2332,12 @@ impl DaemonHandler {
             }
             "query.log" => {
                 #[derive(Deserialize)]
-                #[serde(deny_unknown_fields)]
+                #[serde(deny_unknown_fields, rename_all = "camelCase")]
                 struct Params {
                     #[serde(default)]
                     task: Option<String>,
+                    #[serde(default)]
+                    attempt: Option<u32>,
                     #[serde(default)]
                     session: Option<String>,
                     #[serde(default)]
@@ -2196,22 +2346,64 @@ impl DaemonHandler {
                     source: Option<String>,
                     #[serde(default)]
                     since: Option<String>,
+                    #[serde(default)]
+                    until: Option<String>,
                 }
                 let params: Params = decode_params(params)?;
                 serde_json::to_value(
-                    query_log(
-                        &rows,
-                        &journal,
+                    query_lifecycle_log(
+                        &history,
                         &witness,
-                        &LogFilter {
+                        &LifecycleLogFilter {
                             task: params.task,
+                            attempt: params.attempt,
                             session: params.session,
                             event: params.event,
                             source: params.source,
                             since: params.since,
+                            until: params.until,
                         },
                     )
-                    .map_err(query_wire)?,
+                    .map_err(observability_wire)?,
+                )
+                .map_err(internal_wire)
+            }
+            "query.proof" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    task: String,
+                    #[serde(default)]
+                    attempt: Option<u32>,
+                }
+                let params: Params = decode_params(params)?;
+                if params.task.trim().is_empty() {
+                    return Err(WireError::invalid("query proof task must not be empty"));
+                }
+                let (attestation_report, attestations) = tokio::task::spawn_blocking(move || {
+                    read_verified_attestations(&attestations_path)
+                })
+                .await
+                .map_err(|error| {
+                    internal_wire(format!("attestation query worker failed: {error}"))
+                })?
+                .map_err(internal_wire)?;
+                if !attestation_report.ok {
+                    return Err(internal_wire(
+                        "attestation verification failed during proof query",
+                    ));
+                }
+                serde_json::to_value(
+                    query_proof(
+                        &params.task,
+                        params.attempt,
+                        &details,
+                        &history,
+                        &report,
+                        &witness,
+                        &attestations,
+                    )
+                    .map_err(observability_wire)?,
                 )
                 .map_err(internal_wire)
             }
@@ -2307,6 +2499,11 @@ impl DaemonHandler {
     }
 
     fn spawn_execution(&self, job: Job) {
+        if job.labor_class == LaborClass::Recovered {
+            self.emit_post_ack(execution_event(&job, TallyEvent::Resumed));
+        }
+        self.emit_post_ack(execution_event(&job, TallyEvent::Dispatched));
+        self.emit_post_ack(execution_event(&job, TallyEvent::Started));
         let executor = self.executor.clone();
         let completion = self.completion.clone();
         let request = execution_request(&job, self.settings.unit_limits, &self.tally_socket);
@@ -2356,29 +2553,26 @@ impl DaemonHandler {
     }
 
     fn emit_post_ack(&self, event: EmitEvent) {
+        let fields = match event.into_fields() {
+            Ok(fields) => fields,
+            Err(error) => {
+                let error =
+                    DaemonError::Invalid(format!("invalid lifecycle event after ack: {error}"));
+                eprintln!("tally: {error}");
+                let _ = self.fatal.send(error);
+                return;
+            }
+        };
+        if let Err(error) = self.history.borrow_mut().append_now(fields.clone()) {
+            eprintln!("tally: lifecycle history append failed after ack: {error}");
+            let _ = self.fatal.send(error.into());
+            return;
+        }
         let journal = self.journal.clone();
-        let context = self.context.clone();
         tokio::task::spawn_local(async move {
             tokio::task::yield_now().await;
-            match journal.emit(event) {
-                Ok(fields) => {
-                    let timestamp = Utc::now().timestamp_micros();
-                    let mut context = context.write().await;
-                    context.recent_journal.push(JournalEntry {
-                        fields,
-                        realtime_us: u64::try_from(timestamp).ok(),
-                    });
-                    let excess = context
-                        .recent_journal
-                        .len()
-                        .saturating_sub(MAX_RECENT_JOURNAL_ENTRIES);
-                    if excess > 0 {
-                        context.recent_journal.drain(..excess);
-                    }
-                }
-                Err(error) => {
-                    eprintln!("tally: journald emission failed outside ack barrier: {error}");
-                }
+            if let Err(error) = journal.emit_fields(&fields) {
+                eprintln!("tally: journald emission failed outside ack barrier: {error}");
             }
         });
     }
@@ -2418,6 +2612,15 @@ fn query_wire(error: crate::query::QueryError) -> WireError {
         crate::query::QueryError::UnknownPool(_) => WireError::not_found(error.to_string()),
         crate::query::QueryError::InvalidPool(_)
         | crate::query::QueryError::InvalidTimestamp(_) => WireError::invalid(error.to_string()),
+    }
+}
+
+fn observability_wire(error: ObservabilityError) -> WireError {
+    match error {
+        ObservabilityError::InvalidTimestamp(_) => WireError::invalid(error.to_string()),
+        ObservabilityError::UnknownJob(_) | ObservabilityError::UnknownAttempt { .. } => {
+            WireError::not_found(error.to_string())
+        }
     }
 }
 
@@ -2686,11 +2889,41 @@ fn overlay_live_states(jobs: &mut [JobProjection], live_states: &HashMap<String,
 
 fn enqueued_event(job: &Job) -> EmitEvent {
     let mut event = EmitEvent::enqueued(job.stable_key(), job.row.priority, job.row.source);
+    event.agent = Some(job.row.adapter.clone());
+    event.session_ref.clone_from(&job.row.session_ref);
+    event.unit = Some(format!("tally-job-{}.service", job.stable_key()));
+    event.attempt = Some(job.row.attempt);
+    event.lease_epoch = Some(job.row.lease_epoch);
+    event.labor_class = Some(job.labor_class);
     event.job_id = Some(job.job_id.to_string());
     event.parent = job.row.parent_uuid.map(|uuid| uuid.to_string());
     event.pools = Some(job.row.pools.clone());
     event.executor = job.row.executor.clone();
     event
+}
+
+fn execution_event(job: &Job, event: TallyEvent) -> EmitEvent {
+    EmitEvent {
+        event,
+        task_uuid: job.stable_key(),
+        class: job.row.priority,
+        source: job.row.source,
+        message: None,
+        agent: Some(job.row.adapter.clone()),
+        session_ref: job.row.session_ref.clone(),
+        unit: Some(format!("tally-job-{}.service", job.stable_key())),
+        exit_code: None,
+        gpu_seconds: None,
+        artifact_hash: None,
+        evidence: None,
+        attempt: Some(job.row.attempt),
+        lease_epoch: Some(job.row.lease_epoch),
+        labor_class: Some(job.labor_class),
+        job_id: Some(job.job_id.to_string()),
+        parent: job.row.parent_uuid.map(|uuid| uuid.to_string()),
+        pools: Some(job.row.pools.clone()),
+        executor: job.row.executor.clone(),
+    }
 }
 
 fn canonical_job_model(job: &Job) -> Option<String> {
@@ -2768,6 +3001,13 @@ fn finalize_forced_locked(
                 RowStatus::Completed
             };
         }
+        if let Some(detail) = context.query_details.get_mut(&task_uuid) {
+            detail.row_status = if verdict == Verdict::Cancelled {
+                RowStatus::Deleted
+            } else {
+                RowStatus::Completed
+            };
+        }
     }
 
     let mut launches = Vec::new();
@@ -2793,9 +3033,38 @@ fn finalize_forced_locked(
         job,
         result,
         evidence,
+        evidence_checks: Vec::new(),
         launches,
         scrape_capture,
     }))
+}
+
+fn evidence_event(job: &Job, check: &CheckOutcome) -> EmitEvent {
+    EmitEvent {
+        event: if check.passed {
+            TallyEvent::EvidencePass
+        } else {
+            TallyEvent::EvidenceFail
+        },
+        task_uuid: job.stable_key(),
+        class: job.row.priority,
+        source: job.row.source,
+        message: Some(check.reason.clone()),
+        agent: Some(job.row.adapter.clone()),
+        session_ref: job.row.session_ref.clone(),
+        unit: Some(format!("tally-job-{}.service", job.stable_key())),
+        exit_code: None,
+        gpu_seconds: None,
+        artifact_hash: None,
+        evidence: Some(check.spec.clone()),
+        attempt: Some(job.row.attempt),
+        lease_epoch: Some(job.row.lease_epoch),
+        labor_class: Some(job.labor_class),
+        job_id: Some(job.job_id.to_string()),
+        parent: job.row.parent_uuid.map(|uuid| uuid.to_string()),
+        pools: Some(job.row.pools.clone()),
+        executor: job.row.executor.clone(),
+    }
 }
 
 fn completed_event(job: &Job, result: &JobResult, evidence: String) -> EmitEvent {
@@ -3037,6 +3306,7 @@ impl Daemon {
                 .into_iter()
                 .collect::<Vec<_>>();
         let query_rows = recovery_query_rows(&plan);
+        let query_details = recovery_query_details(&plan);
         let mut context = Context {
             config: config.clone(),
             paths: paths.clone(),
@@ -3058,7 +3328,7 @@ impl Daemon {
             applied_pool_transitions: HashSet::new(),
             barriers: BarrierTracker::with_namespace(epoch),
             query_rows,
-            recent_journal: Vec::new(),
+            query_details,
         };
         restore_completed_results(&mut context, completed_witness)?;
         let initial_jobs = install_recovery_jobs(&mut context, &plan, &executor)?;
@@ -3089,6 +3359,7 @@ impl Daemon {
             completion: completion_tx,
             commits: commit_tx,
             journal: JournalEmitter::from_config(&config.journald),
+            history: Rc::new(RefCell::new(LifecycleStore::open(&paths.data_dir)?)),
             execution_shutdown: execution_shutdown_rx,
             execution_cancel,
             fatal: fatal_tx,
@@ -3421,7 +3692,7 @@ impl Daemon {
             }
             (Some(_), None) => None,
         };
-        let (evidence_verdict, exit_code, artifact_hash) = match finished.outcome {
+        let (evidence_verdict, exit_code, artifact_hash, evidence_checks) = match finished.outcome {
             None => {
                 return Err(DaemonError::Invalid(format!(
                     "job {} stopped without a terminal witness",
@@ -3429,7 +3700,9 @@ impl Daemon {
                 )))
             }
             Some(Ok(outcome)) => match outcome.termination {
-                ExecutionTermination::RuntimeExceeded => (Verdict::RuntimeExceeded, 1, None),
+                ExecutionTermination::RuntimeExceeded => {
+                    (Verdict::RuntimeExceeded, 1, None, Vec::new())
+                }
                 ExecutionTermination::Exited(code) => {
                     let gate = if let Some(gate) = outcome.evidence_gate {
                         gate
@@ -3447,10 +3720,12 @@ impl Daemon {
                             DaemonError::Invalid(format!("evidence worker failed: {error}"))
                         })?
                     };
-                    (gate.verdict, code, gate.artifact_hash)
+                    (gate.verdict, code, gate.artifact_hash, gate.checks)
                 }
                 ExecutionTermination::Signaled { .. }
-                | ExecutionTermination::ServiceFailed { .. } => (Verdict::Failed, 1, None),
+                | ExecutionTermination::ServiceFailed { .. } => {
+                    (Verdict::Failed, 1, None, Vec::new())
+                }
             },
             Some(Err(
                 error @ (ExecutorError::UnitProbe { .. }
@@ -3466,7 +3741,7 @@ impl Daemon {
             )) => return Err(error.into()),
             Some(Err(error)) => {
                 eprintln!("tally: executor failed for {}: {error}", job.stable_key());
-                (Verdict::Failed, 1, None)
+                (Verdict::Failed, 1, None, Vec::new())
             }
         };
         let computed_verdict = canonical_verdict(evidence_verdict, semantic_completion.as_ref());
@@ -3521,6 +3796,9 @@ impl Daemon {
                 if let Some(row) = context.query_rows.get_mut(&task_uuid) {
                     row.status = RowStatus::Completed;
                 }
+                if let Some(detail) = context.query_details.get_mut(&task_uuid) {
+                    detail.row_status = RowStatus::Completed;
+                }
             }
             let evidence = serde_json::to_string(&job.row.evidence)
                 .map_err(|error| DaemonError::Invalid(error.to_string()))?;
@@ -3542,6 +3820,7 @@ impl Daemon {
             job,
             result,
             evidence,
+            evidence_checks,
             launches,
             scrape_capture,
         });
@@ -4443,6 +4722,25 @@ fn recovery_query_rows(plan: &crate::recovery::RecoveryPlan) -> BTreeMap<Uuid, R
         .collect()
 }
 
+fn recovery_query_details(plan: &crate::recovery::RecoveryPlan) -> BTreeMap<Uuid, RowDetailFact> {
+    plan.rows
+        .iter()
+        .map(|recovery| {
+            let status = match recovery.state {
+                RecoveryRowState::Completed => RowStatus::Completed,
+                RecoveryRowState::Deleted => RowStatus::Deleted,
+                RecoveryRowState::Pending
+                | RecoveryRowState::AdoptedRunning
+                | RecoveryRowState::AwaitingReconciliation => RowStatus::Pending,
+            };
+            (
+                recovery.row.uuid,
+                RowDetailFact::from_seed(&recovery.row, status, recovery.labor_class),
+            )
+        })
+        .collect()
+}
+
 fn hydrate_completed_adapter_metadata(
     plan: &mut crate::recovery::RecoveryPlan,
     config: &Config,
@@ -5188,6 +5486,13 @@ fn install_recovery_jobs(
         if let Some(row) = context.query_rows.get_mut(&task_uuid) {
             row.session_ref.clone_from(&job.row.session_ref);
             row.model.clone_from(&job.row.model);
+        }
+        if let Some(detail) = context.query_details.get_mut(&task_uuid) {
+            detail.session_ref.clone_from(&job.row.session_ref);
+            detail.observed_model.clone_from(&job.row.model);
+            detail.attempt = job.row.attempt;
+            detail.lease_epoch = job.row.lease_epoch;
+            detail.labor_class = job.labor_class;
         }
         context.jobs.insert(job_id, job);
     }
@@ -6083,6 +6388,197 @@ mod tests {
         }
     }
 
+    fn append_history_event(
+        store: &mut LifecycleStore,
+        row: &RowSeed,
+        event: TallyEvent,
+        attempt: u32,
+        lease_epoch: u64,
+        realtime_us: u64,
+    ) {
+        let terminal = matches!(event, TallyEvent::Completed | TallyEvent::Failed);
+        let fields = EmitEvent {
+            event,
+            task_uuid: row.uuid.to_string(),
+            class: row.priority,
+            source: row.source,
+            message: Some(format!("fixture {event} attempt={attempt}")),
+            agent: Some(row.adapter.clone()),
+            session_ref: row.session_ref.clone(),
+            unit: Some(format!("tally-job-{}.service", row.uuid)),
+            exit_code: terminal.then_some(if event == TallyEvent::Completed { 0 } else { 1 }),
+            gpu_seconds: terminal.then_some(0.0),
+            artifact_hash: (event == TallyEvent::Completed)
+                .then(|| format!("sha256:{}", "a".repeat(64))),
+            evidence: event.is_evidence().then(|| "exit:0".to_owned()),
+            attempt: Some(attempt),
+            lease_epoch: Some(lease_epoch),
+            labor_class: Some(if attempt == 1 {
+                LaborClass::Fresh
+            } else {
+                LaborClass::Recovered
+            }),
+            job_id: Some(row.uuid.to_string()),
+            parent: row.parent_uuid.map(|uuid| uuid.to_string()),
+            pools: Some(row.pools.clone()),
+            executor: row.executor.clone(),
+        }
+        .into_fields()
+        .unwrap();
+        store.append_at(fields, realtime_us).unwrap();
+    }
+
+    fn append_fixture_witness(
+        ledger: &mut WitnessLedger,
+        row: &RowSeed,
+        timestamp: &str,
+        verdict: Verdict,
+        exit_code: i32,
+        attempt: u32,
+        lease_epoch: u64,
+    ) -> WitnessRecord {
+        ledger
+            .append(WitnessBody {
+                task_uuid: Some(row.uuid.to_string()),
+                transition_timestamp: timestamp.to_owned(),
+                verdict,
+                exit_code,
+                artifact_content_hash: (verdict == Verdict::Pass)
+                    .then(|| format!("sha256:{}", "a".repeat(64))),
+                gpu_seconds: Some(f64::from(attempt)),
+                wall_clock: 10.0 + f64::from(attempt),
+                attempt,
+                lease_epoch,
+                dedup_key: row.dedup_key.clone(),
+                labor_class: if attempt == 1 {
+                    LaborClass::Fresh
+                } else {
+                    LaborClass::Recovered
+                },
+                trace_ref: None,
+                pools: Some(row.pools.clone()),
+                executor: row.executor.clone(),
+                charge: None,
+                model: None,
+                evidence_class: Some(json!({"fixture": "acceptance-24"})),
+                manifest_hash: Some(json!("sha256:fixture-manifest")),
+                completion: None,
+            })
+            .unwrap()
+    }
+
+    fn seed_durable_query_fixture(
+        root: &Path,
+    ) -> (DaemonPaths, Uuid, Uuid, WitnessRecord, WitnessRecord) {
+        let paths = DaemonPaths {
+            socket: root.join("run/tally.sock"),
+            state_dir: root.join("state"),
+            data_dir: root.join("data"),
+        };
+        prepare_paths(&paths).unwrap();
+        // Simulate the epochs owned by the two recorded attempts. The daemon
+        // opened by the acceptance test is therefore a later restart.
+        assert_eq!(bump_epoch(&paths.state_dir).unwrap(), 1);
+        assert_eq!(bump_epoch(&paths.state_dir).unwrap(), 2);
+
+        let parent_uuid = Uuid::new_v4();
+        let child_uuid = Uuid::new_v4();
+        let mut parent = durable_row(parent_uuid, "acceptance-parent", 1);
+        parent.description = "acceptance parent".to_owned();
+        let mut child = durable_row(child_uuid, "acceptance-child", 1);
+        child.description = "acceptance child".to_owned();
+        child.parent_uuid = Some(parent_uuid);
+        write_enqueue_event_atomic(
+            &paths.events_dir(),
+            &DurableEnqueueEvent::new(parent.clone()).unwrap(),
+        )
+        .unwrap();
+        write_enqueue_event_atomic(
+            &paths.events_dir(),
+            &DurableEnqueueEvent::new(child.clone()).unwrap(),
+        )
+        .unwrap();
+
+        let mut history = LifecycleStore::open(&paths.data_dir).unwrap();
+        let mut timestamp = 1_786_000_000_000_000_u64;
+        for event in [
+            TallyEvent::Enqueued,
+            TallyEvent::Dispatched,
+            TallyEvent::Started,
+            TallyEvent::EvidenceFail,
+            TallyEvent::Preempted,
+        ] {
+            append_history_event(&mut history, &parent, event, 1, 1, timestamp);
+            timestamp += 1;
+        }
+        for event in [
+            TallyEvent::Resumed,
+            TallyEvent::Dispatched,
+            TallyEvent::Started,
+            TallyEvent::EvidencePass,
+            TallyEvent::Completed,
+        ] {
+            append_history_event(&mut history, &parent, event, 2, 2, timestamp);
+            timestamp += 1;
+        }
+        for event in [
+            TallyEvent::Enqueued,
+            TallyEvent::Dispatched,
+            TallyEvent::Started,
+            TallyEvent::EvidencePass,
+            TallyEvent::Completed,
+        ] {
+            append_history_event(&mut history, &child, event, 1, 1, timestamp);
+            timestamp += 1;
+        }
+        drop(history);
+
+        let mut ledger = WitnessLedger::open(paths.witness_path()).unwrap();
+        append_fixture_witness(
+            &mut ledger,
+            &parent,
+            "2026-08-05T12:00:00.000Z",
+            Verdict::Preempted,
+            1,
+            1,
+            1,
+        );
+        let parent_pass = append_fixture_witness(
+            &mut ledger,
+            &parent,
+            "2026-08-05T12:01:00.000Z",
+            Verdict::Pass,
+            0,
+            2,
+            2,
+        );
+        let chain_head = append_fixture_witness(
+            &mut ledger,
+            &child,
+            "2026-08-05T12:02:00.000Z",
+            Verdict::Pass,
+            0,
+            1,
+            1,
+        );
+        drop(ledger);
+        append_attestation(
+            &paths.attestations_path(),
+            json!({
+                "kind": "adapter-scrape",
+                "taskUuid": parent_uuid.to_string(),
+                "jobId": parent_uuid.to_string(),
+                "adapter": "shell",
+                "attempt": 2,
+                "leaseEpoch": 2,
+                "captures": {"sessionRef": "advisory-session"},
+                "usageAuthority": "advisory-only",
+            }),
+        )
+        .unwrap();
+        (paths, parent_uuid, child_uuid, parent_pass, chain_head)
+    }
+
     fn gh_test_observation(node_id: &str, item_type: GhItemType) -> GhObservation {
         GhObservation {
             source: "notifications".to_owned(),
@@ -6475,7 +6971,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                let daemon_context = daemon.handler.context.clone();
+                let daemon_history = daemon.handler.history.clone();
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
                 let mut client = RpcClient::connect(&paths.socket).await.unwrap();
@@ -6543,7 +7039,8 @@ mod tests {
                     .await
                     .unwrap();
                 let queried = log
-                    .as_array()
+                    .get("items")
+                    .and_then(Value::as_array)
                     .unwrap()
                     .iter()
                     .find(|entry| entry["origin"] == "witness")
@@ -6566,13 +7063,16 @@ mod tests {
                     .find(|job| job["taskUuid"] == task_uuid)
                     .unwrap();
                 assert_eq!(projected["pool"], json!(["slot", "zeta"]));
-                let context = daemon_context.read().await;
-                assert!(context.recent_journal.iter().any(|entry| {
-                    entry.fields.task_uuid == task_uuid
-                        && entry.fields.pools.as_deref()
-                            == Some(["slot".to_owned(), "zeta".to_owned()].as_slice())
-                }));
-                drop(context);
+                assert!(daemon_history
+                    .borrow()
+                    .snapshot()
+                    .records
+                    .iter()
+                    .any(|record| {
+                        record.fields.task_uuid == task_uuid
+                            && record.fields.pools.as_deref()
+                                == Some(["slot".to_owned(), "zeta".to_owned()].as_slice())
+                    }));
 
                 let absent = client
                     .call(
@@ -6642,7 +7142,7 @@ mod tests {
                 .unwrap();
                 fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
 
-                let mut config = one_pool_config();
+                let mut config = two_pool_config();
                 config.pools.get_mut("slot").unwrap().auto_resume = Some(true);
                 config.adapters.insert(
                     "resumable".to_owned(),
@@ -6679,6 +7179,8 @@ mod tests {
                 let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
+                let restart_config = config.clone();
+                let restart_executor = executor.clone();
                 let mut retry_settings = settings();
                 retry_settings.recovery_policy.max_attempts = 2;
                 let mut daemon =
@@ -6703,6 +7205,33 @@ mod tests {
                 })
                 .await
                 .unwrap();
+                let parent_task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let child = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": ["true"],
+                        "pool": "zeta",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"],
+                        "dedupKey": "acceptance-child",
+                        "parent": parent_task_uuid,
+                        "callerJobId": admitted["job_id"],
+                    })))
+                    .await
+                    .unwrap();
+                let child_task_uuid = child["task_uuid"].as_str().unwrap().to_owned();
+                let child_finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(
+                    child_finished.job_id.to_string(),
+                    child["job_id"].as_str().unwrap()
+                );
+                daemon.finish_job(child_finished).await.unwrap();
+                daemon.handler.drain_post_ack_tasks().await;
 
                 let engine = ProducerEngine::new(&registry, paths.events_dir(), &paths.state_dir);
                 let lost = engine
@@ -6730,9 +7259,13 @@ mod tests {
                     assert!(context.unreachable_pools.contains("slot"));
                 }
                 let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
-                assert_eq!(records.len(), 1);
-                assert_eq!(records[0].verdict, Verdict::PoolVanished);
-                assert_eq!(records[0].attempt, 1);
+                assert_eq!(records.len(), 2);
+                let first_parent = records
+                    .iter()
+                    .find(|record| record.task_uuid.as_deref() == Some(parent_task_uuid.as_str()))
+                    .unwrap();
+                assert_eq!(first_parent.verdict, Verdict::PoolVanished);
+                assert_eq!(first_parent.attempt, 1);
 
                 let returned = engine
                     .observe_reachability("health", true, Utc::now())
@@ -6791,11 +7324,79 @@ mod tests {
                 assert_eq!(terminal["verdict"], "pass");
                 assert_eq!(terminal["attempt"], 2);
                 let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
-                assert_eq!(records.len(), 2);
-                assert_eq!(records[1].verdict, Verdict::Pass);
-                assert_eq!(records[1].attempt, 2);
-                assert_eq!(records[1].labor_class, LaborClass::Recovered);
+                assert_eq!(records.len(), 3);
+                let parent_records = records
+                    .iter()
+                    .filter(|record| record.task_uuid.as_deref() == Some(parent_task_uuid.as_str()))
+                    .collect::<Vec<_>>();
+                assert_eq!(parent_records.len(), 2);
+                assert_eq!(parent_records[1].verdict, Verdict::Pass);
+                assert_eq!(parent_records[1].attempt, 2);
+                assert_eq!(parent_records[1].labor_class, LaborClass::Recovered);
                 daemon.handler.drain_post_ack_tasks().await;
+
+                drop(daemon);
+                let restarted = Daemon::open_with_executor(
+                    restart_config,
+                    paths.clone(),
+                    retry_settings,
+                    restart_executor,
+                )
+                .await
+                .unwrap();
+                let jobs = restarted
+                    .handler
+                    .query("query.jobs", Some(json!({})))
+                    .await
+                    .unwrap();
+                let parent = jobs["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|job| job["taskUuid"] == parent_task_uuid)
+                    .unwrap();
+                assert_eq!(parent["currentAttempt"], 2);
+                assert_eq!(parent["terminalVerdict"], "pass");
+                assert_eq!(parent["childTaskUuids"], json!([child_task_uuid.clone()]));
+                let detail = restarted
+                    .handler
+                    .query("query.job", Some(json!({"id": parent_task_uuid})))
+                    .await
+                    .unwrap();
+                assert_eq!(detail["attempts"].as_array().unwrap().len(), 2);
+                assert_eq!(detail["attempts"][0]["attempt"], 1);
+                assert_eq!(detail["attempts"][1]["attempt"], 2);
+                let log = restarted
+                    .handler
+                    .query(
+                        "query.log",
+                        Some(json!({"task": detail["job"]["taskUuid"]})),
+                    )
+                    .await
+                    .unwrap();
+                assert!(log["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["attempt"] == 1 && event["event"] == "failed"));
+                assert!(log["items"].as_array().unwrap().iter().any(|event| {
+                    event["attempt"] == 2
+                        && event["authority"] == "canonical-witness"
+                        && event["terminalVerdict"] == "pass"
+                }));
+                let proof = restarted
+                    .handler
+                    .query(
+                        "query.proof",
+                        Some(json!({
+                            "task": detail["job"]["taskUuid"],
+                            "attempt": 2,
+                        })),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(proof["status"], "verified");
+                assert_eq!(proof["witnessRecord"]["verdict"], "pass");
             })
             .await;
     }
@@ -9553,7 +10154,7 @@ mod tests {
                     .call("query.status", Some(json!({"pool": "slot"})))
                     .await
                     .unwrap();
-                assert_eq!(status["protocolVersion"], 1);
+                assert_eq!(status["protocolVersion"], 2);
                 assert_eq!(status["pools"][0]["pool"], "slot");
                 assert!(status["jobs"].as_array().unwrap().iter().any(|job| {
                     job["taskUuid"].as_str() == Some(task_uuid) && job["verdict"] == "pass"
@@ -9566,12 +10167,12 @@ mod tests {
                     .unwrap();
                 assert!(render_text
                     .as_str()
-                    .is_some_and(|text| text.contains("\"protocolVersion\": 1")));
+                    .is_some_and(|text| text.contains("\"protocolVersion\": 2")));
                 let render_json = client
                     .call("query.render", Some(json!({"format": "json"})))
                     .await
                     .unwrap();
-                assert_eq!(render_json["protocolVersion"], 1);
+                assert_eq!(render_json["protocolVersion"], 2);
 
                 let reused = client.call("queue.enqueue", Some(payload)).await.unwrap();
                 assert_eq!(reused["state"], "reused");
@@ -10056,6 +10657,171 @@ mod tests {
             let read = socket.recv(&mut buffer).unwrap();
             assert_eq!(&buffer[..read], expected.as_bytes());
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_24_1_restart_reconstructs_lineage_two_attempts_log_and_proof() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let (paths, parent_uuid, child_uuid, parent_pass, _) =
+                    seed_durable_query_fixture(temp.path());
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+
+                // Open and drop one daemon before inspecting through the next
+                // generation. This exercises lifecycle reload independently of
+                // both the TaskChampion cache and the witness ledger.
+                let first = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor.clone(),
+                )
+                .await
+                .unwrap();
+                drop(first);
+                let restarted = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+
+                let jobs = restarted
+                    .handler
+                    .query("query.jobs", Some(json!({})))
+                    .await
+                    .unwrap();
+                assert_eq!(jobs["protocolVersion"], 2);
+                assert_eq!(jobs["nextCursor"], Value::Null);
+                assert_eq!(jobs["snapshot"]["history"]["complete"], true);
+                let parent = jobs["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|job| job["taskUuid"] == parent_uuid.to_string())
+                    .unwrap();
+                assert_eq!(parent["terminalVerdict"], "pass");
+                assert_eq!(parent["terminalAttempt"], 2);
+                assert_eq!(parent["currentAttempt"], 2);
+                assert_eq!(parent["leaseEpoch"], 2);
+                assert_eq!(parent["evidenceResult"], "pass");
+                assert_eq!(parent["lifecycleEvent"], "completed");
+                assert_eq!(parent["childTaskUuids"], json!([child_uuid.to_string()]));
+                assert_ne!(parent["liveState"], parent["terminalVerdict"]);
+                assert_ne!(parent["rowStatus"], parent["evidenceResult"]);
+
+                let job = restarted
+                    .handler
+                    .query("query.job", Some(json!({"id": parent_uuid.to_string()})))
+                    .await
+                    .unwrap();
+                let attempts = job["attempts"].as_array().unwrap();
+                assert_eq!(attempts.len(), 2);
+                assert_eq!(attempts[0]["attempt"], 1);
+                assert_eq!(attempts[0]["leaseEpoch"], 1);
+                assert_eq!(attempts[0]["witnessRecords"][0]["verdict"], "preempted");
+                assert_eq!(attempts[1]["attempt"], 2);
+                assert_eq!(attempts[1]["leaseEpoch"], 2);
+                assert_eq!(attempts[1]["evidenceResult"], "pass");
+
+                let log = restarted
+                    .handler
+                    .query("query.log", Some(json!({"task": parent_uuid.to_string()})))
+                    .await
+                    .unwrap();
+                assert!(log["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["attempt"] == 1 && event["event"] == "preempted"));
+                assert!(log["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| event["attempt"] == 2 && event["event"] == "completed"));
+
+                let proof = restarted
+                    .handler
+                    .query(
+                        "query.proof",
+                        Some(json!({"task": parent_uuid.to_string(), "attempt": 2})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(proof["status"], "verified");
+                assert_eq!(
+                    proof["witnessRecord"],
+                    serde_json::to_value(parent_pass).unwrap()
+                );
+                assert_eq!(proof["evidence"]["observations"][0]["passed"], true);
+                assert_eq!(proof["advisoryAttestations"].as_array().unwrap().len(), 1);
+
+                let status = restarted
+                    .handler
+                    .query("query.status", Some(json!({})))
+                    .await
+                    .unwrap();
+                assert!(status["jobs"].as_array().unwrap().iter().any(|job| {
+                    job["taskUuid"] == parent_uuid.to_string() && job["verdict"] == "pass"
+                }));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_24_6_proof_matches_verified_record_and_reports_chain_head() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let (paths, parent_uuid, _, expected, expected_head) =
+                    seed_durable_query_fixture(temp.path());
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let proof = daemon
+                    .handler
+                    .query(
+                        "query.proof",
+                        Some(json!({"task": parent_uuid.to_string(), "attempt": 2})),
+                    )
+                    .await
+                    .unwrap();
+                let (_, disk_records) = read_verified_records(&paths.witness_path()).unwrap();
+                let disk = disk_records
+                    .iter()
+                    .find(|record| {
+                        record.task_uuid.as_deref() == Some(parent_uuid.to_string().as_str())
+                            && record.attempt == 2
+                    })
+                    .unwrap();
+                assert_eq!(disk, &expected);
+                assert_eq!(
+                    proof["witnessRecord"],
+                    serde_json::to_value(disk).unwrap(),
+                    "proof must preserve every verified WitnessRecord field"
+                );
+                assert_eq!(proof["ledger"]["verified"], true);
+                assert_eq!(
+                    proof["ledger"]["chainHead"],
+                    json!({"seq": expected_head.seq, "hash": expected_head.hash})
+                );
+            })
+            .await;
     }
 
     #[test]

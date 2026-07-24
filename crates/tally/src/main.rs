@@ -20,7 +20,9 @@ use tally_core::producers::{
 use tally_core::recovery::RecoveryPolicy;
 use tally_core::taskdb::{EnqueueSource, RelatedTrigger, WorkspaceMetadata};
 use tally_core::wire::{EnqueuePayload, RpcClient, WireErrorCode, WireIoError};
-use tally_core::witness::{append_attestation, verify_attestations, verify_file};
+use tally_core::witness::{
+    append_attestation, read_verified_attestations, read_verified_records, GENESIS_PREV_HASH,
+};
 use tally_core::{
     adapters::{AdapterEngine, AdapterJobOptions, ScrapeResult},
     Config,
@@ -396,7 +398,15 @@ enum WitnessCommand {
         ledger: Option<PathBuf>,
         #[arg(long)]
         attestations: Option<PathBuf>,
+        #[arg(long, value_enum, default_value = "text")]
+        format: WitnessVerifyFormat,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum WitnessVerifyFormat {
+    Text,
+    Json,
 }
 
 #[derive(Debug, Subcommand)]
@@ -434,6 +444,31 @@ enum DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 enum QueryCommand {
+    Jobs {
+        #[arg(long, alias = "live-state")]
+        state: Option<String>,
+        #[arg(long, alias = "terminal-verdict")]
+        verdict: Option<String>,
+        #[arg(long)]
+        pool: Option<String>,
+        #[arg(long)]
+        executor: Option<String>,
+        #[arg(long)]
+        adapter: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        parent: Option<String>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+    },
+    Job {
+        id: String,
+    },
     Status {
         #[arg(long)]
         pool: Option<String>,
@@ -441,6 +476,24 @@ enum QueryCommand {
     Log {
         #[arg(long)]
         task: Option<String>,
+        #[arg(long)]
+        attempt: Option<u32>,
+        #[arg(long)]
+        session: Option<String>,
+        #[arg(long)]
+        event: Option<String>,
+        #[arg(long)]
+        source: Option<String>,
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        until: Option<String>,
+    },
+    Proof {
+        #[arg(long)]
+        task: String,
+        #[arg(long)]
+        attempt: Option<u32>,
     },
     Render {
         #[arg(long, default_value = "text")]
@@ -1258,11 +1311,71 @@ async fn run_lease(socket: &Path, command: LeaseCommand) -> Result<()> {
 
 async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
     match command {
+        QueryCommand::Jobs {
+            state,
+            verdict,
+            pool,
+            executor,
+            adapter,
+            source,
+            parent,
+            session,
+            since,
+            until,
+        } => {
+            print_rpc(
+                socket,
+                "query.jobs",
+                Some(json!({
+                    "liveState": state,
+                    "terminalVerdict": verdict,
+                    "pool": pool,
+                    "executor": executor,
+                    "adapter": adapter,
+                    "source": source,
+                    "parent": parent,
+                    "session": session,
+                    "since": since,
+                    "until": until,
+                })),
+            )
+            .await
+        }
+        QueryCommand::Job { id } => print_rpc(socket, "query.job", Some(json!({"id": id}))).await,
         QueryCommand::Status { pool } => {
             print_rpc(socket, "query.status", Some(json!({"pool": pool}))).await
         }
-        QueryCommand::Log { task } => {
-            print_rpc(socket, "query.log", Some(json!({"task": task}))).await
+        QueryCommand::Log {
+            task,
+            attempt,
+            session,
+            event,
+            source,
+            since,
+            until,
+        } => {
+            print_rpc(
+                socket,
+                "query.log",
+                Some(json!({
+                    "task": task,
+                    "attempt": attempt,
+                    "session": session,
+                    "event": event,
+                    "source": source,
+                    "since": since,
+                    "until": until,
+                })),
+            )
+            .await
+        }
+        QueryCommand::Proof { task, attempt } => {
+            print_rpc(
+                socket,
+                "query.proof",
+                Some(json!({"task": task, "attempt": attempt})),
+            )
+            .await
         }
         QueryCommand::Render { format } => {
             let mut client = RpcClient::connect(socket).await?;
@@ -1308,38 +1421,76 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
             path,
             ledger,
             attestations,
+            format,
         } => {
             let ledger = path
                 .or(ledger)
                 .unwrap_or(default_data_dir()?.join("witness.jsonl"));
             let attestations =
                 attestations.unwrap_or_else(|| ledger.with_file_name("attestations.jsonl"));
-            let verdict_report = verify_file(&ledger)?;
-            let attestation_report = verify_attestations(&attestations)?;
-            if verdict_report.ok {
-                println!(
-                    "verdict chain: ok ({} records, seq {:?}..{:?})",
-                    verdict_report.records, verdict_report.first_seq, verdict_report.last_seq
-                );
-            } else {
-                println!("verdict chain: invalid");
-                for problem in &verdict_report.problems {
+            let (verdict_report, verdict_records) = read_verified_records(&ledger)?;
+            let (attestation_report, attestation_records) =
+                read_verified_attestations(&attestations)?;
+            match format {
+                WitnessVerifyFormat::Text => {
+                    if verdict_report.ok {
+                        println!(
+                            "verdict chain: ok ({} records, seq {:?}..{:?})",
+                            verdict_report.records,
+                            verdict_report.first_seq,
+                            verdict_report.last_seq
+                        );
+                    } else {
+                        println!("verdict chain: invalid");
+                        for problem in &verdict_report.problems {
+                            println!(
+                                "line {} seq {:?} {:?}: {}",
+                                problem.line, problem.seq, problem.kind, problem.reason
+                            );
+                        }
+                    }
                     println!(
-                        "line {} seq {:?} {:?}: {}",
-                        problem.line, problem.seq, problem.kind, problem.reason
+                        "attestation chain: {} ({} records; {})",
+                        if attestation_report.ok {
+                            "ok"
+                        } else {
+                            "invalid"
+                        },
+                        attestation_report.records,
+                        attestation_report.authentication
+                    );
+                }
+                WitnessVerifyFormat::Json => {
+                    let verdict_head = verdict_records.last().map_or_else(
+                        || json!({"seq": 0, "hash": GENESIS_PREV_HASH}),
+                        |record| json!({"seq": record.seq, "hash": record.hash}),
+                    );
+                    let attestation_head = attestation_records.last().map_or_else(
+                        || json!({"seq": 0, "hash": GENESIS_PREV_HASH}),
+                        |record| json!({"seq": record.seq, "hash": record.hash}),
+                    );
+                    println!(
+                        "{}",
+                        serde_json::to_string(&json!({
+                            "schemaVersion": 1,
+                            "protocolVersion": tally_core::query::QUERY_PROTOCOL_VERSION,
+                            "ok": verdict_report.ok && attestation_report.ok,
+                            "chains": {
+                                "verdict": {
+                                    "path": ledger,
+                                    "report": verdict_report,
+                                    "chainHead": verdict_head,
+                                },
+                                "attestations": {
+                                    "path": attestations,
+                                    "report": attestation_report,
+                                    "chainHead": attestation_head,
+                                },
+                            },
+                        }))?
                     );
                 }
             }
-            println!(
-                "attestation chain: {} ({} records; {})",
-                if attestation_report.ok {
-                    "ok"
-                } else {
-                    "invalid"
-                },
-                attestation_report.records,
-                attestation_report.authentication
-            );
             if !verdict_report.ok || !attestation_report.ok {
                 bail!("ledger verification failed");
             }

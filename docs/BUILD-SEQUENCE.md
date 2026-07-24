@@ -119,20 +119,31 @@ Proof:
 - daemon tests cover adoption, exit reconciliation, exact-row re-presentation, and crash gaps; and
 - `test/scenarios/pool-vanished-return.sh` provides an optional real-host reboot proof.
 
-## 6. Journald and read-time queries
+## 6. Durable lifecycle history, journald, and read-time queries
 
 `crates/tally-core/src/journal.rs` renders one validated lifecycle shape either as bounded JSON
 stdout or native journal protocol. It parses both forms without allowing message content to shadow
 native fields.
 
-`crates/tally-core/src/query.rs` joins journal observations with durable rows and witnesses into
-status, log, render, standup, and pool projections. A witness wins over observational journal data,
-and a newer attempt is not hidden by an older terminal attempt.
+`crates/tally-core/src/history.rs` appends the same validated fields to the private, versioned
+`lifecycle.jsonl` store with monotonic stable cursors. It verifies the complete file on open,
+fails closed on complete-record corruption, repairs only an incomplete crash tail, and persists
+machine-readable retention/truncation metadata. There is no 4,096-record cap.
+
+`crates/tally-core/src/query.rs` supplies the compatibility status, render, standup, and pool
+views. `crates/tally-core/src/query_v2.rs` joins durable lifecycle, row, live-daemon, pool, witness,
+and advisory attestation facts into the protocol-2 `jobs`, `job`, `log`, and `proof` projections.
+A witness wins for canonical terminal material, scraped fields stay advisory, and attempts are
+grouped by `(taskUuid, attempt, leaseEpoch)`.
 
 Proof:
 
-- journal and query unit tests cover validation, both encodings, pruned history, attempts, and
-  canonical totals; and
+- journal and query unit tests cover validation, both journal encodings, provenance, proof states,
+  attempts, and canonical totals;
+- the history test reopens 4,129 records without truncation, and records any repaired crash tail
+  explicitly;
+- issue-24 acceptance tests rebuild parent/child lineage and two attempts after restart, then
+  compare `query proof` with the verified on-disk witness record and chain head; and
 - `crates/tally/tests/journal_live.rs` is an explicit opt-in round trip through a real user journal.
 
 ## 7. Daemon transaction and supervision
