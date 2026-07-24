@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -27,6 +29,11 @@ use tally_core::witness::{
 use tally_core::{
     adapters::{AdapterEngine, AdapterJobOptions, ScrapeResult},
     Config,
+};
+use tally_flow::{
+    check_script, load_catalog, run_script, Admission, CheckOptions, ClientError, FlowClient,
+    FlowError, FlowFuture, FlowSubmission, LifecycleSink, NodeResult, RunInspection, RunOptions,
+    SourceLocation,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -87,6 +94,40 @@ enum Command {
         #[command(subcommand)]
         command: QueryCommand,
     },
+    Flow {
+        #[command(subcommand)]
+        command: FlowCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum FlowCommand {
+    Run(FlowRunArgs),
+    Check(FlowCheckArgs),
+}
+
+#[derive(Debug, Args)]
+struct FlowRunArgs {
+    #[arg(value_name = "SCRIPT")]
+    script: PathBuf,
+    #[arg(long, default_value = "{}", value_parser = parse_opaque_json, allow_hyphen_values = true)]
+    args: Value,
+    #[arg(long, value_name = "PATH")]
+    catalog: Option<PathBuf>,
+    #[arg(long)]
+    flow_run_id: Option<String>,
+    #[arg(long, default_value_t = tally_flow::DEFAULT_MAX_NODES)]
+    max_nodes: u32,
+}
+
+#[derive(Debug, Args)]
+struct FlowCheckArgs {
+    #[arg(value_name = "SCRIPT")]
+    script: PathBuf,
+    #[arg(long, value_parser = parse_opaque_json, allow_hyphen_values = true)]
+    args: Option<Value>,
+    #[arg(long, value_name = "PATH")]
+    catalog: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -604,6 +645,139 @@ fn configuration_contract() -> Value {
     })
 }
 
+struct JsonlLifecycleSink;
+
+impl LifecycleSink for JsonlLifecycleSink {
+    fn emit(&self, event: Value) -> Result<(), FlowError> {
+        let line = serde_json::to_string(&event).map_err(|error| {
+            FlowError::new(
+                "FlowCaptureError",
+                "lifecycle-serialization",
+                format!("cannot serialize lifecycle event: {error}"),
+            )
+            .at(SourceLocation::new(1, 1))
+        })?;
+        writeln!(std::io::stdout().lock(), "{line}").map_err(|error| {
+            FlowError::new(
+                "FlowCaptureError",
+                "lifecycle-write",
+                format!("cannot write lifecycle event: {error}"),
+            )
+            .at(SourceLocation::new(1, 1))
+        })
+    }
+}
+
+struct PreIntegrationFlowClient;
+
+impl FlowClient for PreIntegrationFlowClient {
+    fn inspect_run<'a>(
+        &'a self,
+        _flow_run_id: &'a str,
+    ) -> FlowFuture<'a, std::result::Result<RunInspection, ClientError>> {
+        Box::pin(std::future::ready(Ok(RunInspection { script_hash: None })))
+    }
+
+    fn submit<'a>(
+        &'a self,
+        _submission: FlowSubmission,
+    ) -> FlowFuture<'a, std::result::Result<Admission, ClientError>> {
+        Box::pin(std::future::ready(Err(ClientError::new(
+            "flow-protocol-unavailable",
+            "this daemon build does not expose full-mode flow admission; the replay engine can be embedded through FlowClient",
+        ))))
+    }
+
+    fn await_terminal<'a>(
+        &'a self,
+        _task_uuid: &'a str,
+        _attempt: u32,
+    ) -> FlowFuture<'a, std::result::Result<NodeResult, ClientError>> {
+        Box::pin(std::future::ready(Err(ClientError::new(
+            "flow-protocol-unavailable",
+            "this daemon build does not expose flow terminal results",
+        ))))
+    }
+}
+
+fn run_flow(command: FlowCommand) -> Result<()> {
+    match command {
+        FlowCommand::Check(args) => {
+            let source = std::fs::read_to_string(&args.script)
+                .with_context(|| format!("cannot read flow script {}", args.script.display()))?;
+            let catalog = args
+                .catalog
+                .as_deref()
+                .map(load_catalog)
+                .transpose()
+                .map_err(flow_error)?;
+            let checked = check_script(
+                &source,
+                Some(&args.script),
+                CheckOptions {
+                    args: args.args.as_ref(),
+                    catalog: catalog.as_ref().map(|(catalog, _)| catalog),
+                    catalog_hash: catalog.as_ref().map(|(_, hash)| hash.as_str()),
+                },
+            )
+            .map_err(flow_error)?;
+            println!("{}", serde_json::to_string(&checked.meta_json)?);
+            Ok(())
+        }
+        FlowCommand::Run(args) => {
+            let source = std::fs::read_to_string(&args.script)
+                .with_context(|| format!("cannot read flow script {}", args.script.display()))?;
+            let flow_run_id = args
+                .flow_run_id
+                .or_else(|| std::env::var("TALLY_TASK_UUID").ok())
+                .ok_or_else(|| {
+                    flow_error(
+                        FlowError::new(
+                            "FlowStartupError",
+                            "flow-run-id-missing",
+                            "flow run requires --flow-run-id or TALLY_TASK_UUID",
+                        )
+                        .at(SourceLocation::new(1, 1)),
+                    )
+                })?;
+            let catalog = args
+                .catalog
+                .as_deref()
+                .map(load_catalog)
+                .transpose()
+                .map_err(flow_error)?;
+            let mut options = RunOptions::new(flow_run_id, args.args);
+            options.max_nodes = args.max_nodes;
+            if let Some((catalog, hash)) = catalog {
+                options.catalog = Some(catalog);
+                options.catalog_hash = Some(hash);
+            }
+            let report = run_script(
+                &source,
+                Some(&args.script),
+                Rc::new(PreIntegrationFlowClient),
+                Rc::new(JsonlLifecycleSink),
+                options,
+            )
+            .map_err(flow_error)?;
+            JsonlLifecycleSink
+                .emit(json!({"type": "flow-report", "report": report}))
+                .map_err(flow_error)?;
+            Ok(())
+        }
+    }
+}
+
+fn flow_error(error: FlowError) -> anyhow::Error {
+    let code = match error.code.as_str() {
+        "replay-divergence" | "script-changed-mid-run" => 20,
+        "flow-run-id-missing" => 2,
+        _ => 1,
+    };
+    let message = serde_json::to_string(&error.report()).unwrap_or_else(|_| error.to_string());
+    anyhow::Error::new(ExitFailure { code, message })
+}
+
 async fn execute(opts: Opts) -> Result<()> {
     if matches!(opts.mode, Some(Mode::CheckConfig)) {
         let path = opts
@@ -732,6 +906,7 @@ async fn execute(opts: Opts) -> Result<()> {
         Some(Command::Witness { command }) => run_witness(command),
         Some(Command::Lease { command }) => run_lease(&socket, command).await,
         Some(Command::Query { command }) => run_query(&socket, command).await,
+        Some(Command::Flow { command }) => run_flow(command),
         None => {
             Opts::command().print_help()?;
             println!();
@@ -1736,7 +1911,7 @@ mod tests {
     fn full_top_level_surface_is_visible() {
         let help = Opts::command().render_long_help().to_string();
         for verb in [
-            "enqueue", "queue", "producer", "witness", "lease", "daemon", "query",
+            "enqueue", "queue", "producer", "witness", "lease", "daemon", "query", "flow",
         ] {
             assert!(help.contains(verb), "missing {verb} from help");
         }
@@ -1836,6 +2011,57 @@ mod tests {
             "cmd 'two words'",
         ]);
         assert!(invocation.is_ok());
+    }
+
+    #[test]
+    fn flow_run_and_check_cli_shapes_match_the_declarative_contract() {
+        let check = Opts::try_parse_from([
+            "tally",
+            "flow",
+            "check",
+            "/nix/store/example-flow.js",
+            "--args",
+            r#"{"task":"ship"}"#,
+            "--catalog",
+            "/nix/store/catalog.json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            check.command,
+            Some(Command::Flow {
+                command: FlowCommand::Check(FlowCheckArgs {
+                    script,
+                    args: Some(args),
+                    catalog: Some(catalog),
+                })
+            }) if script == Path::new("/nix/store/example-flow.js")
+                && args == json!({"task": "ship"})
+                && catalog == Path::new("/nix/store/catalog.json")
+        ));
+
+        let run = Opts::try_parse_from([
+            "tally",
+            "flow",
+            "run",
+            "/nix/store/example-flow.js",
+            "--args",
+            r#"{"task":"ship"}"#,
+            "--max-nodes",
+            "200",
+            "--flow-run-id",
+            "run-47",
+        ])
+        .unwrap();
+        assert!(matches!(
+            run.command,
+            Some(Command::Flow {
+                command: FlowCommand::Run(FlowRunArgs {
+                    flow_run_id: Some(flow_run_id),
+                    max_nodes: 200,
+                    ..
+                })
+            }) if flow_run_id == "run-47"
+        ));
     }
 
     #[test]

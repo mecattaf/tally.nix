@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "members": [
+    {
+      "id": "fixture-fast-a",
+      "family": "fixture-a",
+      "maker": "fixture-maker",
+      "classes": ["pooled-fast"],
+      "adapter": "pi",
+      "pools": ["worker-gpu"],
+      "launch": {
+        "model": "fixture-fast-a"
+      }
+    }
+  ]
+}
