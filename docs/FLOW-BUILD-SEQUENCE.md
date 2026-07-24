@@ -37,7 +37,7 @@ gate ladder, then dispatches the next unit of that lane on fresh `main`.
 `crates/tally-core` admission path + wire envelope. Canonical payload serialization +
 `payloadHash` on row and witness (additive optional field); the complete §3.2 disposition
 table including memoized failure; versioned enqueue-response `disposition` surface (§3.3);
-`--wait` composition for attached waiters. Tests: every row of the case table, plus
+`--wait` composition for attached waiters. Includes the §3.3 `queue.retry` verb + CLI. Tests: every row of the case table, plus
 byte-compat regression (absent fields ⇒ legacy hashes identical).
 Dedup key: `fs-1-attach`.
 
@@ -62,8 +62,13 @@ Dedup key: `fs-3-concurrent-wire`.
 Adapter-provisioned `TALLY_GATE_MANIFEST` by default on claude-code/codex presets with
 `gates: not-run` visibility; final-agent-message first-class projection; node result
 schema validation hook; `Assisted-by:` trailer emission from witness data in the gh
-mutation sink. Tests: manifest-absent visibility; trailer format; result-schema reject
-on passing verdict.
+mutation sink. Also owns the Rust half of `adapters.<name>.hardening` — the adapter
+runtime-config field (`strict | workspace | none`, absent = none), propagation onto
+`ExecutionRequest`, and the executor's preset-name → directive-bundle mapping stamped
+into the transient unit; bundles hardcoded in Rust per NIX-SPEC-FLOW §6 (the preset NAME
+travels through config, concrete directives never do). Tests: manifest-absent
+visibility; trailer format; hardening property stamping. (The result-schema-mismatch
+acceptance lives in FS-4 mocked and FS-5 live, per FLOW-SPEC §11.1.)
 Dedup key: `fs-6-semantic-truth`. (Lane A slot 4 — touches adapters/gh sink, disjoint
 from lane B's crate.)
 
@@ -89,7 +94,11 @@ Dedup key: `fs-4-flow-crate`. Runs against pre-FS-1 `main` with the daemon inter
 behind a client trait; rebases and binds to the real dispositions in FS-5.
 
 **FS-5 — replay/attach integration + runner-as-job** (FLOW-SPEC §9, §12)
-After FS-1 and FS-4 merge: bind the runner's replay to the live disposition surface;
+After FS-1, FS-3, and FS-4 merge: bind the runner's replay to the live disposition
+surface. Normative: the runner opens exactly ONE daemon connection and multiplexes all
+concurrent `await_job`s over it per FLOW-SPEC §7.1 — a one-connection-per-outstanding-
+await fallback is forbidden (not an interim strategy; a different observable design), so
+FS-5's live acceptance runs on a build containing FS-3's concurrent serving. Scope:
 `TALLY_*` env sanitization; runner failure taxonomy exit codes; `source=orchestrator`
 submission with ancestry + provenance on every node; end-to-end test on an isolated dev
 daemon: flow of 6 nodes, kill runner mid-run → replay collapses prefix, kill daemon
@@ -103,11 +112,14 @@ catalog schema); catalog JSON Schema shipped + selector resolution goldens; hard
 preset vocabulary rendered to transient-unit properties; the seven new flake checks;
 `examples/flows/` shipped as fixtures: `pooled-review.js` (the pi-appliance pattern
 realized), `agency-nightly.js` (skeleton), `fleet-deploy.js` (zero-LLM shape).
-Dedup key: `fs-7-nix-flows`. (Lane B slot 3 — pure Nix + fixtures, disjoint from FS-6.)
+Dedup key: `fs-7-nix-flows`. (Lane B slot 3 — pure Nix + fixtures, disjoint from FS-6:
+FS-7 declares/validates/renders the hardening preset NAME only and must not assert
+runtime property stamping — FS-6 owns the Rust half; CP-B covers integration. FS-7 may
+merge before FS-6.)
 
 ### Checkpoints (scarce and decisive — two, not five)
 
-**CP-A — flow liveness, mid-campaign** (after FS-1, FS-4, FS-5)
+**CP-A — flow liveness, mid-campaign** (after FS-1, FS-3, FS-4, FS-5)
 Isolated dev daemon on the post-merge build. Live assertions: (1) example flow
 end-to-end with heterogeneous nodes (sh + adapter node); (2) runner killed mid-graph →
 replay, zero duplicate rows, prefix collapsed via dispositions; (3) daemon killed
@@ -130,11 +142,8 @@ Dedup key: `cp-b-seal`.
 
 ```
 Lane A:  FS-1 ──► FS-2 ──► FS-3 ──► FS-6
-                     │
-Lane B:  FS-4 ───────┴─(needs FS-1+FS-4 merged)─► FS-5 ──► FS-7
-                                                    │
-                                  CP-A ◄────────────┘   (also needs FS-1)
-Final:   CP-B after everything.
+Lane B:  FS-4 ──(needs FS-1+FS-3+FS-4 merged)──► FS-5 ──► FS-7
+CP-A after FS-5 (transitively FS-1/FS-3/FS-4). CP-B after everything.
 ```
 
 File-surface disjointness: FS-4 creates a new crate + subcommand registration (one small

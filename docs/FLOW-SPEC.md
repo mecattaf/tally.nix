@@ -42,8 +42,11 @@ runtime only as provenance.*
 ## 2. Vocabulary
 
 - **flow**: a named, content-hashed workflow script plus its static args schema.
-- **flow run**: one execution lifecycle of a flow: `flowRunId` (UUIDv7 assigned at first
-  admission of the runner job), pinned `scriptHash`, pinned canonical `args`.
+- **flow run**: one execution lifecycle of a flow: `flowRunId` — verbatim the runner
+  job's `taskUuid`, assigned by the daemon at first admission of the runner job (FS-2
+  switches task-uuid minting at `daemon.rs:846` from `Uuid::new_v4` to `Uuid::now_v7`,
+  so new run ids are time-sortable; UUID parsing is version-agnostic, additive-safe),
+  pinned `scriptHash`, pinned canonical `args`.
 - **runner**: the `tally flow run` process executing the script; itself an ordinary tally
   job, restartable, stateless (its entire durable state is the witness chain + rows).
 - **node**: one job materialized by the script (`job()` or sugar). Nodes are ordinary jobs.
@@ -100,12 +103,74 @@ For a `full`-mode enqueue carrying `dedup_key = K` with `payloadHash = H`:
 | queued or running, hash H | identical | **attach**: no new row; response `disposition: "attached"` with the existing `taskUuid`, current status, attempt ordinal |
 | queued or running, hash ≠ H | different | **fail closed**: error `dedup-key-conflict` carrying both hashes and the existing taskUuid; nothing enqueued |
 | terminal `pass`, hash H, artifacts rehash clean | identical | **reused** (existing behavior): response `disposition: "reused"` with witnessed result |
-| terminal `pass`, hash H, artifact rehash dirty | identical | existing re-run semantics for stale artifacts apply unchanged; response discloses `reusedRejected: "artifact-drift"` ⟨GROUND: exact current behavior⟩ |
+| terminal `pass`, hash H, artifact rehash dirty | identical | existing re-run semantics for stale artifacts apply unchanged; response discloses `reusedRejected: "artifact-drift"` (drift grounding below) |
 | terminal `failed`/`skipped`/any non-pass verdict, hash H | identical | **memoized failure**: response `disposition: "terminal"` with the recorded verdict and witness seq. The kernel never silently re-runs a failed key — replay must observe the same history. A fresh attempt requires an explicit retry verb (new attempt lane, same key) or a new key (script repair branch). |
 | any terminal, hash ≠ H | different | fail closed, `dedup-key-conflict` (a key permanently names one payload) |
 
 Attach never mutates the attached row. `--wait` composes: an attaching waiter joins the
 same terminal-result broadcast as the original submitter.
+
+### 3.2.1 Durable side-effects per disposition (normative)
+
+Only `created` materializes state:
+
+| disposition | new row | witness append | taskUuid in response | counters |
+|---|---|---|---|---|
+| `created` | yes (Fresh) | at terminal fact, as today | the new row's | `outstanding` +1 at admission, −1 at terminal; flow-run node count +1 |
+| `attached` | no | none | the existing live row's | none — the original creation already charged and is still outstanding, counted once |
+| `reused` | no | none | the governing terminal record's | none |
+| `terminal` | no | none | the governing terminal record's | none |
+
+Full-mode `reused` is a pure read of the ledger. Unlike legacy reuse — which
+materializes a `Completed` row and appends a `Verdict::Reused` record
+(`daemon.rs:930-1055`; preserved verbatim for `legacy` mode) — full mode returns the
+original row's `taskUuid`, the recorded verdict, and the original terminal record's
+`witnessSeq`, appending nothing. `terminal` likewise. This is what makes replay sound:
+re-running an N-node completed prefix touches no durable state, `maxNodes` (§6.2) counts
+only `created` rows, the §12.2 terminal order stays singular per ordinal, and CP-A's
+zero-duplicate-rows assertion is meaningful.
+
+Guardrail charging: the fanout/outstanding charge commits only on the `created` path. An
+implementation charging before the disposition probe (today's order, `wire.rs:709`) MUST
+roll back on every non-`created` disposition; observable behavior is as-if never charged.
+`fanoutCap` denies only submissions that would create a row — a parent at cap still
+resolves attach/reused/terminal successfully (a replaying runner is never starved by its
+own history). Recovery reconstruction (surviving non-terminal child rows) and live
+counting converge by construction.
+
+No-artifact rule (full mode, normative): "artifacts rehash clean" quantifies over the
+governing record's declared artifact paths. When the governing terminal-`pass` record's
+evidence declares no artifact paths (e.g. `exit:0`-only — the common shape for flow `sh`
+and adapter nodes), the rehash step is vacuously satisfied and the disposition is
+`reused`. The legacy `NoArtifactEvidence` miss (`evidence.rs:503-506`) applies in
+`legacy` mode only. Full-mode terminal matching is keyed on `dedup_key` + recorded
+`payloadHash` and does not require `artifact_content_hash` presence on the record
+(unlike the legacy probe filter, `evidence.rs:496`).
+
+Governing-candidate rule (normative). For key K under full mode: (1) live rows govern
+first — `Paused` classifies with queued/running (it is a non-terminal liveness state).
+Exactly one live row with key K ⇒ the table's live rows apply (attach on hash match,
+conflict on mismatch). More than one live row with key K (legal residue of legacy
+no-coalescing) ⇒ fail closed, `dedup-key-conflict`, disclosing every live `taskUuid` —
+full mode never chooses among duplicates. (2) No live row ⇒ the governing record is the
+terminal witness record for K with the highest `seq` (the legacy probe's rule,
+`evidence.rs:498`); earlier records for K are superseded history and are never
+consulted, whatever their hashes. (3) A governing terminal record with no recorded
+`payloadHash` (pre-full-mode history) is incomparable: the submission proceeds as
+`created` and the response discloses `reusedRejected: "payload-hash-unrecorded"` —
+visible, deterministic, and unreachable for flow-namespaced keys
+(`flow:<flowRunId>:…` is a fresh namespace).
+
+Artifact-drift grounding (resolves the table's drift row): "existing re-run semantics
+apply unchanged" means exactly the current `WitnessHashMismatch` path — plain dedup miss
+⇒ a fresh Fresh-row run is admitted (`evidence.rs:535-537`). The full-mode response for
+the drift row is therefore `disposition: "created"` plus the disclosure. All three
+full-mode rehash-miss reasons surface, each under its own string: `WitnessHashMismatch`
+⇒ `reusedRejected: "artifact-drift"`; `DeclaredHashMismatch` ⇒
+`reusedRejected: "declared-hash-mismatch"`; `ArtifactUnavailable` ⇒
+`reusedRejected: "artifact-unavailable"` (offending path in the error-detail field).
+`reusedRejected` is disclosure only — the disposition is `created` in all three cases
+and the fresh run proceeds normally.
 
 ### 3.3 Wire surface
 
@@ -115,6 +180,35 @@ terminal dispositions, the verdict + witness seq. Protocol-versioned per the exi
 query-envelope discipline; older clients that ignore unknown fields keep working
 (additive-only, §19).
 
+Envelope mechanics (normative): every `queue.enqueue`/`queue.continue`/`queue.retry`
+success response gains `schemaVersion: 1` — a NEW enqueue-response schema counter,
+independent of `QUERY_PROTOCOL_VERSION` (which is not bumped; it versions the query
+surface only) — advanced in the future only for additive changes, per the standing
+discipline. All existing response fields (`task_uuid`, `job_id`, `barrier`, `state`,
+`status`, `verdict`, `dedup_key`, `artifact_content_hash`, `witness_lsn`, …) survive
+with unchanged names, types, and values in both modes: the versioned surface wraps
+additively around the current shape, never replaces it. `disposition` appears on every
+enqueue response (legacy fresh ⇒ `created`; legacy reuse hit ⇒ `reused`). Full-mode
+responses additionally carry `payloadHash` and `attempt`, and — for `reused`/`terminal`
+— the recorded `verdict` and the governing terminal record's `witnessSeq` (`reused`
+responses carry the witnessed verdict, i.e. `pass`; the disposition field, not the
+verdict, conveys reuse).
+
+The retry verb (normative, FS-1 scope): new wire method `queue.retry`, CLI
+`tally queue retry <task-uuid>`. Preconditions (else `invalid`): the row exists and is
+terminal with a non-pass verdict — retrying a passed row is invalid (reuse semantics own
+that case; genuinely new work needs a new key). Effect: the same row re-enters `Queued`
+on a new attempt lane (`attempt+1`, same `taskUuid`, same payload and `payloadHash`,
+fresh lease lifecycle); no new row; nothing is appended to the witness at retry time —
+the new attempt's terminal fact witnesses normally. The parent's `outstanding`
+re-increments at retry admission and decrements at the new terminal fact; no depth is
+burned. While the retry attempt is live, a full-mode enqueue of the same key sees a
+queued/running row and follows the live rows of the §3.2 table; once it settles, the
+governing record is the new latest terminal record for the key. Response: the versioned
+envelope with `retried: true` plus `taskUuid` and the new `attempt` (`created`
+semantics do not apply). `queue.continue` is untouched and remains the scraped-session
+resume verb.
+
 ## 4. Kernel seam 2 — orchestration provenance
 
 Optional `orchestration` object on the enqueue payload, persisted on the row and into the
@@ -122,8 +216,16 @@ witness (additive optional field; absent = byte-identical legacy hashes):
 
 ```json
 { "flowName": "agency-nightly", "flowRunId": "…", "scriptHash": "sha256-…",
-  "nodeOrdinal": 17, "nodeLabel": "impl:T042", "iterationPath": [2,0] }
+  "nodeOrdinal": 17, "nodeLabel": "impl:T042",
+  "maxNodes": 200, "selection": { "selector": "pooled-fast", "catalogHash": "sha256-…",
+  "memberId": "…", "members": ["…"] } }
 ```
+
+`iterationPath` does not exist — it has no honest derivation in plain JS; node identity
+within a run is `nodeOrdinal` (+ optional `nodeLabel` and the §11.2 submission key).
+`maxNodes` (§6.2) and `selection` (§11.5) are optional. The kernel interprets exactly
+two capsule fields — `flowRunId` and `maxNodes` (the §6.2 admission backstop) — and
+carries everything else opaque, verbatim, row→witness.
 
 The kernel never interprets it. Query projections group by it (`query jobs
 --flow-run <id>`); the witness carries it verbatim as an optional skip-if-absent field
@@ -155,6 +257,20 @@ references). Mechanics:
   the brief, not in argv; argv becomes `[preset invocation] + TALLY_BRIEF reference`. This
   retires prompts-as-argv (and the secrets-in-queryable-state problem) for all flow nodes.
 
+`briefHash` input bytes (normative): the daemon parses the brief — the inline JSON value
+or the `briefPath` file's contents — and hashes the compact canonical serialization of
+the parsed document: `serde_json` compact form, object member order preserved exactly as
+received (`preserve_order`, the witness hash-input discipline), no insignificant
+whitespace, absent optionals omitted. Stated consequences: an inline brief and a
+`briefPath` file containing the same document (same member order, same values) produce
+the same `briefHash` and therefore attach; formatting and whitespace differences never
+matter; member-order differences do (order is content under `preserve_order` — the flow
+runner always serializes its briefs deterministically, so replay re-derivation is
+byte-stable by construction). The daemon stores the brief durably at a content-addressed
+path derived from `briefHash`; `TALLY_BRIEF` names that path. Raw-file-bytes hashing is
+rejected: inline briefs have no raw bytes after JSON-RPC parsing, and
+transport-dependent hashes would break inline↔path attach.
+
 ## 6. Kernel seam 4 — guardrail counters redesigned
 
 The lifetime-children counter is replaced by three counters with distinct questions:
@@ -176,6 +292,34 @@ live decrement-on-terminal and recovery reconstruction converge on the same valu
 eliminating the current live-vs-recovered divergence (live counter is
 lifetime-cumulative today, incremented at `wire.rs:709`, decremented only on admission
 rollback).
+
+`maxNodes` transport (normative): the per-run cap travels in the orchestration capsule.
+`tally flow run` gains `--max-nodes <n>`; the Nix module renders
+`"--max-nodes" (toString maxNodes)` into every flow producer argv (companion amendment
+in NIX-SPEC-FLOW §1). The runner computes the effective cap = min(`--max-nodes`,
+`meta.maxNodes`) over the values present (the Nix default always renders 1000) and
+stamps it as `maxNodes` on every node's orchestration capsule. At admission of a
+submission that would resolve `created` and carries orchestration provenance, the daemon
+counts durable rows whose `orchestration.flowRunId` equals the capsule's and rejects
+with `flow-node-cap` when count ≥ the capsule's `maxNodes` (absent ⇒ daemon default
+1000). Attach/reused/terminal never count (§3.2.1). The count is reconstructed from
+surviving rows at recovery. The capsule is excluded from `canonicalPayload` (§3.1), so a
+changed cap never perturbs work identity or trips §12.3 divergence. The cap is a
+runner-stamped runaway backstop, not a security boundary — pools remain the safety
+boundary; depthCap/fanoutCap/noEnqueue still bound a misbehaving runner.
+
+Call-site identity for the iteration counter (normative): the counter is keyed by the
+source position `(line, column)` of the innermost flow-script stack frame at the moment
+`job()` or sugar is invoked — i.e. the position of the `job(` token itself; host frames
+are skipped, script frames never are. Stated consequence, documented in the dialect
+docs: a script-defined helper wrapping `job()` is ONE call site for every loop that
+reaches it — its counts aggregate, and authors of helper-heavy scripts raise
+`meta.iterationCap` accordingly. This is the deterministic reading; plain JS has no
+reified back-edges, so the token position is the back-edge proxy. Each call site's
+counter is per flow-run execution, monotonic, and never resets — not per `parallel()`,
+not per enclosing function. Re-execution recounts identically because the script is
+deterministic. Exceeding the cap (`meta.iterationCap`, default 64, applied per call
+site) throws `FlowLoopError` naming the position and the count (§11.6).
 
 Guardrail and barrier bookkeeping must survive restarts by reconstruction from durable
 facts (rows + witnesses), and barrier/`job_results` retention is bounded by waiter
@@ -209,6 +353,26 @@ rows one global group), with **aging**: a row waiting longer than `agingThreshol
 through one queue; a 400-node OCR flow cannot starve a 6-node flow in the same class.
 Deterministic given identical queue states (tie-break inside a group: admission order).
 
+Braid definition (normative, stateless): at each scheduling pass, within one
+effective-rank stratum, every eligible row belongs to exactly one group — its
+`orchestration.flowRunId`; rows without flow provenance group by parent row; parentless
+standalone rows form one global group. Within a group, rows order by admission sequence
+ascending; a row's braid index k is its 0-based position among its group's
+currently-eligible rows. Groups order by their oldest eligible row's admission sequence,
+ascending. The stratum's total order is: k ascending, then group order, then own
+admission sequence. There is no rotation cursor and no scheduler state: the order is a
+pure function of the queue snapshot, so "deterministic given identical queue states"
+holds literally and the ordering is restart-invariant by construction. The FS-3 fairness
+regression encodes exactly this function.
+
+"One effective rank step" (normative): a row waiting longer than `agingThresholdSec`
+takes, as its effective rank, the next-higher priority class's rank value — `low` 10→50,
+`medium` 50→100, `high` 100→1000; `interrupt` is already top and never ages — applied
+once, never compounding. The aged row sorts and braids within the higher stratum as its
+own group (the braid definition applies unchanged). Effective rank is computed at sort
+time from `now − admission time` and is never persisted; the base priority on the row is
+untouched and all projections keep reporting it.
+
 ## 9. The flow runner
 
 - `tally flow run <script.js> --args <json> [--flow-run-id <id>]` — an ordinary
@@ -227,6 +391,14 @@ Deterministic given identical queue states (tie-break inside a group: admission 
   exit code and a structured error report in its capture (verdict `failed`, gate
   `script-error`); determinism violation detected on replay (§12) → distinguished error
   `replay-divergence`, fail closed, no node submitted past the divergence point.
+- `flowRunId` derivation (normative): the runner reads `TALLY_TASK_UUID` from its
+  environment and uses it verbatim; `--flow-run-id <uuid>` overrides (tests, CP-A's
+  two-concurrent-runners assertion, manual resume). Neither present ⇒ fail closed at
+  startup with a distinguished exit code (part of the failure taxonomy above). Because a
+  crash/re-attempt re-executes the same row with the same `taskUuid`, `flowRunId` is
+  byte-identical across attempts with zero extra machinery — §11.2 submission keys and
+  §12 replay hold by construction. The Nix-rendered producer argv stays static: no id
+  flag is ever rendered.
 
 ## 10. The dialect
 
@@ -261,8 +433,19 @@ export const meta = {
   argsSchema: { /* JSON Schema for --args */ },
   maxNodes: 200,                               // optional, ≤ module cap
   iterationCap: 64,                            // optional
+  selectors: ['pooled-fast'],                  // optional; every selector class
+                                               // members() may be called with
 }
 ```
+
+`meta.selectors` semantics (normative): the exhaustive declaration of selector classes
+the script may pass to `members()` (§11.5). Calling `members()` with an undeclared
+class — or at all when the field is absent/empty — is a script error
+`selector-undeclared` naming the class, raised before any submission where statically
+detectable and at the call otherwise. `flow check --catalog` verifies every declared
+class resolves to ≥1 catalog member. The Nix module requires `flows.<name>.catalog`
+exactly when `meta.selectors` is non-empty; a catalog set for a script with no declared
+selectors is permitted and inert.
 
 Violations (missing meta, non-literal meta, undeclared pool used at runtime, args failing
 schema) are errors **before any node is submitted**; the Nix module additionally rejects
@@ -272,8 +455,27 @@ undeclared pools at eval time.
 
 ### 11.1 `job(spec) → Promise<NodeResult>`
 
-`spec`: `{ argv | adapter+prompt, pools, priority?, runtimeMaxSec?, evidence?, workspace?,
-brief?, key?, label?, env? }` — the LLM-agnostic primitive matching the kernel's ontology.
+`spec`: `{ argv | adapter+prompt, pools, executor?, priority?, runtimeMaxSec?,
+evidence?, workspace?, brief?, key?, label?, env?, resultSchema? }` — the LLM-agnostic
+primitive matching the kernel's ontology.
+
+`executor?` (string — an executor name declared in daemon config) is marshalled verbatim
+onto the enqueue payload's first-class `executor` field (`wire.rs:356`), defaulting
+exactly as any enqueue does; it participates in `canonicalPayload` (§3.1). No
+pool→executor mapping exists or is added — pools remain resource leases, executors
+remain placement, orthogonal. The multi-host test and `examples/flows/fleet-deploy.js`
+place worker-side nodes with `executor: 'worker'`; the §15 data-plane rule applies to
+such nodes unchanged.
+
+`resultSchema?` (a JSON Schema object) is host-API surface only — never marshalled onto
+the wire, absent from `ResolvedEnqueue`, and outside `canonicalPayload`; it names what
+the script will accept, not the work. Validation and the `result-schema-mismatch`
+rejection are implemented in `tally-flow` (FS-4; live-bound in FS-5) — the kernel side
+(FS-6) supplies only the final-message/structured-result projection that feeds
+`NodeResult.result`. When `resultSchema` is declared and `NodeResult.result` is absent
+or fails validation, the node rejects with `result-schema-mismatch` even on verdict
+pass; `job(spec, { settle: true })` resolves with the settled NodeResult carrying the
+mismatch.
 Submission is **eager** (admission decides ordering, never the runner). Returns on the
 node's terminal fact with
 `NodeResult = { taskUuid, verdict, exitCode, witnessSeq, disposition, result?, gates? }`
@@ -307,6 +509,22 @@ thin, host-side, each a documented mapping onto `job()` with an adapter preset, 
 conventional pool set, and the prompt placed in the **brief** (§5), never argv. `local`
 resolves its model through the catalog (§11.5). Sugar adds no semantics.
 
+Prompt delivery (normative, all adapters): the sugar's argv is the preset invocation
+plus ONE constant positional after the preset's `--`, the literal sentinel:
+
+`Read the file whose path is in the TALLY_BRIEF environment variable and execute the
+mission it contains. That brief is your complete instruction set.`
+
+defined once in `tally-flow` as an exported, golden-tested constant, identical for
+`claude`, `codex`, `local`, and pi-adapter members (`local` resolves to a catalog member
+whose adapter preset gets the same sentinel). The mission rides exclusively in the
+brief; the sentinel is constant, so argv — and with it `canonicalPayload` — is identical
+across replays and across nodes that differ only in prompt (identity flows through
+`briefHash`, §5). No filesystem path and no `$`-expansion appears in argv: the executor
+spawns without a shell, and the agent process reads its own environment. `sh(argv)`
+takes no prompt and gets no sentinel; a brief attaches to a `sh` node only when the
+author passes `opts.brief`.
+
 ### 11.4 Combinators
 
 - `parallel(thunks) → Promise<NodeResult[]>` — barrier. All submissions eager, then
@@ -321,6 +539,19 @@ resolves its model through the catalog (§11.5). Sugar adds no semantics.
 - `log(msg)` — appended to the runner's capture and lifecycle stream; replay-safe (logs
   from replayed prefixes are suppressed by disposition, not re-emitted as new events).
 
+`log()` mechanics (normative): the lifecycle stream is the runner's own structured
+stdout/capture — JSONL events — with no wire emission and no new RPC (the kernel stays
+closed). Suppression is per-ordinal and uniform across first execution and replay,
+requiring no mode detection: each `log(msg)` is attributed to the runner's current
+submission frontier f (the count of submissions already made, i.e. the next ordinal).
+The event is withheld until ordinal f's disposition is known, then emitted iff that
+disposition is `created`; suppressed iff it is `reused`, `terminal`, or `attached` (the
+log belongs to a replayed/duplicated prefix). Logs after the script's final submission —
+where ordinal f never comes to exist — emit at script exit. On a first execution every
+disposition is `created`, so every log emits (slightly deferred); on replay exactly the
+frontier-and-beyond logs emit. Suppressed logs MAY be written to the capture tagged
+`replayed: true` for debugging; they never enter the lifecycle stream as events.
+
 ### 11.5 Selectors and quorum helpers (pi-appliance contract)
 
 `members(selector, opts)` resolves a pooled-capability selector (`'pooled-fast'`,
@@ -333,6 +564,20 @@ dissent-preserving reduce helpers that force per-member attribution into the agg
 host helpers implementing `docs/transfer/dotfiles-prior-art.md` §2 exactly — identity /
 deterministic / aggregate-node reducer classes, one-repair-attempt idiom (a repair branch
 is an ordinary `job()` with `key: '<member>@1'`), fail closed below quorum.
+
+Witness-before-inference, realized (normative — no new kernel seam): (1) before the
+first member submission, the runner emits a `selector-resolved` lifecycle event (§11.4
+stream, flushed to its capture) carrying `{ selector, opts, catalogHash, members:
+[ids] }` — the pre-inference durable record in the runner's own evidence, exactly the
+pi-appliance transcript rule. (2) Every member node's orchestration capsule carries
+`selection: { selector, catalogHash, memberId, members: [ids] }`, persisting row→witness
+with the capsule: no member node can exist in the ledger without the resolution that
+produced it. Together these satisfy "stamped into the run's provenance before any member
+node is submitted" — (1) temporally, (2) durably. Resolution is a pure function of the
+content-hashed catalog (the runner content-hashes the catalog file at startup,
+`catalogHash`), so replay re-derives the identical list; a catalog change that alters
+membership changes the member nodes' own specs and fires §12.3 payload divergence on the
+first affected ordinal — no separate catalog-pinning rule is needed.
 
 ### 11.6 Script errors
 
@@ -362,6 +607,17 @@ authors branch on `.code`.
    first-future-wins drain (Boa guarantees only FIFO of what the host enqueues; ordering
    ready futures is entirely the host's decision — see the Boa brief §3). Full pipeline
    concurrency is preserved: only observation is ordered, execution is not.
+   Observation-order mechanics (normative): no query is involved. Every `reused` and
+   `terminal` disposition response carries the governing terminal record's `witnessSeq`
+   (§3.3); live nodes acquire theirs at their terminal fact. The runner's JobExecutor
+   resolves ready node promises in ascending `witnessSeq` order — one rule covering both
+   regimes: for replayed ordinals this is exactly the witness chain's recorded terminal
+   order (a replayed promise is held while any known replayed promise with a smaller
+   `witnessSeq` is unresolved); at the frontier, fresh witness seqs are minted in true
+   completion order, so live resolution order is completion order, durably recorded for
+   the next replay. `attached` ordinals are live work and resolve on true completion,
+   necessarily after every already-terminal replayed ordinal. FS-2's
+   `query jobs --flow-run` grouping carries no ordering obligation for replay soundness.
 3. **Divergence detection (Temporal-grade).** For every replayed ordinal whose disposition
    is not `created`, the runner compares its re-derived `payloadHash` with the recorded
    one. Mismatch → `replay-divergence` failure naming ordinal, both hashes, and both
@@ -387,11 +643,40 @@ authors branch on `.code`.
    exit-0 success, and per current `canonical_verdict` (`daemon.rs:3533`) NotRun does not
    downgrade a Pass; only `Fail` does. Flow `NodeResult.gates` surfaces the summary to
    scripts.
+   Injection point (normative): preset manifest defaulting happens at execution-request
+   construction — daemon-side, strictly post-admission. When the daemon builds the
+   `ExecutionRequest` for a row whose adapter preset is claude-code/codex and whose
+   row-level `gate_manifest` is `None`, it synthesizes `GateManifestSpec { path:
+   <deterministic executor-owned path beside the capture file, a pure function of row
+   identity + attempt>, requiredGateIds: [], acceptance: manual }` onto the request; the
+   executor exports `TALLY_GATE_MANIFEST` from the request's spec in both the declared
+   and defaulted cases. The row is never mutated: `canonicalPayload.gate_manifest`
+   contains exactly what the enqueuer declared (possibly nothing), so resubmission and
+   replay hashes are unaffected, §12.3 divergence never fires on defaulting, and the
+   legacy dedup manifest-exclusion (`daemon.rs:900-902`, keyed on the row field) is
+   untouched — §3.2's byte- and behavior-identical promise holds. Completion-side gate
+   evaluation reads the spec from the execution request (`completion.rs`) exactly as
+   today, so the defaulted manifest is evaluated with no new channel.
 2. **Final message + structured result.** A job's final agent message becomes a
    first-class projection (`query job` field, `NodeResult.result`). Flow nodes may declare
    a result schema in spec; the runner validates the structured result before the script
    observes it (invalid ⇒ the node rejects with `result-schema-mismatch` even on verdict
-   pass — the pi-appliance validate stage, generalized).
+   pass — the pi-appliance validate stage, generalized; validation lives in `tally-flow`
+   per §11.1).
+   Final-message extraction (normative, per adapter): implemented as a preset scrape
+   capture named `finalMessage` (same machinery as `sessionRef`/`usage`, `adapters.rs`;
+   FS-6 adds a last-match selection mode where required), evaluated at the existing
+   scrape point — daemon-side, at job completion — and persisted with the row's durable
+   detail, so the `query job` projection survives daemon restart. Anchors:
+   **claude-code** (stream-json): the `result` string of the last event with
+   `type == "result"`; **codex** (`exec --json`): the `item.text` of the last
+   `item.completed` event whose `item.type == "agent_message"`; **pi** (`--mode json`):
+   the text content of the last assistant-role message in the session output;
+   **shell**: no capture — the field is absent; stdout is never promoted to a message.
+   `NodeResult.result`: the parsed value when the extracted message parses as JSON,
+   otherwise the raw string. Absence or non-JSON is an error only when the node declared
+   `resultSchema` (then `result-schema-mismatch`); with no declared schema, whatever was
+   extracted — or absence — flows through untyped.
 
 ## 14. Failure propagation in scripts
 
@@ -418,6 +703,21 @@ scrape envelope feeds the same `TALLY_METER_EVENT_PATH` contract the original ru
 defined, as a built-in feeder. Minimal by ruling: one feeder, windowed pools only. A flow
 run MAY declare a run-scoped budget pool (`meta.budgetPool`) its nodes co-charge —
 workflow.js `budget` semantics realized with existing pool machinery.
+
+Feeder mechanics (normative): (a) placement — inside the daemon, at the point the
+completed job's `usage` scrape resolves; "built-in" is literal: no new home-manager
+unit, no external process; the feeder emits through the identical event schema and
+ingestion path the external `TALLY_METER_EVENT_PATH` contract defines. (b) Routing — the
+feeder targets every pool the job actually LEASED that is a windowed-consumption budget
+pool WITHOUT a declared `usageMeter`; a declared external meter remains that pool's sole
+authority (never double-fed). Jobs leasing no such pool feed nothing. (c) Units — the
+built-in feeder is token-denominated: amount = the scraped usage object's `total_tokens`
+when present, else `input_tokens + output_tokens` (absent terms 0; the claude/codex/pi
+usage shapes all carry these names). Amount 0, missing usage, or unparsable usage ⇒ no
+event, silently (debug log only — malformed input is ignored per the acceptance law). A
+pool routed to the built-in feeder therefore denominates `consumptionCap` in tokens; the
+option docs state this. Advisory headroom clamp only, downward only; charges stay pure
+per the standing ruling.
 
 ## 17. Provenance projections
 
