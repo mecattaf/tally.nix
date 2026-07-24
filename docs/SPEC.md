@@ -240,12 +240,26 @@ The producer registry is closed over exactly five kinds: `calendar`, `build-effe
 
 Calendar producers emit a configured payload for a systemd calendar event. Build-effect producers
 observe bounded Nix store-path feeds. Pool-reachability producers confirm loss and return through
-hysteresis and can emit declared transition work. GitHub producers use explicit notification or
-search sources, authorize and exclude the captured trigger actor, and deduplicate immutable item
-IDs. The current search surface lacks authoritative trigger-actor data and therefore filters its
-candidates closed. Self-trigger admission is explicit. After durable `Pass`/`Reused`, evidence
-posting and item closing are separate policies; closing is impossible unless evidence posting is
-enabled.
+hysteresis and can emit declared transition work. GitHub notification and search sources carry
+per-source repository/owner, label, state, assignee, item-kind, notification-reason, raw-query, and
+explicit-item constraints. A source without a repository, owner, or item identity scope matches
+nothing. There is no implicit `involves:@me` query.
+
+GitHub intake recognizes only configured exact command comments, mentions, assignments, and label
+events. Authorization uses the triggering actor. Each current origin preserves the event,
+comment, timestamp, trigger value, item state, and bounded context snapshot. Receipt, dedup, and
+deterministic task identity use the comment ID for comment/mention triggers and the event ID for
+assignment/label triggers, independent of whether notifications or search observed it. Accepted,
+filtered, and first-duplicate outcomes receive idempotent marker-tagged acknowledgements; filtered
+remote text does not disclose policy detail. Self-trigger admission remains explicit. After durable
+`Pass`/`Reused`, evidence posting and item closing are separate policies; closing is impossible
+unless evidence posting is enabled.
+
+`producer preview`, `producer poll --once --no-enqueue`, and `producer explain --item` resolve and
+report candidates without writing receipts or ingress. `producer test --item --event --actor` is
+also non-mutating by default; `--promote` is the sole opt-in to ingress and acknowledgement. A job
+whose true source is not GitHub may store a validated `relatedTrigger` receipt reference while
+retaining its actual source.
 Events-directory producers accept ordinary files from external scanners.
 
 Ingress files are claimed without following links, bounded, parsed through the same enqueue

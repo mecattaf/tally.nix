@@ -468,6 +468,192 @@ let
     } (_: _: [ ])
   );
 
+  ghSourceConstraintsType = types.submodule (
+    { config, name, ... }:
+    {
+      options = {
+        repo = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "agency-agency/spec";
+          description = "Optional single owner/repository identity constraint.";
+        };
+        repositories = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "agency-agency/spec" ];
+          description = "Additional owner/repository identity constraints.";
+        };
+        owners = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "agency-agency" ];
+          description = "Repository-owner identity constraints.";
+        };
+        labels = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "agency:codex-ready" ];
+          description = "Labels all selected items must carry.";
+        };
+        state = mkOption {
+          type = types.nullOr (
+            types.enum [
+              "open"
+              "closed"
+            ]
+          );
+          default = null;
+          example = "open";
+          description = "Optional exact item state.";
+        };
+        assignee = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "tally-bot";
+          description = "Optional required assignee.";
+        };
+        kinds = mkOption {
+          type = types.listOf (
+            types.enum [
+              "issue"
+              "pull-request"
+            ]
+          );
+          default = [ ];
+          example = [ "pull-request" ];
+          description = "Optional issue/pull-request kind filter.";
+        };
+        notificationReasons = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "mention" ];
+          description = "Allowed notification reasons for a notifications source.";
+        };
+        query = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "draft:false";
+          description = "Optional additional GitHub search query fragment.";
+        };
+        itemAllowlist = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "https://github.com/agency-agency/spec/issues/21" ];
+          description = "Optional exact GitHub item URL allowlist for one-shot operation.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions =
+        map
+          (field: {
+            assertion =
+              builtins.length config.${field} == builtins.length (unique config.${field})
+              && lib.all (value: value != "") config.${field};
+            message = "GitHub source ${name} ${field} must contain unique non-empty values";
+          })
+          [
+            "repositories"
+            "owners"
+            "labels"
+            "kinds"
+            "notificationReasons"
+            "itemAllowlist"
+          ];
+    }
+  );
+
+  ghSourceType = types.submodule (
+    { config, name, ... }:
+    {
+      options = {
+        notifications = mkOption {
+          type = types.nullOr ghSourceConstraintsType;
+          default = null;
+          example.repo = "agency-agency/spec";
+          description = "Scoped GitHub notifications intake.";
+        };
+        search = mkOption {
+          type = types.nullOr ghSourceConstraintsType;
+          default = null;
+          example = {
+            repo = "agency-agency/spec";
+            labels = [ "agency:codex-ready" ];
+            state = "open";
+          };
+          description = "Scoped GitHub issue-search intake.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions = flatten [
+        {
+          assertion = (config.notifications == null) != (config.search == null);
+          message = "GitHub source ${name} requires exactly one of notifications or search";
+        }
+        {
+          assertion = config.notifications == null || config.notifications.query == null;
+          message = "GitHub notifications source ${name} cannot carry a search query";
+        }
+        {
+          assertion = config.search == null || config.search.notificationReasons == [ ];
+          message = "GitHub search source ${name} cannot carry notificationReasons";
+        }
+        (if config.notifications == null then [ ] else config.notifications._tallyAssertions)
+        (if config.search == null then [ ] else config.search._tallyAssertions)
+      ];
+    }
+  );
+
+  ghTriggersType = types.submodule (
+    { config, ... }:
+    {
+      options = {
+        commandComments = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "/tally run" ];
+          description = "Exact explicit slash-command comment grammar.";
+        };
+        mentions = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "@tally run" ];
+          description = "Exact explicit mention-command grammar.";
+        };
+        assignments = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "tally-bot" ];
+          description = "Assignee values that trigger intake.";
+        };
+        labels = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "tally:run" ];
+          description = "Label values that trigger intake.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions =
+        map
+          (field: {
+            assertion =
+              builtins.length config.${field} == builtins.length (unique config.${field})
+              && lib.all (value: value != "") config.${field};
+            message = "GitHub triggers.${field} must contain unique non-empty values";
+          })
+          [
+            "commandComments"
+            "mentions"
+            "assignments"
+            "labels"
+          ];
+    }
+  );
+
   ghProducerType = types.submodule (
     mkProducerModule "gh"
       {
@@ -478,18 +664,24 @@ let
           description = "Generate and run the GitHub polling producer.";
         };
         sources = mkOption {
-          type = types.listOf (
-            types.enum [
-              "notifications"
-              "search"
-            ]
-          );
+          type = types.listOf ghSourceType;
           default = [ ];
           example = [
-            "notifications"
-            "search"
+            {
+              search = {
+                repo = "agency-agency/spec";
+                labels = [ "agency:codex-ready" ];
+                state = "open";
+              };
+            }
           ];
-          description = "Explicit GitHub intake sources.";
+          description = "Explicit, identity-scoped GitHub intake sources.";
+        };
+        triggers = mkOption {
+          type = ghTriggersType;
+          default = { };
+          example.commandComments = [ "/tally run" ];
+          description = "Explicit GitHub comment, mention, assignment, and label triggers.";
         };
         actorExclude = mkOption {
           type = types.str;
@@ -544,8 +736,10 @@ let
             message = "enabled gh producer ${name} requires at least one source";
           }
           {
-            assertion = builtins.length config.sources == builtins.length (unique config.sources);
-            message = "gh producer ${name} sources must not contain duplicates";
+            assertion =
+              builtins.length (map builtins.toJSON config.sources)
+              == builtins.length (unique (map builtins.toJSON config.sources));
+            message = "gh producer ${name} sources must not repeat an identical constraint set";
           }
           {
             assertion = config.actorExclude != "";
@@ -561,6 +755,8 @@ let
             assertion = !config.closeOnPass || config.postEvidence;
             message = "gh producer ${name} closeOnPass=true requires postEvidence=true";
           }
+          (map (source: source._tallyAssertions) config.sources)
+          config.triggers._tallyAssertions
           config.enqueue._tallyAssertions
         ]
       )
@@ -1092,6 +1288,37 @@ let
       credentials = mapAttrs (_: toString) enqueue.credentials;
     };
 
+  renderGhSourceConstraints = constraints: {
+    inherit (constraints)
+      repo
+      repositories
+      owners
+      labels
+      state
+      assignee
+      kinds
+      notificationReasons
+      query
+      itemAllowlist
+      ;
+  };
+
+  renderGhSource =
+    source:
+    if source.search != null then
+      { search = renderGhSourceConstraints source.search; }
+    else
+      { notifications = renderGhSourceConstraints source.notifications; };
+
+  renderGhTriggers = triggers: {
+    inherit (triggers)
+      commandComments
+      mentions
+      assignments
+      labels
+      ;
+  };
+
   renderProducer =
     _: producer:
     (
@@ -1115,7 +1342,6 @@ let
           {
             inherit (producer)
               enable
-              sources
               actorExclude
               allowSelfTriggered
               allowedActors
@@ -1123,6 +1349,8 @@ let
               postEvidence
               closeOnPass
               ;
+            sources = map renderGhSource producer.sources;
+            triggers = renderGhTriggers producer.triggers;
             enqueue = renderEnqueue producer.enqueue;
           }
         else if producer.kind == "build-effect" then

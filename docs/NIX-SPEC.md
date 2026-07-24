@@ -146,7 +146,12 @@ no first firing on a fresh user manager.
 ### `gh`
 
 - `enable`: boolean, default `false`.
-- `sources`: list containing `notifications` and/or `search`, default empty.
+- `sources`: list of exactly-one tagged source submodules, default empty. Each entry is either
+  `{ notifications = { ... }; }` or `{ search = { ... }; }`.
+- `triggers.commandComments`: unique exact slash commands such as `/tally run`, default empty.
+- `triggers.mentions`: unique exact mention commands such as `@tally run`, default empty.
+- `triggers.assignments`: unique assignee-login triggers, default empty.
+- `triggers.labels`: unique label triggers, default empty.
 - `actorExclude`: nonempty literal trigger-actor login, default `self`.
 - `allowSelfTriggered`: boolean, default `false`.
 - `allowedActors`: unique list of trigger-actor logins, default empty; a nonempty list is an
@@ -157,8 +162,24 @@ no first firing on a fresh user manager.
   `Pass`/`Reused` verdict.
 - `enqueue`: required enqueue payload.
 
-An enabled producer requires at least one unique source. Home Manager generates a supervised
-service with `Restart=always`, no start-rate limit, and the polling interval as `RestartSec`.
+Every source constraint submodule supports:
+
+- `repo`: optional single `owner/name` identity;
+- `repositories`: additional unique `owner/name` identities;
+- `owners`: unique repository owners;
+- `labels`: labels all candidates must carry;
+- `state`: null, `open`, or `closed`;
+- `assignee`: optional required login;
+- `kinds`: unique `issue` and/or `pull-request` values;
+- `notificationReasons`: allowed reasons, valid only for `notifications`;
+- `query`: an additional raw query fragment, valid only for `search`; and
+- `itemAllowlist`: exact `https://github.com/owner/repo/issues|pull/number` URLs.
+
+An enabled producer requires at least one unique source. A source without `repo`,
+`repositories`, `owners`, or `itemAllowlist` is valid configuration but deliberately matches
+nothing. Search queries are derived only from these declared constraints; no implicit broad query
+is appended. Home Manager generates a supervised service with `Restart=always`, no start-rate
+limit, and the polling interval as `RestartSec`.
 Authorization, `allowedActors`, and `actorExclude` inspect `triggerActor`, never the item author.
 Self-triggered observations require `allowSelfTriggered = true`; there is no special
 `actorExclude` sentinel for this policy. `closeOnPass = true` requires `postEvidence = true`.
@@ -167,8 +188,13 @@ omits the field retains the historical fused close behavior when `postEvidence` 
 Native intake never substitutes `itemAuthor` when the trigger actor is unknown. A notification's
 latest comment supplies the actor only when its ID and timestamp link it to that notification;
 otherwise that candidate is recorded as filtered with `trigger-actor-unavailable`, without
-stopping unrelated candidates. The current search surface has no authoritative trigger actor and
-therefore fails closed the same way.
+stopping unrelated candidates. Search hydrates exact configured comment and issue-event records,
+so comment, assignment, and label actors remain authoritative. Receipts deduplicate by comment or
+event identity rather than item identity, and acknowledgements are idempotent.
+
+The public `tally producer preview`, `poll --once --no-enqueue`, `explain --item`, and `test`
+diagnostics do not enqueue by default. Only `producer test --promote` opts a synthetic one-shot
+candidate into the selected state directory's ingress.
 
 ### `build-effect`
 

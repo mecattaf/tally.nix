@@ -38,6 +38,7 @@ async fn stock_taskwarrior_reads_the_in_process_replica() {
             no_enqueue: false,
             credentials: BTreeMap::new(),
             gh_origin: None,
+            related_trigger: None,
             evidence_class: None,
             manifest_hash: None,
         };

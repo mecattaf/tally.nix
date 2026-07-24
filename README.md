@@ -258,6 +258,53 @@ Producer names are user-defined, but every producer has exactly one of these fiv
 All producer output passes through the same admission, deduplication, lease, evidence, and witness
 path as manual enqueue. Producers do not add a second execution path.
 
+GitHub producers are scoped per source and fail closed when a source has no repository, owner, or
+explicit-item identity constraint. Triggers are exact command comments, mentions, assignments, or
+labels; issue text never becomes executable argv. For example:
+
+```nix
+producers.agency-codex-intake = {
+  kind = "gh";
+  enable = true;
+  sources = [
+    {
+      search = {
+        repo = "agency-agency/spec";
+        labels = [ "agency:codex-ready" ];
+        state = "open";
+      };
+    }
+  ];
+  triggers.commandComments = [ "/tally run" ];
+  allowedActors = [ "trusted-maintainer" ];
+  enqueue = {
+    argv = [ "handle-ready-item" ];
+    pool = "worker-build";
+  };
+};
+```
+
+Each accepted or filtered trigger gets a durable receipt and an idempotent marker-tagged GitHub
+acknowledgement. Replaying one comment/event reports the existing task; a later command comment has
+a different receipt and can create a new task. The public diagnostic surface is read-only unless
+promotion is explicit:
+
+```console
+$ tally producer preview agency-codex-intake
+$ tally producer poll agency-codex-intake --once --no-enqueue --state-dir /tmp/tally-preview
+$ tally producer explain agency-codex-intake --item https://github.com/agency-agency/spec/issues/21
+$ tally producer test agency-codex-intake --item https://github.com/agency-agency/spec/issues/21 \
+    --event command-comment --actor trusted-maintainer --no-enqueue
+```
+
+An honest non-GitHub fallback can retain the failed leg without changing its own source:
+
+```console
+$ tally enqueue --source orchestrator --pool worker-build \
+    --related-trigger '{"producer":"agency-codex-intake","eventId":"comment-21","outcome":"filtered","receiptId":"…"}' \
+    -- fallback-command
+```
+
 ## Adapters
 
 Adapters are structured data, not a Rust enum. Each named adapter can define:

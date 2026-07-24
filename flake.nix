@@ -80,7 +80,16 @@
               github = {
                 kind = "gh";
                 enable = true;
-                sources = [ "notifications" ];
+                sources = [
+                  {
+                    search = {
+                      repo = "agency-agency/spec";
+                      labels = [ "agency:codex-ready" ];
+                      state = "open";
+                    };
+                  }
+                ];
+                triggers.commandComments = [ "/tally run" ];
                 allowSelfTriggered = true;
                 allowedActors = [ "tally-bot" ];
                 postEvidence = true;
@@ -238,7 +247,16 @@
                   github = {
                     kind = "gh";
                     enable = true;
-                    sources = [ "notifications" ];
+                    sources = [
+                      {
+                        search = {
+                          repo = "agency-agency/spec";
+                          labels = [ "agency:codex-ready" ];
+                          state = "open";
+                        };
+                      }
+                    ];
+                    triggers.commandComments = [ "/tally run" ];
                     enqueue = {
                       argv = [ "gh-job" ];
                       pool = "stock";
@@ -679,6 +697,10 @@
               .producers.daily.enqueue.credentials.JOB_TOKEN == "/run/credentials/tally-job" and
               .producers.effects.onKey.pool == "stock" and
               .producers.health.onReturnAttest.noEnqueue == true and
+              .producers.github.sources[0].search.repo == "agency-agency/spec" and
+              .producers.github.sources[0].search.labels == ["agency:codex-ready"] and
+              .producers.github.sources[0].search.state == "open" and
+              .producers.github.triggers.commandComments == ["/tally run"] and
               .producers.github.allowSelfTriggered == false and
               .producers.github.allowedActors == [] and
               .producers.github.closeOnPass == false and
@@ -834,10 +856,10 @@
                 producer_state="$PWD/state"
                 daily="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch daily --state-dir "$producer_state" --event '{"kind":"calendar"}')"
                 test "$(printf '%s' "$daily" | jq -r 'keys[0]')" = emitted
-                own_event='{"kind":"gh","source":"notifications","repo":"acme/widgets","number":42,"htmlUrl":"https://github.com/acme/widgets/issues/42","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"tally-bot","selfActor":"tally-bot","notificationReason":"mention","triggerKind":"notification","eventId":"notification-42","commentId":"comment-42","context":{"schemaVersion":1,"title":"Self-authored issue","body":"untrusted $(must-not-run)","labels":["build"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-42","author":"tally-bot","body":"please run"}}}'
+                own_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":21,"htmlUrl":"https://github.com/agency-agency/spec/issues/21","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"tally-bot","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-42","commentId":"comment-42","triggerTimestamp":"2026-07-20T12:30:00Z","context":{"schemaVersion":2,"title":"Self-authored issue","body":"untrusted $(must-not-run)","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-42","author":"tally-bot","body":"/tally run"}}}'
                 own="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event "$own_event")"
                 test "$(printf '%s' "$own" | jq -r 'keys[0]')" = emitted
-                rejected_event='{"kind":"gh","source":"notifications","repo":"acme/widgets","number":42,"htmlUrl":"https://github.com/acme/widgets/issues/42","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"untrusted-user","selfActor":"tally-bot","notificationReason":"mention","triggerKind":"notification","eventId":"notification-43","commentId":"comment-43","context":{"schemaVersion":1,"title":"Self-authored issue","body":"untrusted","labels":["build"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-43","author":"untrusted-user","body":"please run"}}}'
+                rejected_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":21,"htmlUrl":"https://github.com/agency-agency/spec/issues/21","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"untrusted-user","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-43","commentId":"comment-43","triggerTimestamp":"2026-07-20T12:31:00Z","context":{"schemaVersion":2,"title":"Self-authored issue","body":"untrusted","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-43","author":"untrusted-user","body":"/tally run"}}}'
                 rejected="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event "$rejected_event")"
                 test "$(printf '%s' "$rejected" | jq -r '.filtered.reason')" = trigger-actor-not-allowed
                 effect="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"

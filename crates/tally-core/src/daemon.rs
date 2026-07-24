@@ -698,7 +698,19 @@ impl DaemonHandler {
                 "RPC admissions must always have a durable recovery row",
             ));
         }
-        let job_id = Uuid::new_v4();
+        let job_id = resolved
+            .task_uuid
+            .as_deref()
+            .map(Uuid::parse_str)
+            .transpose()
+            .map_err(|_| WireError::invalid("taskUuid must be a UUID"))?
+            .unwrap_or_else(Uuid::new_v4);
+        if context.jobs.contains_key(&job_id) || context.query_rows.contains_key(&job_id) {
+            rollback_child_charge(&mut context, caller_job_id.as_deref())?;
+            return Err(WireError::invalid(format!(
+                "task UUID {job_id} is already admitted"
+            )));
+        }
         let task_uuid = Some(job_id);
         let row_uuid = job_id;
         let parent_uuid = resolved
@@ -729,6 +741,7 @@ impl DaemonHandler {
             no_enqueue: resolved.no_enqueue,
             credentials: resolved.credentials,
             gh_origin: resolved.gh_origin,
+            related_trigger: resolved.related_trigger,
             evidence_class: resolved.evidence_class,
             manifest_hash: resolved.manifest_hash.map(Value::String),
         };
@@ -4722,6 +4735,7 @@ fn query_row(row: &RowSeed, status: RowStatus) -> RowFact {
             .gh_origin
             .as_ref()
             .and_then(crate::query::GhOriginProjection::from_origin),
+        related_trigger: row.related_trigger.clone(),
     }
 }
 
@@ -5341,7 +5355,7 @@ mod tests {
     };
     use crate::recovery::RecoveryPlan;
     use crate::taskdb::{
-        GhContextSnapshot, GhItemType, GhOrigin, GH_CONTEXT_SCHEMA_VERSION,
+        GhContextSnapshot, GhItemState, GhItemType, GhOrigin, GH_CONTEXT_SCHEMA_VERSION,
         GH_ORIGIN_SCHEMA_VERSION,
     };
     use crate::wire::RpcClient;
@@ -5801,6 +5815,7 @@ mod tests {
             no_enqueue: false,
             credentials: BTreeMap::new(),
             gh_origin: None,
+            related_trigger: None,
             evidence_class: None,
             manifest_hash: None,
         }
@@ -5824,13 +5839,16 @@ mod tests {
             trigger_actor: "contributor".to_owned(),
             self_actor: "tally-bot".to_owned(),
             notification_reason: Some("mention".to_owned()),
-            trigger_kind: "notification".to_owned(),
+            trigger_kind: "assignment".to_owned(),
             event_id: Some("event-42".to_owned()),
             comment_id: None,
+            trigger_timestamp: "2026-07-20T12:30:00Z".to_owned(),
+            trigger_value: Some("tally-bot".to_owned()),
             context: GhContextSnapshot {
                 schema_version: GH_CONTEXT_SCHEMA_VERSION,
                 title: "Origin fixture".to_owned(),
                 body: "untrusted body".to_owned(),
+                state: Some(GhItemState::Open),
                 head_sha: (item_type == GhItemType::PullRequest)
                     .then(|| "4242424242424242424242424242424242424242".to_owned()),
                 labels: vec!["build".to_owned()],
@@ -5859,6 +5877,8 @@ mod tests {
             trigger_kind: observation.trigger_kind,
             event_id: observation.event_id,
             comment_id: observation.comment_id,
+            trigger_timestamp: Some(observation.trigger_timestamp),
+            trigger_value: observation.trigger_value,
             context: Some(observation.context),
             actor_exclude: "self".to_owned(),
             allow_self_triggered: false,
@@ -6754,7 +6774,8 @@ mod tests {
                     "github": {
                         "kind": "gh",
                         "enable": true,
-                        "sources": ["notifications"],
+                        "sources": [{"notifications": {"repo": "acme/widgets"}}],
+                        "triggers": {"assignments": ["tally-bot"]},
                         "postEvidence": true,
                         "enqueue": {"argv": ["true"], "pool": "slot"}
                     }
@@ -6878,7 +6899,8 @@ mod tests {
                     "github": {
                         "kind": "gh",
                         "enable": true,
-                        "sources": ["notifications"],
+                        "sources": [{"notifications": {"repo": "acme/widgets"}}],
+                        "triggers": {"assignments": ["tally-bot"]},
                         "postEvidence": true,
                         "enqueue": {"argv": ["github"], "pool": "slot"}
                     },
@@ -7011,7 +7033,8 @@ mod tests {
                     "github": {
                         "kind": "gh",
                         "enable": true,
-                        "sources": ["notifications"],
+                        "sources": [{"notifications": {"repo": "acme/widgets"}}],
+                        "triggers": {"mentions": ["@tally-bot inspect this"]},
                         "allowedActors": ["maintainer"],
                         "postEvidence": false,
                         "closeOnPass": false,
@@ -7031,7 +7054,7 @@ mod tests {
                         "  'api --method GET notifications -f all=false -f participating=false -f per_page=100')\n",
                         "    printf '[{\"id\":\"notification-42\",\"reason\":\"mention\",\"updated_at\":\"2026-07-24T08:00:00Z\",\"repository\":{\"full_name\":\"acme/widgets\"},\"subject\":{\"type\":\"PullRequest\",\"url\":\"https://api.github.com/repos/acme/widgets/pulls/42\",\"latest_comment_url\":\"https://api.github.com/repos/acme/widgets/issues/comments/4200\"}}]' ;;\n",
                         "  'api /repos/acme/widgets/pulls/42')\n",
-                        "    printf '{\"node_id\":\"PR_origin_42\",\"number\":42,\"html_url\":\"https://github.com/acme/widgets/pull/42\",\"title\":\"Hydrated PR\",\"body\":\"untrusted $(never-executed)\",\"user\":{\"login\":\"item-author\"},\"head\":{\"sha\":\"4242424242424242424242424242424242424242\"},\"labels\":[{\"name\":\"build\"}],\"assignees\":[{\"login\":\"tally-bot\"}]}' ;;\n",
+                        "    printf '{\"node_id\":\"PR_origin_42\",\"number\":42,\"html_url\":\"https://github.com/acme/widgets/pull/42\",\"state\":\"open\",\"title\":\"Hydrated PR\",\"body\":\"untrusted $(never-executed)\",\"user\":{\"login\":\"item-author\"},\"head\":{\"sha\":\"4242424242424242424242424242424242424242\"},\"labels\":[{\"name\":\"build\"}],\"assignees\":[{\"login\":\"tally-bot\"}]}' ;;\n",
                         "  'api /repos/acme/widgets/issues/comments/4200')\n",
                         "    printf '{\"id\":4200,\"body\":\"@tally-bot inspect this\",\"created_at\":\"2026-07-24T08:00:00Z\",\"updated_at\":\"2026-07-24T08:00:00Z\",\"user\":{\"login\":\"maintainer\"}}' ;;\n",
                         "  *) exit 91 ;;\n",
@@ -7071,7 +7094,7 @@ mod tests {
                     captured_origin.notification_reason.as_deref(),
                     Some("mention")
                 );
-                assert_eq!(captured_origin.trigger_kind, "notification");
+                assert_eq!(captured_origin.trigger_kind, "mention");
                 assert_eq!(
                     captured_origin.event_id.as_deref(),
                     Some("notification-42")
@@ -7149,7 +7172,7 @@ mod tests {
                         ("TALLY_GH_NODE_ID".to_owned(), "PR_origin_42".to_owned()),
                         (
                             "TALLY_GH_TRIGGER_KIND".to_owned(),
-                            "notification".to_owned()
+                            "mention".to_owned()
                         ),
                         (
                             "TALLY_GH_TRIGGER_ACTOR".to_owned(),

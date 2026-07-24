@@ -21,9 +21,9 @@ use thiserror::Error;
 use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::taskdb::{
-    read_acknowledged_events, EnqueueSource, GhContextSnapshot, GhItemType, GhOrigin,
-    GhTriggeringComment, GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
-    MAX_GH_ORIGIN_FIELD_BYTES,
+    gh_trigger_dedup_key, gh_trigger_receipt_id, gh_trigger_task_uuid, read_acknowledged_events,
+    EnqueueSource, GhContextSnapshot, GhItemState, GhItemType, GhOrigin, GhTriggeringComment,
+    GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION, MAX_GH_ORIGIN_FIELD_BYTES,
 };
 use crate::wire::EnqueuePayload;
 use crate::witness::Verdict;
@@ -136,6 +136,8 @@ impl ProducerEnqueue {
             gh_trigger_actor: None,
             gh_self_actor: None,
             gh_origin: None,
+            task_uuid: None,
+            related_trigger: None,
             wait: false,
         })
     }
@@ -159,6 +161,91 @@ pub struct EventsDirProducer {
     pub poll_interval_sec: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GhSourceItemKind {
+    Issue,
+    PullRequest,
+}
+
+impl GhSourceItemKind {
+    const fn matches(self, item_type: GhItemType) -> bool {
+        matches!(
+            (self, item_type),
+            (Self::Issue, GhItemType::Issue) | (Self::PullRequest, GhItemType::PullRequest)
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GhSourceConstraints {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, alias = "repos")]
+    pub repositories: Vec<String>,
+    #[serde(default)]
+    pub owners: Vec<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<GhItemState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub kinds: Vec<GhSourceItemKind>,
+    #[serde(default)]
+    pub notification_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, alias = "items")]
+    pub item_allowlist: Vec<String>,
+}
+
+impl GhSourceConstraints {
+    fn has_identity_scope(&self) -> bool {
+        self.repo.is_some()
+            || !self.repositories.is_empty()
+            || !self.owners.is_empty()
+            || !self.item_allowlist.is_empty()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GhSource {
+    Notifications(GhSourceConstraints),
+    Search(GhSourceConstraints),
+}
+
+impl GhSource {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Notifications(_) => "notifications",
+            Self::Search(_) => "search",
+        }
+    }
+
+    const fn constraints(&self) -> &GhSourceConstraints {
+        match self {
+            Self::Notifications(constraints) | Self::Search(constraints) => constraints,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GhTriggers {
+    #[serde(default)]
+    pub command_comments: Vec<String>,
+    #[serde(default)]
+    pub mentions: Vec<String>,
+    #[serde(default)]
+    pub assignments: Vec<String>,
+    #[serde(default)]
+    pub labels: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct GhProducer {
@@ -166,7 +253,9 @@ pub struct GhProducer {
     pub credentials: BTreeMap<String, PathBuf>,
     pub enable: bool,
     #[serde(default)]
-    pub sources: Vec<String>,
+    pub sources: Vec<GhSource>,
+    #[serde(default)]
+    pub triggers: GhTriggers,
     #[serde(default = "default_actor_exclude")]
     pub actor_exclude: String,
     #[serde(default)]
@@ -302,17 +391,13 @@ pub fn validate_registry(
                 }
                 let mut sources = BTreeSet::new();
                 for source in &config.sources {
-                    validate_name(source, "GitHub source")?;
-                    if !matches!(source.as_str(), "notifications" | "search") {
-                        return Err(ProducerError::InvalidConfig(format!(
-                            "gh producer {name:?} has unsupported source {source:?}"
-                        )));
-                    }
-                    if !sources.insert(source) {
+                    let encoded = serde_json::to_string(source)?;
+                    if !sources.insert(encoded) {
                         return Err(ProducerError::InvalidConfig(format!(
                             "gh producer {name:?} repeats source {source:?}"
                         )));
                     }
+                    validate_gh_source(name, source)?;
                 }
                 validate_name(&config.actor_exclude, "GitHub actorExclude")?;
                 let mut allowed_actors = BTreeSet::new();
@@ -324,6 +409,7 @@ pub fn validate_registry(
                         )));
                     }
                 }
+                validate_gh_triggers(name, &config.triggers)?;
                 if config.close_on_pass == Some(true) && !config.post_evidence {
                     return Err(ProducerError::InvalidConfig(format!(
                         "gh producer {name:?} closeOnPass=true requires postEvidence=true"
@@ -473,6 +559,160 @@ fn validate_name(value: &str, label: &str) -> Result<(), ProducerError> {
     Ok(())
 }
 
+fn validate_gh_source(producer: &str, source: &GhSource) -> Result<(), ProducerError> {
+    let constraints = source.constraints();
+    let mut repositories = constraints.repositories.clone();
+    if let Some(repo) = &constraints.repo {
+        repositories.push(repo.clone());
+    }
+    validate_unique_values(
+        &repositories,
+        &format!("gh producer {producer:?} {} repositories", source.kind()),
+    )?;
+    for repo in &repositories {
+        validate_repo_constraint(repo)?;
+    }
+    for (label, values) in [
+        ("owners", &constraints.owners),
+        ("labels", &constraints.labels),
+        ("notificationReasons", &constraints.notification_reasons),
+        ("itemAllowlist", &constraints.item_allowlist),
+    ] {
+        validate_unique_values(
+            values,
+            &format!("gh producer {producer:?} {} {label}", source.kind()),
+        )?;
+    }
+    for owner in &constraints.owners {
+        validate_login(owner, "GitHub source owner")?;
+    }
+    if let Some(assignee) = &constraints.assignee {
+        validate_login(assignee, "GitHub source assignee")?;
+    }
+    for item in &constraints.item_allowlist {
+        parse_gh_item_url(item).map_err(|reason| {
+            ProducerError::InvalidConfig(format!(
+                "gh producer {producer:?} {} itemAllowlist entry {item:?} is invalid: {reason}",
+                source.kind()
+            ))
+        })?;
+    }
+    if let Some(query) = &constraints.query {
+        validate_name(query, "GitHub raw query")?;
+        if !matches!(source, GhSource::Search(_)) {
+            return Err(ProducerError::InvalidConfig(format!(
+                "gh producer {producer:?} notification source cannot carry query"
+            )));
+        }
+    }
+    if !constraints.notification_reasons.is_empty() && !matches!(source, GhSource::Notifications(_))
+    {
+        return Err(ProducerError::InvalidConfig(format!(
+            "gh producer {producer:?} search source cannot carry notificationReasons"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_gh_triggers(producer: &str, triggers: &GhTriggers) -> Result<(), ProducerError> {
+    for (label, values) in [
+        ("commandComments", &triggers.command_comments),
+        ("mentions", &triggers.mentions),
+        ("assignments", &triggers.assignments),
+        ("labels", &triggers.labels),
+    ] {
+        validate_unique_values(
+            values,
+            &format!("gh producer {producer:?} triggers.{label}"),
+        )?;
+    }
+    for command in &triggers.command_comments {
+        if !valid_explicit_comment_command(command, '/') {
+            return Err(ProducerError::InvalidConfig(format!(
+                "gh producer {producer:?} command comment {command:?} is not an explicit slash-command grammar"
+            )));
+        }
+    }
+    for mention in &triggers.mentions {
+        if !valid_explicit_comment_command(mention, '@') {
+            return Err(ProducerError::InvalidConfig(format!(
+                "gh producer {producer:?} mention {mention:?} is not an explicit mention-command grammar"
+            )));
+        }
+    }
+    for actor in &triggers.assignments {
+        validate_login(actor, "GitHub assignment trigger")?;
+    }
+    Ok(())
+}
+
+fn validate_unique_values(values: &[String], label: &str) -> Result<(), ProducerError> {
+    let mut unique = BTreeSet::new();
+    for value in values {
+        validate_name(value, label)?;
+        if !unique.insert(value) {
+            return Err(ProducerError::InvalidConfig(format!(
+                "{label} contains duplicate value {value:?}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_repo_constraint(repo: &str) -> Result<(), ProducerError> {
+    let Some((owner, name)) = repo.split_once('/') else {
+        return Err(ProducerError::InvalidConfig(format!(
+            "GitHub repository {repo:?} must be owner/name"
+        )));
+    };
+    validate_login(owner, "GitHub repository owner")?;
+    if name.is_empty()
+        || name.contains('/')
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        return Err(ProducerError::InvalidConfig(format!(
+            "GitHub repository {repo:?} must be a safe owner/name pair"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_login(login: &str, label: &str) -> Result<(), ProducerError> {
+    validate_name(login, label)?;
+    if !login
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err(ProducerError::InvalidConfig(format!(
+            "{label} {login:?} is not a safe GitHub login"
+        )));
+    }
+    Ok(())
+}
+
+fn valid_explicit_comment_command(command: &str, prefix: char) -> bool {
+    if command.len() > 128
+        || command.trim() != command
+        || command.chars().any(char::is_control)
+        || !command.starts_with(prefix)
+    {
+        return false;
+    }
+    let mut tokens = command.split(' ');
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let valid_token = |token: &str| {
+        !token.is_empty()
+            && token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    };
+    valid_token(&first[1..]) && tokens.all(valid_token)
+}
+
 fn validate_producer_name(value: &str) -> Result<(), ProducerError> {
     if value.is_empty()
         || value.len() > MAX_PRODUCER_NAME_BYTES
@@ -571,6 +811,9 @@ pub struct GhObservation {
     pub event_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub comment_id: Option<String>,
+    pub trigger_timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_value: Option<String>,
     pub context: GhContextSnapshot,
 }
 
@@ -605,6 +848,10 @@ pub struct GhObservationInput {
     pub event_id: Option<String>,
     #[serde(default)]
     pub comment_id: Option<String>,
+    #[serde(default)]
+    pub trigger_timestamp: Option<String>,
+    #[serde(default)]
+    pub trigger_value: Option<String>,
     #[serde(default)]
     pub context: Option<GhContextSnapshot>,
 }
@@ -677,6 +924,11 @@ pub struct GhCliIntake {
     program: PathBuf,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct GhCliAcknowledgementSink {
+    mutation: GhCliMutationSink,
+}
+
 impl Default for GhCliMutationSink {
     fn default() -> Self {
         Self {
@@ -701,6 +953,14 @@ impl Default for GhCliIntake {
     }
 }
 
+impl GhCliAcknowledgementSink {
+    pub fn with_program(program: impl Into<PathBuf>) -> Self {
+        Self {
+            mutation: GhCliMutationSink::with_program(program),
+        }
+    }
+}
+
 impl GhCliIntake {
     pub fn with_program(program: impl Into<PathBuf>) -> Self {
         Self {
@@ -708,7 +968,7 @@ impl GhCliIntake {
         }
     }
 
-    fn poll(&self, sources: &[String]) -> Result<Vec<GhIntakeCandidate>, ProducerError> {
+    fn poll(&self, config: &GhProducer) -> Result<Vec<GhIntakeCandidate>, ProducerError> {
         let viewer: Value = self.json(&["api", "user"])?;
         let self_actor = viewer
             .get("login")
@@ -719,8 +979,12 @@ impl GhCliIntake {
             })?
             .to_owned();
         let mut observations = Vec::new();
-        for source in sources {
-            match source.as_str() {
+        for source in &config.sources {
+            let constraints = source.constraints();
+            if !constraints.has_identity_scope() {
+                continue;
+            }
+            match source.kind() {
                 "notifications" => {
                     let notifications: Value = self.json(&[
                         "api",
@@ -765,23 +1029,70 @@ impl GhCliIntake {
                             ))
                         })?;
                         let hydrated: Value = self.json(&["api", &url[endpoint_offset..]])?;
-                        let triggering_comment = subject
+                        let triggering_comment = match subject
                             .get("latest_comment_url")
                             .and_then(Value::as_str)
                             .filter(|url| !url.is_empty())
-                            .and_then(|url| {
-                                let offset = url.find("/repos/")?;
-                                let comment = self.json(&["api", &url[offset..]]).ok()?;
+                        {
+                            Some(url) => {
+                                let offset = url.find("/repos/").ok_or_else(|| {
+                                    ProducerError::GitHub(format!(
+                                        "GitHub latest comment URL {url:?} is not a repository comment endpoint"
+                                    ))
+                                })?;
+                                let comment = self.json(&["api", &url[offset..]])?;
                                 exact_notification_comment(notification, url, &comment)
-                            });
+                            }
+                            None => None,
+                        };
                         let repo = notification
                             .pointer("/repository/full_name")
                             .and_then(Value::as_str);
+                        let notification_timestamp = notification
+                            .get("updated_at")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                ProducerError::GitHub(
+                                    "GitHub notification omitted updated_at".to_owned(),
+                                )
+                            })?;
+                        let event_trigger = if triggering_comment.is_none() {
+                            let repo = repo.ok_or_else(|| {
+                                ProducerError::GitHub(
+                                    "GitHub notification omitted repository identity".to_owned(),
+                                )
+                            })?;
+                            let number = hydrated
+                                .get("number")
+                                .and_then(Value::as_u64)
+                                .filter(|number| *number > 0)
+                                .ok_or_else(|| {
+                                    ProducerError::GitHub(
+                                        "GitHub notification item omitted number".to_owned(),
+                                    )
+                                })?;
+                            self.notification_event_trigger(
+                                repo,
+                                number,
+                                notification_timestamp,
+                                &config.triggers,
+                            )?
+                        } else {
+                            None
+                        };
+                        let event_id = event_trigger
+                            .as_ref()
+                            .map(|(event, _)| event.id.clone())
+                            .or_else(|| notification.get("id").and_then(json_identifier));
+                        let event_timestamp = event_trigger
+                            .as_ref()
+                            .map(|(_, timestamp)| timestamp.clone())
+                            .unwrap_or_else(|| notification_timestamp.to_owned());
+                        let event_trigger = event_trigger.map(|(event, _)| event);
                         let reason = notification
                             .get("reason")
                             .and_then(Value::as_str)
                             .map(ToOwned::to_owned);
-                        let event_id = notification.get("id").and_then(json_identifier);
                         observations.push(gh_api_candidate(
                             "notifications",
                             &hydrated,
@@ -792,71 +1103,160 @@ impl GhCliIntake {
                                 notification_reason: reason,
                                 event_id,
                                 triggering_comment,
+                                event_trigger,
+                                trigger_timestamp: Some(&event_timestamp),
+                                triggers: &config.triggers,
                             },
                         )?);
                     }
                 }
                 "search" => {
-                    let response: Value = self.json(&[
-                        "api",
-                        "--method",
-                        "GET",
-                        "search/issues",
-                        "-f",
-                        "q=is:open involves:@me",
-                        "-f",
-                        "per_page=100",
-                    ])?;
-                    let items =
-                        response
-                            .get("items")
-                            .and_then(Value::as_array)
-                            .ok_or_else(|| {
-                                ProducerError::GitHub(
-                                    "GitHub search response omitted items array".to_owned(),
-                                )
-                            })?;
-                    for item in items {
-                        let item_type = if item.get("pull_request").is_some() {
-                            GhItemType::PullRequest
-                        } else {
-                            GhItemType::Issue
-                        };
-                        let hydrated = if item_type == GhItemType::PullRequest {
-                            let url = item
-                                .pointer("/pull_request/url")
-                                .and_then(Value::as_str)
+                    for query in gh_search_queries(constraints) {
+                        let query_field = format!("q={query}");
+                        let response: Value = self.json(&[
+                            "api",
+                            "--method",
+                            "GET",
+                            "search/issues",
+                            "-f",
+                            &query_field,
+                            "-f",
+                            "per_page=100",
+                        ])?;
+                        let items =
+                            response
+                                .get("items")
+                                .and_then(Value::as_array)
                                 .ok_or_else(|| {
                                     ProducerError::GitHub(
-                                        "GitHub PR search result omitted pull_request.url"
+                                        "GitHub search response omitted items array".to_owned(),
+                                    )
+                                })?;
+                        for item in items {
+                            let item_type = if item.get("pull_request").is_some() {
+                                GhItemType::PullRequest
+                            } else {
+                                GhItemType::Issue
+                            };
+                            let hydrated = if item_type == GhItemType::PullRequest {
+                                let url = item
+                                    .pointer("/pull_request/url")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| {
+                                        ProducerError::GitHub(
+                                            "GitHub PR search result omitted pull_request.url"
+                                                .to_owned(),
+                                        )
+                                    })?;
+                                let endpoint_offset = url.find("/repos/").ok_or_else(|| {
+                                    ProducerError::GitHub(format!(
+                                        "GitHub PR search URL {url:?} is not a repository endpoint"
+                                    ))
+                                })?;
+                                self.json(&["api", &url[endpoint_offset..]])?
+                            } else {
+                                item.clone()
+                            };
+                            let repo = item
+                                .get("repository_url")
+                                .and_then(Value::as_str)
+                                .and_then(repo_from_api_url)
+                                .ok_or_else(|| {
+                                    ProducerError::GitHub(
+                                        "GitHub search result omitted repository identity"
                                             .to_owned(),
                                     )
                                 })?;
-                            let endpoint_offset = url.find("/repos/").ok_or_else(|| {
-                                ProducerError::GitHub(format!(
-                                    "GitHub PR search URL {url:?} is not a repository endpoint"
-                                ))
+                            let number = hydrated
+                                .get("number")
+                                .and_then(Value::as_u64)
+                                .filter(|number| *number > 0)
+                                .ok_or_else(|| {
+                                    ProducerError::GitHub(
+                                        "GitHub search result omitted item number".to_owned(),
+                                    )
+                                })?;
+                            let comments_endpoint =
+                                format!("/repos/{repo}/issues/{number}/comments?per_page=100");
+                            let comments = self.json(&["api", &comments_endpoint])?;
+                            let comments = comments.as_array().ok_or_else(|| {
+                                ProducerError::GitHub(
+                                    "GitHub issue comments response must be an array".to_owned(),
+                                )
                             })?;
-                            self.json(&["api", &url[endpoint_offset..]])?
-                        } else {
-                            item.clone()
-                        };
-                        let repo = item
-                            .get("repository_url")
-                            .and_then(Value::as_str)
-                            .and_then(repo_from_api_url);
-                        observations.push(gh_api_candidate(
-                            "search",
-                            &hydrated,
-                            &self_actor,
-                            GhObservationHints {
-                                repo,
-                                item_type: Some(item_type),
-                                notification_reason: None,
-                                event_id: None,
-                                triggering_comment: None,
-                            },
-                        )?);
+                            for comment in comments {
+                                let Some(triggering_comment) = gh_triggering_comment(comment)
+                                else {
+                                    continue;
+                                };
+                                if !comment_is_configured_trigger(
+                                    &config.triggers,
+                                    &triggering_comment.body,
+                                ) {
+                                    continue;
+                                }
+                                let timestamp = gh_comment_timestamp(comment).ok_or_else(|| {
+                                    ProducerError::GitHub(
+                                        "GitHub trigger comment omitted updated_at and created_at"
+                                            .to_owned(),
+                                    )
+                                })?;
+                                observations.push(gh_api_candidate(
+                                    "search",
+                                    &hydrated,
+                                    &self_actor,
+                                    GhObservationHints {
+                                        repo: Some(repo),
+                                        item_type: Some(item_type),
+                                        notification_reason: None,
+                                        event_id: Some(triggering_comment.id.clone()),
+                                        triggering_comment: Some(triggering_comment),
+                                        event_trigger: None,
+                                        trigger_timestamp: Some(timestamp),
+                                        triggers: &config.triggers,
+                                    },
+                                )?);
+                            }
+                            let events_endpoint =
+                                format!("/repos/{repo}/issues/{number}/events?per_page=100");
+                            let events = self.json(&["api", &events_endpoint])?;
+                            let events = events.as_array().ok_or_else(|| {
+                                ProducerError::GitHub(
+                                    "GitHub issue events response must be an array".to_owned(),
+                                )
+                            })?;
+                            for event in events {
+                                let Some(event_trigger) =
+                                    configured_gh_event(event, &config.triggers)
+                                else {
+                                    continue;
+                                };
+                                let timestamp = event
+                                    .get("created_at")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(|| {
+                                        ProducerError::GitHub(
+                                            "GitHub trigger event omitted created_at".to_owned(),
+                                        )
+                                    })?;
+                                let event_id = event_trigger.id.clone();
+                                observations.push(gh_api_candidate(
+                                    "search",
+                                    &hydrated,
+                                    &self_actor,
+                                    GhObservationHints {
+                                        repo: Some(repo),
+                                        item_type: Some(item_type),
+                                        notification_reason: None,
+                                        event_id: Some(event_id),
+                                        triggering_comment: None,
+                                        event_trigger: Some(event_trigger),
+                                        trigger_timestamp: Some(timestamp),
+                                        triggers: &config.triggers,
+                                    },
+                                )?);
+                            }
+                        }
                     }
                 }
                 other => {
@@ -866,13 +1266,7 @@ impl GhCliIntake {
                 }
             }
         }
-        observations.sort_by(|left, right| {
-            left.node_id()
-                .cmp(right.node_id())
-                .then_with(|| left.unavailable().cmp(&right.unavailable()))
-                .then_with(|| left.source().cmp(right.source()))
-        });
-        observations.dedup_by(|right, left| right.node_id() == left.node_id());
+        normalize_gh_candidates(config, &mut observations);
         Ok(observations)
     }
 
@@ -885,6 +1279,280 @@ impl GhCliIntake {
             ))
         })
     }
+
+    fn notification_event_trigger(
+        &self,
+        repo: &str,
+        number: u64,
+        notification_timestamp: &str,
+        triggers: &GhTriggers,
+    ) -> Result<Option<(GhEventTrigger, String)>, ProducerError> {
+        let endpoint = format!("/repos/{repo}/issues/{number}/events?per_page=100");
+        let events = self.json(&["api", &endpoint])?;
+        let events = events.as_array().ok_or_else(|| {
+            ProducerError::GitHub("GitHub issue events response must be an array".to_owned())
+        })?;
+        for event in events.iter().rev() {
+            let Some(timestamp) = event.get("created_at").and_then(Value::as_str) else {
+                continue;
+            };
+            if !gh_timestamps_equal(notification_timestamp, timestamp) {
+                continue;
+            }
+            if let Some(event) = configured_gh_event(event, triggers) {
+                return Ok(Some((event, timestamp.to_owned())));
+            }
+        }
+        Ok(None)
+    }
+
+    fn item(
+        &self,
+        config: &GhProducer,
+        item_url: &str,
+    ) -> Result<Vec<GhIntakeCandidate>, ProducerError> {
+        let location = parse_gh_item_url(item_url).map_err(ProducerError::InvalidObservation)?;
+        let viewer: Value = self.json(&["api", "user"])?;
+        let self_actor = viewer
+            .get("login")
+            .and_then(Value::as_str)
+            .filter(|login| !login.is_empty())
+            .ok_or_else(|| {
+                ProducerError::GitHub("gh api user omitted a non-empty login".to_owned())
+            })?;
+        let item_endpoint = match location.item_type {
+            GhItemType::Issue => {
+                format!("/repos/{}/issues/{}", location.repo, location.number)
+            }
+            GhItemType::PullRequest => {
+                format!("/repos/{}/pulls/{}", location.repo, location.number)
+            }
+        };
+        let item = self.json(&["api", &item_endpoint])?;
+        let comments_endpoint = format!(
+            "/repos/{}/issues/{}/comments?per_page=100",
+            location.repo, location.number
+        );
+        let comments = self.json(&["api", &comments_endpoint])?;
+        let comments = comments.as_array().ok_or_else(|| {
+            ProducerError::GitHub("GitHub issue comments response must be an array".to_owned())
+        })?;
+        let mut candidates = Vec::new();
+        for comment in comments {
+            let Some(triggering_comment) = gh_triggering_comment(comment) else {
+                continue;
+            };
+            if !comment_is_configured_trigger(&config.triggers, &triggering_comment.body) {
+                continue;
+            }
+            let timestamp = gh_comment_timestamp(comment).ok_or_else(|| {
+                ProducerError::GitHub(
+                    "GitHub trigger comment omitted updated_at and created_at".to_owned(),
+                )
+            })?;
+            candidates.push(gh_api_candidate(
+                "search",
+                &item,
+                self_actor,
+                GhObservationHints {
+                    repo: Some(&location.repo),
+                    item_type: Some(location.item_type),
+                    notification_reason: None,
+                    event_id: Some(triggering_comment.id.clone()),
+                    triggering_comment: Some(triggering_comment),
+                    event_trigger: None,
+                    trigger_timestamp: Some(timestamp),
+                    triggers: &config.triggers,
+                },
+            )?);
+        }
+        let events_endpoint = format!(
+            "/repos/{}/issues/{}/events?per_page=100",
+            location.repo, location.number
+        );
+        let events = self.json(&["api", &events_endpoint])?;
+        let events = events.as_array().ok_or_else(|| {
+            ProducerError::GitHub("GitHub issue events response must be an array".to_owned())
+        })?;
+        for event in events {
+            let Some(event_trigger) = configured_gh_event(event, &config.triggers) else {
+                continue;
+            };
+            let timestamp = event
+                .get("created_at")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ProducerError::GitHub("GitHub trigger event omitted created_at".to_owned())
+                })?;
+            let event_id = event_trigger.id.clone();
+            candidates.push(gh_api_candidate(
+                "search",
+                &item,
+                self_actor,
+                GhObservationHints {
+                    repo: Some(&location.repo),
+                    item_type: Some(location.item_type),
+                    notification_reason: None,
+                    event_id: Some(event_id),
+                    triggering_comment: None,
+                    event_trigger: Some(event_trigger),
+                    trigger_timestamp: Some(timestamp),
+                    triggers: &config.triggers,
+                },
+            )?);
+        }
+        candidates.sort_by_key(GhIntakeCandidate::dedup_identity);
+        candidates.dedup_by(|right, left| right.dedup_identity() == left.dedup_identity());
+        Ok(candidates)
+    }
+
+    fn diagnostic_observation(
+        &self,
+        config: &GhProducer,
+        item_url: &str,
+        trigger_kind: &str,
+        actor: &str,
+        now: DateTime<Utc>,
+    ) -> Result<GhObservation, ProducerError> {
+        validate_login(actor, "GitHub diagnostic actor")?;
+        let location = parse_gh_item_url(item_url).map_err(ProducerError::InvalidObservation)?;
+        let viewer: Value = self.json(&["api", "user"])?;
+        let self_actor = viewer
+            .get("login")
+            .and_then(Value::as_str)
+            .filter(|login| !login.is_empty())
+            .ok_or_else(|| {
+                ProducerError::GitHub("gh api user omitted a non-empty login".to_owned())
+            })?;
+        let item_endpoint = match location.item_type {
+            GhItemType::Issue => {
+                format!("/repos/{}/issues/{}", location.repo, location.number)
+            }
+            GhItemType::PullRequest => {
+                format!("/repos/{}/pulls/{}", location.repo, location.number)
+            }
+        };
+        let item = self.json(&["api", &item_endpoint])?;
+        let trigger_value = match trigger_kind {
+            "command-comment" => config.triggers.command_comments.first(),
+            "mention" => config.triggers.mentions.first(),
+            "assignment" => config.triggers.assignments.first(),
+            "label" => config.triggers.labels.first(),
+            _ => {
+                return Err(ProducerError::InvalidObservation(format!(
+                    "unsupported GitHub diagnostic event {trigger_kind:?}"
+                )))
+            }
+        }
+        .ok_or_else(|| {
+            ProducerError::InvalidConfig(format!(
+                "GitHub diagnostic event {trigger_kind:?} has no configured trigger value"
+            ))
+        })?
+        .clone();
+        let timestamp = now.to_rfc3339();
+        let diagnostic_id = format!(
+            "diagnostic-{}",
+            stable_key(&[
+                "gh-diagnostic",
+                item_url,
+                trigger_kind,
+                actor,
+                &trigger_value,
+                &timestamp,
+            ])
+        );
+        let triggering_comment =
+            matches!(trigger_kind, "command-comment" | "mention").then(|| GhTriggeringComment {
+                id: diagnostic_id.clone(),
+                author: actor.to_owned(),
+                body: trigger_value.clone(),
+            });
+        let event_trigger =
+            matches!(trigger_kind, "assignment" | "label").then(|| GhEventTrigger {
+                id: diagnostic_id.clone(),
+                kind: if trigger_kind == "assignment" {
+                    "assignment"
+                } else {
+                    "label"
+                },
+                actor: actor.to_owned(),
+                value: trigger_value,
+            });
+        let mut first_observation = None;
+        for source in config.sources.iter().filter(|source| {
+            matches!(source, GhSource::Search(_)) && source.constraints().has_identity_scope()
+        }) {
+            let candidate = gh_api_candidate(
+                "search",
+                &item,
+                self_actor,
+                GhObservationHints {
+                    repo: Some(&location.repo),
+                    item_type: Some(location.item_type),
+                    notification_reason: None,
+                    event_id: Some(diagnostic_id.clone()),
+                    triggering_comment: triggering_comment.clone(),
+                    event_trigger: event_trigger.clone(),
+                    trigger_timestamp: Some(&timestamp),
+                    triggers: &config.triggers,
+                },
+            )?;
+            let GhIntakeCandidate::Observation(observation) = candidate else {
+                return Err(ProducerError::InvalidObservation(
+                    "configured GitHub diagnostic trigger could not be classified".to_owned(),
+                ));
+            };
+            if gh_source_constraints_reason(source.constraints(), &observation).is_none() {
+                return Ok(*observation);
+            }
+            first_observation.get_or_insert(*observation);
+        }
+        first_observation.ok_or_else(|| {
+            ProducerError::InvalidConfig(
+                "GitHub diagnostic requires at least one identity-scoped search source".to_owned(),
+            )
+        })
+    }
+}
+
+fn configured_gh_event(event: &Value, triggers: &GhTriggers) -> Option<GhEventTrigger> {
+    let id = event
+        .get("id")
+        .and_then(json_identifier)
+        .or_else(|| event.get("node_id").and_then(json_identifier))?;
+    let actor = event
+        .pointer("/actor/login")
+        .and_then(Value::as_str)
+        .filter(|actor| !actor.is_empty())?;
+    let (kind, value) = match event.get("event").and_then(Value::as_str) {
+        Some("assigned") => (
+            "assignment",
+            event.pointer("/assignee/login").and_then(Value::as_str)?,
+        ),
+        Some("labeled") => (
+            "label",
+            event.pointer("/label/name").and_then(Value::as_str)?,
+        ),
+        _ => return None,
+    };
+    let configured = match kind {
+        "assignment" => triggers
+            .assignments
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(value)),
+        "label" => triggers
+            .labels
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(value)),
+        _ => false,
+    };
+    configured.then(|| GhEventTrigger {
+        id,
+        kind,
+        actor: actor.to_owned(),
+        value: value.to_owned(),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -901,10 +1569,21 @@ impl GhIntakeCandidate {
         }
     }
 
-    fn node_id(&self) -> &str {
+    fn dedup_identity(&self) -> String {
         match self {
-            Self::Observation(observation) => &observation.node_id,
-            Self::TriggerActorUnavailable { node_id, .. } => node_id,
+            Self::Observation(observation) => format!(
+                "{}:{}:{}",
+                observation.trigger_kind,
+                observation
+                    .comment_id
+                    .as_deref()
+                    .or(observation.event_id.as_deref())
+                    .unwrap_or_default(),
+                observation.node_id
+            ),
+            Self::TriggerActorUnavailable { source, node_id } => {
+                format!("unavailable:{source}:{node_id}")
+            }
         }
     }
 
@@ -913,12 +1592,40 @@ impl GhIntakeCandidate {
     }
 }
 
+fn normalize_gh_candidates(config: &GhProducer, candidates: &mut Vec<GhIntakeCandidate>) {
+    let source_filtered = |candidate: &GhIntakeCandidate| match candidate {
+        GhIntakeCandidate::Observation(observation) => {
+            gh_source_filter_reason(config, observation).is_some()
+        }
+        GhIntakeCandidate::TriggerActorUnavailable { .. } => true,
+    };
+    candidates.sort_by(|left, right| {
+        left.dedup_identity()
+            .cmp(&right.dedup_identity())
+            .then_with(|| source_filtered(left).cmp(&source_filtered(right)))
+            .then_with(|| left.unavailable().cmp(&right.unavailable()))
+            .then_with(|| left.source().cmp(right.source()))
+    });
+    candidates.dedup_by(|right, left| right.dedup_identity() == left.dedup_identity());
+}
+
 struct GhObservationHints<'a> {
     repo: Option<&'a str>,
     item_type: Option<GhItemType>,
     notification_reason: Option<String>,
     event_id: Option<String>,
     triggering_comment: Option<GhTriggeringComment>,
+    event_trigger: Option<GhEventTrigger>,
+    trigger_timestamp: Option<&'a str>,
+    triggers: &'a GhTriggers,
+}
+
+#[derive(Clone)]
+struct GhEventTrigger {
+    id: String,
+    kind: &'static str,
+    actor: String,
+    value: String,
 }
 
 fn gh_api_candidate(
@@ -933,6 +1640,9 @@ fn gh_api_candidate(
         notification_reason,
         event_id,
         triggering_comment,
+        event_trigger,
+        trigger_timestamp,
+        triggers,
     } = hints;
     let node_id = item
         .get("node_id")
@@ -1028,14 +1738,44 @@ fn gh_api_candidate(
         })
         .transpose()?
         .unwrap_or_default();
-    let Some(triggering_comment) = triggering_comment else {
-        return Ok(GhIntakeCandidate::TriggerActorUnavailable {
-            source: source.to_owned(),
-            node_id: node_id.to_owned(),
-        });
-    };
-    let comment_id = Some(triggering_comment.id.clone());
-    let trigger_actor = triggering_comment.author.clone();
+    let (comment_id, trigger_actor, trigger_kind, trigger_value, triggering_comment) =
+        if let Some(triggering_comment) = triggering_comment {
+            let trigger_kind = if triggers
+                .command_comments
+                .iter()
+                .any(|command| command == triggering_comment.body.trim())
+            {
+                "command-comment"
+            } else if triggers
+                .mentions
+                .iter()
+                .any(|command| command == triggering_comment.body.trim())
+            {
+                "mention"
+            } else {
+                return Ok(GhIntakeCandidate::TriggerActorUnavailable {
+                    source: source.to_owned(),
+                    node_id: node_id.to_owned(),
+                });
+            };
+            (
+                Some(triggering_comment.id.clone()),
+                triggering_comment.author.clone(),
+                trigger_kind,
+                None,
+                Some(triggering_comment),
+            )
+        } else if let Some(event) = event_trigger {
+            (None, event.actor, event.kind, Some(event.value), None)
+        } else {
+            return Ok(GhIntakeCandidate::TriggerActorUnavailable {
+                source: source.to_owned(),
+                node_id: node_id.to_owned(),
+            });
+        };
+    let trigger_timestamp = trigger_timestamp.ok_or_else(|| {
+        ProducerError::GitHub("GitHub trigger omitted an event timestamp".to_owned())
+    })?;
     Ok(GhIntakeCandidate::Observation(Box::new(GhObservation {
         source: source.to_owned(),
         repo: repo.to_owned(),
@@ -1048,21 +1788,20 @@ fn gh_api_candidate(
         trigger_actor,
         self_actor: self_actor.to_owned(),
         notification_reason,
-        trigger_kind: if source == "notifications" {
-            "notification".to_owned()
-        } else {
-            "search".to_owned()
-        },
+        trigger_kind: trigger_kind.to_owned(),
         event_id,
         comment_id,
+        trigger_timestamp: trigger_timestamp.to_owned(),
+        trigger_value,
         context: GhContextSnapshot {
             schema_version: GH_CONTEXT_SCHEMA_VERSION,
             title: title.to_owned(),
             body: body.to_owned(),
+            state: Some(gh_item_state(item)?),
             head_sha: head_sha.clone(),
             labels,
             assignees,
-            triggering_comment: Some(triggering_comment),
+            triggering_comment,
         },
     })))
 }
@@ -1077,11 +1816,18 @@ fn exact_notification_comment(
         return None;
     }
     let notification_updated_at = notification.get("updated_at")?.as_str()?;
-    ["created_at", "updated_at"]
-        .iter()
-        .filter_map(|field| comment.get(*field).and_then(Value::as_str))
-        .any(|comment_at| gh_timestamps_equal(notification_updated_at, comment_at))
+    comment
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .is_some_and(|comment_at| gh_timestamps_equal(notification_updated_at, comment_at))
         .then_some(triggering_comment)
+}
+
+fn gh_comment_timestamp(comment: &Value) -> Option<&str> {
+    comment
+        .get("updated_at")
+        .and_then(Value::as_str)
+        .or_else(|| comment.get("created_at").and_then(Value::as_str))
 }
 
 fn gh_timestamps_equal(left: &str, right: &str) -> bool {
@@ -1108,6 +1854,15 @@ fn gh_triggering_comment(comment: &Value) -> Option<GhTriggeringComment> {
     })
 }
 
+fn comment_is_configured_trigger(triggers: &GhTriggers, body: &str) -> bool {
+    let body = body.trim();
+    triggers
+        .command_comments
+        .iter()
+        .chain(triggers.mentions.iter())
+        .any(|command| command == body)
+}
+
 fn json_identifier(value: &Value) -> Option<String> {
     value
         .as_str()
@@ -1124,6 +1879,120 @@ fn repo_from_api_url(url: &str) -> Option<&str> {
                 && parts.next().is_some_and(|part| !part.is_empty())
                 && parts.next().is_none()
         })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GhItemLocation {
+    repo: String,
+    number: u64,
+    item_type: GhItemType,
+}
+
+fn parse_gh_item_url(url: &str) -> Result<GhItemLocation, String> {
+    let location = url
+        .strip_prefix("https://")
+        .ok_or_else(|| "URL must use HTTPS".to_owned())?;
+    let (host, path) = location
+        .split_once('/')
+        .ok_or_else(|| "URL must contain a host and item path".to_owned())?;
+    if host != "github.com" {
+        return Err("URL host must be github.com".to_owned());
+    }
+    if path.contains(['?', '#']) {
+        return Err("URL must not contain a query or fragment".to_owned());
+    }
+    let parts = path.split('/').collect::<Vec<_>>();
+    if parts.len() != 4 || parts.iter().any(|part| part.is_empty()) {
+        return Err("URL path must be owner/repo/issues|pull/number".to_owned());
+    }
+    let repo = format!("{}/{}", parts[0], parts[1]);
+    validate_repo_constraint(&repo).map_err(|error| error.to_string())?;
+    let item_type = match parts[2] {
+        "issues" => GhItemType::Issue,
+        "pull" => GhItemType::PullRequest,
+        _ => return Err("URL must identify an issue or pull request".to_owned()),
+    };
+    let number = parts[3]
+        .parse::<u64>()
+        .ok()
+        .filter(|number| *number > 0)
+        .ok_or_else(|| "URL item number must be positive".to_owned())?;
+    Ok(GhItemLocation {
+        repo,
+        number,
+        item_type,
+    })
+}
+
+fn gh_item_state(item: &Value) -> Result<GhItemState, ProducerError> {
+    match item.get("state").and_then(Value::as_str) {
+        Some(state) if state.eq_ignore_ascii_case("open") => Ok(GhItemState::Open),
+        Some(state) if state.eq_ignore_ascii_case("closed") => Ok(GhItemState::Closed),
+        _ => Err(ProducerError::GitHub(
+            "GitHub issue/PR omitted a supported state".to_owned(),
+        )),
+    }
+}
+
+fn gh_search_queries(constraints: &GhSourceConstraints) -> Vec<String> {
+    let mut scopes = BTreeSet::new();
+    if let Some(repo) = &constraints.repo {
+        scopes.insert(format!("repo:{repo}"));
+    }
+    scopes.extend(
+        constraints
+            .repositories
+            .iter()
+            .map(|repo| format!("repo:{repo}")),
+    );
+    for owner in &constraints.owners {
+        scopes.insert(format!("org:{owner}"));
+        scopes.insert(format!("user:{owner}"));
+    }
+    let mut filters = Vec::new();
+    filters.extend(
+        constraints
+            .labels
+            .iter()
+            .map(|label| format!("label:{}", quote_gh_query_value(label))),
+    );
+    if let Some(state) = constraints.state {
+        filters.push(format!(
+            "state:{}",
+            match state {
+                GhItemState::Open => "open",
+                GhItemState::Closed => "closed",
+            }
+        ));
+    }
+    if let Some(assignee) = &constraints.assignee {
+        filters.push(format!("assignee:{}", quote_gh_query_value(assignee)));
+    }
+    if constraints.kinds.len() == 1 {
+        filters.push(format!(
+            "is:{}",
+            match constraints.kinds[0] {
+                GhSourceItemKind::Issue => "issue",
+                GhSourceItemKind::PullRequest => "pr",
+            }
+        ));
+    }
+    if let Some(query) = &constraints.query {
+        filters.push(query.clone());
+    }
+    scopes
+        .into_iter()
+        .map(|scope| {
+            std::iter::once(scope)
+                .chain(filters.iter().cloned())
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+fn quote_gh_query_value(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('\"', "\\\""))
 }
 
 impl GhMutationSink for GhCliMutationSink {
@@ -1190,6 +2059,58 @@ impl GhMutationSink for GhCliMutationSink {
             return Err(format!(
                 "GitHub {kind} {:?} has unsupported state {state:?}",
                 mutation.item_id
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl GhAcknowledgementSink for GhCliAcknowledgementSink {
+    fn post_acknowledgement(
+        &mut self,
+        acknowledgement: &GhTriggerAcknowledgement,
+    ) -> Result<(), String> {
+        let decision = match acknowledgement.decision {
+            GhDecisionStatus::Accepted => "accepted",
+            GhDecisionStatus::Filtered => "filtered",
+            GhDecisionStatus::Duplicate => "duplicate",
+            _ => {
+                return Err(format!(
+                    "refusing to acknowledge non-terminal trigger intake decision {:?}",
+                    acknowledgement.decision
+                ))
+            }
+        };
+        let marker = format!(
+            "<!-- tally-trigger:{}:{decision} -->",
+            acknowledgement.receipt_id
+        );
+        let summary = match acknowledgement.decision {
+            GhDecisionStatus::Accepted => "Tally accepted this trigger.",
+            GhDecisionStatus::Filtered => "Tally filtered this trigger by policy.",
+            GhDecisionStatus::Duplicate => "Tally already recorded this trigger.",
+            _ => unreachable!("decision was narrowed above"),
+        };
+        let mut body = format!("{marker}\n{summary}");
+        if let Some(task_uuid) = &acknowledgement.task_uuid {
+            body.push_str(&format!("\n\nTask: `{task_uuid}`"));
+        }
+        if let Some(pointer) = &acknowledgement.status_pointer {
+            body.push_str(&format!("\nStatus: `{pointer}`"));
+        }
+        let (_, state, exists) = self
+            .mutation
+            .completion_state(&acknowledgement.item_id, &marker)?;
+        if !exists {
+            self.mutation.graphql(serde_json::json!({
+                "query": GH_COMPLETION_COMMENT_GRAPHQL,
+                "variables": {"itemId": acknowledgement.item_id, "body": body},
+            }))?;
+        }
+        if !matches!(state.as_str(), "OPEN" | "CLOSED" | "MERGED") {
+            return Err(format!(
+                "GitHub item {:?} has unsupported state {state:?}",
+                acknowledgement.item_id
             ));
         }
         Ok(())
@@ -1414,9 +2335,19 @@ fn bounded_reader(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum GhFilterReason {
+    SourceNotConfigured,
+    SourceUnconstrained,
+    RepositoryNotAllowed,
+    ItemNotAllowlisted,
+    LabelMismatch,
+    StateMismatch,
+    AssigneeMismatch,
+    ItemKindMismatch,
+    NotificationReasonMismatch,
+    TriggerNotConfigured,
     SelfTriggerDisabled,
     TriggerActorNotAllowed,
     TriggerActorExcluded,
@@ -1430,6 +2361,146 @@ pub enum EmitOutcome {
     Duplicate,
     Filtered { reason: GhFilterReason },
     Disabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum GhDecisionStatus {
+    Accepted,
+    Filtered,
+    Duplicate,
+    Malformed,
+    WouldEnqueue,
+    Disabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GhCandidateSummary {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub number: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_actor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
+}
+
+impl GhCandidateSummary {
+    fn from_observation(observation: &GhObservation) -> Self {
+        Self {
+            source: observation.source.clone(),
+            repo: Some(observation.repo.clone()),
+            number: Some(observation.number),
+            url: Some(observation.html_url.clone()),
+            node_id: Some(observation.node_id.clone()),
+            trigger_kind: Some(observation.trigger_kind.clone()),
+            trigger_actor: Some(observation.trigger_actor.clone()),
+            event_id: observation.event_id.clone(),
+            comment_id: observation.comment_id.clone(),
+            timestamp: Some(observation.trigger_timestamp.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GhEnqueuePreview {
+    pub task_uuid: String,
+    pub argv: Vec<String>,
+    #[serde(rename = "pool", serialize_with = "crate::poolset::serialize")]
+    pub pools: Vec<String>,
+    pub adapter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    pub priority: Priority,
+    pub dedup_key: String,
+    pub context: GhOrigin,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GhDecision {
+    pub producer: String,
+    pub candidate: GhCandidateSummary,
+    pub decision: GhDecisionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<GhFilterReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub existing_task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_pointer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enqueue: Option<GhEnqueuePreview>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct GhTriggerAcknowledgement {
+    pub schema_version: u32,
+    pub producer: String,
+    pub receipt_id: String,
+    pub item_id: String,
+    pub decision: GhDecisionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<GhFilterReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_pointer: Option<String>,
+}
+
+pub trait GhAcknowledgementSink {
+    fn post_acknowledgement(
+        &mut self,
+        acknowledgement: &GhTriggerAcknowledgement,
+    ) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct GhTriggerReceipt {
+    schema_version: u32,
+    receipt_id: String,
+    producer: String,
+    source: String,
+    item_id: String,
+    event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    comment_id: Option<String>,
+    trigger_kind: String,
+    trigger_actor: String,
+    trigger_timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    trigger_value: Option<String>,
+    primary_decision: GhDecisionStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rule: Option<GhFilterReason>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_uuid: Option<String>,
+    primary_acknowledged: bool,
+    duplicate_acknowledged: bool,
+    duplicate_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1533,12 +2604,14 @@ impl<'a> ProducerEngine<'a> {
         if let Some(reason) = gh_filter_reason(config, observation) {
             return Ok(EmitOutcome::Filtered { reason });
         }
+        let origin = gh_origin(producer, config, observation);
         let mut payload = config.enqueue.payload(EnqueueSource::Gh, now)?;
-        payload.dedup_key = Some(format!("gh:{}:{}", producer, observation.node_id));
+        payload.dedup_key = Some(gh_trigger_dedup_key(&origin)?);
         payload.gh_trigger_actor = Some(observation.trigger_actor.clone());
         payload.gh_self_actor = Some(observation.self_actor.clone());
-        payload.gh_origin = Some(gh_origin(producer, config, observation));
-        let key = stable_key(&["gh", producer, &observation.node_id]);
+        payload.task_uuid = Some(gh_trigger_task_uuid(&origin)?.to_string());
+        let key = gh_trigger_receipt_id(&origin)?;
+        payload.gh_origin = Some(origin);
         self.emit_named(&format!("{producer}-gh-{key}{INGRESS_SUFFIX}"), &payload)
     }
 
@@ -1555,7 +2628,7 @@ impl<'a> ProducerEngine<'a> {
             return Ok(Vec::new());
         }
         intake
-            .poll(&config.sources)?
+            .poll(config)?
             .iter()
             .map(|candidate| match candidate {
                 GhIntakeCandidate::Observation(observation) => {
@@ -1566,6 +2639,313 @@ impl<'a> ProducerEngine<'a> {
                 }),
             })
             .collect()
+    }
+
+    pub fn preview_gh(
+        &self,
+        producer: &str,
+        intake: &GhCliIntake,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<GhDecision>, ProducerError> {
+        let ProducerConfig::Gh(config) = self.get(producer)? else {
+            return Err(self.kind_mismatch(producer, "gh"));
+        };
+        if !config.enable {
+            return Ok(Vec::new());
+        }
+        let mut decisions = Vec::new();
+        for candidate in intake.poll(config)? {
+            match candidate {
+                GhIntakeCandidate::Observation(observation) => {
+                    decisions.push(
+                        match self.preview_gh_observation(producer, &observation, now) {
+                            Ok(decision) => decision,
+                            Err(error) => malformed_gh_decision(
+                                producer,
+                                GhCandidateSummary::from_observation(&observation),
+                                error.to_string(),
+                            ),
+                        },
+                    );
+                }
+                GhIntakeCandidate::TriggerActorUnavailable { source, node_id } => {
+                    decisions.push(unavailable_actor_decision(producer, source, node_id));
+                }
+            }
+        }
+        Ok(decisions)
+    }
+
+    pub fn explain_gh(
+        &self,
+        producer: &str,
+        intake: &GhCliIntake,
+        item_url: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<GhDecision>, ProducerError> {
+        let ProducerConfig::Gh(config) = self.get(producer)? else {
+            return Err(self.kind_mismatch(producer, "gh"));
+        };
+        let mut decisions = Vec::new();
+        for candidate in intake.item(config, item_url)? {
+            match candidate {
+                GhIntakeCandidate::Observation(observation) => {
+                    decisions.push(
+                        match self.preview_gh_observation(producer, &observation, now) {
+                            Ok(decision) => decision,
+                            Err(error) => malformed_gh_decision(
+                                producer,
+                                GhCandidateSummary::from_observation(&observation),
+                                error.to_string(),
+                            ),
+                        },
+                    );
+                }
+                GhIntakeCandidate::TriggerActorUnavailable { source, node_id } => {
+                    decisions.push(unavailable_actor_decision(producer, source, node_id));
+                }
+            }
+        }
+        Ok(decisions)
+    }
+
+    pub fn diagnostic_gh_observation(
+        &self,
+        producer: &str,
+        intake: &GhCliIntake,
+        item_url: &str,
+        trigger_kind: &str,
+        actor: &str,
+        now: DateTime<Utc>,
+    ) -> Result<GhObservation, ProducerError> {
+        let ProducerConfig::Gh(config) = self.get(producer)? else {
+            return Err(self.kind_mismatch(producer, "gh"));
+        };
+        intake.diagnostic_observation(config, item_url, trigger_kind, actor, now)
+    }
+
+    pub fn poll_gh_with_acknowledgements(
+        &self,
+        producer: &str,
+        intake: &GhCliIntake,
+        now: DateTime<Utc>,
+        sink: &mut dyn GhAcknowledgementSink,
+    ) -> Result<Vec<GhDecision>, ProducerError> {
+        let ProducerConfig::Gh(config) = self.get(producer)? else {
+            return Err(self.kind_mismatch(producer, "gh"));
+        };
+        if !config.enable {
+            return Ok(Vec::new());
+        }
+        let mut decisions = Vec::new();
+        for candidate in intake.poll(config)? {
+            match candidate {
+                GhIntakeCandidate::Observation(observation) => {
+                    decisions.push(
+                        match self.admit_gh_observation(producer, &observation, now, sink) {
+                            Ok(decision) => decision,
+                            Err(ProducerError::InvalidObservation(detail)) => {
+                                malformed_gh_decision(
+                                    producer,
+                                    GhCandidateSummary::from_observation(&observation),
+                                    detail,
+                                )
+                            }
+                            Err(error) => return Err(error),
+                        },
+                    );
+                }
+                GhIntakeCandidate::TriggerActorUnavailable { source, node_id } => {
+                    decisions.push(unavailable_actor_decision(producer, source, node_id));
+                }
+            }
+        }
+        Ok(decisions)
+    }
+
+    pub fn preview_gh_observation(
+        &self,
+        producer: &str,
+        observation: &GhObservation,
+        now: DateTime<Utc>,
+    ) -> Result<GhDecision, ProducerError> {
+        let ProducerConfig::Gh(config) = self.get(producer)? else {
+            return Err(self.kind_mismatch(producer, "gh"));
+        };
+        if !config.enable {
+            return Ok(disabled_gh_decision(producer, observation));
+        }
+        validate_gh_observation(producer, config, observation)?;
+        let origin = gh_origin(producer, config, observation);
+        let receipt_id = gh_trigger_receipt_id(&origin)?;
+        let task_uuid = gh_trigger_task_uuid(&origin)?.to_string();
+        if let Some(receipt) = self.read_gh_receipt(&receipt_id)? {
+            return Ok(duplicate_gh_decision(
+                producer,
+                observation,
+                &receipt_id,
+                receipt.task_uuid,
+            ));
+        }
+        if let Some(rule) = gh_filter_reason(config, observation) {
+            return Ok(filtered_gh_decision(
+                producer,
+                observation,
+                receipt_id,
+                rule,
+            ));
+        }
+        would_enqueue_gh_decision(
+            producer,
+            config,
+            observation,
+            origin,
+            receipt_id,
+            task_uuid,
+            now,
+        )
+    }
+
+    pub fn admit_gh_observation(
+        &self,
+        producer: &str,
+        observation: &GhObservation,
+        now: DateTime<Utc>,
+        sink: &mut dyn GhAcknowledgementSink,
+    ) -> Result<GhDecision, ProducerError> {
+        let ProducerConfig::Gh(config) = self.get(producer)? else {
+            return Err(self.kind_mismatch(producer, "gh"));
+        };
+        if !config.enable {
+            return Ok(disabled_gh_decision(producer, observation));
+        }
+        validate_gh_observation(producer, config, observation)?;
+        let origin = gh_origin(producer, config, observation);
+        let receipt_id = gh_trigger_receipt_id(&origin)?;
+        let task_uuid = gh_trigger_task_uuid(&origin)?.to_string();
+        let receipts_dir = self.state_dir.join("producers/gh-triggers");
+        create_dir_durable(&receipts_dir)?;
+        let lock_path = receipts_dir.join(format!("{receipt_id}.lock"));
+        let lock = open_private_rw(&lock_path)?;
+        lock.lock_exclusive().map_err(|source| ProducerError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+        let receipt_path = receipts_dir.join(format!("{receipt_id}.json"));
+        let (mut receipt, decision, needs_acknowledgement) = if path_lexists(&receipt_path)? {
+            let mut receipt: GhTriggerReceipt =
+                serde_json::from_slice(&read_bounded_regular(&receipt_path, 64 * 1024)?)?;
+            validate_receipt_identity(&receipt, producer, observation, &receipt_id)?;
+            if receipt.primary_acknowledged {
+                receipt.duplicate_count = receipt.duplicate_count.saturating_add(1);
+                let needs_acknowledgement = !receipt.duplicate_acknowledged;
+                let decision = duplicate_gh_decision(
+                    producer,
+                    observation,
+                    &receipt_id,
+                    receipt.task_uuid.clone(),
+                );
+                (receipt, decision, needs_acknowledgement)
+            } else {
+                let decision =
+                    primary_receipt_decision(producer, config, observation, &receipt, now)?;
+                (receipt, decision, true)
+            }
+        } else {
+            let rule = gh_filter_reason(config, observation);
+            let (primary_decision, ingress, receipt_task) = if rule.is_some() {
+                (GhDecisionStatus::Filtered, None, None)
+            } else {
+                let ingress = match self.emit_gh(producer, observation, now)? {
+                    EmitOutcome::Emitted(path) => Some(path),
+                    EmitOutcome::Duplicate => None,
+                    EmitOutcome::Filtered { reason } => {
+                        return Err(ProducerError::InvalidObservation(format!(
+                            "GitHub trigger changed filter decision while locked: {reason:?}"
+                        )))
+                    }
+                    EmitOutcome::Disabled => {
+                        return Ok(disabled_gh_decision(producer, observation))
+                    }
+                };
+                (GhDecisionStatus::Accepted, ingress, Some(task_uuid.clone()))
+            };
+            let receipt = GhTriggerReceipt {
+                schema_version: 1,
+                receipt_id: receipt_id.clone(),
+                producer: producer.to_owned(),
+                source: observation.source.clone(),
+                item_id: observation.node_id.clone(),
+                event_id: observation
+                    .event_id
+                    .clone()
+                    .expect("current observations require eventId"),
+                comment_id: observation.comment_id.clone(),
+                trigger_kind: observation.trigger_kind.clone(),
+                trigger_actor: observation.trigger_actor.clone(),
+                trigger_timestamp: observation.trigger_timestamp.clone(),
+                trigger_value: observation.trigger_value.clone(),
+                primary_decision,
+                rule,
+                task_uuid: receipt_task,
+                primary_acknowledged: false,
+                duplicate_acknowledged: false,
+                duplicate_count: 0,
+            };
+            let decision = match primary_decision {
+                GhDecisionStatus::Accepted => accepted_gh_decision(
+                    producer,
+                    config,
+                    observation,
+                    origin,
+                    receipt_id.clone(),
+                    task_uuid,
+                    ingress,
+                    now,
+                )?,
+                GhDecisionStatus::Filtered => filtered_gh_decision(
+                    producer,
+                    observation,
+                    receipt_id.clone(),
+                    rule.expect("filtered receipt carries its rule"),
+                ),
+                _ => unreachable!("receipt primary decisions are accepted or filtered"),
+            };
+            (receipt, decision, true)
+        };
+        write_json_atomic(&receipt_path, &receipt)?;
+        if needs_acknowledgement {
+            let acknowledgement = acknowledgement_for_decision(&decision, observation)?;
+            sink.post_acknowledgement(&acknowledgement)
+                .map_err(ProducerError::Acknowledgement)?;
+            match decision.decision {
+                GhDecisionStatus::Duplicate => receipt.duplicate_acknowledged = true,
+                GhDecisionStatus::Accepted | GhDecisionStatus::Filtered => {
+                    receipt.primary_acknowledged = true
+                }
+                _ => {}
+            }
+            write_json_atomic(&receipt_path, &receipt)?;
+        }
+        FileExt::unlock(&lock).map_err(|source| ProducerError::Io {
+            path: lock_path,
+            source,
+        })?;
+        Ok(decision)
+    }
+
+    fn read_gh_receipt(&self, receipt_id: &str) -> Result<Option<GhTriggerReceipt>, ProducerError> {
+        let path = self
+            .state_dir
+            .join("producers/gh-triggers")
+            .join(format!("{receipt_id}.json"));
+        if !path_lexists(&path)? {
+            return Ok(None);
+        }
+        Ok(Some(serde_json::from_slice(&read_bounded_regular(
+            &path,
+            64 * 1024,
+        )?)?))
     }
 
     pub fn validate_gh_origin(&self, origin: &GhOrigin) -> Result<(), ProducerError> {
@@ -1587,7 +2967,11 @@ impl<'a> ProducerEngine<'a> {
                 origin.producer
             )));
         }
-        if !config.sources.iter().any(|source| source == &origin.source) {
+        if !config
+            .sources
+            .iter()
+            .any(|source| source.kind() == origin.source)
+        {
             return Err(ProducerError::InvalidObservation(format!(
                 "gh producer {:?} origin source {:?} is not configured",
                 origin.producer, origin.source
@@ -1602,6 +2986,34 @@ impl<'a> ProducerEngine<'a> {
             if excluded {
                 return Err(ProducerError::InvalidObservation(format!(
                     "gh producer {:?} legacy origin actor is excluded",
+                    origin.producer
+                )));
+            }
+            return Ok(());
+        }
+        if origin.schema_version == 1 {
+            if origin.allow_self_triggered != config.allow_self_triggered
+                || origin.allowed_actors.iter().collect::<BTreeSet<_>>()
+                    != config.allowed_actors.iter().collect::<BTreeSet<_>>()
+            {
+                return Err(ProducerError::InvalidObservation(format!(
+                    "gh producer {:?} origin actor policy does not match configuration",
+                    origin.producer
+                )));
+            }
+            let excluded = (!origin.allowed_actors.is_empty()
+                && !origin
+                    .allowed_actors
+                    .iter()
+                    .any(|actor| actor.eq_ignore_ascii_case(&origin.trigger_actor)))
+                || (origin.trigger_actor == origin.self_actor && !origin.allow_self_triggered)
+                || (origin.actor_exclude != "self"
+                    && origin
+                        .trigger_actor
+                        .eq_ignore_ascii_case(&origin.actor_exclude));
+            if excluded {
+                return Err(ProducerError::InvalidObservation(format!(
+                    "gh producer {:?} legacy origin trigger actor is filtered",
                     origin.producer
                 )));
             }
@@ -2050,6 +3462,290 @@ impl<'a> ProducerEngine<'a> {
     }
 }
 
+fn malformed_gh_decision(
+    producer: &str,
+    candidate: GhCandidateSummary,
+    detail: String,
+) -> GhDecision {
+    GhDecision {
+        producer: producer.to_owned(),
+        candidate,
+        decision: GhDecisionStatus::Malformed,
+        rule: None,
+        receipt_id: None,
+        task_uuid: None,
+        existing_task: None,
+        status_pointer: None,
+        enqueue: None,
+        ingress: None,
+        detail: Some(detail),
+    }
+}
+
+fn unavailable_actor_decision(producer: &str, source: String, node_id: String) -> GhDecision {
+    GhDecision {
+        producer: producer.to_owned(),
+        candidate: GhCandidateSummary {
+            source,
+            repo: None,
+            number: None,
+            url: None,
+            node_id: Some(node_id),
+            trigger_kind: None,
+            trigger_actor: None,
+            event_id: None,
+            comment_id: None,
+            timestamp: None,
+        },
+        decision: GhDecisionStatus::Filtered,
+        rule: Some(GhFilterReason::TriggerActorUnavailable),
+        receipt_id: None,
+        task_uuid: None,
+        existing_task: None,
+        status_pointer: None,
+        enqueue: None,
+        ingress: None,
+        detail: None,
+    }
+}
+
+fn disabled_gh_decision(producer: &str, observation: &GhObservation) -> GhDecision {
+    GhDecision {
+        producer: producer.to_owned(),
+        candidate: GhCandidateSummary::from_observation(observation),
+        decision: GhDecisionStatus::Disabled,
+        rule: None,
+        receipt_id: None,
+        task_uuid: None,
+        existing_task: None,
+        status_pointer: None,
+        enqueue: None,
+        ingress: None,
+        detail: None,
+    }
+}
+
+fn filtered_gh_decision(
+    producer: &str,
+    observation: &GhObservation,
+    receipt_id: String,
+    rule: GhFilterReason,
+) -> GhDecision {
+    GhDecision {
+        producer: producer.to_owned(),
+        candidate: GhCandidateSummary::from_observation(observation),
+        decision: GhDecisionStatus::Filtered,
+        rule: Some(rule),
+        receipt_id: Some(receipt_id),
+        task_uuid: None,
+        existing_task: None,
+        status_pointer: None,
+        enqueue: None,
+        ingress: None,
+        detail: None,
+    }
+}
+
+fn duplicate_gh_decision(
+    producer: &str,
+    observation: &GhObservation,
+    receipt_id: &str,
+    task_uuid: Option<String>,
+) -> GhDecision {
+    let status_pointer = task_uuid.as_ref().map(|task| status_pointer(task));
+    GhDecision {
+        producer: producer.to_owned(),
+        candidate: GhCandidateSummary::from_observation(observation),
+        decision: GhDecisionStatus::Duplicate,
+        rule: None,
+        receipt_id: Some(receipt_id.to_owned()),
+        task_uuid: task_uuid.clone(),
+        existing_task: task_uuid,
+        status_pointer,
+        enqueue: None,
+        ingress: None,
+        detail: None,
+    }
+}
+
+fn would_enqueue_gh_decision(
+    producer: &str,
+    config: &GhProducer,
+    observation: &GhObservation,
+    origin: GhOrigin,
+    receipt_id: String,
+    task_uuid: String,
+    now: DateTime<Utc>,
+) -> Result<GhDecision, ProducerError> {
+    let enqueue = gh_enqueue_preview(config, origin, &task_uuid, now)?;
+    Ok(GhDecision {
+        producer: producer.to_owned(),
+        candidate: GhCandidateSummary::from_observation(observation),
+        decision: GhDecisionStatus::WouldEnqueue,
+        rule: None,
+        receipt_id: Some(receipt_id),
+        task_uuid: Some(task_uuid.clone()),
+        existing_task: None,
+        status_pointer: Some(status_pointer(&task_uuid)),
+        enqueue: Some(enqueue),
+        ingress: None,
+        detail: None,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accepted_gh_decision(
+    producer: &str,
+    config: &GhProducer,
+    observation: &GhObservation,
+    origin: GhOrigin,
+    receipt_id: String,
+    task_uuid: String,
+    ingress: Option<PathBuf>,
+    now: DateTime<Utc>,
+) -> Result<GhDecision, ProducerError> {
+    let enqueue = gh_enqueue_preview(config, origin, &task_uuid, now)?;
+    Ok(GhDecision {
+        producer: producer.to_owned(),
+        candidate: GhCandidateSummary::from_observation(observation),
+        decision: GhDecisionStatus::Accepted,
+        rule: None,
+        receipt_id: Some(receipt_id),
+        task_uuid: Some(task_uuid.clone()),
+        existing_task: None,
+        status_pointer: Some(status_pointer(&task_uuid)),
+        enqueue: Some(enqueue),
+        ingress,
+        detail: None,
+    })
+}
+
+fn gh_enqueue_preview(
+    config: &GhProducer,
+    origin: GhOrigin,
+    task_uuid: &str,
+    now: DateTime<Utc>,
+) -> Result<GhEnqueuePreview, ProducerError> {
+    let payload = config.enqueue.payload(EnqueueSource::Gh, now)?;
+    Ok(GhEnqueuePreview {
+        task_uuid: task_uuid.to_owned(),
+        argv: payload
+            .argv
+            .expect("producer enqueue payloads always contain direct argv"),
+        pools: payload
+            .pools
+            .expect("producer enqueue payloads always contain pools"),
+        adapter: payload
+            .adapter
+            .expect("producer enqueue payloads always contain an adapter"),
+        executor: payload.executor,
+        priority: payload
+            .priority
+            .expect("producer enqueue payloads always contain a priority"),
+        dedup_key: gh_trigger_dedup_key(&origin)?,
+        context: origin,
+    })
+}
+
+fn status_pointer(task_uuid: &str) -> String {
+    format!("tally query log --task {task_uuid}")
+}
+
+fn primary_receipt_decision(
+    producer: &str,
+    config: &GhProducer,
+    observation: &GhObservation,
+    receipt: &GhTriggerReceipt,
+    now: DateTime<Utc>,
+) -> Result<GhDecision, ProducerError> {
+    match receipt.primary_decision {
+        GhDecisionStatus::Accepted => {
+            let task_uuid = receipt.task_uuid.clone().ok_or_else(|| {
+                ProducerError::InvalidObservation(
+                    "accepted GitHub trigger receipt omitted taskUuid".to_owned(),
+                )
+            })?;
+            accepted_gh_decision(
+                producer,
+                config,
+                observation,
+                gh_origin(producer, config, observation),
+                receipt.receipt_id.clone(),
+                task_uuid,
+                None,
+                now,
+            )
+        }
+        GhDecisionStatus::Filtered => Ok(filtered_gh_decision(
+            producer,
+            observation,
+            receipt.receipt_id.clone(),
+            receipt.rule.ok_or_else(|| {
+                ProducerError::InvalidObservation(
+                    "filtered GitHub trigger receipt omitted its rule".to_owned(),
+                )
+            })?,
+        )),
+        _ => Err(ProducerError::InvalidObservation(
+            "GitHub trigger receipt has an invalid primary decision".to_owned(),
+        )),
+    }
+}
+
+fn validate_receipt_identity(
+    receipt: &GhTriggerReceipt,
+    producer: &str,
+    observation: &GhObservation,
+    receipt_id: &str,
+) -> Result<(), ProducerError> {
+    if receipt.schema_version != 1
+        || receipt.receipt_id != receipt_id
+        || receipt.producer != producer
+        || receipt.item_id != observation.node_id
+        || receipt.comment_id != observation.comment_id
+        || receipt.trigger_kind != observation.trigger_kind
+        || receipt.trigger_actor != observation.trigger_actor
+        || receipt.trigger_timestamp != observation.trigger_timestamp
+        || receipt.trigger_value != observation.trigger_value
+        || (matches!(observation.trigger_kind.as_str(), "assignment" | "label")
+            && receipt.event_id != observation.event_id.as_deref().unwrap_or_default())
+    {
+        return Err(ProducerError::InvalidObservation(format!(
+            "GitHub trigger receipt {receipt_id} does not match the observation"
+        )));
+    }
+    Ok(())
+}
+
+fn acknowledgement_for_decision(
+    decision: &GhDecision,
+    observation: &GhObservation,
+) -> Result<GhTriggerAcknowledgement, ProducerError> {
+    let receipt_id = decision.receipt_id.clone().ok_or_else(|| {
+        ProducerError::InvalidObservation(
+            "acknowledgeable GitHub decision omitted receiptId".to_owned(),
+        )
+    })?;
+    if !matches!(
+        decision.decision,
+        GhDecisionStatus::Accepted | GhDecisionStatus::Filtered | GhDecisionStatus::Duplicate
+    ) {
+        return Err(ProducerError::InvalidObservation(
+            "only accepted, filtered, and duplicate GitHub decisions are acknowledged".to_owned(),
+        ));
+    }
+    Ok(GhTriggerAcknowledgement {
+        schema_version: 1,
+        producer: decision.producer.clone(),
+        receipt_id,
+        item_id: observation.node_id.clone(),
+        decision: decision.decision,
+        rule: decision.rule,
+        task_uuid: decision.task_uuid.clone(),
+        status_pointer: decision.status_pointer.clone(),
+    })
+}
+
 fn gh_origin(producer: &str, config: &GhProducer, observation: &GhObservation) -> GhOrigin {
     GhOrigin {
         schema_version: GH_ORIGIN_SCHEMA_VERSION,
@@ -2068,6 +3764,8 @@ fn gh_origin(producer: &str, config: &GhProducer, observation: &GhObservation) -
         trigger_kind: observation.trigger_kind.clone(),
         event_id: observation.event_id.clone(),
         comment_id: observation.comment_id.clone(),
+        trigger_timestamp: Some(observation.trigger_timestamp.clone()),
+        trigger_value: observation.trigger_value.clone(),
         context: Some(observation.context.clone()),
         actor_exclude: config.actor_exclude.clone(),
         allow_self_triggered: config.allow_self_triggered,
@@ -2093,6 +3791,10 @@ fn gh_observation(origin: &GhOrigin) -> Result<GhObservation, ProducerError> {
         trigger_kind: origin.trigger_kind.clone(),
         event_id: origin.event_id.clone(),
         comment_id: origin.comment_id.clone(),
+        trigger_timestamp: origin.trigger_timestamp.clone().ok_or_else(|| {
+            ProducerError::InvalidObservation("GitHub origin omitted triggerTimestamp".to_owned())
+        })?,
+        trigger_value: origin.trigger_value.clone(),
         context: origin.context.clone().ok_or_else(|| {
             ProducerError::InvalidObservation("GitHub origin omitted context".to_owned())
         })?,
@@ -2113,16 +3815,6 @@ fn validate_gh_observation(
     config: &GhProducer,
     observation: &GhObservation,
 ) -> Result<(), ProducerError> {
-    if !config
-        .sources
-        .iter()
-        .any(|source| source == &observation.source)
-    {
-        return Err(ProducerError::InvalidObservation(format!(
-            "gh producer {producer:?} rejected unconfigured source {:?}",
-            observation.source
-        )));
-    }
     gh_origin(producer, config, observation)
         .validate()
         .map_err(|error| ProducerError::InvalidObservation(error.to_string()))?;
@@ -2130,19 +3822,167 @@ fn validate_gh_observation(
 }
 
 fn gh_filter_reason(config: &GhProducer, observation: &GhObservation) -> Option<GhFilterReason> {
+    if let Some(reason) = gh_source_filter_reason(config, observation) {
+        return Some(reason);
+    }
+    if !gh_trigger_matches(&config.triggers, observation) {
+        return Some(GhFilterReason::TriggerNotConfigured);
+    }
     if !config.allowed_actors.is_empty()
         && !config
             .allowed_actors
             .iter()
-            .any(|actor| actor == &observation.trigger_actor)
+            .any(|actor| actor.eq_ignore_ascii_case(&observation.trigger_actor))
     {
         return Some(GhFilterReason::TriggerActorNotAllowed);
     }
     if observation.trigger_actor == observation.self_actor && !config.allow_self_triggered {
         return Some(GhFilterReason::SelfTriggerDisabled);
     }
-    (observation.trigger_actor == config.actor_exclude)
-        .then_some(GhFilterReason::TriggerActorExcluded)
+    (config.actor_exclude != "self"
+        && observation
+            .trigger_actor
+            .eq_ignore_ascii_case(&config.actor_exclude))
+    .then_some(GhFilterReason::TriggerActorExcluded)
+}
+
+fn gh_source_filter_reason(
+    config: &GhProducer,
+    observation: &GhObservation,
+) -> Option<GhFilterReason> {
+    let matching_kind = config
+        .sources
+        .iter()
+        .filter(|source| source.kind() == observation.source)
+        .collect::<Vec<_>>();
+    if matching_kind.is_empty() {
+        return Some(GhFilterReason::SourceNotConfigured);
+    }
+    let mut first_reason = None;
+    for source in matching_kind {
+        match gh_source_constraints_reason(source.constraints(), observation) {
+            None => return None,
+            Some(reason) if first_reason.is_none() => first_reason = Some(reason),
+            Some(_) => {}
+        }
+    }
+    first_reason
+}
+
+fn gh_source_constraints_reason(
+    constraints: &GhSourceConstraints,
+    observation: &GhObservation,
+) -> Option<GhFilterReason> {
+    if !constraints.has_identity_scope() {
+        return Some(GhFilterReason::SourceUnconstrained);
+    }
+    let explicit_repositories = constraints
+        .repo
+        .iter()
+        .chain(constraints.repositories.iter());
+    let repo_allowed = explicit_repositories
+        .clone()
+        .any(|repo| repo.eq_ignore_ascii_case(&observation.repo));
+    let owner = observation.repo.split_once('/').map(|(owner, _)| owner);
+    let owner_allowed = owner.is_some_and(|owner| {
+        constraints
+            .owners
+            .iter()
+            .any(|allowed| allowed.eq_ignore_ascii_case(owner))
+    });
+    let item_allowed = constraints
+        .item_allowlist
+        .iter()
+        .any(|item| item == &observation.html_url);
+    if !repo_allowed && !owner_allowed && !item_allowed {
+        return Some(GhFilterReason::RepositoryNotAllowed);
+    }
+    if !constraints.item_allowlist.is_empty() && !item_allowed {
+        return Some(GhFilterReason::ItemNotAllowlisted);
+    }
+    if !constraints.labels.iter().all(|required| {
+        observation
+            .context
+            .labels
+            .iter()
+            .any(|actual| actual.eq_ignore_ascii_case(required))
+    }) {
+        return Some(GhFilterReason::LabelMismatch);
+    }
+    if constraints.state.is_some() && constraints.state != observation.context.state {
+        return Some(GhFilterReason::StateMismatch);
+    }
+    if constraints.assignee.as_ref().is_some_and(|required| {
+        !observation
+            .context
+            .assignees
+            .iter()
+            .any(|actual| actual.eq_ignore_ascii_case(required))
+    }) {
+        return Some(GhFilterReason::AssigneeMismatch);
+    }
+    if !constraints.kinds.is_empty()
+        && !constraints
+            .kinds
+            .iter()
+            .any(|kind| kind.matches(observation.item_type))
+    {
+        return Some(GhFilterReason::ItemKindMismatch);
+    }
+    if !constraints.notification_reasons.is_empty()
+        && observation
+            .notification_reason
+            .as_ref()
+            .is_none_or(|reason| {
+                !constraints
+                    .notification_reasons
+                    .iter()
+                    .any(|allowed| allowed.eq_ignore_ascii_case(reason))
+            })
+    {
+        return Some(GhFilterReason::NotificationReasonMismatch);
+    }
+    None
+}
+
+fn gh_trigger_matches(triggers: &GhTriggers, observation: &GhObservation) -> bool {
+    match observation.trigger_kind.as_str() {
+        "command-comment" => {
+            observation
+                .context
+                .triggering_comment
+                .as_ref()
+                .is_some_and(|comment| {
+                    triggers
+                        .command_comments
+                        .iter()
+                        .any(|command| command == comment.body.trim())
+                })
+        }
+        "mention" => observation
+            .context
+            .triggering_comment
+            .as_ref()
+            .is_some_and(|comment| {
+                triggers
+                    .mentions
+                    .iter()
+                    .any(|command| command == comment.body.trim())
+            }),
+        "assignment" => observation.trigger_value.as_ref().is_some_and(|assignee| {
+            triggers
+                .assignments
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(assignee))
+        }),
+        "label" => observation.trigger_value.as_ref().is_some_and(|label| {
+            triggers
+                .labels
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(label))
+        }),
+        _ => false,
+    }
 }
 
 fn stable_key(parts: &[&str]) -> String {
@@ -2883,6 +4723,8 @@ pub enum ProducerError {
     DurableEvent(#[from] crate::taskdb::TaskDbError),
     #[error("GitHub COMPLETED mutation failed: {0}")]
     Mutation(String),
+    #[error("GitHub trigger acknowledgement failed: {0}")]
+    Acknowledgement(String),
     #[error("GitHub intake failed: {0}")]
     GitHub(String),
 }
@@ -2947,7 +4789,21 @@ mod tests {
                 ProducerConfig::Gh(GhProducer {
                     credentials: BTreeMap::new(),
                     enable: true,
-                    sources: vec!["notifications".to_owned(), "search".to_owned()],
+                    sources: vec![
+                        GhSource::Notifications(GhSourceConstraints {
+                            repo: Some("acme/widgets".to_owned()),
+                            ..GhSourceConstraints::default()
+                        }),
+                        GhSource::Search(GhSourceConstraints {
+                            repo: Some("acme/widgets".to_owned()),
+                            ..GhSourceConstraints::default()
+                        }),
+                    ],
+                    triggers: GhTriggers {
+                        mentions: vec!["@tally-bot please run".to_owned()],
+                        assignments: vec!["tally-bot".to_owned()],
+                        ..GhTriggers::default()
+                    },
                     actor_exclude: "self".to_owned(),
                     allow_self_triggered: false,
                     allowed_actors: Vec::new(),
@@ -2992,7 +4848,7 @@ mod tests {
             source: "notifications".to_owned(),
             repo: "acme/widgets".to_owned(),
             number: 128,
-            html_url: "https://github.example/acme/widgets/pull/128".to_owned(),
+            html_url: "https://github.com/acme/widgets/pull/128".to_owned(),
             item_type: GhItemType::PullRequest,
             head_sha: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
             node_id: node_id.to_owned(),
@@ -3000,13 +4856,16 @@ mod tests {
             trigger_actor: trigger_actor.to_owned(),
             self_actor: "tally-bot".to_owned(),
             notification_reason: Some("mention".to_owned()),
-            trigger_kind: "notification".to_owned(),
+            trigger_kind: "mention".to_owned(),
             event_id: Some("thread-128".to_owned()),
             comment_id: Some("comment-128".to_owned()),
+            trigger_timestamp: "2026-07-20T12:30:00Z".to_owned(),
+            trigger_value: None,
             context: GhContextSnapshot {
                 schema_version: GH_CONTEXT_SCHEMA_VERSION,
                 title: "Update the widget".to_owned(),
                 body: "Treat this as untrusted: $(touch /tmp/not-run)".to_owned(),
+                state: Some(GhItemState::Open),
                 head_sha: Some("0123456789abcdef0123456789abcdef01234567".to_owned()),
                 labels: vec!["build".to_owned()],
                 assignees: vec!["tally-bot".to_owned()],
@@ -3016,6 +4875,56 @@ mod tests {
                     body: "@tally-bot please run".to_owned(),
                 }),
             },
+        }
+    }
+
+    fn gh_command_observation(comment_id: &str, trigger_actor: &str) -> GhObservation {
+        GhObservation {
+            source: "search".to_owned(),
+            repo: "acme/widgets".to_owned(),
+            number: 42,
+            html_url: "https://github.com/acme/widgets/issues/42".to_owned(),
+            item_type: GhItemType::Issue,
+            head_sha: None,
+            node_id: "I_acme_widgets_42".to_owned(),
+            item_author: "issue-author".to_owned(),
+            trigger_actor: trigger_actor.to_owned(),
+            self_actor: "tally-bot".to_owned(),
+            notification_reason: None,
+            trigger_kind: "command-comment".to_owned(),
+            event_id: Some(format!("event-{comment_id}")),
+            comment_id: Some(comment_id.to_owned()),
+            trigger_timestamp: "2026-07-20T12:30:00Z".to_owned(),
+            trigger_value: None,
+            context: GhContextSnapshot {
+                schema_version: GH_CONTEXT_SCHEMA_VERSION,
+                title: "Run the widget checks".to_owned(),
+                body: "Untrusted issue context".to_owned(),
+                state: Some(GhItemState::Open),
+                head_sha: None,
+                labels: vec!["ready".to_owned()],
+                assignees: vec!["tally-bot".to_owned()],
+                triggering_comment: Some(GhTriggeringComment {
+                    id: comment_id.to_owned(),
+                    author: trigger_actor.to_owned(),
+                    body: "/tally run".to_owned(),
+                }),
+            },
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAcknowledgements {
+        entries: Vec<GhTriggerAcknowledgement>,
+    }
+
+    impl GhAcknowledgementSink for RecordingAcknowledgements {
+        fn post_acknowledgement(
+            &mut self,
+            acknowledgement: &GhTriggerAcknowledgement,
+        ) -> Result<(), String> {
+            self.entries.push(acknowledgement.clone());
+            Ok(())
         }
     }
 
@@ -3175,7 +5084,8 @@ mod tests {
             let mut value = serde_json::json!({
                 "kind": "gh",
                 "enable": true,
-                "sources": ["notifications"],
+                "sources": [{"notifications": {"repo": "acme/widgets"}}],
+                "triggers": {"assignments": ["tally-bot"]},
                 "postEvidence": true,
                 "enqueue": {"argv": ["gh-job"], "pool": "slot"}
             });
@@ -3196,6 +5106,127 @@ mod tests {
         let comment_only = config(Some(false));
         assert_eq!(comment_only.close_on_pass, Some(false));
         assert!(!comment_only.close_on_pass());
+    }
+
+    #[test]
+    fn github_search_queries_are_derived_only_from_declared_scopes() {
+        let scoped = GhSourceConstraints {
+            repo: Some("agency-agency/spec".to_owned()),
+            labels: vec!["agency:codex-ready".to_owned()],
+            state: Some(GhItemState::Open),
+            assignee: Some("tally-bot".to_owned()),
+            kinds: vec![GhSourceItemKind::Issue],
+            query: Some("draft:false".to_owned()),
+            ..GhSourceConstraints::default()
+        };
+        assert_eq!(
+            gh_search_queries(&scoped),
+            ["repo:agency-agency/spec label:\"agency:codex-ready\" state:open assignee:\"tally-bot\" is:issue draft:false"]
+        );
+
+        let query_without_identity = GhSourceConstraints {
+            query: Some("state:open".to_owned()),
+            ..GhSourceConstraints::default()
+        };
+        assert!(gh_search_queries(&query_without_identity).is_empty());
+    }
+
+    #[test]
+    fn github_explicit_comment_assignment_and_label_triggers_are_classified_exactly() {
+        let triggers = GhTriggers {
+            command_comments: vec!["/tally run".to_owned()],
+            mentions: vec!["@tally-bot run".to_owned()],
+            assignments: vec!["tally-bot".to_owned()],
+            labels: vec!["tally:run".to_owned()],
+        };
+        let command = gh_command_observation("command", "maintainer");
+        assert!(gh_trigger_matches(&triggers, &command));
+
+        let mut mention = command.clone();
+        mention.trigger_kind = "mention".to_owned();
+        mention.context.triggering_comment.as_mut().unwrap().body = "@tally-bot run".to_owned();
+        assert!(gh_trigger_matches(&triggers, &mention));
+
+        let assignment = configured_gh_event(
+            &serde_json::json!({
+                "id": 42,
+                "event": "assigned",
+                "actor": {"login": "maintainer"},
+                "assignee": {"login": "tally-bot"}
+            }),
+            &triggers,
+        )
+        .unwrap();
+        assert_eq!(assignment.id, "42");
+        assert_eq!(assignment.kind, "assignment");
+        assert_eq!(assignment.actor, "maintainer");
+        assert_eq!(assignment.value, "tally-bot");
+
+        let label = configured_gh_event(
+            &serde_json::json!({
+                "node_id": "LE_label_43",
+                "event": "labeled",
+                "actor": {"login": "maintainer"},
+                "label": {"name": "tally:run"}
+            }),
+            &triggers,
+        )
+        .unwrap();
+        assert_eq!(label.id, "LE_label_43");
+        assert_eq!(label.kind, "label");
+        assert_eq!(label.value, "tally:run");
+
+        assert!(configured_gh_event(
+            &serde_json::json!({
+                "id": 44,
+                "event": "labeled",
+                "actor": {"login": "maintainer"},
+                "label": {"name": "unconfigured"}
+            }),
+            &triggers,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn github_remaining_source_constraints_are_fail_closed() {
+        let constraints = GhSourceConstraints {
+            owners: vec!["acme".to_owned()],
+            assignee: Some("tally-bot".to_owned()),
+            kinds: vec![GhSourceItemKind::Issue],
+            notification_reasons: vec!["mention".to_owned()],
+            item_allowlist: vec!["https://github.com/acme/widgets/issues/42".to_owned()],
+            ..GhSourceConstraints::default()
+        };
+        let mut matching = gh_command_observation("constraints", "maintainer");
+        matching.source = "notifications".to_owned();
+        matching.notification_reason = Some("mention".to_owned());
+        assert_eq!(gh_source_constraints_reason(&constraints, &matching), None);
+
+        let mut wrong_item = matching.clone();
+        wrong_item.html_url = "https://github.com/acme/widgets/issues/43".to_owned();
+        assert_eq!(
+            gh_source_constraints_reason(&constraints, &wrong_item),
+            Some(GhFilterReason::ItemNotAllowlisted)
+        );
+        let mut wrong_assignee = matching.clone();
+        wrong_assignee.context.assignees.clear();
+        assert_eq!(
+            gh_source_constraints_reason(&constraints, &wrong_assignee),
+            Some(GhFilterReason::AssigneeMismatch)
+        );
+        let mut wrong_kind = matching.clone();
+        wrong_kind.item_type = GhItemType::PullRequest;
+        assert_eq!(
+            gh_source_constraints_reason(&constraints, &wrong_kind),
+            Some(GhFilterReason::ItemKindMismatch)
+        );
+        let mut wrong_reason = matching;
+        wrong_reason.notification_reason = Some("subscribed".to_owned());
+        assert_eq!(
+            gh_source_constraints_reason(&constraints, &wrong_reason),
+            Some(GhFilterReason::NotificationReasonMismatch)
+        );
     }
 
     #[test]
@@ -3305,8 +5336,11 @@ mod tests {
         assert_eq!(payload.source, Some(EnqueueSource::Gh));
         assert_eq!(payload.gh_trigger_actor.as_deref(), Some("contributor"));
         assert_eq!(payload.gh_self_actor.as_deref(), Some("tally-bot"));
-        assert_eq!(payload.dedup_key.as_deref(), Some("gh:github:PR_kwABC128"));
         let origin = payload.gh_origin.clone().unwrap();
+        assert_eq!(
+            payload.dedup_key.as_deref(),
+            Some(gh_trigger_dedup_key(&origin).unwrap().as_str())
+        );
         assert_eq!(origin.producer, "github");
         assert_eq!(origin.source, "notifications");
         assert_eq!(origin.node_id, "PR_kwABC128");
@@ -3338,11 +5372,14 @@ mod tests {
             source: "unconfigured".to_owned(),
             ..external.clone()
         };
-        assert!(engine
-            .emit_gh("github", &wrong_source, fixed_now())
-            .unwrap_err()
-            .to_string()
-            .contains("unconfigured source"));
+        assert_eq!(
+            engine
+                .emit_gh("github", &wrong_source, fixed_now())
+                .unwrap(),
+            EmitOutcome::Filtered {
+                reason: GhFilterReason::SourceNotConfigured
+            }
+        );
 
         let mut mutations = RecordingMutation::default();
         assert!(!engine
@@ -3536,11 +5573,412 @@ mod tests {
     }
 
     #[test]
-    fn github_cli_poll_requires_exact_trigger_actor_and_deduplicates_node_ids() {
+    fn github_trigger_acknowledgement_marker_is_stable_and_remote_idempotent() {
+        let temp = tempdir().unwrap();
+        let gh = temp.path().join("fake-gh-ack");
+        let requests = temp.path().join("ack-requests.jsonl");
+        let marker = temp.path().join("ack-marker");
+        std::fs::write(
+            &gh,
+            format!(
+                concat!(
+                    "#!/bin/sh\n",
+                    "[ \"$1 $2 $3 $4\" = 'api graphql --input -' ] || exit 91\n",
+                    "request=$(cat)\n",
+                    "printf '%s\\n' \"$request\" >> '{}'\n",
+                    "case \"$request\" in\n",
+                    "  *TallyCompletionState*)\n",
+                    "    if test -e '{}'; then comments='[{{\"body\":\"<!-- tally-trigger:receipt-42:accepted -->\"}}]'; else comments='[]'; fi\n",
+                    "    printf '{{\"data\":{{\"node\":{{\"__typename\":\"Issue\",\"state\":\"OPEN\",\"comments\":{{\"nodes\":%s,\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}}}}}}}}}}' \"$comments\"\n",
+                    "    ;;\n",
+                    "  *TallyCompletionComment*) touch '{}'; printf '{{\"data\":{{\"addComment\":{{}}}}}}' ;;\n",
+                    "  *) exit 92 ;;\n",
+                    "esac\n"
+                ),
+                requests.display(),
+                marker.display(),
+                marker.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        File::open(&gh).unwrap().sync_all().unwrap();
+        sync_directory(temp.path()).unwrap();
+        let acknowledgement = GhTriggerAcknowledgement {
+            schema_version: 1,
+            producer: "github".to_owned(),
+            receipt_id: "receipt-42".to_owned(),
+            item_id: "I_widget_42".to_owned(),
+            decision: GhDecisionStatus::Accepted,
+            rule: None,
+            task_uuid: Some("00000000-0000-5000-8000-000000000042".to_owned()),
+            status_pointer: Some(
+                "tally query log --task 00000000-0000-5000-8000-000000000042".to_owned(),
+            ),
+        };
+        let mut sink = GhCliAcknowledgementSink::with_program(&gh);
+        sink.post_acknowledgement(&acknowledgement).unwrap();
+        sink.post_acknowledgement(&acknowledgement).unwrap();
+
+        let requests = std::fs::read_to_string(requests)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let comments = requests
+            .iter()
+            .filter(|request| {
+                request["query"]
+                    .as_str()
+                    .unwrap()
+                    .contains("TallyCompletionComment")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(comments.len(), 1);
+        let body = comments[0]["variables"]["body"].as_str().unwrap();
+        assert!(body.contains("<!-- tally-trigger:receipt-42:accepted -->"));
+        assert!(body.contains("00000000-0000-5000-8000-000000000042"));
+        assert!(body.contains("tally query log --task"));
+    }
+
+    #[test]
+    fn github_issue_21_repo_label_and_state_scope_admits_only_the_exact_match() {
         let temp = tempdir().unwrap();
         let mut registry = registry(&temp.path().join("effects.jsonl"));
         let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
             unreachable!()
+        };
+        github.sources = vec![GhSource::Search(GhSourceConstraints {
+            repo: Some("agency-agency/spec".to_owned()),
+            labels: vec!["agency:codex-ready".to_owned()],
+            state: Some(GhItemState::Open),
+            ..GhSourceConstraints::default()
+        })];
+        github.triggers = GhTriggers {
+            command_comments: vec!["/tally run".to_owned()],
+            ..GhTriggers::default()
+        };
+        github.allowed_actors = vec!["contributor".to_owned()];
+        let engine = ProducerEngine::new(
+            &registry,
+            temp.path().join("events"),
+            temp.path().join("state"),
+        );
+
+        let mut matching = gh_command_observation("issue-21-comment", "contributor");
+        matching.repo = "agency-agency/spec".to_owned();
+        matching.number = 21;
+        matching.html_url = "https://github.com/agency-agency/spec/issues/21".to_owned();
+        matching.node_id = "I_agency_spec_21".to_owned();
+        matching.context.labels = vec!["agency:codex-ready".to_owned()];
+        assert!(matches!(
+            engine.emit_gh("github", &matching, fixed_now()).unwrap(),
+            EmitOutcome::Emitted(_)
+        ));
+
+        let mut wrong_repo = matching.clone();
+        wrong_repo.repo = "agency-agency/other".to_owned();
+        wrong_repo.html_url = "https://github.com/agency-agency/other/issues/21".to_owned();
+        assert_eq!(
+            engine.emit_gh("github", &wrong_repo, fixed_now()).unwrap(),
+            EmitOutcome::Filtered {
+                reason: GhFilterReason::RepositoryNotAllowed
+            }
+        );
+
+        let mut wrong_label = matching.clone();
+        wrong_label.context.labels = vec!["agency:triage".to_owned()];
+        assert_eq!(
+            engine.emit_gh("github", &wrong_label, fixed_now()).unwrap(),
+            EmitOutcome::Filtered {
+                reason: GhFilterReason::LabelMismatch
+            }
+        );
+
+        let mut wrong_state = matching.clone();
+        wrong_state.context.state = Some(GhItemState::Closed);
+        assert_eq!(
+            engine.emit_gh("github", &wrong_state, fixed_now()).unwrap(),
+            EmitOutcome::Filtered {
+                reason: GhFilterReason::StateMismatch
+            }
+        );
+
+        let mut unscoped_registry = registry.clone();
+        let ProducerConfig::Gh(unscoped) = unscoped_registry.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        unscoped.sources = vec![GhSource::Search(GhSourceConstraints::default())];
+        let unscoped_engine = ProducerEngine::new(
+            &unscoped_registry,
+            temp.path().join("unscoped-events"),
+            temp.path().join("unscoped-state"),
+        );
+        assert_eq!(
+            unscoped_engine
+                .emit_gh("github", &matching, fixed_now())
+                .unwrap(),
+            EmitOutcome::Filtered {
+                reason: GhFilterReason::SourceUnconstrained
+            }
+        );
+    }
+
+    #[test]
+    fn github_cross_source_replay_prefers_the_source_whose_scope_matches() {
+        let temp = tempdir().unwrap();
+        let mut registry = registry(&temp.path().join("effects.jsonl"));
+        let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        github.sources = vec![
+            GhSource::Notifications(GhSourceConstraints {
+                repo: Some("acme/widgets".to_owned()),
+                labels: vec!["notification-only".to_owned()],
+                ..GhSourceConstraints::default()
+            }),
+            GhSource::Search(GhSourceConstraints {
+                repo: Some("acme/widgets".to_owned()),
+                labels: vec!["ready".to_owned()],
+                ..GhSourceConstraints::default()
+            }),
+        ];
+        let search = gh_command_observation("cross-source-comment", "contributor");
+        let notification = GhObservation {
+            source: "notifications".to_owned(),
+            notification_reason: Some("mention".to_owned()),
+            event_id: Some("notification-42".to_owned()),
+            ..search.clone()
+        };
+        let mut candidates = vec![
+            GhIntakeCandidate::Observation(Box::new(notification)),
+            GhIntakeCandidate::Observation(Box::new(search)),
+        ];
+        normalize_gh_candidates(github, &mut candidates);
+        assert_eq!(candidates.len(), 1);
+        let GhIntakeCandidate::Observation(observation) = &candidates[0] else {
+            panic!("expected the matching concrete observation");
+        };
+        assert_eq!(observation.source, "search");
+    }
+
+    #[test]
+    fn github_comment_receipts_ack_one_accept_one_duplicate_and_a_later_job() {
+        let temp = tempdir().unwrap();
+        let mut registry = registry(&temp.path().join("effects.jsonl"));
+        let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        github.sources = vec![GhSource::Search(GhSourceConstraints {
+            repo: Some("acme/widgets".to_owned()),
+            ..GhSourceConstraints::default()
+        })];
+        github.triggers = GhTriggers {
+            command_comments: vec!["/tally run".to_owned()],
+            ..GhTriggers::default()
+        };
+        github.allowed_actors = vec!["contributor".to_owned()];
+        let events = temp.path().join("events");
+        let state = temp.path().join("state");
+        let engine = ProducerEngine::new(&registry, &events, &state);
+        let first_observation = gh_command_observation("comment-1", "contributor");
+        let mut acknowledgements = RecordingAcknowledgements::default();
+
+        let first = engine
+            .admit_gh_observation(
+                "github",
+                &first_observation,
+                fixed_now(),
+                &mut acknowledgements,
+            )
+            .unwrap();
+        assert_eq!(first.decision, GhDecisionStatus::Accepted);
+        let first_task = first.task_uuid.clone().unwrap();
+        assert_eq!(acknowledgements.entries.len(), 1);
+        assert_eq!(
+            acknowledgements.entries[0].decision,
+            GhDecisionStatus::Accepted
+        );
+        assert_eq!(
+            acknowledgements.entries[0].task_uuid.as_deref(),
+            Some(first_task.as_str())
+        );
+
+        let duplicate = engine
+            .admit_gh_observation(
+                "github",
+                &first_observation,
+                fixed_now(),
+                &mut acknowledgements,
+            )
+            .unwrap();
+        assert_eq!(duplicate.decision, GhDecisionStatus::Duplicate);
+        assert_eq!(
+            duplicate.existing_task.as_deref(),
+            Some(first_task.as_str())
+        );
+        assert_eq!(acknowledgements.entries.len(), 2);
+        assert_eq!(
+            acknowledgements.entries[1].decision,
+            GhDecisionStatus::Duplicate
+        );
+
+        let mut later_observation = gh_command_observation("comment-2", "contributor");
+        later_observation.trigger_timestamp = "2026-07-20T12:35:00Z".to_owned();
+        let later = engine
+            .admit_gh_observation(
+                "github",
+                &later_observation,
+                fixed_now(),
+                &mut acknowledgements,
+            )
+            .unwrap();
+        assert_eq!(later.decision, GhDecisionStatus::Accepted);
+        assert_ne!(later.task_uuid.as_deref(), Some(first_task.as_str()));
+        assert_eq!(acknowledgements.entries.len(), 3);
+        assert_eq!(
+            acknowledgements.entries[2].decision,
+            GhDecisionStatus::Accepted
+        );
+        assert_eq!(
+            std::fs::read_dir(&events)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(INGRESS_SUFFIX))
+                .count(),
+            2
+        );
+
+        let third_replay = engine
+            .admit_gh_observation(
+                "github",
+                &first_observation,
+                fixed_now(),
+                &mut acknowledgements,
+            )
+            .unwrap();
+        assert_eq!(third_replay.decision, GhDecisionStatus::Duplicate);
+        assert_eq!(
+            acknowledgements.entries.len(),
+            3,
+            "the stable duplicate acknowledgement is emitted only once"
+        );
+    }
+
+    #[test]
+    fn github_event_receipt_rejects_a_mutated_value_under_the_same_identity() {
+        let temp = tempdir().unwrap();
+        let mut registry = registry(&temp.path().join("effects.jsonl"));
+        let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        github.sources = vec![GhSource::Search(GhSourceConstraints {
+            repo: Some("acme/widgets".to_owned()),
+            ..GhSourceConstraints::default()
+        })];
+        github.triggers = GhTriggers {
+            assignments: vec!["tally-bot".to_owned()],
+            ..GhTriggers::default()
+        };
+        github.allowed_actors = vec!["maintainer".to_owned()];
+        let engine = ProducerEngine::new(
+            &registry,
+            temp.path().join("events"),
+            temp.path().join("state"),
+        );
+        let mut observation = gh_command_observation("event-1", "maintainer");
+        observation.trigger_kind = "assignment".to_owned();
+        observation.event_id = Some("event-1".to_owned());
+        observation.comment_id = None;
+        observation.trigger_value = Some("tally-bot".to_owned());
+        observation.context.triggering_comment = None;
+        let mut acknowledgements = RecordingAcknowledgements::default();
+
+        let accepted = engine
+            .admit_gh_observation("github", &observation, fixed_now(), &mut acknowledgements)
+            .unwrap();
+        assert_eq!(accepted.decision, GhDecisionStatus::Accepted);
+
+        let mut mutated = observation;
+        mutated.trigger_value = Some("different-bot".to_owned());
+        let error = engine
+            .admit_gh_observation("github", &mutated, fixed_now(), &mut acknowledgements)
+            .unwrap_err();
+        assert!(error.to_string().contains("does not match the observation"));
+        assert_eq!(acknowledgements.entries.len(), 1);
+    }
+
+    #[test]
+    fn github_unauthorized_command_records_rule_acknowledges_and_never_enqueues() {
+        let temp = tempdir().unwrap();
+        let mut registry = registry(&temp.path().join("effects.jsonl"));
+        let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        github.sources = vec![GhSource::Search(GhSourceConstraints {
+            repo: Some("acme/widgets".to_owned()),
+            ..GhSourceConstraints::default()
+        })];
+        github.triggers = GhTriggers {
+            command_comments: vec!["/tally run".to_owned()],
+            ..GhTriggers::default()
+        };
+        github.allowed_actors = vec!["maintainer".to_owned()];
+        let events = temp.path().join("events");
+        let state = temp.path().join("state");
+        let engine = ProducerEngine::new(&registry, &events, &state);
+        let observation = gh_command_observation("unauthorized-comment", "outsider");
+        let mut acknowledgements = RecordingAcknowledgements::default();
+
+        let decision = engine
+            .admit_gh_observation("github", &observation, fixed_now(), &mut acknowledgements)
+            .unwrap();
+        assert_eq!(decision.decision, GhDecisionStatus::Filtered);
+        assert_eq!(decision.rule, Some(GhFilterReason::TriggerActorNotAllowed));
+        assert!(!events.exists() || std::fs::read_dir(&events).unwrap().next().is_none());
+        assert_eq!(acknowledgements.entries.len(), 1);
+        assert_eq!(
+            acknowledgements.entries[0].decision,
+            GhDecisionStatus::Filtered
+        );
+        assert_eq!(
+            acknowledgements.entries[0].rule,
+            Some(GhFilterReason::TriggerActorNotAllowed)
+        );
+        assert!(acknowledgements.entries[0].task_uuid.is_none());
+
+        let receipt_id = decision.receipt_id.unwrap();
+        let receipt: Value = serde_json::from_slice(
+            &std::fs::read(
+                state
+                    .join("producers/gh-triggers")
+                    .join(format!("{receipt_id}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["primaryDecision"], "filtered");
+        assert_eq!(receipt["rule"], "trigger-actor-not-allowed");
+        assert_eq!(receipt["primaryAcknowledged"], true);
+    }
+
+    #[test]
+    fn github_cli_poll_requires_exact_trigger_actor_and_deduplicates_event_ids() {
+        let temp = tempdir().unwrap();
+        let mut registry = registry(&temp.path().join("effects.jsonl"));
+        let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        github.sources = vec![GhSource::Notifications(GhSourceConstraints {
+            repo: Some("acme/repo".to_owned()),
+            ..GhSourceConstraints::default()
+        })];
+        github.triggers = GhTriggers {
+            mentions: vec!["@tally-bot please run".to_owned()],
+            ..GhTriggers::default()
         };
         github.allowed_actors = vec!["contributor".to_owned()];
         let events = temp.path().join("events");
@@ -3556,14 +5994,12 @@ mod tests {
                     "case \"$*\" in\n",
                     "  'api user') printf '{{\"login\":\"tally-bot\"}}' ;;\n",
                     "  'api --method GET notifications -f all=false -f participating=false -f per_page=100')\n",
-                    "    printf '[{{\"id\":\"N1\",\"reason\":\"mention\",\"updated_at\":\"2026-07-20T12:00:00Z\",\"repository\":{{\"full_name\":\"acme/repo\"}},\"subject\":{{\"type\":\"Issue\",\"url\":\"https://api.github.com/repos/acme/repo/issues/1\",\"latest_comment_url\":\"https://api.github.com/repos/acme/repo/issues/comments/101\"}}}},{{\"id\":\"N2\",\"reason\":\"review_requested\",\"updated_at\":\"2026-07-20T12:10:00Z\",\"repository\":{{\"full_name\":\"acme/repo\"}},\"subject\":{{\"type\":\"PullRequest\",\"url\":\"https://api.github.com/repos/acme/repo/pulls/2\",\"latest_comment_url\":\"https://api.github.com/repos/acme/repo/issues/comments/202\"}}}}]' ;;\n",
-                    "  'api /repos/acme/repo/issues/1') printf '{{\"node_id\":\"I_node_1\",\"number\":1,\"html_url\":\"https://github.com/acme/repo/issues/1\",\"title\":\"Issue one\",\"body\":\"untrusted issue body\",\"user\":{{\"login\":\"tally-bot\"}},\"labels\":[{{\"name\":\"bug\"}}],\"assignees\":[{{\"login\":\"tally-bot\"}}]}}' ;;\n",
-                    "  'api /repos/acme/repo/issues/comments/101') printf '{{\"id\":101,\"body\":\"please inspect this\",\"created_at\":\"2026-07-20T12:00:00Z\",\"updated_at\":\"2026-07-20T12:00:00Z\",\"user\":{{\"login\":\"contributor\"}}}}' ;;\n",
-                    "  'api /repos/acme/repo/pulls/2') printf '{{\"node_id\":\"PR_self\",\"number\":2,\"html_url\":\"https://github.com/acme/repo/pull/2\",\"title\":\"PR two\",\"body\":null,\"user\":{{\"login\":\"tally-bot\"}},\"head\":{{\"sha\":\"2222222222222222222222222222222222222222\"}},\"labels\":[],\"assignees\":[]}}' ;;\n",
-                    "  'api /repos/acme/repo/issues/comments/202') printf '{{\"id\":202,\"body\":\"older unrelated comment\",\"created_at\":\"2026-07-20T11:00:00Z\",\"updated_at\":\"2026-07-20T11:00:00Z\",\"user\":{{\"login\":\"tally-bot\"}}}}' ;;\n",
-                    "  'api --method GET search/issues -f q=is:open involves:@me -f per_page=100')\n",
-                    "    printf '{{\"items\":[{{\"node_id\":\"I_node_1\",\"number\":1,\"repository_url\":\"https://api.github.com/repos/acme/repo\",\"html_url\":\"https://github.com/acme/repo/issues/1\",\"title\":\"Issue one\",\"body\":\"untrusted issue body\",\"user\":{{\"login\":\"issue-author\"}},\"labels\":[],\"assignees\":[]}},{{\"repository_url\":\"https://api.github.com/repos/acme/repo\",\"pull_request\":{{\"url\":\"https://api.github.com/repos/acme/repo/pulls/3\"}}}}]}}' ;;\n",
-                    "  'api /repos/acme/repo/pulls/3') printf '{{\"node_id\":\"PR_node_3\",\"number\":3,\"html_url\":\"https://github.com/acme/repo/pull/3\",\"title\":\"PR three\",\"body\":\"review me\",\"user\":{{\"login\":\"reviewer\"}},\"head\":{{\"sha\":\"3333333333333333333333333333333333333333\"}},\"base\":{{\"repo\":{{\"full_name\":\"acme/repo\"}}}},\"labels\":[],\"assignees\":[]}}' ;;\n",
+                    "    printf '[{{\"id\":\"N1\",\"reason\":\"mention\",\"updated_at\":\"2026-07-20T12:00:00Z\",\"repository\":{{\"full_name\":\"acme/repo\"}},\"subject\":{{\"type\":\"Issue\",\"url\":\"https://api.github.com/repos/acme/repo/issues/1\",\"latest_comment_url\":\"https://api.github.com/repos/acme/repo/issues/comments/101\"}}}},{{\"id\":\"N2\",\"reason\":\"subscribed\",\"updated_at\":\"2026-07-20T12:10:00Z\",\"repository\":{{\"full_name\":\"acme/repo\"}},\"subject\":{{\"type\":\"Issue\",\"url\":\"https://api.github.com/repos/acme/repo/issues/2\",\"latest_comment_url\":\"https://api.github.com/repos/acme/repo/issues/comments/202\"}}}}]' ;;\n",
+                    "  'api /repos/acme/repo/issues/1') printf '{{\"node_id\":\"I_node_1\",\"number\":1,\"html_url\":\"https://github.com/acme/repo/issues/1\",\"title\":\"Issue one\",\"body\":\"untrusted issue body\",\"state\":\"open\",\"user\":{{\"login\":\"tally-bot\"}},\"labels\":[{{\"name\":\"bug\"}}],\"assignees\":[{{\"login\":\"tally-bot\"}}]}}' ;;\n",
+                    "  'api /repos/acme/repo/issues/comments/101') printf '{{\"id\":101,\"body\":\"@tally-bot please run\",\"created_at\":\"2026-07-20T12:00:00Z\",\"updated_at\":\"2026-07-20T12:00:00Z\",\"user\":{{\"login\":\"contributor\"}}}}' ;;\n",
+                    "  'api /repos/acme/repo/issues/2') printf '{{\"node_id\":\"I_node_2\",\"number\":2,\"html_url\":\"https://github.com/acme/repo/issues/2\",\"title\":\"Issue two\",\"body\":null,\"state\":\"open\",\"user\":{{\"login\":\"issue-author\"}},\"labels\":[],\"assignees\":[]}}' ;;\n",
+                    "  'api /repos/acme/repo/issues/comments/202') printf '{{\"id\":202,\"body\":\"older unrelated comment\",\"created_at\":\"2026-07-20T11:00:00Z\",\"updated_at\":\"2026-07-20T11:00:00Z\",\"user\":{{\"login\":\"other\"}}}}' ;;\n",
+                    "  'api /repos/acme/repo/issues/2/events?per_page=100') printf '[]' ;;\n",
                     "  *) exit 91 ;;\n",
                     "esac\n"
                 ),
@@ -3594,7 +6030,7 @@ mod tests {
                     )
                 })
                 .count(),
-            2
+            1
         );
         assert!(!first.iter().any(|outcome| {
             matches!(
@@ -3641,9 +6077,9 @@ mod tests {
                     )
                 })
                 .count(),
-            2
+            1
         );
-        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 16);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 14);
 
         let mut disabled_registry = registry.clone();
         let ProducerConfig::Gh(disabled) = disabled_registry.get_mut("github").unwrap() else {
@@ -3666,9 +6102,9 @@ mod tests {
                 "#!/bin/sh\n",
                 "case \"$*\" in\n",
                 "  'api user') printf '{\"login\":\"tally-bot\"}' ;;\n",
-                "  'api --method GET notifications -f all=false -f participating=false -f per_page=100') printf '[{\"subject\":{\"type\":\"Issue\",\"url\":\"https://api.github.com/repos/acme/repo/issues/9\"}}]' ;;\n",
+                "  'api --method GET notifications -f all=false -f participating=false -f per_page=100') printf '[{\"id\":\"N9\",\"updated_at\":\"2026-07-20T12:00:00Z\",\"repository\":{\"full_name\":\"acme/repo\"},\"subject\":{\"type\":\"Issue\",\"url\":\"https://api.github.com/repos/acme/repo/issues/9\"}}]' ;;\n",
                 "  'api /repos/acme/repo/issues/9') printf '{\"user\":{\"login\":\"contributor\"}}' ;;\n",
-                "  'api --method GET search/issues -f q=is:open involves:@me -f per_page=100') printf '{\"items\":[]}' ;;\n",
+                "  'api /repos/acme/repo/issues/9/events?per_page=100') printf '[]' ;;\n",
                 "  *) exit 91 ;;\n",
                 "esac\n",
             ),
@@ -3683,7 +6119,7 @@ mod tests {
             )
             .unwrap_err()
             .to_string()
-            .contains("omitted node_id"));
+            .contains("omitted number"));
     }
 
     #[test]

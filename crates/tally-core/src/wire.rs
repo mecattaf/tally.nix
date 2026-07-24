@@ -13,7 +13,7 @@ use tokio::net::UnixStream;
 
 use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
-use crate::taskdb::{EnqueueSource, GhOrigin};
+use crate::taskdb::{gh_trigger_task_uuid, EnqueueSource, GhOrigin, RelatedTrigger};
 
 pub const FRAME_CAP_BYTES: usize = 64 * 1024;
 
@@ -374,6 +374,10 @@ pub struct EnqueuePayload {
     pub gh_self_actor: Option<String>,
     #[serde(default)]
     pub gh_origin: Option<GhOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_trigger: Option<RelatedTrigger>,
     #[serde(default)]
     pub wait: bool,
 }
@@ -412,6 +416,8 @@ pub struct ResolvedEnqueue {
     pub no_enqueue: bool,
     pub credentials: BTreeMap<String, PathBuf>,
     pub gh_origin: Option<GhOrigin>,
+    pub task_uuid: Option<String>,
+    pub related_trigger: Option<RelatedTrigger>,
     pub depth: u32,
     pub wait: bool,
 }
@@ -515,6 +521,16 @@ impl GuardrailState {
         if payload.gh_origin.is_some() && source != EnqueueSource::Gh {
             return Err(WireError::invalid("ghOrigin is valid only for source=gh"));
         }
+        if let Some(related) = &payload.related_trigger {
+            if source == EnqueueSource::Gh {
+                return Err(WireError::invalid(
+                    "relatedTrigger is fallback provenance and is invalid for source=gh",
+                ));
+            }
+            related
+                .validate()
+                .map_err(|error| WireError::invalid(error.to_string()))?;
+        }
         if let Some(origin) = &payload.gh_origin {
             origin
                 .validate()
@@ -524,6 +540,19 @@ impl GuardrailState {
             {
                 return Err(WireError::invalid(
                     "GitHub trigger actor fields do not match the durable ghOrigin",
+                ));
+            }
+        }
+        if let Some(task_uuid) = &payload.task_uuid {
+            let origin = payload.gh_origin.as_ref().ok_or_else(|| {
+                WireError::invalid("taskUuid may be preassigned only by a GitHub trigger")
+            })?;
+            let expected = gh_trigger_task_uuid(origin)
+                .map_err(|error| WireError::invalid(error.to_string()))?
+                .to_string();
+            if task_uuid != &expected {
+                return Err(WireError::invalid(
+                    "preassigned GitHub taskUuid does not match its trigger identity",
                 ));
             }
         }
@@ -617,6 +646,8 @@ impl GuardrailState {
             no_enqueue: payload.no_enqueue,
             credentials: payload.credentials,
             gh_origin: payload.gh_origin,
+            task_uuid: payload.task_uuid,
+            related_trigger: payload.related_trigger,
             depth,
             wait: payload.wait,
         })
@@ -832,6 +863,8 @@ mod tests {
             gh_trigger_actor: None,
             gh_self_actor: None,
             gh_origin: None,
+            task_uuid: None,
+            related_trigger: None,
             wait: false,
         }
     }
@@ -881,6 +914,35 @@ mod tests {
         let resolved = state.validate_enqueue(payload, &defaults()).unwrap();
         assert_eq!(resolved.evidence_class, Some(evidence_class));
         assert_eq!(resolved.manifest_hash, Some(manifest_hash));
+    }
+
+    #[test]
+    fn fallback_enqueue_preserves_related_trigger_without_falsifying_source() {
+        let mut state = GuardrailState::new(GuardrailConfig::default()).unwrap();
+        let related = RelatedTrigger {
+            producer: "github".to_owned(),
+            event_id: "comment-5068723021".to_owned(),
+            outcome: crate::taskdb::RelatedTriggerOutcome::Filtered,
+            receipt_id: Some("receipt-84".to_owned()),
+        };
+        let mut payload = child_payload();
+        payload.caller_job_id = None;
+        payload.source = Some(EnqueueSource::Orchestrator);
+        payload.related_trigger = Some(related.clone());
+        let resolved = state.validate_enqueue(payload, &defaults()).unwrap();
+        assert_eq!(resolved.source, EnqueueSource::Orchestrator);
+        assert_eq!(resolved.related_trigger, Some(related.clone()));
+        assert!(resolved.gh_origin.is_none());
+
+        let mut dishonest = child_payload();
+        dishonest.caller_job_id = None;
+        dishonest.source = Some(EnqueueSource::Gh);
+        dishonest.related_trigger = Some(related);
+        assert!(state
+            .validate_enqueue(dishonest, &defaults())
+            .unwrap_err()
+            .message
+            .contains("fallback provenance"));
     }
 
     #[test]
