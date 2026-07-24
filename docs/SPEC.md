@@ -195,8 +195,10 @@ Every configured required gate ID must occur, and `not-run` requires a reason. t
 
 The `execution-and-gates` policy accepts only a successful execution with every declared gate
 passing. A failed/missing gate rejects; a reasoned `not-run` remains pending. Manual policy always
-remains pending. These facts are written into the witness only for jobs that declare the feature;
-the absent optional field preserves byte-identical legacy hash inputs.
+remains pending. Before the terminal witness is appended, a failed gate summary converts an
+otherwise `pass` evidence verdict to the existing `failed` verdict; an already non-pass verdict is
+retained. This applies only to jobs that declare a gate manifest. These facts are written into the
+witness only for those jobs; the absent optional field preserves byte-identical legacy hash inputs.
 
 Deduplication is existence-based. A matching prior `pass` must have the same dedup key and the
 current artifact set must rehash to the witnessed value. A hit records `reused`; ambiguity or a

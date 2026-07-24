@@ -26,7 +26,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tokio::task::{JoinHandle, JoinSet, LocalSet};
 
 use crate::adapters::{AdapterEngine, AdapterError, AdapterInvocation, ScrapeResult};
-use crate::completion::{evaluate_completion, ExecutionFact, SemanticCompletion};
+use crate::completion::{
+    evaluate_completion, ExecutionFact, GateSummaryStatus, SemanticCompletion,
+};
 use crate::config::{Config, PoolPredicate, Priority};
 use crate::evidence::{
     parse_evidence_specs, probe_dedup, run_evidence_gate, RetryTrigger, RunOutcome,
@@ -2825,6 +2827,19 @@ fn completed_event(job: &Job, result: &JobResult, evidence: String) -> EmitEvent
     }
 }
 
+fn canonical_verdict(
+    evidence_verdict: Verdict,
+    completion: Option<&SemanticCompletion>,
+) -> Verdict {
+    if evidence_verdict == Verdict::Pass
+        && completion.is_some_and(|completion| completion.gates.status == GateSummaryStatus::Fail)
+    {
+        Verdict::Failed
+    } else {
+        evidence_verdict
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 struct LeaseTickHook {
@@ -3406,7 +3421,7 @@ impl Daemon {
             }
             (Some(_), None) => None,
         };
-        let (computed_verdict, exit_code, artifact_hash) = match finished.outcome {
+        let (evidence_verdict, exit_code, artifact_hash) = match finished.outcome {
             None => {
                 return Err(DaemonError::Invalid(format!(
                     "job {} stopped without a terminal witness",
@@ -3454,6 +3469,7 @@ impl Daemon {
                 (Verdict::Failed, 1, None)
             }
         };
+        let computed_verdict = canonical_verdict(evidence_verdict, semantic_completion.as_ref());
 
         let (result, evidence, launches) = {
             let mut context = self.handler.context.write().await;
@@ -6155,6 +6171,22 @@ mod tests {
     }
 
     #[test]
+    fn no_gate_manifest_leaves_every_evidence_verdict_unchanged() {
+        for verdict in [
+            Verdict::Pass,
+            Verdict::CleanExitNoArtifact,
+            Verdict::Failed,
+            Verdict::Cancelled,
+            Verdict::Reused,
+            Verdict::PoolVanished,
+            Verdict::Preempted,
+            Verdict::RuntimeExceeded,
+        ] {
+            assert_eq!(canonical_verdict(verdict, None), verdict);
+        }
+    }
+
+    #[test]
     fn terminal_witness_beats_a_stale_live_query_snapshot() {
         let projection = |witness_seq: Option<u64>| JobProjection {
             anchor: "job-1".to_owned(),
@@ -6168,6 +6200,7 @@ mod tests {
             workspace: None,
             resumed_from: None,
             model: None,
+            gh_origin: None,
             state: "completed".to_owned(),
             verdict: witness_seq.map(|_| Verdict::Pass),
             gpu_seconds: None,
@@ -7271,7 +7304,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn hydrated_github_pr_origin_reaches_launch_environment_and_query_projection() {
+    async fn hydrated_github_pr_origin_reaches_launch_status_and_survives_restart() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -7368,10 +7401,14 @@ mod tests {
                 let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
-                let daemon =
-                    Daemon::open_with_executor(config, paths, settings(), executor.clone())
-                        .await
-                        .unwrap();
+                let daemon = Daemon::open_with_executor(
+                    config.clone(),
+                    paths.clone(),
+                    settings(),
+                    executor.clone(),
+                )
+                .await
+                .unwrap();
                 daemon
                     .handler
                     .pause(Some(json!({"all": true})))
@@ -7452,7 +7489,23 @@ mod tests {
                     number: 42,
                     url: "https://github.com/acme/widgets/pull/42".to_owned(),
                 };
+                let task_uuid = job.row.uuid.to_string();
                 assert_eq!(row.gh_origin, Some(expected_projection.clone()));
+                let status = daemon
+                    .handler
+                    .query("query.status", Some(json!({})))
+                    .await
+                    .unwrap();
+                let projected = status["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|projected| projected["taskUuid"] == task_uuid)
+                    .unwrap();
+                assert_eq!(
+                    projected["ghOrigin"],
+                    serde_json::to_value(&expected_projection).unwrap()
+                );
                 let standup = query_standup(
                     &[row],
                     &[],
@@ -7465,7 +7518,32 @@ mod tests {
                     },
                 );
                 assert_eq!(standup.in_flight.len(), 1);
-                assert_eq!(standup.in_flight[0].gh_origin, Some(expected_projection));
+                assert_eq!(
+                    standup.in_flight[0].gh_origin,
+                    Some(expected_projection.clone())
+                );
+
+                drop(daemon);
+                tokio::task::yield_now().await;
+                let restarted =
+                    Daemon::open_with_executor(config, paths, settings(), executor)
+                        .await
+                        .unwrap();
+                let restarted_status = restarted
+                    .handler
+                    .query("query.status", Some(json!({})))
+                    .await
+                    .unwrap();
+                let restarted_job = restarted_status["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|projected| projected["taskUuid"] == task_uuid)
+                    .unwrap();
+                assert_eq!(
+                    restarted_job["ghOrigin"],
+                    serde_json::to_value(expected_projection).unwrap()
+                );
             })
             .await;
     }
@@ -7797,6 +7875,7 @@ mod tests {
                     .await_job(Some(json!({"task_uuid": admitted["task_uuid"]})))
                     .await
                     .unwrap();
+                assert_eq!(terminal["verdict"], "failed");
                 assert_eq!(terminal["exit_code"], 0);
                 assert_eq!(terminal["completion"]["execution"]["status"], "success");
                 assert_eq!(terminal["completion"]["gates"]["status"], "fail");
@@ -7808,7 +7887,39 @@ mod tests {
                     terminal["completion"]["acceptance"]["status"],
                     "rejected"
                 );
+                let status = daemon
+                    .handler
+                    .query("query.status", Some(json!({})))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap();
+                let public_job = status["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|job| job["taskUuid"] == task_uuid)
+                    .unwrap();
+                assert_eq!(public_job["verdict"], "failed");
+                let standup = daemon
+                    .handler
+                    .query("query.standup", Some(json!({})))
+                    .await
+                    .unwrap();
+                assert!(standup["completed"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|entry| entry["taskUuid"] != task_uuid));
+                let gate_failure = standup["gateFails"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["taskUuid"] == task_uuid)
+                    .unwrap();
+                assert_eq!(gate_failure["verdict"], "failed");
                 let (_, witness) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(witness[0].verdict, Verdict::Failed);
+                assert_eq!(witness[0].exit_code, 0);
                 let completion = witness[0].completion.as_ref().unwrap();
                 assert_eq!(
                     completion.execution.status,

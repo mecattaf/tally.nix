@@ -6,7 +6,7 @@ use serde_json::Value;
 use taskchampion::Status;
 use thiserror::Error;
 
-use crate::completion::SemanticCompletion;
+use crate::completion::{GateSummaryStatus, SemanticCompletion};
 use crate::journal::{JournalEntry, TallyEvent};
 use crate::taskdb::{GhOrigin, RelatedTrigger, TaskRow, WorkspaceMetadata};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
@@ -329,6 +329,8 @@ pub struct JobProjection {
     pub resumed_from: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gh_origin: Option<GhOriginProjection>,
     pub state: String,
     pub verdict: Option<Verdict>,
     pub gpu_seconds: Option<f64>,
@@ -384,6 +386,7 @@ fn project_job_details(
                     workspace: row.workspace.clone(),
                     resumed_from: row.resumed_from.clone(),
                     model: row.model.clone(),
+                    gh_origin: row.gh_origin.clone(),
                     state: row_status_name(row.status).to_owned(),
                     verdict: None,
                     gpu_seconds: None,
@@ -417,6 +420,7 @@ fn project_job_details(
                 workspace: None,
                 resumed_from: None,
                 model: None,
+                gh_origin: None,
                 state: "observed".to_owned(),
                 verdict: None,
                 gpu_seconds: None,
@@ -476,6 +480,7 @@ fn project_job_details(
                 workspace: None,
                 resumed_from: None,
                 model: record.model.clone(),
+                gh_origin: None,
                 state: "witnessed".to_owned(),
                 verdict: None,
                 gpu_seconds: None,
@@ -918,6 +923,11 @@ pub fn query_standup(
             .witness_attempt
             .or(job.last_attempt)
             .is_some_and(|attempt| job.evidence_fail_attempts.contains(&attempt));
+        let semantic_gate_failed = job
+            .output
+            .completion
+            .as_ref()
+            .is_some_and(|completion| completion.gates.status == GateSummaryStatus::Fail);
         let gh_origin = job
             .output
             .task_uuid
@@ -937,7 +947,10 @@ pub fn query_standup(
             };
             if verdict == Verdict::Cancelled {
                 cancelled.push(entry);
-            } else if verdict == Verdict::CleanExitNoArtifact || saw_evidence_fail {
+            } else if verdict == Verdict::CleanExitNoArtifact
+                || saw_evidence_fail
+                || semantic_gate_failed
+            {
                 gate_fails.push(entry);
             } else {
                 completed.push(entry);
@@ -1223,6 +1236,32 @@ mod tests {
     }
 
     #[test]
+    fn status_projects_github_origin_for_a_witnessed_job() {
+        let origin = GhOriginProjection {
+            repo: "acme/widgets".to_owned(),
+            number: 42,
+            url: "https://github.com/acme/widgets/issues/42".to_owned(),
+        };
+        let mut github = row("github", "drive");
+        github.source = Some("gh".to_owned());
+        github.gh_origin = Some(origin.clone());
+        let status = query_status(
+            &[pool("slot", 1, 10)],
+            None,
+            &[github],
+            &[],
+            &[witness(Some("github"), Verdict::Pass, LaborClass::Fresh, 1)],
+        )
+        .unwrap();
+        assert_eq!(status.jobs.len(), 1);
+        assert_eq!(status.jobs[0].gh_origin, Some(origin.clone()));
+        assert_eq!(
+            serde_json::to_value(status).unwrap()["jobs"][0]["ghOrigin"],
+            serde_json::to_value(origin).unwrap()
+        );
+    }
+
+    #[test]
     fn query_pools_projects_every_pool_in_stable_order() {
         let pools = query_pools(&[pool("zeta", 20, 100), pool("alpha", 90, 100)]).unwrap();
         assert_eq!(pools.protocol_version, QUERY_PROTOCOL_VERSION);
@@ -1380,6 +1419,56 @@ mod tests {
         assert_eq!(digest.completed[0].gh_origin, Some(origin.clone()));
         assert_eq!(digest.in_flight.len(), 1);
         assert_eq!(digest.in_flight[0].gh_origin, Some(origin));
+    }
+
+    #[test]
+    fn witnessed_semantic_gate_failure_is_a_gate_fail_without_journal() {
+        let mut failed = witness(Some("semantic-gate"), Verdict::Failed, LaborClass::Fresh, 1);
+        failed.exit_code = 0;
+        failed.completion = Some(
+            serde_json::from_value(serde_json::json!({
+                "schemaVersion": 1,
+                "execution": {
+                    "status": "success",
+                    "exitCode": 0,
+                    "reason": "process exited with code 0"
+                },
+                "gates": {
+                    "status": "fail",
+                    "artifact": {"commit": "abc"},
+                    "gates": [{
+                        "id": "tests",
+                        "status": "fail",
+                        "reason": "one test failed"
+                    }],
+                    "missingRequiredGateIds": ["live"]
+                },
+                "acceptance": {
+                    "status": "rejected",
+                    "policy": "execution-and-gates",
+                    "reason": "execution or a declared gate failed"
+                }
+            }))
+            .unwrap(),
+        );
+        let digest = query_standup(
+            &[row("semantic-gate", "drive")],
+            &[],
+            &[failed],
+            &StandupOptions {
+                since: None,
+                since_realtime_us: None,
+                until: "2026-07-19T13:00:00Z".to_owned(),
+                source: None,
+            },
+        );
+        assert!(digest.completed.is_empty());
+        assert_eq!(digest.gate_fails.len(), 1);
+        assert_eq!(digest.gate_fails[0].verdict, Verdict::Failed);
+        assert_eq!(
+            digest.gate_fails[0].task_uuid.as_deref(),
+            Some("semantic-gate")
+        );
     }
 
     #[test]

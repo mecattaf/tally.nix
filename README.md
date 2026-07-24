@@ -371,9 +371,9 @@ An optional versioned gate manifest keeps process execution, declared gates, and
 three separate facts. A manifest contains `schemaVersion: 1`, an `artifact` JSON value, and
 `gates[]` entries whose status is `pass`, `fail`, or `not-run`; `not-run` requires a reason.
 Configured required IDs must all be present. A zero process exit with a failed or missing gate is
-recorded as execution success plus gate failure, never as semantic acceptance. GitHub receipt,
-evidence, gate-summary, review-request, and close-on-acceptance policies are independent;
-`neverMutate` overrides all of them.
+recorded as execution success plus gate failure and the canonical `failed` verdict, never as a task
+pass or semantic acceptance. GitHub receipt, evidence, gate-summary, review-request, and
+close-on-acceptance policies are independent; `neverMutate` overrides all of them.
 
 Verify either ledger offline:
 
