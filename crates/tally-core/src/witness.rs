@@ -793,6 +793,62 @@ pub fn verify_attestations(path: &Path) -> Result<AttestationVerifyReport, Witne
     }
 }
 
+pub fn read_verified_attestations(
+    path: &Path,
+) -> Result<(AttestationVerifyReport, Vec<AttestationRecord>), WitnessError> {
+    if !path.exists() {
+        return Ok((
+            AttestationVerifyReport {
+                ok: true,
+                records: 0,
+                authentication: "unauthenticated-by-construction",
+                problem: None,
+            },
+            Vec::new(),
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    file.lock_shared()
+        .map_err(|source| io_error(path, source))?;
+    let report = match scan_attestation_head(&mut file, path) {
+        Ok((records, _)) => AttestationVerifyReport {
+            ok: true,
+            records: records as usize,
+            authentication: "unauthenticated-by-construction",
+            problem: None,
+        },
+        Err(WitnessError::Corrupt(problem)) => {
+            return Ok((
+                AttestationVerifyReport {
+                    ok: false,
+                    records: 0,
+                    authentication: "unauthenticated-by-construction",
+                    problem: Some(problem),
+                },
+                Vec::new(),
+            ))
+        }
+        Err(error) => return Err(error),
+    };
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| io_error(path, source))?;
+    let records = BufReader::new(file)
+        .lines()
+        .filter_map(|line| match line {
+            Ok(line) if line.trim().is_empty() => None,
+            other => Some(other),
+        })
+        .map(|line| {
+            let line = line.map_err(|source| io_error(path, source))?;
+            serde_json::from_str(&line).map_err(WitnessError::Json)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((report, records))
+}
+
 pub fn parse_rfc3339(value: &str) -> bool {
     DateTime::parse_from_rfc3339(value).is_ok()
 }

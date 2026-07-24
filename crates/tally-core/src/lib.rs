@@ -12,6 +12,7 @@ pub mod lease;
 pub mod poolset;
 pub mod producers;
 pub mod query;
+pub mod query_v2;
 pub mod recovery;
 pub mod taskdb;
 pub mod wire;
