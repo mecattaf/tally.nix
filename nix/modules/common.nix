@@ -78,6 +78,24 @@ let
     }
   );
 
+  mkTraceType = types.submodule {
+    options = {
+      stream = mkOption {
+        type = types.enum [
+          "stdout"
+          "stderr"
+        ];
+        default = "stdout";
+        description = "Provider-emitted stream exposed as an advisory trace.";
+      };
+      framing = mkOption {
+        type = types.enum [ "json-lines" ];
+        default = "json-lines";
+        description = "Record framing for the declared provider trace.";
+      };
+    };
+  };
+
   mkAdapterValueOverrideType =
     field:
     types.submodule (
@@ -226,6 +244,11 @@ let
             pattern = "$..session_id";
           };
           description = "Named stdout/stderr captures used by resume and advisory attestations.";
+        };
+        trace = mkOption {
+          type = types.nullOr mkTraceType;
+          default = null;
+          description = "Optional provider trace declaration; arbitrary shell output is never inferred as a trace.";
         };
         yieldHook = mkOption {
           type = types.nullOr (types.listOf types.str);
@@ -1779,6 +1802,7 @@ let
     inherit (adapter)
       argv
       resume
+      trace
       yieldHook
       env
       extraConfig

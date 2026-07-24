@@ -38,7 +38,7 @@ wait_for_daemon() {
   local output
   for ((index = 0; index < attempts; index++)); do
     if [[ -S "$SCENARIO_SOCKET" ]] && output="$($TALLY_BIN --socket "$SCENARIO_SOCKET" query pools 2>/dev/null)"; then
-      jq -e '.protocolVersion == 1' <<<"$output" >/dev/null
+      jq -e '.protocolVersion == 3' <<<"$output" >/dev/null
       return 0
     fi
     if [[ -n "${DAEMON_PID:-}" ]] && ! kill -0 "$DAEMON_PID" 2>/dev/null; then

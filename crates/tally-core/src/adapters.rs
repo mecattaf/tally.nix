@@ -33,6 +33,22 @@ pub enum ScrapeMode {
     JsonPath,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TraceFraming {
+    #[default]
+    JsonLines,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AdapterTrace {
+    #[serde(default)]
+    pub stream: ScrapeStream,
+    #[serde(default)]
+    pub framing: TraceFraming,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ScrapeCapture {
@@ -100,6 +116,8 @@ pub struct AdapterConfig {
     pub resume: Option<Vec<String>>,
     #[serde(default)]
     pub scrape: BTreeMap<String, ScrapeCapture>,
+    #[serde(default)]
+    pub trace: Option<AdapterTrace>,
     #[serde(default)]
     pub yield_hook: Option<Vec<String>>,
     #[serde(default)]
@@ -991,6 +1009,7 @@ mod tests {
                     },
                 ),
             ]),
+            trace: None,
             yield_hook: Some(vec![
                 "tally".to_owned(),
                 "lease".to_owned(),

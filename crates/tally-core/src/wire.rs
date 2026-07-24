@@ -16,7 +16,8 @@ use crate::completion::GateManifestSpec;
 use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::taskdb::{
-    gh_trigger_task_uuid, EnqueueSource, GhOrigin, RelatedTrigger, WorkspaceMetadata,
+    gh_trigger_task_uuid, AdmissionOrigin, EnqueueSource, GhOrigin, RelatedTrigger,
+    WorkspaceMetadata,
 };
 
 pub const FRAME_CAP_BYTES: usize = 64 * 1024;
@@ -38,6 +39,9 @@ pub const RPC_METHODS: &[&str] = &[
     "query.status",
     "query.log",
     "query.proof",
+    "query.trace",
+    "query.producers",
+    "query.watch",
     "query.render",
     "query.standup",
     "query.pools",
@@ -384,6 +388,8 @@ pub struct EnqueuePayload {
     pub no_enqueue: bool,
     #[serde(default)]
     pub credentials: BTreeMap<String, PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<AdmissionOrigin>,
     #[serde(default)]
     pub caller_job_id: Option<String>,
     #[serde(default, rename = "ghTriggerActor", alias = "ghActor")]
@@ -441,6 +447,7 @@ pub struct ResolvedEnqueue {
     pub runtime_max_sec: Option<u64>,
     pub no_enqueue: bool,
     pub credentials: BTreeMap<String, PathBuf>,
+    pub origin: AdmissionOrigin,
     pub gh_origin: Option<GhOrigin>,
     pub task_uuid: Option<String>,
     pub related_trigger: Option<RelatedTrigger>,
@@ -516,7 +523,7 @@ impl GuardrailState {
 
     pub fn validate_enqueue(
         &mut self,
-        payload: EnqueuePayload,
+        mut payload: EnqueuePayload,
         defaults: &ProducerDefaults,
     ) -> Result<ResolvedEnqueue, WireError> {
         let argv = match (payload.invocation.as_deref(), payload.argv) {
@@ -566,6 +573,31 @@ impl GuardrailState {
             .render();
 
         let source = payload.source.unwrap_or(defaults.source);
+        if payload.gh_origin.is_none() {
+            payload.gh_origin = payload
+                .origin
+                .as_ref()
+                .and_then(|origin| origin.github.clone());
+        }
+        let origin = payload.origin.clone().unwrap_or_else(|| {
+            payload.gh_origin.as_ref().map_or_else(
+                || AdmissionOrigin::direct(source),
+                |github| AdmissionOrigin::github(&github.producer, github.clone()),
+            )
+        });
+        if origin.source != source {
+            return Err(WireError::invalid(
+                "origin source does not match enqueue source",
+            ));
+        }
+        origin
+            .validate()
+            .map_err(|error| WireError::invalid(error.to_string()))?;
+        if origin.github.as_ref() != payload.gh_origin.as_ref() {
+            return Err(WireError::invalid(
+                "legacy ghOrigin and nested origin github detail disagree",
+            ));
+        }
         if payload.gh_origin.is_some() && source != EnqueueSource::Gh {
             return Err(WireError::invalid("ghOrigin is valid only for source=gh"));
         }
@@ -700,6 +732,7 @@ impl GuardrailState {
             runtime_max_sec: payload.runtime_max_sec,
             no_enqueue: payload.no_enqueue,
             credentials: payload.credentials,
+            origin,
             gh_origin: payload.gh_origin,
             task_uuid: payload.task_uuid,
             related_trigger: payload.related_trigger,
@@ -937,6 +970,7 @@ mod tests {
             runtime_max_sec: None,
             no_enqueue: false,
             credentials: BTreeMap::new(),
+            origin: None,
             caller_job_id: Some("job-parent".to_owned()),
             gh_trigger_actor: None,
             gh_self_actor: None,

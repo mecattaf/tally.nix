@@ -27,8 +27,8 @@ use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::taskdb::{
     gh_trigger_dedup_key, gh_trigger_receipt_id, gh_trigger_task_uuid, read_acknowledged_events,
-    EnqueueSource, GhContextSnapshot, GhItemState, GhItemType, GhOrigin, GhTriggeringComment,
-    WorkspaceMetadata, GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
+    AdmissionOrigin, EnqueueSource, GhContextSnapshot, GhItemState, GhItemType, GhOrigin,
+    GhTriggeringComment, WorkspaceMetadata, GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
     MAX_GH_ORIGIN_FIELD_BYTES,
 };
 use crate::wire::EnqueuePayload;
@@ -41,11 +41,94 @@ pub const IN_SCOPE_PRODUCER_KINDS: &[&str] = &[
     "build-effect",
     "pool-reachability",
 ];
+pub const PRODUCER_RUNTIME_SCHEMA_VERSION: u32 = 1;
 
 const MAX_INGRESS_BYTES: u64 = 1024 * 1024;
 const INGRESS_SUFFIX: &str = ".producer.json";
 const MAX_PRODUCER_NAME_BYTES: usize = 96;
 const MAX_CLAIMABLE_NAME_BYTES: usize = 200;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ProducerRuntimeRecord {
+    pub schema_version: u32,
+    pub producer: String,
+    pub last_trigger: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_emission: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_outcome: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+pub fn record_producer_runtime(
+    state_dir: &Path,
+    producer: &str,
+    trigger: DateTime<Utc>,
+    outcome: Option<Value>,
+    error: Option<String>,
+) -> Result<(), ProducerError> {
+    validate_producer_name(producer)?;
+    let emitted = outcome.as_ref().is_some_and(outcome_has_emission);
+    let timestamp = trigger.to_rfc3339();
+    let previous_emission = read_producer_runtime(state_dir, producer)
+        .ok()
+        .flatten()
+        .and_then(|record| record.last_emission);
+    let record = ProducerRuntimeRecord {
+        schema_version: PRODUCER_RUNTIME_SCHEMA_VERSION,
+        producer: producer.to_owned(),
+        last_trigger: timestamp.clone(),
+        last_emission: emitted.then_some(timestamp).or(previous_emission),
+        last_outcome: outcome,
+        last_error: error,
+    };
+    write_json_atomic(
+        &state_dir
+            .join("producers")
+            .join(format!("{producer}.runtime.json")),
+        &record,
+    )
+}
+
+fn outcome_has_emission(value: &Value) -> bool {
+    match value {
+        Value::String(path) => path.starts_with('/'),
+        Value::Array(items) => items.iter().any(outcome_has_emission),
+        Value::Object(fields) => {
+            fields
+                .get("enqueued")
+                .and_then(Value::as_u64)
+                .is_some_and(|count| count > 0)
+                || fields.get("emitted").is_some_and(outcome_has_emission)
+                || fields.get("ingress").is_some_and(outcome_has_emission)
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => false,
+    }
+}
+
+pub fn read_producer_runtime(
+    state_dir: &Path,
+    producer: &str,
+) -> Result<Option<ProducerRuntimeRecord>, ProducerError> {
+    validate_producer_name(producer)?;
+    let path = state_dir
+        .join("producers")
+        .join(format!("{producer}.runtime.json"));
+    if !path.exists() {
+        return Ok(None);
+    }
+    let record: ProducerRuntimeRecord =
+        serde_json::from_slice(&read_bounded_regular(&path, 256 * 1024)?)?;
+    if record.schema_version != PRODUCER_RUNTIME_SCHEMA_VERSION || record.producer != producer {
+        return Err(ProducerError::InvalidObservation(format!(
+            "producer runtime state {} has an invalid identity or schema",
+            path.display()
+        )));
+    }
+    Ok(Some(record))
+}
 
 fn default_adapter() -> String {
     "shell".to_owned()
@@ -126,8 +209,9 @@ impl ProducerEnqueue {
     fn payload(
         &self,
         source: EnqueueSource,
+        producer: Option<&str>,
         now: DateTime<Utc>,
-        origin: Option<&GhOrigin>,
+        github: Option<&GhOrigin>,
     ) -> Result<EnqueuePayload, ProducerError> {
         let mut pools = self.pools.clone();
         crate::poolset::canonicalize(&mut pools).map_err(|error| {
@@ -141,7 +225,7 @@ impl ProducerEnqueue {
         let argv = self
             .argv
             .iter()
-            .map(|argument| render_origin_template(argument, origin))
+            .map(|argument| render_origin_template(argument, github))
             .collect::<Result<Vec<_>, _>>()?;
         let cwd = self
             .cwd
@@ -152,7 +236,7 @@ impl ProducerEnqueue {
                         "producer cwd template must be valid UTF-8".to_owned(),
                     )
                 })?;
-                let rendered = render_origin_template(path, origin)?;
+                let rendered = render_origin_template(path, github)?;
                 let rendered = PathBuf::from(rendered);
                 validate_resolved_path(&rendered, "producer cwd")?;
                 Ok::<PathBuf, ProducerError>(rendered)
@@ -181,6 +265,11 @@ impl ProducerEnqueue {
             runtime_max_sec: self.runtime_max_sec,
             no_enqueue: self.no_enqueue,
             credentials: self.credentials.clone(),
+            origin: Some(match (producer, github) {
+                (Some(name), Some(github)) => AdmissionOrigin::github(name, github.clone()),
+                (Some(name), None) => AdmissionOrigin::producer(name, source),
+                (None, _) => AdmissionOrigin::direct(source),
+            }),
             caller_job_id: None,
             gh_trigger_actor: None,
             gh_self_actor: None,
@@ -2871,7 +2960,9 @@ impl<'a> ProducerEngine<'a> {
         let ProducerConfig::Calendar(config) = self.get(producer)? else {
             return Err(self.kind_mismatch(producer, "calendar"));
         };
-        let payload = config.enqueue.payload(EnqueueSource::Calendar, now, None)?;
+        let payload = config
+            .enqueue
+            .payload(EnqueueSource::Calendar, Some(producer), now, None)?;
         let name = format!("{producer}-calendar-{}{}", Uuid::new_v4(), INGRESS_SUFFIX);
         self.emit_named(&name, &payload)
     }
@@ -2893,9 +2984,10 @@ impl<'a> ProducerEngine<'a> {
             return Ok(EmitOutcome::Filtered { reason });
         }
         let origin = gh_origin(producer, config, observation);
-        let mut payload = config
-            .enqueue
-            .payload(EnqueueSource::Gh, now, Some(&origin))?;
+        let mut payload =
+            config
+                .enqueue
+                .payload(EnqueueSource::Gh, Some(producer), now, Some(&origin))?;
         payload.dedup_key = Some(gh_trigger_dedup_key(&origin)?);
         payload.gh_trigger_actor = Some(observation.trigger_actor.clone());
         payload.gh_self_actor = Some(observation.self_actor.clone());
@@ -3527,9 +3619,10 @@ impl<'a> ProducerEngine<'a> {
         {
             return Ok(EmitOutcome::Duplicate);
         }
-        let mut payload = config
-            .on_key
-            .payload(EnqueueSource::BuildEffect, now, None)?;
+        let mut payload =
+            config
+                .on_key
+                .payload(EnqueueSource::BuildEffect, Some(producer), now, None)?;
         payload.dedup_key = Some(dedup_key);
         let key = stable_key(&["build-effect", producer, &store_path]);
         self.emit_named(
@@ -3638,7 +3731,8 @@ impl<'a> ProducerEngine<'a> {
                 }
             };
             for (action, enqueue) in actions {
-                let payload = enqueue.payload(EnqueueSource::PoolReachability, now, None)?;
+                let payload =
+                    enqueue.payload(EnqueueSource::PoolReachability, Some(producer), now, None)?;
                 let name = format!(
                     "{producer}-reach-{}-{action}{INGRESS_SUFFIX}",
                     state.generation
@@ -3983,9 +4077,12 @@ fn gh_enqueue_preview(
     task_uuid: &str,
     now: DateTime<Utc>,
 ) -> Result<GhEnqueuePreview, ProducerError> {
-    let payload = config
-        .enqueue
-        .payload(EnqueueSource::Gh, now, Some(&origin))?;
+    let payload = config.enqueue.payload(
+        EnqueueSource::Gh,
+        Some(&origin.producer),
+        now,
+        Some(&origin),
+    )?;
     Ok(GhEnqueuePreview {
         task_uuid: task_uuid.to_owned(),
         argv: payload
@@ -6917,7 +7014,7 @@ mod tests {
         let events = temp.path().join("events");
         std::fs::create_dir(&events).unwrap();
         let payload = enqueue("from-file")
-            .payload(EnqueueSource::EventsDir, fixed_now(), None)
+            .payload(EnqueueSource::EventsDir, Some("events"), fixed_now(), None)
             .unwrap();
         std::fs::write(
             events.join("valid.json"),

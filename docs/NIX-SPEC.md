@@ -29,8 +29,8 @@ Both modules expose the same typed option tree.
 | `enable` | `bool` | `false` | Enable the daemon and module artifacts. |
 | `package` | `package` | this flake's `tally` | Combined CLI/daemon package. |
 | `installTallydSymlink` | `bool` | `true` | Include the `tallyd` argv-0 alias in the installed package. |
-| `dataDir` | `path` | module-specific | Witnesses, attestations, and TaskChampion data. |
-| `stateDir` | `path` | module-specific | Events, captures, exit records, epochs, and producer state. |
+| `dataDir` | `path` | module-specific | Witnesses, attestations, lifecycle/change logs, and TaskChampion data. |
+| `stateDir` | `path` | module-specific | Events, attempt captures, exit records, epochs, and producer runtime state. |
 | `journald.native` | `bool` | `false` | Emit native journal datagrams instead of JSON stdout events. |
 | `enqueue.depthCap` | positive integer | `3` | Maximum parent-to-child enqueue depth. |
 | `enqueue.fanoutCap` | positive integer | `64` | Maximum accepted children for one parent. |
@@ -126,6 +126,11 @@ remotely executed producer are worker-side paths.
 `kind` is required and accepts exactly `calendar`, `build-effect`, `pool-reachability`, `gh`, or
 `events-dir`. Missing and unknown discriminators produce named assertion messages. Every kind also
 has a `credentials` attribute set passed by reference to its generated Home Manager unit.
+
+Each dispatch records a bounded private runtime observation with last trigger,
+emission/outcome/error, and notifies the daemon's producer change stream when reachable.
+`tally query producers` joins those observations to the effective rendered registry; it is
+inventory only and cannot create, update, or remove declarative producers.
 
 ### `calendar`
 
@@ -259,6 +264,10 @@ duplicate, and unknown pool sets fail checked configuration with distinct errors
 
 `argv` remains an array through rendering and execution. There is no shell-string form.
 
+The dispatcher adds a versioned generic origin to every emitted payload. It contains the source
+and exact producer name/kind. A GitHub producer nests its captured GitHub identity beneath this
+origin. Origin metadata is durable row data; it does not duplicate or override the Nix registry.
+
 For a `gh` producer only, `argv` elements and `cwd` may use `${gh.field}` placeholders. The
 documented fields are `source`, `repo`, `repoName`, `number`, `url`, `type`, `headSha`, `nodeId`,
 `itemAuthor`, `triggerActor`, `selfActor`, `notificationReason`, `triggerKind`, `eventId`,
@@ -292,6 +301,7 @@ appended. Enqueues without `gateManifest` retain their existing witness bytes.
 | `argv` | list of strings | `[]` | Direct prefix for fresh execution. |
 | `resume` | null or list of strings | `null` | Direct template using `%<captureName>%`. |
 | `scrape` | attribute set of capture submodules | `{}` | Named capture extraction. |
+| `trace` | null or `{ stream, framing }` | `null` | Declared advisory provider transcript. |
 | `yieldHook` | null or list of strings | `null` | Direct cooperative checkpoint argv. |
 | `env` | attribute set of strings | `{}` | Non-reserved process environment. |
 | `launch` | launch-authorization submodule | `{}` | Closed per-job direct-argv authorization. |
@@ -300,6 +310,10 @@ appended. Enqueues without `gateManifest` retain their existing witness bytes.
 A scrape selects `stream = "stdout"` or `"stderr"`, `mode = "regex"` or `"jsonPath"`, and a
 nonempty `pattern`. Adapter environment names cannot begin with `TALLY_` and cannot replace
 `CREDENTIALS_DIRECTORY`.
+
+A trace selects `stream = "stdout"` or `"stderr"` and currently requires
+`framing = "json-lines"`. It is distinct from named scrape extraction. Only a declared trace is
+queryable, and every record remains advisory provider capture; shell stdout is not inferred.
 
 `launch` contains `allowPrePromptArgv`, optional `cwdArgv` using `%<cwd>%`, named
 `approvalPolicies` and `sandboxPolicies` maps to direct argv fragments, and optional `model` and
@@ -311,7 +325,8 @@ A resume template may bind the typed `%<cwd>%` value directly when a resumed CLI
 before its subcommand. The Codex preset uses this form to construct `codex -C <cwd> exec resume`.
 
 The preset names are `shell`, `pi`, `claude-code`, and `codex`. Their definitions live entirely in
-`nix/lib/adapters.nix`. In particular, the Codex fresh argv is frozen as:
+`nix/lib/adapters.nix`. Claude Code and Codex declare stdout JSONL traces; shell and pi do not.
+In particular, the Codex fresh argv is frozen as:
 
 ```json
 ["codex", "exec", "--json", "--"]
