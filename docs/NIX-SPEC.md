@@ -281,7 +281,9 @@ durable, queryable, and exported to the execution unit as `TALLY_WORKSPACE_REPO`
 `acceptancePolicy = "manual" | "execution-and-gates"` (default `manual`). The file itself is
 bounded, no-follow JSON with exactly `schemaVersion`, `artifact`, and `gates`. Gate entries have a
 unique ID, `status = "pass" | "fail" | "not-run"`, and optional command/reason; `not-run` requires
-a reason. Missing IDs and invalid manifests fail the gate summary.
+a reason. Missing IDs and invalid manifests fail the gate summary. A failed gate summary converts
+an otherwise `pass` evidence verdict to the canonical `failed` verdict before the witness is
+appended. Enqueues without `gateManifest` retain their existing witness bytes.
 
 ## 5. `adapters.<name>`
 
