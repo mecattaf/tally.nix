@@ -19,6 +19,7 @@ sha2.workspace = true
 taskchampion.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3.20"

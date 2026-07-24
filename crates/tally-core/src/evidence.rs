@@ -690,6 +690,8 @@ mod tests {
             lease_epoch: 1,
             dedup_key: Some(dedup_key.to_owned()),
             payload_hash: None,
+            brief_hash: None,
+            orchestration: None,
             labor_class: LaborClass::Fresh,
             trace_ref: None,
             pools: Some(vec!["gpu".to_owned()]),

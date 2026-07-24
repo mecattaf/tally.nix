@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::completion::SemanticCompletion;
+use crate::provenance::Orchestration;
 
 pub const GENESIS_PREV_HASH: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
@@ -58,6 +59,10 @@ pub struct WitnessRecord {
     pub dedup_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<Orchestration>,
     pub labor_class: LaborClass,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trace_ref: Option<String>,
@@ -95,6 +100,8 @@ pub struct WitnessBody {
     pub lease_epoch: u64,
     pub dedup_key: Option<String>,
     pub payload_hash: Option<String>,
+    pub brief_hash: Option<String>,
+    pub orchestration: Option<Orchestration>,
     pub labor_class: LaborClass,
     pub trace_ref: Option<String>,
     pub pools: Option<Vec<String>>,
@@ -212,6 +219,8 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
         lease_epoch: body.lease_epoch,
         dedup_key: body.dedup_key,
         payload_hash: body.payload_hash,
+        brief_hash: body.brief_hash,
+        orchestration: body.orchestration,
         labor_class: body.labor_class,
         trace_ref: body.trace_ref,
         pools,
@@ -275,6 +284,18 @@ fn validate_record(raw: &Value) -> Result<WitnessRecord, String> {
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     }) {
         return Err("payload_hash is not lowercase sha256 hex".to_owned());
+    }
+    if record.brief_hash.as_ref().is_some_and(|brief_hash| {
+        brief_hash.len() != 71
+            || !brief_hash.starts_with("sha256:")
+            || !brief_hash[7..]
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }) {
+        return Err("brief_hash is not lowercase sha256 hex".to_owned());
+    }
+    if let Some(orchestration) = &record.orchestration {
+        orchestration.validate()?;
     }
     if record.seq == 0 {
         return Err("seq missing or not a positive integer".to_owned());
@@ -889,6 +910,8 @@ mod tests {
             lease_epoch: 42,
             dedup_key: Some("ocr:paper-0001".to_owned()),
             payload_hash: None,
+            brief_hash: None,
+            orchestration: None,
             labor_class: LaborClass::Fresh,
             trace_ref: None,
             pools: Some(vec!["worker-gpu".to_owned()]),
@@ -946,6 +969,12 @@ mod tests {
         assert!(!serde_json::to_string(&record)
             .unwrap()
             .contains("\"payload_hash\""));
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains("\"brief_hash\""));
+        assert!(!serde_json::to_string(&record)
+            .unwrap()
+            .contains("\"orchestration\""));
     }
 
     #[test]
@@ -955,14 +984,26 @@ mod tests {
         assert!(!absent_json.contains("evidence_class"));
         assert!(!absent_json.contains("manifest_hash"));
         assert!(!absent_json.contains("payload_hash"));
+        assert!(!absent_json.contains("brief_hash"));
+        assert!(!absent_json.contains("orchestration"));
 
         let mut present_body = body();
         present_body.payload_hash = Some(format!("sha256:{}", "b".repeat(64)));
+        present_body.brief_hash = Some(format!("sha256:{}", "c".repeat(64)));
+        present_body.orchestration = Some(
+            serde_json::from_value(serde_json::json!({
+                "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+                "scriptHash": "sha256-script"
+            }))
+            .unwrap(),
+        );
         present_body.evidence_class = Some(Value::String("opaque/class".to_owned()));
         present_body.manifest_hash = Some(Value::String("urn:manifest:anything".to_owned()));
         let present = build_record(present_body, &ChainHead::default()).unwrap();
         let json = serde_json::to_string(&present).unwrap();
         assert!(json.find("payload_hash").unwrap() < json.find("labor_class").unwrap());
+        assert!(json.find("brief_hash").unwrap() < json.find("orchestration").unwrap());
+        assert!(json.find("orchestration").unwrap() < json.find("labor_class").unwrap());
         assert!(json.find("evidence_class").unwrap() < json.find("manifest_hash").unwrap());
         assert!(json.find("manifest_hash").unwrap() < json.find("\"seq\"").unwrap());
         let report = verify_reader(BufReader::new(json.as_bytes()));

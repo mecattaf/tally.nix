@@ -16,6 +16,7 @@ use crate::adapters::AdapterJobOptions;
 use crate::completion::GateManifestSpec;
 use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
+use crate::provenance::Orchestration;
 use crate::recovery::{RecoveryPlan, RecoveryRowState};
 use crate::witness::{read_verified_records, LaborClass, Verdict, WitnessError, WitnessRecord};
 
@@ -47,6 +48,8 @@ pub const TALLY_UDA_NAMES: &[&str] = &[
     "resumed_from",
     "dedup_key",
     "payload_hash",
+    "brief_hash",
+    "orchestration_json",
     "lease_epoch",
     "source",
     "priority_class",
@@ -869,6 +872,10 @@ pub struct RowSeed {
     pub dedup_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<Orchestration>,
     #[serde(default)]
     pub session_ref: Option<String>,
     pub lease_epoch: u64,
@@ -949,6 +956,20 @@ impl RowSeed {
             return Err(TaskDbError::InvalidSeed(
                 "payloadHash must be lowercase sha256 hex".to_owned(),
             ));
+        }
+        if self.brief_hash.as_ref().is_some_and(|brief_hash| {
+            brief_hash.len() != 71
+                || !brief_hash.starts_with("sha256:")
+                || !brief_hash[7..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err(TaskDbError::InvalidSeed(
+                "briefHash must be lowercase sha256 hex".to_owned(),
+            ));
+        }
+        if let Some(orchestration) = &self.orchestration {
+            orchestration.validate().map_err(TaskDbError::InvalidSeed)?;
         }
         if self.lease_epoch == 0 {
             return Err(TaskDbError::InvalidSeed(
@@ -1601,6 +1622,12 @@ fn populate_task(
     if let Some(payload_hash) = seed.payload_hash {
         attributes.insert("payload_hash", payload_hash);
     }
+    if let Some(brief_hash) = seed.brief_hash {
+        attributes.insert("brief_hash", brief_hash);
+    }
+    if let Some(orchestration) = seed.orchestration {
+        attributes.insert("orchestration_json", serde_json::to_string(&orchestration)?);
+    }
     if let Some(session_ref) = seed.session_ref {
         attributes.insert("session_ref", session_ref);
     }
@@ -1922,6 +1949,8 @@ mod tests {
             resumed_from: None,
             dedup_key: Some("ocr:paper-1".to_owned()),
             payload_hash: None,
+            brief_hash: None,
+            orchestration: None,
             session_ref: None,
             lease_epoch: 7,
             attempt: 1,
@@ -2171,6 +2200,15 @@ mod tests {
         row_seed.parent_uuid = Some(parent);
         let payload_hash = format!("sha256:{}", "c".repeat(64));
         row_seed.payload_hash = Some(payload_hash.clone());
+        let brief_hash = format!("sha256:{}", "d".repeat(64));
+        row_seed.brief_hash = Some(brief_hash.clone());
+        let orchestration: Orchestration = serde_json::from_value(serde_json::json!({
+            "flowRunId": "00000000-0000-4000-8000-000000000045",
+            "nodeOrdinal": 4,
+            "opaque": {"member": "worker-a"}
+        }))
+        .unwrap();
+        row_seed.orchestration = Some(orchestration.clone());
         let related_trigger = RelatedTrigger {
             producer: "github".to_owned(),
             event_id: "comment-42".to_owned(),
@@ -2197,6 +2235,12 @@ mod tests {
         assert_eq!(row.evidence().unwrap(), ["artifact:/work/paper.txt"]);
         assert_eq!(row.value("consumption_estimate"), Some("60"));
         assert_eq!(row.value("payload_hash"), Some(payload_hash.as_str()));
+        assert_eq!(row.value("brief_hash"), Some(brief_hash.as_str()));
+        assert_eq!(
+            serde_json::from_str::<Orchestration>(row.value("orchestration_json").unwrap())
+                .unwrap(),
+            orchestration
+        );
         assert_eq!(
             serde_json::from_str::<RelatedTrigger>(row.value("related_trigger_json").unwrap())
                 .unwrap(),

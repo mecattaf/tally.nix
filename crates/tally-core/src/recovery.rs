@@ -557,6 +557,18 @@ fn validate_history(
                 record.seq, row.uuid
             )));
         }
+        if record.brief_hash != row.brief_hash {
+            return Err(RecoveryError::InvalidFacts(format!(
+                "witness seq {} brief hash does not match durable row {}",
+                record.seq, row.uuid
+            )));
+        }
+        if record.orchestration != row.orchestration {
+            return Err(RecoveryError::InvalidFacts(format!(
+                "witness seq {} orchestration does not match durable row {}",
+                record.seq, row.uuid
+            )));
+        }
     }
     for retry in retries {
         let previous = history
@@ -1001,6 +1013,8 @@ mod tests {
             resumed_from: None,
             dedup_key: Some(format!("dedup:{uuid}")),
             payload_hash: None,
+            brief_hash: None,
+            orchestration: None,
             session_ref: None,
             lease_epoch,
             attempt: 1,
@@ -1042,6 +1056,8 @@ mod tests {
                         lease_epoch: *lease_epoch,
                         dedup_key: row.dedup_key.clone(),
                         payload_hash: row.payload_hash.clone(),
+                        brief_hash: row.brief_hash.clone(),
+                        orchestration: row.orchestration.clone(),
                         labor_class: if index == 0 {
                             LaborClass::Fresh
                         } else {

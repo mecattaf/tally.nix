@@ -16,6 +16,7 @@ use crate::adapters::AdapterJobOptions;
 use crate::completion::GateManifestSpec;
 use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
+use crate::provenance::Orchestration;
 use crate::taskdb::{
     gh_trigger_task_uuid, AdmissionOrigin, EnqueueSource, GhOrigin, RelatedTrigger,
     WorkspaceMetadata,
@@ -79,6 +80,8 @@ pub enum WireErrorCode {
     EpochChanged,
     #[serde(rename = "dedup-key-conflict")]
     DedupKeyConflict,
+    #[serde(rename = "flow-node-cap")]
+    FlowNodeCap,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -383,6 +386,10 @@ pub struct EnqueuePayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_manifest: Option<GateManifestSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_from: Option<String>,
     #[serde(default)]
     pub source: Option<EnqueueSource>,
@@ -390,6 +397,8 @@ pub struct EnqueuePayload {
     pub dedup_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<SubmissionOptions>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<Orchestration>,
     #[serde(default)]
     pub parent: Option<String>,
     #[serde(default)]
@@ -454,9 +463,11 @@ pub struct ResolvedEnqueue {
     pub workspace: Option<WorkspaceMetadata>,
     pub adapter_options: AdapterJobOptions,
     pub gate_manifest: Option<GateManifestSpec>,
+    pub brief_hash: Option<String>,
     pub resume_from: Option<String>,
     pub source: EnqueueSource,
     pub dedup_key: Option<String>,
+    pub orchestration: Option<Orchestration>,
     pub parent: Option<String>,
     pub evidence: Vec<String>,
     pub evidence_class: Option<Value>,
@@ -498,6 +509,8 @@ struct CanonicalPayload<'a> {
     runtime_max_sec: Option<u64>,
     no_enqueue: bool,
     credentials: &'a BTreeMap<String, PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    brief_hash: Option<&'a str>,
 }
 
 pub fn canonical_payload(resolved: &ResolvedEnqueue) -> Result<Vec<u8>, serde_json::Error> {
@@ -516,6 +529,7 @@ pub fn canonical_payload(resolved: &ResolvedEnqueue) -> Result<Vec<u8>, serde_js
         runtime_max_sec: resolved.runtime_max_sec,
         no_enqueue: resolved.no_enqueue,
         credentials: &resolved.credentials,
+        brief_hash: resolved.brief_hash.as_deref(),
     })
 }
 
@@ -528,8 +542,9 @@ pub fn canonical_payload_hash(resolved: &ResolvedEnqueue) -> Result<String, serd
 pub struct ParentInfo {
     pub parent_uuid: String,
     pub depth: u32,
-    pub children: u32,
+    pub outstanding: u32,
     pub no_enqueue: bool,
+    pub terminal: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -576,17 +591,39 @@ impl GuardrailState {
         self.parents.get(job_id)
     }
 
-    pub fn rollback_child_charge(&mut self, job_id: &str) -> Result<(), WireError> {
-        let info = self
+    pub fn parent_count(&self) -> usize {
+        self.parents.len()
+    }
+
+    pub fn retire_parent(&mut self, job_id: &str) {
+        if self
             .parents
-            .get_mut(job_id)
-            .ok_or_else(|| WireError::not_found(format!("unknown parent job {job_id}")))?;
-        info.children = info.children.checked_sub(1).ok_or_else(|| {
-            WireError::new(
-                WireErrorCode::Internal,
-                format!("parent job {job_id} has no child charge to roll back"),
-            )
-        })?;
+            .get(job_id)
+            .is_some_and(|info| info.outstanding == 0)
+        {
+            self.parents.remove(job_id);
+        } else if let Some(info) = self.parents.get_mut(job_id) {
+            info.terminal = true;
+        }
+    }
+
+    pub fn rollback_child_charge(&mut self, job_id: &str) -> Result<(), WireError> {
+        let remove = {
+            let info = self
+                .parents
+                .get_mut(job_id)
+                .ok_or_else(|| WireError::not_found(format!("unknown parent job {job_id}")))?;
+            info.outstanding = info.outstanding.checked_sub(1).ok_or_else(|| {
+                WireError::new(
+                    WireErrorCode::Internal,
+                    format!("parent job {job_id} has no outstanding child charge"),
+                )
+            })?;
+            info.terminal && info.outstanding == 0
+        };
+        if remove {
+            self.parents.remove(job_id);
+        }
         Ok(())
     }
 
@@ -595,13 +632,13 @@ impl GuardrailState {
             .parents
             .get_mut(job_id)
             .ok_or_else(|| WireError::not_found(format!("unknown parent job {job_id}")))?;
-        if info.children >= self.config.fanout_cap {
+        if info.outstanding >= self.config.fanout_cap {
             return Err(WireError::invalid(format!(
                 "parent fanout would exceed fanoutCap {}",
                 self.config.fanout_cap
             )));
         }
-        info.children += 1;
+        info.outstanding += 1;
         Ok(())
     }
 
@@ -765,6 +802,11 @@ impl GuardrailState {
             let info = self.parents.get_mut(&caller_job_id).ok_or_else(|| {
                 WireError::not_found(format!("unknown parent job {caller_job_id}"))
             })?;
+            if info.terminal {
+                return Err(WireError::not_found(format!(
+                    "parent job {caller_job_id} is terminal"
+                )));
+            }
             if info.no_enqueue {
                 return Err(WireError::invalid(format!(
                     "job {caller_job_id} carries the noEnqueue capability"
@@ -787,7 +829,7 @@ impl GuardrailState {
                     self.config.depth_cap
                 )));
             }
-            if !full_submission && info.children >= self.config.fanout_cap {
+            if !full_submission && info.outstanding >= self.config.fanout_cap {
                 return Err(WireError::invalid(format!(
                     "parent fanout would exceed fanoutCap {}",
                     self.config.fanout_cap
@@ -795,7 +837,7 @@ impl GuardrailState {
             }
             parent = Some(info.parent_uuid.clone());
             if !full_submission {
-                info.children += 1;
+                info.outstanding += 1;
             }
         }
 
@@ -811,9 +853,11 @@ impl GuardrailState {
                 .adapter_options
                 .unwrap_or_else(|| defaults.adapter_options.clone()),
             gate_manifest: payload.gate_manifest,
+            brief_hash: None,
             resume_from: payload.resume_from,
             source,
             dedup_key: payload.dedup_key,
+            orchestration: payload.orchestration,
             parent,
             evidence,
             evidence_class: payload.evidence_class,
@@ -1049,10 +1093,13 @@ mod tests {
             workspace: None,
             adapter_options: None,
             gate_manifest: None,
+            brief: None,
+            brief_path: None,
             resume_from: None,
             source: None,
             dedup_key: Some("child-1".to_owned()),
             submission: None,
+            orchestration: None,
             parent: None,
             evidence: Vec::new(),
             evidence_class: None,
@@ -1085,8 +1132,9 @@ mod tests {
             ParentInfo {
                 parent_uuid: "task-parent".to_owned(),
                 depth: 1,
-                children: 0,
+                outstanding: 0,
                 no_enqueue: false,
+                terminal: false,
             },
         );
         let mut payload = child_payload();
@@ -1163,8 +1211,9 @@ mod tests {
             ParentInfo {
                 parent_uuid: "task-parent".to_owned(),
                 depth: 1,
-                children: 0,
+                outstanding: 0,
                 no_enqueue: false,
+                terminal: false,
             },
         );
         let mut missing_dedup = child_payload();
@@ -1189,8 +1238,9 @@ mod tests {
             ParentInfo {
                 parent_uuid: "task-deep".to_owned(),
                 depth: 2,
-                children: 0,
+                outstanding: 0,
                 no_enqueue: false,
+                terminal: false,
             },
         );
         let mut deep = child_payload();
@@ -1207,8 +1257,9 @@ mod tests {
             ParentInfo {
                 parent_uuid: "task-advisory".to_owned(),
                 depth: 0,
-                children: 0,
+                outstanding: 0,
                 no_enqueue: true,
+                terminal: false,
             },
         );
         let mut advisory = child_payload();
@@ -1259,15 +1310,16 @@ mod tests {
             ParentInfo {
                 parent_uuid: "task-parent".to_owned(),
                 depth: 0,
-                children: 0,
+                outstanding: 0,
                 no_enqueue: false,
+                terminal: false,
             },
         );
 
         let mut malformed = child_payload();
         malformed.evidence = vec!["hash:sha256:short".to_owned()];
         assert!(state.validate_enqueue(malformed, &defaults()).is_err());
-        assert_eq!(state.parent("job-parent").unwrap().children, 0);
+        assert_eq!(state.parent("job-parent").unwrap().outstanding, 0);
 
         let mut valid = child_payload();
         valid.evidence = vec![
@@ -1284,9 +1336,9 @@ mod tests {
                 "exit:0",
             ]
         );
-        assert_eq!(state.parent("job-parent").unwrap().children, 1);
+        assert_eq!(state.parent("job-parent").unwrap().outstanding, 1);
         state.rollback_child_charge("job-parent").unwrap();
-        assert_eq!(state.parent("job-parent").unwrap().children, 0);
+        assert_eq!(state.parent("job-parent").unwrap().outstanding, 0);
         state
             .validate_enqueue(child_payload(), &defaults())
             .expect("a failed post-validation admission can return its fanout charge");
@@ -1373,10 +1425,29 @@ mod tests {
         metadata_only.consumption_estimate = Some(1);
         metadata_only.resume_from = Some("00000000-0000-4000-8000-000000000002".to_owned());
         metadata_only.task_uuid = Some("00000000-0000-4000-8000-000000000003".to_owned());
+        metadata_only.orchestration = Some(
+            serde_json::from_value(serde_json::json!({
+                "flowRunId": "00000000-0000-4000-8000-000000000004",
+                "maxNodes": 9,
+                "opaque": {"member": "worker-a"}
+            }))
+            .unwrap(),
+        );
         metadata_only.depth = 3;
         metadata_only.wait = false;
         assert_eq!(
             canonical_payload_hash(&metadata_only).unwrap(),
+            canonical_payload_hash(&resolved).unwrap()
+        );
+
+        let mut brief_work = resolved.clone();
+        brief_work.brief_hash = Some(format!("sha256:{}", "a".repeat(64)));
+        let brief_canonical = String::from_utf8(canonical_payload(&brief_work).unwrap()).unwrap();
+        assert!(
+            brief_canonical.ends_with(&format!(r#","briefHash":"sha256:{}"}}"#, "a".repeat(64)))
+        );
+        assert_ne!(
+            canonical_payload_hash(&brief_work).unwrap(),
             canonical_payload_hash(&resolved).unwrap()
         );
 
@@ -1400,8 +1471,9 @@ mod tests {
             ParentInfo {
                 parent_uuid: "task-parent".to_owned(),
                 depth: 0,
-                children: 1,
+                outstanding: 1,
                 no_enqueue: false,
+                terminal: false,
             },
         );
         let mut payload = child_payload();
@@ -1410,7 +1482,7 @@ mod tests {
         });
         let resolved = state.validate_enqueue(payload, &defaults()).unwrap();
         assert_eq!(resolved.parent.as_deref(), Some("task-parent"));
-        assert_eq!(state.parent("job-parent").unwrap().children, 1);
+        assert_eq!(state.parent("job-parent").unwrap().outstanding, 1);
         assert!(state.charge_child("job-parent").is_err());
     }
 }

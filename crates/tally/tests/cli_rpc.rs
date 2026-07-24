@@ -97,6 +97,7 @@ impl RpcHandler for CliHandler {
                     assert_eq!(params["source"], "calendar");
                     assert_eq!(params["origin"], "nightly");
                     assert_eq!(params["parent"], "parent-24");
+                    assert_eq!(params["flowRun"], "00000000-0000-4000-8000-000000000045");
                     assert_eq!(params["session"], "session-24");
                     assert_eq!(params["since"], "2026-07-24T00:00:00Z");
                     assert_eq!(params["until"], "2026-07-25T00:00:00Z");
@@ -397,6 +398,8 @@ async fn query_v3_cli_forwards_all_durable_observability_commands() {
                         "nightly",
                         "--parent",
                         "parent-24",
+                        "--flow-run",
+                        "00000000-0000-4000-8000-000000000045",
                         "--session",
                         "session-24",
                         "--since",

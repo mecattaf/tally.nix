@@ -32,6 +32,8 @@ async fn stock_taskwarrior_reads_the_in_process_replica() {
             resumed_from: None,
             dedup_key: Some("stock-viewer-1".to_owned()),
             payload_hash: None,
+            brief_hash: None,
+            orchestration: None,
             session_ref: None,
             lease_epoch: 1,
             attempt: 1,

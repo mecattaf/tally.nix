@@ -254,10 +254,13 @@ impl ProducerEnqueue {
             adapter_options: (!self.adapter_options.is_default())
                 .then(|| self.adapter_options.clone()),
             gate_manifest: self.gate_manifest.clone(),
+            brief: None,
+            brief_path: None,
             resume_from: None,
             source: Some(source),
             dedup_key,
             submission: None,
+            orchestration: None,
             parent: None,
             evidence: self.evidence.clone(),
             evidence_class: self.evidence_class.clone(),

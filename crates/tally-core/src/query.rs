@@ -8,6 +8,7 @@ use thiserror::Error;
 
 use crate::completion::{GateSummaryStatus, SemanticCompletion};
 use crate::journal::{JournalEntry, TallyEvent};
+use crate::provenance::Orchestration;
 use crate::taskdb::{GhOrigin, RelatedTrigger, TaskRow, WorkspaceMetadata};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
@@ -47,6 +48,12 @@ impl GhOriginProjection {
 pub struct RowFact {
     pub task_uuid: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<Orchestration>,
     pub status: RowStatus,
     pub priority: String,
     #[serde(
@@ -84,6 +91,11 @@ impl From<&TaskRow> for RowFact {
         Self {
             task_uuid: row.uuid.to_string(),
             description: row.description.clone(),
+            argv: row.argv().unwrap_or_default(),
+            brief_hash: row.value("brief_hash").map(ToOwned::to_owned),
+            orchestration: row
+                .value("orchestration_json")
+                .and_then(|value| serde_json::from_str(value).ok()),
             status: match row.status {
                 Status::Pending => RowStatus::Pending,
                 Status::Completed => RowStatus::Completed,
@@ -314,6 +326,12 @@ pub struct JobProjection {
     pub anchor: String,
     pub task_uuid: Option<String>,
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub orchestration: Option<Orchestration>,
     #[serde(
         rename = "pool",
         serialize_with = "crate::poolset::serialize_optional",
@@ -381,6 +399,9 @@ fn project_job_details(
                     anchor: row.task_uuid.clone(),
                     task_uuid: Some(row.task_uuid.clone()),
                     description: Some(row.description.clone()),
+                    argv: Some(row.argv.clone()),
+                    brief_hash: row.brief_hash.clone(),
+                    orchestration: row.orchestration.clone(),
                     pools: row.pools.clone(),
                     executor: row.executor.clone(),
                     source: row.source.clone(),
@@ -415,6 +436,9 @@ fn project_job_details(
                 anchor: anchor.clone(),
                 task_uuid: Some(anchor),
                 description: None,
+                argv: None,
+                brief_hash: None,
+                orchestration: None,
                 pools: None,
                 executor: None,
                 source: None,
@@ -475,6 +499,9 @@ fn project_job_details(
                 anchor: anchor.clone(),
                 task_uuid: record.task_uuid.clone(),
                 description: None,
+                argv: None,
+                brief_hash: record.brief_hash.clone(),
+                orchestration: record.orchestration.clone(),
                 pools: None,
                 executor: record.executor.clone(),
                 source: None,
@@ -512,6 +539,11 @@ fn project_job_details(
         job.output.task_uuid = record.task_uuid.clone();
         job.output.pools = record.pools.clone().or(job.output.pools.take());
         job.output.executor = record.executor.clone().or(job.output.executor.take());
+        job.output.brief_hash = record.brief_hash.clone().or(job.output.brief_hash.take());
+        job.output.orchestration = record
+            .orchestration
+            .clone()
+            .or(job.output.orchestration.take());
         job.output.session_ref = record.trace_ref.clone().or(job.output.session_ref.take());
         job.output.model = record.model.clone().or(job.output.model.take());
         job.output.state = "terminal".to_owned();
@@ -1080,6 +1112,9 @@ mod tests {
         RowFact {
             task_uuid: task.to_owned(),
             description: format!("job {task}"),
+            argv: vec![format!("run-{task}")],
+            brief_hash: None,
+            orchestration: None,
             status: RowStatus::Pending,
             priority: "H".to_owned(),
             pools: Some(vec!["gpu".to_owned()]),
@@ -1141,6 +1176,8 @@ mod tests {
             lease_epoch: 7,
             dedup_key: None,
             payload_hash: None,
+            brief_hash: None,
+            orchestration: None,
             labor_class: labor,
             trace_ref: None,
             pools: Some(vec!["gpu".to_owned()]),

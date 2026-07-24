@@ -13,12 +13,14 @@ use std::time::Duration;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 pub use taskchampion::Uuid;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::watch;
 
+use crate::brief::{self, PreparedBrief};
 use crate::completion::{evaluate_completion, ExecutionFact, GateManifestSpec, SemanticCompletion};
 use crate::config::{ExecutionTargetConfig, Priority, SshExecutorConfig};
 use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOutcome};
@@ -28,7 +30,7 @@ pub const CAPTURE_DIRECTORY: &str = "capture";
 pub const CAPTURE_ARCHIVE_DIRECTORY: &str = "capture/archive";
 pub const UNIT_EXIT_DIRECTORY: &str = "unit-exit";
 pub const UNIT_EXIT_SCHEMA_VERSION: u32 = 2;
-const OPTIONAL_TALLY_ENVIRONMENT: [&str; 10] = [
+const OPTIONAL_TALLY_ENVIRONMENT: [&str; 11] = [
     "TALLY_TASK_UUID",
     "TALLY_PARENT",
     "TALLY_NO_ENQUEUE",
@@ -39,6 +41,7 @@ const OPTIONAL_TALLY_ENVIRONMENT: [&str; 10] = [
     "TALLY_WORKSPACE_BASE_REV",
     "TALLY_WORKSPACE_BRANCH",
     "TALLY_WORKSPACE_PATH",
+    "TALLY_BRIEF",
 ];
 const GH_TALLY_ENVIRONMENT: [&str; 11] = [
     "TALLY_GH_REPO",
@@ -97,6 +100,14 @@ pub struct ExecutionRequest {
     pub environment: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gh_origin: Option<GhOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_path: Option<PathBuf>,
+    /// Canonical brief content crosses the fixed remote-executor protocol only
+    /// long enough for the worker to materialize its own content-addressed copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_document: Option<Value>,
     pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceMetadata>,
@@ -369,7 +380,7 @@ impl LocalUnitFact {
 }
 
 pub const REMOTE_EXECUTOR_PROTOCOL_VERSION: u32 = 2;
-const MAX_REMOTE_REQUEST_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_REMOTE_REQUEST_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_REMOTE_REPLY_BYTES: usize = 48 * 1024 * 1024;
 const MAX_REMOTE_STDERR_BYTES: usize = 64 * 1024;
 const MAX_REMOTE_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
@@ -1294,6 +1305,55 @@ impl Executor {
             .join(format!("{}.json", identity.unit_uuid()))
     }
 
+    pub fn brief_path(&self, hash: &str) -> Result<PathBuf, ExecutorError> {
+        brief::content_path(&self.state_dir, hash)
+            .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))
+    }
+
+    fn materialize_brief(&self, request: &mut ExecutionRequest) -> Result<(), ExecutorError> {
+        let Some(hash) = request.brief_hash.as_deref() else {
+            return Ok(());
+        };
+        if let Some(document) = request.brief_document.take() {
+            let prepared = PreparedBrief::from_value(document)
+                .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+            if prepared.hash() != hash {
+                return Err(ExecutorError::InvalidRequest(format!(
+                    "execution brief hashes to {}, expected {hash}",
+                    prepared.hash()
+                )));
+            }
+            create_private_directory(&self.state_dir)?;
+            request.brief_path = Some(
+                brief::store(&self.state_dir, &prepared)
+                    .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?,
+            );
+        } else {
+            let path = request.brief_path.as_ref().ok_or_else(|| {
+                ExecutorError::InvalidRequest(
+                    "briefHash requires briefPath or briefDocument".to_owned(),
+                )
+            })?;
+            brief::read_verified(path, hash)
+                .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn embed_brief_for_remote(&self, request: &mut ExecutionRequest) -> Result<(), ExecutorError> {
+        let Some(hash) = request.brief_hash.as_deref() else {
+            return Ok(());
+        };
+        let path = request.brief_path.as_ref().ok_or_else(|| {
+            ExecutorError::InvalidRequest("remote briefHash requires briefPath".to_owned())
+        })?;
+        let prepared = brief::read_verified(path, hash)
+            .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+        request.brief_document = Some(prepared.document().clone());
+        request.brief_path = None;
+        Ok(())
+    }
+
     pub fn capture_generation_matches(
         &self,
         identity: &ExecutionIdentity,
@@ -1725,12 +1785,14 @@ impl Executor {
     pub async fn execute_on(
         &self,
         executor: Option<&str>,
-        request: ExecutionRequest,
+        mut request: ExecutionRequest,
         evidence: Vec<String>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
         let Some(name) = executor else {
             return self.execute(request).await;
         };
+        self.validate_request(&request)?;
+        self.embed_brief_for_remote(&mut request)?;
         self.validate_request(&request)?;
         parse_evidence_specs(&evidence)
             .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
@@ -2061,8 +2123,10 @@ impl Executor {
 
     pub async fn execute(
         &self,
-        request: ExecutionRequest,
+        mut request: ExecutionRequest,
     ) -> Result<ExecutionOutcome, ExecutorError> {
+        self.validate_request(&request)?;
+        self.materialize_brief(&mut request)?;
         self.validate_request(&request)?;
         let observed = self.inspect_identity_async(&request.identity).await?;
         let absent_without_exit = match observed.state {
@@ -2329,6 +2393,38 @@ impl Executor {
             return Err(ExecutorError::InvalidRequest(
                 "tally socket must be non-empty and contain no NUL bytes".to_owned(),
             ));
+        }
+        match (
+            request.brief_hash.as_deref(),
+            request.brief_path.as_deref(),
+            request.brief_document.as_ref(),
+        ) {
+            (None, None, None) => {}
+            (Some(hash), Some(path), None) => {
+                brief::content_path(&self.state_dir, hash)
+                    .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+                if !path.is_absolute() {
+                    return Err(ExecutorError::InvalidRequest(
+                        "briefPath must be absolute".to_owned(),
+                    ));
+                }
+                validate_systemd_path(path, "brief path")?;
+            }
+            (Some(hash), None, Some(document)) => {
+                let prepared = PreparedBrief::from_value(document.clone())
+                    .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
+                if prepared.hash() != hash {
+                    return Err(ExecutorError::InvalidRequest(format!(
+                        "briefDocument hashes to {}, expected {hash}",
+                        prepared.hash()
+                    )));
+                }
+            }
+            _ => {
+                return Err(ExecutorError::InvalidRequest(
+                    "briefHash requires exactly one of briefPath or briefDocument".to_owned(),
+                ));
+            }
         }
         for (name, value) in &request.environment {
             if !valid_environment_name(name)
@@ -2711,6 +2807,9 @@ fn execution_environment(
     if let Some(socket) = &request.tally_socket {
         environment.push(("TALLY_SOCKET".to_owned(), socket.clone()));
     }
+    if let Some(path) = &request.brief_path {
+        environment.push(("TALLY_BRIEF".to_owned(), display_path(path)?.to_owned()));
+    }
     if let Some(workspace) = &request.workspace {
         environment.extend([
             ("TALLY_WORKSPACE_REPO".to_owned(), workspace.repo.clone()),
@@ -2804,7 +2903,10 @@ fn environment_to_unset(request: &ExecutionRequest) -> Vec<&'static str> {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[5]);
     }
     if request.workspace.is_none() {
-        names.extend(OPTIONAL_TALLY_ENVIRONMENT[6..].iter().copied());
+        names.extend(OPTIONAL_TALLY_ENVIRONMENT[6..10].iter().copied());
+    }
+    if request.brief_path.is_none() {
+        names.push(OPTIONAL_TALLY_ENVIRONMENT[10]);
     }
     if request
         .gh_origin
@@ -3682,6 +3784,9 @@ mod tests {
             tally_socket: Some("/run/user/1000/tally.sock".to_owned()),
             environment: BTreeMap::from([("ADAPTER_COLOR".to_owned(), "never".to_owned())]),
             gh_origin: None,
+            brief_hash: None,
+            brief_path: None,
+            brief_document: None,
             cwd: Some(PathBuf::from("/work tree")),
             workspace: None,
             gate_manifest: None,
@@ -4227,6 +4332,41 @@ mod tests {
         assert!(multi_environment
             .iter()
             .any(|(name, value)| { name == "TALLY_POOL" && value == r#"["alpha","zeta"]"# }));
+    }
+
+    #[test]
+    fn transported_brief_materializes_privately_and_provisions_exact_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("remote-state");
+        let executor = executor(&state_dir);
+        let document = serde_json::json!({
+            "mission": "execute remotely",
+            "acceptance": ["TALLY_BRIEF is durable"]
+        });
+        let prepared = PreparedBrief::from_value(document.clone()).unwrap();
+        let mut request = request();
+        request.brief_hash = Some(prepared.hash().to_owned());
+        request.brief_document = Some(document);
+
+        executor.materialize_brief(&mut request).unwrap();
+        assert!(request.brief_document.is_none());
+        let path = request.brief_path.as_ref().unwrap();
+        assert_eq!(
+            path,
+            &brief::content_path(&state_dir, prepared.hash()).unwrap()
+        );
+        assert_eq!(
+            brief::read_verified(path, prepared.hash()).unwrap(),
+            prepared
+        );
+        assert_eq!(
+            std::fs::metadata(&state_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let environment = execution_environment(&request, None).unwrap();
+        assert!(environment
+            .iter()
+            .any(|(name, value)| name == "TALLY_BRIEF" && value == &path.to_string_lossy()));
     }
 
     #[test]
@@ -5437,6 +5577,9 @@ mod tests {
             tally_socket: None,
             environment: BTreeMap::new(),
             gh_origin: None,
+            brief_hash: None,
+            brief_path: None,
+            brief_document: None,
             cwd: None,
             workspace: None,
             gate_manifest: None,

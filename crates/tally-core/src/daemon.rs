@@ -26,6 +26,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tokio::task::{JoinHandle, JoinSet, LocalSet};
 
 use crate::adapters::{AdapterEngine, AdapterError, AdapterInvocation, ScrapeResult};
+use crate::brief::{self, PreparedBrief};
 use crate::completion::{
     evaluate_completion, ExecutionFact, GateSummaryStatus, SemanticCompletion,
 };
@@ -50,6 +51,7 @@ use crate::producers::{
     acknowledged_ingress_ids, archive_ingress_claim, claim_ingress_files, read_ingress_payload,
     GhCliMutationSink, IngressOutcome, ProducerEngine, ReachabilityTransition,
 };
+use crate::provenance::DEFAULT_FLOW_MAX_NODES;
 use crate::query::{
     query_pools, query_render, query_standup, query_status, JobProjection, PoolHeadroomFact,
     RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
@@ -84,6 +86,7 @@ use crate::witness::{
 
 const LEASE_TICK: Duration = Duration::from_millis(100);
 const MAX_METER_EVENT_BYTES: u64 = 64 * 1024;
+const UNCLAIMED_DRAIN_BARRIER_LIMIT: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct DaemonPaths {
@@ -107,6 +110,10 @@ impl DaemonPaths {
 
     pub fn lifecycle_path(&self) -> PathBuf {
         self.data_dir.join(crate::history::LIFECYCLE_FILE)
+    }
+
+    pub fn brief_path(&self, hash: &str) -> Result<PathBuf, crate::brief::BriefError> {
+        brief::content_path(&self.data_dir, hash)
     }
 }
 
@@ -243,7 +250,6 @@ pub struct BarrierTracker {
     namespace: u64,
     next: u64,
     barriers: HashMap<String, BarrierEntry>,
-    job_results: HashMap<String, Value>,
     job_waiters: HashMap<String, Vec<oneshot::Sender<Value>>>,
 }
 
@@ -256,36 +262,25 @@ impl BarrierTracker {
     }
 
     pub fn register_job(&mut self, stable_job_key: &str, attempt: u32) -> String {
-        let barrier = format!("barrier:{stable_job_key}:{attempt}");
-        let entry = self.barriers.entry(barrier.clone()).or_default();
-        self.job_results.remove(stable_job_key);
-        entry.results.remove(stable_job_key);
-        entry.pending.insert(stable_job_key.to_owned());
-        barrier
+        self.prune_closed_waiters();
+        format!("barrier:{stable_job_key}:{attempt}")
     }
 
     pub fn snapshot(&mut self, jobs: impl IntoIterator<Item = String>) -> String {
+        self.prune_closed_waiters();
         self.next = self.next.saturating_add(1);
         let barrier = format!("barrier:drain:{}:{}", self.namespace, self.next);
         let mut entry = BarrierEntry::default();
         for job in jobs {
-            if let Some(result) = self.job_results.get(&job) {
-                entry.results.insert(job, result.clone());
-            } else {
-                entry.pending.insert(job);
-            }
+            entry.pending.insert(job);
         }
         self.barriers.insert(barrier.clone(), entry);
+        self.prune_unclaimed_barriers();
         barrier
     }
 
-    pub fn restore_job_result(&mut self, stable_job_key: String, value: Value) {
-        self.complete_job(&stable_job_key, value);
-    }
-
     fn complete_job(&mut self, stable_job_key: &str, value: Value) {
-        self.job_results
-            .insert(stable_job_key.to_owned(), value.clone());
+        self.prune_closed_waiters();
         if let Some(waiters) = self.job_waiters.remove(stable_job_key) {
             for waiter in waiters {
                 let _ = waiter.send(value.clone());
@@ -304,19 +299,22 @@ impl BarrierTracker {
             }
         }
         for barrier in completed {
-            if let Some(entry) = self.barriers.get_mut(&barrier) {
+            if let Some(mut entry) = self.barriers.remove(&barrier) {
                 let result = barrier_value(&barrier, &entry.results);
-                for waiter in std::mem::take(&mut entry.waiters) {
-                    let _ = waiter.send(result.clone());
+                if entry.waiters.is_empty() {
+                    self.barriers.insert(barrier, entry);
+                } else {
+                    for waiter in std::mem::take(&mut entry.waiters) {
+                        let _ = waiter.send(result.clone());
+                    }
                 }
             }
         }
+        self.prune_unclaimed_barriers();
     }
 
     fn wait_job(&mut self, stable_job_key: &str) -> WaitRegistration {
-        if let Some(result) = self.job_results.get(stable_job_key) {
-            return WaitRegistration::Ready(result.clone());
-        }
+        self.prune_closed_waiters();
         let (sender, receiver) = oneshot::channel();
         self.job_waiters
             .entry(stable_job_key.to_owned())
@@ -325,20 +323,67 @@ impl BarrierTracker {
         WaitRegistration::Pending(receiver)
     }
 
-    fn wait_barrier(&mut self, barrier: &str) -> Result<WaitRegistration, WireError> {
-        let entry = self
+    fn prune_closed_waiters(&mut self) {
+        self.job_waiters.retain(|_, waiters| {
+            waiters.retain(|waiter| !waiter.is_closed());
+            !waiters.is_empty()
+        });
+        for entry in self.barriers.values_mut() {
+            entry.waiters.retain(|waiter| !waiter.is_closed());
+        }
+    }
+
+    fn prune_unclaimed_barriers(&mut self) {
+        let mut unclaimed = self
             .barriers
-            .get_mut(barrier)
-            .ok_or_else(|| WireError::not_found(format!("unknown barrier {barrier}")))?;
-        if entry.pending.is_empty() {
+            .iter()
+            .filter(|(_, entry)| entry.waiters.is_empty())
+            .map(|(barrier, _)| {
+                let sequence = barrier
+                    .rsplit(':')
+                    .next()
+                    .and_then(|sequence| sequence.parse::<u64>().ok())
+                    .unwrap_or(0);
+                (sequence, barrier.clone())
+            })
+            .collect::<Vec<_>>();
+        unclaimed.sort_by_key(|(sequence, _)| *sequence);
+        let remove_count = unclaimed
+            .len()
+            .saturating_sub(UNCLAIMED_DRAIN_BARRIER_LIMIT);
+        for (_, barrier) in unclaimed.into_iter().take(remove_count) {
+            self.barriers.remove(&barrier);
+        }
+    }
+
+    fn wait_barrier(&mut self, barrier: &str) -> Result<WaitRegistration, WireError> {
+        self.prune_closed_waiters();
+        if self
+            .barriers
+            .get(barrier)
+            .is_some_and(|entry| entry.pending.is_empty())
+        {
+            let entry = self
+                .barriers
+                .remove(barrier)
+                .expect("the completed barrier was just observed");
             return Ok(WaitRegistration::Ready(barrier_value(
                 barrier,
                 &entry.results,
             )));
         }
+        let entry = self
+            .barriers
+            .get_mut(barrier)
+            .ok_or_else(|| WireError::not_found(format!("unknown barrier {barrier}")))?;
         let (sender, receiver) = oneshot::channel();
         entry.waiters.push(sender);
         Ok(WaitRegistration::Pending(receiver))
+    }
+
+    #[cfg(test)]
+    fn retained_entry_count(&self) -> usize {
+        self.barriers.len() + self.job_waiters.values().map(Vec::len).sum::<usize>()
     }
 }
 
@@ -590,6 +635,7 @@ struct DaemonHandler {
     pool_transition_sweep: Rc<Mutex<()>>,
     gh_program: PathBuf,
     tally_socket: String,
+    brief_root: PathBuf,
 }
 
 impl RpcHandler for DaemonHandler {
@@ -778,13 +824,13 @@ impl DaemonHandler {
             .validate_admission(&request)
             .map_err(lease_wire)?;
 
-        let parent_charge = row.payload_hash.is_some()
-            && row.parent_uuid.is_some()
+        let parent_charge = row.parent_uuid.is_some()
             && context
                 .guardrail_depths
                 .get(&task_uuid)
                 .is_some_and(|depth| *depth > 0);
         if let Some(parent_uuid) = row.parent_uuid.filter(|_| parent_charge) {
+            ensure_guardrail_parent(&mut context, &parent_uuid.to_string(), true)?;
             context.guardrails.charge_child(&parent_uuid.to_string())?;
         }
 
@@ -865,22 +911,22 @@ impl DaemonHandler {
                 .values()
                 .filter(|child| child.parent_uuid == Some(task_uuid))
                 .filter(|child| {
-                    child.payload_hash.is_none()
-                        || context
-                            .jobs
-                            .get(&child.uuid)
-                            .is_some_and(|job| job.state != JobState::Completed)
+                    context
+                        .jobs
+                        .get(&child.uuid)
+                        .is_some_and(|job| job.state != JobState::Completed)
                 })
                 .count();
-            let children = u32::try_from(child_count)
+            let outstanding = u32::try_from(child_count)
                 .map_err(|_| internal_wire("retry child guardrail count overflow"))?;
             context.guardrails.register_parent(
                 stable_key.clone(),
                 ParentInfo {
                     parent_uuid: stable_key.clone(),
                     depth: guardrail_depth,
-                    children,
+                    outstanding,
                     no_enqueue: row.no_enqueue,
+                    terminal: false,
                 },
             );
         }
@@ -897,6 +943,7 @@ impl DaemonHandler {
                 stable_key.clone(),
                 ParentInfo {
                     depth: guardrail_depth,
+                    terminal: false,
                     ..parent
                 },
             );
@@ -941,12 +988,22 @@ impl DaemonHandler {
         mut payload: EnqueuePayload,
         ingress_id: Option<String>,
     ) -> Result<Value, WireError> {
+        let inline_brief = payload.brief.take();
+        let brief_source_path = payload.brief_path.take();
+        let prepared_brief =
+            tokio::task::spawn_blocking(move || brief::prepare(inline_brief, brief_source_path))
+                .await
+                .map_err(|error| internal_wire(format!("brief worker failed: {error}")))?
+                .map_err(|error| WireError::invalid(error.to_string()))?;
         let full_mode = payload
             .submission
             .as_ref()
             .is_some_and(|submission| submission.mode == SubmissionMode::Full);
         let caller_job_id = payload.caller_job_id.clone();
         let mut context = self.context.write().await;
+        if let Some(caller_job_id) = caller_job_id.as_deref() {
+            ensure_guardrail_parent(&mut context, caller_job_id, false)?;
+        }
         let resumed_job = if let Some(resume_from) = payload.resume_from.as_deref() {
             let previous = find_job(&context, resume_from)?.clone();
             if previous.state != JobState::Completed {
@@ -1040,6 +1097,7 @@ impl DaemonHandler {
             adapter_options: Default::default(),
         };
         let mut resolved = context.guardrails.validate_enqueue(payload, &defaults)?;
+        resolved.brief_hash = prepared_brief.as_ref().map(|brief| brief.hash().to_owned());
         let mut child_charged = caller_job_id.is_some() && !full_mode;
         for pool in &resolved.pools {
             let pool_credentials = context
@@ -1144,7 +1202,7 @@ impl DaemonHandler {
             .map(Uuid::parse_str)
             .transpose()
             .map_err(|_| WireError::invalid("taskUuid must be a UUID"))?
-            .unwrap_or_else(Uuid::new_v4);
+            .unwrap_or_else(Uuid::now_v7);
         if !full_mode
             && (context.jobs.contains_key(&job_id) || context.query_rows.contains_key(&job_id))
         {
@@ -1177,6 +1235,8 @@ impl DaemonHandler {
             resumed_from: resolved.resume_from,
             dedup_key: resolved.dedup_key.clone(),
             payload_hash,
+            brief_hash: resolved.brief_hash.clone(),
+            orchestration: resolved.orchestration.clone(),
             session_ref: resumed_job
                 .as_ref()
                 .and_then(|job| job.row.session_ref.clone()),
@@ -1359,6 +1419,16 @@ impl DaemonHandler {
                     }
                 };
                 if dedup.hit {
+                    if let Err(error) =
+                        store_admitted_brief(&context.paths, &row, prepared_brief.as_ref())
+                    {
+                        rollback_child_charge(
+                            &mut context,
+                            caller_job_id.as_deref(),
+                            child_charged,
+                        )?;
+                        return Err(error);
+                    }
                     let artifact_hash = dedup
                         .artifact_hash
                         .clone()
@@ -1430,6 +1500,8 @@ impl DaemonHandler {
                         lease_epoch: row.lease_epoch,
                         dedup_key: row.dedup_key.clone(),
                         payload_hash: row.payload_hash.clone(),
+                        brief_hash: row.brief_hash.clone(),
+                        orchestration: row.orchestration.clone(),
                         labor_class: LaborClass::Reused,
                         trace_ref: None,
                         pools: Some(row.pools.clone()),
@@ -1455,17 +1527,9 @@ impl DaemonHandler {
                         completion: None,
                     };
                     context.barriers.complete_job(&stable_key, result.value());
+                    rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
                     context.aliases.insert(job_id.to_string(), job_id);
                     context.aliases.insert(stable_key.clone(), job_id);
-                    context.guardrails.register_parent(
-                        job_id.to_string(),
-                        ParentInfo {
-                            parent_uuid: stable_key.clone(),
-                            depth: resolved.depth,
-                            children: 0,
-                            no_enqueue: row.no_enqueue,
-                        },
-                    );
                     context
                         .query_rows
                         .insert(row_uuid, query_row(&row, RowStatus::Completed));
@@ -1509,6 +1573,11 @@ impl DaemonHandler {
             )));
         }
 
+        if let Err(error) = enforce_flow_node_cap(&context, &row) {
+            rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
+            return Err(error);
+        }
+
         if full_mode {
             if let Some(caller_job_id) = caller_job_id.as_deref() {
                 context.guardrails.charge_child(caller_job_id)?;
@@ -1534,6 +1603,10 @@ impl DaemonHandler {
         if let Err(error) = context.lease.engine().validate_admission(&request) {
             rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
             return Err(lease_wire(error));
+        }
+        if let Err(error) = store_admitted_brief(&context.paths, &row, prepared_brief.as_ref()) {
+            rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
+            return Err(error);
         }
 
         if task_uuid.is_some() {
@@ -1603,8 +1676,9 @@ impl DaemonHandler {
             ParentInfo {
                 parent_uuid: stable_key.clone(),
                 depth: resolved.depth,
-                children: 0,
+                outstanding: 0,
                 no_enqueue: row.no_enqueue,
+                terminal: false,
             },
         );
         if task_uuid.is_some() {
@@ -1681,16 +1755,48 @@ impl DaemonHandler {
                 ));
             }
         };
-        let registration = {
+        let (registration, witness_lookup) = {
             let mut context = self.context.write().await;
-            let stable = context
+            let job_id = context
                 .aliases
                 .get(&presented)
-                .map(ToString::to_string)
+                .copied()
+                .or_else(|| {
+                    Uuid::parse_str(&presented).ok().filter(|uuid| {
+                        context.jobs.contains_key(uuid) || context.rows.contains_key(uuid)
+                    })
+                })
                 .ok_or_else(|| WireError::not_found(format!("job {presented} was not found")))?;
-            context.barriers.wait_job(&stable)
+            let stable = context
+                .jobs
+                .get(&job_id)
+                .map(Job::stable_key)
+                .unwrap_or_else(|| job_id.to_string());
+            if context
+                .jobs
+                .get(&job_id)
+                .is_some_and(|job| job.state != JobState::Completed)
+            {
+                (Some(context.barriers.wait_job(&stable)), None)
+            } else {
+                (
+                    None,
+                    Some((
+                        context.paths.witness_path(),
+                        stable,
+                        context.rows.get(&job_id).map(|row| row.attempt),
+                    )),
+                )
+            }
         };
-        await_registration(registration).await
+        if let Some(registration) = registration {
+            return await_registration(registration).await;
+        }
+        let (path, stable, attempt) =
+            witness_lookup.expect("terminal witness lookup was selected above");
+        tokio::task::spawn_blocking(move || reconstruct_job_result(&path, &stable, attempt))
+            .await
+            .map_err(|error| internal_wire(format!("witness await worker failed: {error}")))?
     }
 
     async fn await_barrier(&self, params: Option<Value>) -> Result<Value, WireError> {
@@ -1700,13 +1806,65 @@ impl DaemonHandler {
             barrier: String,
         }
         let params: Params = decode_params(params)?;
-        let registration = self
-            .context
-            .write()
+        if params.barrier.starts_with("barrier:drain:") {
+            let registration = self
+                .context
+                .write()
+                .await
+                .barriers
+                .wait_barrier(&params.barrier)?;
+            return await_registration(registration).await;
+        }
+        let (presented, attempt) = parse_job_barrier(&params.barrier)?;
+        let (registration, witness_lookup, stable) = {
+            let mut context = self.context.write().await;
+            let job_id = context
+                .aliases
+                .get(presented)
+                .copied()
+                .or_else(|| {
+                    Uuid::parse_str(presented).ok().filter(|uuid| {
+                        context.jobs.contains_key(uuid) || context.rows.contains_key(uuid)
+                    })
+                })
+                .ok_or_else(|| WireError::not_found(format!("job {presented} was not found")))?;
+            let stable = context
+                .jobs
+                .get(&job_id)
+                .map(Job::stable_key)
+                .unwrap_or_else(|| job_id.to_string());
+            if stable != presented {
+                return Err(WireError::not_found(format!(
+                    "barrier {} does not identify job {stable}",
+                    params.barrier
+                )));
+            }
+            if context
+                .jobs
+                .get(&job_id)
+                .is_some_and(|job| job.state != JobState::Completed && job.row.attempt == attempt)
+            {
+                (Some(context.barriers.wait_job(&stable)), None, stable)
+            } else {
+                (
+                    None,
+                    Some((context.paths.witness_path(), stable.clone(), attempt)),
+                    stable,
+                )
+            }
+        };
+        let result = if let Some(registration) = registration {
+            await_registration(registration).await?
+        } else {
+            let (path, stable, attempt) =
+                witness_lookup.expect("terminal barrier lookup was selected above");
+            tokio::task::spawn_blocking(move || {
+                reconstruct_job_result(&path, &stable, Some(attempt))
+            })
             .await
-            .barriers
-            .wait_barrier(&params.barrier)?;
-        await_registration(registration).await
+            .map_err(|error| internal_wire(format!("witness barrier worker failed: {error}")))??
+        };
+        Ok(single_job_barrier_value(&params.barrier, &stable, result))
     }
 
     async fn drain(&self, params: Option<Value>) -> Result<Value, WireError> {
@@ -2878,6 +3036,8 @@ impl DaemonHandler {
                     #[serde(default)]
                     parent: Option<String>,
                     #[serde(default)]
+                    flow_run: Option<String>,
+                    #[serde(default)]
                     session: Option<String>,
                     #[serde(default)]
                     since: Option<String>,
@@ -2898,6 +3058,7 @@ impl DaemonHandler {
                     "source": params.source.clone(),
                     "origin": params.origin.clone(),
                     "parent": params.parent.clone(),
+                    "flowRun": params.flow_run.clone(),
                     "session": params.session.clone(),
                     "since": params.since.clone(),
                     "until": params.until.clone(),
@@ -2933,6 +3094,7 @@ impl DaemonHandler {
                             source: params.source,
                             origin: params.origin,
                             parent: params.parent,
+                            flow_run: params.flow_run,
                             session: params.session,
                             since: params.since,
                             until: params.until,
@@ -3277,7 +3439,12 @@ impl DaemonHandler {
         self.emit_post_ack(execution_event(&job, TallyEvent::Started));
         let executor = self.executor.clone();
         let completion = self.completion.clone();
-        let request = execution_request(&job, self.settings.unit_limits, &self.tally_socket);
+        let request = execution_request(
+            &job,
+            self.settings.unit_limits,
+            &self.tally_socket,
+            &self.brief_root,
+        );
         let execution_target = job.row.executor.clone();
         let evidence = job.row.evidence.clone();
         let mut shutdown = self.execution_shutdown.clone();
@@ -3415,6 +3582,128 @@ fn decode_params<T: for<'de> Deserialize<'de>>(params: Option<Value>) -> Result<
 
 fn internal_wire(error: impl ToString) -> WireError {
     WireError::new(WireErrorCode::Internal, error.to_string())
+}
+
+fn ensure_guardrail_parent(
+    context: &mut Context,
+    presented: &str,
+    allow_terminal: bool,
+) -> Result<(), WireError> {
+    if let Some(info) = context.guardrails.parent(presented) {
+        if info.terminal && !allow_terminal {
+            return Err(WireError::not_found(format!(
+                "parent job {presented} is terminal"
+            )));
+        }
+        return Ok(());
+    }
+    let job_id = context
+        .aliases
+        .get(presented)
+        .copied()
+        .or_else(|| Uuid::parse_str(presented).ok())
+        .filter(|uuid| context.jobs.contains_key(uuid) || context.rows.contains_key(uuid))
+        .ok_or_else(|| WireError::not_found(format!("unknown parent job {presented}")))?;
+    let active = context
+        .jobs
+        .get(&job_id)
+        .is_some_and(|job| job.state != JobState::Completed);
+    if !active && !allow_terminal {
+        return Err(WireError::not_found(format!(
+            "parent job {presented} is terminal"
+        )));
+    }
+    let row = context
+        .jobs
+        .get(&job_id)
+        .map(|job| &job.row)
+        .or_else(|| context.rows.get(&job_id))
+        .ok_or_else(|| WireError::not_found(format!("unknown parent job {presented}")))?;
+    let stable = row.uuid.to_string();
+    let outstanding = context
+        .jobs
+        .values()
+        .filter(|job| job.state != JobState::Completed && job.row.parent_uuid == Some(row.uuid))
+        .count();
+    let outstanding = u32::try_from(outstanding)
+        .map_err(|_| internal_wire("parent outstanding child count overflow"))?;
+    let info = ParentInfo {
+        parent_uuid: stable.clone(),
+        depth: context
+            .guardrail_depths
+            .get(&row.uuid)
+            .copied()
+            .unwrap_or(0),
+        outstanding,
+        no_enqueue: row.no_enqueue,
+        terminal: !active,
+    };
+    context
+        .guardrails
+        .register_parent(stable.clone(), info.clone());
+    if presented != stable {
+        context
+            .guardrails
+            .register_parent(presented.to_owned(), info);
+    }
+    Ok(())
+}
+
+fn enforce_flow_node_cap(context: &Context, row: &RowSeed) -> Result<(), WireError> {
+    let Some(orchestration) = &row.orchestration else {
+        return Ok(());
+    };
+    let flow_run_id = orchestration.flow_run_id();
+    let existing_nodes = context
+        .rows
+        .values()
+        .filter(|existing| {
+            existing
+                .orchestration
+                .as_ref()
+                .is_some_and(|capsule| capsule.flow_run_id() == flow_run_id)
+        })
+        .count();
+    let existing_nodes =
+        u64::try_from(existing_nodes).map_err(|_| internal_wire("flow node count overflow"))?;
+    let max_nodes = orchestration.max_nodes().unwrap_or(DEFAULT_FLOW_MAX_NODES);
+    if existing_nodes >= max_nodes {
+        return Err(WireError {
+            code: WireErrorCode::FlowNodeCap,
+            message: format!(
+                "flow run {flow_run_id} already has {existing_nodes} nodes; maxNodes is {max_nodes}"
+            ),
+            data: Some(json!({
+                "flowRunId": flow_run_id,
+                "maxNodes": max_nodes,
+                "existingNodes": existing_nodes,
+            })),
+        });
+    }
+    Ok(())
+}
+
+fn store_admitted_brief(
+    paths: &DaemonPaths,
+    row: &RowSeed,
+    prepared: Option<&PreparedBrief>,
+) -> Result<(), WireError> {
+    match (row.brief_hash.as_deref(), prepared) {
+        (None, None) => Ok(()),
+        (Some(expected), Some(prepared)) if prepared.hash() == expected => {
+            let stored = brief::store(&paths.data_dir, prepared).map_err(internal_wire)?;
+            let expected_path = paths.brief_path(expected).map_err(internal_wire)?;
+            if stored != expected_path {
+                return Err(internal_wire(
+                    "content-addressed brief store returned an unexpected path",
+                ));
+            }
+            Ok(())
+        }
+        _ => Err(internal_wire(
+            "prepared brief and durable row briefHash disagree",
+        )),
+    }
 }
 
 fn rollback_child_charge(
@@ -3700,6 +3989,69 @@ async fn await_registration(registration: WaitRegistration) -> Result<Value, Wir
     }
 }
 
+fn parse_job_barrier(barrier: &str) -> Result<(&str, u32), WireError> {
+    let body = barrier
+        .strip_prefix("barrier:")
+        .ok_or_else(|| WireError::not_found(format!("unknown barrier {barrier}")))?;
+    let (stable, attempt) = body
+        .rsplit_once(':')
+        .ok_or_else(|| WireError::not_found(format!("unknown barrier {barrier}")))?;
+    if stable.is_empty() || stable.starts_with("drain:") {
+        return Err(WireError::not_found(format!("unknown barrier {barrier}")));
+    }
+    let attempt = attempt
+        .parse::<u32>()
+        .ok()
+        .filter(|attempt| *attempt > 0)
+        .ok_or_else(|| WireError::not_found(format!("unknown barrier {barrier}")))?;
+    Ok((stable, attempt))
+}
+
+fn reconstruct_job_result(
+    path: &Path,
+    stable: &str,
+    attempt: Option<u32>,
+) -> Result<Value, WireError> {
+    let (report, records) = read_verified_records(path).map_err(internal_wire)?;
+    if !report.ok {
+        return Err(internal_wire(
+            "witness verification failed while reconstructing a completed wait",
+        ));
+    }
+    let record = records
+        .into_iter()
+        .filter(|record| record.task_uuid.as_deref() == Some(stable))
+        .filter(|record| attempt.is_none_or(|attempt| record.attempt == attempt))
+        .max_by_key(|record| record.seq)
+        .ok_or_else(|| {
+            let suffix = attempt.map_or_else(String::new, |attempt| format!(" attempt {attempt}"));
+            WireError::not_found(format!("job {stable}{suffix} has no terminal witness"))
+        })?;
+    Ok(job_result_from_witness(&record).value())
+}
+
+fn job_result_from_witness(record: &WitnessRecord) -> JobResult {
+    let stable = record
+        .task_uuid
+        .clone()
+        .expect("durable wait reconstruction selected a task witness");
+    JobResult {
+        task_uuid: Some(stable.clone()),
+        job_id: stable,
+        verdict: record.verdict,
+        exit_code: record.exit_code,
+        artifact_content_hash: record.artifact_content_hash.clone(),
+        attempt: record.attempt,
+        lease_epoch: record.lease_epoch,
+        witness_seq: record.seq,
+        completion: record.completion.clone(),
+    }
+}
+
+fn single_job_barrier_value(barrier: &str, stable: &str, result: Value) -> Value {
+    barrier_value(barrier, &BTreeMap::from([(stable.to_owned(), result)]))
+}
+
 async fn wait_for_cancellation(receiver: &mut broadcast::Receiver<Uuid>, job_id: Uuid) {
     loop {
         match receiver.recv().await {
@@ -3751,7 +4103,16 @@ fn lease_request(job: &Job, unit: String) -> LeaseRequest {
     }
 }
 
-fn execution_request(job: &Job, limits: UnitLimits, tally_socket: &str) -> ExecutionRequest {
+fn execution_request(
+    job: &Job,
+    limits: UnitLimits,
+    tally_socket: &str,
+    brief_root: &Path,
+) -> ExecutionRequest {
+    let brief_path = job.row.brief_hash.as_deref().map(|hash| {
+        brief::content_path(brief_root, hash)
+            .expect("validated durable briefHash always derives a content path")
+    });
     ExecutionRequest {
         identity: job.identity(),
         parent: job.row.parent_uuid,
@@ -3767,6 +4128,9 @@ fn execution_request(job: &Job, limits: UnitLimits, tally_socket: &str) -> Execu
         tally_socket: job.row.executor.is_none().then(|| tally_socket.to_owned()),
         environment: job.invocation.env.clone(),
         gh_origin: job.row.gh_origin.clone(),
+        brief_hash: job.row.brief_hash.clone(),
+        brief_path,
+        brief_document: None,
         cwd: job.row.cwd.clone(),
         workspace: job.row.workspace.clone(),
         gate_manifest: job.row.gate_manifest.clone(),
@@ -4002,6 +4366,8 @@ fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
         lease_epoch: job.row.lease_epoch,
         dedup_key: job.row.dedup_key.clone(),
         payload_hash: job.row.payload_hash.clone(),
+        brief_hash: job.row.brief_hash.clone(),
+        orchestration: job.row.orchestration.clone(),
         labor_class: job.labor_class,
         trace_ref: None,
         pools: Some(job.row.pools.clone()),
@@ -4014,12 +4380,11 @@ fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
     }
 }
 
-fn release_full_child_charge(context: &mut Context, job: &Job) -> Result<(), DaemonError> {
-    if job.row.payload_hash.is_some()
-        && context
-            .guardrail_depths
-            .get(&job.row.uuid)
-            .is_some_and(|depth| *depth > 0)
+fn release_child_charge(context: &mut Context, job: &Job) -> Result<(), DaemonError> {
+    if context
+        .guardrail_depths
+        .get(&job.row.uuid)
+        .is_some_and(|depth| *depth > 0)
     {
         if let Some(parent_uuid) = job.row.parent_uuid {
             context
@@ -4066,7 +4431,8 @@ fn finalize_forced_locked(
     if release_lease {
         stored.lease_id = None;
     }
-    release_full_child_charge(context, &job)?;
+    release_child_charge(context, &job)?;
+    context.guardrails.retire_parent(&job.stable_key());
     if let Some(task_uuid) = job.task_uuid {
         if let Some(row) = context.query_rows.get_mut(&task_uuid) {
             row.status = if verdict == Verdict::Cancelled {
@@ -4362,6 +4728,7 @@ impl Daemon {
         committer: Box<dyn ReplicaCommitter>,
         state_lock: File,
     ) -> Result<Self, DaemonError> {
+        validate_recovery_briefs(&plan, &paths.data_dir)?;
         let event_log = LeaseEventLog::in_state_dir(&paths.state_dir);
         let lease_engine = LeaseEngine::from_durable(
             epoch,
@@ -4416,7 +4783,7 @@ impl Daemon {
             query_rows,
             query_details,
         };
-        restore_completed_results(&mut context, completed_witness)?;
+        restore_completed_aliases(&mut context, &completed_witness)?;
         let initial_jobs = install_recovery_jobs(&mut context, &plan, &executor)?;
         restore_guardrail_parents(&mut context, &plan)?;
 
@@ -4482,6 +4849,7 @@ impl Daemon {
             pool_transition_sweep: Rc::new(Mutex::new(())),
             gh_program: PathBuf::from("gh"),
             tally_socket,
+            brief_root: paths.data_dir.clone(),
         };
         Ok(Self {
             _state_lock: state_lock,
@@ -4881,6 +5249,8 @@ impl Daemon {
                 lease_epoch: job.row.lease_epoch,
                 dedup_key: job.row.dedup_key.clone(),
                 payload_hash: job.row.payload_hash.clone(),
+                brief_hash: job.row.brief_hash.clone(),
+                orchestration: job.row.orchestration.clone(),
                 labor_class: job.labor_class,
                 trace_ref: None,
                 pools: Some(job.row.pools.clone()),
@@ -4906,7 +5276,8 @@ impl Daemon {
             context.barriers.complete_job(&stable, result.value());
             let stored = context.jobs.get_mut(&finished.job_id).expect("job exists");
             stored.state = JobState::Completed;
-            release_full_child_charge(&mut context, &job)?;
+            release_child_charge(&mut context, &job)?;
+            context.guardrails.retire_parent(&job.stable_key());
             if let Some(task_uuid) = job.task_uuid {
                 if let Some(row) = context.query_rows.get_mut(&task_uuid) {
                     row.status = RowStatus::Completed;
@@ -5780,6 +6151,8 @@ fn reconcile_reuse_witnesses(
                     lease_epoch: event.row.lease_epoch,
                     dedup_key: event.row.dedup_key.clone(),
                     payload_hash: event.row.payload_hash.clone(),
+                    brief_hash: event.row.brief_hash.clone(),
+                    orchestration: event.row.orchestration.clone(),
                     labor_class: LaborClass::Reused,
                     trace_ref: None,
                     pools: Some(event.row.pools.clone()),
@@ -5818,6 +6191,8 @@ fn reuse_record_matches(
         && record.lease_epoch == event.row.lease_epoch
         && record.dedup_key == event.row.dedup_key
         && record.payload_hash == event.row.payload_hash
+        && record.brief_hash == event.row.brief_hash
+        && record.orchestration == event.row.orchestration
         && record.labor_class == LaborClass::Reused
         && record.pools.as_ref() == Some(&event.row.pools)
         && record.executor == event.row.executor
@@ -6338,6 +6713,9 @@ fn query_row(row: &RowSeed, status: RowStatus) -> RowFact {
     RowFact {
         task_uuid: row.uuid.to_string(),
         description: row.description.clone(),
+        argv: row.argv.clone(),
+        brief_hash: row.brief_hash.clone(),
+        orchestration: row.orchestration.clone(),
         status,
         priority: priority_name(row.priority).to_owned(),
         pools: Some(row.pools.clone()),
@@ -6381,33 +6759,35 @@ fn source_name(source: EnqueueSource) -> &'static str {
     }
 }
 
-fn restore_completed_results(
+fn restore_completed_aliases(
     context: &mut Context,
-    records: Vec<crate::witness::WitnessRecord>,
+    records: &[crate::witness::WitnessRecord],
 ) -> Result<(), DaemonError> {
     for record in records {
-        let Some(task_uuid) = record.task_uuid.clone() else {
+        let Some(task_uuid) = record.task_uuid.as_deref() else {
             continue;
         };
-        let value = JobResult {
-            task_uuid: Some(task_uuid.clone()),
-            job_id: task_uuid.clone(),
-            verdict: record.verdict,
-            exit_code: record.exit_code,
-            artifact_content_hash: record.artifact_content_hash,
-            attempt: record.attempt,
-            lease_epoch: record.lease_epoch,
-            witness_seq: record.seq,
-            completion: record.completion,
-        }
-        .value();
-        context.barriers.register_job(&task_uuid, record.attempt);
-        context
-            .barriers
-            .restore_job_result(task_uuid.clone(), value);
-        let uuid = Uuid::parse_str(&task_uuid)
+        let uuid = Uuid::parse_str(task_uuid)
             .map_err(|_| DaemonError::Invalid(format!("invalid witnessed UUID {task_uuid}")))?;
-        context.aliases.insert(task_uuid, uuid);
+        context.aliases.insert(task_uuid.to_owned(), uuid);
+    }
+    Ok(())
+}
+
+fn validate_recovery_briefs(
+    plan: &crate::recovery::RecoveryPlan,
+    data_dir: &Path,
+) -> Result<(), DaemonError> {
+    let hashes = plan
+        .rows
+        .iter()
+        .filter_map(|recovery| recovery.row.brief_hash.as_deref())
+        .collect::<BTreeSet<_>>();
+    for hash in hashes {
+        let path = brief::content_path(data_dir, hash)
+            .map_err(|error| DaemonError::Invalid(error.to_string()))?;
+        brief::read_verified(&path, hash)
+            .map_err(|error| DaemonError::Invalid(error.to_string()))?;
     }
     Ok(())
 }
@@ -6418,12 +6798,11 @@ fn restore_guardrail_parents(
 ) -> Result<(), DaemonError> {
     let mut child_counts = HashMap::<Uuid, u32>::new();
     for recovery in &plan.rows {
-        let charged = recovery.row.payload_hash.is_none()
-            || !matches!(
-                recovery.state,
-                RecoveryRowState::Completed | RecoveryRowState::Deleted
-            );
-        if !charged || recovery.guardrail_depth == 0 {
+        if matches!(
+            recovery.state,
+            RecoveryRowState::Completed | RecoveryRowState::Deleted
+        ) || recovery.guardrail_depth == 0
+        {
             continue;
         }
         if let Some(parent) = recovery.row.parent_uuid {
@@ -6435,13 +6814,22 @@ fn restore_guardrail_parents(
     }
     for recovery in &plan.rows {
         let task_uuid = recovery.row.uuid;
+        let terminal = matches!(
+            recovery.state,
+            RecoveryRowState::Completed | RecoveryRowState::Deleted
+        );
+        let outstanding = child_counts.get(&task_uuid).copied().unwrap_or(0);
+        if terminal && outstanding == 0 {
+            continue;
+        }
         context.guardrails.register_parent(
             task_uuid.to_string(),
             ParentInfo {
                 parent_uuid: task_uuid.to_string(),
                 depth: recovery.guardrail_depth,
-                children: child_counts.get(&task_uuid).copied().unwrap_or(0),
+                outstanding,
                 no_enqueue: recovery.row.no_enqueue,
+                terminal,
             },
         );
     }
@@ -6462,6 +6850,12 @@ fn install_recovery_jobs(
     for parent in plan
         .rows
         .iter()
+        .filter(|row| {
+            !matches!(
+                row.state,
+                RecoveryRowState::Completed | RecoveryRowState::Deleted
+            )
+        })
         .filter(|row| row.guardrail_depth > 0)
         .filter_map(|row| row.row.parent_uuid)
     {
@@ -6632,8 +7026,9 @@ fn install_recovery_jobs(
             ParentInfo {
                 parent_uuid: task_uuid.to_string(),
                 depth: recovery_row.guardrail_depth,
-                children: child_counts.get(&task_uuid).copied().unwrap_or(0),
+                outstanding: child_counts.get(&task_uuid).copied().unwrap_or(0),
                 no_enqueue: job.row.no_enqueue,
+                terminal: false,
             },
         );
         if let Some(row) = context.query_rows.get_mut(&task_uuid) {
@@ -7580,6 +7975,8 @@ mod tests {
             resumed_from: None,
             dedup_key: Some(dedup_key.to_owned()),
             payload_hash: None,
+            brief_hash: None,
+            orchestration: None,
             session_ref: None,
             lease_epoch,
             attempt: 1,
@@ -7661,6 +8058,8 @@ mod tests {
                 lease_epoch,
                 dedup_key: row.dedup_key.clone(),
                 payload_hash: row.payload_hash.clone(),
+                brief_hash: row.brief_hash.clone(),
+                orchestration: row.orchestration.clone(),
                 labor_class: if attempt == 1 {
                     LaborClass::Fresh
                 } else {
@@ -7899,6 +8298,9 @@ mod tests {
             anchor: "job-1".to_owned(),
             task_uuid: Some("job-1".to_owned()),
             description: None,
+            argv: None,
+            brief_hash: None,
+            orchestration: None,
             pools: Some(vec!["slot".to_owned()]),
             executor: None,
             source: Some("manual".to_owned()),
@@ -8805,6 +9207,8 @@ mod tests {
                         lease_epoch: 1,
                         dedup_key: row.dedup_key.clone(),
                         payload_hash: row.payload_hash.clone(),
+                        brief_hash: row.brief_hash.clone(),
+                        orchestration: row.orchestration.clone(),
                         labor_class: LaborClass::Fresh,
                         trace_ref: None,
                         pools: Some(vec!["slot".to_owned()]),
@@ -9352,8 +9756,12 @@ mod tests {
                     .cloned()
                     .unwrap();
                 assert_eq!(job.row.gh_origin.as_ref(), Some(&captured_origin));
-                let request =
-                    execution_request(&job, settings().unit_limits, "/run/tally/tally.sock");
+                let request = execution_request(
+                    &job,
+                    settings().unit_limits,
+                    "/run/tally/tally.sock",
+                    &paths.data_dir,
+                );
                 let args = executor
                     .build_systemd_argv(&request)
                     .unwrap()
@@ -9512,7 +9920,7 @@ mod tests {
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon =
-                    Daemon::open_with_executor(config, paths, settings(), executor.clone())
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor.clone())
                         .await
                         .unwrap();
                 daemon
@@ -9571,8 +9979,12 @@ mod tests {
                     "mecattaf/tally.nix"
                 );
 
-                let request =
-                    execution_request(&job, settings().unit_limits, "/run/tally/tally.sock");
+                let request = execution_request(
+                    &job,
+                    settings().unit_limits,
+                    "/run/tally/tally.sock",
+                    &paths.data_dir,
+                );
                 let args = executor
                     .build_systemd_argv(&request)
                     .unwrap()
@@ -10617,24 +11029,106 @@ mod tests {
         assert_eq!(canonical_job_model(&recovered_job), None);
     }
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn late_job_and_barrier_waits_are_immediate() {
+    #[test]
+    fn job_barriers_are_deterministic_and_empty_drain_barriers_are_immediate() {
         let mut tracker = BarrierTracker::with_namespace(41);
         let barrier = tracker.register_job("task-1", 1);
-        tracker.complete_job("task-1", json!({"verdict": "pass"}));
-        assert!(matches!(
-            tracker.wait_job("task-1"),
-            WaitRegistration::Ready(_)
-        ));
-        assert!(matches!(
-            tracker.wait_barrier(&barrier).unwrap(),
-            WaitRegistration::Ready(_)
-        ));
+        tracker.complete_job("task-1", json!({"verdict": "pass", "attempt": 1}));
+        assert_eq!(tracker.retained_entry_count(), 0);
+        assert_eq!(parse_job_barrier(&barrier).unwrap(), ("task-1", 1));
         assert_eq!(tracker.snapshot(Vec::new()), "barrier:drain:41:1");
+        assert!(matches!(
+            tracker.wait_barrier("barrier:drain:41:1").unwrap(),
+            WaitRegistration::Ready(_)
+        ));
         assert_eq!(
             BarrierTracker::with_namespace(42).snapshot(Vec::new()),
             "barrier:drain:42:1"
         );
+    }
+
+    #[test]
+    fn fs2_completed_bookkeeping_is_bounded_and_terminal_parents_retire() {
+        let mut tracker = BarrierTracker::with_namespace(7);
+        for sequence in 0..10_000 {
+            let stable = format!("task-{sequence}");
+            tracker.register_job(&stable, 1);
+            tracker.complete_job(&stable, json!({"attempt": 1, "sequence": sequence}));
+        }
+        assert_eq!(tracker.retained_entry_count(), 0);
+        for sequence in 0..10_000 {
+            tracker.snapshot([format!("still-running-{sequence}")]);
+        }
+        assert_eq!(
+            tracker.retained_entry_count(),
+            UNCLAIMED_DRAIN_BARRIER_LIMIT
+        );
+
+        for _ in 0..10_000 {
+            let WaitRegistration::Pending(receiver) = tracker.wait_job("stuck-job") else {
+                panic!("an active job wait must register");
+            };
+            drop(receiver);
+        }
+        tracker.register_job("prune-trigger", 1);
+        assert!(
+            tracker.job_waiters.is_empty(),
+            "closed waiter senders are evicted on the next tracker operation"
+        );
+
+        let pending_barrier = tracker.snapshot(["stuck-job".to_owned()]);
+        for _ in 0..10_000 {
+            let WaitRegistration::Pending(receiver) =
+                tracker.wait_barrier(&pending_barrier).unwrap()
+            else {
+                panic!("an incomplete drain barrier must register");
+            };
+            drop(receiver);
+        }
+        tracker.register_job("second-prune-trigger", 1);
+        assert!(
+            tracker
+                .barriers
+                .get(&pending_barrier)
+                .unwrap()
+                .waiters
+                .is_empty(),
+            "closed barrier waiter senders are evicted on the next tracker operation"
+        );
+
+        let mut guardrails = GuardrailState::new(GuardrailConfig::default()).unwrap();
+        for sequence in 0..10_000 {
+            let stable = format!("parent-{sequence}");
+            guardrails.register_parent(
+                stable.clone(),
+                ParentInfo {
+                    parent_uuid: stable.clone(),
+                    depth: 0,
+                    outstanding: 0,
+                    no_enqueue: false,
+                    terminal: false,
+                },
+            );
+            guardrails.retire_parent(&stable);
+        }
+        assert_eq!(guardrails.parent_count(), 0);
+
+        guardrails.register_parent(
+            "parent-with-child",
+            ParentInfo {
+                parent_uuid: "parent-with-child".to_owned(),
+                depth: 0,
+                outstanding: 1,
+                no_enqueue: false,
+                terminal: false,
+            },
+        );
+        guardrails.retire_parent("parent-with-child");
+        assert!(guardrails.parent("parent-with-child").unwrap().terminal);
+        guardrails
+            .rollback_child_charge("parent-with-child")
+            .unwrap();
+        assert!(guardrails.parent("parent-with-child").is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -11427,7 +11921,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn restart_rebuilds_cache_and_preserves_terminal_wait_without_reexecution() {
+    async fn restart_reconstructs_terminal_wait_without_reexecution() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -11557,6 +12051,8 @@ mod tests {
                         lease_epoch: 1,
                         dedup_key: original.dedup_key.clone(),
                         payload_hash: original.payload_hash.clone(),
+                        brief_hash: original.brief_hash.clone(),
+                        orchestration: original.orchestration.clone(),
                         labor_class: LaborClass::Fresh,
                         trace_ref: None,
                         pools: Some(vec!["slot".to_owned()]),
@@ -13129,6 +13625,379 @@ mod tests {
 
                 shutdown_tx.send(true).unwrap();
                 daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fs2_large_brief_and_provenance_round_trip_group_and_enforce_max_nodes() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let brief_source = temp.path().join("brief.json");
+                let brief_document = json!({
+                    "mission": "exercise the structured brief path",
+                    "acceptance": ["brief is durable", "provenance is witnessed"],
+                    "payload": "x".repeat(70 * 1024),
+                });
+                fs::write(
+                    &brief_source,
+                    serde_json::to_vec_pretty(&brief_document).unwrap(),
+                )
+                .unwrap();
+                assert!(fs::metadata(&brief_source).unwrap().len() > 64 * 1024);
+
+                let flow_run_id = Uuid::new_v4().to_string();
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let mut payload = fs1_full_payload(
+                    "flow:brief-round-trip:0",
+                    &[
+                        "sh",
+                        "-c",
+                        "test -n \"$TALLY_BRIEF\" && test -f \"$TALLY_BRIEF\"",
+                    ],
+                    ["exit:0".to_owned()],
+                );
+                payload["source"] = json!("orchestrator");
+                payload["briefPath"] = json!(brief_source);
+                payload["orchestration"] = json!({
+                    "flowName": "brief-round-trip",
+                    "flowRunId": flow_run_id,
+                    "scriptHash": "sha256-script-generation",
+                    "nodeOrdinal": 0,
+                    "nodeLabel": "verify-brief",
+                    "maxNodes": 1,
+                    "selection": {
+                        "selector": "pooled-fast",
+                        "members": ["worker-a", "worker-b"]
+                    }
+                });
+                let created = client
+                    .call("queue.enqueue", Some(payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(created["disposition"], "created");
+                let task_uuid = Uuid::parse_str(created["task_uuid"].as_str().unwrap()).unwrap();
+                assert_eq!(task_uuid.get_version_num(), 7);
+                let brief_hash = created["payloadHash"]
+                    .as_str()
+                    .expect("full submission returns payloadHash")
+                    .to_owned();
+                let terminal = fs1_wait(&mut client, &created).await;
+                assert_eq!(terminal["verdict"], "pass");
+
+                let events = read_acknowledged_events(&paths.events_dir()).unwrap();
+                assert_eq!(events.len(), 1);
+                let durable_brief_hash = events[0].row.brief_hash.clone().unwrap();
+                assert_ne!(durable_brief_hash, brief_hash);
+                assert_eq!(
+                    events[0].row.orchestration.as_ref().unwrap().as_value()["selection"]
+                        ["members"],
+                    json!(["worker-a", "worker-b"])
+                );
+                let stored_path =
+                    brief::content_path(&paths.data_dir, &durable_brief_hash).unwrap();
+                let stored = fs::read(&stored_path).unwrap();
+                assert!(stored.len() > 64 * 1024);
+                assert_eq!(
+                    stored,
+                    serde_json::to_vec(&brief_document).unwrap(),
+                    "the daemon stores parsed canonical JSON, not source formatting"
+                );
+                assert_eq!(
+                    fs::metadata(&stored_path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+
+                let (_, witness) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(witness.len(), 1);
+                assert_eq!(
+                    witness[0].brief_hash.as_deref(),
+                    Some(durable_brief_hash.as_str())
+                );
+                assert_eq!(
+                    witness[0].orchestration.as_ref().unwrap().as_value()["nodeLabel"],
+                    "verify-brief"
+                );
+
+                let grouped = client
+                    .call("query.jobs", Some(json!({"flowRun": flow_run_id.clone()})))
+                    .await
+                    .unwrap();
+                assert_eq!(grouped["items"].as_array().unwrap().len(), 1);
+                assert_eq!(
+                    grouped["items"][0]["briefHash"],
+                    Value::String(durable_brief_hash.clone())
+                );
+                assert_eq!(
+                    grouped["items"][0]["orchestration"]["flowRunId"],
+                    flow_run_id
+                );
+                assert_eq!(
+                    grouped["items"][0]["argv"],
+                    json!([
+                        "sh",
+                        "-c",
+                        "test -n \"$TALLY_BRIEF\" && test -f \"$TALLY_BRIEF\""
+                    ])
+                );
+                let unrelated = client
+                    .call(
+                        "query.jobs",
+                        Some(json!({"flowRun": Uuid::new_v4().to_string()})),
+                    )
+                    .await
+                    .unwrap();
+                assert!(unrelated["items"].as_array().unwrap().is_empty());
+
+                let mut replay = payload.clone();
+                replay["orchestration"]["maxNodes"] = json!(999);
+                replay["orchestration"]["selection"]["members"] = json!(["worker-z"]);
+                let reused = client.call("queue.enqueue", Some(replay)).await.unwrap();
+                assert_eq!(reused["disposition"], "reused");
+                assert_eq!(reused["task_uuid"], created["task_uuid"]);
+                assert_eq!(reused["payloadHash"], created["payloadHash"]);
+
+                let mut overflow = payload;
+                overflow["dedupKey"] = json!("flow:brief-round-trip:1");
+                overflow["orchestration"]["nodeOrdinal"] = json!(1);
+                let overflow_error = client
+                    .call("queue.enqueue", Some(overflow))
+                    .await
+                    .unwrap_err();
+                match overflow_error {
+                    WireIoError::Rpc(WireErrorCode::FlowNodeCap, _, Some(data)) => {
+                        assert_eq!(data["flowRunId"], flow_run_id);
+                        assert_eq!(data["maxNodes"], 1);
+                        assert_eq!(data["existingNodes"], 1);
+                    }
+                    other => panic!("expected flow-node-cap, got {other:?}"),
+                }
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+
+                let restarted = fs1_daemon(&paths).await;
+                let status = restarted
+                    .handler
+                    .query("query.status", Some(json!({})))
+                    .await
+                    .unwrap();
+                let projection = status["jobs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|job| job["taskUuid"] == created["task_uuid"])
+                    .unwrap();
+                assert_eq!(projection["briefHash"], durable_brief_hash);
+                assert_eq!(
+                    projection["orchestration"]["scriptHash"],
+                    "sha256-script-generation"
+                );
+                drop(restarted);
+                tokio::task::yield_now().await;
+
+                fs::write(&stored_path, b"{}").unwrap();
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let error = match Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths,
+                    settings(),
+                    executor,
+                )
+                .await
+                {
+                    Ok(_) => panic!("tampered durable brief unexpectedly survived restart"),
+                    Err(error) => error,
+                };
+                assert!(error.to_string().contains("durable brief"));
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fs2_outstanding_converges_across_terminal_rollback_and_restart() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut config = one_pool_config();
+                config.enqueue.fanout_cap = 1;
+                config.pools.get_mut("slot").unwrap().credentials.insert(
+                    "token".to_owned(),
+                    PathBuf::from("/run/credentials/slot-token"),
+                );
+                config.pools.insert(
+                    "flow".to_owned(),
+                    PoolConfig {
+                        resource: ResourceKind::BuildSlot,
+                        predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+                        ..PoolConfig::default()
+                    },
+                );
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon =
+                    Daemon::open_with_executor(config.clone(), paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+
+                let parent = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": ["true"],
+                        "pool": "flow",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "dedupKey": "fs2-parent",
+                        "submission": {"mode": "full"},
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let parent_uuid = parent["task_uuid"].as_str().unwrap().to_owned();
+                let child_payload = |key: &str| {
+                    json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "orchestrator",
+                        "dedupKey": key,
+                        "submission": {"mode": "full"},
+                        "callerJobId": parent_uuid,
+                        "evidence": ["exit:0"]
+                    })
+                };
+                let first = daemon
+                    .handler
+                    .enqueue(Some(child_payload("fs2-child-1")))
+                    .await
+                    .unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(
+                        context.guardrails.parent(&parent_uuid).unwrap().outstanding,
+                        1
+                    );
+                }
+                let capped = daemon
+                    .handler
+                    .enqueue(Some(child_payload("fs2-child-at-cap")))
+                    .await
+                    .unwrap_err();
+                assert_eq!(capped.code, WireErrorCode::InvalidParams);
+                assert_eq!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .guardrails
+                        .parent(&parent_uuid)
+                        .unwrap()
+                        .outstanding,
+                    1
+                );
+
+                let first_uuid = Uuid::parse_str(first["task_uuid"].as_str().unwrap()).unwrap();
+                {
+                    let mut context = daemon.handler.context.write().await;
+                    finalize_forced_locked(
+                        &mut context,
+                        first_uuid,
+                        Verdict::Cancelled,
+                        false,
+                        false,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        context.guardrails.parent(&parent_uuid).unwrap().outstanding,
+                        0
+                    );
+                }
+
+                let rollback = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "orchestrator",
+                        "dedupKey": "fs2-rollback",
+                        "callerJobId": parent_uuid,
+                        "credentials": {"token": "/run/credentials/different-token"},
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap_err();
+                assert_eq!(rollback.code, WireErrorCode::InvalidParams);
+                assert_eq!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .guardrails
+                        .parent(&parent_uuid)
+                        .unwrap()
+                        .outstanding,
+                    0
+                );
+
+                let second = daemon
+                    .handler
+                    .enqueue(Some(child_payload("fs2-child-2")))
+                    .await
+                    .unwrap();
+                assert_eq!(second["disposition"], "created");
+                assert_eq!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .guardrails
+                        .parent(&parent_uuid)
+                        .unwrap()
+                        .outstanding,
+                    1
+                );
+                drop(daemon);
+                tokio::task::yield_now().await;
+
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let restarted = Daemon::open_with_executor(config, paths, settings(), executor)
+                    .await
+                    .unwrap();
+                let second_uuid = Uuid::parse_str(second["task_uuid"].as_str().unwrap()).unwrap();
+                let mut context = restarted.handler.context.write().await;
+                assert_eq!(
+                    context.guardrails.parent(&parent_uuid).unwrap().outstanding,
+                    1
+                );
+                finalize_forced_locked(&mut context, second_uuid, Verdict::Cancelled, false, false)
+                    .unwrap();
+                assert_eq!(
+                    context.guardrails.parent(&parent_uuid).unwrap().outstanding,
+                    0
+                );
             })
             .await;
     }

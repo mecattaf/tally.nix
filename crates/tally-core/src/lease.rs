@@ -2131,6 +2131,8 @@ mod tests {
             lease_epoch: 3,
             dedup_key: None,
             payload_hash: None,
+            brief_hash: None,
+            orchestration: None,
             labor_class: LaborClass::Fresh,
             trace_ref: None,
             pools: Some(vec!["api".to_owned()]),

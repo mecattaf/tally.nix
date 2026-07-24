@@ -20,6 +20,7 @@ use tally_core::producers::{
     record_producer_runtime, GhCliAcknowledgementSink, GhCliIntake, GhObservation, ProducerEngine,
     ProducerObservation,
 };
+use tally_core::provenance::Orchestration;
 use tally_core::recovery::RecoveryPolicy;
 use tally_core::taskdb::{EnqueueSource, RelatedTrigger, WorkspaceMetadata};
 use tally_core::wire::{EnqueuePayload, RpcClient, WireErrorCode, WireIoError};
@@ -252,6 +253,15 @@ struct EnqueueArgs {
     workspace_worktree: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     gate_manifest: Option<PathBuf>,
+    #[arg(
+        long,
+        value_parser = parse_opaque_json,
+        allow_hyphen_values = true,
+        conflicts_with = "brief_path"
+    )]
+    brief: Option<Value>,
+    #[arg(long, value_name = "PATH", conflicts_with = "brief")]
+    brief_path: Option<PathBuf>,
     #[arg(long = "required-gate", action = clap::ArgAction::Append)]
     required_gate_ids: Vec<String>,
     #[arg(long, value_enum)]
@@ -260,6 +270,8 @@ struct EnqueueArgs {
     source: CliSource,
     #[arg(long)]
     dedup_key: Option<String>,
+    #[arg(long, value_parser = parse_orchestration, allow_hyphen_values = true)]
+    orchestration: Option<Orchestration>,
     #[arg(long)]
     parent: Option<String>,
     #[arg(long)]
@@ -321,6 +333,10 @@ fn parse_environment(value: &str) -> Result<(String, String), String> {
 
 fn parse_opaque_json(value: &str) -> Result<Value, String> {
     serde_json::from_str(value).map_err(|error| format!("invalid JSON value: {error}"))
+}
+
+fn parse_orchestration(value: &str) -> Result<Orchestration, String> {
+    serde_json::from_str(value).map_err(|error| format!("invalid orchestration capsule: {error}"))
 }
 
 fn parse_related_trigger(value: &str) -> Result<RelatedTrigger, String> {
@@ -506,6 +522,8 @@ enum QueryCommand {
         origin: Option<String>,
         #[arg(long)]
         parent: Option<String>,
+        #[arg(long)]
+        flow_run: Option<String>,
         #[arg(long)]
         session: Option<String>,
         #[arg(long)]
@@ -1389,10 +1407,13 @@ async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
         workspace,
         adapter_options: (!adapter_options.is_default()).then_some(adapter_options),
         gate_manifest,
+        brief: args.brief,
+        brief_path: args.brief_path,
         resume_from: None,
         source: Some(args.source.into()),
         dedup_key: args.dedup_key,
         submission: None,
+        orchestration: args.orchestration,
         parent: args.parent,
         evidence: args.evidence,
         evidence_class: args.evidence_class,
@@ -1509,10 +1530,13 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
                 workspace: None,
                 adapter_options: None,
                 gate_manifest: None,
+                brief: None,
+                brief_path: None,
                 resume_from: Some(job),
                 source: None,
                 dedup_key: None,
                 submission: None,
+                orchestration: None,
                 parent: None,
                 evidence: Vec::new(),
                 evidence_class: None,
@@ -1589,6 +1613,7 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
             source,
             origin,
             parent,
+            flow_run,
             session,
             since,
             until,
@@ -1607,6 +1632,7 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
                     "source": source,
                     "origin": origin,
                     "parent": parent,
+                    "flowRun": flow_run,
                     "session": session,
                     "since": since,
                     "until": until,

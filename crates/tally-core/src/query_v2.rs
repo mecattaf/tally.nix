@@ -7,6 +7,7 @@ use thiserror::Error;
 
 use crate::history::{LifecycleRecord, LifecycleSnapshot, RetentionMetadata};
 use crate::journal::TallyEvent;
+use crate::provenance::Orchestration;
 use crate::query::{
     GhOriginProjection, HeadroomSignal, RowStatus, QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
 };
@@ -48,6 +49,9 @@ impl<T> SourcedValue<T> {
 pub struct RowDetailFact {
     pub task_uuid: String,
     pub description: String,
+    pub argv: Vec<String>,
+    pub brief_hash: Option<String>,
+    pub orchestration: Option<Orchestration>,
     pub row_status: RowStatus,
     pub priority: String,
     pub pools: Vec<String>,
@@ -86,6 +90,9 @@ impl RowDetailFact {
         Self {
             task_uuid: row.uuid.to_string(),
             description: row.description.clone(),
+            argv: row.argv.clone(),
+            brief_hash: row.brief_hash.clone(),
+            orchestration: row.orchestration.clone(),
             row_status,
             priority: priority_name(row.priority).to_owned(),
             pools: row.pools.clone(),
@@ -207,6 +214,9 @@ pub struct JobSummary {
     pub task_uuid: Option<String>,
     pub live_job_id: Option<String>,
     pub description: Option<String>,
+    pub argv: Vec<String>,
+    pub brief_hash: Option<String>,
+    pub orchestration: Option<Orchestration>,
     pub row_status: Option<RowStatus>,
     pub live_state: Option<String>,
     pub terminal_verdict: Option<Verdict>,
@@ -287,6 +297,7 @@ pub struct JobsFilter {
     pub source: Option<String>,
     pub origin: Option<String>,
     pub parent: Option<String>,
+    pub flow_run: Option<String>,
     pub session: Option<String>,
     pub since: Option<String>,
     pub until: Option<String>,
@@ -876,6 +887,13 @@ fn build_summary(
             .or_else(|| current_event.and_then(|event| event.fields.job_id.clone()))
             .or_else(|| latest_event.and_then(|event| event.fields.job_id.clone())),
         description: detail.map(|detail| detail.description.clone()),
+        argv: detail.map_or_else(Vec::new, |detail| detail.argv.clone()),
+        brief_hash: latest_witness
+            .and_then(|record| record.brief_hash.clone())
+            .or_else(|| detail.and_then(|detail| detail.brief_hash.clone())),
+        orchestration: latest_witness
+            .and_then(|record| record.orchestration.clone())
+            .or_else(|| detail.and_then(|detail| detail.orchestration.clone())),
         row_status: detail.map(|detail| detail.row_status),
         live_state: live.map(|live| live.live_state.clone()),
         terminal_verdict: latest_witness.map(|record| record.verdict),
@@ -1029,6 +1047,11 @@ fn matches_jobs_filter(
             .parent
             .as_deref()
             .is_some_and(|value| job.parent_task_uuid.as_deref() != Some(value))
+        || filter.flow_run.as_deref().is_some_and(|value| {
+            job.orchestration
+                .as_ref()
+                .is_none_or(|orchestration| orchestration.flow_run_id() != value)
+        })
         || filter.session.as_deref().is_some_and(|value| {
             job.session_ref
                 .as_ref()
@@ -1449,6 +1472,9 @@ mod tests {
         RowDetailFact {
             task_uuid: "00000000-0000-4000-8000-000000000024".to_owned(),
             description: "proof state fixture".to_owned(),
+            argv: vec!["run-proof".to_owned()],
+            brief_hash: None,
+            orchestration: None,
             row_status: status,
             priority: "high".to_owned(),
             pools: vec!["slot".to_owned()],
