@@ -297,7 +297,8 @@ producers.agency-codex-intake = {
 
 GitHub producer `argv` and `cwd` templates expand validated origin fields directly into individual
 argv/path values. They never evaluate issue text or rendered values as shell syntax. The complete
-placeholder set is documented in [NIX-SPEC.md](docs/NIX-SPEC.md#4-producer-enqueue-payloads).
+placeholder set is documented in
+[NIX-SPEC.md](legacy-docs/NIX-SPEC.md#4-producer-enqueue-payloads).
 
 Each accepted or filtered trigger gets a durable receipt and an idempotent marker-tagged GitHub
 acknowledgement. Replaying one comment/event reports the existing task; a later command comment has
@@ -488,9 +489,11 @@ tests on the selected NixOS host with `--ignored --nocapture`; with the variable
 `SKIP` before touching systemd. `TALLY_BIN` can point the local scenarios at an already-built
 binary, and `TALLY_PACKAGE` can point the multi-host scenario at an existing Nix store package.
 
-See [the product specification](docs/SPEC.md), [the Nix interface](docs/NIX-SPEC.md), and
-[the implementation map](docs/BUILD-SEQUENCE.md). Contributions are covered by
-[CONTRIBUTING.md](CONTRIBUTING.md).
+The documentation site is being written under `doc/` (mdBook). Until it lands, the
+specifications the implementation was built against live in
+[`legacy-docs/`](legacy-docs/README.md) — start with its README, which records which file
+governs which subject and lists the known legacy/flow-era divergences. Contributions are
+covered by [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 
