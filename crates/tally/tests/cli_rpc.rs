@@ -7,6 +7,7 @@ use tally_core::wire::{serve_connection, RequestFrame, RpcHandler, WireError};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
+#[derive(Clone, Copy)]
 struct CliHandler;
 
 impl RpcHandler for CliHandler {
@@ -216,7 +217,7 @@ async fn cli_maps_rpc_and_waited_verdict_exit_codes() {
             tokio::task::spawn_local(async move {
                 for _ in 0..3 {
                     let (stream, _) = listener.accept().await.unwrap();
-                    serve_connection(stream, &CliHandler).await.unwrap();
+                    serve_connection(stream, CliHandler).await.unwrap();
                 }
             });
 
@@ -250,7 +251,7 @@ async fn cli_forwards_opaque_evidence_metadata() {
         .run_until(async {
             let server = tokio::task::spawn_local(async move {
                 let (stream, _) = listener.accept().await.unwrap();
-                serve_connection(stream, &CliHandler).await.unwrap();
+                serve_connection(stream, CliHandler).await.unwrap();
             });
             let output = run_tally(
                 &socket,
@@ -284,7 +285,7 @@ async fn cli_carries_a_canonical_multi_pool_set_over_enqueue_and_acquire_rpc() {
             let server = tokio::task::spawn_local(async move {
                 for _ in 0..2 {
                     let (stream, _) = listener.accept().await.unwrap();
-                    serve_connection(stream, &CliHandler).await.unwrap();
+                    serve_connection(stream, CliHandler).await.unwrap();
                 }
             });
             let enqueued = run_tally(
@@ -372,7 +373,7 @@ async fn query_v3_cli_forwards_all_durable_observability_commands() {
             let server = tokio::task::spawn_local(async move {
                 for _ in 0..7 {
                     let (stream, _) = listener.accept().await.unwrap();
-                    serve_connection(stream, &CliHandler).await.unwrap();
+                    serve_connection(stream, CliHandler).await.unwrap();
                 }
             });
             let task = "00000000-0000-4000-8000-000000000024";

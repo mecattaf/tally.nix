@@ -3,6 +3,8 @@ use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,10 +13,12 @@ use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
+use tokio::sync::{oneshot, Mutex};
+use tokio::task::JoinSet;
 
 use crate::adapters::AdapterJobOptions;
 use crate::completion::GateManifestSpec;
-use crate::config::Priority;
+use crate::config::{Priority, DEFAULT_MAX_FRAME_BYTES};
 use crate::evidence::parse_evidence_specs;
 use crate::provenance::Orchestration;
 use crate::taskdb::{
@@ -22,7 +26,8 @@ use crate::taskdb::{
     WorkspaceMetadata,
 };
 
-pub const FRAME_CAP_BYTES: usize = 64 * 1024;
+pub const FRAME_CAP_BYTES: usize = DEFAULT_MAX_FRAME_BYTES as usize;
+pub const MAX_IN_FLIGHT_REQUESTS: usize = 64;
 
 pub const RPC_METHODS: &[&str] = &[
     "queue.enqueue",
@@ -130,12 +135,16 @@ pub enum WireIoError {
     Io(#[from] io::Error),
     #[error("wire JSON error: {0}")]
     Json(#[from] serde_json::Error),
-    #[error("wire frame exceeds {FRAME_CAP_BYTES} bytes")]
-    FrameTooLarge,
+    #[error("wire frame exceeds {limit} bytes")]
+    FrameTooLarge { limit: u64 },
+    #[error("wire frame limit must be positive")]
+    InvalidFrameLimit,
     #[error("daemon closed the socket before replying")]
     Closed,
     #[error("invalid response frame: {0}")]
     InvalidResponse(String),
+    #[error("RPC request task failed: {0}")]
+    RequestTask(String),
     #[error("RPC error {0:?}: {1}")]
     Rpc(WireErrorCode, String, Option<Value>),
 }
@@ -149,14 +158,45 @@ pub trait RpcHandler {
 
 async fn read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
+    max_frame_bytes: u64,
 ) -> Result<Option<Vec<u8>>, WireIoError> {
+    validate_frame_limit(max_frame_bytes)?;
     let mut line = Vec::new();
-    let read = reader.read_until(b'\n', &mut line).await?;
-    if read == 0 {
-        return Ok(None);
-    }
-    if line.len() > FRAME_CAP_BYTES {
-        return Err(WireIoError::FrameTooLarge);
+    loop {
+        let (take, complete, eof) = {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                (0, false, true)
+            } else if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
+                (newline + 1, true, false)
+            } else {
+                (available.len(), false, false)
+            }
+        };
+        if eof {
+            return if line.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(line))
+            };
+        }
+        let next_len =
+            (line.len() as u64)
+                .checked_add(take as u64)
+                .ok_or(WireIoError::FrameTooLarge {
+                    limit: max_frame_bytes,
+                })?;
+        if next_len > max_frame_bytes {
+            return Err(WireIoError::FrameTooLarge {
+                limit: max_frame_bytes,
+            });
+        }
+        let available = reader.fill_buf().await?;
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if complete {
+            break;
+        }
     }
     if line.last() == Some(&b'\n') {
         line.pop();
@@ -167,60 +207,173 @@ async fn read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
     Ok(Some(line))
 }
 
-pub async fn serve_connection(
+pub async fn serve_connection<H>(stream: UnixStream, handler: H) -> Result<(), WireIoError>
+where
+    H: RpcHandler + Clone + 'static,
+{
+    serve_connection_with_max_frame_bytes(stream, handler, DEFAULT_MAX_FRAME_BYTES).await
+}
+
+pub async fn serve_connection_with_max_frame_bytes<H>(
     stream: UnixStream,
-    handler: &dyn RpcHandler,
-) -> Result<(), WireIoError> {
+    handler: H,
+    max_frame_bytes: u64,
+) -> Result<(), WireIoError>
+where
+    H: RpcHandler + Clone + 'static,
+{
+    validate_frame_limit(max_frame_bytes)?;
     let (reader, mut writer) = stream.into_split();
     let mut reader = BufReader::new(reader);
-    while let Some(line) = read_line_limited(&mut reader).await? {
-        if line.iter().all(u8::is_ascii_whitespace) {
+    let mut reader_open = true;
+    let mut requests = JoinSet::new();
+    while reader_open || !requests.is_empty() {
+        if !reader_open || requests.len() == MAX_IN_FLIGHT_REQUESTS {
+            let completed = requests
+                .join_next()
+                .await
+                .expect("an in-flight request must be present");
+            write_completed_request(&mut writer, completed, max_frame_bytes).await?;
             continue;
         }
-        let request = match serde_json::from_slice::<RequestFrame>(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                let response = serde_json::json!({
-                    "id": Value::Null,
-                    "error": WireError::new(WireErrorCode::InvalidFrame, error.to_string()),
+
+        tokio::select! {
+            line = read_line_limited(&mut reader, max_frame_bytes) => {
+                let Some(line) = line? else {
+                    reader_open = false;
+                    continue;
+                };
+                if line.iter().all(u8::is_ascii_whitespace) {
+                    continue;
+                }
+                let request = match serde_json::from_slice::<RequestFrame>(&line) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        let response = serde_json::json!({
+                            "id": Value::Null,
+                            "error": WireError::new(WireErrorCode::InvalidFrame, error.to_string()),
+                        });
+                        write_frame(&mut writer, &response, max_frame_bytes).await?;
+                        continue;
+                    }
+                };
+                let request_handler = handler.clone();
+                requests.spawn_local(async move {
+                    let encoded = match request_handler.handle(request.clone()).await {
+                        Ok(result) => serde_json::to_value(ResponseOk {
+                            id: &request.id,
+                            result,
+                        })?,
+                        Err(error) => serde_json::to_value(ResponseErr {
+                            id: &request.id,
+                            error,
+                        })?,
+                    };
+                    Ok(encoded)
                 });
-                write_frame(&mut writer, &response).await?;
-                continue;
             }
-        };
-        let encoded = match handler.handle(request.clone()).await {
-            Ok(result) => serde_json::to_value(ResponseOk {
-                id: &request.id,
-                result,
-            })?,
-            Err(error) => serde_json::to_value(ResponseErr {
-                id: &request.id,
-                error,
-            })?,
-        };
-        write_frame(&mut writer, &encoded).await?;
+            completed = requests.join_next(), if !requests.is_empty() => {
+                let completed = completed.expect("an in-flight request must be present");
+                write_completed_request(&mut writer, completed, max_frame_bytes).await?;
+            }
+        }
     }
     Ok(())
 }
 
-async fn write_frame(writer: &mut OwnedWriteHalf, value: &Value) -> Result<(), WireIoError> {
+async fn write_completed_request(
+    writer: &mut OwnedWriteHalf,
+    completed: Result<Result<Value, WireIoError>, tokio::task::JoinError>,
+    max_frame_bytes: u64,
+) -> Result<(), WireIoError> {
+    let response = completed.map_err(|error| WireIoError::RequestTask(error.to_string()))??;
+    write_frame(writer, &response, max_frame_bytes).await
+}
+
+async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    value: &Value,
+    max_frame_bytes: u64,
+) -> Result<(), WireIoError> {
+    validate_frame_limit(max_frame_bytes)?;
     let mut encoded = serde_json::to_vec(value)?;
-    if encoded.len() + 1 > FRAME_CAP_BYTES {
-        return Err(WireIoError::FrameTooLarge);
-    }
+    ensure_frame_size(encoded.len(), max_frame_bytes)?;
     encoded.push(b'\n');
     writer.write_all(&encoded).await?;
     Ok(())
 }
 
+fn validate_frame_limit(max_frame_bytes: u64) -> Result<(), WireIoError> {
+    if max_frame_bytes == 0 {
+        Err(WireIoError::InvalidFrameLimit)
+    } else {
+        Ok(())
+    }
+}
+
+fn ensure_frame_size(encoded_bytes: usize, max_frame_bytes: u64) -> Result<(), WireIoError> {
+    let frame_bytes = (encoded_bytes as u64)
+        .checked_add(1)
+        .ok_or(WireIoError::FrameTooLarge {
+            limit: max_frame_bytes,
+        })?;
+    if frame_bytes > max_frame_bytes {
+        return Err(WireIoError::FrameTooLarge {
+            limit: max_frame_bytes,
+        });
+    }
+    Ok(())
+}
+
+type PendingResponse = oneshot::Sender<Result<Value, ClientReadFailure>>;
+
+#[derive(Debug, Clone)]
+enum ClientReadFailure {
+    FrameTooLarge { limit: u64 },
+    Closed,
+    Io(String),
+    Json(String),
+    InvalidResponse(String),
+}
+
+impl ClientReadFailure {
+    fn into_wire_error(self) -> WireIoError {
+        match self {
+            Self::FrameTooLarge { limit } => WireIoError::FrameTooLarge { limit },
+            Self::Closed => WireIoError::Closed,
+            Self::Io(message) => WireIoError::Io(io::Error::other(message)),
+            Self::Json(message) => {
+                WireIoError::InvalidResponse(format!("response is not valid JSON: {message}"))
+            }
+            Self::InvalidResponse(message) => WireIoError::InvalidResponse(message),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ClientState {
+    pending: HashMap<RequestId, PendingResponse>,
+    failure: Option<ClientReadFailure>,
+}
+
+#[derive(Clone)]
 pub struct RpcClient {
-    reader: BufReader<OwnedReadHalf>,
-    writer: OwnedWriteHalf,
-    next_id: u64,
+    writer: Arc<Mutex<OwnedWriteHalf>>,
+    state: Arc<StdMutex<ClientState>>,
+    next_id: Arc<AtomicU64>,
+    max_frame_bytes: u64,
 }
 
 impl RpcClient {
     pub async fn connect(path: &Path) -> Result<Self, WireIoError> {
+        Self::connect_with_max_frame_bytes(path, DEFAULT_MAX_FRAME_BYTES).await
+    }
+
+    pub async fn connect_with_max_frame_bytes(
+        path: &Path,
+        max_frame_bytes: u64,
+    ) -> Result<Self, WireIoError> {
+        validate_frame_limit(max_frame_bytes)?;
         let stream =
             UnixStream::connect(path)
                 .await
@@ -229,50 +382,64 @@ impl RpcClient {
                     source,
                 })?;
         let (reader, writer) = stream.into_split();
+        let state = Arc::new(StdMutex::new(ClientState::default()));
+        tokio::spawn(read_responses(
+            BufReader::new(reader),
+            Arc::clone(&state),
+            max_frame_bytes,
+        ));
         Ok(Self {
-            reader: BufReader::new(reader),
-            writer,
-            next_id: 1,
+            writer: Arc::new(Mutex::new(writer)),
+            state,
+            next_id: Arc::new(AtomicU64::new(1)),
+            max_frame_bytes,
         })
     }
 
-    pub async fn call(
-        &mut self,
-        method: &str,
-        params: Option<Value>,
-    ) -> Result<Value, WireIoError> {
-        let id = RequestId::String(format!("cli-{}", self.next_id));
-        self.next_id += 1;
+    pub async fn call(&self, method: &str, params: Option<Value>) -> Result<Value, WireIoError> {
+        let next_id = self
+            .next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                WireIoError::InvalidResponse("RPC request ID counter overflowed".to_owned())
+            })?;
+        let id = RequestId::String(format!("cli-{next_id}"));
         let request = RequestFrame {
             id: id.clone(),
             method: method.to_owned(),
             params,
         };
         let mut encoded = serde_json::to_vec(&request)?;
-        if encoded.len() + 1 > FRAME_CAP_BYTES {
-            return Err(WireIoError::FrameTooLarge);
-        }
+        ensure_frame_size(encoded.len(), self.max_frame_bytes)?;
         encoded.push(b'\n');
-        self.writer.write_all(&encoded).await?;
 
-        let line = read_line_limited(&mut self.reader)
-            .await?
-            .ok_or(WireIoError::Closed)?;
-        let response: Value = serde_json::from_slice(&line)?;
+        let (sender, receiver) = oneshot::channel();
+        {
+            let mut state = self.state.lock().expect("RPC client state lock poisoned");
+            if let Some(failure) = state.failure.clone() {
+                return Err(failure.into_wire_error());
+            }
+            state.pending.insert(id.clone(), sender);
+        }
+
+        if let Err(error) = self.writer.lock().await.write_all(&encoded).await {
+            self.state
+                .lock()
+                .expect("RPC client state lock poisoned")
+                .pending
+                .remove(&id);
+            return Err(WireIoError::Io(error));
+        }
+
+        let response = receiver
+            .await
+            .map_err(|_| WireIoError::Closed)?
+            .map_err(ClientReadFailure::into_wire_error)?;
         let object = response
             .as_object()
             .ok_or_else(|| WireIoError::InvalidResponse("response is not an object".to_owned()))?;
-        let response_id: RequestId = serde_json::from_value(
-            object
-                .get("id")
-                .cloned()
-                .ok_or_else(|| WireIoError::InvalidResponse("response has no id".to_owned()))?,
-        )?;
-        if response_id != id {
-            return Err(WireIoError::InvalidResponse(format!(
-                "response id {response_id:?} does not match request id {id:?}"
-            )));
-        }
         if let Some(result) = object.get("result") {
             return Ok(result.clone());
         }
@@ -283,6 +450,81 @@ impl RpcClient {
         Err(WireIoError::InvalidResponse(
             "response has neither result nor error".to_owned(),
         ))
+    }
+}
+
+async fn read_responses(
+    mut reader: BufReader<OwnedReadHalf>,
+    state: Arc<StdMutex<ClientState>>,
+    max_frame_bytes: u64,
+) {
+    loop {
+        let line = match read_line_limited(&mut reader, max_frame_bytes).await {
+            Ok(Some(line)) => line,
+            Ok(None) => {
+                fail_client(&state, ClientReadFailure::Closed);
+                return;
+            }
+            Err(WireIoError::FrameTooLarge { limit }) => {
+                fail_client(&state, ClientReadFailure::FrameTooLarge { limit });
+                return;
+            }
+            Err(error) => {
+                fail_client(&state, ClientReadFailure::Io(error.to_string()));
+                return;
+            }
+        };
+        let response: Value = match serde_json::from_slice(&line) {
+            Ok(response) => response,
+            Err(error) => {
+                fail_client(&state, ClientReadFailure::Json(error.to_string()));
+                return;
+            }
+        };
+        let response_id = response
+            .as_object()
+            .and_then(|object| object.get("id"))
+            .cloned()
+            .ok_or_else(|| "response has no id".to_owned())
+            .and_then(|id| {
+                serde_json::from_value::<RequestId>(id)
+                    .map_err(|error| format!("response has an invalid id: {error}"))
+            });
+        let response_id = match response_id {
+            Ok(response_id) => response_id,
+            Err(error) => {
+                fail_client(&state, ClientReadFailure::InvalidResponse(error));
+                return;
+            }
+        };
+        let sender = state
+            .lock()
+            .expect("RPC client state lock poisoned")
+            .pending
+            .remove(&response_id);
+        let Some(sender) = sender else {
+            fail_client(
+                &state,
+                ClientReadFailure::InvalidResponse(format!(
+                    "response id {response_id:?} has no pending request"
+                )),
+            );
+            return;
+        };
+        let _ = sender.send(Ok(response));
+    }
+}
+
+fn fail_client(state: &Arc<StdMutex<ClientState>>, failure: ClientReadFailure) {
+    let pending = {
+        let mut state = state.lock().expect("RPC client state lock poisoned");
+        if state.failure.is_none() {
+            state.failure = Some(failure.clone());
+        }
+        std::mem::take(&mut state.pending)
+    };
+    for (_, sender) in pending {
+        let _ = sender.send(Err(failure.clone()));
     }
 }
 
@@ -926,11 +1168,16 @@ fn validate_credentials(credentials: &BTreeMap<String, PathBuf>) -> Result<(), W
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::Duration;
 
+    use tokio::io::AsyncWriteExt;
     use tokio::net::UnixListener;
+    use tokio::sync::{mpsc, Semaphore};
 
     use super::*;
 
+    #[derive(Clone, Copy)]
     struct EchoHandler;
 
     impl RpcHandler for EchoHandler {
@@ -958,9 +1205,9 @@ mod tests {
             .run_until(async {
                 tokio::task::spawn_local(async move {
                     let (stream, _) = listener.accept().await.unwrap();
-                    serve_connection(stream, &EchoHandler).await.unwrap();
+                    serve_connection(stream, EchoHandler).await.unwrap();
                 });
-                let mut client = RpcClient::connect(&socket).await.unwrap();
+                let client = RpcClient::connect(&socket).await.unwrap();
                 let value = client
                     .call("echo", Some(serde_json::json!({"value": 42})))
                     .await
@@ -973,6 +1220,220 @@ mod tests {
                 ));
             })
             .await;
+    }
+
+    #[derive(Clone)]
+    struct MultiplexHandler {
+        started: mpsc::UnboundedSender<u64>,
+    }
+
+    impl RpcHandler for MultiplexHandler {
+        fn handle<'a>(
+            &'a self,
+            request: RequestFrame,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+            Box::pin(async move {
+                if request.method == "query.status" {
+                    return Ok(serde_json::json!({"interleaved": true}));
+                }
+                let index = request
+                    .params
+                    .as_ref()
+                    .and_then(|params| params["index"].as_u64())
+                    .ok_or_else(|| WireError::invalid("missing index"))?;
+                self.started.send(index).unwrap();
+                tokio::time::sleep(Duration::from_millis((7 - index) * 25)).await;
+                Ok(serde_json::json!({"index": index}))
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn one_connection_multiplexes_six_awaits_and_an_interleaved_query() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(
+                        stream,
+                        MultiplexHandler {
+                            started: started_tx,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                });
+                let client = RpcClient::connect(&socket).await.unwrap();
+                let calls = (0..6_u64)
+                    .map(|index| {
+                        let client = client.clone();
+                        tokio::task::spawn_local(async move {
+                            let response = client
+                                .call("queue.await_job", Some(serde_json::json!({"index": index})))
+                                .await
+                                .unwrap();
+                            (index, response["index"].as_u64().unwrap())
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for _ in 0..6 {
+                    started_rx.recv().await.unwrap();
+                }
+                let status = tokio::time::timeout(
+                    Duration::from_millis(40),
+                    client.call("query.status", Some(serde_json::json!({}))),
+                )
+                .await
+                .expect("a query must not queue behind blocked awaits")
+                .unwrap();
+                assert_eq!(status, serde_json::json!({"interleaved": true}));
+                for call in calls {
+                    let (requested, received) = call.await.unwrap();
+                    assert_eq!(received, requested);
+                }
+                drop(client);
+                server.await.unwrap();
+            })
+            .await;
+    }
+
+    #[derive(Clone)]
+    struct WindowHandler {
+        started: mpsc::UnboundedSender<u64>,
+        permits: Arc<Semaphore>,
+    }
+
+    impl RpcHandler for WindowHandler {
+        fn handle<'a>(
+            &'a self,
+            request: RequestFrame,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+            Box::pin(async move {
+                let index = request
+                    .params
+                    .as_ref()
+                    .and_then(|params| params["index"].as_u64())
+                    .ok_or_else(|| WireError::invalid("missing index"))?;
+                self.started.send(index).unwrap();
+                self.permits.acquire().await.unwrap().forget();
+                Ok(serde_json::json!({"index": index}))
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn per_connection_in_flight_window_is_64_and_queues_excess_in_arrival_order() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(Semaphore::new(0));
+        let server_permits = Arc::clone(&permits);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(
+                        stream,
+                        WindowHandler {
+                            started: started_tx,
+                            permits: server_permits,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                });
+                let stream = UnixStream::connect(&socket).await.unwrap();
+                let (read_half, mut write_half) = stream.into_split();
+                for index in 0..=MAX_IN_FLIGHT_REQUESTS {
+                    let request = RequestFrame {
+                        id: RequestId::Number(index as i64),
+                        method: "queue.await_job".to_owned(),
+                        params: Some(serde_json::json!({"index": index})),
+                    };
+                    let mut encoded = serde_json::to_vec(&request).unwrap();
+                    encoded.push(b'\n');
+                    write_half.write_all(&encoded).await.unwrap();
+                }
+                write_half.shutdown().await.unwrap();
+
+                for expected in 0..MAX_IN_FLIGHT_REQUESTS as u64 {
+                    assert_eq!(started_rx.recv().await, Some(expected));
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(30), started_rx.recv())
+                        .await
+                        .is_err(),
+                    "request 65 entered before an in-flight slot opened"
+                );
+                permits.add_permits(1);
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+                        .await
+                        .unwrap(),
+                    Some(MAX_IN_FLIGHT_REQUESTS as u64)
+                );
+                permits.add_permits(MAX_IN_FLIGHT_REQUESTS);
+
+                let mut reader = BufReader::new(read_half);
+                let mut responses = 0;
+                while read_line_limited(&mut reader, DEFAULT_MAX_FRAME_BYTES)
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    responses += 1;
+                }
+                assert_eq!(responses, MAX_IN_FLIGHT_REQUESTS + 1);
+                server.await.unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_16_mib_frame_boundary_is_symmetric() {
+        assert_eq!(DEFAULT_MAX_FRAME_BYTES, 16 * 1024 * 1024);
+        let limit = DEFAULT_MAX_FRAME_BYTES as usize;
+
+        let exact = Value::String("x".repeat(limit - 3));
+        let mut exact_wire = Vec::new();
+        write_frame(&mut exact_wire, &exact, DEFAULT_MAX_FRAME_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(exact_wire.len(), limit);
+        let mut exact_reader = BufReader::new(exact_wire.as_slice());
+        let exact_read = read_line_limited(&mut exact_reader, DEFAULT_MAX_FRAME_BYTES)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(exact_read.len(), limit - 1);
+        assert_eq!(serde_json::from_slice::<Value>(&exact_read).unwrap(), exact);
+
+        let oversized = Value::String("x".repeat(limit - 2));
+        let mut sink = Vec::new();
+        assert!(matches!(
+            write_frame(&mut sink, &oversized, DEFAULT_MAX_FRAME_BYTES).await,
+            Err(WireIoError::FrameTooLarge {
+                limit: DEFAULT_MAX_FRAME_BYTES
+            })
+        ));
+        assert!(sink.is_empty());
+
+        let mut oversized_wire = vec![b'x'; limit];
+        oversized_wire.push(b'\n');
+        let mut oversized_reader = BufReader::new(oversized_wire.as_slice());
+        assert!(matches!(
+            read_line_limited(&mut oversized_reader, DEFAULT_MAX_FRAME_BYTES).await,
+            Err(WireIoError::FrameTooLarge {
+                limit: DEFAULT_MAX_FRAME_BYTES
+            })
+        ));
     }
 
     #[test]

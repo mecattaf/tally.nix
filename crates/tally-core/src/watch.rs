@@ -10,14 +10,13 @@ use taskchampion::Uuid;
 use thiserror::Error;
 
 use crate::query::{QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION};
-use crate::wire::FRAME_CAP_BYTES;
 
 pub const CHANGE_FILE: &str = "changes.jsonl";
 pub const CHANGE_SCHEMA_VERSION: u32 = 1;
 pub const CHANGE_RETENTION_RECORDS: usize = 4_096;
 const MAX_WATCH_PAGE_ITEMS: usize = 1_000;
 const DEFAULT_WATCH_PAGE_ITEMS: usize = 100;
-const WATCH_RESULT_CAP_BYTES: usize = FRAME_CAP_BYTES * 3 / 4;
+const WATCH_RESULT_CAP_BYTES: usize = 48 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

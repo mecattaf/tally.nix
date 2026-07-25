@@ -7,8 +7,19 @@ use thiserror::Error;
 use crate::adapters::{AdapterConfig, AdapterEngine, AdapterError};
 use crate::producers::{validate_registry, ProducerConfig, ProducerError};
 
+pub const DEFAULT_MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
+pub const DEFAULT_AGING_THRESHOLD_SEC: u64 = 3_600;
+
 fn default_ssh_port() -> u16 {
     22
+}
+
+const fn default_max_frame_bytes() -> u64 {
+    DEFAULT_MAX_FRAME_BYTES
+}
+
+const fn default_aging_threshold_sec() -> u64 {
+    DEFAULT_AGING_THRESHOLD_SEC
 }
 
 fn default_connect_timeout_sec() -> u64 {
@@ -275,9 +286,13 @@ const fn default_meter_poll_interval_sec() -> u64 {
     120
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Config {
+    #[serde(default = "default_max_frame_bytes")]
+    pub max_frame_bytes: u64,
+    #[serde(default = "default_aging_threshold_sec")]
+    pub aging_threshold_sec: u64,
     #[serde(default)]
     pub enqueue: EnqueueConfig,
     #[serde(default)]
@@ -292,6 +307,22 @@ pub struct Config {
     pub executors: BTreeMap<String, ExecutionTargetConfig>,
     #[serde(default)]
     pub journald: JournaldConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
+            aging_threshold_sec: DEFAULT_AGING_THRESHOLD_SEC,
+            enqueue: EnqueueConfig::default(),
+            lease: LeaseConfig::default(),
+            pools: BTreeMap::new(),
+            adapters: BTreeMap::new(),
+            producers: BTreeMap::new(),
+            executors: BTreeMap::new(),
+            journald: JournaldConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -327,6 +358,8 @@ pub enum ConfigError {
     InvalidEnqueueGuardrail,
     #[error("lease graceSec, yieldPollSec, and yieldGraceSec must all be positive")]
     InvalidLeaseGuardrail,
+    #[error("maxFrameBytes and agingThresholdSec must both be positive")]
+    InvalidFlowRuntimeLimit,
     #[error("executor {executor:?} is invalid: {detail}")]
     InvalidExecutor { executor: String, detail: String },
     #[error("adapter configuration is invalid: {0}")]
@@ -348,6 +381,9 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         AdapterEngine::new(&self.adapters).validate_all()?;
+        if self.max_frame_bytes == 0 || self.aging_threshold_sec == 0 {
+            return Err(ConfigError::InvalidFlowRuntimeLimit);
+        }
         if self.enqueue.depth_cap == 0 || self.enqueue.fanout_cap == 0 {
             return Err(ConfigError::InvalidEnqueueGuardrail);
         }
@@ -537,6 +573,32 @@ mod tests {
         assert_eq!(Priority::High.rank(), 100);
         assert_eq!(Priority::Medium.rank(), 50);
         assert_eq!(Priority::Low.rank(), 10);
+    }
+
+    #[test]
+    fn flow_runtime_limits_are_serde_defaulted_and_positive() {
+        let legacy: Config = serde_json::from_str(r#"{"pools":{}}"#).unwrap();
+        assert_eq!(legacy.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
+        assert_eq!(legacy.aging_threshold_sec, DEFAULT_AGING_THRESHOLD_SEC);
+        legacy.validate().unwrap();
+
+        let configured: Config = serde_json::from_str(
+            r#"{"maxFrameBytes":20971520,"agingThresholdSec":900,"pools":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(configured.max_frame_bytes, 20 * 1024 * 1024);
+        assert_eq!(configured.aging_threshold_sec, 900);
+        configured.validate().unwrap();
+
+        for invalid in [
+            r#"{"maxFrameBytes":0,"pools":{}}"#,
+            r#"{"agingThresholdSec":0,"pools":{}}"#,
+        ] {
+            assert!(matches!(
+                serde_json::from_str::<Config>(invalid).unwrap().validate(),
+                Err(ConfigError::InvalidFlowRuntimeLimit)
+            ));
+        }
     }
 
     #[test]

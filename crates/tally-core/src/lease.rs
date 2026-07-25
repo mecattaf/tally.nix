@@ -10,7 +10,9 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::config::{PoolConfig, PoolPredicate, Priority, ResourceKind};
+use crate::config::{
+    PoolConfig, PoolPredicate, Priority, ResourceKind, DEFAULT_AGING_THRESHOLD_SEC,
+};
 use crate::witness::{read_verified_records, Verdict, WitnessError};
 
 pub const LEASE_EPOCH_FILE: &str = "lease_epoch";
@@ -27,6 +29,16 @@ pub struct LeaseRequest {
     pub admission_key: Option<String>,
     #[serde(default)]
     pub consumption_estimate: Option<u64>,
+    #[serde(skip)]
+    pub scheduling_group: LeaseSchedulingGroup,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum LeaseSchedulingGroup {
+    Flow(String),
+    Parent(String),
+    #[default]
+    Standalone,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +317,8 @@ struct YieldIntent {
 struct PendingRequest {
     ticket_id: String,
     sequence: u64,
+    admitted_at: DateTime<Utc>,
+    effective_rank: u16,
     request: LeaseRequest,
 }
 
@@ -328,6 +342,7 @@ impl RuntimePool {
 pub struct LeaseEngine {
     epoch: u64,
     yield_grace: Duration,
+    aging_threshold: Duration,
     pools: BTreeMap<String, RuntimePool>,
     held: HashMap<String, HeldLease>,
     pending: Vec<PendingRequest>,
@@ -336,10 +351,46 @@ pub struct LeaseEngine {
     events: Option<LeaseEventLog>,
 }
 
+fn effective_rank_at(
+    pending: &PendingRequest,
+    now: DateTime<Utc>,
+    aging_threshold: Duration,
+) -> u16 {
+    let aged = now
+        .signed_duration_since(pending.admitted_at)
+        .to_std()
+        .is_ok_and(|waited| waited > aging_threshold);
+    if !aged {
+        return pending.request.priority.rank();
+    }
+    match pending.request.priority {
+        Priority::Low => Priority::Medium.rank(),
+        Priority::Medium => Priority::High.rank(),
+        Priority::High => Priority::Interrupt.rank(),
+        Priority::Interrupt => Priority::Interrupt.rank(),
+    }
+}
+
 impl LeaseEngine {
     pub fn new(
         epoch: u64,
         yield_grace: Duration,
+        pools: BTreeMap<String, PoolConfig>,
+        events: Option<LeaseEventLog>,
+    ) -> Result<Self, LeaseError> {
+        Self::new_with_aging_threshold(
+            epoch,
+            yield_grace,
+            Duration::from_secs(DEFAULT_AGING_THRESHOLD_SEC),
+            pools,
+            events,
+        )
+    }
+
+    pub fn new_with_aging_threshold(
+        epoch: u64,
+        yield_grace: Duration,
+        aging_threshold: Duration,
         pools: BTreeMap<String, PoolConfig>,
         events: Option<LeaseEventLog>,
     ) -> Result<Self, LeaseError> {
@@ -351,6 +402,11 @@ impl LeaseEngine {
         if yield_grace.is_zero() {
             return Err(LeaseError::InvalidRequest(
                 "yieldGraceSec must be positive".to_owned(),
+            ));
+        }
+        if aging_threshold.is_zero() {
+            return Err(LeaseError::InvalidRequest(
+                "agingThresholdSec must be positive".to_owned(),
             ));
         }
         for (name, config) in &pools {
@@ -371,6 +427,7 @@ impl LeaseEngine {
         Ok(Self {
             epoch,
             yield_grace,
+            aging_threshold,
             pools: pools
                 .into_iter()
                 .map(|(name, config)| (name, RuntimePool::new(config)))
@@ -391,8 +448,34 @@ impl LeaseEngine {
         witness_path: &Path,
         now: DateTime<Utc>,
     ) -> Result<Self, LeaseError> {
+        Self::from_durable_with_aging_threshold(
+            epoch,
+            yield_grace,
+            Duration::from_secs(DEFAULT_AGING_THRESHOLD_SEC),
+            pools,
+            events,
+            witness_path,
+            now,
+        )
+    }
+
+    pub fn from_durable_with_aging_threshold(
+        epoch: u64,
+        yield_grace: Duration,
+        aging_threshold: Duration,
+        pools: BTreeMap<String, PoolConfig>,
+        events: LeaseEventLog,
+        witness_path: &Path,
+        now: DateTime<Utc>,
+    ) -> Result<Self, LeaseError> {
         let rebuilt = rebuild_window_usage(&pools, &events, witness_path, now)?;
-        let mut engine = Self::new(epoch, yield_grace, pools, Some(events))?;
+        let mut engine = Self::new_with_aging_threshold(
+            epoch,
+            yield_grace,
+            aging_threshold,
+            pools,
+            Some(events),
+        )?;
         for (pool, debits) in rebuilt.debits {
             if let Some(state) = engine.pools.get_mut(&pool) {
                 state.debits = debits.into();
@@ -495,10 +578,12 @@ impl LeaseEngine {
         let pending = PendingRequest {
             ticket_id: ticket_id.clone(),
             sequence,
+            admitted_at: now,
+            effective_rank: request.priority.rank(),
             request,
         };
         self.pending.push(pending);
-        self.sort_pending();
+        self.sort_pending(now);
         if let Err(error) = self.reconcile_yield_demands(now) {
             self.pending
                 .retain(|pending| pending.ticket_id != ticket_id);
@@ -789,6 +874,7 @@ impl LeaseEngine {
     }
 
     fn reconcile_yield_demands(&mut self, now: DateTime<Utc>) -> Result<(), LeaseError> {
+        self.refresh_aged_order(now);
         let interrupts = self
             .pending
             .iter()
@@ -946,18 +1032,50 @@ impl LeaseEngine {
         Ok(())
     }
 
-    fn sort_pending(&mut self) {
+    fn sort_pending(&mut self, now: DateTime<Utc>) {
+        let aging_threshold = self.aging_threshold;
+        for pending in &mut self.pending {
+            pending.effective_rank = effective_rank_at(pending, now, aging_threshold);
+        }
+        let mut groups = HashMap::<(u16, LeaseSchedulingGroup), Vec<u64>>::new();
+        for pending in &self.pending {
+            groups
+                .entry((
+                    pending.effective_rank,
+                    pending.request.scheduling_group.clone(),
+                ))
+                .or_default()
+                .push(pending.sequence);
+        }
+        let mut braid = HashMap::<u64, (usize, u64)>::new();
+        for sequences in groups.values_mut() {
+            sequences.sort_unstable();
+            let oldest = sequences[0];
+            for (index, sequence) in sequences.iter().copied().enumerate() {
+                braid.insert(sequence, (index, oldest));
+            }
+        }
         self.pending.sort_by(|left, right| {
             right
-                .request
-                .priority
-                .rank()
-                .cmp(&left.request.priority.rank())
+                .effective_rank
+                .cmp(&left.effective_rank)
+                .then_with(|| braid[&left.sequence].0.cmp(&braid[&right.sequence].0))
+                .then_with(|| braid[&left.sequence].1.cmp(&braid[&right.sequence].1))
                 .then_with(|| left.sequence.cmp(&right.sequence))
         });
     }
 
+    fn refresh_aged_order(&mut self, now: DateTime<Utc>) {
+        let aging_threshold = self.aging_threshold;
+        if self.pending.iter().any(|pending| {
+            pending.effective_rank != effective_rank_at(pending, now, aging_threshold)
+        }) {
+            self.sort_pending(now);
+        }
+    }
+
     fn promote(&mut self, now: DateTime<Utc>) -> Result<Vec<LeaseGrant>, LeaseError> {
+        self.refresh_aged_order(now);
         let mut promoted = Vec::new();
         loop {
             let mut selected = None;
@@ -1335,6 +1453,7 @@ mod tests {
             priority,
             admission_key: None,
             consumption_estimate: None,
+            scheduling_group: LeaseSchedulingGroup::Standalone,
         }
     }
 
@@ -1374,6 +1493,242 @@ mod tests {
             .unwrap()
             .promoted;
         assert_eq!(first[0].job_id, "child-00");
+    }
+
+    fn grouped_request(job: &str, group: LeaseSchedulingGroup, priority: Priority) -> LeaseRequest {
+        let mut request = request(job, &["cpu"], priority);
+        request.scheduling_group = group;
+        request
+    }
+
+    fn fairness_fixture() -> (LeaseEngine, LeaseGrant) {
+        let mut engine = LeaseEngine::new_with_aging_threshold(
+            1,
+            Duration::from_secs(20),
+            Duration::from_secs(3_600),
+            BTreeMap::from([("cpu".to_owned(), pool(1))]),
+            None,
+        )
+        .unwrap();
+        let holder = grant(
+            engine
+                .admit_at(request("holder", &["cpu"], Priority::Medium), now())
+                .unwrap(),
+        );
+        for index in 0..400 {
+            engine
+                .admit_at(
+                    grouped_request(
+                        &format!("large-{index:03}"),
+                        LeaseSchedulingGroup::Flow("large-flow".to_owned()),
+                        Priority::Medium,
+                    ),
+                    now(),
+                )
+                .unwrap();
+        }
+        for index in 0..6 {
+            engine
+                .admit_at(
+                    grouped_request(
+                        &format!("small-{index:03}"),
+                        LeaseSchedulingGroup::Flow("small-flow".to_owned()),
+                        Priority::Medium,
+                    ),
+                    now(),
+                )
+                .unwrap();
+        }
+        for index in 0..6 {
+            engine
+                .admit_at(
+                    grouped_request(
+                        &format!("ordinary-{index:03}"),
+                        LeaseSchedulingGroup::Standalone,
+                        Priority::Medium,
+                    ),
+                    now(),
+                )
+                .unwrap();
+        }
+        (engine, holder)
+    }
+
+    fn drain_prefix(engine: &mut LeaseEngine, mut held: LeaseGrant, count: usize) -> Vec<String> {
+        let mut jobs = Vec::with_capacity(count);
+        for _ in 0..count {
+            let promoted = engine
+                .release_at(&held.lease_id, held.epoch, now())
+                .unwrap()
+                .promoted;
+            assert_eq!(promoted.len(), 1);
+            held = promoted.into_iter().next().unwrap();
+            jobs.push(held.job_id.clone());
+        }
+        jobs
+    }
+
+    #[test]
+    fn fairness_braid_prevents_a_400_node_flow_from_starving_siblings() {
+        let (mut first, first_holder) = fairness_fixture();
+        let (mut second, second_holder) = fairness_fixture();
+        let first_order = drain_prefix(&mut first, first_holder, 18);
+        let second_order = drain_prefix(&mut second, second_holder, 18);
+        let expected = (0..6)
+            .flat_map(|index| {
+                [
+                    format!("large-{index:03}"),
+                    format!("small-{index:03}"),
+                    format!("ordinary-{index:03}"),
+                ]
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(first_order, expected);
+        assert_eq!(second_order, first_order);
+    }
+
+    #[test]
+    fn no_provenance_rows_group_per_parent_and_parentless_rows_share_one_group() {
+        let mut engine = LeaseEngine::new(
+            1,
+            Duration::from_secs(20),
+            BTreeMap::from([("cpu".to_owned(), pool(1))]),
+            None,
+        )
+        .unwrap();
+        grant(
+            engine
+                .admit_at(request("holder", &["cpu"], Priority::Medium), now())
+                .unwrap(),
+        );
+        for job in ["parent-a-0", "parent-a-1"] {
+            engine
+                .admit_at(
+                    grouped_request(
+                        job,
+                        LeaseSchedulingGroup::Parent("parent-a".to_owned()),
+                        Priority::Medium,
+                    ),
+                    now(),
+                )
+                .unwrap();
+        }
+        for job in ["parent-b-0", "parent-b-1"] {
+            engine
+                .admit_at(
+                    grouped_request(
+                        job,
+                        LeaseSchedulingGroup::Parent("parent-b".to_owned()),
+                        Priority::Medium,
+                    ),
+                    now(),
+                )
+                .unwrap();
+        }
+        for job in ["standalone-0", "standalone-1"] {
+            engine
+                .admit_at(
+                    grouped_request(job, LeaseSchedulingGroup::Standalone, Priority::Medium),
+                    now(),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            engine
+                .pending
+                .iter()
+                .map(|pending| pending.request.job_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "parent-a-0",
+                "parent-b-0",
+                "standalone-0",
+                "parent-a-1",
+                "parent-b-1",
+                "standalone-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn aging_is_strictly_after_threshold_and_advances_exactly_one_rank() {
+        let threshold = Duration::from_secs(3_600);
+        let mut engine = LeaseEngine::new_with_aging_threshold(
+            1,
+            Duration::from_secs(20),
+            threshold,
+            BTreeMap::from([("cpu".to_owned(), pool(1))]),
+            None,
+        )
+        .unwrap();
+        grant(
+            engine
+                .admit_at(request("holder", &["cpu"], Priority::Interrupt), now())
+                .unwrap(),
+        );
+        engine
+            .admit_at(
+                grouped_request(
+                    "old-low",
+                    LeaseSchedulingGroup::Flow("old".to_owned()),
+                    Priority::Low,
+                ),
+                now(),
+            )
+            .unwrap();
+        let boundary = now() + chrono::Duration::seconds(3_600);
+        engine
+            .admit_at(
+                grouped_request(
+                    "new-medium",
+                    LeaseSchedulingGroup::Flow("new".to_owned()),
+                    Priority::Medium,
+                ),
+                boundary,
+            )
+            .unwrap();
+        assert_eq!(engine.pending[0].request.job_id, "new-medium");
+
+        engine.sort_pending(boundary + chrono::Duration::milliseconds(1));
+        assert_eq!(engine.pending[0].request.job_id, "old-low");
+        assert_eq!(engine.pending[0].effective_rank, Priority::Medium.rank());
+        assert_eq!(engine.pending[0].request.priority, Priority::Low);
+
+        engine.sort_pending(boundary + chrono::Duration::seconds(3_601));
+        assert_eq!(engine.pending[0].request.job_id, "new-medium");
+        let old = engine
+            .pending
+            .iter()
+            .find(|pending| pending.request.job_id == "old-low")
+            .unwrap();
+        assert_eq!(old.effective_rank, Priority::Medium.rank());
+        assert_eq!(old.request.priority, Priority::Low);
+    }
+
+    #[test]
+    fn every_priority_uses_the_normative_single_step_aging_map() {
+        for (priority, expected) in [
+            (Priority::Low, Priority::Medium.rank()),
+            (Priority::Medium, Priority::High.rank()),
+            (Priority::High, Priority::Interrupt.rank()),
+            (Priority::Interrupt, Priority::Interrupt.rank()),
+        ] {
+            let pending = PendingRequest {
+                ticket_id: "ticket".to_owned(),
+                sequence: 1,
+                admitted_at: now(),
+                effective_rank: priority.rank(),
+                request: request("job", &["cpu"], priority),
+            };
+            assert_eq!(
+                effective_rank_at(
+                    &pending,
+                    now() + chrono::Duration::seconds(3_601),
+                    Duration::from_secs(3_600),
+                ),
+                expected
+            );
+        }
     }
 
     #[test]

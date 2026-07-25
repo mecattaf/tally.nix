@@ -3,11 +3,9 @@ use std::collections::VecDeque;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::wire::FRAME_CAP_BYTES;
-
 pub const DEFAULT_PAGE_ITEMS: usize = 100;
 pub const MAX_PAGE_ITEMS: usize = 1_000;
-const PAGE_RESULT_CAP_BYTES: usize = FRAME_CAP_BYTES * 3 / 4;
+const PAGE_RESULT_CAP_BYTES: usize = 48 * 1024;
 const MAX_SNAPSHOTS: usize = 32;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -187,7 +185,7 @@ mod tests {
                     })
                 })
                 .collect::<Vec<_>>();
-            assert!(serde_json::to_vec(&items).unwrap().len() > FRAME_CAP_BYTES);
+            assert!(serde_json::to_vec(&items).unwrap().len() > PAGE_RESULT_CAP_BYTES);
             let envelope = serde_json::json!({
                 "schemaVersion": 1,
                 "protocolVersion": 3,
@@ -208,7 +206,7 @@ mod tests {
                         cursor.is_none().then(|| envelope.clone()),
                     )
                     .unwrap();
-                assert!(serde_json::to_vec(&page).unwrap().len() < FRAME_CAP_BYTES);
+                assert!(serde_json::to_vec(&page).unwrap().len() <= PAGE_RESULT_CAP_BYTES);
                 observed.extend(
                     page["items"]
                         .as_array()

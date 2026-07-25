@@ -66,6 +66,7 @@ fn config() -> Config {
         producers: BTreeMap::new(),
         executors: BTreeMap::new(),
         journald: JournaldConfig { native: false },
+        ..Config::default()
     }
 }
 
@@ -190,7 +191,7 @@ async fn real_type_notify_daemon_survives_watchdog_periods() {
         .unwrap();
     assert_ne!(watchdog_timestamp, "0", "{properties}");
 
-    let mut client = RpcClient::connect(&socket).await.unwrap();
+    let client = RpcClient::connect(&socket).await.unwrap();
     let query = client
         .call("query.status", Some(serde_json::json!({})))
         .await
@@ -265,7 +266,7 @@ async fn assert_collected(unit: &str) {
     .unwrap_or_else(|_| panic!("transient unit {unit} was not collected"));
 }
 
-async fn enqueue(client: &mut RpcClient, script: &str) -> serde_json::Value {
+async fn enqueue(client: &RpcClient, script: &str) -> serde_json::Value {
     client
         .call(
             "queue.enqueue",
@@ -428,7 +429,7 @@ async fn real_user_manager_adapter_capture_scrape() {
             .unwrap();
             let (shutdown, shutdown_rx) = watch::channel(false);
             let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-            let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+            let client = RpcClient::connect(&paths.socket).await.unwrap();
             let admitted = client
                 .call(
                     "queue.enqueue",
@@ -549,10 +550,10 @@ async fn real_user_manager_daemon_contention_restart_soak() {
                 .unwrap();
             let (first_shutdown, first_shutdown_rx) = watch::channel(false);
             let first_task = tokio::task::spawn_local(first.run_until(first_shutdown_rx));
-            let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+            let client = RpcClient::connect(&paths.socket).await.unwrap();
 
             let first = enqueue(
-                &mut client,
+                &client,
                 "printf 'first-start\\n'; sleep 3; printf 'first-done\\n'",
             )
             .await;
@@ -561,8 +562,8 @@ async fn real_user_manager_daemon_contention_restart_soak() {
             let first_unit = format!("tally-job-{first_uuid}.service");
             wait_active(&first_unit).await;
 
-            let second = enqueue(&mut client, "printf 'second\\n'").await;
-            let third = enqueue(&mut client, "printf 'third\\n'").await;
+            let second = enqueue(&client, "printf 'second\\n'").await;
+            let third = enqueue(&client, "printf 'third\\n'").await;
             let second_uuid = second["task_uuid"].as_str().unwrap().to_owned();
             let third_uuid = third["task_uuid"].as_str().unwrap().to_owned();
             cleanup.remember(&second_uuid);
@@ -607,7 +608,7 @@ async fn real_user_manager_daemon_contention_restart_soak() {
                 .unwrap();
             let (second_shutdown, second_shutdown_rx) = watch::channel(false);
             let second_task = tokio::task::spawn_local(second_daemon.run_until(second_shutdown_rx));
-            let mut restarted = RpcClient::connect(&paths.socket).await.unwrap();
+            let restarted = RpcClient::connect(&paths.socket).await.unwrap();
             let mut results = Vec::new();
             for task_uuid in [&first_uuid, &second_uuid, &third_uuid] {
                 results.push(

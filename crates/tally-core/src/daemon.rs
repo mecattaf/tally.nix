@@ -43,7 +43,7 @@ use crate::history::{HistoryError, LifecycleStore};
 use crate::journal::{EmitEvent, JournalEmitter, JournalEntry, TallyEvent};
 use crate::lease::{
     bump_epoch, AdmitOutcome, LeaseBackend, LeaseEngine, LeaseError, LeaseEventLog, LeaseGrant,
-    LeaseRequest, LocalLease, SystemdUnitLiveness,
+    LeaseRequest, LeaseSchedulingGroup, LocalLease, SystemdUnitLiveness,
 };
 use crate::pagination::{PageCache, PaginationError};
 use crate::producer_query::query_producers;
@@ -74,9 +74,9 @@ use crate::taskdb::{
 use crate::trace::{query_trace, trace_availability, TraceError, TraceLane};
 use crate::watch::{ChangeError, ChangeKind, ChangeStore};
 use crate::wire::{
-    canonical_payload_hash, serve_connection, EnqueuePayload, GuardrailConfig, GuardrailState,
-    ParentInfo, ProducerDefaults, RequestFrame, RpcHandler, SubmissionMode, WireError,
-    WireErrorCode, WireIoError,
+    canonical_payload_hash, serve_connection_with_max_frame_bytes, EnqueuePayload, GuardrailConfig,
+    GuardrailState, ParentInfo, ProducerDefaults, RequestFrame, RpcHandler, SubmissionMode,
+    WireError, WireErrorCode, WireIoError,
 };
 use crate::witness::{
     append_attestation, read_verified_attestations, read_verified_records, repair_attestation_tail,
@@ -2846,6 +2846,7 @@ impl DaemonHandler {
                 priority: Priority::Interrupt,
                 admission_key: None,
                 consumption_estimate: None,
+                scheduling_group: LeaseSchedulingGroup::Standalone,
             },
             Utc::now(),
         ) {
@@ -4093,6 +4094,13 @@ fn find_job<'a>(context: &'a Context, presented: &str) -> Result<&'a Job, WireEr
 }
 
 fn lease_request(job: &Job, unit: String) -> LeaseRequest {
+    let scheduling_group = if let Some(orchestration) = &job.row.orchestration {
+        LeaseSchedulingGroup::Flow(orchestration.flow_run_id().to_owned())
+    } else if let Some(parent) = job.row.parent_uuid {
+        LeaseSchedulingGroup::Parent(parent.to_string())
+    } else {
+        LeaseSchedulingGroup::Standalone
+    };
     LeaseRequest {
         job_id: job.job_id.to_string(),
         unit,
@@ -4100,6 +4108,7 @@ fn lease_request(job: &Job, unit: String) -> LeaseRequest {
         priority: job.row.priority,
         admission_key: Some(format!("{}:{}", job.stable_key(), job.row.attempt)),
         consumption_estimate: job.row.consumption_estimate,
+        scheduling_group,
     }
 }
 
@@ -4569,6 +4578,7 @@ pub struct Daemon {
     initial_gh_completions: Vec<GhTerminalWork>,
     initial_lost_pools: Vec<String>,
     execution_shutdown: watch::Sender<bool>,
+    max_frame_bytes: u64,
     #[cfg(test)]
     lease_tick_hook: Option<LeaseTickHook>,
 }
@@ -4730,9 +4740,10 @@ impl Daemon {
     ) -> Result<Self, DaemonError> {
         validate_recovery_briefs(&plan, &paths.data_dir)?;
         let event_log = LeaseEventLog::in_state_dir(&paths.state_dir);
-        let lease_engine = LeaseEngine::from_durable(
+        let lease_engine = LeaseEngine::from_durable_with_aging_threshold(
             epoch,
             settings.yield_grace,
+            Duration::from_secs(config.aging_threshold_sec),
             config.pools.clone(),
             event_log,
             &paths.witness_path(),
@@ -4864,6 +4875,7 @@ impl Daemon {
             initial_gh_completions,
             initial_lost_pools,
             execution_shutdown,
+            max_frame_bytes: config.max_frame_bytes,
             #[cfg(test)]
             lease_tick_hook: None,
         })
@@ -4959,8 +4971,15 @@ impl Daemon {
                             match accepted {
                                 Ok((stream, _)) => {
                                     let handler = self.handler.clone();
+                                    let max_frame_bytes = self.max_frame_bytes;
                                     connections.push(tokio::task::spawn_local(async move {
-                                        if let Err(error) = serve_connection(stream, &handler).await {
+                                        if let Err(error) = serve_connection_with_max_frame_bytes(
+                                            stream,
+                                            handler,
+                                            max_frame_bytes,
+                                        )
+                                        .await
+                                        {
                                             eprintln!("tally: RPC connection failed: {error}");
                                         }
                                     }));
@@ -7584,6 +7603,7 @@ mod tests {
             producers: BTreeMap::new(),
             executors: BTreeMap::new(),
             journald: JournaldConfig { native: false },
+            ..Config::default()
         }
     }
 
@@ -7621,6 +7641,7 @@ mod tests {
             producers: BTreeMap::new(),
             executors: BTreeMap::new(),
             journald: JournaldConfig { native: false },
+            ..Config::default()
         }
     }
 
@@ -7941,7 +7962,7 @@ mod tests {
         })
     }
 
-    async fn fs1_wait(client: &mut RpcClient, response: &Value) -> Value {
+    async fn fs1_wait(client: &RpcClient, response: &Value) -> Value {
         client
             .call(
                 "queue.await_job",
@@ -8587,7 +8608,7 @@ mod tests {
                 let daemon_history = daemon.handler.history.clone();
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
 
                 let evidence_class = json!({
                     "arbitrary": [true, 7, {"nested": null}],
@@ -9156,7 +9177,7 @@ mod tests {
                     .is_none());
                 let (shutdown, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
                 let result = client
                     .call(
                         "queue.await_job",
@@ -11171,6 +11192,7 @@ mod tests {
                     priority: Priority::Medium,
                     admission_key: Some(format!("{id}:1")),
                     consumption_estimate: Some(40),
+                    scheduling_group: LeaseSchedulingGroup::Standalone,
                 },
                 Utc::now(),
             )
@@ -11363,7 +11385,7 @@ mod tests {
                 .unwrap();
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
                 let active = client
                     .call(
                         "queue.enqueue",
@@ -11575,7 +11597,7 @@ mod tests {
 
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
                 let result = tokio::time::timeout(
                     Duration::from_secs(1),
                     client.call(
@@ -11715,7 +11737,7 @@ mod tests {
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
 
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
                 let admitted = client
                     .call(
                         "queue.enqueue",
@@ -11830,7 +11852,7 @@ mod tests {
                 .unwrap();
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
                 client
                     .call(
                         "queue.enqueue",
@@ -11945,7 +11967,7 @@ mod tests {
                 let first_context = first.handler.context.clone();
                 let (first_shutdown, first_shutdown_rx) = watch::channel(false);
                 let first_task = tokio::task::spawn_local(first.run_until(first_shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
                 let admitted = client
                     .call(
                         "queue.enqueue",
@@ -11994,7 +12016,7 @@ mod tests {
                 assert!(second.initial_jobs.is_empty());
                 let (second_shutdown, second_shutdown_rx) = watch::channel(false);
                 let second_task = tokio::task::spawn_local(second.run_until(second_shutdown_rx));
-                let mut restarted_client = RpcClient::connect(&paths.socket).await.unwrap();
+                let restarted_client = RpcClient::connect(&paths.socket).await.unwrap();
                 let late = tokio::time::timeout(
                     Duration::from_millis(100),
                     restarted_client.call("queue.await_job", Some(json!({"task_uuid": task_uuid}))),
@@ -12186,7 +12208,7 @@ mod tests {
                 let context = daemon.handler.context.clone();
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
                 let payload = json!({
                     "argv": ["true"],
                     "pool": "slot",
@@ -12290,7 +12312,7 @@ mod tests {
                 let reopened_socket = reopened.handler.context.read().await.paths.socket.clone();
                 let reopened_task =
                     tokio::task::spawn_local(reopened.run_until(reopened_shutdown_rx));
-                let mut reopened_client = RpcClient::connect(&reopened_socket).await.unwrap();
+                let reopened_client = RpcClient::connect(&reopened_socket).await.unwrap();
                 let late_reused = reopened_client
                     .call("queue.await_job", Some(json!({"task_uuid": reused_uuid})))
                     .await
@@ -12574,7 +12596,7 @@ mod tests {
                 let inherited_lock = daemon._state_lock.try_clone().unwrap();
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
                 let admitted = client
                     .call(
                         "queue.enqueue",
@@ -12621,7 +12643,7 @@ mod tests {
                 assert!(reopened.initial_jobs.is_empty());
                 let (second_shutdown, second_shutdown_rx) = watch::channel(false);
                 let second_task = tokio::task::spawn_local(reopened.run_until(second_shutdown_rx));
-                let mut restarted = RpcClient::connect(&paths.socket).await.unwrap();
+                let restarted = RpcClient::connect(&paths.socket).await.unwrap();
                 let late = restarted
                     .call("queue.await_job", Some(json!({"task_uuid": task_uuid})))
                     .await
@@ -12901,8 +12923,8 @@ mod tests {
                 let context = daemon.handler.context.clone();
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut first_client = RpcClient::connect(&paths.socket).await.unwrap();
-                let mut second_client = RpcClient::connect(&paths.socket).await.unwrap();
+                let first_client = RpcClient::connect(&paths.socket).await.unwrap();
+                let second_client = RpcClient::connect(&paths.socket).await.unwrap();
                 let payload = fs1_full_payload("fs1-concurrent", &["true"], ["exit:0".to_owned()]);
                 let mut metadata_variant = payload.clone();
                 metadata_variant["priority"] = json!("low");
@@ -12971,7 +12993,7 @@ mod tests {
                 let daemon = fs1_daemon(&paths).await;
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
 
                 let running = client
                     .call(
@@ -13087,7 +13109,7 @@ mod tests {
                 let context = daemon.handler.context.clone();
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
 
                 let mut payload =
                     fs1_full_payload("fs1-vacuous-reuse", &["true"], ["exit:0".to_owned()]);
@@ -13107,7 +13129,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(created["disposition"], "created");
-                let terminal = fs1_wait(&mut client, &created).await;
+                let terminal = fs1_wait(&client, &created).await;
                 assert_eq!(terminal["verdict"], "pass");
                 let (_, before) = read_verified_records(&paths.witness_path()).unwrap();
                 assert_eq!(before.len(), 1);
@@ -13152,7 +13174,7 @@ mod tests {
                 let daemon = fs1_daemon(&paths).await;
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
 
                 let clean_payload = fs1_full_payload(
                     "fs1-clean-artifact",
@@ -13166,7 +13188,7 @@ mod tests {
                     .call("queue.enqueue", Some(clean_payload.clone()))
                     .await
                     .unwrap();
-                assert_eq!(fs1_wait(&mut client, &clean).await["verdict"], "pass");
+                assert_eq!(fs1_wait(&client, &clean).await["verdict"], "pass");
                 let clean_reused = client
                     .call("queue.enqueue", Some(clean_payload))
                     .await
@@ -13185,7 +13207,7 @@ mod tests {
                     .call("queue.enqueue", Some(drift_payload.clone()))
                     .await
                     .unwrap();
-                assert_eq!(fs1_wait(&mut client, &drift).await["verdict"], "pass");
+                assert_eq!(fs1_wait(&client, &drift).await["verdict"], "pass");
                 fs::write(&drift_path, b"changed\n").unwrap();
                 let drift_rerun = client
                     .call("queue.enqueue", Some(drift_payload))
@@ -13193,7 +13215,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(drift_rerun["disposition"], "created");
                 assert_eq!(drift_rerun["reusedRejected"], "artifact-drift");
-                assert_eq!(fs1_wait(&mut client, &drift_rerun).await["verdict"], "pass");
+                assert_eq!(fs1_wait(&client, &drift_rerun).await["verdict"], "pass");
 
                 let declared_payload = fs1_full_payload(
                     "fs1-declared-mismatch",
@@ -13211,7 +13233,7 @@ mod tests {
                     .call("queue.enqueue", Some(declared_payload.clone()))
                     .await
                     .unwrap();
-                assert_eq!(fs1_wait(&mut client, &declared).await["verdict"], "pass");
+                assert_eq!(fs1_wait(&client, &declared).await["verdict"], "pass");
                 fs::write(&declared_path, b"changed\n").unwrap();
                 let declared_rerun = client
                     .call("queue.enqueue", Some(declared_payload))
@@ -13220,7 +13242,7 @@ mod tests {
                 assert_eq!(declared_rerun["disposition"], "created");
                 assert_eq!(declared_rerun["reusedRejected"], "declared-hash-mismatch");
                 assert_eq!(
-                    fs1_wait(&mut client, &declared_rerun).await["verdict"],
+                    fs1_wait(&client, &declared_rerun).await["verdict"],
                     "clean-exit-no-artifact"
                 );
 
@@ -13236,7 +13258,7 @@ mod tests {
                     .call("queue.enqueue", Some(unavailable_payload.clone()))
                     .await
                     .unwrap();
-                assert_eq!(fs1_wait(&mut client, &unavailable).await["verdict"], "pass");
+                assert_eq!(fs1_wait(&client, &unavailable).await["verdict"], "pass");
                 fs::remove_file(&unavailable_path).unwrap();
                 let unavailable_rerun = client
                     .call("queue.enqueue", Some(unavailable_payload))
@@ -13249,7 +13271,7 @@ mod tests {
                     unavailable_path.to_string_lossy().as_ref()
                 );
                 assert_eq!(
-                    fs1_wait(&mut client, &unavailable_rerun).await["verdict"],
+                    fs1_wait(&client, &unavailable_rerun).await["verdict"],
                     "clean-exit-no-artifact"
                 );
 
@@ -13276,15 +13298,15 @@ mod tests {
                 let daemon = fs1_daemon(&paths).await;
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
-                let mut attached_client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
+                let attached_client = RpcClient::connect(&paths.socket).await.unwrap();
                 let failed_payload =
                     fs1_full_payload("fs1-memoized-failure", &["false"], ["exit:0".to_owned()]);
                 let created = client
                     .call("queue.enqueue", Some(failed_payload.clone()))
                     .await
                     .unwrap();
-                let failed = fs1_wait(&mut client, &created).await;
+                let failed = fs1_wait(&client, &created).await;
                 assert_eq!(failed["verdict"], "failed");
                 let terminal = client
                     .call("queue.enqueue", Some(failed_payload.clone()))
@@ -13375,7 +13397,7 @@ mod tests {
                     .call("queue.enqueue", Some(passing_payload))
                     .await
                     .unwrap();
-                assert_eq!(fs1_wait(&mut client, &passing).await["verdict"], "pass");
+                assert_eq!(fs1_wait(&client, &passing).await["verdict"], "pass");
                 let pass_retry = client
                     .call(
                         "queue.retry",
@@ -13415,7 +13437,7 @@ mod tests {
                 let daemon = fs1_daemon(&paths).await;
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
                 let payload =
                     fs1_full_payload("fs1-retry-restart", &["false"], ["exit:0".to_owned()]);
                 let created = client
@@ -13423,7 +13445,7 @@ mod tests {
                     .await
                     .unwrap();
                 let task_uuid = created["task_uuid"].as_str().unwrap().to_owned();
-                assert_eq!(fs1_wait(&mut client, &created).await["attempt"], 1);
+                assert_eq!(fs1_wait(&client, &created).await["attempt"], 1);
                 client
                     .call("queue.pause", Some(json!({"pool": "slot", "all": false})))
                     .await
@@ -13441,7 +13463,7 @@ mod tests {
                 let (restart_shutdown_tx, restart_shutdown_rx) = watch::channel(false);
                 let restarted_task =
                     tokio::task::spawn_local(restarted.run_until(restart_shutdown_rx));
-                let mut restarted_client = RpcClient::connect(&paths.socket).await.unwrap();
+                let restarted_client = RpcClient::connect(&paths.socket).await.unwrap();
                 let terminal = restarted_client
                     .call(
                         "queue.await_job",
@@ -13492,7 +13514,7 @@ mod tests {
                 let daemon = fs1_daemon(&paths).await;
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
 
                 let legacy = json!({
                     "argv": ["true"],
@@ -13512,7 +13534,7 @@ mod tests {
                 assert_eq!(first["schemaVersion"], 1);
                 assert_eq!(first["disposition"], "created");
                 assert!(first.get("payloadHash").is_none());
-                assert_eq!(fs1_wait(&mut client, &first).await["verdict"], "pass");
+                assert_eq!(fs1_wait(&client, &first).await["verdict"], "pass");
                 let reused = client
                     .call("queue.enqueue", Some(legacy.clone()))
                     .await
@@ -13548,7 +13570,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(
-                    fs1_wait(&mut client, &manifest_first).await["verdict"],
+                    fs1_wait(&client, &manifest_first).await["verdict"],
                     "pass"
                 );
                 let manifest_second = client
@@ -13558,7 +13580,7 @@ mod tests {
                 assert_eq!(manifest_second["disposition"], "created");
                 assert_ne!(manifest_second["task_uuid"], manifest_first["task_uuid"]);
                 assert_eq!(
-                    fs1_wait(&mut client, &manifest_second).await["verdict"],
+                    fs1_wait(&client, &manifest_second).await["verdict"],
                     "pass"
                 );
 
@@ -13575,7 +13597,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(
-                    fs1_wait(&mut client, &failed_first).await["verdict"],
+                    fs1_wait(&client, &failed_first).await["verdict"],
                     "failed"
                 );
                 let failed_second = client
@@ -13585,7 +13607,7 @@ mod tests {
                 assert_eq!(failed_second["disposition"], "created");
                 assert_ne!(failed_second["task_uuid"], failed_first["task_uuid"]);
                 assert_eq!(
-                    fs1_wait(&mut client, &failed_second).await["verdict"],
+                    fs1_wait(&client, &failed_second).await["verdict"],
                     "failed"
                 );
 
@@ -13601,7 +13623,7 @@ mod tests {
                     .call("queue.enqueue", Some(unrecorded_legacy.clone()))
                     .await
                     .unwrap();
-                assert_eq!(fs1_wait(&mut client, &unrecorded).await["verdict"], "pass");
+                assert_eq!(fs1_wait(&client, &unrecorded).await["verdict"], "pass");
                 unrecorded_legacy["submission"] = json!({"mode": "full"});
                 let full_after_legacy = client
                     .call("queue.enqueue", Some(unrecorded_legacy))
@@ -13614,7 +13636,7 @@ mod tests {
                 );
                 assert_ne!(full_after_legacy["task_uuid"], unrecorded["task_uuid"]);
                 assert_eq!(
-                    fs1_wait(&mut client, &full_after_legacy).await["verdict"],
+                    fs1_wait(&client, &full_after_legacy).await["verdict"],
                     "pass"
                 );
 
@@ -13653,7 +13675,7 @@ mod tests {
                 let daemon = fs1_daemon(&paths).await;
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let mut client = RpcClient::connect(&paths.socket).await.unwrap();
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
 
                 let mut payload = fs1_full_payload(
                     "flow:brief-round-trip:0",
@@ -13689,7 +13711,7 @@ mod tests {
                     .as_str()
                     .expect("full submission returns payloadHash")
                     .to_owned();
-                let terminal = fs1_wait(&mut client, &created).await;
+                let terminal = fs1_wait(&client, &created).await;
                 assert_eq!(terminal["verdict"], "pass");
 
                 let events = read_acknowledged_events(&paths.events_dir()).unwrap();

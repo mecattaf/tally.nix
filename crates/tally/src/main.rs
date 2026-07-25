@@ -10,7 +10,7 @@ use chrono::Utc;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
-use tally_core::config::Priority;
+use tally_core::config::{Priority, DEFAULT_MAX_FRAME_BYTES};
 use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings};
 use tally_core::evidence::RetryPolicy;
 use tally_core::executor::{
@@ -914,16 +914,30 @@ async fn execute(opts: Opts) -> Result<()> {
         }
         Some(Command::Daemon {
             command: DaemonCommand::Drain,
-        }) => print_rpc(&socket, "queue.drain", Some(json!({}))).await,
-        Some(Command::Enqueue(args)) => run_enqueue(&socket, *args).await,
+        }) => {
+            print_rpc(
+                &socket,
+                opts.config.as_deref(),
+                "queue.drain",
+                Some(json!({})),
+            )
+            .await
+        }
+        Some(Command::Enqueue(args)) => run_enqueue(&socket, opts.config.as_deref(), *args).await,
         Some(Command::Queue {
             command: QueueCommand::Enqueue(args),
-        }) => run_enqueue(&socket, *args).await,
-        Some(Command::Queue { command }) => run_queue(&socket, command).await,
+        }) => run_enqueue(&socket, opts.config.as_deref(), *args).await,
+        Some(Command::Queue { command }) => {
+            run_queue(&socket, opts.config.as_deref(), command).await
+        }
         Some(Command::Producer { command }) => run_producer(opts.config, command),
         Some(Command::Witness { command }) => run_witness(command),
-        Some(Command::Lease { command }) => run_lease(&socket, command).await,
-        Some(Command::Query { command }) => run_query(&socket, command).await,
+        Some(Command::Lease { command }) => {
+            run_lease(&socket, opts.config.as_deref(), command).await
+        }
+        Some(Command::Query { command }) => {
+            run_query(&socket, opts.config.as_deref(), command).await
+        }
         Some(Command::Flow { command }) => run_flow(command),
         None => {
             Opts::command().print_help()?;
@@ -1030,6 +1044,7 @@ async fn run_producer_dispatch(
 ) -> Result<()> {
     let config_path = config_path.context("__producer-dispatch requires --config PATH")?;
     let config = Config::from_path(&config_path)?;
+    let max_frame_bytes = config.max_frame_bytes;
     let event: ProducerObservation = serde_json::from_str(&args.event)
         .context("--event must be a producer observation JSON object")?;
     let state_dir = args.state_dir.map_or_else(default_state_dir, Ok)?;
@@ -1059,7 +1074,8 @@ async fn run_producer_dispatch(
             serde_json::to_value(engine.emit_calendar(&args.producer, now)?)?
         }
         ProducerObservation::EventsDir => {
-            let mut client = RpcClient::connect(socket).await?;
+            let client =
+                RpcClient::connect_with_max_frame_bytes(socket, max_frame_bytes).await?;
             client
                 .call(
                     "queue.drain",
@@ -1187,7 +1203,8 @@ async fn run_producer_dispatch(
                     engine
                         .acknowledge_reachability_transition(&args.producer, outcome.generation)?;
                 } else {
-                    let mut client = RpcClient::connect(socket).await?;
+                    let client =
+                        RpcClient::connect_with_max_frame_bytes(socket, max_frame_bytes).await?;
                     client
                         .call(
                             "__producer.pool-transition",
@@ -1227,8 +1244,8 @@ async fn run_producer_dispatch(
         );
     }
     if runtime_recorded && !args.engine_only {
-        match RpcClient::connect(socket).await {
-            Ok(mut client) => {
+        match RpcClient::connect_with_max_frame_bytes(socket, max_frame_bytes).await {
+            Ok(client) => {
                 if let Err(error) = client
                     .call(
                         "__producer.runtime-observed",
@@ -1322,7 +1339,11 @@ where
         .map_err(|error| anyhow::anyhow!("{environment} has an invalid value: {error}"))
 }
 
-async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
+async fn run_enqueue(
+    socket: &Path,
+    config_path: Option<&Path>,
+    mut args: EnqueueArgs,
+) -> Result<()> {
     let has_invocation = args.invocation.is_some();
     let has_argv = !args.argv.is_empty();
     if has_invocation == has_argv {
@@ -1431,16 +1452,17 @@ async fn run_enqueue(socket: &Path, mut args: EnqueueArgs) -> Result<()> {
         related_trigger: args.related_trigger,
         wait: args.wait,
     };
-    submit_payload(socket, "queue.enqueue", payload, args.wait).await
+    submit_payload(socket, config_path, "queue.enqueue", payload, args.wait).await
 }
 
 async fn submit_payload(
     socket: &Path,
+    config_path: Option<&Path>,
     method: &str,
     payload: EnqueuePayload,
     wait: bool,
 ) -> Result<()> {
-    let mut client = RpcClient::connect(socket).await?;
+    let client = connect_rpc(socket, config_path).await?;
     let result = client
         .call(method, Some(serde_json::to_value(payload)?))
         .await?;
@@ -1491,12 +1513,13 @@ async fn submit_payload(
     }
 }
 
-async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
+async fn run_queue(socket: &Path, config_path: Option<&Path>, command: QueueCommand) -> Result<()> {
     match command {
         QueueCommand::Enqueue(_) => unreachable!("enqueue is routed before run_queue"),
         QueueCommand::Cancel { job, force } => {
             print_rpc(
                 socket,
+                config_path,
                 "queue.cancel",
                 Some(json!({"task_uuid": job, "force": force})),
             )
@@ -1505,6 +1528,7 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
         QueueCommand::Pause { pool, all } => {
             print_rpc(
                 socket,
+                config_path,
                 "queue.pause",
                 Some(json!({"pool": pool, "all": all})),
             )
@@ -1513,6 +1537,7 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
         QueueCommand::Resume { pool, all } => {
             print_rpc(
                 socket,
+                config_path,
                 "queue.resume",
                 Some(json!({"pool": pool, "all": all})),
             )
@@ -1554,18 +1579,31 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
                 related_trigger: None,
                 wait,
             };
-            submit_payload(socket, "queue.continue", payload, wait).await
+            submit_payload(socket, config_path, "queue.continue", payload, wait).await
         }
         QueueCommand::Retry { job } => {
-            print_rpc(socket, "queue.retry", Some(json!({"task_uuid": job}))).await
+            print_rpc(
+                socket,
+                config_path,
+                "queue.retry",
+                Some(json!({"task_uuid": job})),
+            )
+            .await
         }
-        QueueCommand::Drain => print_rpc(socket, "queue.drain", Some(json!({}))).await,
+        QueueCommand::Drain => print_rpc(socket, config_path, "queue.drain", Some(json!({}))).await,
         QueueCommand::AwaitJob { job } => {
-            print_rpc(socket, "queue.await_job", Some(json!({"task_uuid": job}))).await
+            print_rpc(
+                socket,
+                config_path,
+                "queue.await_job",
+                Some(json!({"task_uuid": job})),
+            )
+            .await
         }
         QueueCommand::AwaitBarrier { barrier } => {
             print_rpc(
                 socket,
+                config_path,
                 "queue.await_barrier",
                 Some(json!({"barrier": barrier})),
             )
@@ -1574,7 +1612,7 @@ async fn run_queue(socket: &Path, command: QueueCommand) -> Result<()> {
     }
 }
 
-async fn run_lease(socket: &Path, command: LeaseCommand) -> Result<()> {
+async fn run_lease(socket: &Path, config_path: Option<&Path>, command: LeaseCommand) -> Result<()> {
     match command {
         LeaseCommand::Acquire { mut pools } => {
             tally_core::poolset::canonicalize(&mut pools)
@@ -1583,10 +1621,22 @@ async fn run_lease(socket: &Path, command: LeaseCommand) -> Result<()> {
                 [pool] => Value::String(pool.clone()),
                 pools => serde_json::to_value(pools)?,
             };
-            print_rpc(socket, "lease.acquire", Some(json!({"pool": pool}))).await
+            print_rpc(
+                socket,
+                config_path,
+                "lease.acquire",
+                Some(json!({"pool": pool})),
+            )
+            .await
         }
         LeaseCommand::Release { lease } => {
-            print_rpc(socket, "lease.release", Some(json!({"lease": lease}))).await
+            print_rpc(
+                socket,
+                config_path,
+                "lease.release",
+                Some(json!({"lease": lease})),
+            )
+            .await
         }
         LeaseCommand::Status { lease } => {
             let params = if let Some(lease) = lease {
@@ -1597,12 +1647,12 @@ async fn run_lease(socket: &Path, command: LeaseCommand) -> Result<()> {
                 })?;
                 json!({"jobId": job_id})
             };
-            print_rpc(socket, "lease.status", Some(params)).await
+            print_rpc(socket, config_path, "lease.status", Some(params)).await
         }
     }
 }
 
-async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
+async fn run_query(socket: &Path, config_path: Option<&Path>, command: QueryCommand) -> Result<()> {
     match command {
         QueryCommand::Jobs {
             state,
@@ -1622,6 +1672,7 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
         } => {
             print_rpc(
                 socket,
+                config_path,
                 "query.jobs",
                 Some(json!({
                     "liveState": state,
@@ -1642,9 +1693,17 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
             )
             .await
         }
-        QueryCommand::Job { id } => print_rpc(socket, "query.job", Some(json!({"id": id}))).await,
+        QueryCommand::Job { id } => {
+            print_rpc(socket, config_path, "query.job", Some(json!({"id": id}))).await
+        }
         QueryCommand::Status { pool } => {
-            print_rpc(socket, "query.status", Some(json!({"pool": pool}))).await
+            print_rpc(
+                socket,
+                config_path,
+                "query.status",
+                Some(json!({"pool": pool})),
+            )
+            .await
         }
         QueryCommand::Log {
             task,
@@ -1659,6 +1718,7 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
         } => {
             print_rpc(
                 socket,
+                config_path,
                 "query.log",
                 Some(json!({
                     "task": task,
@@ -1677,6 +1737,7 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
         QueryCommand::Proof { task, attempt } => {
             print_rpc(
                 socket,
+                config_path,
                 "query.proof",
                 Some(json!({"task": task, "attempt": attempt})),
             )
@@ -1690,6 +1751,7 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
         } => {
             print_rpc(
                 socket,
+                config_path,
                 "query.trace",
                 Some(json!({
                     "task": task,
@@ -1703,14 +1765,17 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
         QueryCommand::Producers { name, kind } => {
             print_rpc(
                 socket,
+                config_path,
                 "query.producers",
                 Some(json!({"name": name, "kind": kind})),
             )
             .await
         }
-        QueryCommand::Watch { after, once } => run_query_watch(socket, after, once).await,
+        QueryCommand::Watch { after, once } => {
+            run_query_watch(socket, config_path, after, once).await
+        }
         QueryCommand::Render { format } => {
-            let mut client = RpcClient::connect(socket).await?;
+            let client = connect_rpc(socket, config_path).await?;
             let result = client
                 .call("query.render", Some(json!({"format": format.clone()})))
                 .await?;
@@ -1727,21 +1792,64 @@ async fn run_query(socket: &Path, command: QueryCommand) -> Result<()> {
             Ok(())
         }
         QueryCommand::Standup { since } => {
-            print_rpc(socket, "query.standup", Some(json!({"since": since}))).await
+            print_rpc(
+                socket,
+                config_path,
+                "query.standup",
+                Some(json!({"since": since})),
+            )
+            .await
         }
-        QueryCommand::Pools => print_rpc(socket, "query.pools", Some(json!({}))).await,
+        QueryCommand::Pools => print_rpc(socket, config_path, "query.pools", Some(json!({}))).await,
     }
 }
 
-async fn print_rpc(socket: &Path, method: &str, params: Option<Value>) -> Result<()> {
-    let mut client = RpcClient::connect(socket).await?;
+async fn print_rpc(
+    socket: &Path,
+    config_path: Option<&Path>,
+    method: &str,
+    params: Option<Value>,
+) -> Result<()> {
+    let client = connect_rpc(socket, config_path).await?;
     let result = client.call(method, params).await?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
-async fn run_query_watch(socket: &Path, mut after: Option<String>, once: bool) -> Result<()> {
-    let mut client = RpcClient::connect(socket).await?;
+async fn connect_rpc(socket: &Path, config_path: Option<&Path>) -> Result<RpcClient> {
+    let max_frame_bytes = client_max_frame_bytes(config_path)?;
+    RpcClient::connect_with_max_frame_bytes(socket, max_frame_bytes)
+        .await
+        .map_err(Into::into)
+}
+
+fn client_max_frame_bytes(config_path: Option<&Path>) -> Result<u64> {
+    let (path, explicit) = if let Some(path) = config_path {
+        (path.to_owned(), true)
+    } else {
+        let Ok(path) = default_config_path() else {
+            return Ok(DEFAULT_MAX_FRAME_BYTES);
+        };
+        (path, false)
+    };
+    match Config::from_path(&path) {
+        Ok(config) => Ok(config.max_frame_bytes),
+        Err(tally_core::ConfigError::Read { source, .. })
+            if !explicit && source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            Ok(DEFAULT_MAX_FRAME_BYTES)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn run_query_watch(
+    socket: &Path,
+    config_path: Option<&Path>,
+    mut after: Option<String>,
+    once: bool,
+) -> Result<()> {
+    let client = connect_rpc(socket, config_path).await?;
     loop {
         let result = client
             .call(
@@ -1931,6 +2039,22 @@ mod tests {
     #[test]
     fn clap_tree_is_consistent() {
         Opts::command().debug_assert();
+    }
+
+    #[test]
+    fn explicit_client_config_controls_the_transport_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = temp.path().join("config.json");
+        std::fs::write(
+            &config,
+            r#"{"maxFrameBytes":20971520,"agingThresholdSec":3600,"pools":{}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            client_max_frame_bytes(Some(&config)).unwrap(),
+            20 * 1024 * 1024
+        );
+        assert!(client_max_frame_bytes(Some(&temp.path().join("missing.json"))).is_err());
     }
 
     #[test]
