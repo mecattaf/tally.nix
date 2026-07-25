@@ -10,6 +10,7 @@ export const meta = {
     },
     additionalProperties: false
   },
+  maxNodes: 5,
   selectors: ["pooled-fast"]
 };
 

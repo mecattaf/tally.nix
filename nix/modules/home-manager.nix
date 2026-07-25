@@ -346,10 +346,14 @@ in
   config = lib.mkMerge [
     {
       services.tally.adapters = common.adapterDefaults;
+      services.tally.producers = common.mkFlowProducers cfg.flows;
       home.activation.tallyCleanRemovedProducers = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
         ${cleanupProgram}/bin/tally-clean-removed-producers
       '';
     }
+    (lib.mkIf (cfg.flows != { }) {
+      services.tally.pools.flow = common.flowPoolDefaults;
+    })
     (lib.mkIf cfg.enable {
       assertions = common.mkAssertions cfg;
 

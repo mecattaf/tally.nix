@@ -1,0 +1,24 @@
+{
+  "capacityNote": "Selector resolution chooses membership only; a capacity-1 pool drains the selected members sequentially.",
+  "pool": {
+    "name": "worker-gpu",
+    "capacity": 1
+  },
+  "cases": [
+    {
+      "selector": "pooled-fast",
+      "options": { "count": 4 },
+      "expectedIds": ["qwen-a", "qwen-b", "llama-a", "mistral-a"]
+    },
+    {
+      "selector": "pooled-fast",
+      "options": { "count": 5, "diversity": "family" },
+      "expectedIds": ["qwen-a", "llama-a", "mistral-a", "qwen-b", "llama-b"]
+    },
+    {
+      "selector": "pooled-fast",
+      "options": { "count": 5, "diversity": "maker" },
+      "expectedIds": ["qwen-a", "qwen-b", "llama-a", "mistral-a", "llama-b"]
+    }
+  ]
+}

@@ -39,6 +39,21 @@ let
 
   validCredentialName = value: builtins.stringLength value <= 255 && validComponent value;
 
+  storePathWithContext =
+    value:
+    let
+      path = toString value;
+      matched = builtins.match "(/nix/store/[0-9a-z]{32}-[^/]+)(/.*)?" path;
+    in
+    if matched == null then
+      path
+    else
+      builtins.appendContext path {
+        ${builtins.head matched} = {
+          path = true;
+        };
+      };
+
   mkScrapeCaptureType = types.submodule (
     { config, name, ... }: {
       options = {
@@ -271,6 +286,22 @@ let
           type = mkAdapterLaunchType;
           default = { };
           description = "Closed per-job direct-argv, cwd, policy, model, and effort authorization.";
+        };
+        hardening = mkOption {
+          type = types.nullOr (
+            types.enum [
+              "strict"
+              "workspace"
+              "none"
+            ]
+          );
+          default = null;
+          example = "strict";
+          description = ''
+            Optional transient-unit hardening preset. Null preserves the
+            compatibility behavior and renders no preset name; "none" is the
+            explicit spelling of that behavior.
+          '';
         };
         extraConfig = mkOption {
           type = types.attrsOf types.raw;
@@ -1459,6 +1490,100 @@ let
     }
   );
 
+  mkFlowType = types.submodule (
+    { config, name, ... }: {
+      options = {
+        script = mkOption {
+          type = types.path;
+          example = lib.literalExpression "./flows/nightly.js";
+          description = "Flow script store path; its content hash is the scriptHash identity.";
+        };
+        onCalendar = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "daily";
+          description = "Optional systemd calendar expression; null registers without scheduling.";
+        };
+        args = mkOption {
+          type = types.attrs;
+          default = { };
+          example.repository = "mecattaf/tally.nix";
+          description = "JSON-serializable flow arguments validated against meta.argsSchema.";
+        };
+        priority = mkOption {
+          type = types.enum [
+            "interrupt"
+            "high"
+            "medium"
+            "low"
+          ];
+          default = "low";
+          example = "medium";
+          description = "Priority of the runner job; flow nodes declare their own priorities.";
+        };
+        runtimeMaxSec = mkOption {
+          type = types.nullOr types.ints.positive;
+          default = 43200;
+          example = 7200;
+          description = "Optional RuntimeMaxSec watchdog for the runner job.";
+        };
+        maxNodes = mkOption {
+          type = types.ints.positive;
+          default = 1000;
+          example = 200;
+          description = "Per-run node backstop; must cover meta.maxNodes when declared.";
+        };
+        catalog = mkOption {
+          type = types.nullOr types.path;
+          default = null;
+          example = lib.literalExpression "./catalog.json";
+          description = "Optional selector catalog validated by tally flow check.";
+        };
+        budgetPool = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "programmatic";
+          description = "Optional run-scoped budget pool leased with the flow runner.";
+        };
+        extraEnv = mkOption {
+          type = types.attrsOf types.str;
+          default = { };
+          example.NO_COLOR = "1";
+          description = "Non-reserved environment added to the flow runner invocation.";
+        };
+        credentials = mkOption {
+          type = credentialType;
+          default = { };
+          example.API_TOKEN = "/run/credentials/flow-api-token";
+          description = "Credential references passed to the flow runner through LoadCredential.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions = flatten [
+        {
+          assertion = config.onCalendar == null || config.onCalendar != "";
+          message = "tally flow ${name} onCalendar must be null or non-empty";
+        }
+        {
+          assertion = config.budgetPool == null || config.budgetPool != "";
+          message = "tally flow ${name} budgetPool must be null or non-empty";
+        }
+        (mapAttrsToList (environment: _: {
+          assertion =
+            validEnvironmentName environment
+            && !(lib.hasPrefix "TALLY_" environment)
+            && environment != "CREDENTIALS_DIRECTORY";
+          message = "tally flow ${name} environment name ${environment} is invalid or reserved";
+        }) config.extraEnv)
+        (mapAttrsToList (credential: _: {
+          assertion = validCredentialName credential;
+          message = "tally flow ${name} has invalid credential name ${credential}";
+        }) config.credentials)
+      ];
+    }
+  );
+
   mkOptions =
     {
       defaultPackage,
@@ -1534,6 +1659,18 @@ let
         };
         description = "Server-side enqueue capability guardrails.";
       };
+      transport.maxFrameBytes = mkOption {
+        type = types.ints.positive;
+        default = 16777216;
+        example = 33554432;
+        description = "Maximum local wire-frame size enforced on reads and writes.";
+      };
+      scheduling.agingThresholdSec = mkOption {
+        type = types.ints.positive;
+        default = 3600;
+        example = 900;
+        description = "Wait time before one-step priority aging applies.";
+      };
       lease = mkOption {
         type = types.submodule {
           options = {
@@ -1600,6 +1737,16 @@ let
           };
         };
         description = "Five-kind producer registry with discriminator-specific submodules.";
+      };
+      flows = mkOption {
+        type = types.attrsOf mkFlowType;
+        default = { };
+        example.nightly = {
+          script = lib.literalExpression "./flows/nightly.js";
+          onCalendar = "daily";
+          args.repository = "mecattaf/tally.nix";
+        };
+        description = "Declarative flow registrations, optionally rendered as calendar producers.";
       };
       adapters = mkOption {
         type = types.attrsOf mkAdapterType;
@@ -1803,20 +1950,25 @@ let
     effort = renderAdapterValueOverride launch.effort;
   };
 
-  renderAdapter = _: adapter: {
-    inherit (adapter)
-      argv
-      resume
-      trace
-      yieldHook
-      env
-      extraConfig
-      ;
-    launch = renderAdapterLaunch adapter.launch;
-    scrape = mapAttrs (_: capture: {
-      inherit (capture) stream mode pattern;
-    }) adapter.scrape;
-  };
+  renderAdapter =
+    _: adapter:
+    {
+      inherit (adapter)
+        argv
+        resume
+        trace
+        yieldHook
+        env
+        extraConfig
+        ;
+      launch = renderAdapterLaunch adapter.launch;
+      scrape = mapAttrs (_: capture: {
+        inherit (capture) stream mode pattern;
+      }) adapter.scrape;
+    }
+    // optionalAttrs (adapter.hardening != null) {
+      inherit (adapter) hardening;
+    };
 
   renderPool = _: pool: {
     inherit (pool)
@@ -1858,6 +2010,8 @@ let
   };
 
   mkRuntimeConfig = cfg: {
+    inherit (cfg.transport) maxFrameBytes;
+    inherit (cfg.scheduling) agingThresholdSec;
     enqueue = {
       inherit (cfg.enqueue) depthCap fanoutCap requireDedupKey;
     };
@@ -1869,6 +2023,48 @@ let
     producers = mapAttrs renderProducer cfg.producers;
     adapters = mapAttrs renderAdapter cfg.adapters;
     journald = { inherit (cfg.journald) native; };
+  };
+
+  mkFlowProducer = name: flow: {
+    kind = "calendar";
+    inherit (flow) onCalendar;
+    credentials = { };
+    enqueue = {
+      argv = [
+        "tally"
+        "flow"
+        "run"
+        (storePathWithContext flow.script)
+        "--args"
+        (builtins.toJSON flow.args)
+        "--max-nodes"
+        (toString flow.maxNodes)
+      ]
+      ++ lib.optionals (flow.catalog != null) [
+        "--catalog"
+        (storePathWithContext flow.catalog)
+      ];
+      adapter = "shell";
+      adapterOptions.environment = flow.extraEnv;
+      pool = [ "flow" ];
+      inherit (flow) priority runtimeMaxSec credentials;
+      dedupKey = "flow-${name}-%Y-%m-%d";
+      evidence = [ "exit:0" ];
+      noEnqueue = false;
+    };
+  };
+
+  mkFlowProducers =
+    flows:
+    lib.mapAttrs' (name: flow: lib.nameValuePair "flow-${name}" (mkFlowProducer name flow)) (
+      filterAttrs (_: flow: flow.onCalendar != null) flows
+    );
+
+  flowPoolDefaults = {
+    resource = lib.mkDefault "cpu-slot";
+    capacity = lib.mkDefault 8;
+    enforce = lib.mkDefault "cooperative";
+    hardPreempt = lib.mkDefault false;
   };
 
   producerEnqueues =
@@ -1943,6 +2139,17 @@ let
           ]
         ) (producerEnqueues producer))
       ]) cfg.producers)
+      (mapAttrsToList (name: flow: [
+        {
+          assertion = validComponent name;
+          message = "tally flow name ${name} is not a safe unit/file component";
+        }
+        flow._tallyAssertions
+        {
+          assertion = flow.budgetPool == null || builtins.hasAttr flow.budgetPool cfg.pools;
+          message = "tally flow ${name} references unknown budgetPool ${toString flow.budgetPool}";
+        }
+      ]) cfg.flows)
       (
         let
           owners = mapAttrsToList (
@@ -1969,6 +2176,60 @@ let
     let
       rendered = pkgs.writeText "tally-config.json" (builtins.toJSON (mkRuntimeConfig cfg));
       expectedPriorityRanks = pkgs.writeText "tally-priority-ranks.json" (builtins.toJSON priorityRanks);
+      flowChecks = lib.concatStringsSep "\n" (
+        mapAttrsToList (
+          name: flow:
+          let
+            id = builtins.substring 0 16 (builtins.hashString "sha256" name);
+            args = pkgs.writeText "tally-flow-${id}-args.json" (builtins.toJSON flow.args);
+            script = lib.escapeShellArg (storePathWithContext flow.script);
+            flowName = lib.escapeShellArg name;
+            catalogCheck =
+              if flow.catalog == null then
+                ''
+                  if [ "$selector_count" -ne 0 ]; then
+                    printf 'tally flow %s declares selectors but has no catalog\n' ${flowName} >&2
+                    exit 1
+                  fi
+                ''
+              else
+                ''
+                  ${lib.getExe cfg.package} flow check ${script} \
+                    --catalog ${lib.escapeShellArg (storePathWithContext flow.catalog)} >/dev/null
+                '';
+          in
+          ''
+            meta="$TMPDIR/flow-${id}-meta.json"
+            ${lib.getExe cfg.package} flow check ${script} > "$meta"
+
+            unknown_pool="$(
+              jq -r --slurpfile config ${rendered} \
+                '[.pools[] as $pool | select(($config[0].pools | has($pool)) | not) | $pool][0] // empty' \
+                "$meta"
+            )"
+            if [ -n "$unknown_pool" ]; then
+              printf 'tally flow %s references unknown pool %s\n' ${flowName} "$unknown_pool" >&2
+              exit 1
+            fi
+            if jq -e '.pools | index("flow") != null' "$meta" >/dev/null; then
+              printf 'tally flow %s script meta.pools must not include flow\n' ${flowName} >&2
+              exit 1
+            fi
+
+            script_max_nodes="$(jq -r '.maxNodes // empty' "$meta")"
+            if [ -n "$script_max_nodes" ] && [ "$script_max_nodes" -gt ${toString flow.maxNodes} ]; then
+              printf 'tally flow %s maxNodes %s is less than script meta.maxNodes %s\n' \
+                ${flowName} ${lib.escapeShellArg (toString flow.maxNodes)} "$script_max_nodes" >&2
+              exit 1
+            fi
+
+            ${lib.getExe cfg.package} flow check ${script} --args "$(cat ${args})" >/dev/null
+
+            selector_count="$(jq -r '(.selectors // []) | length' "$meta")"
+            ${catalogCheck}
+          ''
+        ) cfg.flows
+      );
     in
     pkgs.runCommand "tally-checked-config.json"
       {
@@ -1981,6 +2242,7 @@ let
         contract="$(${lib.getExe cfg.package} --mode check-config --config ${rendered})"
         printf '%s\n' "$contract" | jq -e --slurpfile expected ${expectedPriorityRanks} \
           '.configuration == "valid" and .priorityRanks == $expected[0]' >/dev/null
+        ${flowChecks}
         cp ${rendered} "$out"
       '';
 
@@ -2009,8 +2271,10 @@ in
     adapterLibrary
     adapterDefaults
     meterEventPath
+    flowPoolDefaults
     mkAssertions
     mkCheckedConfig
+    mkFlowProducers
     mkInstalledPackage
     mkOptions
     mkRuntimeConfig

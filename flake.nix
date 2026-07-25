@@ -146,6 +146,66 @@
           inherit pkgs;
           tallyPackage = tally;
         };
+        flowWorkerHandoff = pkgs.writeShellApplication {
+          name = "tally-fs7-worker-handoff";
+          runtimeInputs = [
+            pkgs.coreutils
+            pkgs.git
+          ];
+          text = ''
+            work="$(mktemp -d)"
+            trap 'rm -rf "$work"' EXIT
+            git clone /srv/tally-fs7-handoff.git "$work/repository"
+            git -C "$work/repository" config user.name "tally FS-7 worker"
+            git -C "$work/repository" config user.email "tally-fs7-worker@example.invalid"
+            printf '%s\n' 'artifact-created-on-worker' >"$work/repository/artifact.txt"
+            git -C "$work/repository" add artifact.txt
+            git -C "$work/repository" commit -m 'FS-7 worker artifact'
+            touch /tmp/tally-fs7-worker-started
+            sleep 15
+            git -C "$work/repository" push origin HEAD:refs/heads/artifact
+          '';
+        };
+        flowCoordinatorHandoff = pkgs.writeShellApplication {
+          name = "tally-fs7-coordinator-handoff";
+          runtimeInputs = [
+            pkgs.coreutils
+            pkgs.git
+          ];
+          text = ''
+            work="$(mktemp -d)"
+            trap 'rm -rf "$work"' EXIT
+            git clone --branch artifact git://worker/tally-fs7-handoff.git "$work/repository"
+            test "$(cat "$work/repository/artifact.txt")" = artifact-created-on-worker
+            {
+              printf '%s\n' 'artifact-created-on-worker'
+              git -C "$work/repository" rev-parse HEAD
+            } >/tmp/tally-fs7-coordinator-consumed
+          '';
+        };
+        multiHostFlowArgs = {
+          workerProgram = "${flowWorkerHandoff}/bin/tally-fs7-worker-handoff";
+          coordinatorProgram = "${flowCoordinatorHandoff}/bin/tally-fs7-coordinator-handoff";
+        };
+        multiHostFlowArgsJson = builtins.toJSON multiHostFlowArgs;
+        flowReplayProgram = pkgs.writeShellApplication {
+          name = "tally-fs7-replay";
+          text = ''
+            if [ "$#" -ne 2 ]; then
+              echo "usage: tally-fs7-replay FLOW_RUN_ID RUNNER_JOB_ID" >&2
+              exit 2
+            fi
+            export TALLY_TASK_UUID="$1"
+            export TALLY_JOB_ID="$2"
+            exec ${tally}/bin/tally \
+              --config /var/lib/tally-coordinator/.config/tally/config.json \
+              --socket /run/user/1000/tally/tally.sock \
+              flow run ${./test/fixtures/flows/multi-host.js} \
+              --args ${pkgs.lib.escapeShellArg multiHostFlowArgsJson} \
+              --max-nodes 2 \
+              --flow-run-id "$1"
+          '';
+        };
         stockHome = home-manager.lib.homeManagerConfiguration {
           inherit pkgs;
           modules = [
@@ -158,6 +218,8 @@
               };
               services.tally = {
                 enable = true;
+                transport.maxFrameBytes = 33554432;
+                scheduling.agingThresholdSec = 900;
                 pools = {
                   stock = {
                     resource = "build-slot";
@@ -175,6 +237,8 @@
                     ];
                     credentials.METER_TOKEN = "/run/credentials/tally-meter";
                   };
+                  build.resource = "build-slot";
+                  worker-gpu.resource = "vram";
                 };
                 adapters.project-codex = {
                   argv = [
@@ -220,6 +284,12 @@
                       allowedValues = [ "high" ];
                     };
                   };
+                  hardening = "strict";
+                };
+                adapters.shell.hardening = "workspace";
+                adapters.explicit-none = {
+                  argv = [ "true" ];
+                  hardening = "none";
                 };
                 executors.worker = {
                   host = "worker.example";
@@ -308,6 +378,22 @@
                   };
                   drop.kind = "events-dir";
                 };
+                flows = {
+                  fixture = {
+                    script = ./test/fixtures/flows/valid.js;
+                    onCalendar = "daily";
+                    args.task = "ship";
+                    catalog = ./test/fixtures/flows/catalog.json;
+                    budgetPool = "programmatic";
+                    extraEnv.FLOW_MODE = "fixture";
+                    credentials.FLOW_TOKEN = "/run/credentials/tally-flow";
+                  };
+                  manual = {
+                    script = ./test/fixtures/flows/valid.js;
+                    args.task = "manual";
+                    catalog = ./test/fixtures/flows/catalog.json;
+                  };
+                };
               };
             }
           ];
@@ -359,6 +445,214 @@
         moduleCommon = import ./nix/modules/common.nix {
           inherit self pkgs;
           lib = pkgs.lib;
+        };
+        invalidFlowSchema = pkgs.lib.evalModules {
+          modules = [
+            {
+              options.services.tally = moduleCommon.mkOptions {
+                defaultPackage = tally;
+                defaultDataDir = "/tmp/tally-data";
+                defaultStateDir = "/tmp/tally-state";
+              };
+              config.services.tally = {
+                pools = {
+                  build.resource = "build-slot";
+                  flow.resource = "cpu-slot";
+                  worker-gpu.resource = "vram";
+                };
+                flows.bad-budget = {
+                  script = ./test/fixtures/flows/valid.js;
+                  args.task = "ship";
+                  catalog = ./test/fixtures/flows/catalog.json;
+                  budgetPool = "missing-budget";
+                };
+              };
+            }
+          ];
+        };
+        invalidFlowMessages = map (entry: entry.message) (
+          builtins.filter (entry: !entry.assertion) (
+            moduleCommon.mkAssertions invalidFlowSchema.config.services.tally
+          )
+        );
+        mkFlowConfig =
+          {
+            script,
+            args ? { },
+            catalog ? null,
+            maxNodes ? 1000,
+            pools ? {
+              build.resource = "build-slot";
+              worker-gpu.resource = "vram";
+            },
+          }:
+          (pkgs.lib.evalModules {
+            modules = [
+              {
+                options.services.tally = moduleCommon.mkOptions {
+                  defaultPackage = tally;
+                  defaultDataDir = "/tmp/tally-data";
+                  defaultStateDir = "/tmp/tally-state";
+                };
+                config.services.tally = {
+                  pools = pools // {
+                    flow = {
+                      resource = "cpu-slot";
+                      capacity = 8;
+                      enforce = "cooperative";
+                      hardPreempt = false;
+                    };
+                  };
+                  flows.fixture = {
+                    inherit
+                      script
+                      args
+                      catalog
+                      maxNodes
+                      ;
+                  };
+                };
+              }
+            ];
+          }).config.services.tally;
+        flowValidCheckedConfig = moduleCommon.mkCheckedConfig (mkFlowConfig {
+          script = ./test/fixtures/flows/valid.js;
+          args.task = "ship";
+          catalog = ./test/fixtures/flows/catalog.json;
+        });
+        flowNonliteralFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-nonliteral-meta-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/nonliteral-meta.js;
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            ''tally: {"name":"FlowMetaError","code":"meta-nonliteral","message":"meta must contain only JSON-compatible literals","location":{"line":5,"column":25}}''
+          ];
+        };
+        flowBannedGlobalFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-banned-global-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/banned-global.js;
+          });
+          expectedBuilderExitCode = 10;
+          expectedBuilderLogEntries = [
+            ''tally: {"name":"FlowDeterminismError","code":"determinism-violation","message":"banned global Math.random is unavailable in flow scripts","location":{"line":8,"column":1},"details":{"global":"Math.random"}}''
+          ];
+        };
+        flowUndeclaredPoolFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-undeclared-pool-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/undeclared-pool.js;
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            ''tally: {"name":"FlowPoolError","code":"undeclared-pool","message":"pool \"worker-gpu\" is used by the script but absent from meta.pools","location":{"line":8,"column":31},"details":{"pool":"worker-gpu"}}''
+          ];
+        };
+        flowBadArgsSchemaFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-bad-args-schema-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/bad-args-schema.js;
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            ''tally: {"name":"FlowMetaError","code":"args-schema-invalid","message":"meta.argsSchema is not a valid JSON Schema: \"definitely-not-a-json-schema-type\" is not valid under any of the schemas listed in the 'anyOf' keyword","location":{"line":1,"column":21}}''
+          ];
+        };
+        flowArgsMismatchFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-args-mismatch-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/valid.js;
+            args.task = 7;
+            catalog = ./test/fixtures/flows/catalog.json;
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            ''tally: {"name":"FlowArgsError","code":"args-schema-mismatch","message":"args do not match meta.argsSchema: /task: 7 is not of type \"string\"","location":{"line":1,"column":21},"details":{"errors":["/task: 7 is not of type \"string\""]}}''
+          ];
+        };
+        flowPoolClosureFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-pool-closure-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/valid.js;
+            args.task = "ship";
+            catalog = ./test/fixtures/flows/catalog.json;
+            pools.build.resource = "build-slot";
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            "tally flow fixture references unknown pool worker-gpu"
+          ];
+        };
+        flowReservedPoolFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-reserved-pool-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/reserved-flow-pool.js;
+            pools = { };
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            "tally flow fixture script meta.pools must not include flow"
+          ];
+        };
+        flowMaxNodesFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-max-nodes-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/valid.js;
+            args.task = "ship";
+            catalog = ./test/fixtures/flows/catalog.json;
+            maxNodes = 4;
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            "tally flow fixture maxNodes 4 is less than script meta.maxNodes 5"
+          ];
+        };
+        invalidFlowCatalog = pkgs.writeText "tally-invalid-flow-catalog.json" (
+          builtins.toJSON {
+            version = 1;
+            members = [ { id = "only"; } ];
+          }
+        );
+        flowCatalogFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-catalog-schema-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/valid.js;
+            args.task = "ship";
+            catalog = invalidFlowCatalog;
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            ''tally: {"name":"FlowCatalogError","code":"catalog-schema-mismatch","message":"catalog does not match schema: /members/0: \"family\" is a required property; /members/0: \"maker\" is a required property; /members/0: \"classes\" is a required property; /members/0: \"adapter\" is a required property; /members/0: \"pools\" is a required property; /members/0: \"launch\" is a required property","location":{"line":1,"column":1},"details":{"errors":["/members/0: \"family\" is a required property","/members/0: \"maker\" is a required property","/members/0: \"classes\" is a required property","/members/0: \"adapter\" is a required property","/members/0: \"pools\" is a required property","/members/0: \"launch\" is a required property"]}}''
+          ];
+        };
+        flowCatalogRequiredFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-catalog-required-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/valid.js;
+            args.task = "ship";
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            "tally flow fixture declares selectors but has no catalog"
+          ];
+        };
+        flowCatalogSelectorFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-catalog-selector-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./examples/flows/pooled-review.js;
+            args = {
+              subject = "audit";
+              minimumValid = 2;
+            };
+            catalog = ./test/fixtures/flows/catalog-resolution.json;
+            pools.worker-gpu.resource = "vram";
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            ''tally: {"name":"FlowSelectorError","code":"selector-empty","message":"selector class \"pooled-strongest\" resolves to no catalog members","location":{"line":1,"column":21},"details":{"selector":"pooled-strongest"}}''
+          ];
         };
         invalidProducerSchema = pkgs.lib.evalModules {
           modules = [
@@ -495,6 +789,319 @@
             )
             machine.wait_until_succeeds(
               user + " journalctl --user --unit=tally-drain.service --output=cat --no-pager | grep -F '\"barrier\":\"barrier:drain:' | grep -F '\"rejected\":0'"
+            )
+          '';
+        };
+        flowMultiHostTest = pkgs.testers.runNixOSTest {
+          name = "tally-flow-multi-host";
+          nodes = {
+            coordinator =
+              { ... }:
+              {
+                imports = [ home-manager.nixosModules.home-manager ];
+
+                system.stateVersion = "26.11";
+                virtualisation.memorySize = 1536;
+                users.users.tally = {
+                  isNormalUser = true;
+                  uid = 1000;
+                  createHome = true;
+                  home = "/var/lib/tally-coordinator";
+                  linger = true;
+                };
+                environment.systemPackages = [
+                  tally
+                  pkgs.git
+                  pkgs.jq
+                ];
+                environment.etc = {
+                  "tally-fs7/id_ed25519" = {
+                    source = ./test/fixtures/ssh/fs7_coordinator_ed25519;
+                    mode = "0400";
+                    user = "tally";
+                    group = "users";
+                  };
+                  "tally-fs7/worker-known-hosts" = {
+                    source = ./test/fixtures/ssh/fs7_worker_known_hosts;
+                    mode = "0444";
+                  };
+                };
+
+                home-manager = {
+                  useGlobalPkgs = true;
+                  useUserPackages = true;
+                  users.tally = {
+                    imports = [ self.homeManagerModules.tally ];
+                    home = {
+                      username = "tally";
+                      homeDirectory = "/var/lib/tally-coordinator";
+                      stateVersion = "26.11";
+                    };
+                    services.tally = {
+                      enable = true;
+                      pools = {
+                        coordinator-slot = {
+                          resource = "build-slot";
+                          capacity = 1;
+                        };
+                        worker-slot = {
+                          resource = "build-slot";
+                          capacity = 1;
+                        };
+                      };
+                      executors.worker = {
+                        host = "worker";
+                        user = "tally-worker";
+                        identityFile = "/etc/tally-fs7/id_ed25519";
+                        knownHostsFile = "/etc/tally-fs7/worker-known-hosts";
+                        program = "${tally}/bin/tally";
+                        stateDir = "/var/lib/tally-remote";
+                        connectTimeoutSec = 5;
+                        serverAliveIntervalSec = 1;
+                        serverAliveCountMax = 2;
+                        retryIntervalMs = 100;
+                      };
+                      flows.multi-host = {
+                        script = ./test/fixtures/flows/multi-host.js;
+                        onCalendar = "2099-01-01 00:00:00";
+                        args = multiHostFlowArgs;
+                        maxNodes = 2;
+                        runtimeMaxSec = 120;
+                      };
+                    };
+                  };
+                };
+              };
+
+            worker =
+              { lib, ... }:
+              {
+                system.stateVersion = "26.11";
+                virtualisation.memorySize = 1024;
+                networking.firewall.allowedTCPPorts = [
+                  22
+                  9418
+                ];
+                environment.systemPackages = [
+                  tally
+                  pkgs.git
+                ];
+                environment.etc."ssh/ssh_host_ed25519_key" = {
+                  source = ./test/fixtures/ssh/fs7_worker_host_ed25519;
+                  mode = "0600";
+                };
+                environment.etc."ssh/ssh_host_ed25519_key.pub" = {
+                  source = ./test/fixtures/ssh/fs7_worker_host_ed25519.pub;
+                  mode = "0644";
+                };
+                users.users.tally-worker = {
+                  isNormalUser = true;
+                  uid = 1001;
+                  createHome = true;
+                  home = "/var/lib/tally-worker";
+                  linger = true;
+                  openssh.authorizedKeys.keys = [
+                    (builtins.readFile ./test/fixtures/ssh/fs7_coordinator_ed25519.pub)
+                  ];
+                };
+                services.openssh = {
+                  enable = true;
+                  hostKeys = [
+                    {
+                      path = "/etc/ssh/ssh_host_ed25519_key";
+                      type = "ed25519";
+                    }
+                  ];
+                  settings = {
+                    PasswordAuthentication = false;
+                    KbdInteractiveAuthentication = false;
+                    PermitRootLogin = "no";
+                    AllowUsers = [ "tally-worker" ];
+                  };
+                };
+                systemd.tmpfiles.rules = [
+                  "d /var/lib/tally-remote 0700 tally-worker users -"
+                  "d /srv/tally-fs7-handoff.git 0750 tally-worker users -"
+                ];
+                systemd.services.tally-fs7-repository = {
+                  description = "initialize the FS-7 sanctioned Git handoff repository";
+                  wantedBy = [ "multi-user.target" ];
+                  before = [ "tally-fs7-git.service" ];
+                  path = [
+                    pkgs.coreutils
+                    pkgs.git
+                  ];
+                  script = ''
+                    if [ ! -d /srv/tally-fs7-handoff.git/objects ]; then
+                      git init --bare /srv/tally-fs7-handoff.git
+                    fi
+                    touch /srv/tally-fs7-handoff.git/git-daemon-export-ok
+                  '';
+                  serviceConfig = {
+                    Type = "oneshot";
+                    RemainAfterExit = true;
+                    User = "tally-worker";
+                    Group = "users";
+                  };
+                };
+                systemd.services.tally-fs7-git = {
+                  description = "serve the FS-7 Git handoff repository";
+                  wantedBy = [ "multi-user.target" ];
+                  after = [
+                    "network.target"
+                    "tally-fs7-repository.service"
+                  ];
+                  requires = [ "tally-fs7-repository.service" ];
+                  serviceConfig = {
+                    Type = "simple";
+                    User = "tally-worker";
+                    Group = "users";
+                    ExecStart = lib.escapeShellArgs [
+                      "${pkgs.git}/bin/git"
+                      "daemon"
+                      "--reuseaddr"
+                      "--base-path=/srv"
+                      "--export-all"
+                      "--verbose"
+                      "/srv/tally-fs7-handoff.git"
+                    ];
+                    Restart = "on-failure";
+                  };
+                };
+              };
+          };
+          testScript = ''
+            start_all()
+
+            worker.wait_for_unit("sshd.service")
+            worker.wait_for_unit("tally-fs7-git.service")
+            worker.wait_until_succeeds(
+              "runuser -u tally-worker -- env HOME=/var/lib/tally-worker XDG_RUNTIME_DIR=/run/user/1001 systemctl --user is-active default.target"
+            )
+
+            coordinator.wait_for_unit("home-manager-tally.service")
+            coordinator.wait_until_succeeds(
+              "runuser -u tally -- env HOME=/var/lib/tally-coordinator XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active tally-daemon.service"
+            )
+            coordinator.succeed(
+              "runuser -u tally -- ${pkgs.openssh}/bin/ssh -F /dev/null "
+              "-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "
+              "-o UserKnownHostsFile=/etc/tally-fs7/worker-known-hosts "
+              "-i /etc/tally-fs7/id_ed25519 tally-worker@worker true"
+            )
+
+            user = (
+              "runuser -u tally -- env HOME=/var/lib/tally-coordinator "
+              "XDG_RUNTIME_DIR=/run/user/1000"
+            )
+            cli = (
+              user
+              + " ${tally}/bin/tally"
+              + " --config /var/lib/tally-coordinator/.config/tally/config.json"
+              + " --socket /run/user/1000/tally/tally.sock"
+            )
+
+            coordinator.succeed(
+              "jq -e '.pools.flow.capacity == 8 and "
+              ".producers[\"flow-multi-host\"].enqueue.executor == null and "
+              ".producers[\"flow-multi-host\"].enqueue.noEnqueue == false' "
+              "/var/lib/tally-coordinator/.config/tally/config.json"
+            )
+            coordinator.succeed(
+              user + " systemctl --user start tally-producer-flow-multi-host.service"
+            )
+            coordinator.wait_until_succeeds(
+              cli + " query jobs --source calendar | jq -e '.items | length == 1'"
+            )
+            coordinator.succeed(
+              cli
+              + " query jobs --source calendar | jq -r '.items[0].anchor' "
+              + "> /tmp/tally-fs7-parent"
+            )
+            coordinator.wait_until_succeeds(
+              cli
+              + " query job \"$(cat /tmp/tally-fs7-parent)\" "
+              + "| jq -e '.job.liveJobId != null'"
+            )
+            coordinator.succeed(
+              cli
+              + " query job \"$(cat /tmp/tally-fs7-parent)\" "
+              + "| jq -r '.job.liveJobId' > /tmp/tally-fs7-parent-job"
+            )
+
+            worker.wait_until_succeeds("test -f /tmp/tally-fs7-worker-started")
+            worker.succeed(
+              "runuser -u tally-worker -- env HOME=/var/lib/tally-worker "
+              "XDG_RUNTIME_DIR=/run/user/1001 systemctl --user list-units "
+              "'tally-job-*.service' --state=running --no-legend | grep -F tally-job-"
+            )
+            coordinator.succeed(
+              cli
+              + " query jobs --flow-run \"$(cat /tmp/tally-fs7-parent)\" "
+              + "| jq -e '.items | length == 1 and .[0].executor == \"worker\"'"
+            )
+
+            coordinator.succeed(
+              user
+              + " systemctl --user show tally-daemon.service --property=MainPID --value "
+              + "> /tmp/tally-fs7-old-daemon-pid"
+            )
+            coordinator.succeed("kill -KILL \"$(cat /tmp/tally-fs7-old-daemon-pid)\"")
+            coordinator.wait_until_succeeds(
+              user
+              + " systemctl --user show tally-daemon.service --property=MainPID --value "
+              + "| grep -E '^[1-9][0-9]*$'"
+            )
+            coordinator.wait_until_succeeds(
+              "test \"$("
+              + user
+              + " systemctl --user show tally-daemon.service --property=MainPID --value"
+              + ")\" != \"$(cat /tmp/tally-fs7-old-daemon-pid)\""
+            )
+            coordinator.wait_until_succeeds("test -S /run/user/1000/tally/tally.sock")
+
+            coordinator.succeed(
+              user
+              + " systemd-run --user --unit=tally-fs7-replay --collect "
+              + "--property=Type=exec "
+              + "--property=StandardOutput=append:/tmp/tally-fs7-replay.out "
+              + "--property=StandardError=append:/tmp/tally-fs7-replay.err -- "
+              + "${flowReplayProgram}/bin/tally-fs7-replay "
+              + "\"$(cat /tmp/tally-fs7-parent)\" "
+              + "\"$(cat /tmp/tally-fs7-parent-job)\""
+            )
+            coordinator.wait_until_succeeds(
+              "grep -F '\"type\":\"flow-report\"' /tmp/tally-fs7-replay.out"
+            )
+            coordinator.succeed(
+              "grep -F '\"disposition\":\"attached\"' /tmp/tally-fs7-replay.out"
+            )
+            coordinator.wait_until_succeeds(
+              cli
+              + " query job \"$(cat /tmp/tally-fs7-parent)\" "
+              + "| jq -e '.job.terminalVerdict == \"pass\"'"
+            )
+            coordinator.succeed(
+              cli
+              + " query jobs --flow-run \"$(cat /tmp/tally-fs7-parent)\" "
+              + "| jq -e --arg parent \"$(cat /tmp/tally-fs7-parent)\" "
+              + "'.items | length == 2 and "
+              + "all(.[]; .source == \"orchestrator\" and "
+              + ".parentTaskUuid == $parent and .terminalVerdict == \"pass\") and "
+              + "any(.[]; .executor == \"worker\") and "
+              + "any(.[]; .executor == null)'"
+            )
+
+            coordinator.succeed(
+              "grep -Fx artifact-created-on-worker /tmp/tally-fs7-coordinator-consumed"
+            )
+            coordinator.succeed(
+              "${pkgs.git}/bin/git ls-remote git://worker/tally-fs7-handoff.git "
+              "refs/heads/artifact | grep -F refs/heads/artifact"
+            )
+            coordinator.succeed(
+              "${tally}/bin/tally witness verify --ledger "
+              "/var/lib/tally-coordinator/.local/share/tally/witness.jsonl"
             )
           '';
         };
@@ -661,6 +1268,13 @@
         moduleContract =
           assert homeTimers ? tally-producer-daily;
           assert homeTimers.tally-producer-daily.Timer.OnCalendar == "daily";
+          assert homeTimers ? tally-producer-flow-fixture;
+          assert homeTimers.tally-producer-flow-fixture.Timer.OnCalendar == "daily";
+          assert homeServices ? tally-producer-flow-fixture;
+          assert !(homeTimers ? tally-producer-flow-manual);
+          assert !(homeServices ? tally-producer-flow-manual);
+          assert builtins.elem "tally flow bad-budget references unknown budgetPool missing-budget"
+            invalidFlowMessages;
           assert homeServices.tally-producer-health.Service.Restart == "always";
           assert homeServices.tally-producer-health.Unit.StartLimitIntervalSec == 0;
           assert homeServices.tally-producer-effects.Service.Restart == "always";
@@ -730,12 +1344,36 @@
             grep -F -- 'witness append --ledger "$ledger" --payload "$payload"' \
               ${tallyWitnessEmit}/bin/tally-witness-emit
             jq -e '
+              .maxFrameBytes == 33554432 and
+              .agingThresholdSec == 900 and
               .enqueue.depthCap == 3 and
               .enqueue.fanoutCap == 64 and
               .lease.yieldGraceSec == 20 and
+              .pools.flow.resource == "cpu-slot" and
+              .pools.flow.capacity == 8 and
+              .pools.flow.enforce == "cooperative" and
+              .pools.flow.hardPreempt == false and
               .pools.stock.enforce == "cooperative" and
               .pools.programmatic.usageMeter.budgetClass == "programmatic" and
               .pools.programmatic.credentials.METER_TOKEN == "/run/credentials/tally-meter" and
+              .producers["flow-fixture"].kind == "calendar" and
+              .producers["flow-fixture"].onCalendar == "daily" and
+              .producers["flow-fixture"].enqueue.argv[0:3] == ["tally", "flow", "run"] and
+              .producers["flow-fixture"].enqueue.argv[4] == "--args" and
+              (.producers["flow-fixture"].enqueue.argv[5] | fromjson) == {"task":"ship"} and
+              .producers["flow-fixture"].enqueue.argv[6:8] == ["--max-nodes", "1000"] and
+              .producers["flow-fixture"].enqueue.argv[8] == "--catalog" and
+              .producers["flow-fixture"].enqueue.adapter == "shell" and
+              .producers["flow-fixture"].enqueue.pool == "flow" and
+              .producers["flow-fixture"].enqueue.priority == "low" and
+              .producers["flow-fixture"].enqueue.dedupKey == "flow-fixture-%Y-%m-%d" and
+              .producers["flow-fixture"].enqueue.runtimeMaxSec == 43200 and
+              .producers["flow-fixture"].enqueue.evidence == ["exit:0"] and
+              .producers["flow-fixture"].enqueue.noEnqueue == false and
+              .producers["flow-fixture"].enqueue.adapterOptions.environment.FLOW_MODE == "fixture" and
+              .producers["flow-fixture"].enqueue.credentials.FLOW_TOKEN == "/run/credentials/tally-flow" and
+              (.producers | has("flow-manual") | not) and
+              (has("flows") | not) and
               .producers.daily.enqueue.pool == ["programmatic", "stock"] and
               .producers.daily.enqueue.executor == "worker" and
               .producers.daily.enqueue.credentials.JOB_TOKEN == "/run/credentials/tally-job" and
@@ -769,6 +1407,10 @@
               .executors.worker.program == "/run/current-system/sw/bin/tally" and
               .executors.worker.stateDir == "/var/lib/tally-remote" and
               .adapters["project-codex"].argv == ["codex", "exec", "--json", "--"] and
+              .adapters["project-codex"].hardening == "strict" and
+              .adapters.shell.hardening == "workspace" and
+              .adapters["explicit-none"].hardening == "none" and
+              (.adapters.pi | has("hardening") | not) and
               .adapters["project-codex"].launch.cwdArgv == ["-C", "%<cwd>%"] and
               .adapters["project-codex"].launch.model.allowedValues == ["gpt-5-codex"] and
               ([.. | objects | keys[]] | any(. == "remote" or . == "servingSlice" or . == "patchedSystemd") | not)
@@ -797,6 +1439,82 @@
           stock-nixos-activation = stockNixos.config.system.build.toplevel;
           stock-host-activation = stockHostTest;
           module-layer = moduleContract;
+          flow-dialect-accept =
+            pkgs.runCommand "tally-flow-dialect-accept"
+              {
+                checkedConfig = flowValidCheckedConfig;
+                nativeBuildInputs = [ pkgs.jq ];
+              }
+              ''
+                ${tally}/bin/tally --mode check-config --config "$checkedConfig"
+                meta="$(${tally}/bin/tally flow check ${./test/fixtures/flows/valid.js} \
+                  --args '{"task":"ship"}' \
+                  --catalog ${./test/fixtures/flows/catalog.json})"
+                test "$(printf '%s' "$meta" | jq -r '.name')" = fixture-valid
+                test "$(printf '%s' "$meta" | jq -c '.pools')" = '["build","worker-gpu"]'
+                for example in \
+                  ${./examples/flows/agency-nightly.js} \
+                  ${./examples/flows/fleet-deploy.js} \
+                  ${./examples/flows/pooled-review.js}; do
+                  ${tally}/bin/tally flow check "$example" >/dev/null
+                done
+                touch "$out"
+              '';
+          flow-dialect-reject-nonliteral-meta = flowNonliteralFailure;
+          flow-dialect-reject-banned-global = flowBannedGlobalFailure;
+          flow-dialect-reject-bad-args-schema =
+            pkgs.runCommand "tally-flow-dialect-reject-bad-args-schema"
+              {
+                schemaFailure = flowBadArgsSchemaFailure;
+                argsFailure = flowArgsMismatchFailure;
+              }
+              ''
+                test -e "$schemaFailure"
+                test -e "$argsFailure"
+                touch "$out"
+              '';
+          flow-pool-closure =
+            pkgs.runCommand "tally-flow-pool-closure"
+              {
+                lintFailure = flowUndeclaredPoolFailure;
+                closureFailure = flowPoolClosureFailure;
+                reservedFailure = flowReservedPoolFailure;
+                maxNodesFailure = flowMaxNodesFailure;
+              }
+              ''
+                test -e "$lintFailure"
+                test -e "$closureFailure"
+                test -e "$reservedFailure"
+                test -e "$maxNodesFailure"
+                touch "$out"
+              '';
+          flow-catalog-schema =
+            pkgs.runCommand "tally-flow-catalog-schema"
+              {
+                schemaFailure = flowCatalogFailure;
+                requiredFailure = flowCatalogRequiredFailure;
+                selectorFailure = flowCatalogSelectorFailure;
+                nativeBuildInputs = [ pkgs.jq ];
+              }
+              ''
+                test -e "$schemaFailure"
+                test -e "$requiredFailure"
+                test -e "$selectorFailure"
+                jq -e '
+                  ."$id" == "https://tally.nix/schemas/flow-catalog-v1.json" and
+                  .properties.version.const == 1 and
+                  (.properties.members.items."$ref" == "#/$defs/member")
+                ' ${./crates/tally-flow/schema/catalog.schema.json} >/dev/null
+                ${tally}/bin/tally flow check ${./test/fixtures/flows/valid.js} \
+                  --args '{"task":"catalog-golden"}' \
+                  --catalog ${./test/fixtures/flows/catalog-resolution.json} >/dev/null
+                test "$(jq -r '.pool.capacity' ${./test/fixtures/flows/catalog-resolution.golden.json})" = 1
+                test "$(jq -r '.cases[1].expectedIds | join(",")' \
+                  ${./test/fixtures/flows/catalog-resolution.golden.json})" = \
+                  'qwen-a,llama-a,mistral-a,qwen-b,llama-b'
+                touch "$out"
+              '';
+          flow-multi-host = flowMultiHostTest;
           bad-pool-rejected =
             assert !badPoolAttempt.success;
             pkgs.runCommand "tally-bad-pool-rejected" { } ''
@@ -857,6 +1575,17 @@
           '';
           adapter-presets = pkgs.runCommand "tally-adapter-presets" { nativeBuildInputs = [ pkgs.jq ]; } ''
             ${tally}/bin/tally --mode check-config --config ${adapterConfig}
+            ${tally}/bin/tally --mode check-config --config ${checkedHomeConfig}
+            test "$(jq -r '.adapters["project-codex"].hardening' ${checkedHomeConfig})" = strict
+            test "$(jq -r '.adapters.shell.hardening' ${checkedHomeConfig})" = workspace
+            test "$(jq -r '.adapters["explicit-none"].hardening' ${checkedHomeConfig})" = none
+            test "$(jq -r '.adapters.pi.hardening // "absent"' ${checkedHomeConfig})" = absent
+            strict_launch="$(${tally}/bin/tally --config ${checkedHomeConfig} __adapter-render project-codex -- payload)"
+            test "$(printf '%s' "$strict_launch" | jq -r '.hardening')" = strict
+            workspace_launch="$(${tally}/bin/tally --config ${checkedHomeConfig} __adapter-render shell -- /bin/true)"
+            test "$(printf '%s' "$workspace_launch" | jq -r '.hardening')" = workspace
+            none_launch="$(${tally}/bin/tally --config ${checkedHomeConfig} __adapter-render explicit-none -- payload)"
+            test "$(printf '%s' "$none_launch" | jq -r '.hardening')" = none
             grep -F '"nix-custom"' ${adapterConfig} >/dev/null
             grep -F '"claude-code"' ${adapterConfig} >/dev/null
             grep -F '"codex"' ${adapterConfig} >/dev/null
