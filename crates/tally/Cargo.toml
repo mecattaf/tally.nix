@@ -15,6 +15,7 @@ serde_json.workspace = true
 tally-core = { path = "../tally-core" }
 tally-flow = { path = "../tally-flow" }
 tokio.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3.20"

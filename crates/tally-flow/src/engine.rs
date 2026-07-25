@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::task::{Poll, Waker};
 
@@ -63,6 +63,7 @@ pub struct RunOptions {
     pub max_nodes: u32,
     pub catalog: Option<Catalog>,
     pub catalog_hash: Option<String>,
+    pub pool_credentials: BTreeMap<String, BTreeMap<String, PathBuf>>,
 }
 
 impl RunOptions {
@@ -74,6 +75,7 @@ impl RunOptions {
             max_nodes: DEFAULT_MAX_NODES,
             catalog: None,
             catalog_hash: None,
+            pool_credentials: BTreeMap::new(),
         }
     }
 }
@@ -112,6 +114,7 @@ pub(crate) struct HostShared {
     host_call_sites: Vec<SourceLocation>,
     catalog: Option<Catalog>,
     catalog_hash: Option<String>,
+    pool_credentials: BTreeMap<String, BTreeMap<String, PathBuf>>,
     state: RefCell<HostState>,
 }
 
@@ -383,7 +386,8 @@ impl HostShared {
         };
 
         let result_schema = spec.result_schema.take();
-        let payload_hash = canonical_payload_hash(&spec)?;
+        let credentials = resolve_pool_credentials(&spec.pools, &self.pool_credentials);
+        let payload_hash = canonical_payload_hash(&spec, &credentials)?;
         let orchestration = Orchestration {
             flow_name: self.meta.name.clone(),
             flow_run_id: self.flow_run_id.clone(),
@@ -397,6 +401,7 @@ impl HostShared {
             mode: "full".to_owned(),
             dedup_key: dedup_key.clone(),
             payload_hash,
+            credentials,
             spec,
             orchestration,
         };
@@ -418,8 +423,16 @@ impl HostShared {
         let admission = match self.client.submit(plan.submission).await {
             Ok(admission) => admission,
             Err(error) => {
+                let fatal_replay = matches!(
+                    error.code.as_str(),
+                    "replay-divergence" | "script-changed-mid-run"
+                );
                 let flow_error = error.into_flow(plan.location, plan.ordinal);
-                self.finish_admission(plan.ordinal, None)?;
+                if fatal_replay {
+                    self.set_fatal(flow_error.clone());
+                } else {
+                    self.finish_admission(plan.ordinal, None)?;
+                }
                 return Err(flow_error);
             }
         };
@@ -717,6 +730,7 @@ pub fn run_script(
         host_call_sites: checked.host_call_sites,
         catalog: options.catalog,
         catalog_hash: options.catalog_hash,
+        pool_credentials: options.pool_credentials,
         state: RefCell::default(),
     });
     let hooks = Rc::new(FlowHooks::new());
@@ -1970,12 +1984,38 @@ fn normalize_adapter_options(
     Ok(())
 }
 
-fn canonical_payload_hash(spec: &NodeSpec) -> Result<String, FlowError> {
+fn resolve_pool_credentials(
+    pools: &[String],
+    configured: &BTreeMap<String, BTreeMap<String, PathBuf>>,
+) -> BTreeMap<String, PathBuf> {
+    let mut credentials = BTreeMap::new();
+    for pool in pools {
+        if let Some(pool_credentials) = configured.get(pool) {
+            for (name, path) in pool_credentials {
+                credentials
+                    .entry(name.clone())
+                    .or_insert_with(|| path.clone());
+            }
+        }
+    }
+    credentials
+}
+
+fn canonical_payload_hash(
+    spec: &NodeSpec,
+    credentials: &BTreeMap<String, PathBuf>,
+) -> Result<String, FlowError> {
     let mut payload = Map::new();
     if let Some(argv) = &spec.argv {
         payload.insert("argv".to_owned(), json!(argv));
     }
-    payload.insert("pool".to_owned(), json!(spec.pools));
+    payload.insert(
+        "pool".to_owned(),
+        match spec.pools.as_slice() {
+            [pool] => Value::String(pool.clone()),
+            pools => json!(pools),
+        },
+    );
     if let Some(executor) = &spec.executor {
         payload.insert("executor".to_owned(), json!(executor));
     }
@@ -2002,7 +2042,16 @@ fn canonical_payload_hash(spec: &NodeSpec) -> Result<String, FlowError> {
         payload.insert("runtimeMaxSec".to_owned(), json!(runtime));
     }
     payload.insert("noEnqueue".to_owned(), Value::Bool(true));
-    payload.insert("credentials".to_owned(), Value::Object(Map::new()));
+    payload.insert(
+        "credentials".to_owned(),
+        serde_json::to_value(credentials).map_err(|error| {
+            FlowError::new(
+                "FlowSpecError",
+                "payload-serialization",
+                format!("cannot serialize resolved pool credentials: {error}"),
+            )
+        })?,
+    );
     if let Some(brief) = &spec.brief {
         let bytes = serde_json::to_vec(brief).map_err(|error| {
             FlowError::new(
@@ -3129,16 +3178,38 @@ mod tests {
             meta(&["cpu"], &[])
         );
         let client = MockClient::new(Vec::new());
-        run(&source, client.clone()).unwrap();
+        let mut options = RunOptions::new("run-1", json!({}));
+        options.pool_credentials.insert(
+            "cpu".to_owned(),
+            BTreeMap::from([(
+                "token".to_owned(),
+                PathBuf::from("/run/credentials/cpu-token"),
+            )]),
+        );
+        run_script(
+            &source,
+            Some(Path::new("test-flow.js")),
+            client.clone(),
+            Rc::new(VecLifecycleSink::default()),
+            options,
+        )
+        .unwrap();
         let submissions = client.submissions.borrow();
         let submission = &submissions[0];
         assert_eq!(
             submission.spec.adapter_options,
             Some(json!({"prePromptArgv": [], "environment": {}}))
         );
+        assert_eq!(
+            submission.credentials,
+            BTreeMap::from([(
+                "token".to_owned(),
+                PathBuf::from("/run/credentials/cpu-token")
+            )])
+        );
         let expected = json!({
             "argv": ["true"],
-            "pool": ["cpu"],
+            "pool": "cpu",
             "adapter": "shell",
             "adapterOptions": {
                 "prePromptArgv": [],
@@ -3146,15 +3217,13 @@ mod tests {
             },
             "evidence": [],
             "noEnqueue": true,
-            "credentials": {}
+            "credentials": {
+                "token": "/run/credentials/cpu-token"
+            }
         });
         assert_eq!(
             submission.payload_hash,
             sha256(&serde_json::to_vec(&expected).unwrap())
-        );
-        assert_eq!(
-            submission.payload_hash,
-            "sha256:99406c81d65b4f607e9daf429a3a5b8402e01d6d898b3416de08259721c9952c"
         );
     }
 }

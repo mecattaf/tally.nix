@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -180,6 +181,8 @@ pub struct FlowSubmission {
     pub mode: String,
     pub dedup_key: String,
     pub payload_hash: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub credentials: BTreeMap<String, PathBuf>,
     pub spec: NodeSpec,
     pub orchestration: Orchestration,
 }
@@ -213,13 +216,27 @@ impl ClientError {
             "dedup-key-conflict" => "FlowDedupKeyConflict",
             "admission-denied" => "FlowAdmissionDenied",
             "flow-node-cap" => "FlowNodeCapError",
+            "replay-divergence" | "script-history-conflict" | "script-changed-mid-run" => {
+                "FlowReplayError"
+            }
             _ => "FlowClientError",
         };
         let mut error = FlowError::new(name, self.code, self.message)
             .at(location)
             .with_ordinal(ordinal);
         if let Some(details) = self.details {
-            error = error.detail("client", details);
+            if matches!(
+                error.code.as_str(),
+                "replay-divergence" | "script-changed-mid-run"
+            ) {
+                if let Value::Object(details) = details {
+                    error.details.extend(details);
+                } else {
+                    error = error.detail("client", details);
+                }
+            } else {
+                error = error.detail("client", details);
+            }
         }
         error
     }

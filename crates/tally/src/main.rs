@@ -1,3 +1,5 @@
+mod flow_live;
+
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
 use std::ffi::OsStr;
@@ -32,10 +34,11 @@ use tally_core::{
     Config,
 };
 use tally_flow::{
-    check_script, load_catalog, run_script, Admission, CheckOptions, ClientError, FlowClient,
-    FlowError, FlowFuture, FlowSubmission, LifecycleSink, NodeResult, RunInspection, RunOptions,
+    check_script, load_catalog, run_script, CheckOptions, FlowError, LifecycleSink, RunOptions,
     SourceLocation,
 };
+
+use crate::flow_live::{LiveFlowClient, RunnerIdentity};
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Mode {
@@ -686,39 +689,7 @@ impl LifecycleSink for JsonlLifecycleSink {
     }
 }
 
-struct PreIntegrationFlowClient;
-
-impl FlowClient for PreIntegrationFlowClient {
-    fn inspect_run<'a>(
-        &'a self,
-        _flow_run_id: &'a str,
-    ) -> FlowFuture<'a, std::result::Result<RunInspection, ClientError>> {
-        Box::pin(std::future::ready(Ok(RunInspection { script_hash: None })))
-    }
-
-    fn submit<'a>(
-        &'a self,
-        _submission: FlowSubmission,
-    ) -> FlowFuture<'a, std::result::Result<Admission, ClientError>> {
-        Box::pin(std::future::ready(Err(ClientError::new(
-            "flow-protocol-unavailable",
-            "this daemon build does not expose full-mode flow admission; the replay engine can be embedded through FlowClient",
-        ))))
-    }
-
-    fn await_terminal<'a>(
-        &'a self,
-        _task_uuid: &'a str,
-        _attempt: u32,
-    ) -> FlowFuture<'a, std::result::Result<NodeResult, ClientError>> {
-        Box::pin(std::future::ready(Err(ClientError::new(
-            "flow-protocol-unavailable",
-            "this daemon build does not expose flow terminal results",
-        ))))
-    }
-}
-
-fn run_flow(command: FlowCommand) -> Result<()> {
+async fn run_flow(socket: &Path, config_path: Option<&Path>, command: FlowCommand) -> Result<()> {
     match command {
         FlowCommand::Check(args) => {
             let source = std::fs::read_to_string(&args.script)
@@ -745,9 +716,11 @@ fn run_flow(command: FlowCommand) -> Result<()> {
         FlowCommand::Run(args) => {
             let source = std::fs::read_to_string(&args.script)
                 .with_context(|| format!("cannot read flow script {}", args.script.display()))?;
+            let inherited_task_uuid = std::env::var("TALLY_TASK_UUID").ok();
+            let inherited_job_id = std::env::var("TALLY_JOB_ID").ok();
             let flow_run_id = args
                 .flow_run_id
-                .or_else(|| std::env::var("TALLY_TASK_UUID").ok())
+                .or_else(|| inherited_task_uuid.clone())
                 .ok_or_else(|| {
                     flow_error(
                         FlowError::new(
@@ -758,6 +731,15 @@ fn run_flow(command: FlowCommand) -> Result<()> {
                         .at(SourceLocation::new(1, 1)),
                     )
                 })?;
+            uuid::Uuid::parse_str(&flow_run_id).map_err(|_| {
+                flow_error(FlowError::new(
+                    "FlowStartupError",
+                    "flow-run-id-invalid",
+                    format!("flow run ID {flow_run_id:?} is not a UUID"),
+                ))
+            })?;
+            let runner = captured_runner_identity(inherited_task_uuid, inherited_job_id)
+                .map_err(|error| flow_error(*error))?;
             let catalog = args
                 .catalog
                 .as_deref()
@@ -770,26 +752,112 @@ fn run_flow(command: FlowCommand) -> Result<()> {
                 options.catalog = Some(catalog);
                 options.catalog_hash = Some(hash);
             }
-            let report = run_script(
-                &source,
-                Some(&args.script),
-                Rc::new(PreIntegrationFlowClient),
-                Rc::new(JsonlLifecycleSink),
-                options,
-            )
-            .map_err(flow_error)?;
-            JsonlLifecycleSink
-                .emit(json!({"type": "flow-report", "report": report}))
-                .map_err(flow_error)?;
-            Ok(())
+            let client_config = load_client_config(config_path)?;
+            let max_frame_bytes = client_config
+                .as_ref()
+                .map_or(DEFAULT_MAX_FRAME_BYTES, |config| config.max_frame_bytes);
+            if let Some(config) = client_config {
+                options.pool_credentials = config
+                    .pools
+                    .into_iter()
+                    .map(|(name, pool)| (name, pool.credentials))
+                    .collect();
+            }
+            sanitize_inherited_tally_environment();
+            let socket = socket.to_owned();
+            let script = args.script;
+            let runtime = tokio::runtime::Handle::current();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let _runtime = runtime.enter();
+                run_script(
+                    &source,
+                    Some(&script),
+                    Rc::new(LiveFlowClient::new(socket, max_frame_bytes, runner)),
+                    Rc::new(JsonlLifecycleSink),
+                    options,
+                )
+                .map_err(Box::new)
+            })
+            .await
+            .context("flow runner worker failed")?;
+            match outcome {
+                Ok(report) => {
+                    JsonlLifecycleSink
+                        .emit(json!({"type": "flow-report", "report": report}))
+                        .map_err(flow_error)?;
+                    Ok(())
+                }
+                Err(error) => {
+                    JsonlLifecycleSink
+                        .emit(json!({
+                            "type": "flow-failed",
+                            "error": error.report(),
+                        }))
+                        .map_err(flow_error)?;
+                    Err(flow_error(*error))
+                }
+            }
         }
+    }
+}
+
+fn captured_runner_identity(
+    task_uuid: Option<String>,
+    job_id: Option<String>,
+) -> std::result::Result<RunnerIdentity, Box<FlowError>> {
+    match (task_uuid, job_id) {
+        (None, None) => Ok(RunnerIdentity::default()),
+        (Some(task_uuid), Some(job_id)) => {
+            for (name, value) in [("TALLY_TASK_UUID", &task_uuid), ("TALLY_JOB_ID", &job_id)] {
+                uuid::Uuid::parse_str(value).map_err(|_| {
+                    Box::new(FlowError::new(
+                        "FlowStartupError",
+                        "runner-identity-invalid",
+                        format!("{name}={value:?} is not a UUID"),
+                    ))
+                })?;
+            }
+            Ok(RunnerIdentity {
+                task_uuid: Some(task_uuid),
+                job_id: Some(job_id),
+            })
+        }
+        _ => Err(Box::new(FlowError::new(
+            "FlowStartupError",
+            "runner-identity-incomplete",
+            "TALLY_TASK_UUID and TALLY_JOB_ID must either both be set or both be absent",
+        ))),
+    }
+}
+
+fn sanitize_inherited_tally_environment() {
+    let inherited = std::env::vars_os()
+        .filter_map(|(name, _)| {
+            name.to_str()
+                .filter(|name| name.starts_with("TALLY_") && *name != "TALLY_SOCKET")
+                .map(ToOwned::to_owned)
+        })
+        .collect::<Vec<_>>();
+    for name in inherited {
+        std::env::remove_var(name);
     }
 }
 
 fn flow_error(error: FlowError) -> anyhow::Error {
     let code = match error.code.as_str() {
         "replay-divergence" | "script-changed-mid-run" => 20,
-        "flow-run-id-missing" => 2,
+        "flow-run-id-missing"
+        | "flow-run-id-invalid"
+        | "runner-identity-invalid"
+        | "runner-identity-incomplete" => 2,
+        "script-syntax"
+        | "script-encoding"
+        | "script-evaluation"
+        | "script-exception"
+        | "unhandled-rejection"
+        | "determinism-violation"
+        | "iteration-cap"
+        | "runtime-limit" => 10,
         _ => 1,
     };
     let message = serde_json::to_string(&error.report()).unwrap_or_else(|_| error.to_string());
@@ -940,7 +1008,7 @@ async fn execute(opts: Opts) -> Result<()> {
         Some(Command::Query { command }) => {
             run_query(&socket, opts.config.as_deref(), command).await
         }
-        Some(Command::Flow { command }) => run_flow(command),
+        Some(Command::Flow { command }) => run_flow(&socket, opts.config.as_deref(), command).await,
         None => {
             Opts::command().print_help()?;
             println!();
@@ -1826,20 +1894,26 @@ async fn connect_rpc(socket: &Path, config_path: Option<&Path>) -> Result<RpcCli
 }
 
 fn client_max_frame_bytes(config_path: Option<&Path>) -> Result<u64> {
+    Ok(load_client_config(config_path)?
+        .map(|config| config.max_frame_bytes)
+        .unwrap_or(DEFAULT_MAX_FRAME_BYTES))
+}
+
+fn load_client_config(config_path: Option<&Path>) -> Result<Option<Config>> {
     let (path, explicit) = if let Some(path) = config_path {
         (path.to_owned(), true)
     } else {
         let Ok(path) = default_config_path() else {
-            return Ok(DEFAULT_MAX_FRAME_BYTES);
+            return Ok(None);
         };
         (path, false)
     };
     match Config::from_path(&path) {
-        Ok(config) => Ok(config.max_frame_bytes),
+        Ok(config) => Ok(Some(config)),
         Err(tally_core::ConfigError::Read { source, .. })
             if !explicit && source.kind() == std::io::ErrorKind::NotFound =>
         {
-            Ok(DEFAULT_MAX_FRAME_BYTES)
+            Ok(None)
         }
         Err(error) => Err(error.into()),
     }
@@ -2049,14 +2123,72 @@ mod tests {
         let config = temp.path().join("config.json");
         std::fs::write(
             &config,
-            r#"{"maxFrameBytes":20971520,"agingThresholdSec":3600,"pools":{}}"#,
+            concat!(
+                r#"{"maxFrameBytes":20971520,"agingThresholdSec":3600,"pools":{"slot":{"#,
+                r#""credentials":{"token":"/run/credentials/slot-token"}}}}"#
+            ),
         )
         .unwrap();
         assert_eq!(
             client_max_frame_bytes(Some(&config)).unwrap(),
             20 * 1024 * 1024
         );
+        assert_eq!(
+            load_client_config(Some(&config)).unwrap().unwrap().pools["slot"].credentials["token"],
+            PathBuf::from("/run/credentials/slot-token")
+        );
         assert!(client_max_frame_bytes(Some(&temp.path().join("missing.json"))).is_err());
+    }
+
+    #[test]
+    fn runner_identity_is_all_or_nothing_and_uuid_typed() {
+        assert_eq!(
+            captured_runner_identity(None, None).unwrap(),
+            RunnerIdentity::default()
+        );
+        let identity = captured_runner_identity(
+            Some("00000000-0000-4000-8000-000000000071".to_owned()),
+            Some("00000000-0000-4000-8000-000000000072".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(
+            identity.task_uuid.as_deref(),
+            Some("00000000-0000-4000-8000-000000000071")
+        );
+        assert_eq!(
+            captured_runner_identity(
+                Some("00000000-0000-4000-8000-000000000071".to_owned()),
+                None
+            )
+            .unwrap_err()
+            .code,
+            "runner-identity-incomplete"
+        );
+        assert_eq!(
+            captured_runner_identity(Some("not-a-uuid".to_owned()), Some("also-bad".to_owned()))
+                .unwrap_err()
+                .code,
+            "runner-identity-invalid"
+        );
+    }
+
+    #[test]
+    fn flow_failure_taxonomy_has_distinguished_exit_codes() {
+        let exit_code = |code| {
+            error_exit_code(&flow_error(FlowError::new(
+                "FlowTestError",
+                code,
+                "fixture",
+            )))
+        };
+        assert_eq!(exit_code("script-syntax"), 10);
+        assert_eq!(exit_code("script-evaluation"), 10);
+        assert_eq!(exit_code("determinism-violation"), 10);
+        assert_eq!(exit_code("replay-divergence"), 20);
+        assert_eq!(exit_code("script-changed-mid-run"), 20);
+        assert_eq!(exit_code("flow-run-id-missing"), 2);
+        assert_eq!(exit_code("runner-identity-incomplete"), 2);
+        assert_eq!(exit_code("terminal-failure"), 1);
     }
 
     #[test]

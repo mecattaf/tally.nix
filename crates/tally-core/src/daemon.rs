@@ -53,7 +53,7 @@ use crate::producers::{
     acknowledged_ingress_ids, archive_ingress_claim, claim_ingress_files, read_ingress_payload,
     GhCliMutationSink, IngressOutcome, ProducerEngine, ReachabilityTransition,
 };
-use crate::provenance::DEFAULT_FLOW_MAX_NODES;
+use crate::provenance::{Orchestration, DEFAULT_FLOW_MAX_NODES};
 use crate::query::{
     query_pools, query_render, query_standup, query_status, JobProjection, PoolHeadroomFact,
     RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
@@ -1346,7 +1346,11 @@ impl DaemonHandler {
                         return Err(dedup_conflict(
                             dedup_key,
                             payload_hash,
-                            vec![(task_uuid, Some(existing_payload_hash.to_owned()))],
+                            vec![DedupConflictCandidate {
+                                task_uuid,
+                                payload_hash: Some(existing_payload_hash.to_owned()),
+                                orchestration: governing.orchestration.clone(),
+                            }],
                         ));
                     }
                     if governing.verdict != Verdict::Pass {
@@ -1752,8 +1756,14 @@ impl DaemonHandler {
             task_uuid: Option<String>,
             #[serde(default)]
             job_id: Option<String>,
+            #[serde(default)]
+            attempt: Option<u32>,
         }
         let params: Params = decode_params(params)?;
+        if params.attempt == Some(0) {
+            return Err(WireError::invalid("attempt must be positive"));
+        }
+        let requested_attempt = params.attempt;
         let presented = match (params.task_uuid, params.job_id) {
             (Some(task_uuid), None) => task_uuid,
             (None, Some(job_id)) => job_id,
@@ -1780,11 +1790,11 @@ impl DaemonHandler {
                 .get(&job_id)
                 .map(Job::stable_key)
                 .unwrap_or_else(|| job_id.to_string());
-            if context
-                .jobs
-                .get(&job_id)
-                .is_some_and(|job| job.state != JobState::Completed)
-            {
+            let current = context.jobs.get(&job_id);
+            if current.is_some_and(|job| {
+                job.state != JobState::Completed
+                    && requested_attempt.is_none_or(|attempt| job.row.attempt == attempt)
+            }) {
                 (Some(context.barriers.wait_job(&stable)), None)
             } else {
                 (
@@ -1792,7 +1802,8 @@ impl DaemonHandler {
                     Some((
                         context.paths.witness_path(),
                         stable,
-                        context.rows.get(&job_id).map(|row| row.attempt),
+                        requested_attempt
+                            .or_else(|| context.rows.get(&job_id).map(|row| row.attempt)),
                     )),
                 )
             }
@@ -4320,19 +4331,37 @@ fn state_name(state: JobState) -> &'static str {
     }
 }
 
+struct DedupConflictCandidate {
+    task_uuid: String,
+    payload_hash: Option<String>,
+    orchestration: Option<Orchestration>,
+}
+
+fn orchestration_node_label(orchestration: Option<&Orchestration>) -> Option<&str> {
+    orchestration?
+        .as_value()
+        .get("nodeLabel")
+        .and_then(Value::as_str)
+}
+
 fn dedup_conflict(
     dedup_key: &str,
     payload_hash: &str,
-    mut existing: Vec<(String, Option<String>)>,
+    mut existing: Vec<DedupConflictCandidate>,
 ) -> WireError {
-    existing.sort_by(|left, right| left.0.cmp(&right.0));
+    existing.sort_by(|left, right| left.task_uuid.cmp(&right.task_uuid));
     let existing_values = existing
         .iter()
-        .map(|(task_uuid, existing_payload_hash)| {
-            json!({
-                "taskUuid": task_uuid,
-                "payloadHash": existing_payload_hash,
-            })
+        .map(|candidate| {
+            let mut value = json!({
+                "taskUuid": candidate.task_uuid,
+                "payloadHash": candidate.payload_hash,
+                "orchestration": candidate.orchestration,
+            });
+            if let Some(label) = orchestration_node_label(candidate.orchestration.as_ref()) {
+                value["nodeLabel"] = Value::String(label.to_owned());
+            }
+            value
         })
         .collect::<Vec<_>>();
     let mut data = json!({
@@ -4341,14 +4370,24 @@ fn dedup_conflict(
         "existing": existing_values,
         "liveTaskUuids": existing
             .iter()
-            .map(|(task_uuid, _)| task_uuid)
+            .map(|candidate| &candidate.task_uuid)
             .collect::<Vec<_>>(),
     });
-    if let [(task_uuid, existing_payload_hash)] = existing.as_slice() {
-        data["existingTaskUuid"] = Value::String(task_uuid.clone());
-        data["existingPayloadHash"] = existing_payload_hash
+    if let [candidate] = existing.as_slice() {
+        data["existingTaskUuid"] = Value::String(candidate.task_uuid.clone());
+        data["existingPayloadHash"] = candidate
+            .payload_hash
             .as_ref()
             .map_or(Value::Null, |hash| Value::String(hash.clone()));
+        data["existingOrchestration"] = candidate
+            .orchestration
+            .as_ref()
+            .map_or(Value::Null, |orchestration| {
+                orchestration.as_value().clone()
+            });
+        if let Some(label) = orchestration_node_label(candidate.orchestration.as_ref()) {
+            data["existingLabel"] = Value::String(label.to_owned());
+        }
     }
     WireError {
         code: WireErrorCode::DedupKeyConflict,
@@ -4377,11 +4416,10 @@ fn full_live_disposition(
             dedup_key,
             payload_hash,
             live.into_iter()
-                .map(|job| {
-                    (
-                        job.stable_key(),
-                        job.row.payload_hash.as_ref().map(ToOwned::to_owned),
-                    )
+                .map(|job| DedupConflictCandidate {
+                    task_uuid: job.stable_key(),
+                    payload_hash: job.row.payload_hash.as_ref().map(ToOwned::to_owned),
+                    orchestration: job.row.orchestration.clone(),
                 })
                 .collect(),
         ));
@@ -4391,12 +4429,16 @@ fn full_live_disposition(
         return Err(dedup_conflict(
             dedup_key,
             payload_hash,
-            vec![(job.stable_key(), job.row.payload_hash.clone())],
+            vec![DedupConflictCandidate {
+                task_uuid: job.stable_key(),
+                payload_hash: job.row.payload_hash.clone(),
+                orchestration: job.row.orchestration.clone(),
+            }],
         ));
     }
     let task_uuid = job.stable_key();
     let state = state_name(job.state);
-    Ok(Some(json!({
+    let mut response = json!({
         "schemaVersion": 1,
         "disposition": "attached",
         "task_uuid": task_uuid,
@@ -4408,7 +4450,14 @@ fn full_live_disposition(
         "dedup_key": dedup_key,
         "payloadHash": payload_hash,
         "attempt": job.row.attempt,
-    })))
+    });
+    if let Some(label) = orchestration_node_label(job.row.orchestration.as_ref()) {
+        response["recordedLabel"] = Value::String(label.to_owned());
+    }
+    if let Some(orchestration) = &job.row.orchestration {
+        response["recordedOrchestration"] = orchestration.as_value().clone();
+    }
+    Ok(Some(response))
 }
 
 fn full_terminal_response(
@@ -4446,6 +4495,12 @@ fn full_terminal_response(
     });
     if let Some(completion) = &record.completion {
         response["completion"] = serde_json::to_value(completion).map_err(internal_wire)?;
+    }
+    if let Some(label) = orchestration_node_label(record.orchestration.as_ref()) {
+        response["recordedLabel"] = Value::String(label.to_owned());
+    }
+    if let Some(orchestration) = &record.orchestration {
+        response["recordedOrchestration"] = orchestration.as_value().clone();
     }
     Ok(response)
 }
@@ -13792,6 +13847,18 @@ mod tests {
                     events[0].retries[0].previous_witness_seq,
                     failed["witness_seq"].as_u64().unwrap()
                 );
+                let original_attempt = client
+                    .call(
+                        "queue.await_job",
+                        Some(json!({
+                            "task_uuid": created["task_uuid"],
+                            "attempt": 1
+                        })),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(original_attempt["attempt"], 1);
+                assert_eq!(original_attempt["witness_seq"], failed["witness_seq"]);
 
                 let attached = attached_client
                     .call("queue.enqueue", Some(failed_payload.clone()))

@@ -39,9 +39,12 @@ tally flow check SCRIPT [--args JSON] [--catalog PATH]
 tally flow run SCRIPT --args JSON --max-nodes N [--catalog PATH] [--flow-run-id ID]
 ```
 
-The live daemon disposition transport is intentionally the FS-5 binding. FS-4
-defines and exercises the complete contract through `FlowClient`; the
-pre-FS-1 executable fails closed when a script attempts daemon submission.
+The executable binds `FlowClient` to one multiplexed daemon connection. Every
+node uses full-mode admission; live rows attach and await, terminal rows replay
+their witnessed result, and a daemon restart replaces the connection and
+reissues the idempotent operation. When run as a tally job, the runner derives
+`flowRunId` and child ancestry from its job identity and submits children as
+`source=orchestrator`.
 
 ## Engine boundary
 

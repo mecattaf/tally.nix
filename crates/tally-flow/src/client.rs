@@ -7,8 +7,8 @@ pub type FlowFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 
 /// Daemon boundary owned by the runner.
 ///
-/// FS-4 tests this interface against deterministic mocks. The live transport binding can
-/// multiplex these calls without changing engine or replay semantics.
+/// Deterministic mocks and the live single-connection transport implement the same
+/// disposition, terminal-result, and run-inspection contract.
 pub trait FlowClient {
     fn inspect_run<'a>(
         &'a self,
