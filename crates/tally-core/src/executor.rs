@@ -20,8 +20,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::watch;
 
+use crate::adapters::AdapterHardening;
 use crate::brief::{self, PreparedBrief};
-use crate::completion::{evaluate_completion, ExecutionFact, GateManifestSpec, SemanticCompletion};
+use crate::completion::{
+    evaluate_completion, AcceptancePolicy, ExecutionFact, GateManifestSpec, SemanticCompletion,
+};
 use crate::config::{ExecutionTargetConfig, Priority, SshExecutorConfig};
 use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOutcome};
 use crate::taskdb::{GhOrigin, WorkspaceMetadata};
@@ -30,7 +33,7 @@ pub const CAPTURE_DIRECTORY: &str = "capture";
 pub const CAPTURE_ARCHIVE_DIRECTORY: &str = "capture/archive";
 pub const UNIT_EXIT_DIRECTORY: &str = "unit-exit";
 pub const UNIT_EXIT_SCHEMA_VERSION: u32 = 2;
-const OPTIONAL_TALLY_ENVIRONMENT: [&str; 11] = [
+const OPTIONAL_TALLY_ENVIRONMENT: [&str; 12] = [
     "TALLY_TASK_UUID",
     "TALLY_PARENT",
     "TALLY_NO_ENQUEUE",
@@ -42,6 +45,7 @@ const OPTIONAL_TALLY_ENVIRONMENT: [&str; 11] = [
     "TALLY_WORKSPACE_BRANCH",
     "TALLY_WORKSPACE_PATH",
     "TALLY_BRIEF",
+    "TALLY_GATE_MANIFEST",
 ];
 const GH_TALLY_ENVIRONMENT: [&str; 11] = [
     "TALLY_GH_REPO",
@@ -113,6 +117,8 @@ pub struct ExecutionRequest {
     pub workspace: Option<WorkspaceMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_manifest: Option<GateManifestSpec>,
+    #[serde(default, skip_serializing_if = "AdapterHardening::is_none")]
+    pub hardening: AdapterHardening,
     pub credentials: BTreeMap<String, PathBuf>,
     pub limits: UnitLimits,
     pub runtime_max_sec: Option<u64>,
@@ -1299,6 +1305,26 @@ impl Executor {
         }
     }
 
+    pub fn default_gate_manifest_on(
+        &self,
+        execution_target: Option<&str>,
+        identity: &ExecutionIdentity,
+        attempt: u32,
+    ) -> Result<GateManifestSpec, ExecutorError> {
+        let state_dir = execution_target
+            .map(|name| self.remote_config(name).map(|config| config.state_dir))
+            .transpose()?
+            .unwrap_or_else(|| self.state_dir.clone());
+        Ok(GateManifestSpec {
+            path: state_dir.join(CAPTURE_DIRECTORY).join(format!(
+                "{}.attempt-{attempt}.gates.json",
+                identity.unit_uuid()
+            )),
+            required_gate_ids: Vec::new(),
+            acceptance_policy: AcceptancePolicy::Manual,
+        })
+    }
+
     pub fn gh_context_path(&self, identity: &ExecutionIdentity) -> PathBuf {
         self.state_dir
             .join(GH_CONTEXT_DIRECTORY)
@@ -2090,6 +2116,7 @@ impl Executor {
             "--property",
             format!("ExecStopPost={exec_stop_post}"),
         );
+        self.push_hardening_properties(&mut args, request)?;
         for (name, source) in &request.credentials {
             push_pair(
                 &mut args,
@@ -2119,6 +2146,41 @@ impl Executor {
         args.push("--".into());
         args.extend(request.argv.iter().map(OsString::from));
         Ok(args)
+    }
+
+    fn push_hardening_properties(
+        &self,
+        args: &mut Vec<OsString>,
+        request: &ExecutionRequest,
+    ) -> Result<(), ExecutorError> {
+        if request.hardening == AdapterHardening::None {
+            return Ok(());
+        }
+        if request.hardening == AdapterHardening::Strict {
+            push_pair(args, "--property", "ProtectHome=read-only");
+        }
+        push_pair(args, "--property", "PrivateTmp=yes");
+        if request.hardening == AdapterHardening::Strict {
+            push_pair(args, "--property", "ProtectSystem=strict");
+            push_pair(args, "--property", "NoNewPrivileges=yes");
+            push_pair(
+                args,
+                "--property",
+                "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            );
+        }
+        let mut writable = Vec::new();
+        if let Some(workspace) = &request.workspace {
+            writable.push(workspace.worktree_path.as_path());
+        }
+        writable.push(self.state_dir.as_path());
+        let writable = writable
+            .into_iter()
+            .map(|path| quote_systemd_exec_word(path.as_os_str()))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(" ");
+        push_pair(args, "--property", format!("ReadWritePaths={writable}"));
+        Ok(())
     }
 
     pub async fn execute(
@@ -2810,6 +2872,12 @@ fn execution_environment(
     if let Some(path) = &request.brief_path {
         environment.push(("TALLY_BRIEF".to_owned(), display_path(path)?.to_owned()));
     }
+    if let Some(manifest) = &request.gate_manifest {
+        environment.push((
+            "TALLY_GATE_MANIFEST".to_owned(),
+            display_path(&manifest.path)?.to_owned(),
+        ));
+    }
     if let Some(workspace) = &request.workspace {
         environment.extend([
             ("TALLY_WORKSPACE_REPO".to_owned(), workspace.repo.clone()),
@@ -2907,6 +2975,9 @@ fn environment_to_unset(request: &ExecutionRequest) -> Vec<&'static str> {
     }
     if request.brief_path.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[10]);
+    }
+    if request.gate_manifest.is_none() {
+        names.push(OPTIONAL_TALLY_ENVIRONMENT[11]);
     }
     if request
         .gh_origin
@@ -3790,6 +3861,7 @@ mod tests {
             cwd: Some(PathBuf::from("/work tree")),
             workspace: None,
             gate_manifest: None,
+            hardening: AdapterHardening::None,
             credentials: BTreeMap::from([
                 ("alpha".to_owned(), PathBuf::from("/run/keys/alpha")),
                 ("zeta".to_owned(), PathBuf::from("/run/keys/zeta")),
@@ -4316,6 +4388,111 @@ mod tests {
         for forbidden in ["DeviceMemoryMax", "Delegate=", "dmem", "servingSlice"] {
             assert!(!joined.contains(forbidden));
         }
+    }
+
+    #[test]
+    fn hardening_preset_names_stamp_only_the_normative_property_bundles() {
+        let executor = executor(Path::new("/state tree"));
+        let mut strict = request();
+        strict.hardening = AdapterHardening::Strict;
+        strict.workspace = Some(WorkspaceMetadata {
+            repo: "acme/widgets".to_owned(),
+            base_rev: "origin/main".to_owned(),
+            branch: "tally/work".to_owned(),
+            worktree_path: PathBuf::from("/work tree"),
+        });
+        let strict = strings(&executor.build_systemd_argv(&strict).unwrap());
+        for property in [
+            "ProtectHome=read-only",
+            "PrivateTmp=yes",
+            "ProtectSystem=strict",
+            "NoNewPrivileges=yes",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "ReadWritePaths=\"/work tree\" \"/state tree\"",
+        ] {
+            assert!(
+                strict
+                    .windows(2)
+                    .any(|pair| pair == ["--property", property]),
+                "strict bundle omitted {property}"
+            );
+        }
+
+        let mut workspace = request();
+        workspace.hardening = AdapterHardening::Workspace;
+        let workspace = strings(&executor.build_systemd_argv(&workspace).unwrap());
+        for property in ["PrivateTmp=yes", "ReadWritePaths=\"/state tree\""] {
+            assert!(workspace
+                .windows(2)
+                .any(|pair| pair == ["--property", property]));
+        }
+        for forbidden in [
+            "ProtectHome=",
+            "ProtectSystem=",
+            "NoNewPrivileges=",
+            "RestrictAddressFamilies=",
+        ] {
+            assert!(!workspace
+                .iter()
+                .any(|argument| argument.starts_with(forbidden)));
+        }
+
+        let none = strings(&executor.build_systemd_argv(&request()).unwrap());
+        for forbidden in [
+            "ProtectHome=",
+            "PrivateTmp=",
+            "ProtectSystem=",
+            "NoNewPrivileges=",
+            "RestrictAddressFamilies=",
+            "ReadWritePaths=",
+        ] {
+            assert!(!none.iter().any(|argument| argument.starts_with(forbidden)));
+        }
+    }
+
+    #[test]
+    fn gate_manifest_path_is_exported_or_scrubbed_and_defaults_per_target() {
+        let local = executor(Path::new("/coordinator-state"));
+        let mut declared = request();
+        declared.gate_manifest = Some(GateManifestSpec {
+            path: PathBuf::from("/work/gates.json"),
+            required_gate_ids: Vec::new(),
+            acceptance_policy: AcceptancePolicy::Manual,
+        });
+        let environment = execution_environment(&declared, None).unwrap();
+        assert!(environment
+            .iter()
+            .any(|(name, value)| { name == "TALLY_GATE_MANIFEST" && value == "/work/gates.json" }));
+        assert!(!environment_to_unset(&declared).contains(&"TALLY_GATE_MANIFEST"));
+        assert!(environment_to_unset(&request()).contains(&"TALLY_GATE_MANIFEST"));
+
+        let local_default = local
+            .default_gate_manifest_on(None, &declared.identity, 3)
+            .unwrap();
+        assert_eq!(
+            local_default.path,
+            PathBuf::from(format!(
+                "/coordinator-state/capture/{}.attempt-3.gates.json",
+                declared.identity.unit_uuid()
+            ))
+        );
+        assert!(local_default.required_gate_ids.is_empty());
+        assert_eq!(local_default.acceptance_policy, AcceptancePolicy::Manual);
+
+        let remote = local.with_remote_executors(BTreeMap::from([(
+            "worker".to_owned(),
+            ExecutionTargetConfig::Ssh(ssh_config()),
+        )]));
+        let remote_default = remote
+            .default_gate_manifest_on(Some("worker"), &declared.identity, 4)
+            .unwrap();
+        assert_eq!(
+            remote_default.path,
+            PathBuf::from(format!(
+                "/var/lib/tally-remote/capture/{}.attempt-4.gates.json",
+                declared.identity.unit_uuid()
+            ))
+        );
     }
 
     #[test]
@@ -5583,6 +5760,7 @@ mod tests {
             cwd: None,
             workspace: None,
             gate_manifest: None,
+            hardening: AdapterHardening::None,
             credentials: BTreeMap::new(),
             limits: UnitLimits {
                 cpu_weight: 100,

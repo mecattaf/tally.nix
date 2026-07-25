@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -25,10 +25,12 @@ use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tokio::task::{JoinHandle, JoinSet, LocalSet};
 
-use crate::adapters::{AdapterEngine, AdapterError, AdapterInvocation, ScrapeResult};
+use crate::adapters::{
+    provisions_gate_manifest, AdapterEngine, AdapterError, AdapterInvocation, ScrapeResult,
+};
 use crate::brief::{self, PreparedBrief};
 use crate::completion::{
-    evaluate_completion, ExecutionFact, GateSummaryStatus, SemanticCompletion,
+    evaluate_completion, ExecutionFact, GateManifestSpec, GateSummaryStatus, SemanticCompletion,
 };
 use crate::config::{Config, PoolPredicate, Priority};
 use crate::evidence::{
@@ -210,6 +212,7 @@ pub struct JobResult {
     pub attempt: u32,
     pub lease_epoch: u64,
     pub witness_seq: u64,
+    pub model: Option<String>,
     pub completion: Option<SemanticCompletion>,
 }
 
@@ -494,7 +497,10 @@ impl ReplicaCommitter for TaskDbCommitter {
                     labor_class,
                 } => {
                     let row = *row;
-                    if row.session_ref.is_some() || row.model.is_some() {
+                    if row.session_ref.is_some()
+                        || row.model.is_some()
+                        || row.final_message.is_some()
+                    {
                         self.adapter_metadata
                             .insert(row.uuid, (row.clone(), status.clone(), labor_class));
                     } else {
@@ -1240,6 +1246,7 @@ impl DaemonHandler {
             session_ref: resumed_job
                 .as_ref()
                 .and_then(|job| job.row.session_ref.clone()),
+            final_message: None,
             lease_epoch: epoch,
             attempt: 1,
             argv: resolved.argv,
@@ -1524,6 +1531,7 @@ impl DaemonHandler {
                         attempt: row.attempt,
                         lease_epoch: row.lease_epoch,
                         witness_seq: record.seq,
+                        model: record.model.clone(),
                         completion: None,
                     };
                     context.barriers.complete_job(&stable_key, result.value());
@@ -2587,6 +2595,8 @@ impl DaemonHandler {
                 "verdict": result.verdict,
                 "exitCode": result.exit_code,
                 "artifactContentHash": result.artifact_content_hash,
+                "adapter": row.adapter,
+                "model": result.model,
             });
             if let Some(completion) = &result.completion {
                 evidence["completion"] = serde_json::to_value(completion)
@@ -2659,11 +2669,13 @@ impl DaemonHandler {
         }
         let handler = self.clone();
         let task = tokio::task::spawn_local(async move {
-            let (adapters, attestation_path) = {
+            let (adapters, attestation_path, state_dir, pools) = {
                 let context = handler.context.read().await;
                 (
                     context.config.adapters.clone(),
                     context.paths.attestations_path(),
+                    context.paths.state_dir.clone(),
+                    context.config.pools.clone(),
                 )
             };
             let scrape_configured = adapters
@@ -2680,6 +2692,7 @@ impl DaemonHandler {
             let job_id = job.job_id.to_string();
             let attempt = job.row.attempt;
             let lease_epoch = job.row.lease_epoch;
+            let leased_pools = job.row.pools.clone();
             let scraped = tokio::task::spawn_blocking(move || {
                 let captures = AdapterEngine::new(&adapters)
                     .scrape_paths(&adapter, &paths)
@@ -2703,11 +2716,12 @@ impl DaemonHandler {
                     .err()
                     .map(|error| error.to_string())
                 };
-                Ok::<_, String>((captures, attestation_error))
+                let meter_errors = feed_scraped_usage(&state_dir, &pools, &leased_pools, &captures);
+                Ok::<_, String>((captures, attestation_error, meter_errors))
             })
             .await;
 
-            let (captures, attestation_error) = match scraped {
+            let (captures, attestation_error, meter_errors) = match scraped {
                 Ok(Ok(scraped)) => scraped,
                 Ok(Err(error)) => {
                     eprintln!(
@@ -2726,6 +2740,12 @@ impl DaemonHandler {
                     return;
                 }
             };
+            for error in meter_errors {
+                eprintln!(
+                    "tally: built-in usage meter feeder failed for {}: {error}",
+                    job.stable_key()
+                );
+            }
             if let Some(error) = attestation_error {
                 eprintln!(
                     "tally: post-ack adapter attestation failed for {}: {error}",
@@ -2742,20 +2762,29 @@ impl DaemonHandler {
             if let Ok(Some(model)) = captures.model() {
                 enriched.row.model = Some(model.to_owned());
             }
+            if let Ok(Some(final_message)) = captures.final_message() {
+                enriched.row.final_message = Some(final_message.to_owned());
+            }
             {
                 let mut context = handler.context.write().await;
                 if let Some(stored) = context.jobs.get_mut(&enriched.job_id) {
                     stored.row.session_ref.clone_from(&enriched.row.session_ref);
                     stored.row.model.clone_from(&enriched.row.model);
+                    stored
+                        .row
+                        .final_message
+                        .clone_from(&enriched.row.final_message);
                 }
                 if let Some(task_uuid) = enriched.task_uuid {
                     if let Some(row) = context.query_rows.get_mut(&task_uuid) {
                         row.session_ref.clone_from(&enriched.row.session_ref);
                         row.model.clone_from(&enriched.row.model);
+                        row.final_message.clone_from(&enriched.row.final_message);
                     }
                     if let Some(detail) = context.query_details.get_mut(&task_uuid) {
                         detail.session_ref.clone_from(&enriched.row.session_ref);
                         detail.observed_model.clone_from(&enriched.row.model);
+                        detail.final_message.clone_from(&enriched.row.final_message);
                     }
                 }
             }
@@ -3441,6 +3470,7 @@ impl DaemonHandler {
         let executor = self.executor.clone();
         let completion = self.completion.clone();
         let request = execution_request(
+            &executor,
             &job,
             self.settings.unit_limits,
             &self.tally_socket,
@@ -3453,6 +3483,7 @@ impl DaemonHandler {
         tokio::task::spawn_local(async move {
             let started = Instant::now();
             let execution = async {
+                let request = request?;
                 if job.adopted {
                     executor
                         .adopt_on(
@@ -3868,7 +3899,7 @@ fn pool_headroom_facts(context: &mut Context) -> Result<Vec<PoolHeadroomFact>, W
                 + unleased_by_pool.get(&name).copied().unwrap_or(0);
             let consumption = match pool.predicate {
                 PoolPredicate::CoResidency(_) => None,
-                PoolPredicate::WindowedConsumption(window) => {
+                PoolPredicate::WindowedConsumption(ref window) => {
                     let used = context
                         .lease
                         .engine_mut()
@@ -3886,14 +3917,20 @@ fn pool_headroom_facts(context: &mut Context) -> Result<Vec<PoolHeadroomFact>, W
                     })
                 }
             };
-            let meter = pool.usage_meter.as_ref().and_then(|meter| {
-                read_usage_meter(
+            let meter = match (&pool.usage_meter, &pool.predicate) {
+                (Some(meter), _) => read_usage_meter(
                     &context.paths.state_dir,
                     &name,
-                    meter.poll_interval_sec,
+                    meter.poll_interval_sec.saturating_mul(2),
                     now,
-                )
-            });
+                ),
+                (None, PoolPredicate::WindowedConsumption(window))
+                    if pool.resource == crate::config::ResourceKind::Budget =>
+                {
+                    read_usage_meter(&context.paths.state_dir, &name, window.window_sec, now)
+                }
+                _ => None,
+            };
             Ok(PoolHeadroomFact {
                 pool: name,
                 capacity: u64::from(pool.capacity),
@@ -3907,7 +3944,7 @@ fn pool_headroom_facts(context: &mut Context) -> Result<Vec<PoolHeadroomFact>, W
         .collect()
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UsageMeterObservation {
     pool: String,
@@ -3927,7 +3964,7 @@ fn usage_meter_event_path(state_dir: &Path, pool: &str) -> PathBuf {
 fn read_usage_meter(
     state_dir: &Path,
     pool: &str,
-    poll_interval_sec: u64,
+    freshness_sec: u64,
     now: chrono::DateTime<Utc>,
 ) -> Option<UsageMeterObservation> {
     let path = usage_meter_event_path(state_dir, pool);
@@ -3969,7 +4006,6 @@ fn read_usage_meter(
     let reset_at = chrono::DateTime::parse_from_rfc3339(&event.reset_at)
         .ok()?
         .with_timezone(&Utc);
-    let freshness_sec = poll_interval_sec.checked_mul(2)?;
     let freshness_sec = i64::try_from(freshness_sec).ok()?;
     if observed_at > now
         || now.signed_duration_since(observed_at) > chrono::Duration::seconds(freshness_sec)
@@ -3979,6 +4015,95 @@ fn read_usage_meter(
         return None;
     }
     Some(event)
+}
+
+fn feed_scraped_usage(
+    state_dir: &Path,
+    pools: &BTreeMap<String, crate::config::PoolConfig>,
+    leased_pools: &[String],
+    captures: &ScrapeResult,
+) -> Vec<String> {
+    let Some(amount) = scraped_token_amount(captures) else {
+        return Vec::new();
+    };
+    let observed_at = Utc::now();
+    leased_pools
+        .iter()
+        .filter_map(|name| {
+            let pool = pools.get(name)?;
+            let PoolPredicate::WindowedConsumption(window) = &pool.predicate else {
+                return None;
+            };
+            if pool.resource != crate::config::ResourceKind::Budget || pool.usage_meter.is_some() {
+                return None;
+            }
+            let reset_at = observed_at.checked_add_signed(chrono::Duration::seconds(
+                i64::try_from(window.window_sec).ok()?,
+            ))?;
+            let event = UsageMeterObservation {
+                pool: name.clone(),
+                budget_class: crate::config::MeterBudgetClass::Programmatic,
+                utilization_pct: ((amount as f64 / window.consumption_cap as f64) * 100.0)
+                    .min(100.0),
+                weekly_utilization_pct: None,
+                reset_at: reset_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+                observed_at: observed_at.to_rfc3339_opts(SecondsFormat::Millis, true),
+            };
+            write_usage_meter(state_dir, &event)
+                .err()
+                .map(|error| format!("pool {name:?}: {error}"))
+        })
+        .collect()
+}
+
+fn scraped_token_amount(captures: &ScrapeResult) -> Option<u64> {
+    let usage = captures.captures.get("usage")?.as_object()?;
+    let amount = if let Some(total) = usage.get("total_tokens") {
+        total.as_u64()?
+    } else {
+        let input = match usage.get("input_tokens") {
+            Some(value) => value.as_u64()?,
+            None => 0,
+        };
+        let output = match usage.get("output_tokens") {
+            Some(value) => value.as_u64()?,
+            None => 0,
+        };
+        input.checked_add(output)?
+    };
+    (amount > 0).then_some(amount)
+}
+
+fn write_usage_meter(state_dir: &Path, event: &UsageMeterObservation) -> io::Result<()> {
+    let directory = state_dir.join("meters");
+    std::fs::create_dir_all(&directory)?;
+    let metadata = std::fs::symlink_metadata(&directory)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "meter directory is not a regular directory",
+        ));
+    }
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))?;
+    let path = usage_meter_event_path(state_dir, &event.pool);
+    let temporary = directory.join(format!(".{}.tmp", Uuid::new_v4()));
+    let write_result = (|| {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&temporary)?;
+        serde_json::to_writer(&mut file, event).map_err(io::Error::other)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, &path)?;
+        File::open(&directory)?.sync_all()
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    write_result
 }
 
 async fn await_registration(registration: WaitRegistration) -> Result<Value, WireError> {
@@ -4045,6 +4170,7 @@ fn job_result_from_witness(record: &WitnessRecord) -> JobResult {
         attempt: record.attempt,
         lease_epoch: record.lease_epoch,
         witness_seq: record.seq,
+        model: record.model.clone(),
         completion: record.completion.clone(),
     }
 }
@@ -4113,16 +4239,18 @@ fn lease_request(job: &Job, unit: String) -> LeaseRequest {
 }
 
 fn execution_request(
+    executor: &Executor,
     job: &Job,
     limits: UnitLimits,
     tally_socket: &str,
     brief_root: &Path,
-) -> ExecutionRequest {
+) -> Result<ExecutionRequest, ExecutorError> {
     let brief_path = job.row.brief_hash.as_deref().map(|hash| {
         brief::content_path(brief_root, hash)
             .expect("validated durable briefHash always derives a content path")
     });
-    ExecutionRequest {
+    let gate_manifest = effective_gate_manifest(executor, job)?;
+    Ok(ExecutionRequest {
         identity: job.identity(),
         parent: job.row.parent_uuid,
         pools: job.row.pools.clone(),
@@ -4142,11 +4270,30 @@ fn execution_request(
         brief_document: None,
         cwd: job.row.cwd.clone(),
         workspace: job.row.workspace.clone(),
-        gate_manifest: job.row.gate_manifest.clone(),
+        gate_manifest,
+        hardening: job.invocation.hardening,
         credentials: job.row.credentials.clone(),
         limits,
         runtime_max_sec: job.row.runtime_max_sec,
+    })
+}
+
+fn effective_gate_manifest(
+    executor: &Executor,
+    job: &Job,
+) -> Result<Option<GateManifestSpec>, ExecutorError> {
+    if let Some(spec) = &job.row.gate_manifest {
+        return Ok(Some(spec.clone()));
     }
+    provisions_gate_manifest(&job.row.adapter)
+        .then(|| {
+            executor.default_gate_manifest_on(
+                job.row.executor.as_deref(),
+                &job.identity(),
+                job.row.attempt,
+            )
+        })
+        .transpose()
 }
 
 fn execution_fact_for_termination(termination: &ExecutionTermination) -> ExecutionFact {
@@ -4355,11 +4502,13 @@ fn execution_event(job: &Job, event: TallyEvent) -> EmitEvent {
 }
 
 fn canonical_job_model(job: &Job) -> Option<String> {
-    if job.model_is_advisory {
-        None
-    } else {
-        job.row.model.clone()
-    }
+    job.row.adapter_options.model.clone().or_else(|| {
+        if job.model_is_advisory {
+            None
+        } else {
+            job.row.model.clone()
+        }
+    })
 }
 
 fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
@@ -4430,6 +4579,7 @@ fn finalize_forced_locked(
         attempt: job.row.attempt,
         lease_epoch: job.row.lease_epoch,
         witness_seq: record.seq,
+        model: record.model.clone(),
         completion: None,
     };
     context
@@ -4684,7 +4834,11 @@ impl Daemon {
         let adapter_metadata = plan
             .rows
             .iter()
-            .filter(|recovery| recovery.row.session_ref.is_some() || recovery.row.model.is_some())
+            .filter(|recovery| {
+                recovery.row.session_ref.is_some()
+                    || recovery.row.model.is_some()
+                    || recovery.row.final_message.is_some()
+            })
             .map(|recovery| {
                 let status = match recovery.state {
                     RecoveryRowState::Pending => Status::Pending,
@@ -5148,7 +5302,8 @@ impl Daemon {
             &finished.outcome,
             Some(Ok(outcome)) if outcome.captures_available
         );
-        let semantic_completion = match (&job.row.gate_manifest, &finished.outcome) {
+        let effective_gate_manifest = effective_gate_manifest(&self.handler.executor, &job)?;
+        let semantic_completion = match (&effective_gate_manifest, &finished.outcome) {
             (None, Some(Ok(outcome))) if outcome.semantic_completion.is_some() => {
                 return Err(DaemonError::Invalid(format!(
                     "job {} returned semantic completion without a declared gate manifest",
@@ -5256,6 +5411,7 @@ impl Daemon {
                 return Ok(());
             }
             let verdict = computed_verdict;
+            let model = canonical_job_model(&job);
             let record = context.witness.append(WitnessBody {
                 task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
                 transition_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -5275,7 +5431,7 @@ impl Daemon {
                 pools: Some(job.row.pools.clone()),
                 executor: job.row.executor.clone(),
                 charge: None,
-                model: canonical_job_model(&job),
+                model: model.clone(),
                 evidence_class: job.row.evidence_class.clone(),
                 manifest_hash: job.row.manifest_hash.clone(),
                 completion: semantic_completion.clone(),
@@ -5289,6 +5445,7 @@ impl Daemon {
                 attempt: job.row.attempt,
                 lease_epoch: job.row.lease_epoch,
                 witness_seq: record.seq,
+                model,
                 completion: semantic_completion,
             };
             let stable = job.stable_key();
@@ -5898,6 +6055,7 @@ async fn reconcile_pool_loss_intents(
             invocation: AdapterInvocation {
                 argv: Vec::new(),
                 env: BTreeMap::new(),
+                hardening: Default::default(),
                 yield_hook: None,
             },
             labor_class: intent.labor_class,
@@ -6111,6 +6269,7 @@ fn recovery_gh_completions(
                 attempt: record.attempt,
                 lease_epoch: record.lease_epoch,
                 witness_seq: record.seq,
+                model: record.model.clone(),
                 completion: record.completion.clone(),
             },
         })
@@ -6297,6 +6456,9 @@ fn hydrate_completed_adapter_metadata(
                 if let Ok(Some(model)) = captures.model() {
                     recovery.row.model = Some(model.to_owned());
                 }
+                if let Ok(Some(final_message)) = captures.final_message() {
+                    recovery.row.final_message = Some(final_message.to_owned());
+                }
             }
             Err(error) => eprintln!(
                 "tally: retained adapter metadata for {} could not be scraped: {error}",
@@ -6327,10 +6489,11 @@ fn hydrate_represent_adapter_metadata(
                 row.uuid,
                 captures.session_ref()?.map(str::to_owned),
                 captures.model()?.map(str::to_owned),
+                captures.final_message()?.map(str::to_owned),
             ))
         })
         .collect::<Result<Vec<_>, _>>()?;
-    for (uuid, session_ref, model) in updates {
+    for (uuid, session_ref, model, final_message) in updates {
         let recovery = plan
             .rows
             .iter_mut()
@@ -6341,6 +6504,9 @@ fn hydrate_represent_adapter_metadata(
         }
         if model.is_some() {
             recovery.row.model = model;
+        }
+        if final_message.is_some() {
+            recovery.row.final_message = final_message;
         }
     }
     Ok(())
@@ -6393,6 +6559,9 @@ fn hydrate_adopted_adapter_metadata(
         }
         if let Some(model) = captures.model()? {
             recovery.row.model = Some(model.to_owned());
+        }
+        if let Some(final_message) = captures.final_message()? {
+            recovery.row.final_message = Some(final_message.to_owned());
         }
     }
     Ok(())
@@ -6587,6 +6756,7 @@ fn verified_adapter_attestation_captures(
         };
         result.session_ref()?;
         result.model()?;
+        result.final_message()?;
         selected = Some(result);
     }
     Ok(selected)
@@ -6655,6 +6825,7 @@ fn verified_latest_adapter_attestation_before(
         };
         result.session_ref()?;
         result.model()?;
+        result.final_message()?;
         if selected
             .as_ref()
             .is_none_or(|(selected_attempt, _)| attempt >= *selected_attempt)
@@ -6741,6 +6912,7 @@ fn query_row(row: &RowSeed, status: RowStatus) -> RowFact {
         executor: row.executor.clone(),
         source: Some(source_name(row.source).to_owned()),
         session_ref: row.session_ref.clone(),
+        final_message: row.final_message.clone(),
         cwd: row
             .cwd
             .as_ref()
@@ -7206,6 +7378,7 @@ fn recovery_adapter_invocation(
             AdapterInvocation {
                 argv: row.argv.clone(),
                 env: BTreeMap::new(),
+                hardening: engine.adapter(&row.adapter)?.hardening,
                 yield_hook: None,
             },
             None,
@@ -7894,6 +8067,14 @@ mod tests {
                         pattern: "$..usage".to_owned(),
                     },
                 ),
+                (
+                    "finalMessage".to_owned(),
+                    ScrapeCapture {
+                        stream: ScrapeStream::Stdout,
+                        mode: ScrapeMode::JsonPath,
+                        pattern: "$..final_message".to_owned(),
+                    },
+                ),
             ]),
             trace: None,
             yield_hook: Some(vec![
@@ -7903,6 +8084,7 @@ mod tests {
             ]),
             env: BTreeMap::from([("CUSTOM_AGENT_MODE".to_owned(), "batch".to_owned())]),
             launch: crate::adapters::AdapterLaunchConfig::default(),
+            hardening: Default::default(),
             extra_config: BTreeMap::from([(
                 "modelFlag".to_owned(),
                 Value::String("--model".to_owned()),
@@ -7999,6 +8181,7 @@ mod tests {
             brief_hash: None,
             orchestration: None,
             session_ref: None,
+            final_message: None,
             lease_epoch,
             attempt: 1,
             argv: vec!["true".to_owned()],
@@ -8326,6 +8509,7 @@ mod tests {
             executor: None,
             source: Some("manual".to_owned()),
             session_ref: None,
+            final_message: None,
             cwd: None,
             workspace: None,
             resumed_from: None,
@@ -8799,6 +8983,7 @@ mod tests {
                         yield_hook: None,
                         env: BTreeMap::new(),
                         launch: crate::adapters::AdapterLaunchConfig::default(),
+                        hardening: Default::default(),
                         extra_config: BTreeMap::new(),
                     },
                 );
@@ -9058,6 +9243,7 @@ mod tests {
             invocation: AdapterInvocation {
                 argv: vec!["true".to_owned()],
                 env: BTreeMap::new(),
+                hardening: Default::default(),
                 yield_hook: None,
             },
             labor_class: LaborClass::Fresh,
@@ -9341,6 +9527,7 @@ mod tests {
 
                 let mut row = durable_row(Uuid::new_v4(), "gh:github:item-1", 1);
                 row.source = EnqueueSource::Gh;
+                row.adapter = "codex".to_owned();
                 row.gh_origin = Some(gh_test_origin("item-1", GhItemType::Issue));
                 let result = JobResult {
                     task_uuid: Some(row.uuid.to_string()),
@@ -9351,6 +9538,7 @@ mod tests {
                     attempt: 1,
                     lease_epoch: 1,
                     witness_seq: 9,
+                    model: Some("gpt-5.6-codex".to_owned()),
                     completion: None,
                 };
                 daemon
@@ -9375,15 +9563,10 @@ mod tests {
                         .contains("TallyCompletionComment"))
                     .unwrap();
                 assert_eq!(comment["variables"]["itemId"], "item-1");
-                let evidence: Value = serde_json::from_str(
-                    comment["variables"]["body"]
-                        .as_str()
-                        .unwrap()
-                        .split_once('\n')
-                        .unwrap()
-                        .1,
-                )
-                .unwrap();
+                let body = comment["variables"]["body"].as_str().unwrap();
+                let (_, remainder) = body.split_once('\n').unwrap();
+                let (encoded, trailer) = remainder.split_once("\n\n").unwrap();
+                let evidence: Value = serde_json::from_str(encoded).unwrap();
                 assert_eq!(evidence["producer"], "github");
                 assert_eq!(evidence["source"], "notifications");
                 assert_eq!(evidence["itemId"], "item-1");
@@ -9391,6 +9574,13 @@ mod tests {
                 assert_eq!(evidence["evidence"]["taskUuid"], row.uuid.to_string());
                 assert_eq!(evidence["evidence"]["witnessSeq"], 9);
                 assert_eq!(evidence["evidence"]["verdict"], "pass");
+                assert_eq!(
+                    trailer,
+                    format!(
+                        "Assisted-by: codex:gpt-5.6-codex (tally:{} witness:9)",
+                        row.uuid
+                    )
+                );
 
                 let mut failed = result;
                 failed.witness_seq = 10;
@@ -9778,11 +9968,13 @@ mod tests {
                     .unwrap();
                 assert_eq!(job.row.gh_origin.as_ref(), Some(&captured_origin));
                 let request = execution_request(
+                    &executor,
                     &job,
                     settings().unit_limits,
                     "/run/tally/tally.sock",
                     &paths.data_dir,
-                );
+                )
+                .unwrap();
                 let args = executor
                     .build_systemd_argv(&request)
                     .unwrap()
@@ -10001,11 +10193,13 @@ mod tests {
                 );
 
                 let request = execution_request(
+                    &executor,
                     &job,
                     settings().unit_limits,
                     "/run/tally/tally.sock",
                     &paths.data_dir,
-                );
+                )
+                .unwrap();
                 let args = executor
                     .build_systemd_argv(&request)
                     .unwrap()
@@ -10296,6 +10490,118 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn preset_gate_defaults_distinguish_absent_manifest_from_gates_passed() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let observed_path = temp.path().join("observed-manifest-path");
+                let program = temp.path().join("gate-aware-agent");
+                fs::write(
+                    &program,
+                    format!(
+                        concat!(
+                            "#!/bin/sh\n",
+                            "test -n \"$TALLY_GATE_MANIFEST\" || exit 51\n",
+                            "printf '%s' \"$TALLY_GATE_MANIFEST\" > '{}'\n",
+                            "if test \"$1\" = write; then\n",
+                            "  printf '%s' '{{\"schemaVersion\":1,\"artifact\":null,\"gates\":[]}}' > \"$TALLY_GATE_MANIFEST\"\n",
+                            "fi\n",
+                        ),
+                        observed_path.display(),
+                    ),
+                )
+                .unwrap();
+                fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+                let mut config = one_pool_config();
+                config
+                    .adapters
+                    .insert("codex".to_owned(), AdapterConfig::default());
+                let executor =
+                    Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                        .with_systemd_run(temp.path().join("absent-systemd-run"))
+                        .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+
+                let absent = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": [program, "absent"],
+                        "pool": "slot",
+                        "adapter": "codex",
+                    })))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                let absent_result = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": absent["task_uuid"]})))
+                    .await
+                    .unwrap();
+                assert_eq!(absent_result["verdict"], "pass");
+                assert_eq!(absent_result["completion"]["gates"]["status"], "not-run");
+                let absent_uuid =
+                    Uuid::parse_str(absent["task_uuid"].as_str().unwrap()).unwrap();
+                assert!(daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&absent_uuid)
+                    .unwrap()
+                    .row
+                    .gate_manifest
+                    .is_none());
+                assert_eq!(
+                    fs::read_to_string(&observed_path).unwrap(),
+                    paths
+                        .state_dir
+                        .join("capture")
+                        .join(format!("{absent_uuid}.attempt-1.gates.json"))
+                        .to_string_lossy()
+                );
+
+                let passed = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": [program, "write"],
+                        "pool": "slot",
+                        "adapter": "codex",
+                    })))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                let passed_result = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": passed["task_uuid"]})))
+                    .await
+                    .unwrap();
+                assert_eq!(passed_result["verdict"], "pass");
+                assert_eq!(passed_result["completion"]["gates"]["status"], "pass");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn acceptance_24_5_trace_and_scraped_usage_are_advisory_only() {
         let local = LocalSet::new();
         local
@@ -10318,7 +10624,7 @@ mod tests {
                         "test -S \"$TALLY_SOCKET\" || exit 45\n",
                         "test \"$3\" = '' || exit 46\n",
                         "test \"$4\" = --option-looking || exit 47\n",
-                        "printf '%s\\n' '{\"event\":{\"session_id\":\"session-opaque\",\"model\":\"Provider/Model.Exact-CASE\",\"usage\":{\"input_tokens\":999999},\"claimed_verdict\":\"fail\",\"claimed_evidence\":\"fail\",\"claimed_charge\":999999,\"claimed_gpu_seconds\":999999}}'\n",
+                        "printf '%s\\n' '{\"event\":{\"session_id\":\"session-opaque\",\"model\":\"Provider/Model.Exact-CASE\",\"usage\":{\"input_tokens\":999999},\"final_message\":\"{\\\"answer\\\":42}\",\"claimed_verdict\":\"fail\",\"claimed_evidence\":\"fail\",\"claimed_charge\":999999,\"claimed_gpu_seconds\":999999}}'\n",
                         "printf '%s\\n' 'branch=adapter-test' >&2\n",
                         "sleep 0.1\n"
                     ),
@@ -10453,6 +10759,14 @@ mod tests {
                     .query("query.job", Some(json!({"id": task_uuid})))
                     .await
                     .unwrap();
+                assert_eq!(
+                    before["job"]["finalMessage"],
+                    json!({
+                        "value": "{\"answer\":42}",
+                        "authority": "advisory-provider-capture",
+                        "provenance": "adapter-scrape",
+                    })
+                );
                 let canonical_before = json!({
                     "priority": before["job"]["priority"],
                     "pool": before["job"]["pool"],
@@ -10552,6 +10866,14 @@ mod tests {
                         .as_deref(),
                     Some("Provider/Model.Exact-CASE")
                 );
+                assert_eq!(
+                    reopened
+                        .handler
+                        .query("query.job", Some(json!({"id": task_uuid})))
+                        .await
+                        .unwrap()["job"]["finalMessage"]["value"],
+                    "{\"answer\":42}"
+                );
                 let repaired = fs::read_to_string(paths.attestations_path()).unwrap();
                 assert_eq!(repaired.lines().count(), 1);
                 let repaired: crate::witness::AttestationRecord =
@@ -10568,6 +10890,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(projected.value("session_ref"), Some("session-opaque"));
                 assert_eq!(projected.value("model"), Some("Provider/Model.Exact-CASE"));
+                assert_eq!(projected.value("final_message"), Some("{\"answer\":42}"));
                 drop(db);
 
                 let deduplicated =
@@ -11263,6 +11586,112 @@ mod tests {
             .unwrap();
         assert_eq!(ignored["pools"][0]["effectiveUtilizationPct"], 40.0);
         assert_eq!(ignored["pools"][0]["remainingBudget"], 60);
+    }
+
+    #[test]
+    fn built_in_usage_feeder_routes_tokens_and_can_only_clamp_headroom_downward() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let mut config = window_pool_config();
+        let captures = ScrapeResult {
+            captures: BTreeMap::from([(
+                "usage".to_owned(),
+                json!({"input_tokens": 30, "output_tokens": 50}),
+            )]),
+        };
+        assert!(
+            feed_scraped_usage(&state_dir, &config.pools, &["api".to_owned()], &captures,)
+                .is_empty()
+        );
+        let event = read_usage_meter(&state_dir, "api", 3600, Utc::now()).unwrap();
+        assert_eq!(event.utilization_pct, 80.0);
+
+        let projection = query_pools(&[PoolHeadroomFact {
+            pool: "api".to_owned(),
+            capacity: 1,
+            held: 0,
+            queued: 0,
+            consumption: Some(WindowConsumptionFact {
+                used: 40,
+                cap: 100,
+                reset_at: None,
+            }),
+            meter_utilization_pct: Some(event.utilization_pct),
+            weekly_utilization_pct: None,
+        }])
+        .unwrap();
+        assert_eq!(projection.pools[0].self_utilization_pct, 40.0);
+        assert_eq!(projection.pools[0].effective_utilization_pct, 80.0);
+
+        let path = usage_meter_event_path(&state_dir, "api");
+        let low = ScrapeResult {
+            captures: BTreeMap::from([("usage".to_owned(), json!({"total_tokens": 10}))]),
+        };
+        assert!(
+            feed_scraped_usage(&state_dir, &config.pools, &["api".to_owned()], &low,).is_empty()
+        );
+        let low = read_usage_meter(&state_dir, "api", 3600, Utc::now()).unwrap();
+        let projection = query_pools(&[PoolHeadroomFact {
+            pool: "api".to_owned(),
+            capacity: 1,
+            held: 0,
+            queued: 0,
+            consumption: Some(WindowConsumptionFact {
+                used: 40,
+                cap: 100,
+                reset_at: None,
+            }),
+            meter_utilization_pct: Some(low.utilization_pct),
+            weekly_utilization_pct: None,
+        }])
+        .unwrap();
+        assert_eq!(projection.pools[0].effective_utilization_pct, 40.0);
+
+        let valid_bytes = fs::read(&path).unwrap();
+        for malformed in [
+            json!({"usage": {"total_tokens": "80"}}),
+            json!({"usage": {"input_tokens": -1, "output_tokens": 4}}),
+            json!({"usage": {"input_tokens": 0, "output_tokens": 0}}),
+        ] {
+            let captures = ScrapeResult {
+                captures: malformed.as_object().unwrap().clone().into_iter().collect(),
+            };
+            assert!(
+                feed_scraped_usage(&state_dir, &config.pools, &["api".to_owned()], &captures,)
+                    .is_empty()
+            );
+            assert_eq!(fs::read(&path).unwrap(), valid_bytes);
+        }
+
+        config.pools.get_mut("api").unwrap().usage_meter = Some(UsageMeterConfig {
+            argv: vec!["external-meter".to_owned()],
+            poll_interval_sec: 120,
+            budget_class: MeterBudgetClass::Programmatic,
+        });
+        fs::remove_file(&path).unwrap();
+        assert!(
+            feed_scraped_usage(&state_dir, &config.pools, &["api".to_owned()], &captures,)
+                .is_empty()
+        );
+        assert!(
+            !path.exists(),
+            "an external meter must remain the sole authority"
+        );
+
+        let now = Utc::now();
+        write_usage_meter(
+            &state_dir,
+            &UsageMeterObservation {
+                pool: "api".to_owned(),
+                budget_class: MeterBudgetClass::Programmatic,
+                utilization_pct: 99.0,
+                weekly_utilization_pct: None,
+                observed_at: (now - chrono::Duration::seconds(121)).to_rfc3339(),
+                reset_at: (now + chrono::Duration::hours(1)).to_rfc3339(),
+            },
+        )
+        .unwrap();
+        assert!(read_usage_meter(&state_dir, "api", 120, now).is_none());
     }
 
     #[tokio::test(flavor = "current_thread")]

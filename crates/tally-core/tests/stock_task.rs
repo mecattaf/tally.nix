@@ -35,6 +35,7 @@ async fn stock_taskwarrior_reads_the_in_process_replica() {
             brief_hash: None,
             orchestration: None,
             session_ref: None,
+            final_message: None,
             lease_epoch: 1,
             attempt: 1,
             argv: vec!["true".to_owned()],

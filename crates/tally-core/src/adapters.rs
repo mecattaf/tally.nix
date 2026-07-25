@@ -17,6 +17,10 @@ use crate::executor::ExecutionPaths;
 
 const MAX_CAPTURE_BYTES: u64 = 16 * 1024 * 1024;
 
+pub fn provisions_gate_manifest(adapter: &str) -> bool {
+    matches!(adapter, "claude-code" | "codex")
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ScrapeStream {
@@ -31,6 +35,26 @@ pub enum ScrapeMode {
     #[default]
     Regex,
     JsonPath,
+    /// Evaluate one JSONPath over the complete JSON-lines stream and retain
+    /// its last non-null match. This lets presets predicate on event shape
+    /// without accidentally promoting similarly named fields from other
+    /// events.
+    JsonPathLast,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AdapterHardening {
+    Strict,
+    Workspace,
+    #[default]
+    None,
+}
+
+impl AdapterHardening {
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -124,6 +148,8 @@ pub struct AdapterConfig {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub launch: AdapterLaunchConfig,
+    #[serde(default, skip_serializing_if = "AdapterHardening::is_none")]
+    pub hardening: AdapterHardening,
     #[serde(default)]
     pub extra_config: BTreeMap<String, Value>,
 }
@@ -132,6 +158,7 @@ pub struct AdapterConfig {
 pub struct AdapterInvocation {
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
+    pub hardening: AdapterHardening,
     /// Direct checkpoint probe installed by the harness integration. Tally
     /// deliberately does not run it on a timer: the harness owns its safe
     /// checkpoints, and the no-argument preset probe resolves TALLY_JOB_ID.
@@ -158,6 +185,10 @@ impl ScrapeResult {
 
     pub fn model(&self) -> Result<Option<&str>, AdapterError> {
         self.string("model")
+    }
+
+    pub fn final_message(&self) -> Result<Option<&str>, AdapterError> {
+        self.string("finalMessage")
     }
 }
 
@@ -323,6 +354,7 @@ impl<'a> AdapterEngine<'a> {
             let value = match capture.mode {
                 ScrapeMode::Regex => scrape_regex(&capture.pattern, input),
                 ScrapeMode::JsonPath => scrape_json_path(&capture.pattern, input),
+                ScrapeMode::JsonPathLast => scrape_json_path_last(&capture.pattern, input),
             }
             .map_err(|detail| AdapterError::Scrape {
                 capture: capture_name.clone(),
@@ -335,6 +367,7 @@ impl<'a> AdapterEngine<'a> {
         let result = ScrapeResult { captures };
         result.session_ref()?;
         result.model()?;
+        result.final_message()?;
         Ok(result)
     }
 
@@ -406,6 +439,7 @@ fn invocation(
     Ok(AdapterInvocation {
         argv,
         env,
+        hardening: adapter.hardening,
         yield_hook: adapter.yield_hook.clone(),
     })
 }
@@ -626,7 +660,7 @@ fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterEr
                     detail: format!("capture {capture_name:?} has invalid regex: {error}"),
                 })?;
             }
-            ScrapeMode::JsonPath => {
+            ScrapeMode::JsonPath | ScrapeMode::JsonPathLast => {
                 parse_json_path(&capture.pattern).map_err(|detail| {
                     AdapterError::InvalidConfig {
                         adapter: name.to_owned(),
@@ -870,6 +904,29 @@ fn scrape_json_path(pattern: &str, input: &str) -> Result<Option<Value>, String>
     Ok(selected)
 }
 
+fn scrape_json_path_last(pattern: &str, input: &str) -> Result<Option<Value>, String> {
+    let path = parse_json_path(pattern)?;
+    let documents = serde_json::Deserializer::from_str(input)
+        .into_iter::<Value>()
+        .enumerate()
+        .map(|(document_index, document)| match document {
+            Ok(document) => Ok(Some(document)),
+            Err(error) if error.is_eof() && document_index > 0 => Ok(None),
+            Err(error) => Err(format!("invalid JSON stream: {error}")),
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    Ok(path
+        .query(&Value::Array(documents))
+        .all()
+        .into_iter()
+        .rev()
+        .find(|value| !value.is_null())
+        .cloned())
+}
+
 fn read_capture(path: &Path) -> Result<String, AdapterError> {
     let parent = path
         .parent()
@@ -1017,6 +1074,7 @@ mod tests {
             ]),
             env: BTreeMap::from([("AGENT_COLOR".to_owned(), "never".to_owned())]),
             launch: AdapterLaunchConfig::default(),
+            hardening: AdapterHardening::None,
             extra_config: BTreeMap::from([(
                 "modelFlag".to_owned(),
                 Value::String("--model".to_owned()),
@@ -1044,6 +1102,7 @@ mod tests {
             ["agent", "--batch", "two words", "$(touch /tmp/nope)", ""]
         );
         assert_eq!(launch.env["AGENT_COLOR"], "never");
+        assert_eq!(launch.hardening, AdapterHardening::None);
         assert_eq!(
             launch.yield_hook.as_deref(),
             Some(&["tally".to_owned(), "lease".to_owned(), "status".to_owned()][..])
@@ -1075,6 +1134,41 @@ mod tests {
                 "",
             ]
         );
+    }
+
+    #[test]
+    fn hardening_name_defaults_to_none_and_propagates_without_directives() {
+        let default: AdapterConfig = serde_json::from_value(serde_json::json!({
+            "argv": ["agent"]
+        }))
+        .unwrap();
+        assert_eq!(default.hardening, AdapterHardening::None);
+        assert!(
+            serde_json::to_value(&default)
+                .unwrap()
+                .get("hardening")
+                .is_none(),
+            "absent hardening must remain absent on compatibility serialization"
+        );
+
+        let strict: AdapterConfig = serde_json::from_value(serde_json::json!({
+            "argv": ["agent"],
+            "hardening": "strict"
+        }))
+        .unwrap();
+        let adapters = BTreeMap::from([("strict-agent".to_owned(), strict)]);
+        assert_eq!(
+            engine(&adapters)
+                .launch("strict-agent", &[])
+                .unwrap()
+                .hardening,
+            AdapterHardening::Strict
+        );
+        assert!(serde_json::from_value::<AdapterConfig>(serde_json::json!({
+            "argv": ["agent"],
+            "hardening": "almost-strict"
+        }))
+        .is_err());
     }
 
     #[test]
@@ -1119,6 +1213,47 @@ mod tests {
             )
             .unwrap(),
             Some(Value::from(4))
+        );
+    }
+
+    #[test]
+    fn json_path_last_selects_only_the_normative_final_agent_events() {
+        let claude = concat!(
+            "{\"type\":\"result\",\"result\":\"first\"}\n",
+            "{\"type\":\"tool_result\",\"result\":\"ignore\"}\n",
+            "{\"type\":\"result\",\"result\":\"final\"}\n",
+        );
+        assert_eq!(
+            scrape_json_path_last("$[?@.type == 'result'].result", claude).unwrap(),
+            Some(Value::String("final".to_owned()))
+        );
+
+        let codex = concat!(
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"first\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\",\"text\":\"ignore\"}}\n",
+            "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"final\"}}\n",
+        );
+        assert_eq!(
+            scrape_json_path_last(
+                "$[?@.type == 'item.completed' && @.item.type == 'agent_message'].item.text",
+                codex,
+            )
+            .unwrap(),
+            Some(Value::String("final".to_owned()))
+        );
+
+        let pi = concat!(
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}}\n",
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"ignore\"}]}}\n",
+            "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"final\"}]}}\n",
+        );
+        assert_eq!(
+            scrape_json_path_last(
+                "$[?@.type == 'message_end' && @.message.role == 'assistant'].message.content[?@.type == 'text'].text",
+                pi,
+            )
+            .unwrap(),
+            Some(Value::String("final".to_owned()))
         );
     }
 

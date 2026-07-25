@@ -76,6 +76,7 @@ fn request(argv: Vec<String>) -> ExecutionRequest {
         cwd: None,
         workspace: None,
         gate_manifest: None,
+        hardening: Default::default(),
         credentials: BTreeMap::new(),
         limits: UnitLimits {
             cpu_weight: 250,

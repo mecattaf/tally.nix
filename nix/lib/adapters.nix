@@ -15,7 +15,8 @@ let
     assert lib.assertMsg (builtins.elem mode [
       "regex"
       "jsonPath"
-    ]) "tally adapter scrape mode must be regex or jsonPath";
+      "jsonPathLast"
+    ]) "tally adapter scrape mode must be regex, jsonPath, or jsonPathLast";
     assert lib.assertMsg (
       builtins.isString pattern && pattern != ""
     ) "tally adapter scrape pattern must be a non-empty string";
@@ -108,6 +109,10 @@ let
           mode = "jsonPath";
           pattern = "$..usage";
         };
+        finalMessage = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant'].message.content[?@.type == 'text'].text";
+        };
       };
       yieldHook = checkpointHook;
       extraConfig.modelFlag = "--model";
@@ -151,6 +156,10 @@ let
           mode = "jsonPath";
           pattern = "$..usage";
         };
+        finalMessage = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'result'].result";
+        };
       };
       yieldHook = checkpointHook;
       extraConfig.modelFlag = "--model";
@@ -193,6 +202,10 @@ let
         usage = mkScrapeCapture {
           mode = "jsonPath";
           pattern = "$..usage";
+        };
+        finalMessage = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'item.completed' && @.item.type == 'agent_message'].item.text";
         };
       };
       yieldHook = checkpointHook;

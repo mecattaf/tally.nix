@@ -880,7 +880,9 @@
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.sessionRef.mode' ${adapterConfig})" = jsonPath
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.model.mode' ${adapterConfig})" = jsonPath
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.usage.mode' ${adapterConfig})" = jsonPath
+              test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.finalMessage.mode' ${adapterConfig})" = jsonPathLast
             done
+            test "$(jq -r '.adapters.shell.scrape.finalMessage // "absent"' ${adapterConfig})" = absent
             test "$(jq -r '.adapters.pi.scrape.sessionRef.pattern' ${adapterConfig})" = '$.id'
             test "$(jq -r '.adapters["claude-code"].scrape.sessionRef.pattern' ${adapterConfig})" = '$..session_id'
             test "$(jq -r '.adapters.codex.scrape.sessionRef.pattern' ${adapterConfig})" = '$..thread_id'
@@ -894,23 +896,38 @@
             : > empty.err
             printf '%s\n' \
               '{"type":"session","id":"pi-session","model":"Pi/Exact.Model"}' \
-              '{"type":"message","model":"Pi/Exact.Model","usage":{"input_tokens":11}}' > pi.jsonl
+              '{"type":"message_end","message":{"role":"assistant","model":"Pi/Exact.Model","content":[{"type":"text","text":"pi first"}],"usage":{"input_tokens":5}}}' \
+              '{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"ignore user"}]}}' \
+              '{"type":"message_end","message":{"role":"assistant","model":"Pi/Exact.Model","content":[{"type":"text","text":"pi final"}],"usage":{"input_tokens":11}}}' > pi.jsonl
             pi_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render pi --scrape-stdout "$PWD/pi.jsonl" --scrape-stderr "$PWD/empty.err" -- work)"
             test "$(printf '%s' "$pi_render" | jq -c '.argv')" = '["pi","--mode","json","--session","pi-session","--model","Pi/Exact.Model","--","work"]'
             test "$(printf '%s' "$pi_render" | jq -c '.captures.usage')" = '{"input_tokens":11}'
+            test "$(printf '%s' "$pi_render" | jq -r '.captures.finalMessage')" = 'pi final'
+            test "$(printf '%s' "$pi_render" | jq -r '.defaultGateManifest')" = false
             printf '%s\n' \
               '{"type":"system","subtype":"init","session_id":"claude-session","model":"Claude/Exact.Model"}' \
-              '{"type":"assistant","message":{"model":"Claude/Exact.Model","usage":{"input_tokens":12}}}' > claude.jsonl
+              '{"type":"result","result":"claude first"}' \
+              '{"type":"assistant","message":{"model":"Claude/Exact.Model","usage":{"input_tokens":12}}}' \
+              '{"type":"result","result":"claude final"}' > claude.jsonl
             claude_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render claude-code --scrape-stdout "$PWD/claude.jsonl" --scrape-stderr "$PWD/empty.err" -- work)"
             test "$(printf '%s' "$claude_render" | jq -c '.argv')" = '["claude","--resume","claude-session","--model","Claude/Exact.Model","--print","--verbose","--output-format","stream-json","--","work"]'
             test "$(printf '%s' "$claude_render" | jq -c '.captures.usage')" = '{"input_tokens":12}'
+            test "$(printf '%s' "$claude_render" | jq -r '.captures.finalMessage')" = 'claude final'
+            test "$(printf '%s' "$claude_render" | jq -r '.defaultGateManifest')" = true
             printf '%s\n' \
               '{"type":"thread.started","thread_id":"codex-thread","model":"Codex/Exact.Model"}' \
-              '{"type":"turn.completed","model":"Codex/Exact.Model","usage":{"input_tokens":13}}' > codex.jsonl
+              '{"type":"item.completed","item":{"type":"agent_message","text":"codex first"}}' \
+              '{"type":"item.completed","item":{"type":"command_execution","text":"ignore command"}}' \
+              '{"type":"turn.completed","model":"Codex/Exact.Model","usage":{"input_tokens":13}}' \
+              '{"type":"item.completed","item":{"type":"agent_message","text":"codex final"}}' > codex.jsonl
             codex_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render codex --cwd "$PWD" --scrape-stdout "$PWD/codex.jsonl" --scrape-stderr "$PWD/empty.err" -- work)"
             expected_codex="$(jq -cn --arg cwd "$PWD" '["codex","-C",$cwd,"exec","resume","--json","--model","Codex/Exact.Model","codex-thread","--","work"]')"
             test "$(printf '%s' "$codex_render" | jq -c '.argv')" = "$expected_codex"
             test "$(printf '%s' "$codex_render" | jq -c '.captures.usage')" = '{"input_tokens":13}'
+            test "$(printf '%s' "$codex_render" | jq -r '.captures.finalMessage')" = 'codex final'
+            test "$(printf '%s' "$codex_render" | jq -r '.defaultGateManifest')" = true
+            shell_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render shell -- /bin/true)"
+            test "$(printf '%s' "$shell_render" | jq -r '.defaultGateManifest')" = false
             touch $out
           '';
           producer-registry =

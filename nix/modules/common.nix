@@ -55,10 +55,11 @@ let
           type = types.enum [
             "regex"
             "jsonPath"
+            "jsonPathLast"
           ];
           default = "regex";
-          example = "jsonPath";
-          description = "Structured scrape mode.";
+          example = "jsonPathLast";
+          description = "Structured scrape mode, including whole-stream last-match JSONPath selection.";
         };
         pattern = mkOption {
           type = types.str;
@@ -1357,7 +1358,11 @@ let
                     type = types.ints.positive;
                     default = 1;
                     example = 18000;
-                    description = "Authoritative spend cap in the resource's native unit.";
+                    description = ''
+                      Authoritative spend cap in the resource's native unit. For a
+                      windowed budget pool without usageMeter, the built-in adapter
+                      usage feeder denominates this cap in tokens.
+                    '';
                   };
                 };
               };

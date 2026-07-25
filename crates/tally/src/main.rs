@@ -28,7 +28,7 @@ use tally_core::witness::{
     append_attestation, read_verified_attestations, read_verified_records, GENESIS_PREV_HASH,
 };
 use tally_core::{
-    adapters::{AdapterEngine, AdapterJobOptions, ScrapeResult},
+    adapters::{provisions_gate_manifest, AdapterEngine, AdapterJobOptions, ScrapeResult},
     Config,
 };
 use tally_flow::{
@@ -872,8 +872,10 @@ async fn execute(opts: Opts) -> Result<()> {
                 serde_json::to_string(&json!({
                     "argv": invocation.argv,
                     "env": invocation.env,
+                    "hardening": invocation.hardening,
                     "yieldHook": invocation.yield_hook,
                     "captures": scraped,
+                    "defaultGateManifest": provisions_gate_manifest(&args.adapter),
                 }))?
             );
             Ok(())

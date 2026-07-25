@@ -1016,6 +1016,7 @@ mod tests {
             brief_hash: None,
             orchestration: None,
             session_ref: None,
+            final_message: None,
             lease_epoch,
             attempt: 1,
             argv: vec!["worker".to_owned(), "leaf".to_owned()],

@@ -45,11 +45,6 @@ impl GateManifestSpec {
                 "gate manifest path must contain no control characters".to_owned(),
             ));
         }
-        if self.required_gate_ids.is_empty() {
-            return Err(CompletionError::InvalidSpec(
-                "requiredGateIds must contain at least one gate ID".to_owned(),
-            ));
-        }
         let mut unique = BTreeSet::new();
         for gate_id in &self.required_gate_ids {
             validate_gate_id(gate_id).map_err(CompletionError::InvalidSpec)?;
@@ -201,6 +196,17 @@ pub fn evaluate_completion(
 ) -> SemanticCompletion {
     let gates = match read_gate_manifest(spec) {
         Ok(summary) => summary,
+        Err(ref error @ CompletionError::Read { ref source, .. })
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            GateSummary {
+                status: GateSummaryStatus::NotRun,
+                artifact: None,
+                gates: Vec::new(),
+                missing_required_gate_ids: spec.required_gate_ids.clone(),
+                manifest_error: Some(error.to_string()),
+            }
+        }
         Err(error) => GateSummary {
             status: GateSummaryStatus::Fail,
             artifact: None,
@@ -475,6 +481,35 @@ mod tests {
         );
         assert_eq!(completion.gates.status, GateSummaryStatus::Pass);
         assert_eq!(completion.acceptance.status, AcceptanceStatus::Accepted);
+    }
+
+    #[test]
+    fn absent_manifest_is_visible_not_run_without_failing_execution() {
+        let temp = tempfile::tempdir().unwrap();
+        let completion = evaluate_completion(
+            ExecutionFact::exited(0),
+            &GateManifestSpec {
+                path: temp.path().join("absent-default.json"),
+                required_gate_ids: Vec::new(),
+                acceptance_policy: AcceptancePolicy::Manual,
+            },
+        );
+        assert_eq!(completion.execution.status, ExecutionStatus::Success);
+        assert_eq!(completion.gates.status, GateSummaryStatus::NotRun);
+        assert!(completion.gates.gates.is_empty());
+        assert!(completion.gates.manifest_error.is_some());
+        assert_eq!(completion.acceptance.status, AcceptanceStatus::Pending);
+
+        let required = evaluate_completion(
+            ExecutionFact::exited(0),
+            &spec(
+                temp.path().join("absent-required.json"),
+                AcceptancePolicy::ExecutionAndGates,
+            ),
+        );
+        assert_eq!(required.gates.status, GateSummaryStatus::NotRun);
+        assert_eq!(required.gates.missing_required_gate_ids, ["static", "live"]);
+        assert_eq!(required.acceptance.status, AcceptanceStatus::Pending);
     }
 
     #[test]

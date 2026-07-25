@@ -67,6 +67,8 @@ pub struct RowFact {
     pub source: Option<String>,
     pub session_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceMetadata>,
@@ -110,6 +112,7 @@ impl From<&TaskRow> for RowFact {
             executor: row.value("executor").map(ToOwned::to_owned),
             source: row.value("source").map(ToOwned::to_owned),
             session_ref: row.value("session_ref").map(ToOwned::to_owned),
+            final_message: row.value("final_message").map(ToOwned::to_owned),
             cwd: row.value("cwd").map(ToOwned::to_owned),
             workspace: row
                 .value("workspace_json")
@@ -343,6 +346,8 @@ pub struct JobProjection {
     pub source: Option<String>,
     pub session_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_message: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceMetadata>,
@@ -406,6 +411,7 @@ fn project_job_details(
                     executor: row.executor.clone(),
                     source: row.source.clone(),
                     session_ref: row.session_ref.clone(),
+                    final_message: row.final_message.clone(),
                     cwd: row.cwd.clone(),
                     workspace: row.workspace.clone(),
                     resumed_from: row.resumed_from.clone(),
@@ -443,6 +449,7 @@ fn project_job_details(
                 executor: None,
                 source: None,
                 session_ref: None,
+                final_message: None,
                 cwd: None,
                 workspace: None,
                 resumed_from: None,
@@ -506,6 +513,7 @@ fn project_job_details(
                 executor: record.executor.clone(),
                 source: None,
                 session_ref: None,
+                final_message: None,
                 cwd: None,
                 workspace: None,
                 resumed_from: None,
@@ -1121,6 +1129,7 @@ mod tests {
             executor: None,
             source: Some("manual".to_owned()),
             session_ref: Some(session.to_owned()),
+            final_message: None,
             cwd: None,
             workspace: None,
             resumed_from: None,

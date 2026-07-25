@@ -41,6 +41,7 @@ pub const TALLY_UDA_NAMES: &[&str] = &[
     "executor",
     "session_ref",
     "model",
+    "final_message",
     "cwd",
     "workspace_json",
     "adapter_options_json",
@@ -878,6 +879,8 @@ pub struct RowSeed {
     pub orchestration: Option<Orchestration>,
     #[serde(default)]
     pub session_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_message: Option<String>,
     pub lease_epoch: u64,
     #[serde(default = "default_attempt")]
     pub attempt: u32,
@@ -1631,6 +1634,9 @@ fn populate_task(
     if let Some(session_ref) = seed.session_ref {
         attributes.insert("session_ref", session_ref);
     }
+    if let Some(final_message) = seed.final_message {
+        attributes.insert("final_message", final_message);
+    }
     if let Some(parent_uuid) = seed.parent_uuid {
         attributes.insert("parent_uuid", parent_uuid.to_string());
     }
@@ -1952,6 +1958,7 @@ mod tests {
             brief_hash: None,
             orchestration: None,
             session_ref: None,
+            final_message: None,
             lease_epoch: 7,
             attempt: 1,
             argv: vec!["ocr".to_owned(), "paper.pdf".to_owned()],

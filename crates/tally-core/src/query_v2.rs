@@ -61,6 +61,7 @@ pub struct RowDetailFact {
     pub requested_model: Option<String>,
     pub observed_model: Option<String>,
     pub session_ref: Option<String>,
+    pub final_message: Option<String>,
     pub attempt: u32,
     pub lease_epoch: u64,
     pub labor_class: LaborClass,
@@ -102,6 +103,7 @@ impl RowDetailFact {
             requested_model: row.adapter_options.model.clone(),
             observed_model: row.model.clone(),
             session_ref: row.session_ref.clone(),
+            final_message: row.final_message.clone(),
             attempt: row.attempt,
             lease_epoch: row.lease_epoch,
             labor_class,
@@ -237,6 +239,8 @@ pub struct JobSummary {
     pub origin: Option<SourcedValue<OriginProjection>>,
     pub model: Vec<SourcedValue<String>>,
     pub session_ref: Option<SourcedValue<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_message: Option<SourcedValue<String>>,
     pub current_attempt: Option<u32>,
     pub lease_epoch: Option<u64>,
     pub unit: Option<String>,
@@ -930,6 +934,15 @@ fn build_summary(
                 )
             })
         }),
+        final_message: detail.and_then(|detail| {
+            detail.final_message.clone().map(|value| {
+                SourcedValue::new(
+                    value,
+                    FactAuthority::AdvisoryProviderCapture,
+                    "adapter-scrape",
+                )
+            })
+        }),
         current_attempt,
         lease_epoch: current_lease_epoch,
         unit: live
@@ -1484,6 +1497,7 @@ mod tests {
             requested_model: Some("requested-model".to_owned()),
             observed_model: Some("scraped-model".to_owned()),
             session_ref: Some("scraped-session".to_owned()),
+            final_message: Some("{\"answer\":42}".to_owned()),
             attempt: 1,
             lease_epoch: 7,
             labor_class: LaborClass::Fresh,

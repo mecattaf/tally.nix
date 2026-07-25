@@ -1245,6 +1245,48 @@ pub enum ProducerObservation {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AssistedBy {
+    pub adapter: String,
+    pub model: String,
+    pub task_uuid: String,
+    pub witness_seq: u64,
+}
+
+impl AssistedBy {
+    fn trailer(&self) -> String {
+        format!(
+            "Assisted-by: {}:{} (tally:{} witness:{})",
+            self.adapter, self.model, self.task_uuid, self.witness_seq
+        )
+    }
+}
+
+fn assisted_by_from_evidence(evidence: &Value) -> Option<AssistedBy> {
+    let adapter = evidence.get("adapter")?.as_str()?;
+    let model = evidence.get("model")?.as_str()?;
+    let task_uuid = evidence.get("taskUuid")?.as_str()?;
+    let witness_seq = evidence
+        .get("witnessSeq")?
+        .as_u64()
+        .filter(|seq| *seq > 0)?;
+    if adapter.is_empty()
+        || model.is_empty()
+        || adapter.chars().any(char::is_control)
+        || model.chars().any(char::is_control)
+        || Uuid::parse_str(task_uuid).is_err()
+    {
+        return None;
+    }
+    Some(AssistedBy {
+        adapter: adapter.to_owned(),
+        model: model.to_owned(),
+        task_uuid: task_uuid.to_owned(),
+        witness_seq,
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct GhCompletedMutation {
     pub producer: String,
     pub source: String,
@@ -1260,6 +1302,8 @@ pub struct GhCompletedMutation {
     pub acceptance: Option<AcceptanceFact>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub request_review: bool,
+    #[serde(skip)]
+    pub assisted_by: Option<AssistedBy>,
 }
 
 pub trait GhMutationSink {
@@ -2382,10 +2426,11 @@ impl GhMutationSink for GhCliMutationSink {
             .ok_or_else(|| "concrete GitHub mutation requires a durable completionId".to_owned())?;
         let remote_key = stable_key(&["gh-remote-completion", completion_id]);
         let remote_marker = format!("<!-- tally-completion:{remote_key} -->");
-        let body = format!(
-            "{remote_marker}\n{}",
-            serde_json::to_string(mutation)
-                .map_err(|error| format!("cannot encode GitHub evidence: {error}"))?
+        let encoded = serde_json::to_string(mutation)
+            .map_err(|error| format!("cannot encode GitHub evidence: {error}"))?;
+        let body = mutation.assisted_by.as_ref().map_or_else(
+            || format!("{remote_marker}\n{encoded}"),
+            |assisted_by| format!("{remote_marker}\n{encoded}\n\n{}", assisted_by.trailer()),
         );
         let (kind, state, comment_exists) =
             self.completion_state(&mutation.item_id, &remote_marker)?;
@@ -3551,6 +3596,7 @@ impl<'a> ProducerEngine<'a> {
             return Ok(false);
         }
         self.validate_gh_origin(origin)?;
+        let assisted_by = evidence.as_ref().and_then(assisted_by_from_evidence);
         let execution_passed = matches!(verdict, Verdict::Pass | Verdict::Reused);
         let evidence = (config.post_evidence && execution_passed)
             .then_some(evidence)
@@ -3591,6 +3637,7 @@ impl<'a> ProducerEngine<'a> {
             gate_summary,
             acceptance,
             request_review,
+            assisted_by,
         };
         if should_post {
             sink.post_evidence(&mutation)
@@ -6138,12 +6185,18 @@ mod tests {
         permissions.set_mode(0o700);
         std::fs::set_permissions(&gh, permissions).unwrap();
         let mut cli = GhCliMutationSink::with_program(&gh);
+        let trailer_evidence = serde_json::json!({
+            "taskUuid": "00000000-0000-4000-8000-000000000049",
+            "witnessSeq": 5,
+            "adapter": "codex",
+            "model": "gpt-5.6-codex",
+        });
         assert!(engine
             .complete_gh_once(
                 &origin,
                 completion_id,
                 Verdict::Reused,
-                Some(serde_json::json!({"witnessSeq": 5})),
+                Some(trailer_evidence.clone()),
                 &mut cli,
             )
             .unwrap_err()
@@ -6154,7 +6207,7 @@ mod tests {
                 &origin,
                 completion_id,
                 Verdict::Reused,
-                Some(serde_json::json!({"witnessSeq": 5})),
+                Some(trailer_evidence.clone()),
                 &mut cli,
             )
             .unwrap());
@@ -6163,7 +6216,7 @@ mod tests {
                 &origin,
                 completion_id,
                 Verdict::Reused,
-                Some(serde_json::json!({"witnessSeq": 5})),
+                Some(trailer_evidence),
                 &mut cli,
             )
             .unwrap());
@@ -6207,6 +6260,12 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("witnessSeq"));
+        assert!(comment["variables"]["body"]
+            .as_str()
+            .unwrap()
+            .ends_with(
+                "\n\nAssisted-by: codex:gpt-5.6-codex (tally:00000000-0000-4000-8000-000000000049 witness:5)"
+            ));
     }
 
     #[test]
