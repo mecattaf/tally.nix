@@ -19,6 +19,7 @@ pair still governs. Nothing here is normative once the corresponding book chapte
 | `BUILD-SEQUENCE.md`, `FLOW-BUILD-SEQUENCE.md` | Unit decomposition and merge order for the implementation campaigns | Historical |
 | `CODEX-HANDOFF.md`, `PRE-BUILD-ADDENDUM.md` | Agent-session handoff artifacts | Historical |
 | `transfer/` (9 briefs) | Style-transfer corpora: Boa, rquickjs, workflows.js, Inngest/Cloudflare, durable execution, spec-kit vocabulary, dotfiles prior art, Nix module style, attic/Trustix | Keep as design-rationale sources for the book's Architecture chapter; each records *why* a mechanism looks the way it does |
+| `campaign/` | Agent-campaign provenance, previously loose at the repo root and untracked: `CODEX-HANDOFF.md`'s companions — `completion-july20.md` (waves 12–13 correction handoff), `wave-11-5.md` (the r2 removal wave), `ORCHESTRATION-HANDOFF.md` (state at checkpoint 2), `FLOW-CAMPAIGN-HANDOFF.md` + `FLOW-CAMPAIGN-STATE.md` (the 2026-07-24→25 flow campaign's mission and step ledger), `MORNING-REPORT.md` (its outcome report), `wave-log.jsonl` | Historical. Records how the code came to exist and which sessions decided what; the surviving conclusions are in issue #82 |
 
 ## The six known divergences (legacy vs flow era)
 
