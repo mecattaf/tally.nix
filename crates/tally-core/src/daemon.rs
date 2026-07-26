@@ -81,9 +81,9 @@ use crate::wire::{
     WireError, WireErrorCode, WireIoError,
 };
 use crate::witness::{
-    append_attestation, read_verified_attestations, read_verified_records, repair_attestation_tail,
-    verify_attestations, AttestationRecord, LaborClass, Verdict, WitnessBody, WitnessError,
-    WitnessLedger, WitnessRecord,
+    append_attestation, current_host_id, read_verified_attestations, read_verified_records,
+    repair_attestation_tail, verify_attestations, AttestationRecord, LaborClass, Verdict,
+    WitnessBody, WitnessError, WitnessLedger, WitnessRecord,
 };
 
 const LEASE_TICK: Duration = Duration::from_millis(100);
@@ -166,6 +166,10 @@ pub enum DaemonError {
     TaskDb(#[from] TaskDbError),
     #[error("witness error: {0}")]
     Witness(#[from] WitnessError),
+    #[error(
+        "old-format events directory at {path}; archive it aside before first boot: mv -- {path} {archive}"
+    )]
+    OldFormatEvents { path: PathBuf, archive: PathBuf },
     #[error("lifecycle history error: {0}")]
     History(#[from] HistoryError),
     #[error("change log error: {0}")]
@@ -439,6 +443,7 @@ impl Job {
 pub struct Context {
     config: Config,
     paths: DaemonPaths,
+    host_id: String,
     epoch: u64,
     lease: LocalLease<SystemdUnitLiveness>,
     guardrails: GuardrailState,
@@ -4575,7 +4580,7 @@ fn canonical_job_model(job: &Job) -> Option<String> {
     })
 }
 
-fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
+fn forced_witness(job: &Job, verdict: Verdict, host_id: Option<String>) -> WitnessBody {
     WitnessBody {
         task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
         transition_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -4601,7 +4606,7 @@ fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
         trace_ref: None,
         pools: job.row.pools.clone(),
         executor: job.row.executor.clone(),
-        host_id: None,
+        host_id,
         charge: None,
         model: canonical_job_model(job),
         evidence_class: job.row.evidence_class.clone(),
@@ -4643,7 +4648,11 @@ fn finalize_forced_locked(
     if job.state == JobState::Completed {
         return Ok(None);
     }
-    let record = context.witness.append(forced_witness(&job, verdict))?;
+    let host_id = (job.state == JobState::Running && job.row.executor.is_none())
+        .then(|| context.host_id.clone());
+    let record = context
+        .witness
+        .append(forced_witness(&job, verdict, host_id))?;
     let result = JobResult {
         task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
         job_id: job.job_id.to_string(),
@@ -4833,10 +4842,12 @@ impl Daemon {
         let settings = settings.validate()?;
         prepare_paths(&paths)?;
         let state_lock = acquire_daemon_lock(&paths.state_dir)?;
+        require_fresh_events_for_new_ledger(&paths)?;
+        let host_id = current_host_id()?;
         let witness_path = paths.witness_path();
         let mut witness_ledger = WitnessLedger::open(&witness_path)?;
         let epoch = bump_epoch(&paths.state_dir)?;
-        reconcile_pool_loss_intents(&paths, &executor, &mut witness_ledger).await?;
+        reconcile_pool_loss_intents(&paths, &executor, &mut witness_ledger, &host_id).await?;
         let mut durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
         if reconcile_reuse_witnesses(&durable, &mut witness_ledger)? {
             durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
@@ -4934,7 +4945,7 @@ impl Daemon {
             adapter_metadata,
         });
         Self::build_locked(
-            config, paths, settings, executor, epoch, plan, committer, state_lock,
+            config, paths, settings, executor, host_id, epoch, plan, committer, state_lock,
         )
     }
 
@@ -4950,8 +4961,9 @@ impl Daemon {
         committer: Box<dyn ReplicaCommitter>,
     ) -> Result<Self, DaemonError> {
         let state_lock = acquire_daemon_lock(&paths.state_dir)?;
+        let host_id = current_host_id()?;
         Self::build_locked(
-            config, paths, settings, executor, epoch, plan, committer, state_lock,
+            config, paths, settings, executor, host_id, epoch, plan, committer, state_lock,
         )
     }
 
@@ -4961,6 +4973,7 @@ impl Daemon {
         paths: DaemonPaths,
         settings: DaemonSettings,
         executor: Executor,
+        host_id: String,
         epoch: u64,
         plan: crate::recovery::RecoveryPlan,
         committer: Box<dyn ReplicaCommitter>,
@@ -5000,6 +5013,7 @@ impl Daemon {
         let mut context = Context {
             config: config.clone(),
             paths: paths.clone(),
+            host_id,
             epoch,
             lease: LocalLease::new(lease_engine, SystemdUnitLiveness::default()),
             guardrails: GuardrailState::new(GuardrailConfig {
@@ -5486,6 +5500,7 @@ impl Daemon {
             }
             let verdict = computed_verdict;
             let model = canonical_job_model(&job);
+            let host_id = job.row.executor.is_none().then(|| context.host_id.clone());
             let record = context.witness.append(WitnessBody {
                 task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
                 transition_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
@@ -5511,7 +5526,7 @@ impl Daemon {
                 trace_ref: None,
                 pools: job.row.pools.clone(),
                 executor: job.row.executor.clone(),
-                host_id: None,
+                host_id,
                 charge: None,
                 model: model.clone(),
                 evidence_class: job.row.evidence_class.clone(),
@@ -6059,6 +6074,7 @@ async fn reconcile_pool_loss_intents(
     paths: &DaemonPaths,
     executor: &Executor,
     ledger: &mut WitnessLedger,
+    host_id: &str,
 ) -> Result<(), DaemonError> {
     let directory = pool_loss_intent_directory(&paths.state_dir);
     if !directory.exists() {
@@ -6149,7 +6165,12 @@ async fn reconcile_pool_loss_intents(
             adopted_invocation_id: intent.adopted_invocation_id,
             model_is_advisory: intent.model_is_advisory,
         };
-        records.push(ledger.append(forced_witness(&job, Verdict::PoolVanished))?);
+        let execution_host_id = job.row.executor.is_none().then(|| host_id.to_owned());
+        records.push(ledger.append(forced_witness(
+            &job,
+            Verdict::PoolVanished,
+            execution_host_id,
+        ))?);
         clear_pool_loss_intent(&path)?;
     }
     Ok(())
@@ -6270,6 +6291,36 @@ fn prepare_paths(paths: &DaemonPaths) -> Result<(), DaemonError> {
         .ok_or_else(|| DaemonError::Invalid("socket has no parent directory".to_owned()))?;
     std::fs::create_dir_all(socket_parent).map_err(|source| io_error(socket_parent, source))?;
     Ok(())
+}
+
+fn require_fresh_events_for_new_ledger(paths: &DaemonPaths) -> Result<(), DaemonError> {
+    // The final-schema daemon creates this file and fsyncs its parent before it
+    // can admit an event, so its existence is the durable cutover marker.
+    if paths.witness_path().exists() {
+        return Ok(());
+    }
+    let events_dir = paths.events_dir();
+    if !events_dir.exists() {
+        return Ok(());
+    }
+    let mut entries =
+        std::fs::read_dir(&events_dir).map_err(|source| io_error(&events_dir, source))?;
+    if entries
+        .next()
+        .transpose()
+        .map_err(|source| io_error(&events_dir, source))?
+        .is_none()
+    {
+        return Ok(());
+    }
+    Err(DaemonError::OldFormatEvents {
+        path: events_dir.clone(),
+        archive: PathBuf::from(format!(
+            "{}.pre-{}",
+            events_dir.display(),
+            Utc::now().format("%Y-%m-%d")
+        )),
+    })
 }
 
 fn acquire_daemon_lock(state_dir: &Path) -> Result<File, DaemonError> {
@@ -8214,6 +8265,11 @@ mod tests {
         }
     }
 
+    fn initialize_final_witness_state(paths: &DaemonPaths) {
+        prepare_paths(paths).unwrap();
+        drop(WitnessLedger::open(paths.witness_path()).unwrap());
+    }
+
     async fn fs1_daemon(paths: &DaemonPaths) -> Daemon {
         let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
             .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
@@ -8250,6 +8306,9 @@ mod tests {
             Err(error) => error,
         };
 
+        assert!(error
+            .to_string()
+            .contains("archive it aside before first boot: mv --"));
         match error {
             DaemonError::Witness(WitnessError::OldFormat { path, archive }) => {
                 assert_eq!(path, paths.witness_path());
@@ -8261,6 +8320,74 @@ mod tests {
             }
             other => panic!("expected typed old-format witness error, got {other:?}"),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_format_events_refuse_first_boot_without_reading_or_mutating_them() {
+        let temp = tempdir().unwrap();
+        let paths = fs1_paths(temp.path());
+        fs::create_dir_all(paths.events_dir()).unwrap();
+        let legacy_event = paths.events_dir().join("legacy.enqueue.json");
+        let legacy_bytes = b"not even parseable legacy event bytes\n";
+        fs::write(&legacy_event, legacy_bytes).unwrap();
+        let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+            .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+            .with_unit_probe(ExitFileProbe);
+
+        let error = match Daemon::open_with_executor(
+            one_pool_config(),
+            paths.clone(),
+            settings(),
+            executor,
+        )
+        .await
+        {
+            Ok(_) => panic!("daemon unexpectedly booted over old-format events"),
+            Err(error) => error,
+        };
+
+        assert!(error
+            .to_string()
+            .contains("archive it aside before first boot: mv --"));
+        match error {
+            DaemonError::OldFormatEvents { path, archive } => {
+                assert_eq!(path, paths.events_dir());
+                assert!(archive
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("events.pre-"));
+            }
+            other => panic!("expected typed old-format events error, got {other:?}"),
+        }
+        assert_eq!(fs::read(legacy_event).unwrap(), legacy_bytes);
+        assert!(!paths.witness_path().exists());
+        drop(acquire_daemon_lock(&paths.state_dir).unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn empty_events_initialize_the_ledger_and_later_events_survive_restart() {
+        let temp = tempdir().unwrap();
+        let paths = fs1_paths(temp.path());
+        fs::create_dir_all(paths.events_dir()).unwrap();
+
+        let daemon = fs1_daemon(&paths).await;
+        assert!(paths.witness_path().is_file());
+        assert_eq!(paths.witness_path().metadata().unwrap().len(), 0);
+        drop(daemon);
+
+        let row = durable_row(Uuid::new_v4(), "post-cutover-pending", 1);
+        write_enqueue_event_atomic(
+            &paths.events_dir(),
+            &DurableEnqueueEvent::new(row.clone()).unwrap(),
+        )
+        .unwrap();
+
+        let restarted = fs1_daemon(&paths).await;
+        assert!(restarted
+            .initial_jobs
+            .iter()
+            .any(|job| job.task_uuid == Some(row.uuid)));
     }
 
     fn fs1_full_payload(
@@ -8979,6 +9106,14 @@ mod tests {
                     .iter()
                     .find(|record| record.task_uuid.as_deref() == Some(&task_uuid))
                     .unwrap();
+                assert_eq!(record.schema_version, crate::witness::WITNESS_SCHEMA_VERSION);
+                assert_eq!(record.record_type, crate::witness::RecordType::Verdict);
+                assert_eq!(
+                    record.origin,
+                    AdmissionOrigin::direct(EnqueueSource::Manual)
+                );
+                let expected_host_id = current_host_id().unwrap();
+                assert_eq!(record.host_id.as_deref(), Some(expected_host_id.as_str()));
                 assert_eq!(
                     record.pools,
                     ["slot".to_owned(), "zeta".to_owned()]
@@ -8998,6 +9133,13 @@ mod tests {
                     .lines()
                     .find(|line| line.contains(&task_uuid))
                     .unwrap();
+                let raw_record: Value = serde_json::from_str(fielded_line).unwrap();
+                assert_eq!(raw_record["schemaVersion"], 2);
+                assert_eq!(raw_record["recordType"], "verdict");
+                assert!(raw_record["pools"].is_array());
+                assert!(raw_record.get("pool").is_none());
+                assert!(raw_record["origin"].is_object());
+                assert_eq!(raw_record["hostId"], expected_host_id);
                 assert!(
                     fielded_line.find("\"evidenceClass\"").unwrap()
                         < fielded_line.find("\"manifestHash\"").unwrap()
@@ -9426,7 +9568,8 @@ mod tests {
                 inspections: inspections.clone(),
             });
         let mut ledger = WitnessLedger::open(paths.witness_path()).unwrap();
-        reconcile_pool_loss_intents(&paths, &executor, &mut ledger)
+        let host_id = current_host_id().unwrap();
+        reconcile_pool_loss_intents(&paths, &executor, &mut ledger, &host_id)
             .await
             .unwrap();
         assert_eq!(inspections.load(Ordering::SeqCst), 1);
@@ -9441,13 +9584,14 @@ mod tests {
         assert_eq!(records[0].verdict, Verdict::PoolVanished);
         assert_eq!(records[0].attempt, row.attempt);
         assert_eq!(records[0].lease_epoch, row.lease_epoch);
+        assert_eq!(records[0].host_id.as_deref(), Some(host_id.as_str()));
 
         // Simulate a second crash after witness fsync and before intent removal.
         assert_eq!(
             write_pool_loss_intent(&paths.state_dir, &job).unwrap(),
             intent_path
         );
-        reconcile_pool_loss_intents(&paths, &executor, &mut ledger)
+        reconcile_pool_loss_intents(&paths, &executor, &mut ledger, &host_id)
             .await
             .unwrap();
         assert_eq!(inspections.load(Ordering::SeqCst), 1);
@@ -9470,6 +9614,7 @@ mod tests {
                     data_dir: temp.path().join("data"),
                 };
                 prepare_paths(&paths).unwrap();
+                initialize_final_witness_state(&paths);
                 let row = durable_row(Uuid::new_v4(), "startup-real-exit", 1);
                 write_enqueue_event_atomic(
                     &paths.events_dir(),
@@ -9646,6 +9791,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
+                initialize_final_witness_state(&paths);
                 let mut config = one_pool_config();
                 config.producers = serde_json::from_value(json!({
                     "github": {
@@ -9770,6 +9916,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
+                initialize_final_witness_state(&paths);
                 let mut config = one_pool_config();
                 config.producers = serde_json::from_value(json!({
                     "daily": {
@@ -10021,6 +10168,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
+                initialize_final_witness_state(&paths);
                 let mut config = one_pool_config();
                 config.producers = serde_json::from_value(json!({
                     "github": {
@@ -12151,6 +12299,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
+                initialize_final_witness_state(&paths);
                 let task_uuid = Uuid::new_v4();
                 let mut row = durable_row(task_uuid, "restart-remote", 1);
                 row.executor = Some("worker".to_owned());
@@ -12492,6 +12641,7 @@ mod tests {
                     data_dir: temp.path().join("data"),
                 };
                 prepare_paths(&paths).unwrap();
+                initialize_final_witness_state(&paths);
                 assert_eq!(bump_epoch(&paths.state_dir).unwrap(), 1);
                 let mut row = durable_row(Uuid::new_v4(), "restart-multi-pool", 1);
                 row.pools = vec!["slot".to_owned(), "zeta".to_owned()];
