@@ -183,11 +183,12 @@ pub fn run_exec(request: ExecRunRequest) -> Result<ExecRunOutcome, ExecRunError>
         wall_clock_seconds: elapsed.as_secs_f64(),
         evidence: &evidence,
     });
+    let task_uuid = request.task_uuid.clone();
     let payload = host_id.map(|host_id| ExecAttestationPayload {
         schema_version: EXEC_ATTESTATION_SCHEMA_VERSION,
         kind: "exec".to_owned(),
         execution_id: execution_id(&request.task_uuid, request.attempt, request.lease_epoch),
-        task_uuid: request.task_uuid,
+        task_uuid: task_uuid.clone(),
         attempt: request.attempt,
         lease_epoch: request.lease_epoch,
         host_id,
@@ -212,7 +213,7 @@ pub fn run_exec(request: ExecRunRequest) -> Result<ExecRunOutcome, ExecRunError>
             Err(error) => {
                 eprintln!(
                     "tally: execution attestation append failed for {}: {error}",
-                    request.task_uuid
+                    task_uuid
                 );
                 false
             }
@@ -220,7 +221,7 @@ pub fn run_exec(request: ExecRunRequest) -> Result<ExecRunOutcome, ExecRunError>
         Err(error) => {
             eprintln!(
                 "tally: execution attestation append failed for {}: {error}",
-                request.task_uuid
+                task_uuid
             );
             false
         }
