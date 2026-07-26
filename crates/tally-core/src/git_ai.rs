@@ -596,7 +596,8 @@ async fn bind_inner(
         );
     };
     let Preflight::Available {
-        provider_version, ..
+        provider_version,
+        provider_program,
     } = preflight
     else {
         let Preflight::Failed {
@@ -635,7 +636,7 @@ async fn bind_inner(
             Err(reason) => Err(reason),
         }
     } else if allow_legacy_global && execution.config.global_await_ok {
-        settle_legacy_global(execution, worktree, context).await
+        settle_legacy_global(execution, provider_program, worktree, context).await
     } else if allow_legacy_global {
         Err(format!(
             "git-ai-error: git-ai {provider_version} exposes no repository-family-scoped await and globalAwaitOk is false"
@@ -848,6 +849,7 @@ async fn bind_inner(
 
 async fn settle_legacy_global(
     execution: &GitAiExecution,
+    provider_program: &Path,
     worktree: &Path,
     context: &CommandContext,
 ) -> Result<(), String> {
@@ -855,7 +857,7 @@ async fn settle_legacy_global(
     let await_result = tokio::time::timeout(
         Duration::from_secs(execution.config.await_timeout_sec.saturating_add(1)),
         command_output(
-            PROGRAM,
+            provider_program,
             ["await", "--timeout", timeout.as_str()],
             Some(worktree),
             context,
@@ -1487,10 +1489,19 @@ mod tests {
         let bin = root.join("bin");
         fs::create_dir(&bin).unwrap();
         let program = bin.join("git-ai");
+        let shell = resolve_program("sh", &CommandContext::default())
+            .expect("the test environment must provide sh on PATH");
+        let shell = shell
+            .to_str()
+            .expect("the test shell path must be valid UTF-8");
+        assert!(
+            !shell.contains(['\n', '\r', ' ']),
+            "the test shell path must be valid in a shebang"
+        );
         fs::write(
             &program,
             format!(
-                "#!/bin/sh\ncase \"$1\" in\n  --version) printf '1.6.17\\n' ;;\n  await) {await_command} ;;\n  *) exit 64 ;;\nesac\n"
+                "#!{shell}\ncase \"$1\" in\n  --version) printf '1.6.17\\n' ;;\n  await) {await_command} ;;\n  *) exit 64 ;;\nesac\n"
             ),
         )
         .unwrap();
@@ -1595,7 +1606,12 @@ mod tests {
     }
 
     async fn available(execution: &GitAiExecution, context: &CommandContext) -> Preflight {
-        preflight_with_context(execution, context).await.unwrap()
+        match preflight_with_context(execution, context).await.unwrap() {
+            available @ Preflight::Available { .. } => available,
+            Preflight::Failed { status, reason, .. } => {
+                panic!("the Git AI test provider must be available, got {status:?}: {reason}")
+            }
+        }
     }
 
     fn control_server(
@@ -1627,8 +1643,12 @@ mod tests {
             execution.expected_model.as_deref().unwrap(),
         );
         install_note(repo.path(), &note);
-        let context = stub_path(repo.path());
+        let mut context = stub_path(repo.path());
         let preflight = available(&execution, &context).await;
+        // Settlement must use the provider accepted by preflight, even if PATH later changes.
+        let shadow = repo.path().join("shadow");
+        fs::create_dir(&shadow).unwrap();
+        context.path = stub_path_with_await(&shadow, "exit 86").path;
         let binding = bind_with_context(
             &execution,
             &preflight,
