@@ -112,6 +112,9 @@ impl ExecAttestationPayload {
         if self.lease_epoch == 0 {
             return Err("leaseEpoch must be positive".to_owned());
         }
+        if self.execution_id != execution_id(&self.task_uuid, self.attempt, self.lease_epoch) {
+            return Err("executionId does not match taskUuid, attempt, and leaseEpoch".to_owned());
+        }
         crate::witness::validate_host_id(&self.host_id)
             .map_err(|error| format!("hostId is invalid: {error}"))?;
         for (name, value) in [

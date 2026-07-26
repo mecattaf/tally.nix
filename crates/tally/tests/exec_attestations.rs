@@ -100,15 +100,17 @@ fn compare(canon: &Path, attestations: &Path) -> Output {
         .unwrap()
 }
 
-fn rewrite_self_consistent_divergence(source: &Path, destination: &Path) {
+fn rewrite_self_consistent(
+    source: &Path,
+    destination: &Path,
+    mut mutate: impl FnMut(usize, &mut AttestationRecord),
+) {
     let input = fs::read_to_string(source).unwrap();
     let mut previous_hash = GENESIS_PREV_HASH.to_owned();
     let mut output = String::new();
     for (index, line) in input.lines().enumerate() {
         let mut record: AttestationRecord = serde_json::from_str(line).unwrap();
-        if index == 0 {
-            record.payload["exitCode"] = Value::from(17);
-        }
+        mutate(index, &mut record);
         record.prev_hash.clone_from(&previous_hash);
         record.hash.clear();
         let raw = serde_json::to_value(&record).unwrap();
@@ -168,7 +170,11 @@ fn wrapper_and_compare_distinguish_chain_tamper_from_self_consistent_divergence(
     assert_eq!(compare(&canon_path, &tampered).status.code(), Some(2));
 
     let divergent = temp.path().join("exec-attestations-divergent.jsonl");
-    rewrite_self_consistent_divergence(&exec_ledger, &divergent);
+    rewrite_self_consistent(&exec_ledger, &divergent, |index, record| {
+        if index == 0 {
+            record.payload["exitCode"] = Value::from(17);
+        }
+    });
     let divergence = compare(&canon_path, &divergent);
     assert_eq!(divergence.status.code(), Some(1));
     let report: Value = serde_json::from_slice(&divergence.stdout).unwrap();
@@ -177,6 +183,16 @@ fn wrapper_and_compare_distinguish_chain_tamper_from_self_consistent_divergence(
         .as_str()
         .unwrap()
         .contains("exitCode"));
+
+    let inconsistent = temp
+        .path()
+        .join("exec-attestations-inconsistent-identity.jsonl");
+    rewrite_self_consistent(&exec_ledger, &inconsistent, |index, record| {
+        if index == 0 {
+            record.payload["executionId"] = Value::String(format!("sha256:{}", "c".repeat(64)));
+        }
+    });
+    assert_eq!(compare(&canon_path, &inconsistent).status.code(), Some(2));
 }
 
 #[test]
@@ -211,4 +227,35 @@ fn attestation_append_failure_never_changes_child_exit_propagation() {
             String::from_utf8_lossy(&output.stderr).contains("execution attestation append failed")
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_maps_a_signalled_child_to_128_plus_signal() {
+    let temp = tempfile::tempdir().unwrap();
+    let ledger = temp.path().join("exec-attestations.jsonl");
+    let output = tally()
+        .args([
+            "attest",
+            "exec",
+            "--task-uuid",
+            FIRST,
+            "--attempt",
+            "1",
+            "--lease-epoch",
+            "7",
+            "--ledger",
+            ledger.to_str().unwrap(),
+            "--",
+            "/bin/sh",
+            "-c",
+            "kill -TERM $$",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(143));
+    let line = fs::read_to_string(ledger).unwrap();
+    let record: AttestationRecord = serde_json::from_str(line.trim_end()).unwrap();
+    assert_eq!(record.payload["exitCode"], 143);
 }

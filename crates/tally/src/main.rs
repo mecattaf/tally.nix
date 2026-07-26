@@ -2065,18 +2065,9 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
             let mut exec_reports = Vec::with_capacity(exec_attestations.len());
             let mut exec_ok = true;
             for path in exec_attestations {
-                let (report, records) = read_verified_exec_attestations(&path)?;
+                let (report, _) = read_verified_exec_attestations(&path)?;
                 exec_ok &= report.ok;
-                let head = records.last().map_or_else(
-                    || json!({"seq": 0, "hash": GENESIS_PREV_HASH}),
-                    |record| {
-                        json!({
-                            "seq": record.record.seq,
-                            "hash": record.record.hash,
-                        })
-                    },
-                );
-                exec_reports.push((path, report, head));
+                exec_reports.push((path, report));
             }
             match format {
                 WitnessVerifyFormat::Text => {
@@ -2106,7 +2097,7 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                         attestation_report.records,
                         attestation_report.authentication
                     );
-                    for (path, report, _) in &exec_reports {
+                    for (path, report) in &exec_reports {
                         println!(
                             "execution attestation chain {}: {} ({} records; {})",
                             path.display(),
@@ -2148,10 +2139,9 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                             },
                             "execAttestations": exec_reports
                                 .iter()
-                                .map(|(path, report, head)| json!({
+                                .map(|(path, report)| json!({
                                     "path": path,
                                     "report": report,
-                                    "chainHead": head,
                                 }))
                                 .collect::<Vec<_>>(),
                         }))?
