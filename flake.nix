@@ -243,6 +243,60 @@
               --flow-run-id "$1"
           '';
         };
+        execAttestationMutator = pkgs.writeShellApplication {
+          name = "tally-exec-attestation-mutator";
+          runtimeInputs = [
+            pkgs.coreutils
+            pkgs.jq
+          ];
+          text = ''
+            if [ "$#" -ne 3 ]; then
+              echo "usage: tally-exec-attestation-mutator MODE INPUT OUTPUT" >&2
+              exit 2
+            fi
+
+            mode="$1"
+            input="$2"
+            output="$3"
+            case "$mode" in
+              stale-next | rewrite) ;;
+              *)
+                echo "unknown mutation mode: $mode" >&2
+                exit 2
+                ;;
+            esac
+
+            previous="sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            first=1
+            : >"$output"
+            while IFS= read -r record; do
+              if [ "$first" -eq 1 ]; then
+                record="$(jq -c '.payload.exitCode = 17' <<<"$record")"
+              fi
+
+              if [ "$mode" = rewrite ] || [ "$first" -eq 1 ]; then
+                if [ "$mode" = rewrite ]; then
+                  cleared="$(jq -c --arg previous "$previous" \
+                    '.prev_hash = $previous | .hash = ""' <<<"$record")"
+                else
+                  cleared="$(jq -c '.hash = ""' <<<"$record")"
+                fi
+                digest="$(printf '%s' "$cleared" | sha256sum | cut -d' ' -f1)"
+                record="$(jq -c --arg hash "sha256:$digest" \
+                  '.hash = $hash' <<<"$cleared")"
+              fi
+
+              printf '%s\n' "$record" >>"$output"
+              previous="$(jq -r '.hash' <<<"$record")"
+              first=0
+            done <"$input"
+
+            if [ "$first" -eq 1 ]; then
+              echo "input ledger is empty" >&2
+              exit 2
+            fi
+          '';
+        };
         stockHome = home-manager.lib.homeManagerConfiguration {
           inherit pkgs;
           modules = [
@@ -1013,6 +1067,7 @@
                 environment.systemPackages = [
                   tally
                   pkgs.git
+                  pkgs.jq
                 ];
                 environment.etc."ssh/ssh_host_ed25519_key" = {
                   source = ./test/fixtures/ssh/fs7_worker_host_ed25519;
@@ -1111,12 +1166,13 @@
             coordinator.wait_until_succeeds(
               "runuser -u tally -- env HOME=/var/lib/tally-coordinator XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active tally-daemon.service"
             )
-            coordinator.succeed(
+            worker_ssh = (
               "runuser -u tally -- ${pkgs.openssh}/bin/ssh -F /dev/null "
               "-o BatchMode=yes -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "
               "-o UserKnownHostsFile=/etc/tally-fs7/worker-known-hosts "
-              "-i /etc/tally-fs7/id_ed25519 tally-worker@worker true"
+              "-i /etc/tally-fs7/id_ed25519 tally-worker@worker"
             )
+            coordinator.succeed(worker_ssh + " true")
 
             user = (
               "runuser -u tally -- env HOME=/var/lib/tally-coordinator "
@@ -1230,6 +1286,82 @@
             coordinator.succeed(
               "${tally}/bin/tally witness verify --ledger "
               "/var/lib/tally-coordinator/.local/share/tally/witness.jsonl"
+            )
+
+            worker.succeed(
+              "runuser -u tally-worker -- ${pkgs.bash}/bin/bash -euc '"
+              "ledger=/var/lib/tally-remote/exec-attestations.jsonl; "
+              "task=$(${pkgs.jq}/bin/jq -er .payload.taskUuid \"$ledger\" | head -n1); "
+              "attempt=$(${pkgs.jq}/bin/jq -er .payload.attempt \"$ledger\" | head -n1); "
+              "lease=$(${pkgs.jq}/bin/jq -er .payload.leaseEpoch \"$ledger\" | head -n1); "
+              "payload=$(${pkgs.jq}/bin/jq -er .payload.payloadHash \"$ledger\" | head -n1); "
+              "${tally}/bin/tally attest exec "
+              "--task-uuid \"$task\" --attempt \"$attempt\" --lease-epoch \"$lease\" "
+              "--adapter shell --executor worker --payload-hash \"$payload\" "
+              "--evidence exit:0 --ledger \"$ledger\" -- ${pkgs.coreutils}/bin/true'"
+            )
+            coordinator.succeed(
+              worker_ssh
+              + " cat /var/lib/tally-remote/exec-attestations.jsonl "
+              + "> /tmp/tally-u6-exec.jsonl"
+            )
+            coordinator.succeed(
+              "test \"$(wc -l < /tmp/tally-u6-exec.jsonl)\" -eq 2"
+            )
+
+            canon = "/var/lib/tally-coordinator/.local/share/tally/witness.jsonl"
+            compare = (
+              "${tally}/bin/tally witness compare --canon "
+              + canon
+              + " --attestations /tmp/tally-u6-exec.jsonl --format json"
+            )
+            coordinator.succeed(compare + " > /tmp/tally-u6-unanimous.json")
+            coordinator.succeed(
+              "jq -e '.summary.unanimous >= 1 and .summary.diverged == 0 and "
+              "any(.executions[]; .canon.hostId == \"worker\" and "
+              "(.attestations | length) >= 1 and "
+              "all(.attestations[]; .hostId == \"worker\"))' "
+              "/tmp/tally-u6-unanimous.json"
+            )
+
+            coordinator.succeed(
+              "sed '1s/\"exitCode\":0/\"exitCode\":1/' "
+              "/tmp/tally-u6-exec.jsonl > /tmp/tally-u6-flipped.jsonl"
+            )
+            status, output = coordinator.execute(
+              compare.replace(
+                "/tmp/tally-u6-exec.jsonl",
+                "/tmp/tally-u6-flipped.jsonl",
+              )
+            )
+            assert status == 2, output
+
+            coordinator.succeed(
+              "${execAttestationMutator}/bin/tally-exec-attestation-mutator "
+              "stale-next /tmp/tally-u6-exec.jsonl /tmp/tally-u6-stale.jsonl"
+            )
+            status, output = coordinator.execute(
+              compare.replace(
+                "/tmp/tally-u6-exec.jsonl",
+                "/tmp/tally-u6-stale.jsonl",
+              )
+            )
+            assert status == 2, output
+
+            coordinator.succeed(
+              "${execAttestationMutator}/bin/tally-exec-attestation-mutator "
+              "rewrite /tmp/tally-u6-exec.jsonl /tmp/tally-u6-diverged.jsonl"
+            )
+            status, output = coordinator.execute(
+              compare.replace(
+                "/tmp/tally-u6-exec.jsonl",
+                "/tmp/tally-u6-diverged.jsonl",
+              )
+              + " > /tmp/tally-u6-diverged.json"
+            )
+            assert status == 1, output
+            coordinator.succeed(
+              "jq -e '.summary.diverged >= 1' /tmp/tally-u6-diverged.json"
             )
           '';
         };
