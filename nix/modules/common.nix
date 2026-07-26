@@ -43,9 +43,12 @@ let
     value:
     let
       path = toString value;
+      # Derivation strings already carry build context. Adding opaque path context
+      # would instead require their outputs to exist during module evaluation.
+      context = builtins.getContext path;
       matched = builtins.match "(/nix/store/[0-9a-z]{32}-[^/]+)(/.*)?" path;
     in
-    if matched == null then
+    if matched == null || context != { } then
       path
     else
       builtins.appendContext path {
