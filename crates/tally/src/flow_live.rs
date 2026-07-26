@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Map, Value};
 use tally_client::{RpcClient, WireErrorCode, WireIoError};
@@ -13,6 +13,8 @@ use tally_flow::{
 use tokio::sync::Mutex;
 
 const RECONNECT_DELAY: Duration = Duration::from_millis(50);
+const RESULT_PROJECTION_RETRY: Duration = Duration::from_millis(10);
+const RESULT_PROJECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct RunnerIdentity {
@@ -38,6 +40,7 @@ pub(crate) struct LiveFlowClient {
     max_frame_bytes: u64,
     runner: Mutex<RunnerIdentity>,
     connection: Mutex<ConnectionState>,
+    result_expected: Mutex<BTreeSet<(String, u32)>>,
 }
 
 impl LiveFlowClient {
@@ -51,6 +54,7 @@ impl LiveFlowClient {
             max_frame_bytes,
             runner: Mutex::new(runner),
             connection: Mutex::new(ConnectionState::default()),
+            result_expected: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -112,6 +116,45 @@ impl LiveFlowClient {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    async fn await_projected_result(&self, task_uuid: &str) -> Result<Option<Value>, ClientError> {
+        let deadline = Instant::now() + RESULT_PROJECTION_TIMEOUT;
+        loop {
+            let response = self
+                .call("query.job", json!({"id": task_uuid}))
+                .await
+                .map_err(client_error)?;
+            require_query_envelope(&response)?;
+            if let Some(message) = response
+                .get("job")
+                .and_then(|job| job.get("finalMessage"))
+                .and_then(|message| message.get("value"))
+                .and_then(Value::as_str)
+            {
+                return Ok(Some(decode_projected_result(message)));
+            }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            tokio::time::sleep(RESULT_PROJECTION_RETRY).await;
+        }
+    }
+
+    async fn enrich_terminal_result(
+        &self,
+        result: &mut NodeResult,
+        attempt: u32,
+    ) -> Result<(), ClientError> {
+        let key = (result.task_uuid.clone(), attempt);
+        let expected = self.result_expected.lock().await.contains(&key);
+        if expected && result.verdict.is_pass() && result.result.is_none() {
+            result.result = self.await_projected_result(&result.task_uuid).await?;
+        }
+        if expected {
+            self.result_expected.lock().await.remove(&key);
+        }
+        Ok(())
     }
 }
 
@@ -197,12 +240,24 @@ impl FlowClient for LiveFlowClient {
         submission: FlowSubmission,
     ) -> FlowFuture<'a, Result<Admission, ClientError>> {
         Box::pin(async move {
+            let result_expected = submission.spec.result_schema.is_some();
             let runner = self.runner.lock().await.clone();
             let payload = enqueue_payload(&submission, &runner)?;
             match self.call("queue.enqueue", payload).await {
                 Ok(response) => {
                     validate_recorded_script_identity(&response, &submission)?;
-                    parse_admission(&response)
+                    let mut admission = parse_admission(&response)?;
+                    if result_expected {
+                        self.result_expected
+                            .lock()
+                            .await
+                            .insert((admission.task_uuid.clone(), admission.attempt));
+                        if let Some(result) = &mut admission.terminal {
+                            self.enrich_terminal_result(result, admission.attempt)
+                                .await?;
+                        }
+                    }
+                    Ok(admission)
                 }
                 Err(error) => Err(submission_error(&submission, error)),
             }
@@ -222,7 +277,9 @@ impl FlowClient for LiveFlowClient {
                 )
                 .await
                 .map_err(client_error)?;
-            parse_node_result(&response, Disposition::Created)
+            let mut result = parse_node_result(&response, Disposition::Created)?;
+            self.enrich_terminal_result(&mut result, attempt).await?;
+            Ok(result)
         })
     }
 }
@@ -458,9 +515,13 @@ fn projected_result(value: &Value) -> Option<Value> {
         .cloned()
         .or_else(|| value.get("finalMessage").cloned())
         .map(|result| match result {
-            Value::String(text) => serde_json::from_str(&text).unwrap_or(Value::String(text)),
+            Value::String(text) => decode_projected_result(&text),
             result => result,
         })
+}
+
+fn decode_projected_result(message: &str) -> Value {
+    serde_json::from_str(message).unwrap_or_else(|_| Value::String(message.to_owned()))
 }
 
 fn parse_disposition(value: &str) -> Result<Disposition, ClientError> {

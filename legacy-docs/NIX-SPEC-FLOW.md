@@ -19,7 +19,9 @@ New `attrsOf mkFlowType` alongside pools/executors/producers/adapters in `mkOpti
 | `onCalendar` | nullOr str | `null` | a systemd calendar expression (e.g. `"daily"`) when set; `null` = registered but not calendar-fired (gh/manual only) — nothing fires without an explicit expression |
 | `args` | attrs (JSON-serializable) | `{}` | validated against the script's `meta.argsSchema` at eval time |
 | `priority` | enum interrupt/high/medium/low | `"low"` | the RUNNER's priority; nodes carry their own |
+| `dedupKey` | str | `"flow-<name>-%Y-%m-%d"` | strftime-expanded scheduled-run identity; override for workload periods such as `%Y-%m` |
 | `runtimeMaxSec` | nullOr positive int | `43200` | runner watchdog |
+| `evidence` | listOf str | `["exit:0"]` | canonical runner evidence; may retain a workload receipt artifact and hash |
 | `maxNodes` | positive int | `1000` | per-run node backstop (FLOW-SPEC §6.2); must be ≥ script's own `meta.maxNodes` if that is set — assertion otherwise |
 | `catalog` | nullOr path | `null` | pooled-selector catalog JSON (§4); required if the script's meta declares selector use |
 | `budgetPool` | nullOr str | `null` | run-scoped budget pool name; must exist in `pools` |
@@ -41,9 +43,9 @@ enqueue = {
   adapter   = "shell";
   pool      = [ "flow" ];
   priority  = cfg.priority;
-  dedupKey  = "flow-<name>-%Y-%m-%d";        # same strftime discipline as existing producers
+  dedupKey  = cfg.dedupKey;                   # daily default; workload periods may override
   runtimeMaxSec = cfg.runtimeMaxSec;
-  evidence  = [ "exit:0" ];
+  evidence  = cfg.evidence;
   noEnqueue = false;                          # flows REQUIRE enqueue capability
 };
 ```

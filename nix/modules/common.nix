@@ -1549,11 +1549,27 @@ let
           example = "medium";
           description = "Priority of the runner job; flow nodes declare their own priorities.";
         };
+        dedupKey = mkOption {
+          type = types.str;
+          default = "flow-${name}-%Y-%m-%d";
+          example = "monthly-review-%Y-%m";
+          description = "Strftime-expanded existence key for scheduled flow runs.";
+        };
         runtimeMaxSec = mkOption {
           type = types.nullOr types.ints.positive;
           default = 43200;
           example = 7200;
           description = "Optional RuntimeMaxSec watchdog for the runner job.";
+        };
+        evidence = mkOption {
+          type = types.listOf types.str;
+          default = [ "exit:0" ];
+          example = [
+            "exit:0"
+            "artifact:/var/lib/review/receipt.json"
+            "hash:sha256"
+          ];
+          description = "Canonical evidence specifications for the flow runner.";
         };
         maxNodes = mkOption {
           type = types.ints.positive;
@@ -1596,6 +1612,10 @@ let
         {
           assertion = config.budgetPool == null || config.budgetPool != "";
           message = "tally flow ${name} budgetPool must be null or non-empty";
+        }
+        {
+          assertion = config.dedupKey != "";
+          message = "tally flow ${name} dedupKey must be non-empty";
         }
         (mapAttrsToList (environment: _: {
           assertion =
@@ -2168,9 +2188,13 @@ let
       adapter = "shell";
       adapterOptions.environment = flow.extraEnv;
       pool = [ "flow" ];
-      inherit (flow) priority runtimeMaxSec credentials;
-      dedupKey = "flow-${name}-%Y-%m-%d";
-      evidence = [ "exit:0" ];
+      inherit (flow)
+        priority
+        dedupKey
+        runtimeMaxSec
+        credentials
+        evidence
+        ;
       noEnqueue = false;
     };
   };

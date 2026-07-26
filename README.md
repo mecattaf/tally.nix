@@ -396,6 +396,10 @@ the result with the same flow binary used at activation time. The
 [pooled-review cookbook](doc/pooled-review.md) shows the complete roster, flow registration, and
 capacity model without hand-written catalog JSON.
 
+The [monthly review flow](doc/monthly-review-flow.md) is the first production-workload migration.
+It combines roster rendering, three maker-diverse members, bounded repair, attributed dissent,
+store-native stages, period deduplication, and the fixed publication receipt.
+
 ## Evidence and ledgers
 
 Evidence checks support `exit:<code>`, `artifact:<absolute-path>`, `store:<nix-store-path>`, and
