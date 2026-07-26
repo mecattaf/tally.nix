@@ -79,6 +79,7 @@ fn append_canon(ledger: &mut WitnessLedger, task_uuid: &str, artifact: &Path, pa
             completion: None,
             result_revision: None,
             authorship: None,
+            authorship_sessions: None,
         })
         .unwrap();
 }

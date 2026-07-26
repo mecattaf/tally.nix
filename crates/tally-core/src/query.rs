@@ -1205,6 +1205,7 @@ mod tests {
             completion: None,
             result_revision: None,
             authorship: None,
+            authorship_sessions: None,
             extensions: serde_json::Map::new(),
             seq,
             prev_hash: GENESIS_PREV_HASH.to_owned(),

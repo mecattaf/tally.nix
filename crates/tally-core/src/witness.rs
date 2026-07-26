@@ -139,6 +139,31 @@ pub struct Authorship {
     pub reason: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AuthorshipSession {
+    pub tool: String,
+    pub id: String,
+    pub model: String,
+}
+
+impl AuthorshipSession {
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        for (name, value, maximum) in [
+            ("tool", self.tool.as_str(), 64),
+            ("id", self.id.as_str(), 512),
+            ("model", self.model.as_str(), 256),
+        ] {
+            if value.is_empty() || value.len() > maximum || value.chars().any(char::is_control) {
+                return Err(format!(
+                    "authorshipSessions {name} must be non-empty, at most {maximum} bytes, and contain no control characters"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WitnessRecord {
@@ -191,6 +216,8 @@ pub struct WitnessRecord {
     pub result_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorship: Option<Authorship>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorship_sessions: Option<Vec<AuthorshipSession>>,
     #[serde(flatten, default)]
     pub extensions: Map<String, Value>,
     pub seq: u64,
@@ -228,6 +255,7 @@ pub struct WitnessBody {
     pub completion: Option<SemanticCompletion>,
     pub result_revision: Option<String>,
     pub authorship: Option<Authorship>,
+    pub authorship_sessions: Option<Vec<AuthorshipSession>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -343,6 +371,15 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
     if let Some(drv) = &mut drv {
         drv.canonicalize().map_err(WitnessError::Corrupt)?;
     }
+    let mut authorship_sessions = body.authorship_sessions;
+    if let Some(sessions) = &mut authorship_sessions {
+        sessions.sort();
+        if sessions.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(WitnessError::Corrupt(
+                "authorshipSessions contains a duplicate observation".to_owned(),
+            ));
+        }
+    }
     let mut record = WitnessRecord {
         schema_version: WITNESS_SCHEMA_VERSION,
         record_type: RecordType::Verdict,
@@ -374,6 +411,7 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
         completion: body.completion,
         result_revision: body.result_revision,
         authorship: body.authorship,
+        authorship_sessions,
         extensions: Map::new(),
         seq: head.seq + 1,
         prev_hash: head.hash.clone(),
@@ -504,6 +542,7 @@ fn canonical_field_index(field: &str) -> Option<usize> {
         "completion",
         "resultRevision",
         "authorship",
+        "authorshipSessions",
         "seq",
         "prevHash",
         "hash",
@@ -605,6 +644,9 @@ fn validate_record(raw: &Value) -> Result<WitnessRecord, ValidationFailure> {
     }
     if let Some(authorship) = &record.authorship {
         validate_canonical_field_value(object, "authorship", authorship)?;
+    }
+    if let Some(authorship_sessions) = &record.authorship_sessions {
+        validate_canonical_field_value(object, "authorshipSessions", authorship_sessions)?;
     }
     let parsed_timestamp = DateTime::parse_from_rfc3339(&record.transition_timestamp)
         .map_err(|_| ValidationFailure::invalid("transitionTimestamp is not RFC3339 UTC millis"))?;
@@ -797,6 +839,34 @@ fn validate_record(raw: &Value) -> Result<WitnessRecord, ValidationFailure> {
         {
             return Err(ValidationFailure::invalid(
                 "bound authorship requires notesRefTarget and noteContentSha256",
+            ));
+        }
+    }
+    if let Some(sessions) = &record.authorship_sessions {
+        let Some(authorship) = &record.authorship else {
+            return Err(ValidationFailure::invalid(
+                "authorshipSessions requires authorship",
+            ));
+        };
+        if !matches!(
+            authorship.status,
+            AuthorshipStatus::Bound | AuthorshipStatus::Mismatch
+        ) {
+            return Err(ValidationFailure::invalid(
+                "authorshipSessions requires bound or mismatch authorship",
+            ));
+        }
+        if sessions.is_empty() || sessions.len() > 16 {
+            return Err(ValidationFailure::invalid(
+                "authorshipSessions must contain 1..=16 observations",
+            ));
+        }
+        for session in sessions {
+            session.validate().map_err(ValidationFailure::invalid)?;
+        }
+        if sessions.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ValidationFailure::invalid(
+                "authorshipSessions must be sorted and unique",
             ));
         }
     }
@@ -1495,6 +1565,7 @@ mod tests {
             completion: None,
             result_revision: None,
             authorship: None,
+            authorship_sessions: None,
         }
     }
 
@@ -1572,6 +1643,11 @@ mod tests {
                 note_content_sha256: Some(format!("sha256:{}", "f".repeat(64))),
                 reason: Some("matched".to_owned()),
             }),
+            authorship_sessions: Some(vec![AuthorshipSession {
+                tool: "codex".to_owned(),
+                id: "session-42".to_owned(),
+                model: "gpt-5".to_owned(),
+            }]),
         }
     }
 
@@ -1692,7 +1768,7 @@ mod tests {
         let raw = serde_json::to_value(&record).unwrap();
         assert_eq!(
             canonical_hash_input(&raw).unwrap(),
-            r#"{"schemaVersion":2,"recordType":"verdict","transitionTimestamp":"2026-07-26T12:34:56.789Z","taskUuid":"b2c40001-0000-4000-8000-000000000002","verdict":"pass","exitCode":0,"artifactContentHash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","storePaths":["/nix/store/22222222222222222222222222222222-dev","/nix/store/33333333333333333333333333333333-out"],"drv":{"drvPath":"/nix/store/11111111111111111111111111111111-package.drv","outputs":[{"name":"dev","path":"/nix/store/22222222222222222222222222222222-dev"},{"name":"out","path":"/nix/store/33333333333333333333333333333333-out"}]},"gpuSeconds":42.5,"wallClock":44.0,"attempt":2,"leaseEpoch":42,"dedupKey":"drv:package","payloadHash":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","briefHash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","origin":{"schemaVersion":1,"source":"calendar","producer":{"name":"calendar","kind":"calendar"}},"orchestration":{"flowRunId":"018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321","maxNodes":12,"promptRevision":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","skillRevision":"review-agent-v3","selection":{"members":["b","a"]}},"laborClass":"fresh","traceRef":"trace:session-2","pools":["worker-cpu","worker-gpu"],"executor":"ssh-worker-1","hostId":"worker-1","charge":{"unit":"gpu-seconds","amount":42.5,"class":"verifiable"},"model":"vllm/qwen2-vl-ocr","evidenceClass":{"kind":"artifact","rank":1},"manifestHash":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","completion":{"schemaVersion":1,"execution":{"status":"success","exitCode":0,"reason":"process exited with code 0"},"gates":{"status":"pass","artifact":{"commit":"abc"},"gates":[]},"acceptance":{"status":"accepted","policy":"execution-and-gates","reason":"all gates passed"}},"resultRevision":"ffffffffffffffffffffffffffffffffffffffff","authorship":{"provider":"git-ai","providerVersion":"1.2.3","noteRef":"refs/notes/ai","status":"bound","notesRefTarget":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","noteContentSha256":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","reason":"matched"},"seq":1,"prevHash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","hash":""}"#
+            r#"{"schemaVersion":2,"recordType":"verdict","transitionTimestamp":"2026-07-26T12:34:56.789Z","taskUuid":"b2c40001-0000-4000-8000-000000000002","verdict":"pass","exitCode":0,"artifactContentHash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","storePaths":["/nix/store/22222222222222222222222222222222-dev","/nix/store/33333333333333333333333333333333-out"],"drv":{"drvPath":"/nix/store/11111111111111111111111111111111-package.drv","outputs":[{"name":"dev","path":"/nix/store/22222222222222222222222222222222-dev"},{"name":"out","path":"/nix/store/33333333333333333333333333333333-out"}]},"gpuSeconds":42.5,"wallClock":44.0,"attempt":2,"leaseEpoch":42,"dedupKey":"drv:package","payloadHash":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","briefHash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","origin":{"schemaVersion":1,"source":"calendar","producer":{"name":"calendar","kind":"calendar"}},"orchestration":{"flowRunId":"018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321","maxNodes":12,"promptRevision":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","skillRevision":"review-agent-v3","selection":{"members":["b","a"]}},"laborClass":"fresh","traceRef":"trace:session-2","pools":["worker-cpu","worker-gpu"],"executor":"ssh-worker-1","hostId":"worker-1","charge":{"unit":"gpu-seconds","amount":42.5,"class":"verifiable"},"model":"vllm/qwen2-vl-ocr","evidenceClass":{"kind":"artifact","rank":1},"manifestHash":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","completion":{"schemaVersion":1,"execution":{"status":"success","exitCode":0,"reason":"process exited with code 0"},"gates":{"status":"pass","artifact":{"commit":"abc"},"gates":[]},"acceptance":{"status":"accepted","policy":"execution-and-gates","reason":"all gates passed"}},"resultRevision":"ffffffffffffffffffffffffffffffffffffffff","authorship":{"provider":"git-ai","providerVersion":"1.2.3","noteRef":"refs/notes/ai","status":"bound","notesRefTarget":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","noteContentSha256":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","reason":"matched"},"authorshipSessions":[{"tool":"codex","id":"session-42","model":"gpt-5"}],"seq":1,"prevHash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","hash":""}"#
         );
     }
 
@@ -1756,6 +1832,70 @@ mod tests {
         );
         let revised = build_record(revised_body, &ChainHead::default()).unwrap();
         assert_ne!(revised.hash, baseline.hash);
+    }
+
+    #[test]
+    fn authorship_sessions_are_bounded_canonical_and_hash_covered() {
+        let mut reordered = fully_populated_body();
+        reordered.authorship_sessions = Some(vec![
+            AuthorshipSession {
+                tool: "codex".to_owned(),
+                id: "session-z".to_owned(),
+                model: "gpt-5".to_owned(),
+            },
+            AuthorshipSession {
+                tool: "claude".to_owned(),
+                id: "session-a".to_owned(),
+                model: "opus".to_owned(),
+            },
+        ]);
+        let canonical = build_record(reordered, &ChainHead::default()).unwrap();
+        assert_eq!(
+            canonical
+                .authorship_sessions
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|session| session.tool.as_str())
+                .collect::<Vec<_>>(),
+            ["claude", "codex"]
+        );
+
+        let mut duplicate = fully_populated_body();
+        duplicate.authorship_sessions = Some(vec![
+            AuthorshipSession {
+                tool: "codex".to_owned(),
+                id: "session-42".to_owned(),
+                model: "gpt-5".to_owned(),
+            },
+            AuthorshipSession {
+                tool: "codex".to_owned(),
+                id: "session-42".to_owned(),
+                model: "gpt-5".to_owned(),
+            },
+        ]);
+        assert!(build_record(duplicate, &ChainHead::default())
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate observation"));
+
+        let baseline = build_record(fully_populated_body(), &ChainHead::default()).unwrap();
+        let mut changed = fully_populated_body();
+        changed.authorship_sessions.as_mut().unwrap()[0].id = "session-43".to_owned();
+        let changed = build_record(changed, &ChainHead::default()).unwrap();
+        assert_ne!(baseline.hash, changed.hash);
+
+        let mut invalid = baseline.clone();
+        invalid.authorship_sessions.as_mut().unwrap()[0].id = "bad\nsession".to_owned();
+        assert!(validation_failure(invalid)
+            .reason
+            .contains("control characters"));
+
+        let mut invalid = baseline;
+        invalid.authorship.as_mut().unwrap().status = AuthorshipStatus::Error;
+        assert!(validation_failure(invalid)
+            .reason
+            .contains("bound or mismatch"));
     }
 
     fn validation_failure(record: WitnessRecord) -> ValidationFailure {

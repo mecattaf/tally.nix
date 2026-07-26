@@ -30,7 +30,7 @@ use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOu
 use crate::exec_attestation::{ExecAttestationContext, EXEC_ATTESTATION_LEDGER};
 use crate::git_ai::{self, GitAiExecution};
 use crate::taskdb::{GhOrigin, WorkspaceMetadata};
-use crate::witness::Authorship;
+use crate::witness::{Authorship, AuthorshipSession};
 
 pub const CAPTURE_DIRECTORY: &str = "capture";
 pub const CAPTURE_ARCHIVE_DIRECTORY: &str = "capture/archive";
@@ -196,6 +196,7 @@ pub struct ExecutionOutcome {
     /// result worktree. Both remain absent when Git AI integration is disabled.
     pub result_revision: Option<String>,
     pub authorship: Option<Authorship>,
+    pub authorship_sessions: Option<Vec<AuthorshipSession>>,
     /// Host that owned the child process. This is authoritative for remote
     /// execution and lets the coordinator stamp the worker hostname.
     pub host_id: Option<String>,
@@ -467,6 +468,8 @@ pub struct RemoteCompletion {
     pub result_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorship: Option<Authorship>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorship_sessions: Option<Vec<AuthorshipSession>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_id: Option<String>,
 }
@@ -1804,6 +1807,7 @@ impl Executor {
             semantic_completion: completion.semantic_completion,
             result_revision: completion.result_revision,
             authorship: completion.authorship,
+            authorship_sessions: completion.authorship_sessions,
             host_id: completion.host_id,
             captures_available,
         })
@@ -2309,6 +2313,7 @@ impl Executor {
                         semantic_completion: None,
                         result_revision: None,
                         authorship: None,
+                        authorship_sessions: None,
                         host_id: self.host_id.clone(),
                         captures_available: true,
                     });
@@ -2408,6 +2413,7 @@ impl Executor {
             semantic_completion: None,
             result_revision: None,
             authorship: None,
+            authorship_sessions: None,
             host_id: self.host_id.clone(),
             captures_available: true,
         })
@@ -2511,6 +2517,7 @@ impl Executor {
                         semantic_completion: None,
                         result_revision: None,
                         authorship: None,
+                        authorship_sessions: None,
                         host_id: self.host_id.clone(),
                         captures_available: true,
                     });
@@ -2538,6 +2545,7 @@ impl Executor {
             let binding = git_ai::bind(git_ai, preflight, &completion, worktree).await;
             outcome.result_revision = binding.result_revision;
             outcome.authorship = binding.authorship;
+            outcome.authorship_sessions = binding.authorship_sessions;
             if let Some(reason) = binding.required_failure {
                 completion = evaluate_completion(ExecutionFact::failed(reason), spec);
             }
@@ -2943,6 +2951,7 @@ impl Executor {
             semantic_completion: None,
             result_revision: None,
             authorship: None,
+            authorship_sessions: None,
             host_id: self.host_id.clone(),
             captures_available: true,
         })
@@ -3767,6 +3776,7 @@ fn remote_completion(
         semantic_completion: outcome.semantic_completion,
         result_revision: outcome.result_revision,
         authorship: outcome.authorship,
+        authorship_sessions: outcome.authorship_sessions,
         host_id: outcome.host_id,
     })
 }
@@ -4247,6 +4257,7 @@ mod tests {
             semantic_completion: None,
             result_revision: None,
             authorship: None,
+            authorship_sessions: None,
             host_id: Some("worker.example".to_owned()),
         }
     }

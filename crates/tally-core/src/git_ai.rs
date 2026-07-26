@@ -10,7 +10,7 @@ use tokio::process::Command;
 
 use crate::completion::SemanticCompletion;
 use crate::config::{GitAiConfig, GitAiMode};
-use crate::witness::{current_host_id, Authorship, AuthorshipStatus};
+use crate::witness::{current_host_id, Authorship, AuthorshipSession, AuthorshipStatus};
 
 const PROGRAM: &str = "git-ai";
 const NOTE_REF: &str = "refs/notes/ai";
@@ -85,6 +85,7 @@ pub(crate) enum Preflight {
 pub(crate) struct Binding {
     pub result_revision: Option<String>,
     pub authorship: Option<Authorship>,
+    pub authorship_sessions: Option<Vec<AuthorshipSession>>,
     pub required_failure: Option<String>,
 }
 
@@ -448,7 +449,7 @@ async fn bind_with_context(
     }
 
     match note_matches(&note, execution) {
-        Ok(()) => finish(
+        Ok(sessions) => finish_with_sessions(
             execution,
             revision,
             authorship(
@@ -458,8 +459,9 @@ async fn bind_with_context(
                 Some(note_hash),
                 None,
             ),
+            sessions,
         ),
-        Err(NoteFailure::Mismatch(reason)) => finish(
+        Err(NoteFailure::Mismatch { reason, sessions }) => finish_with_sessions(
             execution,
             revision,
             authorship(
@@ -469,6 +471,7 @@ async fn bind_with_context(
                 Some(note_hash),
                 Some(format!("git-ai-mismatch: {reason}")),
             ),
+            sessions,
         ),
         Err(NoteFailure::Malformed(reason)) => finish(
             execution,
@@ -485,6 +488,24 @@ async fn bind_with_context(
 }
 
 fn finish(execution: &GitAiExecution, revision: String, authorship: Authorship) -> Binding {
+    finish_with_optional_sessions(execution, revision, authorship, None)
+}
+
+fn finish_with_sessions(
+    execution: &GitAiExecution,
+    revision: String,
+    authorship: Authorship,
+    sessions: Vec<AuthorshipSession>,
+) -> Binding {
+    finish_with_optional_sessions(execution, revision, authorship, Some(sessions))
+}
+
+fn finish_with_optional_sessions(
+    execution: &GitAiExecution,
+    revision: String,
+    authorship: Authorship,
+    authorship_sessions: Option<Vec<AuthorshipSession>>,
+) -> Binding {
     let required_failure = (execution.config.mode == GitAiMode::Required
         && authorship.status != AuthorshipStatus::Bound)
         .then(|| {
@@ -496,6 +517,7 @@ fn finish(execution: &GitAiExecution, revision: String, authorship: Authorship) 
     Binding {
         result_revision: Some(revision),
         authorship: Some(authorship),
+        authorship_sessions: authorship_sessions.filter(|sessions| !sessions.is_empty()),
         required_failure,
     }
 }
@@ -504,6 +526,7 @@ fn failure_without_binding(execution: &GitAiExecution, reason: String) -> Bindin
     Binding {
         result_revision: None,
         authorship: None,
+        authorship_sessions: None,
         required_failure: (execution.config.mode == GitAiMode::Required).then_some(reason),
     }
 }
@@ -536,11 +559,17 @@ fn preflight_version(preflight: &Preflight) -> &str {
 }
 
 enum NoteFailure {
-    Mismatch(String),
+    Mismatch {
+        reason: String,
+        sessions: Vec<AuthorshipSession>,
+    },
     Malformed(String),
 }
 
-fn note_matches(note: &[u8], execution: &GitAiExecution) -> Result<(), NoteFailure> {
+fn note_matches(
+    note: &[u8],
+    execution: &GitAiExecution,
+) -> Result<Vec<AuthorshipSession>, NoteFailure> {
     let divider = note
         .windows(NOTE_DIVIDER.len())
         .rposition(|window| window == NOTE_DIVIDER)
@@ -587,6 +616,8 @@ fn note_matches(note: &[u8], execution: &GitAiExecution) -> Result<(), NoteFailu
         .into_iter()
         .flat_map(|sessions| sessions.values());
     let mut correlated = false;
+    let mut matched = false;
+    let mut observations = Vec::new();
     for record in prompts.values().chain(sessions) {
         let Some(record) = record.as_object() else {
             return Err(NoteFailure::Malformed(
@@ -623,6 +654,25 @@ fn note_matches(note: &[u8], execution: &GitAiExecution) -> Result<(), NoteFailu
                 )));
             }
         }
+        let observation = AuthorshipSession {
+            tool: agent
+                .get("tool")
+                .and_then(Value::as_str)
+                .expect("validated agent_id.tool")
+                .to_owned(),
+            id: agent
+                .get("id")
+                .and_then(Value::as_str)
+                .expect("validated agent_id.id")
+                .to_owned(),
+            model: agent
+                .get("model")
+                .and_then(Value::as_str)
+                .expect("validated agent_id.model")
+                .to_owned(),
+        };
+        observation.validate().map_err(NoteFailure::Malformed)?;
+        observations.push(observation);
         let session_matches = execution
             .expected_session
             .as_deref()
@@ -631,18 +681,29 @@ fn note_matches(note: &[u8], execution: &GitAiExecution) -> Result<(), NoteFailu
             .expected_model
             .as_deref()
             .is_none_or(|expected| agent.get("model").and_then(Value::as_str) == Some(expected));
-        if session_matches && model_matches {
-            return Ok(());
-        }
+        matched |= session_matches && model_matches;
+    }
+    observations.sort();
+    observations.dedup();
+    if observations.len() > 16 {
+        return Err(NoteFailure::Malformed(
+            "more than 16 correlated agent sessions are present".to_owned(),
+        ));
+    }
+    if matched {
+        return Ok(observations);
     }
     if correlated {
-        Err(NoteFailure::Mismatch(
-            "Tally session/model differs from Git AI's correlated attribution".to_owned(),
-        ))
+        Err(NoteFailure::Mismatch {
+            reason: "Tally session/model differs from Git AI's correlated attribution".to_owned(),
+            sessions: observations,
+        })
     } else {
-        Err(NoteFailure::Mismatch(
-            "no Git AI session or prompt carries the Tally correlation attributes".to_owned(),
-        ))
+        Err(NoteFailure::Mismatch {
+            reason: "no Git AI session or prompt carries the Tally correlation attributes"
+                .to_owned(),
+            sessions: observations,
+        })
     }
 }
 
@@ -906,6 +967,14 @@ mod tests {
                     .to_owned()
             )
         );
+        assert_eq!(
+            binding.authorship_sessions,
+            Some(vec![AuthorshipSession {
+                tool: "codex".to_owned(),
+                id: "session-53".to_owned(),
+                model: "gpt-5".to_owned(),
+            }])
+        );
         assert_eq!(binding.required_failure, None);
     }
 
@@ -1067,6 +1136,14 @@ mod tests {
             .is_some_and(|reason| reason.starts_with("git-ai-mismatch:")));
         assert!(authorship.notes_ref_target.is_some());
         assert!(authorship.note_content_sha256.is_some());
+        assert_eq!(
+            binding.authorship_sessions,
+            Some(vec![AuthorshipSession {
+                tool: "codex".to_owned(),
+                id: "another-session".to_owned(),
+                model: "another-model".to_owned(),
+            }])
+        );
         assert_eq!(binding.required_failure, None);
     }
 

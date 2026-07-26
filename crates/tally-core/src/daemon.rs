@@ -1676,6 +1676,7 @@ impl DaemonHandler {
                             completion: None,
                             result_revision: None,
                             authorship: None,
+                            authorship_sessions: None,
                         },
                     ) {
                         Ok(record) => record,
@@ -4857,6 +4858,7 @@ fn forced_witness(job: &Job, verdict: Verdict, host_id: Option<String>) -> Witne
         completion: None,
         result_revision: None,
         authorship: None,
+        authorship_sessions: None,
     }
 }
 
@@ -4893,6 +4895,7 @@ fn substituted_witness(row: &RowSeed, drv: Derivation) -> WitnessBody {
         completion: None,
         result_revision: None,
         authorship: None,
+        authorship_sessions: None,
     }
 }
 
@@ -5704,9 +5707,13 @@ impl Daemon {
             Some(Ok(outcome)) if outcome.captures_available
         );
         let effective_gate_manifest = effective_gate_manifest(&self.handler.executor, &job)?;
-        let (result_revision, authorship) = match &finished.outcome {
-            Some(Ok(outcome)) => (outcome.result_revision.clone(), outcome.authorship.clone()),
-            _ => (None, None),
+        let (result_revision, authorship, authorship_sessions) = match &finished.outcome {
+            Some(Ok(outcome)) => (
+                outcome.result_revision.clone(),
+                outcome.authorship.clone(),
+                outcome.authorship_sessions.clone(),
+            ),
+            _ => (None, None, None),
         };
         let execution_host_id = match &finished.outcome {
             Some(Ok(outcome)) => outcome.host_id.clone(),
@@ -5872,6 +5879,7 @@ impl Daemon {
                     completion: semantic_completion.clone(),
                     result_revision: result_revision.clone(),
                     authorship: authorship.clone(),
+                    authorship_sessions: authorship_sessions.clone(),
                 },
             )?;
             let result = JobResult {
@@ -6829,6 +6837,7 @@ fn reconcile_reuse_witnesses(
                         completion: None,
                         result_revision: None,
                         authorship: None,
+                        authorship_sessions: None,
                     },
                 )?;
                 appended = true;
@@ -8433,6 +8442,7 @@ mod tests {
                             semantic_completion: None,
                             result_revision: None,
                             authorship: None,
+                            authorship_sessions: None,
                             host_id: Some("worker".to_owned()),
                         },
                     ))),
@@ -8520,6 +8530,7 @@ mod tests {
                             semantic_completion: None,
                             result_revision: None,
                             authorship: None,
+                            authorship_sessions: None,
                             host_id: Some("worker".to_owned()),
                         }))
                     }
@@ -9092,6 +9103,7 @@ mod tests {
                 completion: None,
                 result_revision: None,
                 authorship: None,
+                authorship_sessions: None,
             })
             .unwrap()
     }
@@ -10328,6 +10340,7 @@ mod tests {
                         completion: None,
                         result_revision: None,
                         authorship: None,
+                        authorship_sessions: None,
                     })
                     .unwrap();
                 let mut config = one_pool_config();
@@ -13431,6 +13444,7 @@ mod tests {
                         completion: None,
                         result_revision: None,
                         authorship: None,
+                        authorship_sessions: None,
                     })
                     .unwrap();
                 drop(ledger);
