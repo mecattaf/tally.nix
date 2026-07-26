@@ -4,6 +4,7 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -34,6 +35,11 @@ const CONCURRENT_RUN: &str = "00000000-0000-4000-8000-000000000501";
 const KILLED_RUN: &str = "00000000-0000-4000-8000-000000000502";
 const RESTARTED_RUN: &str = "00000000-0000-4000-8000-000000000503";
 const DIVERGENT_RUN: &str = "00000000-0000-4000-8000-000000000504";
+const DRV_BUILD_RUN: &str = "00000000-0000-4000-8000-000000000505";
+const DRV_SUBSTITUTE_RUN: &str = "00000000-0000-4000-8000-000000000506";
+const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
+const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
+static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
 struct ExitFileProbe;
 
@@ -106,6 +112,7 @@ fn config() -> Config {
     Config {
         pools: BTreeMap::from([
             ("flow".to_owned(), pool(ResourceKind::CpuSlot)),
+            ("build".to_owned(), pool(ResourceKind::BuildSlot)),
             ("alpha".to_owned(), pool(ResourceKind::BuildSlot)),
             ("beta".to_owned(), pool(ResourceKind::BuildSlot)),
         ]),
@@ -163,6 +170,63 @@ fn install_fake_gh(root: &Path) -> (std::path::PathBuf, PathGuard) {
     fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
     let path_guard = PathGuard::prepend(&bin);
     (requests, path_guard)
+}
+
+fn install_fake_nix(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, PathGuard) {
+    let bin = root.join("fake-nix-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let marker = root.join("store-output-valid");
+    let builds = root.join("nix-builds");
+    let nix = bin.join("nix");
+    fs::write(
+        &nix,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "case \" $* \" in\n",
+                "  *\" --dry-run \"*)\n",
+                "    if [ -e '{}' ]; then printf '[]\\n'; ",
+                "else printf 'this derivation will be built\\n' >&2; fi\n",
+                "    exit 0\n",
+                "    ;;\n",
+                "  *\" --max-jobs 0 \"*)\n",
+                "    test -e '{}'\n",
+                "    ;;\n",
+                "  *)\n",
+                "    : > '{}'\n",
+                "    printf 'build\\n' >> '{}'\n",
+                "    printf '[]\\n'\n",
+                "    ;;\n",
+                "esac\n"
+            ),
+            marker.display(),
+            marker.display(),
+            marker.display(),
+            builds.display(),
+        ),
+    )
+    .unwrap();
+    let nix_store = bin.join("nix-store");
+    fs::write(
+        &nix_store,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "case \"$1\" in\n",
+                "  --check-validity) test -e '{}' ;;\n",
+                "  --add-root) exit 0 ;;\n",
+                "  *) exit 93 ;;\n",
+                "esac\n"
+            ),
+            marker.display(),
+        ),
+    )
+    .unwrap();
+    for program in [&nix, &nix_store] {
+        fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path_guard = PathGuard::prepend(&bin);
+    (marker, builds, path_guard)
 }
 
 fn github_flow_observation() -> GhObservation {
@@ -315,6 +379,26 @@ export const meta = {
 "#
 }
 
+fn drv_source() -> String {
+    format!(
+        r#"
+export const meta = {{
+  name: "drv-store-native",
+  description: "build once and substitute from the Nix store",
+  pools: [],
+  argsSchema: {{ type: "object", additionalProperties: false }},
+  selectors: [],
+  maxNodes: 1
+}};
+
+(async () => drv({{
+  drvPath: {DRV_PATH:?},
+  outputs: [{{ name: "out", path: {DRV_OUTPUT:?} }}]
+}}))()
+"#
+    )
+}
+
 fn runner(
     config_path: &Path,
     socket: &Path,
@@ -410,6 +494,20 @@ async fn runner_output(child: Child) -> std::process::Output {
         .unwrap()
 }
 
+fn flow_report(output: &std::process::Output) -> Value {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["type"] == "flow-report")
+        .unwrap_or_else(|| {
+            panic!(
+                "runner omitted flow-report\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+}
+
 fn capture(paths: &DaemonPaths, task_uuid: &str) -> String {
     let stdout = fs::read_to_string(
         paths
@@ -468,6 +566,9 @@ fn assert_six_unique_rows(paths: &DaemonPaths, flow_run_id: &str) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn fs5_live_acceptance_matrix() {
+    let _environment = ENVIRONMENT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     tokio::task::LocalSet::new()
         .run_until(async {
             let temp = tempfile::tempdir().unwrap();
@@ -926,6 +1027,117 @@ async fn fs5_live_acceptance_matrix() {
                 .all(|event| event.row.source == EnqueueSource::Orchestrator));
 
             daemon.stop().await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn drv_second_run_substitutes_without_a_second_build() {
+    let _environment = ENVIRONMENT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let (_marker, builds, _path_guard) = install_fake_nix(temp.path());
+            let config = config();
+            config.validate().unwrap();
+            let config_path = temp.path().join("config.json");
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let script = temp.path().join("drv.js");
+            fs::write(&script, drv_source()).unwrap();
+
+            let first_paths = paths(&temp.path().join("first"));
+            let first_daemon = start_daemon(&first_paths, config.clone()).await;
+            let first = runner(
+                &config_path,
+                &first_paths.socket,
+                &script,
+                DRV_BUILD_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let first = runner_output(first).await;
+            assert!(
+                first.status.success(),
+                "{}",
+                String::from_utf8_lossy(&first.stderr)
+            );
+            let first_report = flow_report(&first);
+            assert_eq!(
+                first_report["report"]["finalValue"]["disposition"],
+                "created"
+            );
+            assert_eq!(first_report["report"]["finalValue"]["verdict"], "pass");
+            first_daemon.stop().await;
+
+            assert_eq!(fs::read_to_string(&builds).unwrap().lines().count(), 1);
+            let first_events = read_acknowledged_events(&first_paths.events_dir()).unwrap();
+            assert_eq!(first_events.len(), 1);
+            assert_eq!(first_events[0].row.pools, ["build"]);
+            assert_eq!(
+                first_events[0].row.dedup_key.as_deref(),
+                Some(format!("drv:{DRV_PATH}").as_str())
+            );
+            let (report, records) = read_verified_records(&first_paths.witness_path()).unwrap();
+            assert!(report.ok);
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].verdict, tally_core::witness::Verdict::Pass);
+            assert_eq!(records[0].store_paths, Some(vec![DRV_OUTPUT.to_owned()]));
+
+            let second_paths = paths(&temp.path().join("second"));
+            let second_daemon = start_daemon(&second_paths, config).await;
+            let second = runner(
+                &config_path,
+                &second_paths.socket,
+                &script,
+                DRV_SUBSTITUTE_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let second = runner_output(second).await;
+            assert!(
+                second.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&second.stdout),
+                String::from_utf8_lossy(&second.stderr)
+            );
+            let second_report = flow_report(&second);
+            assert_eq!(
+                second_report["report"]["finalValue"]["disposition"],
+                "substituted"
+            );
+            assert_eq!(
+                second_report["report"]["finalValue"]["verdict"],
+                "substituted"
+            );
+            second_daemon.stop().await;
+
+            assert_eq!(
+                fs::read_to_string(&builds).unwrap().lines().count(),
+                1,
+                "the store-native second run must not execute nix build"
+            );
+            assert!(
+                read_acknowledged_events(&second_paths.events_dir())
+                    .unwrap()
+                    .is_empty(),
+                "the substituted fast path must not admit a row"
+            );
+            let (report, records) = read_verified_records(&second_paths.witness_path()).unwrap();
+            assert!(report.ok);
+            assert_eq!(records.len(), 1);
+            assert_eq!(
+                records[0].verdict,
+                tally_core::witness::Verdict::Substituted
+            );
+            assert_eq!(records[0].pools, ["build"]);
+            assert_eq!(records[0].drv.as_ref().unwrap().drv_path, DRV_PATH);
+            assert_eq!(records[0].store_paths, Some(vec![DRV_OUTPUT.to_owned()]));
         })
         .await;
 }
