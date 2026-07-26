@@ -98,6 +98,39 @@
                 enqueue = {
                   argv = [ "gh-job" ];
                   pool = "slot";
+                  noEnqueue = true;
+                };
+              };
+              github-flow = {
+                kind = "gh";
+                enable = true;
+                sources = [
+                  {
+                    search = {
+                      repo = "agency-agency/spec";
+                      labels = [ "agency:codex-ready" ];
+                      state = "open";
+                    };
+                  }
+                ];
+                triggers.commandComments = [ "/pooled-review" ];
+                allowSelfTriggered = true;
+                allowedActors = [ "tally-bot" ];
+                enqueue = {
+                  argv = [
+                    "tally"
+                    "flow"
+                    "run"
+                    "${./examples/flows/pooled-review.js}"
+                    "--args"
+                    "{\"subject\":\"\${gh.url}\",\"minimumValid\":2}"
+                    "--max-nodes"
+                    "1000"
+                    "--catalog"
+                    "${./test/fixtures/flows/catalog-resolution.json}"
+                  ];
+                  pool = "slot";
+                  noEnqueue = false;
                 };
               };
               effects = {
@@ -1662,7 +1695,7 @@
             pkgs.runCommand "tally-producer-registry" { nativeBuildInputs = [ pkgs.jq ]; }
               ''
                 ${tally}/bin/tally --mode check-config --config ${producerConfig}
-                test "$(jq -r '.producers | keys | join(",")' ${producerConfig})" = 'daily,drop,effects,github,health'
+                test "$(jq -r '.producers | keys | join(",")' ${producerConfig})" = 'daily,drop,effects,github,github-flow,health'
                 test "$(jq -r '[.producers[] | select(has("pool") or has("priority") or has("adapter"))] | length' ${producerConfig})" = 0
                 producer_state="$PWD/state"
                 daily="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch daily --state-dir "$producer_state" --event '{"kind":"calendar"}')"
@@ -1670,6 +1703,30 @@
                 own_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":21,"htmlUrl":"https://github.com/agency-agency/spec/issues/21","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"tally-bot","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-42","commentId":"comment-42","triggerTimestamp":"2026-07-20T12:30:00Z","context":{"schemaVersion":2,"title":"Self-authored issue","body":"untrusted $(must-not-run)","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-42","author":"tally-bot","body":"/tally run"}}}'
                 own="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event "$own_event")"
                 test "$(printf '%s' "$own" | jq -r 'keys[0]')" = emitted
+                own_path="$(printf '%s' "$own" | jq -r '.emitted')"
+                jq -e '.argv == ["gh-job"] and .noEnqueue == true' "$own_path" >/dev/null
+                flow_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":61,"htmlUrl":"https://github.com/agency-agency/spec/issues/61","itemType":"issue","nodeId":"I-flow-61","itemAuthor":"flow-author","triggerActor":"tally-bot","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"notification-61","commentId":"comment-61","triggerTimestamp":"2026-07-26T12:30:00Z","context":{"schemaVersion":2,"title":"Pooled review","body":"untrusted $(must-not-run)","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-61","author":"tally-bot","body":"/pooled-review"}}}'
+                flow="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github-flow --state-dir "$producer_state" --event "$flow_event")"
+                test "$(printf '%s' "$flow" | jq -r 'keys[0]')" = emitted
+                flow_path="$(printf '%s' "$flow" | jq -r '.emitted')"
+                jq -e \
+                  --arg script ${./examples/flows/pooled-review.js} \
+                  --arg catalog ${./test/fixtures/flows/catalog-resolution.json} '
+                    .source == "gh" and
+                    .noEnqueue == false and
+                    .argv[0:3] == ["tally", "flow", "run"] and
+                    .argv[3] == $script and
+                    .argv[4] == "--args" and
+                    (.argv[5] | fromjson) == {
+                      "subject": "https://github.com/agency-agency/spec/issues/61",
+                      "minimumValid": 2
+                    } and
+                    .argv[6:9] == ["--max-nodes", "1000", "--catalog"] and
+                    .argv[9] == $catalog and
+                    ([.argv[] | contains("must-not-run")] | any | not)
+                  ' "$flow_path" >/dev/null
+                flow_duplicate="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github-flow --state-dir "$producer_state" --event "$flow_event")"
+                test "$(printf '%s' "$flow_duplicate" | jq -r '.')" = duplicate
                 rejected_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":21,"htmlUrl":"https://github.com/agency-agency/spec/issues/21","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"untrusted-user","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-43","commentId":"comment-43","triggerTimestamp":"2026-07-20T12:31:00Z","context":{"schemaVersion":2,"title":"Self-authored issue","body":"untrusted","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-43","author":"untrusted-user","body":"/tally run"}}}'
                 rejected="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event "$rejected_event")"
                 test "$(printf '%s' "$rejected" | jq -r '.filtered.reason')" = trigger-actor-not-allowed
@@ -1692,7 +1749,7 @@
                 test "$(printf '%s' "$returned" | jq -r '.transition')" = returned
                 test "$(printf '%s' "$returned" | jq -r '.emitted | length')" = 2
                 find "$producer_state/events" -maxdepth 1 -name '*.producer.json' -print0 \
-                  | xargs -0 jq -s 'map(select(.noEnqueue == true)) | length == 1' \
+                  | xargs -0 jq -s 'map(select(.noEnqueue == true)) | length == 2' \
                   | grep -Fx true >/dev/null
                 touch $out
               '';

@@ -13,9 +13,13 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn serve_empty_flow_history(socket: &Path) -> thread::JoinHandle<()> {
+fn serve_empty_flow_history(
+    socket: &Path,
+    runner_task_uuid: Option<&str>,
+) -> thread::JoinHandle<()> {
     let listener = UnixListener::bind(socket).unwrap();
     listener.set_nonblocking(true).unwrap();
+    let runner_task_uuid = runner_task_uuid.map(str::to_owned);
     thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(10);
         let (mut stream, _) = loop {
@@ -30,17 +34,26 @@ fn serve_empty_flow_history(socket: &Path) -> thread::JoinHandle<()> {
                 Err(error) => panic!("flow history server did not accept a client: {error}"),
             }
         };
-        let mut line = String::new();
-        BufReader::new(stream.try_clone().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        let request: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["method"], "query.jobs");
-        serde_json::to_writer(
-            &mut stream,
-            &json!({
-                "id": request["id"],
-                "result": {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let request_count = usize::from(runner_task_uuid.is_some()) + 1;
+        for _ in 0..request_count {
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "query.job" => {
+                    let runner_task_uuid = runner_task_uuid.as_deref().unwrap();
+                    assert_eq!(request["params"]["id"], runner_task_uuid);
+                    json!({
+                        "schemaVersion": 1,
+                        "protocolVersion": 3,
+                        "job": {
+                            "taskUuid": runner_task_uuid,
+                            "source": "manual"
+                        }
+                    })
+                }
+                "query.jobs" => json!({
                     "schemaVersion": 1,
                     "protocolVersion": 3,
                     "items": [],
@@ -58,11 +71,13 @@ fn serve_empty_flow_history(socket: &Path) -> thread::JoinHandle<()> {
                             "hash": "sha256:genesis"
                         }
                     }
-                }
-            }),
-        )
-        .unwrap();
-        stream.write_all(b"\n").unwrap();
+                }),
+                method => panic!("unexpected flow history request: {method}"),
+            };
+            serde_json::to_writer(&mut stream, &json!({"id": request["id"], "result": result}))
+                .unwrap();
+            stream.write_all(b"\n").unwrap();
+        }
     })
 }
 
@@ -110,7 +125,7 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
 fn flow_run_cli_derives_the_run_id_and_emits_jsonl_for_a_zero_node_script() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("tally.sock");
-    let server = serve_empty_flow_history(&socket);
+    let server = serve_empty_flow_history(&socket, Some("00000000-0000-4000-8000-000000000048"));
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
         .arg("--socket")
         .arg(&socket)
@@ -153,7 +168,7 @@ fn flow_run_cli_derives_the_run_id_and_emits_jsonl_for_a_zero_node_script() {
 fn flow_run_script_failure_has_a_distinguished_exit_and_structured_capture_event() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("tally.sock");
-    let server = serve_empty_flow_history(&socket);
+    let server = serve_empty_flow_history(&socket, None);
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
         .arg("--socket")
         .arg(&socket)
