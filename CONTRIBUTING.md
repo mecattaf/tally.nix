@@ -70,9 +70,10 @@ The expected result is no output and grep exit 1.
 
 `.github/workflows/ci.yml` runs one light Rust smoke check for every pull request and every push
 to `main`: `cargo test --workspace`, Clippy with warnings denied, and the no-stubs grep. The job
-uses a GitHub-hosted `ubuntu-latest` runner, installs the stable Rust toolchain, and restores a
-Cargo cache. GitHub Actions never runs Nix builds, KVM preflights, or VM checks, and tally does
-not register a self-hosted coordinator as a CI runner.
+uses a GitHub-hosted `ubuntu-latest` runner, installs the stable Rust toolchain and the stock
+Taskwarrior 3 test dependency, and restores a Cargo cache. GitHub Actions never runs Nix builds,
+KVM preflights, or VM checks, and tally does not register a self-hosted coordinator as a CI
+runner.
 
 GitHub supplies an advisory smoke signal; it is never the arbiter of merge readiness. A red
 smoke check blocks merge, but a green check is not the full verdict. Before every merge, the

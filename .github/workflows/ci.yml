@@ -23,6 +23,11 @@ jobs:
         with:
           components: clippy
 
+      - name: Install the Taskwarrior 3 test dependency
+        run: |
+          /home/linuxbrew/.linuxbrew/bin/brew install task
+          echo "/home/linuxbrew/.linuxbrew/bin" >> "$GITHUB_PATH"
+
       - name: Restore and save the Cargo cache
         uses: Swatinem/rust-cache@v2
 
