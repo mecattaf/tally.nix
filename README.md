@@ -218,6 +218,11 @@ ID, so retrying after an SSH interruption cannot launch a second copy. Evidence 
 paths is evaluated on the worker; exit status, captures, evidence result, executor name, and pool
 set return to the coordinator for its canonical witness.
 
+Git AI authorship binding is optional and remains an external fleet-tool integration. Tom's
+dotfiles provide `git-ai` on each execution host; tally.nix never packages or fetches it. See
+[Git AI authorship: one result, two authorities](doc/git-ai-authorship.md) for configuration,
+settlement, witness/query fields, offline verification, and the Agent Trace compatibility boundary.
+
 Before creating a unit, the worker fsyncs its generation marker in `stateDir`. If that generation
 later has neither a live unit nor a durable exit record, tally treats the state as an interrupted
 prior launch and refuses to replay it. Keep `stateDir` on storage that survives worker restarts.
