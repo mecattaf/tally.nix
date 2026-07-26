@@ -66,6 +66,23 @@ $ grep -rn 'todo!\|unimplemented!\|TODO' crates/
 
 The expected result is no output and grep exit 1.
 
+## Continuous integration
+
+`.github/workflows/ci.yml` runs the gate ladder for every pull request and every push to `main`.
+Both jobs use GitHub-hosted `ubuntu-latest` runners; tally does not register a self-hosted
+coordinator as a CI runner.
+
+The Nix job requires `/dev/kvm` before it checks out or builds anything. A runner without KVM
+fails with an explicit annotation instead of skipping VM coverage. The job runs the complete
+`nix flake check -L` set and then requires
+`checks.x86_64-linux.flow-multi-host` by name, so the coordinator-and-worker NixOS VM result is
+part of every green run.
+
+Each job's Nix store cache is keyed by runner OS, `flake.lock`, and job name. The cache contains
+store paths only: it never caches a gate status or the Cargo target directory. Every run still
+invokes each gate against the checked-out tree, and Nix evaluates that tree before deciding
+whether a content-addressed store path can be reused.
+
 ## Live-system tests
 
 Ignored Rust tests exercise a real NixOS user manager and journal. They require an explicit
