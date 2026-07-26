@@ -263,6 +263,14 @@ Producer names are user-defined, but every producer has exactly one of these fiv
 All producer output passes through the same admission, deduplication, lease, evidence, and witness
 path as manual enqueue. Producers do not add a second execution path.
 
+Flow `drv()` nodes and `build-effect` meet at Nix's existing feeds, not through a private tally
+channel. A locally built derivation reaches a `build-effect` producer when the host's Nix
+`post-build-hook` writes to the producer's configured `post-build-hook` or `jsonl` input. The
+producer then applies its normal store-path deduplication and downstream enqueue template.
+An already-valid `drv()` output takes tally's substitution fast path, so no build hook is
+fabricated; its canonical witness still records the derivation and output paths. See
+[Retention and Nix store evidence](doc/retention.md) for store validity and GC-root semantics.
+
 GitHub producers are scoped per source and fail closed when a source has no repository, owner, or
 explicit-item identity constraint. Triggers are exact command comments, mentions, assignments, or
 labels; issue text never becomes executable argv. For example:
@@ -376,11 +384,12 @@ records credential names but never reads or serializes their values.
 
 ## Evidence and ledgers
 
-Evidence checks support `exit:<code>`, `artifact:<absolute-path>`, and SHA-256 checks over the
-ordered artifact set. Artifact files are opened without following symlinks, bounded, hashed, and
-checked after execution. The resulting verdict is appended to `witness.jsonl`; advisory records
-from external unit hooks go to the separate `attestations.jsonl` chain and cannot create a
-canonical job verdict.
+Evidence checks support `exit:<code>`, `artifact:<absolute-path>`, `store:<nix-store-path>`, and
+SHA-256 checks over the ordered artifact set. Artifact files are opened without following
+symlinks, bounded, hashed, and checked after execution. Store evidence is validated by Nix and
+retained through indirect GC roots rather than rehashed: the path already commits to the bytes.
+The resulting verdict is appended to `witness.jsonl`; advisory records from external unit hooks
+go to the separate `attestations.jsonl` chain and cannot create a canonical job verdict.
 
 An optional versioned gate manifest keeps process execution, declared gates, and acceptance as
 three separate facts. A manifest contains `schemaVersion: 1`, an `artifact` JSON value, and

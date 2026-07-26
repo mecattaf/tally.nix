@@ -15,6 +15,7 @@ witnessed node results are the script-visible inputs.
 The globals are:
 
 - `job(spec, { settle })`
+- `drv(spec, { settle })`
 - `claude(prompt, opts)`, `codex(prompt, opts)`, `local(prompt, opts)`, and
   `sh(argv, opts)`
 - `parallel(thunks, { settle })` and `pipeline(items, ...stages, { settle })`
@@ -26,6 +27,33 @@ The globals are:
 key, loop, and replay failures. Settle mode returns the failed `NodeResult`
 instead. Every report carries a source position; uncaught exceptions also
 carry Boa's available shadow-stack frames and the current ordinal frontier.
+
+`drv()` is the store-native primitive:
+
+```js
+await drv({
+  drvPath: "/nix/store/00000000000000000000000000000000-package.drv",
+  outputs: [
+    {
+      name: "out",
+      path: "/nix/store/11111111111111111111111111111111-package"
+    }
+  ]
+});
+```
+
+The host sorts outputs by name, rejects malformed or duplicate store paths, and
+maps the node to `nix build --no-link <drvPath>^*`. Its pool is always the
+reserved, automatically declared `build` pool. Its dedup key is
+`drv:<drvPath>`, and its task UUID is derived deterministically from that same
+seed. A missing output admits an ordinary build row and leases one build slot.
+When every output is already valid in the Nix store, the daemon skips the row
+and lease, then appends a cheap witness with `substituted` disposition, the
+derivation, and `store:<path>` evidence for every output.
+
+> If a node is hermetic and replay-stable, it should be a derivation and Nix
+> memoizes it. `job()` exists only for the impure — and everything impure gets
+> witnessed.
 
 The runner assigns ordinals synchronously, submits in ordinal order, and makes
 terminal facts observable in ascending `witnessSeq` order. Replayed payload
