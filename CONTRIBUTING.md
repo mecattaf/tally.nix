@@ -68,21 +68,31 @@ The expected result is no output and grep exit 1.
 
 ## Continuous integration
 
-`.github/workflows/ci.yml` runs the gate ladder for every pull request and every push to `main`.
-Both jobs use GitHub-hosted `ubuntu-latest` runners; tally does not register a self-hosted
-coordinator as a CI runner.
+`.github/workflows/ci.yml` runs one light Rust smoke check for every pull request and every push
+to `main`: `cargo test --workspace`, Clippy with warnings denied, and the no-stubs grep. The job
+uses a GitHub-hosted `ubuntu-latest` runner, installs the stable Rust toolchain, and restores a
+Cargo cache. GitHub Actions never runs Nix builds, KVM preflights, or VM checks, and tally does
+not register a self-hosted coordinator as a CI runner.
 
-The Nix job requires `/dev/kvm` before it checks out or builds anything. A runner without KVM
-fails with an explicit annotation instead of skipping VM coverage. The job runs the complete
-`nix flake check -L` set and then requires
-`checks.x86_64-linux.flow-multi-host` by name, so the coordinator-and-worker NixOS VM result is
-part of every green run.
+GitHub supplies an advisory smoke signal; it is never the arbiter of merge readiness. A red
+smoke check blocks merge, but a green check is not the full verdict. Before every merge, the
+implementing worker runs the authoritative gate ladder on this KVM-capable fleet host:
 
-Each job's Nix store cache is keyed by runner OS, `flake.lock`, and job name. The cache contains
-store paths only: it never caches a gate status or the Cargo target directory. Every run still
-invokes each gate against the checked-out tree, and Nix evaluates that tree before deciding
-whether a content-addressed store path can be reused. CI disables Determinate Nix's lazy trees so
-the checked-out source is materialized as a real store path before sandboxed checks consume it.
+```console
+$ env -u TALLY_TEST_REMOTE_HOST nix develop --command cargo test --workspace
+$ nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+$ nix flake check -L
+$ nix develop --command cargo run --quiet -p tally -- \
+    witness verify test/fixtures/ledger/valid.jsonl
+$ nix develop --command cargo run --quiet -p tally -- \
+    witness verify test/fixtures/ledger/tampered.jsonl
+$ grep -rn 'todo!\|unimplemented!\|TODO' crates/
+```
+
+The `nix flake check -L` run must include the `flow-multi-host` coordinator-and-worker NixOS VM
+check. The valid witness command must exit 0, the tampered witness command must exit 1, and the
+no-stubs grep must produce no output and exit 1. The worker pastes the gate transcript into the
+pull request. That transcript plus a green GitHub Rust smoke check is the merge evidence.
 
 ## Live-system tests
 
