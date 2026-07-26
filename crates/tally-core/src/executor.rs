@@ -27,6 +27,7 @@ use crate::completion::{
 };
 use crate::config::{ExecutionTargetConfig, Priority, SshExecutorConfig};
 use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOutcome};
+use crate::exec_attestation::{ExecAttestationContext, EXEC_ATTESTATION_LEDGER};
 use crate::git_ai::{self, GitAiExecution};
 use crate::taskdb::{GhOrigin, WorkspaceMetadata};
 use crate::witness::Authorship;
@@ -121,6 +122,8 @@ pub struct ExecutionRequest {
     pub gate_manifest: Option<GateManifestSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git_ai: Option<GitAiExecution>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_attestation: Option<ExecAttestationContext>,
     #[serde(default, skip_serializing_if = "AdapterHardening::is_none")]
     pub hardening: AdapterHardening,
     pub credentials: BTreeMap<String, PathBuf>,
@@ -193,6 +196,9 @@ pub struct ExecutionOutcome {
     /// result worktree. Both remain absent when Git AI integration is disabled.
     pub result_revision: Option<String>,
     pub authorship: Option<Authorship>,
+    /// Host that owned the child process. This is authoritative for remote
+    /// execution and lets the coordinator stamp the worker hostname.
+    pub host_id: Option<String>,
     /// Whether stdout/stderr for this exact generation are locally available
     /// for advisory adapter scraping.
     pub captures_available: bool,
@@ -461,6 +467,8 @@ pub struct RemoteCompletion {
     pub result_revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authorship: Option<Authorship>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
 }
 
 #[doc(hidden)]
@@ -1214,6 +1222,7 @@ pub struct Executor {
     allow_direct_fallback: bool,
     remote_executors: Arc<BTreeMap<String, ExecutionTargetConfig>>,
     remote_transport: Arc<dyn RemoteTransport>,
+    host_id: Option<String>,
 }
 
 impl std::fmt::Debug for Executor {
@@ -1244,6 +1253,7 @@ impl Executor {
             allow_direct_fallback: true,
             remote_executors: Arc::new(BTreeMap::new()),
             remote_transport: Arc::new(SshRemoteTransport),
+            host_id: crate::witness::current_host_id().ok(),
         }
     }
 
@@ -1794,6 +1804,7 @@ impl Executor {
             semantic_completion: completion.semantic_completion,
             result_revision: completion.result_revision,
             authorship: completion.authorship,
+            host_id: completion.host_id,
             captures_available,
         })
     }
@@ -2163,8 +2174,46 @@ impl Executor {
             );
         }
         args.push("--".into());
-        args.extend(request.argv.iter().map(OsString::from));
+        args.extend(self.execution_argv(request));
         Ok(args)
+    }
+
+    fn execution_argv(&self, request: &ExecutionRequest) -> Vec<OsString> {
+        let Some(attestation) = &request.exec_attestation else {
+            return request.argv.iter().map(OsString::from).collect();
+        };
+        let mut argv = vec![
+            self.recorder_program.as_os_str().to_owned(),
+            "attest".into(),
+            "exec".into(),
+            "--task-uuid".into(),
+            request.identity.unit_uuid().to_string().into(),
+            "--attempt".into(),
+            request.attempt.to_string().into(),
+            "--lease-epoch".into(),
+            request.lease_epoch.to_string().into(),
+            "--adapter".into(),
+            attestation.adapter.clone().into(),
+        ];
+        if let Some(executor) = &attestation.executor {
+            argv.extend(["--executor".into(), executor.clone().into()]);
+        }
+        if let Some(payload_hash) = &attestation.payload_hash {
+            argv.extend(["--payload-hash".into(), payload_hash.clone().into()]);
+        }
+        if let Some(brief_hash) = &attestation.brief_hash {
+            argv.extend(["--brief-hash".into(), brief_hash.clone().into()]);
+        }
+        for evidence in &attestation.evidence {
+            argv.extend(["--evidence".into(), evidence.clone().into()]);
+        }
+        argv.extend([
+            "--ledger".into(),
+            self.state_dir.join(EXEC_ATTESTATION_LEDGER).into_os_string(),
+            "--".into(),
+        ]);
+        argv.extend(request.argv.iter().map(OsString::from));
+        argv
     }
 
     fn push_hardening_properties(
@@ -2258,6 +2307,7 @@ impl Executor {
                         semantic_completion: None,
                         result_revision: None,
                         authorship: None,
+                        host_id: self.host_id.clone(),
                         captures_available: true,
                     });
                 }
@@ -2356,6 +2406,7 @@ impl Executor {
             semantic_completion: None,
             result_revision: None,
             authorship: None,
+            host_id: self.host_id.clone(),
             captures_available: true,
         })
     }
@@ -2458,6 +2509,7 @@ impl Executor {
                         semantic_completion: None,
                         result_revision: None,
                         authorship: None,
+                        host_id: self.host_id.clone(),
                         captures_available: true,
                     });
                 }
@@ -2525,6 +2577,11 @@ impl Executor {
         }
         if let Some(git_ai) = &request.git_ai {
             git_ai.validate().map_err(ExecutorError::InvalidRequest)?;
+        }
+        if let Some(attestation) = &request.exec_attestation {
+            attestation
+                .validate()
+                .map_err(ExecutorError::InvalidRequest)?;
         }
         if request.argv.is_empty() || request.argv[0].is_empty() {
             return Err(ExecutorError::InvalidRequest(
@@ -2760,9 +2817,10 @@ impl Executor {
             .append(true)
             .open(&paths.stderr)
             .map_err(|source| io_error(&paths.stderr, source))?;
-        let mut command = Command::new(&request.argv[0]);
+        let execution_argv = self.execution_argv(&request);
+        let mut command = Command::new(&execution_argv[0]);
         command
-            .args(&request.argv[1..])
+            .args(&execution_argv[1..])
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
             .kill_on_drop(true)
@@ -2782,7 +2840,7 @@ impl Executor {
             command.env(name, value);
         }
         let mut child = command.spawn().map_err(|source| ExecutorError::Spawn {
-            program: PathBuf::from(&request.argv[0]),
+            program: PathBuf::from(&execution_argv[0]),
             source,
         })?;
         let child_pid = child.id();
@@ -2830,7 +2888,7 @@ impl Executor {
             match tokio::time::timeout(Duration::from_secs(seconds), child.wait()).await {
                 Ok(status) => direct_completion(
                     status.map_err(|source| ExecutorError::Spawn {
-                        program: PathBuf::from(&request.argv[0]),
+                        program: PathBuf::from(&execution_argv[0]),
                         source,
                     })?,
                     invocation_id,
@@ -2839,7 +2897,7 @@ impl Executor {
                     terminate_direct_process_group(&mut child, child_pid)
                         .await
                         .map_err(|source| ExecutorError::Spawn {
-                            program: PathBuf::from(&request.argv[0]),
+                            program: PathBuf::from(&execution_argv[0]),
                             source,
                         })?;
                     let record = UnitExitRecord {
@@ -2858,7 +2916,7 @@ impl Executor {
         } else {
             direct_completion(
                 child.wait().await.map_err(|source| ExecutorError::Spawn {
-                    program: PathBuf::from(&request.argv[0]),
+                    program: PathBuf::from(&execution_argv[0]),
                     source,
                 })?,
                 invocation_id,
@@ -2883,6 +2941,7 @@ impl Executor {
             semantic_completion: None,
             result_revision: None,
             authorship: None,
+            host_id: self.host_id.clone(),
             captures_available: true,
         })
     }
@@ -3706,6 +3765,7 @@ fn remote_completion(
         semantic_completion: outcome.semantic_completion,
         result_revision: outcome.result_revision,
         authorship: outcome.authorship,
+        host_id: outcome.host_id,
     })
 }
 
@@ -3986,6 +4046,7 @@ mod tests {
             workspace: None,
             gate_manifest: None,
             git_ai: None,
+            exec_attestation: None,
             hardening: AdapterHardening::None,
             credentials: BTreeMap::from([
                 ("alpha".to_owned(), PathBuf::from("/run/keys/alpha")),
@@ -4184,6 +4245,7 @@ mod tests {
             semantic_completion: None,
             result_revision: None,
             authorship: None,
+            host_id: Some("worker.example".to_owned()),
         }
     }
 
@@ -6008,6 +6070,7 @@ mod tests {
             workspace: None,
             gate_manifest: None,
             git_ai: None,
+            exec_attestation: None,
             hardening: AdapterHardening::None,
             credentials: BTreeMap::new(),
             limits: UnitLimits {

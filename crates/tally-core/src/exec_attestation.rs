@@ -28,6 +28,44 @@ pub const EXEC_ATTESTATION_LEDGER: &str = "exec-attestations.jsonl";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ExecAttestationContext {
+    pub adapter: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_hash: Option<String>,
+    pub evidence: Vec<String>,
+}
+
+impl ExecAttestationContext {
+    pub fn validate(&self) -> Result<(), String> {
+        if !registry_component_shape(&self.adapter) {
+            return Err("adapter is not a safe registry component".to_owned());
+        }
+        if self
+            .executor
+            .as_deref()
+            .is_some_and(|executor| !registry_component_shape(executor))
+        {
+            return Err("executor is not a safe registry component".to_owned());
+        }
+        for (name, value) in [
+            ("payloadHash", self.payload_hash.as_deref()),
+            ("briefHash", self.brief_hash.as_deref()),
+        ] {
+            if value.is_some_and(|value| !sha256_shape(value)) {
+                return Err(format!("{name} is not lowercase sha256 hex"));
+            }
+        }
+        parse_evidence_specs(&self.evidence).map_err(|error| error.to_string())?;
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecAttestationPayload {
     pub schema_version: u32,
     pub kind: String,

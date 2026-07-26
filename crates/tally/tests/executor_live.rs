@@ -77,6 +77,7 @@ fn request(argv: Vec<String>) -> ExecutionRequest {
         workspace: None,
         gate_manifest: None,
         git_ai: None,
+        exec_attestation: None,
         hardening: Default::default(),
         credentials: BTreeMap::new(),
         limits: UnitLimits {

@@ -38,6 +38,7 @@ use crate::evidence::{
     parse_evidence_specs, probe_dedup, probe_full_pass, run_evidence_gate, CheckOutcome,
     DedupMissReason, RetryTrigger, RunOutcome,
 };
+use crate::exec_attestation::ExecAttestationContext;
 use crate::executor::{
     ExecutionIdentity, ExecutionOutcome, ExecutionRequest, ExecutionTermination, Executor,
     ExecutorError, UnitLimits, Uuid,
@@ -662,6 +663,7 @@ struct DaemonHandler {
     tally_socket: String,
     brief_root: PathBuf,
     git_ai: GitAiConfig,
+    exec_attestations: bool,
 }
 
 impl RpcHandler for DaemonHandler {
@@ -3642,6 +3644,7 @@ impl DaemonHandler {
             &self.tally_socket,
             &self.brief_root,
             &self.git_ai,
+            self.exec_attestations,
         );
         let execution_target = job.row.executor.clone();
         let evidence = job.row.evidence.clone();
@@ -4412,6 +4415,7 @@ fn execution_request(
     tally_socket: &str,
     brief_root: &Path,
     git_ai_config: &GitAiConfig,
+    exec_attestations: bool,
 ) -> Result<ExecutionRequest, ExecutorError> {
     let brief_path = job.row.brief_hash.as_deref().map(|hash| {
         brief::content_path(brief_root, hash)
@@ -4467,6 +4471,13 @@ fn execution_request(
         workspace: job.row.workspace.clone(),
         gate_manifest,
         git_ai,
+        exec_attestation: exec_attestations.then(|| ExecAttestationContext {
+            adapter: job.row.adapter.clone(),
+            executor: job.row.executor.clone(),
+            payload_hash: job.row.payload_hash.clone(),
+            brief_hash: job.row.brief_hash.clone(),
+            evidence: job.row.evidence.clone(),
+        }),
         hardening: job.invocation.hardening,
         credentials: job.row.credentials.clone(),
         limits,
@@ -5404,6 +5415,7 @@ impl Daemon {
             tally_socket,
             brief_root: paths.data_dir.clone(),
             git_ai: config.git_ai.clone(),
+            exec_attestations: config.attestations.exec.enable,
         };
         Ok(Self {
             _state_lock: state_lock,
@@ -5696,6 +5708,10 @@ impl Daemon {
             Some(Ok(outcome)) => (outcome.result_revision.clone(), outcome.authorship.clone()),
             _ => (None, None),
         };
+        let execution_host_id = match &finished.outcome {
+            Some(Ok(outcome)) => outcome.host_id.clone(),
+            _ => None,
+        };
         let semantic_completion = match (&effective_gate_manifest, &finished.outcome) {
             (None, Some(Ok(outcome))) if outcome.semantic_completion.is_some() => {
                 return Err(DaemonError::Invalid(format!(
@@ -5816,7 +5832,11 @@ impl Daemon {
             }
             let verdict = computed_verdict;
             let model = canonical_job_model(&job);
-            let host_id = job.row.executor.is_none().then(|| context.host_id.clone());
+            let host_id = if job.row.executor.is_none() {
+                Some(context.host_id.clone())
+            } else {
+                execution_host_id.clone()
+            };
             let record = append_context_witness(
                 &mut context,
                 WitnessBody {
@@ -8404,6 +8424,7 @@ mod tests {
                             semantic_completion: None,
                             result_revision: None,
                             authorship: None,
+                            host_id: Some("worker".to_owned()),
                         },
                     ))),
                 })
@@ -8490,6 +8511,7 @@ mod tests {
                             semantic_completion: None,
                             result_revision: None,
                             authorship: None,
+                            host_id: Some("worker".to_owned()),
                         }))
                     }
                     RemoteExecutorRequest::Ensure { .. } => {
@@ -10850,6 +10872,7 @@ mod tests {
                     "/run/tally/tally.sock",
                     &paths.data_dir,
                     &GitAiConfig::default(),
+                    false,
                 )
                 .unwrap();
                 let args = executor
@@ -11075,6 +11098,7 @@ mod tests {
                     "/run/tally/tally.sock",
                     &paths.data_dir,
                     &GitAiConfig::default(),
+                    false,
                 )
                 .unwrap();
                 let args = executor

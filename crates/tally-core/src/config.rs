@@ -77,6 +77,26 @@ impl Default for GitAiConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ExecAttestationConfig {
+    #[serde(default = "default_true")]
+    pub enable: bool,
+}
+
+impl Default for ExecAttestationConfig {
+    fn default() -> Self {
+        Self { enable: true }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AttestationsConfig {
+    #[serde(default)]
+    pub exec: ExecAttestationConfig,
+}
+
 /// A daemonless execution target reached through a single, explicitly
 /// configured OpenSSH identity. The remote side runs the same `tally` binary
 /// as a short-lived protocol helper; it does not run a tally daemon.
@@ -370,6 +390,8 @@ pub struct Config {
     #[serde(default)]
     pub git_ai: GitAiConfig,
     #[serde(default)]
+    pub attestations: AttestationsConfig,
+    #[serde(default)]
     pub pools: BTreeMap<String, PoolConfig>,
     #[serde(default)]
     pub adapters: BTreeMap<String, AdapterConfig>,
@@ -390,6 +412,7 @@ impl Default for Config {
             lease: LeaseConfig::default(),
             retention: RetentionConfig::default(),
             git_ai: GitAiConfig::default(),
+            attestations: AttestationsConfig::default(),
             pools: BTreeMap::new(),
             adapters: BTreeMap::new(),
             producers: BTreeMap::new(),
