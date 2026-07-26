@@ -8157,9 +8157,10 @@ mod tests {
     };
     use crate::recovery::RecoveryPlan;
     use crate::taskdb::{
-        GhContextSnapshot, GhItemState, GhItemType, GhOrigin, GH_CONTEXT_SCHEMA_VERSION,
-        GH_ORIGIN_SCHEMA_VERSION,
+        GhContextSnapshot, GhItemState, GhItemType, GhOrigin, WorkspaceMetadata,
+        GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
     };
+    use crate::witness::{Authorship, AuthorshipSession, AuthorshipStatus};
     use tally_client::RpcClient;
 
     struct ExitFileProbe;
@@ -8777,6 +8778,139 @@ mod tests {
             .initial_jobs
             .iter()
             .any(|job| job.task_uuid == Some(row.uuid)));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn authorship_projection_reconstructs_from_durable_row_and_witness_after_restart() {
+        let temp = tempdir().unwrap();
+        let paths = fs1_paths(temp.path());
+        prepare_paths(&paths).unwrap();
+        let task_uuid = Uuid::new_v4();
+        let mut row = durable_row(task_uuid, "authorship-query-restart", 1);
+        row.adapter_options.model = Some("tally-model".to_owned());
+        row.session_ref = Some("tally-session".to_owned());
+        row.workspace = Some(WorkspaceMetadata {
+            repo: "mecattaf/tally.nix".to_owned(),
+            base_rev: "a".repeat(40),
+            branch: "authorship-query-restart".to_owned(),
+            worktree_path: temp.path().join("worktree"),
+        });
+        write_enqueue_event_atomic(
+            &paths.events_dir(),
+            &DurableEnqueueEvent::new(row.clone()).unwrap(),
+        )
+        .unwrap();
+        WitnessLedger::open(paths.witness_path())
+            .unwrap()
+            .append(WitnessBody {
+                task_uuid: Some(task_uuid.to_string()),
+                transition_timestamp: "2026-07-26T20:00:00.000Z".to_owned(),
+                verdict: Verdict::Pass,
+                exit_code: 0,
+                artifact_content_hash: None,
+                store_paths: None,
+                drv: None,
+                gpu_seconds: None,
+                wall_clock: 1.0,
+                attempt: 1,
+                lease_epoch: 1,
+                dedup_key: row.dedup_key.clone(),
+                payload_hash: row.payload_hash.clone(),
+                brief_hash: None,
+                origin: AdmissionOrigin::direct(EnqueueSource::Manual),
+                orchestration: None,
+                labor_class: LaborClass::Fresh,
+                trace_ref: None,
+                pools: vec!["slot".to_owned()],
+                executor: None,
+                host_id: None,
+                charge: None,
+                model: Some("tally-model".to_owned()),
+                evidence_class: None,
+                manifest_hash: None,
+                completion: None,
+                result_revision: Some("b".repeat(40)),
+                authorship: Some(Authorship {
+                    provider: "git-ai".to_owned(),
+                    provider_version: "1.6.17".to_owned(),
+                    note_ref: "refs/notes/ai".to_owned(),
+                    status: AuthorshipStatus::Mismatch,
+                    notes_ref_target: Some("c".repeat(40)),
+                    note_content_sha256: Some(format!("sha256:{}", "d".repeat(64))),
+                    reason: Some(
+                        "git-ai-mismatch: Tally session/model differs from Git AI's correlated attribution"
+                            .to_owned(),
+                    ),
+                }),
+                authorship_sessions: Some(vec![AuthorshipSession {
+                    tool: "codex".to_owned(),
+                    id: "git-ai-session".to_owned(),
+                    model: "git-ai-model".to_owned(),
+                }]),
+            })
+            .unwrap();
+
+        let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+            .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+            .with_unit_probe(ExitFileProbe);
+        let first = Daemon::open_with_executor(
+            one_pool_config(),
+            paths.clone(),
+            settings(),
+            executor.clone(),
+        )
+        .await
+        .unwrap();
+        let before = first
+            .handler
+            .query("query.job", Some(json!({"id": task_uuid})))
+            .await
+            .unwrap();
+        drop(first);
+
+        let restarted = Daemon::open_with_executor(one_pool_config(), paths, settings(), executor)
+            .await
+            .unwrap();
+        let after = restarted
+            .handler
+            .query("query.job", Some(json!({"id": task_uuid})))
+            .await
+            .unwrap();
+        assert_eq!(after["protocolVersion"], 4);
+        assert_eq!(after["job"]["authorship"], before["job"]["authorship"]);
+        assert_eq!(
+            after["job"]["authorship"]["workspace"]["value"]["repo"],
+            "mecattaf/tally.nix"
+        );
+        assert_eq!(
+            after["job"]["authorship"]["tallySession"]["value"],
+            "tally-session"
+        );
+        assert_eq!(
+            after["job"]["authorship"]["tallySession"]["authority"],
+            "advisory-provider-capture"
+        );
+        assert_eq!(
+            after["job"]["authorship"]["gitAiSessions"][0]["value"]["id"],
+            "git-ai-session"
+        );
+        assert_eq!(
+            after["job"]["authorship"]["gitAiSessions"][0]["authority"],
+            "canonical-witness-fact"
+        );
+        assert_eq!(
+            after["job"]["authorship"]["identityMismatch"],
+            Value::Bool(true)
+        );
+        let proof = restarted
+            .handler
+            .query(
+                "query.proof",
+                Some(json!({"task": task_uuid, "attempt": 1})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(proof["authorship"], after["job"]["authorship"]);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -13605,7 +13739,7 @@ mod tests {
                     .call("query.status", Some(json!({"pool": "slot"})))
                     .await
                     .unwrap();
-                assert_eq!(status["protocolVersion"], 3);
+                assert_eq!(status["protocolVersion"], 4);
                 assert_eq!(status["pools"][0]["pool"], "slot");
                 assert!(status["jobs"].as_array().unwrap().iter().any(|job| {
                     job["taskUuid"].as_str() == Some(task_uuid) && job["verdict"] == "pass"
@@ -13618,12 +13752,12 @@ mod tests {
                     .unwrap();
                 assert!(render_text
                     .as_str()
-                    .is_some_and(|text| text.contains("\"protocolVersion\": 3")));
+                    .is_some_and(|text| text.contains("\"protocolVersion\": 4")));
                 let render_json = client
                     .call("query.render", Some(json!({"format": "json"})))
                     .await
                     .unwrap();
-                assert_eq!(render_json["protocolVersion"], 3);
+                assert_eq!(render_json["protocolVersion"], 4);
 
                 let reused = client.call("queue.enqueue", Some(payload)).await.unwrap();
                 assert_eq!(reused["state"], "reused");
@@ -14148,7 +14282,7 @@ mod tests {
                     .query("query.jobs", Some(json!({})))
                     .await
                     .unwrap();
-                assert_eq!(jobs["protocolVersion"], 3);
+                assert_eq!(jobs["protocolVersion"], 4);
                 assert_eq!(jobs["nextCursor"], Value::Null);
                 assert_eq!(jobs["snapshot"]["history"]["complete"], true);
                 let parent = jobs["items"]

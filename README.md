@@ -421,7 +421,7 @@ Absent revision keys remain absent, preserving legacy witness bytes and hashes e
 
 ## Durable query projections
 
-Query protocol 3 exposes the complete durable read-only surface:
+Query protocol 4 exposes the complete durable read-only surface:
 
 ```console
 $ tally query jobs --state running --adapter codex --limit 100
