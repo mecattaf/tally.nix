@@ -355,7 +355,7 @@ fn mapped_exit_code(status: ExitStatus) -> i32 {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        return 128 + status.signal().unwrap_or(0);
+        128 + status.signal().unwrap_or(0)
     }
     #[cfg(not(unix))]
     {
