@@ -638,6 +638,7 @@ mod tests {
                         },
                         "yieldHook": ["tally", "lease", "status"],
                         "env": {"NO_COLOR": "1"},
+                        "skillRevision": "review-agent-v3",
                         "extraConfig": {"modelFlag": "--model"}
                     }
                 }
@@ -648,6 +649,12 @@ mod tests {
         assert_eq!(
             config.adapters["from-pure-nix"].extra_config["modelFlag"],
             "--model"
+        );
+        assert_eq!(
+            config.adapters["from-pure-nix"]
+                .resolved_skill_revision()
+                .as_deref(),
+            Some("review-agent-v3")
         );
 
         let unknown_field = serde_json::from_str::<Config>(

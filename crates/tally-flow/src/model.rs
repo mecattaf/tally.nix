@@ -130,6 +130,10 @@ pub struct Orchestration {
     pub node_label: Option<String>,
     pub max_nodes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection: Option<SelectionProvenance>,
 }
 

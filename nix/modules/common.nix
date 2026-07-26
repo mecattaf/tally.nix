@@ -303,6 +303,27 @@ let
             explicit spelling of that behavior.
           '';
         };
+        skillBundle = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = lib.literalExpression "builtins.readFile ./agent-skill.md";
+          description = ''
+            Optional resolved skill or agent-definition content. tally hashes
+            the exact UTF-8 bytes as sha256:<hex> for flow provenance. Resolve
+            files at Nix evaluation time; tally never reads a skill file while
+            replaying a flow.
+          '';
+        };
+        skillRevision = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "review-agent-v3";
+          description = ''
+            Optional stable skill or agent-definition version/name identifier,
+            copied verbatim into flow provenance when no bundle content is
+            available.
+          '';
+        };
         extraConfig = mkOption {
           type = types.attrsOf types.raw;
           default = { };
@@ -332,6 +353,10 @@ let
         {
           assertion = config.yieldHook == null || builtins.head config.yieldHook != "";
           message = "tally adapter ${name} yieldHook must start with a non-empty executable";
+        }
+        {
+          assertion = config.skillBundle == null || config.skillRevision == null;
+          message = "tally adapter ${name} skillBundle and skillRevision are mutually exclusive";
         }
         (mapAttrsToList (capture: value: value._tallyAssertions) config.scrape)
         (mapAttrsToList (environment: _: {
@@ -1968,6 +1993,12 @@ let
     }
     // optionalAttrs (adapter.hardening != null) {
       inherit (adapter) hardening;
+    }
+    // optionalAttrs (adapter.skillBundle != null) {
+      inherit (adapter) skillBundle;
+    }
+    // optionalAttrs (adapter.skillRevision != null) {
+      inherit (adapter) skillRevision;
     };
 
   renderPool = _: pool: {

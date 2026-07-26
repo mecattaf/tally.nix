@@ -32,6 +32,16 @@ terminal facts observable in ascending `witnessSeq` order. Replayed payload
 hashes and the run's pinned script hash are checked before execution can pass a
 divergence point. No runner journal or state file exists.
 
+Every `claude()`, `codex()`, and `local()` node carries a host-stamped
+`orchestration.promptRevision` equal to `sha256:<hex>` over the exact UTF-8 bytes
+of its resolved prompt. When the selected adapter configuration declares
+`skillBundle`, the host hashes that configured content with the same construction;
+when it declares `skillRevision`, the stable identifier is copied verbatim.
+The fields are absent when unavailable and cannot be supplied by script options.
+Re-execution derives them from the same prompt and adapter configuration; a changed
+prompt also changes the structured brief and therefore reaches the existing
+`replay-divergence` check through `payloadHash`.
+
 The executable exposes:
 
 ```text

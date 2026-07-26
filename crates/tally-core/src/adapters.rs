@@ -11,6 +11,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json_path::JsonPath;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::executor::ExecutionPaths;
@@ -150,8 +151,24 @@ pub struct AdapterConfig {
     pub launch: AdapterLaunchConfig,
     #[serde(default, skip_serializing_if = "AdapterHardening::is_none")]
     pub hardening: AdapterHardening,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_bundle: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_revision: Option<String>,
     #[serde(default)]
     pub extra_config: BTreeMap<String, Value>,
+}
+
+impl AdapterConfig {
+    /// Resolve the replay-stable skill or agent-definition revision carried by
+    /// this adapter configuration.
+    #[must_use]
+    pub fn resolved_skill_revision(&self) -> Option<String> {
+        self.skill_bundle
+            .as_deref()
+            .map(|bundle| format!("sha256:{:x}", Sha256::digest(bundle.as_bytes())))
+            .or_else(|| self.skill_revision.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -616,6 +633,12 @@ fn validate_adapter_name(name: &str) -> Result<(), AdapterError> {
 }
 
 fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterError> {
+    if adapter.skill_bundle.is_some() && adapter.skill_revision.is_some() {
+        return invalid_config(
+            name,
+            "skillBundle and skillRevision are mutually exclusive".to_owned(),
+        );
+    }
     validate_argv(name, "argv", &adapter.argv, true)?;
     if let Some(resume) = &adapter.resume {
         validate_argv(name, "resume", resume, false)?;
@@ -1075,6 +1098,8 @@ mod tests {
             env: BTreeMap::from([("AGENT_COLOR".to_owned(), "never".to_owned())]),
             launch: AdapterLaunchConfig::default(),
             hardening: AdapterHardening::None,
+            skill_bundle: None,
+            skill_revision: None,
             extra_config: BTreeMap::from([(
                 "modelFlag".to_owned(),
                 Value::String("--model".to_owned()),
@@ -1169,6 +1194,48 @@ mod tests {
             "hardening": "almost-strict"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn skill_revision_hashes_configured_bundle_bytes_or_uses_stable_identifier() {
+        let bundle: AdapterConfig = serde_json::from_value(serde_json::json!({
+            "argv": ["agent"],
+            "skillBundle": "review protocol α\n"
+        }))
+        .unwrap();
+        assert_eq!(
+            bundle.resolved_skill_revision().as_deref(),
+            Some("sha256:d4c012fb39d01ea2633ef9519d2bd1233837fad7cf216af85b6eb9fb7b86879d")
+        );
+
+        let identifier: AdapterConfig = serde_json::from_value(serde_json::json!({
+            "argv": ["agent"],
+            "skillRevision": "review-agent-v3"
+        }))
+        .unwrap();
+        assert_eq!(
+            identifier.resolved_skill_revision().as_deref(),
+            Some("review-agent-v3")
+        );
+
+        let conflicting = BTreeMap::from([(
+            "agent".to_owned(),
+            serde_json::from_value(serde_json::json!({
+                "argv": ["agent"],
+                "skillBundle": "bundle",
+                "skillRevision": "v1"
+            }))
+            .unwrap(),
+        )]);
+        assert!(matches!(
+            engine(&conflicting).validate_all(),
+            Err(AdapterError::InvalidConfig { detail, .. })
+                if detail == "skillBundle and skillRevision are mutually exclusive"
+        ));
+
+        let legacy = serde_json::to_value(AdapterConfig::default()).unwrap();
+        assert!(legacy.get("skillBundle").is_none());
+        assert!(legacy.get("skillRevision").is_none());
     }
 
     #[test]

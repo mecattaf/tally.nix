@@ -54,6 +54,7 @@
                   pattern = "$.session";
                 };
                 env.CUSTOM_AGENT_MODE = "batch";
+                skillBundle = "review protocol α\n";
                 extraConfig.origin = "pure-nix-check";
               };
             };
@@ -285,6 +286,7 @@
                     };
                   };
                   hardening = "strict";
+                  skillRevision = "project-codex-v3";
                 };
                 adapters.shell.hardening = "workspace";
                 adapters.explicit-none = {
@@ -1402,6 +1404,7 @@
               .executors.worker.stateDir == "/var/lib/tally-remote" and
               .adapters["project-codex"].argv == ["codex", "exec", "--json", "--"] and
               .adapters["project-codex"].hardening == "strict" and
+              .adapters["project-codex"].skillRevision == "project-codex-v3" and
               .adapters.shell.hardening == "workspace" and
               .adapters["explicit-none"].hardening == "none" and
               (.adapters.pi | has("hardening") | not) and
@@ -1571,6 +1574,7 @@
             ${tally}/bin/tally --mode check-config --config ${adapterConfig}
             ${tally}/bin/tally --mode check-config --config ${checkedHomeConfig}
             test "$(jq -r '.adapters["project-codex"].hardening' ${checkedHomeConfig})" = strict
+            test "$(jq -r '.adapters["project-codex"].skillRevision' ${checkedHomeConfig})" = project-codex-v3
             test "$(jq -r '.adapters.shell.hardening' ${checkedHomeConfig})" = workspace
             test "$(jq -r '.adapters["explicit-none"].hardening' ${checkedHomeConfig})" = none
             test "$(jq -r '.adapters.pi.hardening // "absent"' ${checkedHomeConfig})" = absent
@@ -1610,6 +1614,7 @@
             test "$(jq -r '.adapters["claude-code"].scrape.sessionRef.pattern' ${adapterConfig})" = '$..session_id'
             test "$(jq -r '.adapters.codex.scrape.sessionRef.pattern' ${adapterConfig})" = '$..thread_id'
             test "$(jq -r '.adapters.codex.extraConfig.modelFlag' ${adapterConfig})" = '--model'
+            jq -e '.adapters["nix-custom"].skillBundle == "review protocol α\n"' ${adapterConfig} >/dev/null
             test "$(jq -r '.adapters["nix-custom"].env.CUSTOM_AGENT_MODE' ${adapterConfig})" = batch
             launch="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render nix-custom -- 'payload arg' "")"
             test "$(printf '%s' "$launch" | jq -c '.argv')" = '["custom-agent","--structured","payload arg",""]'

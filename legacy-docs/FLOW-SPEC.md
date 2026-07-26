@@ -217,6 +217,7 @@ witness (additive optional field; absent = byte-identical legacy hashes):
 ```json
 { "flowName": "agency-nightly", "flowRunId": "…", "scriptHash": "sha256-…",
   "nodeOrdinal": 17, "nodeLabel": "impl:T042",
+  "promptRevision": "sha256:…", "skillRevision": "review-agent-v3",
   "maxNodes": 200, "selection": { "selector": "pooled-fast", "catalogHash": "sha256-…",
   "memberId": "…", "members": ["…"] } }
 ```
@@ -226,6 +227,19 @@ within a run is `nodeOrdinal` (+ optional `nodeLabel` and the §11.2 submission 
 `maxNodes` (§6.2) and `selection` (§11.5) are optional. The kernel interprets exactly
 two capsule fields — `flowRunId` and `maxNodes` (the §6.2 admission backstop) — and
 carries everything else opaque, verbatim, row→witness.
+
+`promptRevision` and `skillRevision` are reserved optional capsule keys populated
+host-side for `claude()`, `codex()`, and `local()` nodes. `promptRevision` is
+`"sha256:" + hex(Sha256(prompt_bytes))`, where `prompt_bytes` is the exact UTF-8
+sequence of the resolved prompt submitted in the structured brief. Adapter configuration
+may carry either resolved `skillBundle` content, producing the same hash construction
+over its UTF-8 bytes, or a stable `skillRevision` version/name copied verbatim; the two
+configuration inputs are mutually exclusive. Unknown skill revision means the key is
+absent, never a placeholder. Files used as bundles are resolved while constructing the
+adapter configuration, not read by the runner during replay. A changed prompt changes
+both `promptRevision` and the brief-derived `payloadHash`, so the existing
+`replay-divergence` path remains the enforcement mechanism. With both keys absent, the
+serialized capsule and witness hash input remain byte-identical.
 
 The kernel never interprets it. Query projections group by it (`query jobs
 --flow-run <id>`); the witness carries it verbatim as an optional skip-if-absent field
