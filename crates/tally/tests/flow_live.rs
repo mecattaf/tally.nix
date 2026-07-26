@@ -4,7 +4,6 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use serde_json::{json, Value};
@@ -28,7 +27,7 @@ use tally_core::taskdb::{
 use tally_core::wire::EnqueuePayload;
 use tally_core::witness::read_verified_records;
 use tokio::process::{Child, Command};
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
 const CONCURRENT_RUN: &str = "00000000-0000-4000-8000-000000000501";
@@ -39,7 +38,7 @@ const DRV_BUILD_RUN: &str = "00000000-0000-4000-8000-000000000505";
 const DRV_SUBSTITUTE_RUN: &str = "00000000-0000-4000-8000-000000000506";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
-static ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
 
 struct ExitFileProbe;
 
@@ -566,9 +565,7 @@ fn assert_six_unique_rows(paths: &DaemonPaths, flow_run_id: &str) {
 
 #[tokio::test(flavor = "current_thread")]
 async fn fs5_live_acceptance_matrix() {
-    let _environment = ENVIRONMENT_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _environment = ENVIRONMENT_LOCK.lock().await;
     tokio::task::LocalSet::new()
         .run_until(async {
             let temp = tempfile::tempdir().unwrap();
@@ -1033,9 +1030,7 @@ async fn fs5_live_acceptance_matrix() {
 
 #[tokio::test(flavor = "current_thread")]
 async fn drv_second_run_substitutes_without_a_second_build() {
-    let _environment = ENVIRONMENT_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _environment = ENVIRONMENT_LOCK.lock().await;
     tokio::task::LocalSet::new()
         .run_until(async {
             let temp = tempfile::tempdir().unwrap();
