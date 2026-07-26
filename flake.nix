@@ -192,8 +192,10 @@
         flowWorkerHandoff = pkgs.writeShellApplication {
           name = "tally-fs7-worker-handoff";
           runtimeInputs = [
+            pkgs.attic-client
             pkgs.coreutils
             pkgs.git
+            pkgs.nix
           ];
           text = ''
             work="$(mktemp -d)"
@@ -202,7 +204,11 @@
             git -C "$work/repository" config user.name "tally FS-7 worker"
             git -C "$work/repository" config user.email "tally-fs7-worker@example.invalid"
             printf '%s\n' 'artifact-created-on-worker' >"$work/repository/artifact.txt"
-            git -C "$work/repository" add artifact.txt
+            printf '%s\n' 'artifact-created-on-worker-through-attic' >"$work/attic-artifact"
+            store_path="$(nix store add --name tally-attic-handoff "$work/attic-artifact")"
+            attic push tally:tally-handoff "$store_path"
+            printf '%s\n' "$store_path" >"$work/repository/attic-store-path.txt"
+            git -C "$work/repository" add artifact.txt attic-store-path.txt
             git -C "$work/repository" commit -m 'FS-7 worker artifact'
             touch /tmp/tally-fs7-worker-started
             sleep 15
@@ -214,16 +220,35 @@
           runtimeInputs = [
             pkgs.coreutils
             pkgs.git
+            pkgs.nix
           ];
           text = ''
             work="$(mktemp -d)"
             trap 'rm -rf "$work"' EXIT
             git clone --branch artifact git://worker/tally-fs7-handoff.git "$work/repository"
             test "$(cat "$work/repository/artifact.txt")" = artifact-created-on-worker
+            store_path="$(cat "$work/repository/attic-store-path.txt")"
+            case "$store_path" in
+              /nix/store/*-tally-attic-handoff) ;;
+              *)
+                echo "worker returned an invalid Attic store path: $store_path" >&2
+                exit 1
+                ;;
+            esac
+            if nix-store --query --hash "$store_path" >/dev/null 2>&1; then
+              echo "Attic handoff path was present before substitution: $store_path" >&2
+              exit 1
+            fi
+            nix-store --realise "$store_path"
+            test "$(cat "$store_path")" = artifact-created-on-worker-through-attic
             {
               printf '%s\n' 'artifact-created-on-worker'
               git -C "$work/repository" rev-parse HEAD
             } >/tmp/tally-fs7-coordinator-consumed
+            {
+              printf '%s\n' "$store_path"
+              cat "$store_path"
+            } >/tmp/tally-attic-coordinator-consumed
           '';
         };
         multiHostFlowArgs = {
@@ -1190,11 +1215,17 @@
               "--configure-cache '*' --configure-cache-retention '*'"
             ).strip()
             coordinator.succeed(
-              "${pkgs.attic-client}/bin/attic login tally "
+              "runuser -u tally -- env HOME=/var/lib/tally-coordinator "
+              "${pkgs.attic-client}/bin/attic login --set-default tally "
               "http://coordinator:8080 " + attic_token
             )
             coordinator.succeed(
-              "${pkgs.attic-client}/bin/attic cache create --public tally-handoff"
+              "runuser -u tally -- env HOME=/var/lib/tally-coordinator "
+              "${pkgs.attic-client}/bin/attic cache create --public tally:tally-handoff"
+            )
+            coordinator.succeed(
+              "runuser -u tally -- env HOME=/var/lib/tally-coordinator "
+              "${pkgs.attic-client}/bin/attic use tally:tally-handoff"
             )
             worker.succeed(
               "runuser -u tally-worker -- env HOME=/var/lib/tally-worker "
@@ -1328,6 +1359,17 @@
             coordinator.succeed(
               "${pkgs.git}/bin/git ls-remote git://worker/tally-fs7-handoff.git "
               "refs/heads/artifact | grep -F refs/heads/artifact"
+            )
+            coordinator.succeed(
+              "grep -Fx artifact-created-on-worker-through-attic "
+              "/tmp/tally-attic-coordinator-consumed"
+            )
+            coordinator.succeed(
+              "store_path=$(head -n1 /tmp/tally-attic-coordinator-consumed); "
+              "store_hash=$(basename \"$store_path\" | cut -d- -f1); "
+              "${pkgs.curl}/bin/curl --fail --silent "
+              "\"http://coordinator:8080/tally-handoff/$store_hash.narinfo\" "
+              "| grep -F \"StorePath: $store_path\""
             )
             coordinator.succeed(
               "${tally}/bin/tally witness verify --ledger "

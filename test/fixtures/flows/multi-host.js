@@ -1,6 +1,6 @@
 export const meta = {
   name: "fixture-multi-host",
-  description: "SSH execution, replay attach, and Git-backed cross-host artifact handoff",
+  description: "SSH execution, replay attach, and Git- and Attic-backed cross-host artifact handoff",
   pools: ["coordinator-slot", "worker-slot"],
   argsSchema: {
     type: "object",
