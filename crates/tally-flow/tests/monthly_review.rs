@@ -258,7 +258,7 @@ fn options() -> RunOptions {
     options
 }
 
-fn run(client: Rc<TestClient>) -> Result<tally_flow::RunReport, tally_flow::FlowError> {
+fn run(client: Rc<TestClient>) -> Result<tally_flow::RunReport, Box<tally_flow::FlowError>> {
     run_script(
         SOURCE,
         Some(Path::new("examples/flows/monthly-review.js")),
@@ -266,6 +266,7 @@ fn run(client: Rc<TestClient>) -> Result<tally_flow::RunReport, tally_flow::Flow
         Rc::new(VecLifecycleSink::default()),
         options(),
     )
+    .map_err(Box::new)
 }
 
 #[test]
