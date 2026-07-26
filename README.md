@@ -218,6 +218,11 @@ ID, so retrying after an SSH interruption cannot launch a second copy. Evidence 
 paths is evaluated on the worker; exit status, captures, evidence result, executor name, and pool
 set return to the coordinator for its canonical witness.
 
+Git AI authorship binding is optional and remains an external fleet-tool integration. Tom's
+dotfiles provide `git-ai` on each execution host; tally.nix never packages or fetches it. See
+[Git AI authorship: one result, two authorities](doc/git-ai-authorship.md) for configuration,
+settlement, witness/query fields, offline verification, and the Agent Trace compatibility boundary.
+
 Before creating a unit, the worker fsyncs its generation marker in `stateDir`. If that generation
 later has neither a live unit nor a durable exit record, tally treats the state as an interrupted
 prior launch and refuses to replay it. Keep `stateDir` on storage that survives worker restarts.
@@ -421,7 +426,7 @@ Absent revision keys remain absent, preserving legacy witness bytes and hashes e
 
 ## Durable query projections
 
-Query protocol 3 exposes the complete durable read-only surface:
+Query protocol 4 exposes the complete durable read-only surface:
 
 ```console
 $ tally query jobs --state running --adapter codex --limit 100
@@ -480,12 +485,11 @@ remain advisory. The protocol uses one authority vocabulary: `durable-admission-
 match the winning canonical witness. Credential names may be projected; credential values are
 never stored in lifecycle history, trace metadata, or query output.
 
-Protocol 3 deliberately supersedes protocol 2. The boundary adds cursor pagination, trace,
-producer inventory, watch, nested generic origin, and trace availability; it also renames
-`durable-admission`, `canonical-witness`, and `advisory-adapter-scrape` to the vocabulary above.
-Existing `status`, `render`, `standup`, and `pools` views keep their practical shapes but now carry
-`protocolVersion: 3` and read the same durable sources. Clients that validate protocol versions
-must negotiate or reject version 3 rather than assuming protocol-2 authority strings.
+Protocol 4 adds the compact Git AI authorship cross-link to the protocol-3 durable query boundary.
+It carries the exact witnessed revision and note binding, repository/workspace identity, and
+separately sourced Tally and Git AI session/model observations. Existing `status`, `render`,
+`standup`, and `pools` views keep their practical shapes but now carry `protocolVersion: 4`.
+Clients that validate protocol versions must negotiate or reject version 4.
 
 ## Tests and scenarios
 

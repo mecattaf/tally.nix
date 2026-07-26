@@ -487,6 +487,7 @@ mod tests {
                 completion: None,
                 result_revision: None,
                 authorship: None,
+                authorship_sessions: None,
             })
             .unwrap()
     }
@@ -671,6 +672,7 @@ mod tests {
             completion: None,
             result_revision: None,
             authorship: None,
+            authorship_sessions: None,
             extensions: serde_json::Map::new(),
             seq: 1,
             prev_hash: crate::witness::GENESIS_PREV_HASH.to_owned(),

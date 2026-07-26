@@ -167,6 +167,7 @@ fn seed_durable_facts(paths: &DaemonPaths, uuid: Uuid) {
             completion: None,
             result_revision: None,
             authorship: None,
+            authorship_sessions: None,
         })
         .unwrap();
     assert_eq!(record.seq, 1);

@@ -15,6 +15,7 @@ use tally_client::{
     default_config_path, resolve_max_frame_bytes, RpcClient, WireErrorCode, WireIoError,
     DEFAULT_MAX_FRAME_BYTES,
 };
+use tally_core::authorship::verify_authorship;
 use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
 use tally_core::config::Priority;
 use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings};
@@ -535,6 +536,20 @@ enum WitnessCommand {
         attestations: Option<PathBuf>,
         #[arg(long = "exec-attestations", value_name = "PATH")]
         exec_attestations: Vec<PathBuf>,
+        #[arg(long, value_enum, default_value = "text")]
+        format: WitnessVerifyFormat,
+    },
+    VerifyAuthorship {
+        #[arg(long, value_name = "PATH")]
+        ledger: Option<PathBuf>,
+        #[arg(long, alias = "repo", value_name = "DIR")]
+        repository: PathBuf,
+        #[arg(long, value_name = "UUID")]
+        task: String,
+        #[arg(long)]
+        attempt: Option<u32>,
+        #[arg(long)]
+        lease_epoch: Option<u64>,
         #[arg(long, value_enum, default_value = "text")]
         format: WitnessVerifyFormat,
     },
@@ -2216,6 +2231,59 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                 Err(exit_failure(1, String::new()))
             }
         }
+        WitnessCommand::VerifyAuthorship {
+            ledger,
+            repository,
+            task,
+            attempt,
+            lease_epoch,
+            format,
+        } => {
+            let ledger = ledger.unwrap_or(default_data_dir()?.join("witness.jsonl"));
+            let report =
+                verify_authorship(&ledger, &repository, task.as_str(), attempt, lease_epoch)?;
+            match format {
+                WitnessVerifyFormat::Json => {
+                    println!("{}", serde_json::to_string(&report)?);
+                }
+                WitnessVerifyFormat::Text => {
+                    println!(
+                        "authorship binding: {}",
+                        serde_json::to_value(report.status)?
+                            .as_str()
+                            .expect("status serializes as a string")
+                    );
+                    println!(
+                        "verdict chain: {} ({} records)",
+                        if report.ledger.ok { "ok" } else { "invalid" },
+                        report.ledger.records
+                    );
+                    if let Some(revision) = &report.result_revision {
+                        println!("result revision: {revision}");
+                    }
+                    if let Some(expected) = &report.expected_note_content_sha256 {
+                        println!("expected note digest: {expected}");
+                    }
+                    if let Some(observed) = &report.observed_note_content_sha256 {
+                        println!("observed note digest: {observed}");
+                    }
+                    if let Some(expected) = &report.expected_notes_ref_target {
+                        println!("expected notes-ref target: {expected}");
+                    }
+                    if let Some(observed) = &report.observed_notes_ref_target {
+                        println!("observed notes-ref target: {observed}");
+                    }
+                    if let Some(reason) = &report.reason {
+                        println!("reason: {reason}");
+                    }
+                }
+            }
+            if report.ok {
+                Ok(())
+            } else {
+                Err(exit_failure(1, String::new()))
+            }
+        }
     }
 }
 
@@ -2363,6 +2431,43 @@ mod tests {
     #[test]
     fn clap_tree_is_consistent() {
         Opts::command().debug_assert();
+    }
+
+    #[test]
+    fn authorship_verifier_cli_selects_an_exact_witness_lane() {
+        let options = Opts::try_parse_from([
+            "tally",
+            "witness",
+            "verify-authorship",
+            "--ledger",
+            "/tmp/witness.jsonl",
+            "--repository",
+            "/tmp/repository",
+            "--task",
+            "00000000-0000-4000-8000-000000000053",
+            "--attempt",
+            "2",
+            "--lease-epoch",
+            "7",
+            "--format",
+            "json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            options.command,
+            Some(Command::Witness {
+                command: WitnessCommand::VerifyAuthorship {
+                    ledger: Some(ledger),
+                    repository,
+                    task,
+                    attempt: Some(2),
+                    lease_epoch: Some(7),
+                    format: WitnessVerifyFormat::Json,
+                }
+            }) if ledger == Path::new("/tmp/witness.jsonl")
+                && repository == Path::new("/tmp/repository")
+                && task == "00000000-0000-4000-8000-000000000053"
+        ));
     }
 
     #[test]
