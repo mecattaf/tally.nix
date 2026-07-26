@@ -19,6 +19,10 @@ use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
 use tally_core::config::Priority;
 use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings};
 use tally_core::evidence::RetryPolicy;
+use tally_core::exec_attestation::{
+    compare as compare_witness_attestations, read_verified_exec_attestations, run_exec,
+    ExecRunRequest, EXEC_ATTESTATION_LEDGER,
+};
 use tally_core::executor::{
     persist_exit_record_from_env, serve_remote_executor_stdio, ExecutionPaths, UnitLimits,
 };
@@ -90,6 +94,10 @@ enum Command {
     Witness {
         #[command(subcommand)]
         command: WitnessCommand,
+    },
+    Attest {
+        #[command(subcommand)]
+        command: AttestCommand,
     },
     Lease {
         #[command(subcommand)]
@@ -181,6 +189,35 @@ struct RecordUnitExitArgs {
     record: PathBuf,
     #[arg(long)]
     unit: String,
+}
+
+#[derive(Debug, Subcommand)]
+enum AttestCommand {
+    Exec(AttestExecArgs),
+}
+
+#[derive(Debug, Args)]
+struct AttestExecArgs {
+    #[arg(long)]
+    task_uuid: String,
+    #[arg(long)]
+    attempt: u32,
+    #[arg(long)]
+    lease_epoch: u64,
+    #[arg(long)]
+    payload_hash: Option<String>,
+    #[arg(long)]
+    brief_hash: Option<String>,
+    #[arg(long)]
+    adapter: Option<String>,
+    #[arg(long)]
+    executor: Option<String>,
+    #[arg(long, value_name = "SPEC")]
+    evidence: Vec<String>,
+    #[arg(long, value_name = "PATH")]
+    ledger: Option<PathBuf>,
+    #[arg(last = true, required = true)]
+    argv: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -479,8 +516,22 @@ enum WitnessCommand {
         ledger: Option<PathBuf>,
         #[arg(long)]
         attestations: Option<PathBuf>,
+        #[arg(long = "exec-attestations", value_name = "PATH")]
+        exec_attestations: Vec<PathBuf>,
         #[arg(long, value_enum, default_value = "text")]
         format: WitnessVerifyFormat,
+    },
+    Compare {
+        #[arg(long, value_name = "DIR", conflicts_with = "canon")]
+        data_dir: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        canon: Option<PathBuf>,
+        #[arg(long, value_name = "PATH", required = true, num_args = 1..)]
+        attestations: Vec<PathBuf>,
+        #[arg(long, value_enum, default_value = "text")]
+        format: WitnessVerifyFormat,
+        #[arg(long)]
+        strict: bool,
     },
 }
 
@@ -636,8 +687,12 @@ impl std::fmt::Display for ExitFailure {
 impl StdError for ExitFailure {}
 
 fn invalid(message: impl Into<String>) -> anyhow::Error {
+    exit_failure(2, message)
+}
+
+fn exit_failure(code: i32, message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(ExitFailure {
-        code: 2,
+        code,
         message: message.into(),
     })
 }
@@ -653,7 +708,7 @@ async fn main() {
     match run().await {
         Ok(()) => {}
         Err(error) => {
-            if !helper_mode {
+            if !helper_mode && !error.to_string().is_empty() {
                 eprintln!("tally: {error:#}");
             }
             std::process::exit(error_exit_code(&error));
@@ -1030,6 +1085,7 @@ async fn execute(opts: Opts) -> Result<()> {
         }
         Some(Command::Producer { command }) => run_producer(opts.config, command),
         Some(Command::Witness { command }) => run_witness(command),
+        Some(Command::Attest { command }) => run_attest(command),
         Some(Command::Lease { command }) => {
             run_lease(&socket, opts.config.as_deref(), command).await
         }
@@ -1995,6 +2051,7 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
             path,
             ledger,
             attestations,
+            exec_attestations,
             format,
         } => {
             let ledger = path
@@ -2005,6 +2062,22 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
             let (verdict_report, verdict_records) = read_verified_records(&ledger)?;
             let (attestation_report, attestation_records) =
                 read_verified_attestations(&attestations)?;
+            let mut exec_reports = Vec::with_capacity(exec_attestations.len());
+            let mut exec_ok = true;
+            for path in exec_attestations {
+                let (report, records) = read_verified_exec_attestations(&path)?;
+                exec_ok &= report.ok;
+                let head = records.last().map_or_else(
+                    || json!({"seq": 0, "hash": GENESIS_PREV_HASH}),
+                    |record| {
+                        json!({
+                            "seq": record.record.seq,
+                            "hash": record.record.hash,
+                        })
+                    },
+                );
+                exec_reports.push((path, report, head));
+            }
             match format {
                 WitnessVerifyFormat::Text => {
                     if verdict_report.ok {
@@ -2033,6 +2106,18 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                         attestation_report.records,
                         attestation_report.authentication
                     );
+                    for (path, report, _) in &exec_reports {
+                        println!(
+                            "execution attestation chain {}: {} ({} records; {})",
+                            path.display(),
+                            if report.ok { "ok" } else { "invalid" },
+                            report.records,
+                            report.authentication
+                        );
+                        if let Some(problem) = &report.problem {
+                            println!("  {problem}");
+                        }
+                    }
                 }
                 WitnessVerifyFormat::Json => {
                     let verdict_head = verdict_records.last().map_or_else(
@@ -2048,7 +2133,7 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                         serde_json::to_string(&json!({
                             "schemaVersion": 2,
                             "protocolVersion": tally_core::query::QUERY_PROTOCOL_VERSION,
-                            "ok": verdict_report.ok && attestation_report.ok,
+                            "ok": verdict_report.ok && attestation_report.ok && exec_ok,
                             "chains": {
                                 "verdict": {
                                     "path": ledger,
@@ -2061,14 +2146,95 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                                     "chainHead": attestation_head,
                                 },
                             },
+                            "execAttestations": exec_reports
+                                .iter()
+                                .map(|(path, report, head)| json!({
+                                    "path": path,
+                                    "report": report,
+                                    "chainHead": head,
+                                }))
+                                .collect::<Vec<_>>(),
                         }))?
                     );
                 }
             }
-            if !verdict_report.ok || !attestation_report.ok {
+            if !verdict_report.ok || !attestation_report.ok || !exec_ok {
                 bail!("ledger verification failed");
             }
             Ok(())
+        }
+        WitnessCommand::Compare {
+            data_dir,
+            canon,
+            attestations,
+            format,
+            strict,
+        } => {
+            let canon = match (data_dir, canon) {
+                (Some(data_dir), None) => data_dir.join("witness.jsonl"),
+                (None, Some(canon)) => canon,
+                (None, None) => default_data_dir()?.join("witness.jsonl"),
+                (Some(_), Some(_)) => unreachable!("clap rejects conflicting canon selectors"),
+            };
+            let report = compare_witness_attestations(&canon, &attestations, strict)
+                .map_err(|error| exit_failure(2, error.to_string()))?;
+            match format {
+                WitnessVerifyFormat::Json => {
+                    println!("{}", serde_json::to_string(&report)?);
+                }
+                WitnessVerifyFormat::Text => {
+                    for execution in &report.executions {
+                        println!(
+                            "{} {} {:?}",
+                            execution.witness_ref, execution.execution_id, execution.agreement
+                        );
+                        for diff in &execution.diffs {
+                            println!("  {diff}");
+                        }
+                    }
+                    println!(
+                        "compared={} unanimous={} diverged={} unattested={} orphans={}",
+                        report.summary.compared,
+                        report.summary.unanimous,
+                        report.summary.diverged,
+                        report.summary.unattested,
+                        report.summary.orphans
+                    );
+                }
+            }
+            if report.ok {
+                Ok(())
+            } else {
+                Err(exit_failure(1, String::new()))
+            }
+        }
+    }
+}
+
+fn run_attest(command: AttestCommand) -> Result<()> {
+    match command {
+        AttestCommand::Exec(args) => {
+            let ledger = args
+                .ledger
+                .unwrap_or(default_state_dir()?.join(EXEC_ATTESTATION_LEDGER));
+            let outcome = run_exec(ExecRunRequest {
+                ledger,
+                task_uuid: args.task_uuid,
+                attempt: args.attempt,
+                lease_epoch: args.lease_epoch,
+                payload_hash: args.payload_hash,
+                brief_hash: args.brief_hash,
+                adapter: args.adapter,
+                executor: args.executor,
+                evidence: args.evidence,
+                argv: args.argv,
+            })
+            .map_err(|error| invalid(error.to_string()))?;
+            if outcome.exit_code == 0 {
+                Ok(())
+            } else {
+                Err(exit_failure(outcome.exit_code, String::new()))
+            }
         }
     }
 }
