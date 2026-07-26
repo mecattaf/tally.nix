@@ -476,7 +476,7 @@ impl<'ast> Visitor<'ast> for DeterminismLint<'_> {
                 }
             }
             let spec_index = match function.as_str() {
-                "job" => Some(0),
+                "job" | "drv" => Some(0),
                 "claude" | "codex" | "local" | "sh" => Some(1),
                 _ => None,
             };

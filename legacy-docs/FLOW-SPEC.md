@@ -516,6 +516,33 @@ flow:<flowRunId>:k:<spec.key>         — when the author supplies spec.key (mus
 Keys are scoped to the flow run — cross-run memoization is opt-in by the author supplying
 a raw global `dedupKey` in spec (advanced; documented as escaping run scoping).
 
+### 11.2.1 `drv(spec) → Promise<NodeResult>`
+
+`drv()` is the first-class primitive for hermetic, replay-stable work:
+
+> If a node is hermetic and replay-stable, it should be a derivation and Nix memoizes it.
+> `job()` exists only for the impure — and everything impure gets witnessed.
+
+`spec` is `{ drvPath, outputs: [{ name, path }, ...] }`. The derivation path must be a
+top-level Nix store path ending in `.drv`; outputs are canonicalized by name and must be
+non-empty, uniquely named top-level store paths. The fixed mapping is
+`nix build --no-link <drvPath>^*`, pool `build`, `store:<path>` evidence for every
+output, and dedup key `drv:<drvPath>`. The submitted task UUID is derived from the
+flow-local `flowRunId` and ordinal: it is byte-stable on replay, while a later flow run
+gets a distinct seed and therefore its own witness.
+
+The `build` pool is reserved in `meta.pools` and auto-declared beside `flow` with resource
+`build-slot`, cooperative enforcement, no hard preemption, and default capacity 2. If
+any output is not valid, the daemon admits an ordinary build row that leases one slot.
+If all outputs are valid, it skips admission entirely: no row and no lease. It still
+appends the cheap, hole-free witness with disposition and verdict `substituted`, pools
+`["build"]`, the stable UUID, derivation identity, and output `storePaths`.
+
+Store reuse validates paths through Nix rather than rehashing artifacts. Locally built
+outputs can enter downstream `build-effect` work through the host's existing Nix
+post-build-hook or JSONL feed. The substitution fast path does not synthesize a build
+event; its witness records that the already-valid store object satisfied the node.
+
 ### 11.3 Sugar
 
 `claude(prompt, opts)`, `codex(prompt, opts)`, `local(prompt, opts)`, `sh(argv, opts)` —
@@ -763,12 +790,13 @@ ORACLE-DELTAS entries when the BS-13 harness runs.
 
 ## 20. Explicitly out of scope (design chapters reserved, not corners cut)
 
-Witness v2 epoch break; script patching/versioning for in-flight runs; `drv()` derivation
-nodes and store-native memoization; attic-backed evidence retention via GC roots;
-query.watch-driven web/TUI; cross-machine witness comparison; microvm executor tier;
-multi-tenant anything.
+Witness v2 epoch break; script patching/versioning for in-flight runs; attic-backed evidence
+retention via GC roots; query.watch-driven web/TUI; cross-machine witness comparison; microvm
+executor tier; multi-tenant anything.
 
 > **Superseded entries 2026-07-26:** [Issue #84](https://github.com/mecattaf/tally.nix/issues/84)
 > discharged the witness-schema, store-evidence/GC-root retention, and cross-machine comparison
-> reservations. Its amendments make the schema plain rather than epoch-named. The `drv()` dialect
-> surface remains separately tracked by issue #71; this note does not claim that later unit.
+> reservations. Its amendments make the schema plain rather than epoch-named.
+>
+> **Further superseded 2026-07-26:** [Issue #71](https://github.com/mecattaf/tally.nix/issues/71)
+> admitted the `drv()` dialect surface. Section 11.2.1 is the resulting contract.

@@ -71,6 +71,21 @@ and that the declared set exactly matches the governing witness's `storePaths`. 
 Nix GC collect a path, this check becomes a normal dedup miss and the work runs fresh. Tally never
 reconstructs a store path from witness bytes and never substitutes byte hashing for Nix validity.
 
+For a flow `drv()` node, the declared derivation and outputs become the witness's `drv` and
+`storePaths` fields. The node uses `drv:<drvPath>` as its cross-run dedup key and derives its
+submitted task UUID from the flow-local run ID and ordinal. The latter is stable on replay but
+distinct in a later flow run, so each run gets its own cheap witness. If all outputs are valid, the
+daemon emits a `substituted` witness without admitting a row or leasing the reserved `build` pool.
+Otherwise it admits `nix build --no-link <drvPath>^*` under that pool, then applies the same store
+validation and root-registration rules.
+
+`build-effect` remains an observation surface rather than an implicit callback from witness
+append. To trigger downstream work for locally built outputs, configure the host's Nix
+`post-build-hook` to write the stream watched by a `build-effect` producer (directly as
+`post-build-hook`, or through its `jsonl` format). A substitution does not pretend that a build
+occurred and therefore does not synthesize a hook entry; the cheap witness is the record of that
+path through the flow.
+
 For cross-host durability, publish store objects explicitly from a flow with an `attic push`
 `sh()` step. There is no executor post-run push hook: cache publication remains visible work in
 the flow rather than a hidden data plane.

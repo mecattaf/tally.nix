@@ -2185,6 +2185,13 @@ let
     hardPreempt = lib.mkDefault false;
   };
 
+  buildPoolDefaults = {
+    resource = lib.mkDefault "build-slot";
+    capacity = lib.mkDefault 2;
+    enforce = lib.mkDefault "cooperative";
+    hardPreempt = lib.mkDefault false;
+  };
+
   producerEnqueues =
     producer:
     if producer.kind == "calendar" || producer.kind == "gh" then
@@ -2341,6 +2348,10 @@ let
               printf 'tally flow %s script meta.pools must not include flow\n' ${flowName} >&2
               exit 1
             fi
+            if jq -e '.pools | index("build") != null' "$meta" >/dev/null; then
+              printf 'tally flow %s script meta.pools must not include build\n' ${flowName} >&2
+              exit 1
+            fi
 
             script_max_nodes="$(jq -r '.maxNodes // empty' "$meta")"
             if [ -n "$script_max_nodes" ] && [ "$script_max_nodes" -gt ${toString flow.maxNodes} ]; then
@@ -2396,6 +2407,7 @@ in
   inherit
     adapterLibrary
     adapterDefaults
+    buildPoolDefaults
     meterEventPath
     flowPoolDefaults
     mkAssertions

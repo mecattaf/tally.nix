@@ -1,7 +1,7 @@
 export const meta = {
   name: "fixture-valid",
   description: "valid flow-check fixture",
-  pools: ["build", "worker-gpu"],
+  pools: ["worker-gpu"],
   argsSchema: {
     type: "object",
     required: ["task"],

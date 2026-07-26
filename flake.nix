@@ -688,6 +688,16 @@
             "tally flow fixture script meta.pools must not include flow"
           ];
         };
+        flowReservedBuildPoolFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-reserved-build-pool-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/reserved-build-pool.js;
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            "tally flow fixture script meta.pools must not include build"
+          ];
+        };
         flowMaxNodesFailure = pkgs.testers.testBuildFailure' {
           name = "tally-flow-max-nodes-failure";
           drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
@@ -1629,6 +1639,10 @@
               .retention == {"enable":true,"horizon":"30d","onCalendar":"daily"} and
               .attestations == {"exec":{"enable":true}} and
               .gitAi == {"enable":false,"mode":"advisory","awaitTimeoutSec":60,"globalAwaitOk":false} and
+              .pools.build.resource == "build-slot" and
+              .pools.build.capacity == 2 and
+              .pools.build.enforce == "cooperative" and
+              .pools.build.hardPreempt == false and
               .pools.flow.resource == "cpu-slot" and
               .pools.flow.capacity == 8 and
               .pools.flow.enforce == "cooperative" and
@@ -1733,7 +1747,10 @@
                   --args '{"task":"ship"}' \
                   --catalog ${./test/fixtures/flows/catalog.json})"
                 test "$(printf '%s' "$meta" | jq -r '.name')" = fixture-valid
-                test "$(printf '%s' "$meta" | jq -c '.pools')" = '["build","worker-gpu"]'
+                test "$(printf '%s' "$meta" | jq -c '.pools')" = '["worker-gpu"]'
+                drv_meta="$(${tally}/bin/tally flow check ${./test/fixtures/flows/valid-drv.js})"
+                test "$(printf '%s' "$drv_meta" | jq -r '.name')" = fixture-valid-drv
+                test "$(printf '%s' "$drv_meta" | jq -c '.pools')" = '[]'
                 for example in \
                   ${./examples/flows/agency-nightly.js} \
                   ${./examples/flows/fleet-deploy.js} \
@@ -1761,12 +1778,14 @@
                 lintFailure = flowUndeclaredPoolFailure;
                 closureFailure = flowPoolClosureFailure;
                 reservedFailure = flowReservedPoolFailure;
+                reservedBuildFailure = flowReservedBuildPoolFailure;
                 maxNodesFailure = flowMaxNodesFailure;
               }
               ''
                 test -e "$lintFailure"
                 test -e "$closureFailure"
                 test -e "$reservedFailure"
+                test -e "$reservedBuildFailure"
                 test -e "$maxNodesFailure"
                 touch "$out"
               '';

@@ -21,8 +21,8 @@ pub use dialect::{check_script, CheckOptions, CheckedFlow, Meta};
 pub use engine::{run_script, LifecycleSink, RunOptions, VecLifecycleSink};
 pub use error::{FlowError, SourceLocation};
 pub use model::{
-    Admission, ClientError, Disposition, FlowSubmission, NodeFailure, NodeResult, NodeSpec,
-    Orchestration, RunInspection, RunReport, SelectionProvenance, Verdict,
+    Admission, ClientError, Derivation, DerivationOutput, Disposition, FlowSubmission, NodeFailure,
+    NodeResult, NodeSpec, Orchestration, RunInspection, RunReport, SelectionProvenance, Verdict,
 };
 
 /// The one prompt-delivery argument used by every agent adapter sugar.

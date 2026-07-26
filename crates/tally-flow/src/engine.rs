@@ -18,10 +18,10 @@ use serde_json::{json, Map, Value};
 use crate::catalog::sha256;
 use crate::dialect::validate_instance;
 use crate::executor::FlowJobExecutor;
-use crate::model::SubmissionPlan;
+use crate::model::{is_nix_store_path, SubmissionPlan};
 use crate::{
-    check_script, resolve_members, Catalog, CheckOptions, Disposition, FlowClient, FlowError,
-    FlowSubmission, Meta, NodeFailure, NodeResult, NodeSpec, Orchestration, RunReport,
+    check_script, resolve_members, Catalog, CheckOptions, Derivation, Disposition, FlowClient,
+    FlowError, FlowSubmission, Meta, NodeFailure, NodeResult, NodeSpec, Orchestration, RunReport,
     SelectionProvenance, SelectorOptions, SourceLocation, BRIEF_SENTINEL, DEFAULT_MAX_NODES,
     ENGINE_LOOP_LIMIT, ENGINE_RECURSION_LIMIT,
 };
@@ -413,6 +413,10 @@ impl HostShared {
             mode: "full".to_owned(),
             dedup_key: dedup_key.clone(),
             payload_hash,
+            task_uuid: spec
+                .drv
+                .as_ref()
+                .map(|_| stable_drv_task_uuid(&self.flow_run_id, ordinal)),
             credentials,
             spec,
             orchestration,
@@ -497,7 +501,7 @@ impl HostShared {
 
         self.finish_admission(plan.ordinal, Some(admission.disposition))?;
         let mut result = match admission.disposition {
-            Disposition::Reused | Disposition::Terminal => {
+            Disposition::Reused | Disposition::Substituted | Disposition::Terminal => {
                 admission.terminal.clone().ok_or_else(|| {
                     FlowError::new(
                         "FlowProtocolError",
@@ -918,6 +922,7 @@ fn harden_engine(context: &mut Context) -> JsResult<()> {
 fn install_host_api(context: &mut Context) -> JsResult<()> {
     for (name, length, function) in [
         ("job", 2, NativeFunction::from_fn_ptr(native_job)),
+        ("drv", 2, NativeFunction::from_fn_ptr(native_drv)),
         ("claude", 2, NativeFunction::from_fn_ptr(native_claude)),
         ("codex", 2, NativeFunction::from_fn_ptr(native_codex)),
         ("local", 2, NativeFunction::from_fn_ptr(native_local)),
@@ -983,6 +988,51 @@ fn native_job(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         )
     })?;
     let settle = settle_option(args.get(1), context)?;
+    make_job_promise(spec, NodeRevisions::default(), settle, location, context)
+}
+
+fn native_drv(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
+    let location = call_site(context);
+    let raw = value_to_json(
+        args.first().unwrap_or(&JsValue::undefined()),
+        "derivation spec",
+        context,
+    )?;
+    reject_unknown_keys(&raw, &["drvPath", "outputs"], location)
+        .map_err(|error| flow_to_js_error(error, context))?;
+    let mut drv: Derivation = serde_json::from_value(raw).map_err(|error| {
+        flow_to_js_error(
+            FlowError::new(
+                "FlowSpecError",
+                "invalid-derivation",
+                format!("drv spec has an invalid shape: {error}"),
+            )
+            .at(location),
+            context,
+        )
+    })?;
+    drv.canonicalize().map_err(|error| {
+        flow_to_js_error(
+            FlowError::new("FlowSpecError", "invalid-derivation", error).at(location),
+            context,
+        )
+    })?;
+    let settle = settle_option(args.get(1), context)?;
+    let drv_path = drv.drv_path.clone();
+    let evidence = drv
+        .output_paths()
+        .into_iter()
+        .map(|path| format!("store:{path}"))
+        .collect::<Vec<_>>();
+    let spec: NodeSpec = serde_json::from_value(json!({
+        "argv": ["nix", "build", "--no-link", format!("{drv_path}^*")],
+        "adapter": "shell",
+        "pools": ["build"],
+        "evidence": evidence,
+        "drv": drv,
+        "dedupKey": format!("drv:{drv_path}"),
+    }))
+    .expect("the fixed drv mapping always has a valid NodeSpec shape");
     make_job_promise(spec, NodeRevisions::default(), settle, location, context)
 }
 
@@ -1637,6 +1687,36 @@ fn validate_node_spec_shape(spec: &NodeSpec, location: SourceLocation) -> Result
     for (name, value) in &spec.env {
         validate_environment_entry(name, value, location)?;
     }
+    if let Some(drv) = &spec.drv {
+        drv.validate().map_err(|error| {
+            FlowError::new("FlowSpecError", "invalid-derivation", error).at(location)
+        })?;
+        let expected_argv = vec![
+            "nix".to_owned(),
+            "build".to_owned(),
+            "--no-link".to_owned(),
+            format!("{}^*", drv.drv_path),
+        ];
+        let expected_evidence = drv
+            .output_paths()
+            .into_iter()
+            .map(|path| format!("store:{path}"))
+            .collect::<Vec<_>>();
+        let expected_key = format!("drv:{}", drv.drv_path);
+        if spec.argv.as_ref() != Some(&expected_argv)
+            || spec.adapter.as_deref() != Some("shell")
+            || spec.pools != ["build"]
+            || spec.evidence != expected_evidence
+            || spec.dedup_key.as_deref() != Some(expected_key.as_str())
+        {
+            return Err(FlowError::new(
+                "FlowSpecError",
+                "invalid-derivation",
+                "drv nodes require the fixed nix build argv, shell adapter, build pool, drv key, and output store evidence",
+            )
+            .at(location));
+        }
+    }
     Ok(())
 }
 
@@ -1784,7 +1864,7 @@ fn normalize_pools(
             )
             .at(location));
         }
-        if !meta.pools.iter().any(|declared| declared == pool) {
+        if spec.drv.is_none() && !meta.pools.iter().any(|declared| declared == pool) {
             return Err(FlowError::new(
                 "FlowPoolError",
                 "undeclared-pool",
@@ -1808,6 +1888,7 @@ fn canonicalize_evidence(
     };
     let mut hash_seen = false;
     let mut exit_seen = false;
+    let mut store_paths = BTreeSet::new();
     let mut canonical = Vec::with_capacity(evidence.len());
     for spec in evidence {
         let (kind, value) = spec
@@ -1818,6 +1899,17 @@ fn canonicalize_evidence(
             "artifact" => {
                 return Err(invalid("artifact evidence requires a path".to_owned()));
             }
+            "store" if !is_nix_store_path(value) => {
+                return Err(invalid(
+                    "store evidence requires an absolute canonical Nix store path".to_owned(),
+                ));
+            }
+            "store" if !store_paths.insert(value.to_owned()) => {
+                return Err(invalid(format!(
+                    "store evidence contains duplicate path {value}"
+                )));
+            }
+            "store" => canonical.push(spec.clone()),
             "hash" => {
                 if hash_seen {
                     return Err(invalid("hash evidence appears more than once".to_owned()));
@@ -1864,7 +1956,7 @@ fn canonicalize_evidence(
             }
             _ => {
                 return Err(invalid(format!(
-                    "unknown evidence kind {kind:?}; expected artifact, hash, or exit"
+                    "unknown evidence kind {kind:?}; expected artifact, store, hash, or exit"
                 )));
             }
         }
@@ -2055,6 +2147,9 @@ fn canonical_payload_hash(
             .unwrap_or_else(|| json!({"prePromptArgv": [], "environment": {}})),
     );
     payload.insert("evidence".to_owned(), json!(spec.evidence));
+    if let Some(drv) = &spec.drv {
+        payload.insert("drv".to_owned(), json!(drv));
+    }
     if let Some(class) = &spec.evidence_class {
         payload.insert("evidenceClass".to_owned(), class.clone());
     }
@@ -2093,6 +2188,40 @@ fn canonical_payload_hash(
         )
     })?;
     Ok(sha256(&bytes))
+}
+
+fn stable_drv_task_uuid(flow_run_id: &str, ordinal: u64) -> String {
+    let digest = sha256(format!("flow:{flow_run_id}:{ordinal}").as_bytes());
+    let hex = digest
+        .strip_prefix("sha256:")
+        .expect("sha256 helper always returns a tagged digest");
+    let mut bytes = [0_u8; 16];
+    for (index, pair) in hex.as_bytes().chunks_exact(2).take(16).enumerate() {
+        let pair = std::str::from_utf8(pair).expect("sha256 output is ASCII");
+        bytes[index] =
+            u8::from_str_radix(pair, 16).expect("sha256 output contains hexadecimal digits");
+    }
+    bytes[6] = (bytes[6] & 0x0f) | 0x50;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15]
+    )
 }
 
 fn validate_terminal_result(
@@ -2523,7 +2652,10 @@ mod tests {
                 self.submissions.borrow_mut().push(submission);
                 return Box::pin(std::future::ready(Err(error)));
             }
-            let task_uuid = format!("task-{index}");
+            let task_uuid = submission
+                .task_uuid
+                .clone()
+                .unwrap_or_else(|| format!("task-{index}"));
             let terminal = NodeResult {
                 task_uuid: task_uuid.clone(),
                 verdict: reply.verdict,
@@ -2540,7 +2672,7 @@ mod tests {
             };
             let inline = matches!(
                 reply.disposition,
-                Disposition::Reused | Disposition::Terminal
+                Disposition::Reused | Disposition::Substituted | Disposition::Terminal
             )
             .then(|| terminal.clone());
             self.terminals
@@ -3039,6 +3171,109 @@ mod tests {
         assert!(submissions[3].spec.brief.is_none());
         assert!(submissions[3].orchestration.prompt_revision.is_none());
         assert!(submissions[3].orchestration.skill_revision.is_none());
+    }
+
+    #[test]
+    fn drv_sugar_is_store_native_replay_stable_and_substituted_is_success() {
+        const DRV: &str = "/nix/store/00000000000000000000000000000000-fixture.drv";
+        const DEV: &str = "/nix/store/11111111111111111111111111111111-fixture-dev";
+        const OUT: &str = "/nix/store/22222222222222222222222222222222-fixture";
+        let source = format!(
+            "{}\n(async () => drv({{\n\
+             drvPath: {DRV:?},\n\
+             outputs: [\n\
+               {{name: 'out', path: {OUT:?}}},\n\
+               {{name: 'dev', path: {DEV:?}}}\n\
+             ]\n\
+             }}))()",
+            meta(&[], &[])
+        );
+        let mut identities = Vec::new();
+        for _ in 0..2 {
+            let client = MockClient::new(vec![Reply {
+                disposition: Disposition::Substituted,
+                witness_seq: 7,
+                verdict: Verdict::Substituted,
+                result: None,
+                divergent_hash: false,
+                client_error: None,
+            }]);
+            let (report, _) = run(&source, client.clone()).unwrap();
+            assert_eq!(
+                report.final_value.as_ref().unwrap()["disposition"],
+                "substituted"
+            );
+            assert_eq!(
+                report.final_value.as_ref().unwrap()["verdict"],
+                "substituted"
+            );
+            let submission = client.submissions.borrow()[0].clone();
+            assert_eq!(submission.dedup_key, format!("drv:{DRV}"));
+            assert_eq!(
+                submission.task_uuid.as_deref(),
+                Some("35c1f3a2-0ec5-53bf-8019-62ac60ca5bb0")
+            );
+            assert_eq!(submission.spec.pools, ["build"]);
+            assert_eq!(submission.spec.adapter.as_deref(), Some("shell"));
+            assert_eq!(
+                submission.spec.argv.as_deref(),
+                Some(
+                    &[
+                        "nix".to_owned(),
+                        "build".to_owned(),
+                        "--no-link".to_owned(),
+                        format!("{DRV}^*")
+                    ][..]
+                )
+            );
+            assert_eq!(
+                submission.spec.evidence,
+                [format!("store:{DEV}"), format!("store:{OUT}")]
+            );
+            assert_eq!(
+                submission
+                    .spec
+                    .drv
+                    .as_ref()
+                    .unwrap()
+                    .outputs
+                    .iter()
+                    .map(|output| output.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["dev", "out"]
+            );
+            assert_eq!(
+                submission.payload_hash,
+                "sha256:7420a9161793b05545bbb806bf1449a9554f756b8e4d800718050b6447b31f7f"
+            );
+            identities.push((submission.task_uuid, submission.payload_hash));
+        }
+        assert_eq!(identities[0], identities[1]);
+    }
+
+    #[test]
+    fn drv_sugar_rejects_noncanonical_derivations_before_submission() {
+        let cases = [
+            (
+                "{drvPath: '/tmp/not-a.drv', outputs: [{name: 'out', path: '/nix/store/11111111111111111111111111111111-out'}]}",
+                "drvPath must be a Nix store path ending in .drv",
+            ),
+            (
+                "{drvPath: '/nix/store/00000000000000000000000000000000-empty.drv', outputs: []}",
+                "drv outputs must be non-empty",
+            ),
+            (
+                "{drvPath: '/nix/store/00000000000000000000000000000000-dupe.drv', outputs: [{name: 'out', path: '/nix/store/11111111111111111111111111111111-one'}, {name: 'out', path: '/nix/store/22222222222222222222222222222222-two'}]}",
+                "drv outputs must be sorted by name and unique",
+            ),
+        ];
+        for (spec, message) in cases {
+            let source = format!("{}\ndrv({spec});", meta(&[], &[]));
+            let error = run(&source, MockClient::new(Vec::new())).unwrap_err();
+            assert_eq!(error.code, "invalid-derivation");
+            assert!(error.message.contains(message), "{error}");
+            assert!(error.location.is_some());
+        }
     }
 
     #[test]

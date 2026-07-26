@@ -59,12 +59,19 @@ invocable via §5 gh command wiring or manually — `tally flow run <store-path>
 <rendered args> --max-nodes <n> [--catalog <path>]`, the same argv the module would
 render.
 
-## 2. The `flow` pool
+## 2. Reserved flow pools
 
-Auto-declared when `flows != {}` (overridable by an explicit user declaration of the same
-name): `resource = "cpu-slot"`, `capacity = 8`, `enforce = "cooperative"`,
-`hardPreempt = false`. A blocked runner holds only this near-free slot. Assertion: a flow
-script's `meta.pools` MUST NOT list `flow` (nodes never run in the runner's pool).
+Two pools are auto-declared when `flows != {}` and can be overridden by explicit user
+declarations of the same names:
+
+- `flow`: `resource = "cpu-slot"`, `capacity = 8`, `enforce = "cooperative"`,
+  `hardPreempt = false`. A blocked runner holds only this near-free slot.
+- `build`: `resource = "build-slot"`, `capacity = mkDefault 2`,
+  `enforce = "cooperative"`, `hardPreempt = false`. A non-substitutable `drv()` node
+  leases one slot; its substitution fast path leases none.
+
+Both names are reserved. A flow script's `meta.pools` MUST NOT list `flow` or `build`;
+the runner supplies those implementation pools.
 
 ## 3. Eval-time validation — the most Nix-native section
 
@@ -77,8 +84,9 @@ declared flow adds to the checked-config derivation:
    global references detectable statically), and emits `meta` as JSON on stdout. Non-zero
    exit fails the build with the engine's own error (line/column).
 2. **Pool closure**: `jq` cross-check that `meta.pools ⊆ config.pools` (plus the §2
-   assertion). An undeclared pool is a **build failure at `nixos-rebuild`/`home-manager
-   switch` time**, never a 1 a.m. `unknown pool` runtime failure.
+   reserved-name assertions). An undeclared or reserved pool is a **build failure at
+   `nixos-rebuild`/`home-manager switch` time**, never a 1 a.m. `unknown pool` runtime
+   failure.
 3. **Args validation**: rendered `args` validated against `meta.argsSchema` (the binary
    does this in `flow check --args`; JSON Schema evaluation lives in Rust, not in Nix).
 4. **Catalog check**: when `catalog` is set, `tally flow check --catalog` validates it
