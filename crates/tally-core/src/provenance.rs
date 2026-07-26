@@ -37,6 +37,31 @@ impl Orchestration {
                 return Err("orchestration maxNodes must be a positive integer when set".to_owned());
             }
         }
+        if object.get("promptRevision").is_some_and(|revision| {
+            revision.as_str().is_none_or(|revision| {
+                revision.len() != 71
+                    || !revision.starts_with("sha256:")
+                    || !revision[7..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        }) {
+            return Err(
+                "orchestration promptRevision must be lowercase sha256 hex when set".to_owned(),
+            );
+        }
+        if object.get("skillRevision").is_some_and(|revision| {
+            revision.as_str().is_none_or(|revision| {
+                revision.is_empty()
+                    || revision.len() > 256
+                    || revision.chars().any(char::is_control)
+            })
+        }) {
+            return Err(
+                "orchestration skillRevision must be non-empty, at most 256 bytes, and contain no control characters when set"
+                    .to_owned(),
+            );
+        }
         Ok(())
     }
 
@@ -107,8 +132,31 @@ mod tests {
                 "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
                 "iterationPath": [1]
             }),
+            serde_json::json!({
+                "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+                "promptRevision": "sha256:ABC"
+            }),
+            serde_json::json!({
+                "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+                "skillRevision": ""
+            }),
+            serde_json::json!({
+                "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+                "skillRevision": "bad\nrevision"
+            }),
         ] {
             assert!(Orchestration::new(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn capsule_accepts_reserved_revision_keys_and_preserves_their_order() {
+        let raw = concat!(
+            r#"{"flowRunId":"018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321","promptRevision":"sha256:"#,
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            r#"","skillRevision":"review-agent-v3"}"#,
+        );
+        let capsule: Orchestration = serde_json::from_str(raw).unwrap();
+        assert_eq!(serde_json::to_string(&capsule).unwrap(), raw);
     }
 }

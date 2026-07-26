@@ -851,7 +851,7 @@ fn build_summary(
     let pools = detail
         .map(|detail| detail.pools.clone())
         .or_else(|| current_event.and_then(|event| event.fields.pools.clone()))
-        .or_else(|| latest_witness.and_then(|record| record.pools.clone()));
+        .or_else(|| latest_witness.map(|record| record.pools.clone()));
     let pool_signal_values = pools
         .iter()
         .flatten()
@@ -1205,7 +1205,7 @@ fn witness_lifecycle_projection(record: &WitnessRecord) -> LifecycleEventProject
         attempt: Some(record.attempt),
         lease_epoch: Some(record.lease_epoch),
         adapter: None,
-        pools: record.pools.clone(),
+        pools: Some(record.pools.clone()),
         executor: record.executor.clone(),
         unit: None,
         job_id: None,

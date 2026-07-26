@@ -2030,7 +2030,7 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                     println!(
                         "{}",
                         serde_json::to_string(&json!({
-                            "schemaVersion": 1,
+                            "schemaVersion": 2,
                             "protocolVersion": tally_core::query::QUERY_PROTOCOL_VERSION,
                             "ok": verdict_report.ok && attestation_report.ok,
                             "chains": {
@@ -2076,7 +2076,7 @@ fn error_exit_code(error: &anyhow::Error) -> i32 {
 
 fn verdict_exit_code(verdict: &str) -> i32 {
     match verdict {
-        "pass" | "reused" => 0,
+        "pass" | "reused" | "substituted" => 0,
         "clean-exit-no-artifact" => 3,
         "cancelled" => 4,
         "failed" | "pool-vanished" | "preempted" | "runtime-exceeded" => 1,

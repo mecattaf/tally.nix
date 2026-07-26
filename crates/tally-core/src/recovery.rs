@@ -535,11 +535,7 @@ fn validate_history(
             )));
         }
         previous_record = Some(record);
-        if record
-            .pools
-            .as_ref()
-            .is_some_and(|pools| pools != &row.pools)
-        {
+        if record.pools != row.pools {
             return Err(RecoveryError::InvalidFacts(format!(
                 "witness seq {} pool does not match durable row {}",
                 record.seq, row.uuid
@@ -991,7 +987,7 @@ mod tests {
         RemoteExecutorReply, RemoteExecutorRequest, RemoteExecutorResult, RemoteTransport,
         RemoteTransportError, REMOTE_EXECUTOR_PROTOCOL_VERSION,
     };
-    use crate::taskdb::{write_enqueue_event_atomic, DurableRetry, EnqueueSource};
+    use crate::taskdb::{write_enqueue_event_atomic, AdmissionOrigin, DurableRetry, EnqueueSource};
     use crate::witness::{build_record, ChainHead, WitnessBody};
 
     use super::*;
@@ -1026,7 +1022,7 @@ mod tests {
             runtime_max_sec: Some(30),
             no_enqueue: false,
             credentials: BTreeMap::new(),
-            origin: None,
+            origin: Some(AdmissionOrigin::direct(EnqueueSource::EventsDir)),
             gh_origin: None,
             related_trigger: None,
             evidence_class: None,
@@ -1047,10 +1043,16 @@ mod tests {
                 let record = build_record(
                     WitnessBody {
                         task_uuid: Some(row.uuid.to_string()),
-                        transition_timestamp: format!("2026-07-19T10:00:0{index}Z"),
+                        transition_timestamp: format!("2026-07-19T10:00:0{index}.000Z"),
                         verdict: *verdict,
-                        exit_code: if *verdict == Verdict::Pass { 0 } else { 1 },
+                        exit_code: if matches!(*verdict, Verdict::Pass | Verdict::Reused) {
+                            0
+                        } else {
+                            1
+                        },
                         artifact_content_hash: None,
+                        store_paths: None,
+                        drv: None,
                         gpu_seconds: None,
                         wall_clock: 1.0,
                         attempt: row.attempt + index as u32,
@@ -1058,20 +1060,29 @@ mod tests {
                         dedup_key: row.dedup_key.clone(),
                         payload_hash: row.payload_hash.clone(),
                         brief_hash: row.brief_hash.clone(),
+                        origin: row
+                            .origin
+                            .clone()
+                            .expect("fixture row carries admission origin"),
                         orchestration: row.orchestration.clone(),
-                        labor_class: if index == 0 {
+                        labor_class: if *verdict == Verdict::Reused {
+                            LaborClass::Reused
+                        } else if index == 0 {
                             LaborClass::Fresh
                         } else {
                             LaborClass::Recovered
                         },
                         trace_ref: None,
-                        pools: Some(row.pools.clone()),
+                        pools: row.pools.clone(),
                         executor: row.executor.clone(),
+                        host_id: None,
                         charge: None,
                         model: None,
                         evidence_class: None,
                         manifest_hash: None,
                         completion: None,
+                        result_revision: None,
+                        authorship: None,
                     },
                     &head,
                 )

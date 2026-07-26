@@ -636,7 +636,8 @@ pub const fn retry_trigger(verdict: Verdict) -> Option<RetryTrigger> {
         | Verdict::CleanExitNoArtifact
         | Verdict::Failed
         | Verdict::Cancelled
-        | Verdict::Reused => None,
+        | Verdict::Reused
+        | Verdict::Substituted => None,
     }
 }
 
@@ -666,7 +667,11 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
-    use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, WitnessRecord};
+    use crate::taskdb::{AdmissionOrigin, EnqueueSource};
+    use crate::witness::{
+        counts_toward_canonical_gpu_seconds, LaborClass, RecordType, WitnessRecord,
+        WITNESS_SCHEMA_VERSION,
+    };
 
     fn parse(specs: &[&str]) -> EvidenceSpec {
         EvidenceSpec::parse(specs.iter().copied()).unwrap()
@@ -679,11 +684,15 @@ mod tests {
         seq: u64,
     ) -> WitnessRecord {
         WitnessRecord {
+            schema_version: WITNESS_SCHEMA_VERSION,
+            record_type: RecordType::Verdict,
+            transition_timestamp: "2026-07-19T00:00:00.000Z".to_owned(),
             task_uuid: None,
-            transition_timestamp: "2026-07-19T00:00:00Z".to_owned(),
             verdict,
             exit_code: 0,
             artifact_content_hash,
+            store_paths: None,
+            drv: None,
             gpu_seconds: Some(1.0),
             wall_clock: 1.0,
             attempt: 1,
@@ -691,16 +700,21 @@ mod tests {
             dedup_key: Some(dedup_key.to_owned()),
             payload_hash: None,
             brief_hash: None,
+            origin: AdmissionOrigin::direct(EnqueueSource::Manual),
             orchestration: None,
             labor_class: LaborClass::Fresh,
             trace_ref: None,
-            pools: Some(vec!["gpu".to_owned()]),
+            pools: vec!["gpu".to_owned()],
             executor: None,
+            host_id: None,
             charge: None,
             model: None,
             evidence_class: None,
             manifest_hash: None,
             completion: None,
+            result_revision: None,
+            authorship: None,
+            extensions: serde_json::Map::new(),
             seq,
             prev_hash: String::new(),
             hash: String::new(),
