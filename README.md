@@ -480,12 +480,11 @@ remain advisory. The protocol uses one authority vocabulary: `durable-admission-
 match the winning canonical witness. Credential names may be projected; credential values are
 never stored in lifecycle history, trace metadata, or query output.
 
-Protocol 3 deliberately supersedes protocol 2. The boundary adds cursor pagination, trace,
-producer inventory, watch, nested generic origin, and trace availability; it also renames
-`durable-admission`, `canonical-witness`, and `advisory-adapter-scrape` to the vocabulary above.
-Existing `status`, `render`, `standup`, and `pools` views keep their practical shapes but now carry
-`protocolVersion: 3` and read the same durable sources. Clients that validate protocol versions
-must negotiate or reject version 3 rather than assuming protocol-2 authority strings.
+Protocol 4 adds the compact Git AI authorship cross-link to the protocol-3 durable query boundary.
+It carries the exact witnessed revision and note binding, repository/workspace identity, and
+separately sourced Tally and Git AI session/model observations. Existing `status`, `render`,
+`standup`, and `pools` views keep their practical shapes but now carry `protocolVersion: 4`.
+Clients that validate protocol versions must negotiate or reject version 4.
 
 ## Tests and scenarios
 
