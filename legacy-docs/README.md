@@ -9,6 +9,12 @@ behavior, `FLOW-SPEC.md` and `NIX-SPEC-FLOW.md` win over `SPEC.md` and `NIX-SPEC
 wherever they speak to the same subject. Where the flow-era pair is silent, the pre-flow
 pair still governs. Nothing here is normative once the corresponding book chapter lands.
 
+**Superseded witness reservation (2026-07-26):** `FLOW-SPEC.md` §§19–20 deferred a witness
+encoding decision to a later Tom-led session. That reservation was discharged by
+[issue #84](https://github.com/mecattaf/tally.nix/issues/84) as amended: the final schema replaced
+the predecessor encoding in place, archived predecessor state is inert, and TaskChampion is a
+rebuildable view. The current ruling is recorded in [`doc/witness.md`](../doc/witness.md).
+
 | File | What it is | Status |
 |---|---|---|
 | `SPEC.md` | Pre-flow normative product spec — kernel, pools, leases, executors, evidence, witness, producers, adapters | Authority for everything the flow era did not amend; absorb into the book's Concepts + Reference chapters |
@@ -21,11 +27,12 @@ pair still governs. Nothing here is normative once the corresponding book chapte
 | `transfer/` (9 briefs) | Style-transfer corpora: Boa, rquickjs, workflows.js, Inngest/Cloudflare, durable execution, spec-kit vocabulary, dotfiles prior art, Nix module style, attic/Trustix | Keep as design-rationale sources for the book's Architecture chapter; each records *why* a mechanism looks the way it does |
 | `campaign/` | Agent-campaign provenance, previously loose at the repo root and untracked: `CODEX-HANDOFF.md`'s companions — `completion-july20.md` (waves 12–13 correction handoff), `wave-11-5.md` (the r2 removal wave), `ORCHESTRATION-HANDOFF.md` (state at checkpoint 2), `FLOW-CAMPAIGN-HANDOFF.md` + `FLOW-CAMPAIGN-STATE.md` (the 2026-07-24→25 flow campaign's mission and step ledger), `MORNING-REPORT.md` (its outcome report), `wave-log.jsonl` | Historical. Records how the code came to exist and which sessions decided what; the surviving conclusions are in issue #82 |
 
-## The six known divergences (legacy vs flow era)
+## The seven known divergences (legacy vs current implementation)
 
-Recorded by the flow campaign as ORACLE-DELTAS 4–9. In every case the implementation
-followed the flow-era spec; the legacy sentence is the stale one. These must be resolved
-in prose exactly once, in the book — not patched here.
+The first six were recorded by the flow campaign as ORACLE-DELTAS 4–9. In every case the
+implementation followed the flow-era spec; the legacy sentence is the stale one. The seventh
+records the later final-witness ruling. These are resolved in prose exactly once, in the book,
+while the legacy statements remain visible as provenance.
 
 1. `NIX-SPEC.md §4` requires a nonempty `requiredGateIds` and treats a missing manifest as
    failure; `FLOW-SPEC.md §13` requires empty preset defaults and treats an absent manifest
@@ -42,6 +49,10 @@ in prose exactly once, in the book — not patched here.
 6. `NIX-SPEC-FLOW.md §1` `budgetPool`: normative producer rendering fixes the runner pool to
    `[ "flow" ]`; `budgetPool` is validated for existence only, and no extra render channel
    was invented.
+7. `FLOW-SPEC.md` §§19–20 reserve a witness epoch break and say none occurs in that campaign.
+   [Issue #84](https://github.com/mecattaf/tally.nix/issues/84), Amendments 1–2, supersedes that
+   reservation with the final in-place schema, inert predecessor archives, and the rebuildable
+   TaskChampion view recorded in [`doc/witness.md`](../doc/witness.md).
 
 Additionally, `README.md`'s claim that tally "is not a workflow scheduler" predates the
 flow-era doctrine amendment (`FLOW-SPEC.md §1`: tally never *originates intent*;

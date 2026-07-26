@@ -1406,6 +1406,12 @@ pub struct TaskAdmission {
     pub prepared: Option<PreparedRow>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildStats {
+    pub rows: usize,
+    pub witness_records: usize,
+}
+
 #[derive(Debug, Error)]
 pub enum TaskDbError {
     #[error("TaskChampion error: {0}")]
@@ -1568,6 +1574,17 @@ impl TaskDb {
         events_dir: &Path,
         witness_path: &Path,
     ) -> Result<usize, TaskDbError> {
+        Ok(self
+            .rebuild_from_sources_with_stats(events_dir, witness_path)
+            .await?
+            .rows)
+    }
+
+    pub async fn rebuild_from_sources_with_stats(
+        &mut self,
+        events_dir: &Path,
+        witness_path: &Path,
+    ) -> Result<RebuildStats, TaskDbError> {
         let events = read_acknowledged_events(events_dir)?;
         let (report, witness) = read_verified_records(witness_path)?;
         if !report.ok {
@@ -1582,6 +1599,7 @@ impl TaskDb {
             );
             return Err(TaskDbError::InvalidWitness(detail));
         }
+        let witness_records = report.records;
         let terminal = terminal_witness_by_task(witness);
         let mut authoritative = Vec::new();
         for event in events {
@@ -1596,7 +1614,11 @@ impl TaskDb {
                     });
             authoritative.push((row, status, labor_class));
         }
-        self.replace_with_authoritative_rows(authoritative).await
+        let rows = self.replace_with_authoritative_rows(authoritative).await?;
+        Ok(RebuildStats {
+            rows,
+            witness_records,
+        })
     }
 
     pub async fn rebuild_from_recovery_plan(
