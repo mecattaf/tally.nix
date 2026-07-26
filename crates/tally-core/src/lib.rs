@@ -6,6 +6,7 @@ pub mod completion;
 pub mod config;
 pub mod daemon;
 pub mod evidence;
+pub mod exec_attestation;
 pub mod executor;
 pub mod git_ai;
 pub mod history;

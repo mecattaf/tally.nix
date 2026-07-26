@@ -77,6 +77,26 @@ impl Default for GitAiConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ExecAttestationConfig {
+    #[serde(default = "default_true")]
+    pub enable: bool,
+}
+
+impl Default for ExecAttestationConfig {
+    fn default() -> Self {
+        Self { enable: true }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AttestationsConfig {
+    #[serde(default)]
+    pub exec: ExecAttestationConfig,
+}
+
 /// A daemonless execution target reached through a single, explicitly
 /// configured OpenSSH identity. The remote side runs the same `tally` binary
 /// as a short-lived protocol helper; it does not run a tally daemon.
@@ -370,6 +390,8 @@ pub struct Config {
     #[serde(default)]
     pub git_ai: GitAiConfig,
     #[serde(default)]
+    pub attestations: AttestationsConfig,
+    #[serde(default)]
     pub pools: BTreeMap<String, PoolConfig>,
     #[serde(default)]
     pub adapters: BTreeMap<String, AdapterConfig>,
@@ -390,6 +412,7 @@ impl Default for Config {
             lease: LeaseConfig::default(),
             retention: RetentionConfig::default(),
             git_ai: GitAiConfig::default(),
+            attestations: AttestationsConfig::default(),
             pools: BTreeMap::new(),
             adapters: BTreeMap::new(),
             producers: BTreeMap::new(),
@@ -669,6 +692,7 @@ mod tests {
         assert_eq!(legacy.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
         assert_eq!(legacy.aging_threshold_sec, DEFAULT_AGING_THRESHOLD_SEC);
         assert_eq!(legacy.retention, RetentionConfig::default());
+        assert_eq!(legacy.attestations, AttestationsConfig::default());
         legacy.validate().unwrap();
 
         let configured: Config = serde_json::from_str(
@@ -688,6 +712,18 @@ mod tests {
                 Err(ConfigError::InvalidFlowRuntimeLimit)
             ));
         }
+    }
+
+    #[test]
+    fn execution_attestations_are_default_on_and_strictly_shaped() {
+        let configured: Config =
+            serde_json::from_str(r#"{"pools":{},"attestations":{"exec":{"enable":false}}}"#)
+                .unwrap();
+        assert!(!configured.attestations.exec.enable);
+        assert!(serde_json::from_str::<Config>(
+            r#"{"pools":{},"attestations":{"exec":{"enable":true,"ledger":"elsewhere"}}}"#
+        )
+        .is_err());
     }
 
     #[test]
