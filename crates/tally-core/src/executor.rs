@@ -27,7 +27,9 @@ use crate::completion::{
 };
 use crate::config::{ExecutionTargetConfig, Priority, SshExecutorConfig};
 use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOutcome};
+use crate::git_ai::{self, GitAiExecution};
 use crate::taskdb::{GhOrigin, WorkspaceMetadata};
+use crate::witness::Authorship;
 
 pub const CAPTURE_DIRECTORY: &str = "capture";
 pub const CAPTURE_ARCHIVE_DIRECTORY: &str = "capture/archive";
@@ -117,6 +119,8 @@ pub struct ExecutionRequest {
     pub workspace: Option<WorkspaceMetadata>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_manifest: Option<GateManifestSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_ai: Option<GitAiExecution>,
     #[serde(default, skip_serializing_if = "AdapterHardening::is_none")]
     pub hardening: AdapterHardening,
     pub credentials: BTreeMap<String, PathBuf>,
@@ -185,6 +189,10 @@ pub struct ExecutionOutcome {
     /// Structured execution/gate/acceptance facts computed on the filesystem
     /// that owns the declared gate manifest.
     pub semantic_completion: Option<SemanticCompletion>,
+    /// Exact result/authorship binding computed on the host that owns the
+    /// result worktree. Both remain absent when Git AI integration is disabled.
+    pub result_revision: Option<String>,
+    pub authorship: Option<Authorship>,
     /// Whether stdout/stderr for this exact generation are locally available
     /// for advisory adapter scraping.
     pub captures_available: bool,
@@ -385,7 +393,7 @@ impl LocalUnitFact {
     }
 }
 
-pub const REMOTE_EXECUTOR_PROTOCOL_VERSION: u32 = 2;
+pub const REMOTE_EXECUTOR_PROTOCOL_VERSION: u32 = 3;
 const MAX_REMOTE_REQUEST_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_REMOTE_REPLY_BYTES: usize = 48 * 1024 * 1024;
 const MAX_REMOTE_STDERR_BYTES: usize = 64 * 1024;
@@ -449,6 +457,10 @@ pub struct RemoteCompletion {
     pub evidence_gate: Option<GateResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_completion: Option<SemanticCompletion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorship: Option<Authorship>,
 }
 
 #[doc(hidden)]
@@ -1080,6 +1092,8 @@ pub enum ExecutorError {
     RemoteExecution { executor: String, detail: String },
     #[error("remote executor protocol error for {executor:?}: {detail}")]
     RemoteProtocol { executor: String, detail: String },
+    #[error("{0}")]
+    GitAiRequired(String),
     #[error("local execution unit {unit} already exists in state {state:?}")]
     ExistingUnit { unit: String, state: LocalUnitState },
     #[error(
@@ -1608,6 +1622,9 @@ impl Executor {
                             ),
                         });
                     }
+                    if message.starts_with("git-ai-") {
+                        return Err(ExecutorError::GitAiRequired(message));
+                    }
                     return Err(ExecutorError::RemoteExecution {
                         executor: name.to_owned(),
                         detail: message,
@@ -1775,6 +1792,8 @@ impl Executor {
             termination: completion.termination,
             evidence_gate: completion.evidence_gate,
             semantic_completion: completion.semantic_completion,
+            result_revision: completion.result_revision,
+            authorship: completion.authorship,
             captures_available,
         })
     }
@@ -2171,10 +2190,19 @@ impl Executor {
         }
         let mut writable = Vec::new();
         if let Some(workspace) = &request.workspace {
-            writable.push(workspace.worktree_path.as_path());
+            writable.push(workspace.worktree_path.clone());
+            if request.git_ai.is_some() {
+                writable.extend(git_repository_write_paths(&workspace.worktree_path));
+            }
         }
-        writable.push(self.state_dir.as_path());
-        let writable = writable
+        writable.push(self.state_dir.clone());
+        let mut unique_writable = Vec::new();
+        for path in writable {
+            if !unique_writable.contains(&path) {
+                unique_writable.push(path);
+            }
+        }
+        let writable = unique_writable
             .into_iter()
             .map(|path| quote_systemd_exec_word(path.as_os_str()))
             .collect::<Result<Vec<_>, _>>()?
@@ -2184,6 +2212,23 @@ impl Executor {
     }
 
     pub async fn execute(
+        &self,
+        request: ExecutionRequest,
+    ) -> Result<ExecutionOutcome, ExecutorError> {
+        let preflight = match &request.git_ai {
+            Some(execution) => Some(
+                git_ai::preflight(execution)
+                    .await
+                    .map_err(ExecutorError::GitAiRequired)?,
+            ),
+            None => None,
+        };
+        let outcome = self.execute_raw(request.clone()).await?;
+        self.finalize_outcome(outcome, &request, preflight.as_ref())
+            .await
+    }
+
+    async fn execute_raw(
         &self,
         mut request: ExecutionRequest,
     ) -> Result<ExecutionOutcome, ExecutorError> {
@@ -2211,6 +2256,8 @@ impl Executor {
                         termination,
                         evidence_gate: None,
                         semantic_completion: None,
+                        result_revision: None,
+                        authorship: None,
                         captures_available: true,
                     });
                 }
@@ -2307,6 +2354,8 @@ impl Executor {
             termination,
             evidence_gate: None,
             semantic_completion: None,
+            result_revision: None,
+            authorship: None,
             captures_available: true,
         })
     }
@@ -2315,6 +2364,26 @@ impl Executor {
     /// running. Unlike `execute`, this path can never turn an absent or stale
     /// observation into a fresh launch.
     pub async fn adopt(
+        &self,
+        request: ExecutionRequest,
+        expected_invocation_id: &str,
+    ) -> Result<ExecutionOutcome, ExecutorError> {
+        let preflight = match &request.git_ai {
+            Some(execution) => Some(
+                git_ai::preflight(execution)
+                    .await
+                    .map_err(ExecutorError::GitAiRequired)?,
+            ),
+            None => None,
+        };
+        let outcome = self
+            .adopt_raw(request.clone(), expected_invocation_id)
+            .await?;
+        self.finalize_outcome(outcome, &request, preflight.as_ref())
+            .await
+    }
+
+    async fn adopt_raw(
         &self,
         request: ExecutionRequest,
         expected_invocation_id: &str,
@@ -2387,11 +2456,40 @@ impl Executor {
                         termination,
                         evidence_gate: None,
                         semantic_completion: None,
+                        result_revision: None,
+                        authorship: None,
                         captures_available: true,
                     });
                 }
             }
         }
+    }
+
+    async fn finalize_outcome(
+        &self,
+        mut outcome: ExecutionOutcome,
+        request: &ExecutionRequest,
+        preflight: Option<&git_ai::Preflight>,
+    ) -> Result<ExecutionOutcome, ExecutorError> {
+        let Some(spec) = &request.gate_manifest else {
+            return Ok(outcome);
+        };
+        let execution = execution_fact(&outcome.termination);
+        let mut completion = evaluate_completion(execution, spec);
+        if let (Some(git_ai), Some(preflight)) = (&request.git_ai, preflight) {
+            let worktree = request
+                .workspace
+                .as_ref()
+                .map(|workspace| workspace.worktree_path.as_path());
+            let binding = git_ai::bind(git_ai, preflight, &completion, worktree).await;
+            outcome.result_revision = binding.result_revision;
+            outcome.authorship = binding.authorship;
+            if let Some(reason) = binding.required_failure {
+                completion = evaluate_completion(ExecutionFact::failed(reason), spec);
+            }
+        }
+        outcome.semantic_completion = Some(completion);
+        Ok(outcome)
     }
 
     fn validate_request(&self, request: &ExecutionRequest) -> Result<(), ExecutorError> {
@@ -2424,6 +2522,9 @@ impl Executor {
             return Err(ExecutorError::InvalidRequest(
                 "attempt must be positive".to_owned(),
             ));
+        }
+        if let Some(git_ai) = &request.git_ai {
+            git_ai.validate().map_err(ExecutorError::InvalidRequest)?;
         }
         if request.argv.is_empty() || request.argv[0].is_empty() {
             return Err(ExecutorError::InvalidRequest(
@@ -2780,9 +2881,35 @@ impl Executor {
             termination,
             evidence_gate: None,
             semantic_completion: None,
+            result_revision: None,
+            authorship: None,
             captures_available: true,
         })
     }
+}
+
+fn git_repository_write_paths(worktree: &Path) -> Vec<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args([
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-dir",
+            "--git-common-dir",
+        ])
+        .output();
+    let Ok(output) = output else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .collect()
 }
 
 async fn terminate_direct_process_group(
@@ -2876,6 +3003,12 @@ fn execution_environment(
         environment.push((
             "TALLY_GATE_MANIFEST".to_owned(),
             display_path(&manifest.path)?.to_owned(),
+        ));
+    }
+    if let Some(git_ai) = &request.git_ai {
+        environment.push((
+            "GIT_AI_CUSTOM_ATTRIBUTES".to_owned(),
+            git_ai.attributes_json()?,
         ));
     }
     if let Some(workspace) = &request.workspace {
@@ -2978,6 +3111,9 @@ fn environment_to_unset(request: &ExecutionRequest) -> Vec<&'static str> {
     }
     if request.gate_manifest.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[11]);
+    }
+    if request.git_ai.is_none() {
+        names.push("GIT_AI_CUSTOM_ATTRIBUTES");
     }
     if request
         .gh_origin
@@ -3543,7 +3679,6 @@ fn collect_remote_capture(paths: &ExecutionPaths, attempt: u32, lease_epoch: u64
 fn remote_completion(
     outcome: ExecutionOutcome,
     evidence: &[String],
-    gate_manifest: Option<&GateManifestSpec>,
 ) -> Result<RemoteCompletion, ExecutorError> {
     let gate = match &outcome.termination {
         ExecutionTermination::Exited(exit_code) => {
@@ -3557,8 +3692,6 @@ fn remote_completion(
         }
         _ => None,
     };
-    let semantic_completion =
-        gate_manifest.map(|spec| evaluate_completion(execution_fact(&outcome.termination), spec));
     let capture = collect_remote_capture(
         &outcome.paths,
         outcome.record.attempt,
@@ -3570,7 +3703,9 @@ fn remote_completion(
         termination: outcome.termination,
         capture,
         evidence_gate: gate,
-        semantic_completion,
+        semantic_completion: outcome.semantic_completion,
+        result_revision: outcome.result_revision,
+        authorship: outcome.authorship,
     })
 }
 
@@ -3706,31 +3841,20 @@ async fn handle_remote_executor_request(
     match request {
         RemoteExecutorRequest::Ensure {
             request, evidence, ..
-        } => {
-            let gate_manifest = request.gate_manifest.clone();
-            Ok(RemoteExecutorResult::Completion(Box::new(
-                remote_completion(
-                    ensure_local_execution(&executor, request).await?,
-                    &evidence,
-                    gate_manifest.as_ref(),
-                )?,
-            )))
-        }
+        } => Ok(RemoteExecutorResult::Completion(Box::new(
+            remote_completion(ensure_local_execution(&executor, request).await?, &evidence)?,
+        ))),
         RemoteExecutorRequest::Adopt {
             request,
             expected_invocation_id,
             evidence,
             ..
-        } => {
-            let gate_manifest = request.gate_manifest.clone();
-            Ok(RemoteExecutorResult::Completion(Box::new(
-                remote_completion(
-                    executor.adopt(request, &expected_invocation_id).await?,
-                    &evidence,
-                    gate_manifest.as_ref(),
-                )?,
-            )))
-        }
+        } => Ok(RemoteExecutorResult::Completion(Box::new(
+            remote_completion(
+                executor.adopt(request, &expected_invocation_id).await?,
+                &evidence,
+            )?,
+        ))),
         RemoteExecutorRequest::Probe { identity, .. } => Ok(RemoteExecutorResult::Fact(
             executor.inspect_identity_async(&identity).await?,
         )),
@@ -3861,6 +3985,7 @@ mod tests {
             cwd: Some(PathBuf::from("/work tree")),
             workspace: None,
             gate_manifest: None,
+            git_ai: None,
             hardening: AdapterHardening::None,
             credentials: BTreeMap::from([
                 ("alpha".to_owned(), PathBuf::from("/run/keys/alpha")),
@@ -3871,6 +3996,28 @@ mod tests {
                 memory_max_bytes: 1_073_741_824,
             },
             runtime_max_sec: Some(30),
+        }
+    }
+
+    fn git_ai_execution() -> GitAiExecution {
+        GitAiExecution {
+            config: crate::config::GitAiConfig {
+                enable: true,
+                mode: crate::config::GitAiMode::Advisory,
+                await_timeout_sec: 60,
+                global_await_ok: true,
+            },
+            attributes: BTreeMap::from([
+                ("adapter".to_owned(), "codex".to_owned()),
+                ("attempt".to_owned(), "1".to_owned()),
+                ("leaseEpoch".to_owned(), "7".to_owned()),
+                (
+                    "taskUuid".to_owned(),
+                    "00000000-0000-4000-8000-000000000002".to_owned(),
+                ),
+            ]),
+            expected_session: None,
+            expected_model: None,
         }
     }
 
@@ -4035,6 +4182,8 @@ mod tests {
                 evidence: &evidence,
             })),
             semantic_completion: None,
+            result_revision: None,
+            authorship: None,
         }
     }
 
@@ -4451,6 +4600,71 @@ mod tests {
     }
 
     #[test]
+    fn git_ai_hardening_grants_the_linked_worktree_common_git_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = temp.path().join("repository");
+        let worktree = temp.path().join("linked-worktree");
+        std::fs::create_dir(&repository).unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&repository, &["init", "-q"]);
+        git(&repository, &["config", "user.name", "Tally Test"]);
+        git(
+            &repository,
+            &["config", "user.email", "tally@example.invalid"],
+        );
+        std::fs::write(repository.join("file"), "initial\n").unwrap();
+        git(&repository, &["add", "file"]);
+        git(&repository, &["commit", "-q", "-m", "initial"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "tally-linked-test",
+                worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        let mut enabled = request();
+        enabled.hardening = AdapterHardening::Strict;
+        enabled.workspace = Some(WorkspaceMetadata {
+            repo: "acme/widgets".to_owned(),
+            base_rev: "HEAD".to_owned(),
+            branch: "tally-linked-test".to_owned(),
+            worktree_path: worktree.clone(),
+        });
+        enabled.git_ai = Some(git_ai_execution());
+        let args = strings(
+            &executor(&temp.path().join("state"))
+                .build_systemd_argv(&enabled)
+                .unwrap(),
+        );
+        let writable = args
+            .windows(2)
+            .find(|pair| pair[0] == "--property" && pair[1].starts_with("ReadWritePaths="))
+            .unwrap()[1]
+            .clone();
+        assert!(writable.contains(worktree.to_str().unwrap()));
+        assert!(writable.contains(repository.join(".git").to_str().unwrap()));
+        assert!(writable.contains(".git/worktrees/linked-worktree"));
+    }
+
+    #[test]
     fn gate_manifest_path_is_exported_or_scrubbed_and_defaults_per_target() {
         let local = executor(Path::new("/coordinator-state"));
         let mut declared = request();
@@ -4509,6 +4723,39 @@ mod tests {
         assert!(multi_environment
             .iter()
             .any(|(name, value)| { name == "TALLY_POOL" && value == r#"["alpha","zeta"]"# }));
+    }
+
+    #[test]
+    fn git_ai_custom_attributes_are_exact_and_disabled_integration_is_absent() {
+        let mut enabled = request();
+        enabled.environment.insert(
+            "GIT_AI_CUSTOM_ATTRIBUTES".to_owned(),
+            r#"{"spoofed":"value"}"#.to_owned(),
+        );
+        enabled.git_ai = Some(git_ai_execution());
+        let environment = execution_environment(&enabled, None).unwrap();
+        assert_eq!(
+            environment
+                .iter()
+                .rev()
+                .find(|(name, _)| name == "GIT_AI_CUSTOM_ATTRIBUTES")
+                .map(|(_, value)| value.as_str()),
+            Some(
+                r#"{"adapter":"codex","attempt":"1","leaseEpoch":"7","taskUuid":"00000000-0000-4000-8000-000000000002"}"#
+            )
+        );
+        assert!(!environment_to_unset(&enabled).contains(&"GIT_AI_CUSTOM_ATTRIBUTES"));
+
+        let disabled = request();
+        assert!(execution_environment(&disabled, None)
+            .unwrap()
+            .iter()
+            .all(|(name, _)| name != "GIT_AI_CUSTOM_ATTRIBUTES"));
+        assert!(environment_to_unset(&disabled).contains(&"GIT_AI_CUSTOM_ATTRIBUTES"));
+        assert!(serde_json::to_value(&disabled)
+            .unwrap()
+            .get("gitAi")
+            .is_none());
     }
 
     #[test]
@@ -5760,6 +6007,7 @@ mod tests {
             cwd: None,
             workspace: None,
             gate_manifest: None,
+            git_ai: None,
             hardening: AdapterHardening::None,
             credentials: BTreeMap::new(),
             limits: UnitLimits {

@@ -169,7 +169,10 @@
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
           doCheck = true;
-          nativeCheckInputs = [ pkgs.taskwarrior3 ];
+          nativeCheckInputs = [
+            pkgs.git
+            pkgs.taskwarrior3
+          ];
           postInstall = ''
             ln -s tally $out/bin/tallyd
           '';
@@ -1396,6 +1399,12 @@
             horizon = "30d";
             onCalendar = "daily";
           };
+          assert stockHome.config.services.tally.gitAi == {
+            enable = false;
+            mode = "advisory";
+            awaitTimeoutSec = 60;
+            globalAwaitOk = false;
+          };
           assert homeServices ? tally-retention;
           assert homeTimers ? tally-retention;
           assert homeTimers.tally-retention.Timer.OnCalendar == "daily";
@@ -1485,6 +1494,7 @@
               .enqueue.fanoutCap == 64 and
               .lease.yieldGraceSec == 20 and
               .retention == {"enable":true,"horizon":"30d","onCalendar":"daily"} and
+              .gitAi == {"enable":false,"mode":"advisory","awaitTimeoutSec":60,"globalAwaitOk":false} and
               .pools.flow.resource == "cpu-slot" and
               .pools.flow.capacity == 8 and
               .pools.flow.enforce == "cooperative" and

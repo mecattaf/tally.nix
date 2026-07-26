@@ -30,9 +30,10 @@ use crate::adapters::{
 };
 use crate::brief::{self, PreparedBrief};
 use crate::completion::{
-    evaluate_completion, ExecutionFact, GateManifestSpec, GateSummaryStatus, SemanticCompletion,
+    evaluate_completion, ExecutionFact, ExecutionStatus, GateManifestSpec, GateSummaryStatus,
+    SemanticCompletion,
 };
-use crate::config::{Config, PoolPredicate, Priority};
+use crate::config::{Config, GitAiConfig, PoolPredicate, Priority};
 use crate::evidence::{
     parse_evidence_specs, probe_dedup, probe_full_pass, run_evidence_gate, CheckOutcome,
     DedupMissReason, RetryTrigger, RunOutcome,
@@ -41,6 +42,7 @@ use crate::executor::{
     ExecutionIdentity, ExecutionOutcome, ExecutionRequest, ExecutionTermination, Executor,
     ExecutorError, UnitLimits, Uuid,
 };
+use crate::git_ai::GitAiExecution;
 use crate::history::{HistoryError, LifecycleStore};
 use crate::journal::{EmitEvent, JournalEmitter, JournalEntry, TallyEvent};
 use crate::lease::{
@@ -659,6 +661,7 @@ struct DaemonHandler {
     gh_program: PathBuf,
     tally_socket: String,
     brief_root: PathBuf,
+    git_ai: GitAiConfig,
 }
 
 impl RpcHandler for DaemonHandler {
@@ -3638,6 +3641,7 @@ impl DaemonHandler {
             self.settings.unit_limits,
             &self.tally_socket,
             &self.brief_root,
+            &self.git_ai,
         );
         let execution_target = job.row.executor.clone();
         let evidence = job.row.evidence.clone();
@@ -4407,12 +4411,40 @@ fn execution_request(
     limits: UnitLimits,
     tally_socket: &str,
     brief_root: &Path,
+    git_ai_config: &GitAiConfig,
 ) -> Result<ExecutionRequest, ExecutorError> {
     let brief_path = job.row.brief_hash.as_deref().map(|hash| {
         brief::content_path(brief_root, hash)
             .expect("validated durable briefHash always derives a content path")
     });
     let gate_manifest = effective_gate_manifest(executor, job)?;
+    let git_ai = git_ai_config.enable.then(|| {
+        let mut attributes = BTreeMap::from([
+            ("taskUuid".to_owned(), job.stable_key()),
+            ("attempt".to_owned(), job.row.attempt.to_string()),
+            ("leaseEpoch".to_owned(), job.row.lease_epoch.to_string()),
+            ("adapter".to_owned(), job.row.adapter.clone()),
+        ]);
+        if let Some(orchestration) = &job.row.orchestration {
+            attributes.insert(
+                "flowRunId".to_owned(),
+                orchestration.flow_run_id().to_owned(),
+            );
+            if let Some(node_ordinal) = orchestration
+                .as_value()
+                .get("nodeOrdinal")
+                .and_then(Value::as_u64)
+            {
+                attributes.insert("nodeOrdinal".to_owned(), node_ordinal.to_string());
+            }
+        }
+        GitAiExecution {
+            config: git_ai_config.clone(),
+            attributes,
+            expected_session: job.row.session_ref.clone(),
+            expected_model: canonical_job_model(job),
+        }
+    });
     Ok(ExecutionRequest {
         identity: job.identity(),
         parent: job.row.parent_uuid,
@@ -4434,6 +4466,7 @@ fn execution_request(
         cwd: job.row.cwd.clone(),
         workspace: job.row.workspace.clone(),
         gate_manifest,
+        git_ai,
         hardening: job.invocation.hardening,
         credentials: job.row.credentials.clone(),
         limits,
@@ -5016,7 +5049,10 @@ fn canonical_verdict(
     completion: Option<&SemanticCompletion>,
 ) -> Verdict {
     if evidence_verdict == Verdict::Pass
-        && completion.is_some_and(|completion| completion.gates.status == GateSummaryStatus::Fail)
+        && completion.is_some_and(|completion| {
+            completion.execution.status == ExecutionStatus::Failure
+                || completion.gates.status == GateSummaryStatus::Fail
+        })
     {
         Verdict::Failed
     } else {
@@ -5367,6 +5403,7 @@ impl Daemon {
             gh_program: PathBuf::from("gh"),
             tally_socket,
             brief_root: paths.data_dir.clone(),
+            git_ai: config.git_ai.clone(),
         };
         Ok(Self {
             _state_lock: state_lock,
@@ -5655,6 +5692,10 @@ impl Daemon {
             Some(Ok(outcome)) if outcome.captures_available
         );
         let effective_gate_manifest = effective_gate_manifest(&self.handler.executor, &job)?;
+        let (result_revision, authorship) = match &finished.outcome {
+            Some(Ok(outcome)) => (outcome.result_revision.clone(), outcome.authorship.clone()),
+            _ => (None, None),
+        };
         let semantic_completion = match (&effective_gate_manifest, &finished.outcome) {
             (None, Some(Ok(outcome))) if outcome.semantic_completion.is_some() => {
                 return Err(DaemonError::Invalid(format!(
@@ -5687,7 +5728,11 @@ impl Daemon {
                 }
             }
             (Some(spec), Some(Err(error))) => {
-                let execution = ExecutionFact::failed(format!("executor failed: {error}"));
+                let reason = match error {
+                    ExecutorError::GitAiRequired(reason) => reason.clone(),
+                    _ => format!("executor failed: {error}"),
+                };
+                let execution = ExecutionFact::failed(reason);
                 let spec = spec.clone();
                 Some(
                     tokio::task::spawn_blocking(move || evaluate_completion(execution, &spec))
@@ -5805,8 +5850,8 @@ impl Daemon {
                     evidence_class: job.row.evidence_class.clone(),
                     manifest_hash: job.row.manifest_hash.clone(),
                     completion: semantic_completion.clone(),
-                    result_revision: None,
-                    authorship: None,
+                    result_revision: result_revision.clone(),
+                    authorship: authorship.clone(),
                 },
             )?;
             let result = JobResult {
@@ -8357,6 +8402,8 @@ mod tests {
                                 evidence: &evidence,
                             })),
                             semantic_completion: None,
+                            result_revision: None,
+                            authorship: None,
                         },
                     ))),
                 })
@@ -8441,6 +8488,8 @@ mod tests {
                                 evidence: &evidence,
                             })),
                             semantic_completion: None,
+                            result_revision: None,
+                            authorship: None,
                         }))
                     }
                     RemoteExecutorRequest::Ensure { .. } => {
@@ -9229,6 +9278,54 @@ mod tests {
         ] {
             assert_eq!(canonical_verdict(verdict, None), verdict);
         }
+    }
+
+    #[test]
+    fn a_bound_authorship_note_never_rescues_a_failed_gate() {
+        let completion: SemanticCompletion = serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "execution": {
+                "status": "success",
+                "exitCode": 0,
+                "reason": "process exited with code 0"
+            },
+            "gates": {
+                "status": "fail",
+                "artifact": {"resultRevision": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+                "gates": [{"id": "tests", "status": "fail"}]
+            },
+            "acceptance": {
+                "status": "rejected",
+                "policy": "execution-and-gates",
+                "reason": "a required gate failed"
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            canonical_verdict(Verdict::Pass, Some(&completion)),
+            Verdict::Failed
+        );
+    }
+
+    #[test]
+    fn required_authorship_failure_is_a_failed_canonical_verdict() {
+        let reason = "git-ai-missing-note: refs/notes/ai has no note for result";
+        let completion: SemanticCompletion = serde_json::from_value(json!({
+            "schemaVersion": 1,
+            "execution": {"status": "failure", "reason": reason},
+            "gates": {"status": "pass", "artifact": {}, "gates": []},
+            "acceptance": {
+                "status": "rejected",
+                "policy": "execution-and-gates",
+                "reason": "execution failed"
+            }
+        }))
+        .unwrap();
+        assert_eq!(completion.execution.reason, reason);
+        assert_eq!(
+            canonical_verdict(Verdict::Pass, Some(&completion)),
+            Verdict::Failed
+        );
     }
 
     #[test]
@@ -10752,6 +10849,7 @@ mod tests {
                     settings().unit_limits,
                     "/run/tally/tally.sock",
                     &paths.data_dir,
+                    &GitAiConfig::default(),
                 )
                 .unwrap();
                 let args = executor
@@ -10976,6 +11074,7 @@ mod tests {
                     settings().unit_limits,
                     "/run/tally/tally.sock",
                     &paths.data_dir,
+                    &GitAiConfig::default(),
                 )
                 .unwrap();
                 let args = executor
