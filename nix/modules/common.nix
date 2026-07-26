@@ -1727,6 +1727,31 @@ let
         };
         description = "Coordinator lease and cooperative-yield timing guardrails.";
       };
+      retention = mkOption {
+        type = types.submodule {
+          options = {
+            enable = mkOption {
+              type = types.bool;
+              default = true;
+              description = "Enable the age-based store-evidence retention timer.";
+            };
+            horizon = mkOption {
+              type = types.str;
+              default = "30d";
+              example = "90d";
+              description = "Systemd timespan for the witness-liveness retention floor.";
+            };
+            onCalendar = mkOption {
+              type = types.str;
+              default = "daily";
+              example = "weekly";
+              description = "Systemd calendar expression for store-evidence collection.";
+            };
+          };
+        };
+        default = { };
+        description = "Age-based Nix GC-root retention with a live-witness floor.";
+      };
       pools = mkOption {
         type = types.attrsOf mkPoolType;
         default = { };
@@ -2049,6 +2074,9 @@ let
     lease = {
       inherit (cfg.lease) graceSec yieldPollSec yieldGraceSec;
     };
+    retention = {
+      inherit (cfg.retention) enable horizon onCalendar;
+    };
     pools = mapAttrs renderPool cfg.pools;
     executors = mapAttrs renderExecutor cfg.executors;
     producers = mapAttrs renderProducer cfg.producers;
@@ -2116,6 +2144,14 @@ let
   mkAssertions =
     cfg:
     flatten [
+      {
+        assertion = cfg.retention.horizon != "";
+        message = "tally retention horizon must be non-empty";
+      }
+      {
+        assertion = cfg.retention.onCalendar != "";
+        message = "tally retention onCalendar must be non-empty";
+      }
       (mapAttrsToList (name: pool: [
         {
           assertion = validComponent name;

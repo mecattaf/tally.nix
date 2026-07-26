@@ -47,6 +47,7 @@ use crate::lease::{
     bump_epoch, AdmitOutcome, LeaseBackend, LeaseEngine, LeaseError, LeaseEventLog, LeaseGrant,
     LeaseRequest, LeaseSchedulingGroup, LocalLease, SystemdUnitLiveness,
 };
+use crate::nix_store::{DerivationAvailability, NixStore};
 use crate::pagination::{PageCache, PaginationError};
 use crate::producer_query::query_producers;
 use crate::producers::{
@@ -68,6 +69,10 @@ use crate::recovery::{
     RecoveryAction, RecoveryFacts, RecoveryIdentity, RecoveryPolicy, RecoveryRowState,
     RecoveryTriggers,
 };
+use crate::retention::{
+    acquire_registration_lock, gcroots_lock_path, parse_horizon, reconcile_recent_roots,
+    register_record_roots, GcRootsLock, RetentionError,
+};
 use crate::taskdb::{
     admits_durable_row, migrate_acknowledged_events, read_acknowledged_events,
     update_enqueue_event_atomic, write_enqueue_event_atomic, AdmissionInput, AdmissionOrigin,
@@ -82,8 +87,8 @@ use crate::wire::{
 };
 use crate::witness::{
     append_attestation, current_host_id, read_verified_attestations, read_verified_records,
-    repair_attestation_tail, verify_attestations, AttestationRecord, LaborClass, Verdict,
-    WitnessBody, WitnessError, WitnessLedger, WitnessRecord,
+    repair_attestation_tail, verify_attestations, AttestationRecord, Derivation, LaborClass,
+    Verdict, WitnessBody, WitnessError, WitnessLedger, WitnessRecord,
 };
 
 const LEASE_TICK: Duration = Duration::from_millis(100);
@@ -108,6 +113,10 @@ impl DaemonPaths {
 
     pub fn attestations_path(&self) -> PathBuf {
         self.data_dir.join("attestations.jsonl")
+    }
+
+    pub fn gcroots_dir(&self) -> PathBuf {
+        self.data_dir.join("gcroots")
     }
 
     pub fn lifecycle_path(&self) -> PathBuf {
@@ -166,6 +175,8 @@ pub enum DaemonError {
     TaskDb(#[from] TaskDbError),
     #[error("witness error: {0}")]
     Witness(#[from] WitnessError),
+    #[error("retention error: {0}")]
+    Retention(#[from] RetentionError),
     #[error(
         "old-format events directory at {path}; archive it aside before first boot: mv -- {path} {archive}"
     )]
@@ -448,6 +459,7 @@ pub struct Context {
     lease: LocalLease<SystemdUnitLiveness>,
     guardrails: GuardrailState,
     witness: WitnessLedger,
+    derivation_store: Arc<dyn DerivationAvailability>,
     jobs: HashMap<Uuid, Job>,
     aliases: HashMap<String, Uuid>,
     lease_jobs: HashMap<String, Uuid>,
@@ -1257,6 +1269,7 @@ impl DaemonHandler {
             attempt: 1,
             argv: resolved.argv,
             evidence: resolved.evidence,
+            drv: resolved.drv,
             parent_uuid,
             consumption_estimate: resolved.consumption_estimate,
             runtime_max_sec: resolved.runtime_max_sec,
@@ -1271,6 +1284,116 @@ impl DaemonHandler {
         if let Err(error) = row.validate() {
             rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
             return Err(WireError::invalid(error.to_string()));
+        }
+
+        if let Some(drv) = row.drv.clone() {
+            if let Some(existing) = latest_witness_for_task(&context.paths.witness_path(), job_id)?
+            {
+                if full_mode
+                    && existing.payload_hash == row.payload_hash
+                    && existing.drv.as_ref() == Some(&drv)
+                {
+                    return full_terminal_response(
+                        &existing,
+                        row.payload_hash
+                            .as_deref()
+                            .expect("full drv rows carry a payload hash"),
+                        "terminal",
+                    );
+                }
+                rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
+                return Err(WireError::invalid(format!(
+                    "drv seed task UUID {job_id} already has witness seq {}",
+                    existing.seq
+                )));
+            }
+
+            let probe_drv = drv.clone();
+            let derivation_store = context.derivation_store.clone();
+            drop(context);
+            let substitution = tokio::task::spawn_blocking(move || {
+                derivation_store.outputs_available_or_substitutable(&probe_drv)
+            })
+            .await;
+            context = self.context.write().await;
+            let substituted = match substitution {
+                Ok(Ok(substituted)) => substituted,
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "tally: drv substitution probe failed for {}: {error}",
+                        drv.drv_path
+                    );
+                    false
+                }
+                Err(error) => {
+                    eprintln!(
+                        "tally: drv substitution worker failed for {}: {error}",
+                        drv.drv_path
+                    );
+                    false
+                }
+            };
+            if context.jobs.contains_key(&job_id) || context.query_rows.contains_key(&job_id) {
+                rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
+                return Err(WireError::invalid(format!(
+                    "task UUID {job_id} was admitted while its drv substitution was checked"
+                )));
+            }
+            if let Some(existing) = latest_witness_for_task(&context.paths.witness_path(), job_id)?
+            {
+                if full_mode
+                    && existing.payload_hash == row.payload_hash
+                    && existing.drv.as_ref() == Some(&drv)
+                {
+                    return full_terminal_response(
+                        &existing,
+                        row.payload_hash
+                            .as_deref()
+                            .expect("full drv rows carry a payload hash"),
+                        "terminal",
+                    );
+                }
+                rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
+                return Err(WireError::invalid(format!(
+                    "drv seed task UUID {job_id} gained witness seq {} while substitution was checked",
+                    existing.seq
+                )));
+            }
+            if substituted {
+                if let Err(error) =
+                    store_admitted_brief(&context.paths, &row, prepared_brief.as_ref())
+                {
+                    rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
+                    return Err(error);
+                }
+                rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
+                let record =
+                    append_context_witness(&mut context, substituted_witness(&row, drv.clone()))
+                        .map_err(|error| self.fail_stop(error.into()))?;
+                let mut response = json!({
+                    "schemaVersion": 1,
+                    "disposition": "substituted",
+                    "task_uuid": job_id.to_string(),
+                    "taskUuid": job_id.to_string(),
+                    "job_id": job_id.to_string(),
+                    "state": "substituted",
+                    "status": "substituted",
+                    "verdict": Verdict::Substituted,
+                    "exit_code": 0,
+                    "dedup_key": row.dedup_key,
+                    "store_paths": record.store_paths,
+                    "storePaths": record.store_paths,
+                    "drv": record.drv,
+                    "witness_lsn": record.seq,
+                    "witnessSeq": record.seq,
+                    "attempt": 1,
+                    "lease_epoch": 1,
+                });
+                if let Some(payload_hash) = &row.payload_hash {
+                    response["payloadHash"] = Value::String(payload_hash.clone());
+                }
+                return Ok(response);
+            }
         }
 
         let mut reused_rejected = None;
@@ -1292,6 +1415,7 @@ impl DaemonHandler {
                     let probe_dedup_key = dedup_key.to_owned();
                     let probe_payload_hash = payload_hash.to_owned();
                     let evidence_specs = row.evidence.clone();
+                    let probe_substituted = row.drv.is_some();
                     drop(context);
                     let probe = tokio::task::spawn_blocking(move || {
                         let (report, witness) = read_verified_records(&witness_path)?;
@@ -1309,7 +1433,9 @@ impl DaemonHandler {
                             .cloned();
                         let pass_probe = governing.as_ref().and_then(|record| {
                             (record.payload_hash.as_deref() == Some(probe_payload_hash.as_str())
-                                && record.verdict == Verdict::Pass)
+                                && (record.verdict == Verdict::Pass
+                                    || (probe_substituted
+                                        && record.verdict == Verdict::Substituted)))
                                 .then(|| {
                                     let evidence = parse_evidence_specs(&evidence_specs)
                                         .expect("validated row evidence remains canonical");
@@ -1359,11 +1485,13 @@ impl DaemonHandler {
                             }],
                         ));
                     }
-                    if governing.verdict != Verdict::Pass {
+                    if governing.verdict != Verdict::Pass
+                        && !(row.drv.is_some() && governing.verdict == Verdict::Substituted)
+                    {
                         return full_terminal_response(&governing, payload_hash, "terminal");
                     }
                     let pass_probe = pass_probe.expect(
-                        "matching pass governing records are artifact-probed in the worker",
+                        "matching successful governing records are evidence-probed in the worker",
                     );
                     if pass_probe.hit {
                         return full_terminal_response(&governing, payload_hash, "reused");
@@ -1378,6 +1506,13 @@ impl DaemonHandler {
                         Some(DedupMissReason::ArtifactUnavailable(path)) => {
                             reused_rejected = Some("artifact-unavailable");
                             reuse_error_detail = Some(path.to_string_lossy().into_owned());
+                        }
+                        Some(DedupMissReason::StorePathInvalid(path)) => {
+                            reused_rejected = Some("store-path-invalid");
+                            reuse_error_detail = Some(path.to_string_lossy().into_owned());
+                        }
+                        Some(DedupMissReason::WitnessStorePathsMismatch) => {
+                            reused_rejected = Some("store-path-drift");
                         }
                         Some(reason) => {
                             return Err(internal_wire(format!(
@@ -1446,10 +1581,6 @@ impl DaemonHandler {
                         )?;
                         return Err(error);
                     }
-                    let artifact_hash = dedup
-                        .artifact_hash
-                        .clone()
-                        .expect("a dedup hit always carries an artifact hash");
                     let matched_witness_seq = dedup
                         .matched_witness_seq
                         .expect("a dedup hit always carries a matched witness");
@@ -1457,7 +1588,8 @@ impl DaemonHandler {
                         row.clone(),
                         resolved.depth,
                         matched_witness_seq,
-                        artifact_hash.clone(),
+                        dedup.artifact_hash.clone(),
+                        dedup.store_paths.clone(),
                     )
                     .and_then(|event| event.with_ingress_id(ingress_id.clone()))
                     {
@@ -1504,40 +1636,43 @@ impl DaemonHandler {
                         }
                         return Err(internal_wire(error));
                     }
-                    let record = match context.witness.append(WitnessBody {
-                        task_uuid: task_uuid.map(|uuid| uuid.to_string()),
-                        transition_timestamp: Utc::now()
-                            .to_rfc3339_opts(SecondsFormat::Millis, true),
-                        verdict: Verdict::Reused,
-                        exit_code: 0,
-                        artifact_content_hash: Some(artifact_hash.clone()),
-                        store_paths: None,
-                        drv: None,
-                        gpu_seconds: None,
-                        wall_clock: 0.0,
-                        attempt: row.attempt,
-                        lease_epoch: row.lease_epoch,
-                        dedup_key: row.dedup_key.clone(),
-                        payload_hash: row.payload_hash.clone(),
-                        brief_hash: row.brief_hash.clone(),
-                        origin: row
-                            .origin
-                            .clone()
-                            .expect("canonical row carries admission origin"),
-                        orchestration: row.orchestration.clone(),
-                        labor_class: LaborClass::Reused,
-                        trace_ref: None,
-                        pools: row.pools.clone(),
-                        executor: row.executor.clone(),
-                        host_id: None,
-                        charge: None,
-                        model: row.model.clone(),
-                        evidence_class: row.evidence_class.clone(),
-                        manifest_hash: row.manifest_hash.clone(),
-                        completion: None,
-                        result_revision: None,
-                        authorship: None,
-                    }) {
+                    let record = match append_context_witness(
+                        &mut context,
+                        WitnessBody {
+                            task_uuid: task_uuid.map(|uuid| uuid.to_string()),
+                            transition_timestamp: Utc::now()
+                                .to_rfc3339_opts(SecondsFormat::Millis, true),
+                            verdict: Verdict::Reused,
+                            exit_code: 0,
+                            artifact_content_hash: dedup.artifact_hash.clone(),
+                            store_paths: dedup.store_paths.clone(),
+                            drv: row.drv.clone(),
+                            gpu_seconds: None,
+                            wall_clock: 0.0,
+                            attempt: row.attempt,
+                            lease_epoch: row.lease_epoch,
+                            dedup_key: row.dedup_key.clone(),
+                            payload_hash: row.payload_hash.clone(),
+                            brief_hash: row.brief_hash.clone(),
+                            origin: row
+                                .origin
+                                .clone()
+                                .expect("canonical row carries admission origin"),
+                            orchestration: row.orchestration.clone(),
+                            labor_class: LaborClass::Reused,
+                            trace_ref: None,
+                            pools: row.pools.clone(),
+                            executor: row.executor.clone(),
+                            host_id: None,
+                            charge: None,
+                            model: row.model.clone(),
+                            evidence_class: row.evidence_class.clone(),
+                            manifest_hash: row.manifest_hash.clone(),
+                            completion: None,
+                            result_revision: None,
+                            authorship: None,
+                        },
+                    ) {
                         Ok(record) => record,
                         Err(error) => return Err(self.fail_stop(error.into())),
                     };
@@ -1546,7 +1681,7 @@ impl DaemonHandler {
                         job_id: job_id.to_string(),
                         verdict: Verdict::Reused,
                         exit_code: 0,
-                        artifact_content_hash: Some(artifact_hash.clone()),
+                        artifact_content_hash: dedup.artifact_hash.clone(),
                         attempt: row.attempt,
                         lease_epoch: row.lease_epoch,
                         witness_seq: record.seq,
@@ -1586,6 +1721,8 @@ impl DaemonHandler {
                         "verdict": Verdict::Reused,
                         "dedup_key": dedup.dedup_key,
                         "artifact_content_hash": dedup.artifact_hash,
+                        "store_paths": dedup.store_paths,
+                        "storePaths": dedup.store_paths,
                         "witness_lsn": dedup.matched_witness_seq,
                     }));
                 }
@@ -4502,6 +4639,9 @@ fn full_terminal_response(
         "exit_code": record.exit_code,
         "dedup_key": record.dedup_key,
         "artifact_content_hash": record.artifact_content_hash,
+        "store_paths": record.store_paths,
+        "storePaths": record.store_paths,
+        "drv": record.drv,
         "witness_lsn": record.seq,
         "witnessSeq": record.seq,
         "payloadHash": payload_hash,
@@ -4518,6 +4658,23 @@ fn full_terminal_response(
         response["recordedOrchestration"] = orchestration.as_value().clone();
     }
     Ok(response)
+}
+
+fn latest_witness_for_task(
+    witness_path: &Path,
+    task_uuid: Uuid,
+) -> Result<Option<WitnessRecord>, WireError> {
+    let (report, records) = read_verified_records(witness_path).map_err(internal_wire)?;
+    if !report.ok {
+        return Err(internal_wire(
+            "witness verification failed while checking drv seed identity",
+        ));
+    }
+    let task_uuid = task_uuid.to_string();
+    Ok(records
+        .into_iter()
+        .filter(|record| record.task_uuid.as_deref() == Some(task_uuid.as_str()))
+        .max_by_key(|record| record.seq))
 }
 
 fn overlay_live_states(jobs: &mut [JobProjection], live_states: &HashMap<String, String>) {
@@ -4581,6 +4738,47 @@ fn canonical_job_model(job: &Job) -> Option<String> {
     })
 }
 
+fn log_gcroot_registration_failures(record: &WitnessRecord, paths: &DaemonPaths) {
+    let report = register_record_roots(&paths.gcroots_dir(), record, &NixStore::default());
+    for failure in report.failures {
+        eprintln!(
+            "tally: gcroot registration failed for witness {} path {} link {}: {}",
+            record.seq,
+            failure.target.display(),
+            failure.link.display(),
+            failure.reason
+        );
+    }
+}
+
+fn lock_gcroot_registration(paths: &DaemonPaths) -> Result<GcRootsLock, WitnessError> {
+    acquire_registration_lock(&paths.gcroots_dir()).map_err(|source| WitnessError::Io {
+        path: gcroots_lock_path(&paths.gcroots_dir()),
+        source,
+    })
+}
+
+fn append_daemon_witness(
+    ledger: &mut WitnessLedger,
+    paths: &DaemonPaths,
+    body: WitnessBody,
+) -> Result<WitnessRecord, WitnessError> {
+    let _lock = lock_gcroot_registration(paths)?;
+    let record = ledger.append(body)?;
+    log_gcroot_registration_failures(&record, paths);
+    Ok(record)
+}
+
+fn append_context_witness(
+    context: &mut Context,
+    body: WitnessBody,
+) -> Result<WitnessRecord, WitnessError> {
+    let _lock = lock_gcroot_registration(&context.paths)?;
+    let record = context.witness.append(body)?;
+    log_gcroot_registration_failures(&record, &context.paths);
+    Ok(record)
+}
+
 fn forced_witness(job: &Job, verdict: Verdict, host_id: Option<String>) -> WitnessBody {
     WitnessBody {
         task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
@@ -4589,7 +4787,7 @@ fn forced_witness(job: &Job, verdict: Verdict, host_id: Option<String>) -> Witne
         exit_code: if verdict == Verdict::Cancelled { 0 } else { 1 },
         artifact_content_hash: None,
         store_paths: None,
-        drv: None,
+        drv: job.row.drv.clone(),
         gpu_seconds: None,
         wall_clock: 0.0,
         attempt: job.row.attempt,
@@ -4612,6 +4810,42 @@ fn forced_witness(job: &Job, verdict: Verdict, host_id: Option<String>) -> Witne
         model: canonical_job_model(job),
         evidence_class: job.row.evidence_class.clone(),
         manifest_hash: job.row.manifest_hash.clone(),
+        completion: None,
+        result_revision: None,
+        authorship: None,
+    }
+}
+
+fn substituted_witness(row: &RowSeed, drv: Derivation) -> WitnessBody {
+    WitnessBody {
+        task_uuid: Some(row.uuid.to_string()),
+        transition_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        verdict: Verdict::Substituted,
+        exit_code: 0,
+        artifact_content_hash: None,
+        store_paths: Some(drv.output_paths()),
+        drv: Some(drv),
+        gpu_seconds: None,
+        wall_clock: 0.0,
+        attempt: 1,
+        lease_epoch: 1,
+        dedup_key: row.dedup_key.clone(),
+        payload_hash: row.payload_hash.clone(),
+        brief_hash: row.brief_hash.clone(),
+        origin: row
+            .origin
+            .clone()
+            .expect("canonical row carries admission origin"),
+        orchestration: row.orchestration.clone(),
+        labor_class: LaborClass::Substituted,
+        trace_ref: None,
+        pools: row.pools.clone(),
+        executor: row.executor.clone(),
+        host_id: None,
+        charge: None,
+        model: row.model.clone(),
+        evidence_class: row.evidence_class.clone(),
+        manifest_hash: row.manifest_hash.clone(),
         completion: None,
         result_revision: None,
         authorship: None,
@@ -4651,9 +4885,7 @@ fn finalize_forced_locked(
     }
     let host_id = (job.state == JobState::Running && job.row.executor.is_none())
         .then(|| context.host_id.clone());
-    let record = context
-        .witness
-        .append(forced_witness(&job, verdict, host_id))?;
+    let record = append_context_witness(context, forced_witness(&job, verdict, host_id))?;
     let result = JobResult {
         task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
         job_id: job.job_id.to_string(),
@@ -4854,8 +5086,34 @@ impl Daemon {
         let epoch = bump_epoch(&paths.state_dir)?;
         reconcile_pool_loss_intents(&paths, &executor, &mut witness_ledger, &host_id).await?;
         let mut durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
-        if reconcile_reuse_witnesses(&durable, &mut witness_ledger)? {
+        if reconcile_reuse_witnesses(&paths, &durable, &mut witness_ledger)? {
             durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
+        }
+        {
+            let _lock = lock_gcroot_registration(&paths)?;
+            let horizon = parse_horizon(&config.retention.horizon)?;
+            let (verification, records) = read_verified_records(&witness_path)?;
+            if !verification.ok {
+                return Err(DaemonError::Invalid(
+                    "witness verification failed during GC-root reconciliation".to_owned(),
+                ));
+            }
+            for (sequence, report) in reconcile_recent_roots(
+                &paths.gcroots_dir(),
+                &records,
+                Utc::now(),
+                horizon,
+                &NixStore::default(),
+            )? {
+                for failure in report.failures {
+                    eprintln!(
+                        "tally: gcroot registration failed for witness {sequence} path {} link {}: {}",
+                        failure.target.display(),
+                        failure.link.display(),
+                        failure.reason
+                    );
+                }
+            }
         }
         drop(witness_ledger);
         let units = collect_local_unit_facts(&executor, &durable).await?;
@@ -5028,6 +5286,7 @@ impl Daemon {
             })
             .map_err(|error| DaemonError::Invalid(error.message))?,
             witness: WitnessLedger::open(paths.witness_path())?,
+            derivation_store: Arc::new(NixStore::default()),
             jobs: HashMap::new(),
             aliases: HashMap::new(),
             lease_jobs: HashMap::new(),
@@ -5440,58 +5699,65 @@ impl Daemon {
             }
             (Some(_), None) => None,
         };
-        let (evidence_verdict, exit_code, artifact_hash, evidence_checks) = match finished.outcome {
-            None => {
-                return Err(DaemonError::Invalid(format!(
-                    "job {} stopped without a terminal witness",
-                    job.stable_key()
-                )))
-            }
-            Some(Ok(outcome)) => match outcome.termination {
-                ExecutionTermination::RuntimeExceeded => {
-                    (Verdict::RuntimeExceeded, 1, None, Vec::new())
+        let (evidence_verdict, exit_code, artifact_hash, store_paths, evidence_checks) =
+            match finished.outcome {
+                None => {
+                    return Err(DaemonError::Invalid(format!(
+                        "job {} stopped without a terminal witness",
+                        job.stable_key()
+                    )))
                 }
-                ExecutionTermination::Exited(code) => {
-                    let gate = if let Some(gate) = outcome.evidence_gate {
-                        gate
-                    } else {
-                        let elapsed = finished.elapsed;
-                        tokio::task::spawn_blocking(move || {
-                            run_evidence_gate(RunOutcome {
-                                exit_code: code,
-                                wall_clock_seconds: elapsed.as_secs_f64(),
-                                evidence: &evidence_spec,
+                Some(Ok(outcome)) => match outcome.termination {
+                    ExecutionTermination::RuntimeExceeded => {
+                        (Verdict::RuntimeExceeded, 1, None, None, Vec::new())
+                    }
+                    ExecutionTermination::Exited(code) => {
+                        let gate = if let Some(gate) = outcome.evidence_gate {
+                            gate
+                        } else {
+                            let elapsed = finished.elapsed;
+                            tokio::task::spawn_blocking(move || {
+                                run_evidence_gate(RunOutcome {
+                                    exit_code: code,
+                                    wall_clock_seconds: elapsed.as_secs_f64(),
+                                    evidence: &evidence_spec,
+                                })
                             })
-                        })
-                        .await
-                        .map_err(|error| {
-                            DaemonError::Invalid(format!("evidence worker failed: {error}"))
-                        })?
-                    };
-                    (gate.verdict, code, gate.artifact_hash, gate.checks)
+                            .await
+                            .map_err(|error| {
+                                DaemonError::Invalid(format!("evidence worker failed: {error}"))
+                            })?
+                        };
+                        (
+                            gate.verdict,
+                            code,
+                            gate.artifact_hash,
+                            gate.store_paths,
+                            gate.checks,
+                        )
+                    }
+                    ExecutionTermination::Signaled { .. }
+                    | ExecutionTermination::ServiceFailed { .. } => {
+                        (Verdict::Failed, 1, None, None, Vec::new())
+                    }
+                },
+                Some(Err(
+                    error @ (ExecutorError::UnitProbe { .. }
+                    | ExecutorError::UnitControl { .. }
+                    | ExecutorError::ExistingUnit { .. }
+                    | ExecutorError::IndeterminatePriorLaunch { .. }
+                    | ExecutorError::AdoptedUnitUnavailable { .. }
+                    | ExecutorError::AdoptedInvocationMismatch { .. }
+                    | ExecutorError::AdoptedGenerationMismatch { .. }
+                    | ExecutorError::UnknownRemoteExecutor(_)
+                    | ExecutorError::RemoteExecution { .. }
+                    | ExecutorError::RemoteProtocol { .. }),
+                )) => return Err(error.into()),
+                Some(Err(error)) => {
+                    eprintln!("tally: executor failed for {}: {error}", job.stable_key());
+                    (Verdict::Failed, 1, None, None, Vec::new())
                 }
-                ExecutionTermination::Signaled { .. }
-                | ExecutionTermination::ServiceFailed { .. } => {
-                    (Verdict::Failed, 1, None, Vec::new())
-                }
-            },
-            Some(Err(
-                error @ (ExecutorError::UnitProbe { .. }
-                | ExecutorError::UnitControl { .. }
-                | ExecutorError::ExistingUnit { .. }
-                | ExecutorError::IndeterminatePriorLaunch { .. }
-                | ExecutorError::AdoptedUnitUnavailable { .. }
-                | ExecutorError::AdoptedInvocationMismatch { .. }
-                | ExecutorError::AdoptedGenerationMismatch { .. }
-                | ExecutorError::UnknownRemoteExecutor(_)
-                | ExecutorError::RemoteExecution { .. }
-                | ExecutorError::RemoteProtocol { .. }),
-            )) => return Err(error.into()),
-            Some(Err(error)) => {
-                eprintln!("tally: executor failed for {}: {error}", job.stable_key());
-                (Verdict::Failed, 1, None, Vec::new())
-            }
-        };
+            };
         let computed_verdict = canonical_verdict(evidence_verdict, semantic_completion.as_ref());
 
         let (result, evidence, launches) = {
@@ -5506,40 +5772,43 @@ impl Daemon {
             let verdict = computed_verdict;
             let model = canonical_job_model(&job);
             let host_id = job.row.executor.is_none().then(|| context.host_id.clone());
-            let record = context.witness.append(WitnessBody {
-                task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
-                transition_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                verdict,
-                exit_code,
-                artifact_content_hash: artifact_hash.clone(),
-                store_paths: None,
-                drv: None,
-                gpu_seconds: None,
-                wall_clock: finished.elapsed.as_secs_f64(),
-                attempt: job.row.attempt,
-                lease_epoch: job.row.lease_epoch,
-                dedup_key: job.row.dedup_key.clone(),
-                payload_hash: job.row.payload_hash.clone(),
-                brief_hash: job.row.brief_hash.clone(),
-                origin: job
-                    .row
-                    .origin
-                    .clone()
-                    .expect("canonical row carries admission origin"),
-                orchestration: job.row.orchestration.clone(),
-                labor_class: job.labor_class,
-                trace_ref: None,
-                pools: job.row.pools.clone(),
-                executor: job.row.executor.clone(),
-                host_id,
-                charge: None,
-                model: model.clone(),
-                evidence_class: job.row.evidence_class.clone(),
-                manifest_hash: job.row.manifest_hash.clone(),
-                completion: semantic_completion.clone(),
-                result_revision: None,
-                authorship: None,
-            })?;
+            let record = append_context_witness(
+                &mut context,
+                WitnessBody {
+                    task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
+                    transition_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                    verdict,
+                    exit_code,
+                    artifact_content_hash: artifact_hash.clone(),
+                    store_paths: store_paths.clone(),
+                    drv: job.row.drv.clone(),
+                    gpu_seconds: None,
+                    wall_clock: finished.elapsed.as_secs_f64(),
+                    attempt: job.row.attempt,
+                    lease_epoch: job.row.lease_epoch,
+                    dedup_key: job.row.dedup_key.clone(),
+                    payload_hash: job.row.payload_hash.clone(),
+                    brief_hash: job.row.brief_hash.clone(),
+                    origin: job
+                        .row
+                        .origin
+                        .clone()
+                        .expect("canonical row carries admission origin"),
+                    orchestration: job.row.orchestration.clone(),
+                    labor_class: job.labor_class,
+                    trace_ref: None,
+                    pools: job.row.pools.clone(),
+                    executor: job.row.executor.clone(),
+                    host_id,
+                    charge: None,
+                    model: model.clone(),
+                    evidence_class: job.row.evidence_class.clone(),
+                    manifest_hash: job.row.manifest_hash.clone(),
+                    completion: semantic_completion.clone(),
+                    result_revision: None,
+                    authorship: None,
+                },
+            )?;
             let result = JobResult {
                 task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
                 job_id: job.job_id.to_string(),
@@ -6171,11 +6440,11 @@ async fn reconcile_pool_loss_intents(
             model_is_advisory: intent.model_is_advisory,
         };
         let execution_host_id = job.row.executor.is_none().then(|| host_id.to_owned());
-        records.push(ledger.append(forced_witness(
-            &job,
-            Verdict::PoolVanished,
-            execution_host_id,
-        ))?);
+        records.push(append_daemon_witness(
+            ledger,
+            paths,
+            forced_witness(&job, Verdict::PoolVanished, execution_host_id),
+        )?);
         clear_pool_loss_intent(&path)?;
     }
     Ok(())
@@ -6417,6 +6686,7 @@ fn recovery_gh_completions(
 }
 
 fn reconcile_reuse_witnesses(
+    paths: &DaemonPaths,
     durable: &DurableRecoveryFacts,
     ledger: &mut WitnessLedger,
 ) -> Result<bool, DaemonError> {
@@ -6440,8 +6710,8 @@ fn reconcile_reuse_witnesses(
             })?;
         if matched.verdict != Verdict::Pass
             || matched.dedup_key.as_deref() != Some(dedup_key)
-            || matched.artifact_content_hash.as_deref()
-                != Some(reuse.artifact_content_hash.as_str())
+            || matched.artifact_content_hash != reuse.artifact_content_hash
+            || matched.store_paths != reuse.store_paths
         {
             return Err(DaemonError::Invalid(format!(
                 "reuse event {} does not match prior passing witness {}",
@@ -6457,40 +6727,45 @@ fn reconcile_reuse_witnesses(
             .collect::<Vec<_>>();
         match existing.as_slice() {
             [] => {
-                ledger.append(WitnessBody {
-                    task_uuid: Some(task_uuid),
-                    transition_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
-                    verdict: Verdict::Reused,
-                    exit_code: 0,
-                    artifact_content_hash: Some(reuse.artifact_content_hash.clone()),
-                    store_paths: None,
-                    drv: None,
-                    gpu_seconds: None,
-                    wall_clock: 0.0,
-                    attempt: event.row.attempt,
-                    lease_epoch: event.row.lease_epoch,
-                    dedup_key: event.row.dedup_key.clone(),
-                    payload_hash: event.row.payload_hash.clone(),
-                    brief_hash: event.row.brief_hash.clone(),
-                    origin: event
-                        .row
-                        .origin
-                        .clone()
-                        .expect("canonical row carries admission origin"),
-                    orchestration: event.row.orchestration.clone(),
-                    labor_class: LaborClass::Reused,
-                    trace_ref: None,
-                    pools: event.row.pools.clone(),
-                    executor: event.row.executor.clone(),
-                    host_id: None,
-                    charge: None,
-                    model: event.row.model.clone(),
-                    evidence_class: event.row.evidence_class.clone(),
-                    manifest_hash: event.row.manifest_hash.clone(),
-                    completion: None,
-                    result_revision: None,
-                    authorship: None,
-                })?;
+                append_daemon_witness(
+                    ledger,
+                    paths,
+                    WitnessBody {
+                        task_uuid: Some(task_uuid),
+                        transition_timestamp: Utc::now()
+                            .to_rfc3339_opts(SecondsFormat::Millis, true),
+                        verdict: Verdict::Reused,
+                        exit_code: 0,
+                        artifact_content_hash: reuse.artifact_content_hash.clone(),
+                        store_paths: reuse.store_paths.clone(),
+                        drv: event.row.drv.clone(),
+                        gpu_seconds: None,
+                        wall_clock: 0.0,
+                        attempt: event.row.attempt,
+                        lease_epoch: event.row.lease_epoch,
+                        dedup_key: event.row.dedup_key.clone(),
+                        payload_hash: event.row.payload_hash.clone(),
+                        brief_hash: event.row.brief_hash.clone(),
+                        origin: event
+                            .row
+                            .origin
+                            .clone()
+                            .expect("canonical row carries admission origin"),
+                        orchestration: event.row.orchestration.clone(),
+                        labor_class: LaborClass::Reused,
+                        trace_ref: None,
+                        pools: event.row.pools.clone(),
+                        executor: event.row.executor.clone(),
+                        host_id: None,
+                        charge: None,
+                        model: event.row.model.clone(),
+                        evidence_class: event.row.evidence_class.clone(),
+                        manifest_hash: event.row.manifest_hash.clone(),
+                        completion: None,
+                        result_revision: None,
+                        authorship: None,
+                    },
+                )?;
                 appended = true;
             }
             [record]
@@ -6514,7 +6789,9 @@ fn reuse_record_matches(
 ) -> bool {
     record.verdict == Verdict::Reused
         && record.exit_code == 0
-        && record.artifact_content_hash.as_deref() == Some(reuse.artifact_content_hash.as_str())
+        && record.artifact_content_hash == reuse.artifact_content_hash
+        && record.store_paths == reuse.store_paths
+        && record.drv == event.row.drv
         && record.attempt == event.row.attempt
         && record.lease_epoch == event.row.lease_epoch
         && record.dedup_key == event.row.dedup_key
@@ -7835,6 +8112,22 @@ mod tests {
         }
     }
 
+    struct AlwaysAvailableDerivation;
+
+    impl DerivationAvailability for AlwaysAvailableDerivation {
+        fn outputs_available_or_substitutable(&self, _drv: &Derivation) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
+    struct NeverAvailableDerivation;
+
+    impl DerivationAvailability for NeverAvailableDerivation {
+        fn outputs_available_or_substitutable(&self, _drv: &Derivation) -> Result<bool, String> {
+            Ok(false)
+        }
+    }
+
     struct RunningProbe {
         attempt: u32,
         lease_epoch: u64,
@@ -8396,6 +8689,122 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn substituted_drv_witness_skips_every_admission_surface_and_meter() {
+        const DRV: &str = "/nix/store/00000000000000000000000000000000-node.drv";
+        const OUT: &str = "/nix/store/11111111111111111111111111111111-node";
+
+        let temp = tempdir().unwrap();
+        let paths = fs1_paths(temp.path());
+        let mut config = one_pool_config();
+        config.pools.insert(
+            "build".to_owned(),
+            PoolConfig {
+                resource: ResourceKind::BuildSlot,
+                predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+                ..PoolConfig::default()
+            },
+        );
+        let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+            .with_systemd_run(temp.path().join("absent-systemd-run"))
+            .with_unit_probe(ExitFileProbe);
+        let daemon = Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+            .await
+            .unwrap();
+        daemon.handler.context.write().await.derivation_store = Arc::new(AlwaysAvailableDerivation);
+
+        let task_uuid = "00000000-0000-4000-8000-000000000084";
+        let response = daemon
+            .handler
+            .enqueue(Some(json!({
+                "argv": ["nix", "build", "--no-link", format!("{DRV}^*")],
+                "pool": ["build"],
+                "adapter": "shell",
+                "source": "orchestrator",
+                "dedupKey": format!("drv:{DRV}"),
+                "submission": {"mode": "full"},
+                "evidence": [format!("store:{OUT}")],
+                "drv": {
+                    "drvPath": DRV,
+                    "outputs": [{"name": "out", "path": OUT}]
+                },
+                "taskUuid": task_uuid,
+                "orchestration": {
+                    "flowRunId": "00000000-0000-4000-8000-000000000071"
+                }
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response["disposition"], "substituted");
+        assert_eq!(response["taskUuid"], task_uuid);
+
+        let context = daemon.handler.context.read().await;
+        assert!(context.rows.is_empty());
+        assert!(context.jobs.is_empty());
+        assert!(context.query_rows.is_empty());
+        assert!(read_acknowledged_events(&paths.events_dir())
+            .unwrap()
+            .is_empty());
+        drop(context);
+
+        let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.verdict, Verdict::Substituted);
+        assert_eq!(record.labor_class, LaborClass::Substituted);
+        assert_eq!(record.task_uuid.as_deref(), Some(task_uuid));
+        assert_eq!(record.pools, ["build"]);
+        assert_eq!(
+            record.dedup_key.as_deref(),
+            Some(format!("drv:{DRV}").as_str())
+        );
+        assert_eq!(record.store_paths, Some(vec![OUT.to_owned()]));
+        assert_eq!(record.drv.as_ref().unwrap().drv_path, DRV);
+        assert_eq!(record.wall_clock, 0.0);
+        assert_eq!(record.attempt, 1);
+        assert_eq!(record.lease_epoch, 1);
+        assert!(record.gpu_seconds.is_none());
+        assert!(record.charge.is_none());
+        assert!(!crate::witness::counts_toward_canonical_gpu_seconds(record));
+
+        {
+            let mut context = daemon.handler.context.write().await;
+            context.derivation_store = Arc::new(NeverAvailableDerivation);
+            context.paused_pools.insert("build".to_owned());
+        }
+        let fresh_uuid = "00000000-0000-4000-8000-000000000085";
+        let fresh = tokio::task::LocalSet::new()
+            .run_until(daemon.handler.enqueue(Some(json!({
+                "argv": ["nix", "build", "--no-link", format!("{DRV}^*")],
+                "pool": ["build"],
+                "adapter": "shell",
+                "source": "orchestrator",
+                "dedupKey": format!("drv:{DRV}"),
+                "submission": {"mode": "full"},
+                "evidence": [format!("store:{OUT}")],
+                "drv": {
+                    "drvPath": DRV,
+                    "outputs": [{"name": "out", "path": OUT}]
+                },
+                "taskUuid": fresh_uuid,
+                "orchestration": {
+                    "flowRunId": "00000000-0000-4000-8000-000000000071"
+                }
+            }))))
+            .await
+            .unwrap();
+        assert_eq!(fresh["disposition"], "created");
+        assert_eq!(fresh["reusedRejected"], "store-path-invalid");
+        let context = daemon.handler.context.read().await;
+        assert!(context
+            .rows
+            .contains_key(&Uuid::parse_str(fresh_uuid).unwrap()));
+        assert_eq!(
+            read_acknowledged_events(&paths.events_dir()).unwrap().len(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn non_empty_current_state_migrates_before_recovery_and_is_restart_stable() {
         let temp = tempdir().unwrap();
         let paths = fs1_paths(temp.path());
@@ -8502,6 +8911,7 @@ mod tests {
             attempt: 1,
             argv: vec!["true".to_owned()],
             evidence: vec!["exit:0".to_owned()],
+            drv: None,
             parent_uuid: None,
             consumption_estimate: None,
             runtime_max_sec: None,
@@ -12898,7 +13308,8 @@ mod tests {
                     reused.clone(),
                     0,
                     pass.seq,
-                    artifact_hash.clone(),
+                    Some(artifact_hash.clone()),
+                    None,
                 )
                 .unwrap();
                 write_enqueue_event_atomic(&paths.events_dir(), &reuse_event).unwrap();
@@ -12955,13 +13366,19 @@ mod tests {
             row,
             0,
             99,
-            format!("sha256:{}", "b".repeat(64)),
+            Some(format!("sha256:{}", "b".repeat(64))),
+            None,
         )
         .unwrap();
         write_enqueue_event_atomic(&events, &event).unwrap();
         let durable = collect_durable_recovery_facts(&events, &witness).unwrap();
         let mut ledger = WitnessLedger::open(&witness).unwrap();
-        assert!(reconcile_reuse_witnesses(&durable, &mut ledger)
+        let paths = DaemonPaths {
+            socket: temp.path().join("run/tally.sock"),
+            state_dir: temp.path().join("state"),
+            data_dir: temp.path().join("data"),
+        };
+        assert!(reconcile_reuse_witnesses(&paths, &durable, &mut ledger)
             .unwrap_err()
             .to_string()
             .contains("references missing witness 99"));

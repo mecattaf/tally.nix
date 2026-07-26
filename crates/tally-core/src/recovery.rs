@@ -1018,6 +1018,7 @@ mod tests {
             attempt: 1,
             argv: vec!["worker".to_owned(), "leaf".to_owned()],
             evidence: vec!["exit:0".to_owned()],
+            drv: None,
             parent_uuid: None,
             consumption_estimate: Some(3),
             runtime_max_sec: Some(30),

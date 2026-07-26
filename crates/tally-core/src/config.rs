@@ -9,6 +9,8 @@ use crate::adapters::{AdapterConfig, AdapterEngine, AdapterError};
 use crate::producers::{validate_registry, ProducerConfig, ProducerError};
 
 pub const DEFAULT_AGING_THRESHOLD_SEC: u64 = 3_600;
+pub const DEFAULT_RETENTION_HORIZON: &str = "30d";
+pub const DEFAULT_RETENTION_CALENDAR: &str = "daily";
 
 fn default_ssh_port() -> u16 {
     22
@@ -181,6 +183,27 @@ impl Default for LeaseConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RetentionConfig {
+    #[serde(default = "default_true")]
+    pub enable: bool,
+    #[serde(default = "default_retention_horizon")]
+    pub horizon: String,
+    #[serde(default = "default_retention_calendar")]
+    pub on_calendar: String,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            enable: true,
+            horizon: DEFAULT_RETENTION_HORIZON.to_owned(),
+            on_calendar: DEFAULT_RETENTION_CALENDAR.to_owned(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MeterBudgetClass {
@@ -270,6 +293,14 @@ const fn default_true() -> bool {
     true
 }
 
+fn default_retention_horizon() -> String {
+    DEFAULT_RETENTION_HORIZON.to_owned()
+}
+
+fn default_retention_calendar() -> String {
+    DEFAULT_RETENTION_CALENDAR.to_owned()
+}
+
 const fn default_lease_grace_sec() -> u64 {
     90
 }
@@ -298,6 +329,8 @@ pub struct Config {
     #[serde(default)]
     pub lease: LeaseConfig,
     #[serde(default)]
+    pub retention: RetentionConfig,
+    #[serde(default)]
     pub pools: BTreeMap<String, PoolConfig>,
     #[serde(default)]
     pub adapters: BTreeMap<String, AdapterConfig>,
@@ -316,6 +349,7 @@ impl Default for Config {
             aging_threshold_sec: DEFAULT_AGING_THRESHOLD_SEC,
             enqueue: EnqueueConfig::default(),
             lease: LeaseConfig::default(),
+            retention: RetentionConfig::default(),
             pools: BTreeMap::new(),
             adapters: BTreeMap::new(),
             producers: BTreeMap::new(),
@@ -358,6 +392,10 @@ pub enum ConfigError {
     InvalidEnqueueGuardrail,
     #[error("lease graceSec, yieldPollSec, and yieldGraceSec must all be positive")]
     InvalidLeaseGuardrail,
+    #[error("retention horizon is invalid: {0}")]
+    InvalidRetentionHorizon(String),
+    #[error("retention onCalendar must be non-empty")]
+    InvalidRetentionCalendar,
     #[error("maxFrameBytes and agingThresholdSec must both be positive")]
     InvalidFlowRuntimeLimit,
     #[error("executor {executor:?} is invalid: {detail}")]
@@ -392,6 +430,11 @@ impl Config {
             || self.lease.yield_grace_sec == 0
         {
             return Err(ConfigError::InvalidLeaseGuardrail);
+        }
+        crate::retention::parse_horizon(&self.retention.horizon)
+            .map_err(|error| ConfigError::InvalidRetentionHorizon(error.to_string()))?;
+        if self.retention.on_calendar.trim().is_empty() {
+            return Err(ConfigError::InvalidRetentionCalendar);
         }
         for (name, pool) in &self.pools {
             if name.trim().is_empty() {
@@ -580,6 +623,7 @@ mod tests {
         let legacy: Config = serde_json::from_str(r#"{"pools":{}}"#).unwrap();
         assert_eq!(legacy.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
         assert_eq!(legacy.aging_threshold_sec, DEFAULT_AGING_THRESHOLD_SEC);
+        assert_eq!(legacy.retention, RetentionConfig::default());
         legacy.validate().unwrap();
 
         let configured: Config = serde_json::from_str(
@@ -598,6 +642,27 @@ mod tests {
                 serde_json::from_str::<Config>(invalid).unwrap().validate(),
                 Err(ConfigError::InvalidFlowRuntimeLimit)
             ));
+        }
+    }
+
+    #[test]
+    fn retention_is_default_on_strict_and_uses_a_systemd_timespan() {
+        let configured: Config = serde_json::from_str(
+            r#"{"pools":{},"retention":{"enable":false,"horizon":"2h 30min","onCalendar":"weekly"}}"#,
+        )
+        .unwrap();
+        configured.validate().unwrap();
+        assert!(!configured.retention.enable);
+
+        for invalid in [
+            r#"{"pools":{},"retention":{"horizon":"never"}}"#,
+            r#"{"pools":{},"retention":{"onCalendar":""}}"#,
+            r#"{"pools":{},"retention":{"enable":true,"extra":false}}"#,
+        ] {
+            let result = serde_json::from_str::<Config>(invalid)
+                .map_err(ConfigError::from)
+                .and_then(|config| config.validate());
+            assert!(result.is_err());
         }
     }
 

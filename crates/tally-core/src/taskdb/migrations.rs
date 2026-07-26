@@ -14,11 +14,18 @@ pub struct RowMigration {
     pub migrate: fn(&RowSeed) -> Result<RowSeed, String>,
 }
 
-pub const ROW_MIGRATIONS: &[RowMigration] = &[RowMigration {
-    from: 1,
-    to: 2,
-    migrate: migrate_origin_v1_to_v2,
-}];
+pub const ROW_MIGRATIONS: &[RowMigration] = &[
+    RowMigration {
+        from: 1,
+        to: 2,
+        migrate: migrate_origin_v1_to_v2,
+    },
+    RowMigration {
+        from: 2,
+        to: 3,
+        migrate: migrate_drv_v2_to_v3,
+    },
+];
 
 pub fn migrate_to_current(row: &RowSeed) -> Result<RowSeed, String> {
     let mut migrated = row.clone();
@@ -82,5 +89,35 @@ fn migrate_origin_v1_to_v2(original: &RowSeed) -> Result<RowSeed, String> {
         );
     }
 
+    Ok(canonical)
+}
+
+fn migrate_drv_v2_to_v3(original: &RowSeed) -> Result<RowSeed, String> {
+    if original.row_version != 2 {
+        return Err(format!(
+            "drv migration requires rowVersion 2, got {}",
+            original.row_version
+        ));
+    }
+    original.validate().map_err(|error| error.to_string())?;
+    if original.drv.is_some() {
+        return Err(
+            "rowVersion 2 drv migration requires the new drv field to be absent".to_owned(),
+        );
+    }
+
+    let mut canonical = original.clone();
+    canonical.row_version = 3;
+    canonical
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+
+    let mut allowed_delta = original.clone();
+    allowed_delta.row_version = 3;
+    if allowed_delta != canonical {
+        return Err(
+            "rowVersion 2 differs from canonical rowVersion 3 beyond drv absence".to_owned(),
+        );
+    }
     Ok(canonical)
 }

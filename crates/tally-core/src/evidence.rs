@@ -9,11 +9,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::nix_store::{NixStore, StoreValidity};
 use crate::witness::{Verdict, WitnessRecord};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EvidenceCheck {
     Artifact(PathBuf),
+    Store(PathBuf),
     HashSha256 { expected: Option<String> },
     Exit(i32),
 }
@@ -22,6 +24,7 @@ impl fmt::Display for EvidenceCheck {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Artifact(path) => write!(formatter, "artifact:{}", path.display()),
+            Self::Store(path) => write!(formatter, "store:{}", path.display()),
             Self::HashSha256 { expected: None } => formatter.write_str("hash:sha256"),
             Self::HashSha256 {
                 expected: Some(expected),
@@ -46,6 +49,12 @@ impl FromStr for EvidenceCheck {
             "artifact" if !value.is_empty() => Ok(Self::Artifact(PathBuf::from(value))),
             "artifact" => Err(EvidenceError::InvalidSpec(
                 "artifact evidence requires a path".to_owned(),
+            )),
+            "store" if crate::witness::is_nix_store_path(value) => {
+                Ok(Self::Store(PathBuf::from(value)))
+            }
+            "store" => Err(EvidenceError::InvalidSpec(
+                "store evidence requires an absolute canonical Nix store path".to_owned(),
             )),
             "hash" => {
                 let (algorithm, expected) = value
@@ -73,7 +82,7 @@ impl FromStr for EvidenceCheck {
                 Ok(Self::Exit(code))
             }
             _ => Err(EvidenceError::InvalidSpec(format!(
-                "unknown evidence kind {kind:?}; expected artifact, hash, or exit"
+                "unknown evidence kind {kind:?}; expected artifact, store, hash, or exit"
             ))),
         }
     }
@@ -98,6 +107,7 @@ impl EvidenceSpec {
     pub fn new(mut checks: Vec<EvidenceCheck>) -> Result<Self, EvidenceError> {
         let mut hash_seen = false;
         let mut exit_seen = false;
+        let mut store_paths = std::collections::BTreeSet::new();
         for check in &mut checks {
             match check {
                 EvidenceCheck::Artifact(path) if path.as_os_str().is_empty() => {
@@ -109,6 +119,16 @@ impl EvidenceSpec {
                     return Err(EvidenceError::InvalidSpec(
                         "artifact evidence paths must be valid UTF-8".to_owned(),
                     ));
+                }
+                EvidenceCheck::Store(path)
+                    if !path.to_str().is_some_and(crate::witness::is_nix_store_path) =>
+                {
+                    return Err(EvidenceError::InvalidSpec(
+                        "store evidence requires an absolute canonical Nix store path".to_owned(),
+                    ));
+                }
+                EvidenceCheck::Store(path) if !store_paths.insert(path.clone()) => {
+                    return Err(EvidenceError::DuplicateStore(path.clone()));
                 }
                 EvidenceCheck::HashSha256 { .. } if hash_seen => {
                     return Err(EvidenceError::DuplicateCheck("hash"));
@@ -128,7 +148,7 @@ impl EvidenceSpec {
                     )));
                 }
                 EvidenceCheck::Exit(_) => exit_seen = true,
-                EvidenceCheck::Artifact(_) => {}
+                EvidenceCheck::Artifact(_) | EvidenceCheck::Store(_) => {}
             }
         }
         Ok(Self { checks })
@@ -156,6 +176,23 @@ impl EvidenceSpec {
             EvidenceCheck::Artifact(path) => Some(path.as_path()),
             _ => None,
         })
+    }
+
+    fn store_paths(&self) -> impl Iterator<Item = &Path> {
+        self.checks.iter().filter_map(|check| match check {
+            EvidenceCheck::Store(path) => Some(path.as_path()),
+            _ => None,
+        })
+    }
+
+    pub fn declared_store_paths(&self) -> Vec<String> {
+        let mut paths = self
+            .store_paths()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     fn expected_exit(&self) -> i32 {
@@ -187,6 +224,8 @@ pub enum EvidenceError {
     UnsupportedHash(String),
     #[error("evidence specification contains more than one {0} check")]
     DuplicateCheck(&'static str),
+    #[error("evidence specification contains duplicate store path {0}")]
+    DuplicateStore(PathBuf),
     #[error("cannot read artifact {path}: {source}")]
     ArtifactIo {
         path: PathBuf,
@@ -313,11 +352,20 @@ pub struct GateResult {
     pub verdict: Verdict,
     pub passed: bool,
     pub artifact_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_paths: Option<Vec<String>>,
     pub checks: Vec<CheckOutcome>,
     pub clean_exit_no_artifact: bool,
 }
 
 pub fn run_evidence_gate(outcome: RunOutcome<'_>) -> GateResult {
+    run_evidence_gate_with_store(outcome, &NixStore::default())
+}
+
+pub fn run_evidence_gate_with_store(
+    outcome: RunOutcome<'_>,
+    store: &impl StoreValidity,
+) -> GateResult {
     let mut checks = Vec::new();
 
     let expected_exit = outcome.evidence.expected_exit();
@@ -375,7 +423,34 @@ pub fn run_evidence_gate(outcome: RunOutcome<'_>) -> GateResult {
     } else {
         None
     };
-    let mut artifact_required = !artifact_paths.is_empty();
+    let store_paths = outcome.evidence.store_paths().collect::<Vec<_>>();
+    let mut passing_store_paths = Vec::with_capacity(store_paths.len());
+    let mut stores_ok = true;
+    for path in &store_paths {
+        match store.check_validity(path) {
+            Ok(()) => {
+                checks.push(CheckOutcome {
+                    spec: format!("store:{}", path.display()),
+                    passed: true,
+                    reason: "store path is valid".to_owned(),
+                });
+                passing_store_paths.push(path.to_string_lossy().into_owned());
+            }
+            Err(reason) => {
+                stores_ok = false;
+                checks.push(CheckOutcome {
+                    spec: format!("store:{}", path.display()),
+                    passed: false,
+                    reason,
+                });
+            }
+        }
+    }
+    passing_store_paths.sort();
+    passing_store_paths.dedup();
+    let passing_store_paths = (!passing_store_paths.is_empty()).then_some(passing_store_paths);
+
+    let mut artifact_required = !artifact_paths.is_empty() || !store_paths.is_empty();
     if let Some(EvidenceCheck::HashSha256 { expected }) = outcome.evidence.hash_check() {
         artifact_required = true;
         let hash_ok = expected.as_ref().map_or_else(
@@ -409,23 +484,25 @@ pub fn run_evidence_gate(outcome: RunOutcome<'_>) -> GateResult {
         }
     }
 
-    let gate_passed = exit_ok && span_ok && (!artifact_required || artifacts_ok);
+    let gate_passed = exit_ok && span_ok && (!artifact_required || (artifacts_ok && stores_ok));
     if gate_passed {
         return GateResult {
             verdict: Verdict::Pass,
             passed: true,
             artifact_hash,
+            store_paths: passing_store_paths,
             checks,
             clean_exit_no_artifact: false,
         };
     }
 
-    if exit_ok && span_ok && artifact_required && !artifacts_ok {
+    if exit_ok && span_ok && artifact_required && (!artifacts_ok || !stores_ok) {
         artifact_hash = None;
         return GateResult {
             verdict: Verdict::CleanExitNoArtifact,
             passed: false,
             artifact_hash,
+            store_paths: passing_store_paths,
             checks,
             clean_exit_no_artifact: true,
         };
@@ -435,6 +512,7 @@ pub fn run_evidence_gate(outcome: RunOutcome<'_>) -> GateResult {
         verdict: Verdict::Failed,
         passed: false,
         artifact_hash,
+        store_paths: passing_store_paths,
         checks,
         clean_exit_no_artifact: false,
     }
@@ -456,6 +534,8 @@ pub enum DedupMissReason {
     ArtifactUnavailable(PathBuf),
     WitnessHashMismatch,
     DeclaredHashMismatch,
+    StorePathInvalid(PathBuf),
+    WitnessStorePathsMismatch,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,6 +543,7 @@ pub struct DedupResult {
     pub hit: bool,
     pub dedup_key: Option<String>,
     pub artifact_hash: Option<String>,
+    pub store_paths: Option<Vec<String>>,
     pub matched_witness_seq: Option<u64>,
     pub rehashed: bool,
     pub miss_reason: Option<DedupMissReason>,
@@ -473,6 +554,7 @@ fn dedup_miss(dedup_key: Option<&str>, reason: DedupMissReason, rehashed: bool) 
         hit: false,
         dedup_key: dedup_key.map(str::to_owned),
         artifact_hash: None,
+        store_paths: None,
         matched_witness_seq: None,
         rehashed,
         miss_reason: Some(reason),
@@ -484,6 +566,15 @@ pub fn probe_dedup(
     evidence: &EvidenceSpec,
     witness: &[WitnessRecord],
 ) -> DedupResult {
+    probe_dedup_with_store(dedup_key, evidence, witness, &NixStore::default())
+}
+
+pub fn probe_dedup_with_store(
+    dedup_key: Option<&str>,
+    evidence: &EvidenceSpec,
+    witness: &[WitnessRecord],
+    store: &impl StoreValidity,
+) -> DedupResult {
     let Some(dedup_key) = dedup_key.filter(|key| !key.trim().is_empty()) else {
         return dedup_miss(dedup_key, DedupMissReason::NoKey, false);
     };
@@ -493,7 +584,7 @@ pub fn probe_dedup(
         .filter(|record| {
             record.dedup_key.as_deref() == Some(dedup_key)
                 && record.verdict == Verdict::Pass
-                && record.artifact_content_hash.is_some()
+                && (record.artifact_content_hash.is_some() || record.store_paths.is_some())
         })
         .max_by_key(|record| record.seq)
     else {
@@ -501,59 +592,29 @@ pub fn probe_dedup(
     };
 
     let paths: Vec<&Path> = evidence.artifact_paths().collect();
-    if paths.is_empty() {
+    let store_paths = evidence.store_paths().collect::<Vec<_>>();
+    if paths.is_empty() && store_paths.is_empty() {
         return dedup_miss(Some(dedup_key), DedupMissReason::NoArtifactEvidence, false);
     }
 
-    let mut hashes = Vec::with_capacity(paths.len());
-    for path in paths {
-        match hash_artifact_file(path) {
-            Ok(hash) => hashes.push(hash),
-            Err(_) => {
-                return dedup_miss(
-                    Some(dedup_key),
-                    DedupMissReason::ArtifactUnavailable(path.to_owned()),
-                    true,
-                );
-            }
-        }
-    }
-    let current_hash = combine_artifact_hashes(&hashes)
-        .expect("at least one artifact hash was collected before combination");
-
-    if evidence
-        .hash_check()
-        .and_then(|check| match check {
-            EvidenceCheck::HashSha256 { expected } => expected.as_ref(),
-            _ => None,
-        })
-        .is_some_and(|expected| expected != &current_hash)
-    {
-        return dedup_miss(Some(dedup_key), DedupMissReason::DeclaredHashMismatch, true);
-    }
-
-    if matched.artifact_content_hash.as_deref() != Some(current_hash.as_str()) {
-        return dedup_miss(Some(dedup_key), DedupMissReason::WitnessHashMismatch, true);
-    }
-
-    DedupResult {
-        hit: true,
-        dedup_key: Some(dedup_key.to_owned()),
-        artifact_hash: Some(current_hash),
-        matched_witness_seq: Some(matched.seq),
-        rehashed: true,
-        miss_reason: None,
-    }
+    probe_matching_record(Some(dedup_key), evidence, matched, store, false)
 }
 
-pub fn probe_full_pass(evidence: &EvidenceSpec, matched: &WitnessRecord) -> DedupResult {
-    let dedup_key = matched.dedup_key.clone();
+fn probe_matching_record(
+    dedup_key: Option<&str>,
+    evidence: &EvidenceSpec,
+    matched: &WitnessRecord,
+    store: &impl StoreValidity,
+    allow_empty: bool,
+) -> DedupResult {
     let paths: Vec<&Path> = evidence.artifact_paths().collect();
-    if paths.is_empty() {
+    let declared_store_paths = evidence.store_paths().collect::<Vec<_>>();
+    if paths.is_empty() && declared_store_paths.is_empty() && allow_empty {
         return DedupResult {
             hit: true,
-            dedup_key,
+            dedup_key: dedup_key.map(str::to_owned),
             artifact_hash: matched.artifact_content_hash.clone(),
+            store_paths: matched.store_paths.clone(),
             matched_witness_seq: Some(matched.seq),
             rehashed: false,
             miss_reason: None,
@@ -561,49 +622,76 @@ pub fn probe_full_pass(evidence: &EvidenceSpec, matched: &WitnessRecord) -> Dedu
     }
 
     let mut hashes = Vec::with_capacity(paths.len());
-    for path in paths {
+    for path in &paths {
         match hash_artifact_file(path) {
             Ok(hash) => hashes.push(hash),
             Err(_) => {
                 return dedup_miss(
-                    dedup_key.as_deref(),
-                    DedupMissReason::ArtifactUnavailable(path.to_owned()),
+                    dedup_key,
+                    DedupMissReason::ArtifactUnavailable((*path).to_owned()),
                     true,
                 );
             }
         }
     }
-    let current_hash = combine_artifact_hashes(&hashes)
-        .expect("at least one artifact hash was collected before combination");
+    let current_hash = combine_artifact_hashes(&hashes);
+
     if evidence
         .hash_check()
         .and_then(|check| match check {
             EvidenceCheck::HashSha256 { expected } => expected.as_ref(),
             _ => None,
         })
-        .is_some_and(|expected| expected != &current_hash)
+        .is_some_and(|expected| Some(expected) != current_hash.as_ref())
     {
-        return dedup_miss(
-            dedup_key.as_deref(),
-            DedupMissReason::DeclaredHashMismatch,
-            true,
-        );
+        return dedup_miss(dedup_key, DedupMissReason::DeclaredHashMismatch, true);
     }
-    if matched.artifact_content_hash.as_deref() != Some(current_hash.as_str()) {
-        return dedup_miss(
-            dedup_key.as_deref(),
-            DedupMissReason::WitnessHashMismatch,
-            true,
-        );
+
+    if !paths.is_empty() && matched.artifact_content_hash != current_hash {
+        return dedup_miss(dedup_key, DedupMissReason::WitnessHashMismatch, true);
     }
+
+    let mut canonical_store_paths = declared_store_paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    canonical_store_paths.sort();
+    canonical_store_paths.dedup();
+    for path in &declared_store_paths {
+        if store.check_validity(path).is_err() {
+            return dedup_miss(
+                dedup_key,
+                DedupMissReason::StorePathInvalid((*path).to_owned()),
+                true,
+            );
+        }
+    }
+    let store_paths = (!canonical_store_paths.is_empty()).then_some(canonical_store_paths);
+    if !declared_store_paths.is_empty() && matched.store_paths != store_paths {
+        return dedup_miss(dedup_key, DedupMissReason::WitnessStorePathsMismatch, true);
+    }
+
     DedupResult {
         hit: true,
-        dedup_key,
-        artifact_hash: Some(current_hash),
+        dedup_key: dedup_key.map(str::to_owned),
+        artifact_hash: current_hash,
+        store_paths,
         matched_witness_seq: Some(matched.seq),
         rehashed: true,
         miss_reason: None,
     }
+}
+
+pub fn probe_full_pass(evidence: &EvidenceSpec, matched: &WitnessRecord) -> DedupResult {
+    probe_full_pass_with_store(evidence, matched, &NixStore::default())
+}
+
+pub fn probe_full_pass_with_store(
+    evidence: &EvidenceSpec,
+    matched: &WitnessRecord,
+    store: &impl StoreValidity,
+) -> DedupResult {
+    probe_matching_record(matched.dedup_key.as_deref(), evidence, matched, store, true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -659,6 +747,8 @@ pub const fn retry_disposition(verdict: Verdict, policy: RetryPolicy) -> RetryDi
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+    use std::collections::BTreeSet;
     use std::ffi::CString;
     use std::fs;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -675,6 +765,32 @@ mod tests {
 
     fn parse(specs: &[&str]) -> EvidenceSpec {
         EvidenceSpec::parse(specs.iter().copied()).unwrap()
+    }
+
+    #[derive(Default)]
+    struct FakeStore {
+        valid: BTreeSet<PathBuf>,
+        calls: RefCell<Vec<PathBuf>>,
+    }
+
+    impl FakeStore {
+        fn with_valid(paths: impl IntoIterator<Item = &'static str>) -> Self {
+            Self {
+                valid: paths.into_iter().map(PathBuf::from).collect(),
+                calls: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl StoreValidity for FakeStore {
+        fn check_validity(&self, path: &Path) -> Result<(), String> {
+            self.calls.borrow_mut().push(path.to_owned());
+            if self.valid.contains(path) {
+                Ok(())
+            } else {
+                Err(format!("{} is invalid or unavailable", path.display()))
+            }
+        }
     }
 
     fn witness_record(
@@ -762,6 +878,107 @@ mod tests {
         }])
         .is_err());
         assert!(EvidenceSpec::new(vec![EvidenceCheck::Exit(-1)]).is_err());
+    }
+
+    #[test]
+    fn store_specs_use_the_exact_nix_shape_and_reject_duplicates() {
+        const FIRST: &str = "/nix/store/00000000000000000000000000000000-first+1.0";
+        const SECOND: &str = "/nix/store/11111111111111111111111111111111-second_out?x=y";
+        let spec = parse(&[&format!("store:{SECOND}"), &format!("store:{FIRST}")]);
+        assert_eq!(
+            spec.render(),
+            [format!("store:{SECOND}"), format!("store:{FIRST}")]
+        );
+        assert!(EvidenceSpec::parse(
+            [format!("store:{FIRST}"), format!("store:{FIRST}")]
+                .iter()
+                .map(String::as_str)
+        )
+        .is_err());
+        for invalid in [
+            "store:/tmp/not-store",
+            "store:/nix/store/0000000000000000000000000000000-short",
+            "store:/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-bad-alphabet",
+            "store:/nix/store/00000000000000000000000000000000-name/child",
+            "store:/nix/store/00000000000000000000000000000000-",
+        ] {
+            assert!(
+                invalid.parse::<EvidenceCheck>().is_err(),
+                "{invalid:?} parsed"
+            );
+        }
+    }
+
+    #[test]
+    fn store_gate_checks_each_path_once_sorts_passes_and_fails_closed() {
+        const FIRST: &str = "/nix/store/00000000000000000000000000000000-first";
+        const SECOND: &str = "/nix/store/11111111111111111111111111111111-second";
+        let evidence = parse(&[&format!("store:{SECOND}"), &format!("store:{FIRST}")]);
+        let store = FakeStore::with_valid([FIRST, SECOND]);
+        let result = run_evidence_gate_with_store(
+            RunOutcome {
+                exit_code: 0,
+                wall_clock_seconds: 0.25,
+                evidence: &evidence,
+            },
+            &store,
+        );
+        assert_eq!(result.verdict, Verdict::Pass);
+        assert_eq!(result.artifact_hash, None);
+        assert_eq!(
+            result.store_paths,
+            Some(vec![FIRST.to_owned(), SECOND.to_owned()])
+        );
+        assert_eq!(
+            store.calls.borrow().as_slice(),
+            [PathBuf::from(SECOND), PathBuf::from(FIRST)]
+        );
+
+        let store = FakeStore::with_valid([FIRST]);
+        let result = run_evidence_gate_with_store(
+            RunOutcome {
+                exit_code: 0,
+                wall_clock_seconds: 0.25,
+                evidence: &evidence,
+            },
+            &store,
+        );
+        assert_eq!(result.verdict, Verdict::CleanExitNoArtifact);
+        assert_eq!(result.store_paths, Some(vec![FIRST.to_owned()]));
+        assert_eq!(store.calls.borrow().len(), 2);
+    }
+
+    #[test]
+    fn store_only_dedup_revalidates_and_requires_witness_set_equality() {
+        const FIRST: &str = "/nix/store/00000000000000000000000000000000-first";
+        const SECOND: &str = "/nix/store/11111111111111111111111111111111-second";
+        let evidence = parse(&[&format!("store:{SECOND}"), &format!("store:{FIRST}")]);
+        let mut record = witness_record("store-only", Verdict::Pass, None, 9);
+        record.store_paths = Some(vec![FIRST.to_owned(), SECOND.to_owned()]);
+        let store = FakeStore::with_valid([FIRST, SECOND]);
+        let hit = probe_dedup_with_store(
+            Some("store-only"),
+            &evidence,
+            std::slice::from_ref(&record),
+            &store,
+        );
+        assert!(hit.hit);
+        assert_eq!(hit.artifact_hash, None);
+        assert_eq!(hit.store_paths, record.store_paths);
+        assert_eq!(store.calls.borrow().len(), 2);
+
+        let store = FakeStore::with_valid([FIRST]);
+        assert_eq!(
+            probe_full_pass_with_store(&evidence, &record, &store).miss_reason,
+            Some(DedupMissReason::StorePathInvalid(PathBuf::from(SECOND)))
+        );
+
+        let store = FakeStore::with_valid([FIRST, SECOND]);
+        record.store_paths = Some(vec![FIRST.to_owned()]);
+        assert_eq!(
+            probe_full_pass_with_store(&evidence, &record, &store).miss_reason,
+            Some(DedupMissReason::WitnessStorePathsMismatch)
+        );
     }
 
     #[test]

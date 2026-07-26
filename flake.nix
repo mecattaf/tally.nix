@@ -821,6 +821,102 @@
             )
           '';
         };
+        retentionTest = pkgs.testers.runNixOSTest {
+          name = "tally-retention-liveness-floor";
+          nodes.machine =
+            { ... }:
+            {
+              imports = [ home-manager.nixosModules.home-manager ];
+
+              system.stateVersion = "26.11";
+              virtualisation.memorySize = 1536;
+              nix.settings.experimental-features = [ "nix-command" ];
+              users.users.tally = {
+                isNormalUser = true;
+                uid = 1000;
+                createHome = true;
+                home = "/var/lib/tally-retention";
+                linger = true;
+              };
+
+              home-manager = {
+                useGlobalPkgs = true;
+                useUserPackages = true;
+                users.tally = {
+                  imports = [ self.homeManagerModules.tally ];
+                  home = {
+                    username = "tally";
+                    homeDirectory = "/var/lib/tally-retention";
+                    stateVersion = "26.11";
+                  };
+                  services.tally = {
+                    enable = true;
+                    retention.enable = false;
+                    pools.stock = {
+                      resource = "build-slot";
+                      enforce = "cooperative";
+                    };
+                  };
+                };
+              };
+            };
+          testScript = ''
+            machine.start()
+            machine.wait_for_unit("multi-user.target")
+            machine.wait_for_unit("home-manager-tally.service")
+            machine.wait_for_unit("user@1000.service")
+
+            user = "runuser -u tally -- env HOME=/var/lib/tally-retention XDG_RUNTIME_DIR=/run/user/1000"
+            socket = "/run/user/1000/tally/tally.sock"
+            data = "/var/lib/tally-retention/.local/share/tally"
+            cli = user + " ${tally}/bin/tally --socket " + socket
+            nix_store = user + " ${pkgs.nix}/bin/nix-store"
+            machine.wait_until_succeeds("test -S " + socket)
+
+            def enqueue(command):
+              status, output = machine.execute(command)
+              if status != 0:
+                daemon_log = machine.succeed(
+                  user + " journalctl --user --unit=tally-daemon.service --output=cat --no-pager"
+                )
+                raise Exception(output + "\n--- tally daemon journal ---\n" + daemon_log)
+              return output
+
+            machine.succeed("printf old-only > /tmp/tally-old-only")
+            machine.succeed("printf shared > /tmp/tally-shared")
+            old_only = machine.succeed(nix_store + " --add /tmp/tally-old-only").strip()
+            shared = machine.succeed(nix_store + " --add /tmp/tally-shared").strip()
+
+            enqueue(
+              cli + " enqueue --pool stock" +
+              " --evidence store:" + old_only +
+              " --evidence store:" + shared +
+              " --wait -- ${pkgs.coreutils}/bin/sleep 1"
+            )
+            machine.succeed(nix_store + " --check-validity " + old_only)
+            machine.succeed(nix_store + " --check-validity " + shared)
+
+            machine.succeed("${pkgs.coreutils}/bin/sleep 4")
+            enqueue(
+              cli + " enqueue --pool stock" +
+              " --evidence store:" + shared +
+              " --wait -- ${pkgs.coreutils}/bin/sleep 1"
+            )
+            ledger_hash = machine.succeed(
+              "${pkgs.coreutils}/bin/sha256sum " + data + "/witness.jsonl"
+            ).split()[0]
+
+            report = machine.succeed(
+              user + " ${tally}/bin/tally gc --horizon 3s --collect --data-dir " + data
+            )
+            assert '"rootsPruned":1' in report, report
+            assert ledger_hash == machine.succeed(
+              "${pkgs.coreutils}/bin/sha256sum " + data + "/witness.jsonl"
+            ).split()[0]
+            machine.fail(nix_store + " --check-validity " + old_only)
+            machine.succeed(nix_store + " --check-validity " + shared)
+          '';
+        };
         flowMultiHostTest = pkgs.testers.runNixOSTest {
           name = "tally-flow-multi-host";
           nodes = {
@@ -1295,6 +1391,16 @@
         systemDaemon = stockNixos.config.systemd.services.tally-daemon;
         systemWitnessEmitter = stockNixos.config.systemd.services."tally-witness-emit@";
         moduleContract =
+          assert stockHome.config.services.tally.retention == {
+            enable = true;
+            horizon = "30d";
+            onCalendar = "daily";
+          };
+          assert homeServices ? tally-retention;
+          assert homeTimers ? tally-retention;
+          assert homeTimers.tally-retention.Timer.OnCalendar == "daily";
+          assert pkgs.lib.hasInfix "gc --horizon 30d --collect"
+            (homeServiceExec "tally-retention");
           assert homeTimers ? tally-producer-daily;
           assert homeTimers.tally-producer-daily.Timer.OnCalendar == "daily";
           assert homeTimers ? tally-producer-flow-fixture;
@@ -1378,6 +1484,7 @@
               .enqueue.depthCap == 3 and
               .enqueue.fanoutCap == 64 and
               .lease.yieldGraceSec == 20 and
+              .retention == {"enable":true,"horizon":"30d","onCalendar":"daily"} and
               .pools.flow.resource == "cpu-slot" and
               .pools.flow.capacity == 8 and
               .pools.flow.enforce == "cooperative" and
@@ -1468,6 +1575,7 @@
           stock-home-activation = stockHome.activationPackage;
           stock-nixos-activation = stockNixos.config.system.build.toplevel;
           stock-host-activation = stockHostTest;
+          retention-liveness-floor = retentionTest;
           module-layer = moduleContract;
           flow-dialect-accept =
             pkgs.runCommand "tally-flow-dialect-accept"
