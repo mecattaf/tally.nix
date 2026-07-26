@@ -5,7 +5,7 @@
       "id": "qwen-a",
       "family": "qwen",
       "maker": "alibaba",
-      "classes": ["pooled-fast", "coding"],
+      "classes": ["pooled-fast", "pooled-strongest", "coding"],
       "adapter": "pi",
       "pools": ["worker-gpu"],
       "launch": { "model": "qwen-a" }
@@ -14,7 +14,7 @@
       "id": "qwen-b",
       "family": "qwen",
       "maker": "community",
-      "classes": ["pooled-fast", "coding"],
+      "classes": ["pooled-fast", "pooled-strongest", "coding"],
       "adapter": "pi",
       "pools": ["worker-gpu"],
       "launch": { "model": "qwen-b" }
@@ -23,7 +23,7 @@
       "id": "llama-a",
       "family": "llama",
       "maker": "meta",
-      "classes": ["pooled-fast", "coding"],
+      "classes": ["pooled-fast", "pooled-strongest", "coding"],
       "adapter": "pi",
       "pools": ["worker-gpu"],
       "launch": { "model": "llama-a" }
@@ -32,7 +32,7 @@
       "id": "mistral-a",
       "family": "mistral",
       "maker": "mistral",
-      "classes": ["pooled-fast", "coding"],
+      "classes": ["pooled-fast", "pooled-strongest", "coding"],
       "adapter": "pi",
       "pools": ["worker-gpu"],
       "launch": { "model": "mistral-a" }
@@ -41,7 +41,7 @@
       "id": "llama-b",
       "family": "llama",
       "maker": "community",
-      "classes": ["pooled-fast", "coding"],
+      "classes": ["pooled-fast", "pooled-strongest", "coding"],
       "adapter": "pi",
       "pools": ["worker-gpu"],
       "launch": { "model": "llama-b" }

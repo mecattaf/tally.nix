@@ -56,8 +56,9 @@ $ cargo build --workspace
 ```
 
 The flake exposes `packages.<system>.tally`, `packages.<system>.tally-witness-emit`,
-`homeManagerModules.tally`, `nixosModules.tally`, adapter helpers under `lib.adapters`, and the
-canonical priority table under `lib.priorityRanks`.
+`homeManagerModules.tally`, `nixosModules.tally`, adapter helpers under `lib.adapters`, the typed
+catalog renderer at `lib.tally.mkCatalog`, and the canonical priority table under
+`lib.priorityRanks`.
 
 After enabling one of the modules below, enqueue a local command through the running daemon:
 
@@ -386,6 +387,14 @@ $ tally queue continue <job-or-task-uuid> -- "Address the review feedback"
 
 Credentials are absolute source paths passed by name through systemd `LoadCredential=`. tally
 records credential names but never reads or serializes their values.
+
+## Selector catalogs and pooled review
+
+Selector catalog instances belong in the consuming Nix configuration. Use
+`tally.lib.tally.mkCatalog` to type-check a roster, render its ordered enabled members, and validate
+the result with the same flow binary used at activation time. The
+[pooled-review cookbook](doc/pooled-review.md) shows the complete roster, flow registration, and
+capacity model without hand-written catalog JSON.
 
 ## Evidence and ledgers
 

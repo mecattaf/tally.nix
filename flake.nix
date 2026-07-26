@@ -19,11 +19,16 @@
     }:
     let
       adapterLibrary = import ./nix/lib/adapters.nix { lib = nixpkgs.lib; };
+      catalogLibrary = import ./nix/lib/catalog.nix {
+        lib = nixpkgs.lib;
+        inherit self;
+      };
       priorityRanks = import ./nix/lib/priority-ranks.nix;
     in
     {
       lib.adapters = adapterLibrary;
       lib.priorityRanks = priorityRanks;
+      lib.tally.mkCatalog = catalogLibrary.mkCatalog;
       lib.tallyWitnessUnitHooks = {
         OnSuccess = [ "tally-witness-emit@success:%n.service" ];
         OnFailure = [ "tally-witness-emit@failure:%n.service" ];
@@ -127,7 +132,7 @@
                     "--max-nodes"
                     "1000"
                     "--catalog"
-                    "${./test/fixtures/flows/catalog-resolution.json}"
+                    "${catalogFixture}"
                   ];
                   pool = "slot";
                   noEnqueue = false;
@@ -178,6 +183,44 @@
           '';
           meta.mainProgram = "tally";
         };
+        catalogFixtureInput = import ./test/fixtures/catalog/valid.nix;
+        catalogFixture = catalogLibrary.mkCatalog (
+          catalogFixtureInput
+          // {
+            inherit pkgs;
+            package = tally;
+          }
+        );
+        mkCatalogRejectionCheck =
+          {
+            name,
+            fixture,
+            expectedMessage,
+          }:
+          let
+            input = import fixture;
+            evaluated = catalogLibrary.evalCatalog input;
+            failureMessages = map (entry: entry.message) (
+              builtins.filter (entry: !entry.assertion) (catalogLibrary.mkCatalogAssertions evaluated)
+            );
+            attempt = builtins.tryEval (
+              toString (
+                catalogLibrary.mkCatalog (
+                  input
+                  // {
+                    inherit pkgs;
+                    package = tally;
+                  }
+                )
+              )
+            );
+          in
+          assert failureMessages != [ ];
+          assert builtins.head failureMessages == expectedMessage;
+          assert !attempt.success;
+          pkgs.runCommand name { } ''
+            printf '%s\n' ${pkgs.lib.escapeShellArg expectedMessage} >"$out"
+          '';
         tallyWitnessEmit = import ./nix/lib/witness-emitter.nix {
           lib = pkgs.lib;
           inherit pkgs;
@@ -563,7 +606,7 @@
                     script = ./test/fixtures/flows/valid.js;
                     onCalendar = "daily";
                     args.task = "ship";
-                    catalog = ./test/fixtures/flows/catalog.json;
+                    catalog = catalogFixture;
                     budgetPool = "programmatic";
                     extraEnv.FLOW_MODE = "fixture";
                     credentials.FLOW_TOKEN = "/run/credentials/tally-flow";
@@ -571,7 +614,7 @@
                   manual = {
                     script = ./test/fixtures/flows/valid.js;
                     args.task = "manual";
-                    catalog = ./test/fixtures/flows/catalog.json;
+                    catalog = catalogFixture;
                   };
                 };
               };
@@ -643,7 +686,7 @@
                 flows.bad-budget = {
                   script = ./test/fixtures/flows/valid.js;
                   args.task = "ship";
-                  catalog = ./test/fixtures/flows/catalog.json;
+                  catalog = catalogFixture;
                   budgetPool = "missing-budget";
                 };
               };
@@ -698,7 +741,7 @@
         flowValidCheckedConfig = moduleCommon.mkCheckedConfig (mkFlowConfig {
           script = ./test/fixtures/flows/valid.js;
           args.task = "ship";
-          catalog = ./test/fixtures/flows/catalog.json;
+          catalog = catalogFixture;
         });
         flowNonliteralFailure = pkgs.testers.testBuildFailure' {
           name = "tally-flow-nonliteral-meta-failure";
@@ -745,7 +788,7 @@
           drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
             script = ./test/fixtures/flows/valid.js;
             args.task = 7;
-            catalog = ./test/fixtures/flows/catalog.json;
+            catalog = catalogFixture;
           });
           expectedBuilderExitCode = 1;
           expectedBuilderLogEntries = [
@@ -757,7 +800,7 @@
           drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
             script = ./test/fixtures/flows/valid.js;
             args.task = "ship";
-            catalog = ./test/fixtures/flows/catalog.json;
+            catalog = catalogFixture;
             pools.build.resource = "build-slot";
           });
           expectedBuilderExitCode = 1;
@@ -791,7 +834,7 @@
           drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
             script = ./test/fixtures/flows/valid.js;
             args.task = "ship";
-            catalog = ./test/fixtures/flows/catalog.json;
+            catalog = catalogFixture;
             maxNodes = 4;
           });
           expectedBuilderExitCode = 1;
@@ -830,7 +873,7 @@
               subject = "audit";
               minimumValid = 2;
             };
-            catalog = ./test/fixtures/flows/catalog-resolution.json;
+            catalog = ./test/fixtures/flows/catalog.json;
             pools.worker-gpu.resource = "vram";
           });
           expectedBuilderExitCode = 1;
@@ -2083,7 +2126,7 @@
                 ${tally}/bin/tally --mode check-config --config "$checkedConfig"
                 meta="$(${tally}/bin/tally flow check ${./test/fixtures/flows/valid.js} \
                   --args '{"task":"ship"}' \
-                  --catalog ${./test/fixtures/flows/catalog.json})"
+                  --catalog ${catalogFixture})"
                 test "$(printf '%s' "$meta" | jq -r '.name')" = fixture-valid
                 test "$(printf '%s' "$meta" | jq -c '.pools')" = '["worker-gpu"]'
                 drv_meta="$(${tally}/bin/tally flow check ${./test/fixtures/flows/valid-drv.js})"
@@ -2127,6 +2170,44 @@
                 test -e "$maxNodesFailure"
                 touch "$out"
               '';
+          flow-catalog-renderer =
+            pkgs.runCommand "tally-flow-catalog-renderer"
+              {
+                nativeBuildInputs = [ pkgs.jq ];
+              }
+              ''
+                jq -S . ${catalogFixture} > rendered.json
+                jq -S . ${./test/fixtures/flows/catalog-resolution.json} > golden.json
+                cmp rendered.json golden.json
+                jq -e '
+                  .version == 1 and
+                  [.members[].id] == ["qwen-a", "qwen-b", "llama-a", "mistral-a", "llama-b"] and
+                  all(.members[]; .classes | index("pooled-strongest") != null)
+                ' ${catalogFixture} >/dev/null
+                ${tally}/bin/tally flow check ${./examples/flows/pooled-review.js} \
+                  --catalog ${catalogFixture} >/dev/null
+                touch "$out"
+              '';
+          flow-catalog-reject-unknown-class = mkCatalogRejectionCheck {
+            name = "tally-flow-catalog-reject-unknown-class";
+            fixture = ./test/fixtures/catalog/unknown-class.nix;
+            expectedMessage = "tally catalog member qwen-a references unknown class not-declared";
+          };
+          flow-catalog-reject-empty-class = mkCatalogRejectionCheck {
+            name = "tally-flow-catalog-reject-empty-class";
+            fixture = ./test/fixtures/catalog/empty-class.nix;
+            expectedMessage = "tally catalog class dormant has no members after filtering";
+          };
+          flow-catalog-reject-unknown-pool = mkCatalogRejectionCheck {
+            name = "tally-flow-catalog-reject-unknown-pool";
+            fixture = ./test/fixtures/catalog/unknown-pool.nix;
+            expectedMessage = "tally catalog member qwen-a references undeclared pool not-declared";
+          };
+          flow-catalog-reject-missing-diversity = mkCatalogRejectionCheck {
+            name = "tally-flow-catalog-reject-missing-diversity";
+            fixture = ./test/fixtures/catalog/missing-diversity.nix;
+            expectedMessage = "tally catalog class review requires diversity key maker, but member local does not define it";
+          };
           flow-catalog-schema =
             pkgs.runCommand "tally-flow-catalog-schema"
               {
@@ -2146,11 +2227,14 @@
                 ' ${./crates/tally-flow/schema/catalog.schema.json} >/dev/null
                 ${tally}/bin/tally flow check ${./test/fixtures/flows/valid.js} \
                   --args '{"task":"catalog-golden"}' \
-                  --catalog ${./test/fixtures/flows/catalog-resolution.json} >/dev/null
+                  --catalog ${catalogFixture} >/dev/null
                 test "$(jq -r '.pool.capacity' ${./test/fixtures/flows/catalog-resolution.golden.json})" = 1
                 test "$(jq -r '.cases[1].expectedIds | join(",")' \
                   ${./test/fixtures/flows/catalog-resolution.golden.json})" = \
                   'qwen-a,llama-a,mistral-a,qwen-b,llama-b'
+                test "$(jq -r '.cases[2].expectedIds | join(",")' \
+                  ${./test/fixtures/flows/catalog-resolution.golden.json})" = \
+                  'qwen-a,qwen-b,llama-a,mistral-a,llama-b'
                 touch "$out"
               '';
           flow-multi-host = flowMultiHostTest;
@@ -2320,7 +2404,7 @@
                 flow_path="$(printf '%s' "$flow" | jq -r '.emitted')"
                 jq -e \
                   --arg script ${./examples/flows/pooled-review.js} \
-                  --arg catalog ${./test/fixtures/flows/catalog-resolution.json} '
+                  --arg catalog ${catalogFixture} '
                     .source == "gh" and
                     .noEnqueue == false and
                     .argv[0:3] == ["tally", "flow", "run"] and
