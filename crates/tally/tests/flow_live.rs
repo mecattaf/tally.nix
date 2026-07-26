@@ -5,6 +5,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use tally_client::RpcClient;
 use tally_core::adapters::AdapterConfig;
 use tally_core::config::{
     CoResidencyPredicate, Config, JournaldConfig, PoolConfig, PoolPredicate, ResourceKind,
@@ -17,7 +18,6 @@ use tally_core::executor::{
 };
 use tally_core::recovery::RecoveryPolicy;
 use tally_core::taskdb::{read_acknowledged_events, EnqueueSource};
-use tally_core::wire::RpcClient;
 use tally_core::witness::read_verified_records;
 use tokio::process::{Child, Command};
 use tokio::sync::watch;

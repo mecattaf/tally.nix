@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_json_path.workspace = true
 sha2.workspace = true
+tally-client = { path = "../tally-client" }
 taskchampion.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

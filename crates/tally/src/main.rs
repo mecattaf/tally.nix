@@ -11,8 +11,12 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
+use tally_client::{
+    default_config_path, resolve_max_frame_bytes, RpcClient, WireErrorCode, WireIoError,
+    DEFAULT_MAX_FRAME_BYTES,
+};
 use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
-use tally_core::config::{Priority, DEFAULT_MAX_FRAME_BYTES};
+use tally_core::config::Priority;
 use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings};
 use tally_core::evidence::RetryPolicy;
 use tally_core::executor::{
@@ -25,7 +29,7 @@ use tally_core::producers::{
 use tally_core::provenance::Orchestration;
 use tally_core::recovery::RecoveryPolicy;
 use tally_core::taskdb::{EnqueueSource, RelatedTrigger, WorkspaceMetadata};
-use tally_core::wire::{EnqueuePayload, RpcClient, WireErrorCode, WireIoError};
+use tally_core::wire::EnqueuePayload;
 use tally_core::witness::{
     append_attestation, read_verified_attestations, read_verified_records, GENESIS_PREV_HASH,
 };
@@ -1894,9 +1898,7 @@ async fn connect_rpc(socket: &Path, config_path: Option<&Path>) -> Result<RpcCli
 }
 
 fn client_max_frame_bytes(config_path: Option<&Path>) -> Result<u64> {
-    Ok(load_client_config(config_path)?
-        .map(|config| config.max_frame_bytes)
-        .unwrap_or(DEFAULT_MAX_FRAME_BYTES))
+    resolve_max_frame_bytes(config_path).map_err(Into::into)
 }
 
 fn load_client_config(config_path: Option<&Path>) -> Result<Option<Config>> {
@@ -2080,14 +2082,6 @@ fn default_socket_path() -> PathBuf {
         || std::env::temp_dir().join("tally/tally.sock"),
         |runtime| PathBuf::from(runtime).join("tally/tally.sock"),
     )
-}
-
-fn default_config_path() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(path).join("tally/config.json"));
-    }
-    let home = std::env::var_os("HOME").context("HOME and XDG_CONFIG_HOME are both unset")?;
-    Ok(PathBuf::from(home).join(".config/tally/config.json"))
 }
 
 fn default_state_dir() -> Result<PathBuf> {

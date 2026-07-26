@@ -1,22 +1,18 @@
 [package]
-name = "tally"
+name = "tally-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 description.workspace = true
 repository.workspace = true
 keywords.workspace = true
+readme = "README.md"
 
 [dependencies]
-anyhow.workspace = true
-chrono.workspace = true
-clap.workspace = true
+serde.workspace = true
 serde_json.workspace = true
-tally-client = { path = "../tally-client" }
-tally-core = { path = "../tally-core" }
-tally-flow = { path = "../tally-flow" }
+thiserror.workspace = true
 tokio.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
 tempfile = "3.20"

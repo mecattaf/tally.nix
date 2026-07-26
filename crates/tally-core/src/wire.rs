@@ -1,24 +1,22 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
-use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tally_client::framing::{ensure_frame_size, read_line_limited, validate_frame_limit};
+use tally_client::DEFAULT_MAX_FRAME_BYTES;
+pub use tally_client::{RequestFrame, RequestId, WireError, WireErrorCode, WireIoError};
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::UnixStream;
-use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinSet;
 
 use crate::adapters::AdapterJobOptions;
 use crate::completion::GateManifestSpec;
-use crate::config::{Priority, DEFAULT_MAX_FRAME_BYTES};
+use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::provenance::Orchestration;
 use crate::taskdb::{
@@ -55,66 +53,6 @@ pub const RPC_METHODS: &[&str] = &[
     "query.pools",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RequestId {
-    String(String),
-    Number(i64),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RequestFrame {
-    pub id: RequestId,
-    pub method: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub params: Option<Value>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum WireErrorCode {
-    UnsupportedProtocol,
-    InvalidParams,
-    InvalidFrame,
-    FrameTooLarge,
-    UnknownMethod,
-    NotFound,
-    Unsupported,
-    Internal,
-    Timeout,
-    EpochChanged,
-    #[serde(rename = "dedup-key-conflict")]
-    DedupKeyConflict,
-    #[serde(rename = "flow-node-cap")]
-    FlowNodeCap,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WireError {
-    pub code: WireErrorCode,
-    pub message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
-}
-
-impl WireError {
-    pub fn new(code: WireErrorCode, message: impl Into<String>) -> Self {
-        Self {
-            code,
-            message: message.into(),
-            data: None,
-        }
-    }
-
-    pub fn invalid(message: impl Into<String>) -> Self {
-        Self::new(WireErrorCode::InvalidParams, message)
-    }
-
-    pub fn not_found(message: impl Into<String>) -> Self {
-        Self::new(WireErrorCode::NotFound, message)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize)]
 struct ResponseOk<'a> {
     id: &'a RequestId,
@@ -127,84 +65,11 @@ struct ResponseErr<'a> {
     error: WireError,
 }
 
-#[derive(Debug, Error)]
-pub enum WireIoError {
-    #[error("daemon socket {path} is unreachable: {source}")]
-    Unreachable { path: PathBuf, source: io::Error },
-    #[error("wire I/O error: {0}")]
-    Io(#[from] io::Error),
-    #[error("wire JSON error: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error("wire frame exceeds {limit} bytes")]
-    FrameTooLarge { limit: u64 },
-    #[error("wire frame limit must be positive")]
-    InvalidFrameLimit,
-    #[error("daemon closed the socket before replying")]
-    Closed,
-    #[error("invalid response frame: {0}")]
-    InvalidResponse(String),
-    #[error("RPC request task failed: {0}")]
-    RequestTask(String),
-    #[error("RPC error {0:?}: {1}")]
-    Rpc(WireErrorCode, String, Option<Value>),
-}
-
 pub trait RpcHandler {
     fn handle<'a>(
         &'a self,
         request: RequestFrame,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>>;
-}
-
-async fn read_line_limited<R: tokio::io::AsyncBufRead + Unpin>(
-    reader: &mut R,
-    max_frame_bytes: u64,
-) -> Result<Option<Vec<u8>>, WireIoError> {
-    validate_frame_limit(max_frame_bytes)?;
-    let mut line = Vec::new();
-    loop {
-        let (take, complete, eof) = {
-            let available = reader.fill_buf().await?;
-            if available.is_empty() {
-                (0, false, true)
-            } else if let Some(newline) = available.iter().position(|byte| *byte == b'\n') {
-                (newline + 1, true, false)
-            } else {
-                (available.len(), false, false)
-            }
-        };
-        if eof {
-            return if line.is_empty() {
-                Ok(None)
-            } else {
-                Ok(Some(line))
-            };
-        }
-        let next_len =
-            (line.len() as u64)
-                .checked_add(take as u64)
-                .ok_or(WireIoError::FrameTooLarge {
-                    limit: max_frame_bytes,
-                })?;
-        if next_len > max_frame_bytes {
-            return Err(WireIoError::FrameTooLarge {
-                limit: max_frame_bytes,
-            });
-        }
-        let available = reader.fill_buf().await?;
-        line.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if complete {
-            break;
-        }
-    }
-    if line.last() == Some(&b'\n') {
-        line.pop();
-    }
-    if line.last() == Some(&b'\r') {
-        line.pop();
-    }
-    Ok(Some(line))
 }
 
 pub async fn serve_connection<H>(stream: UnixStream, handler: H) -> Result<(), WireIoError>
@@ -301,231 +166,6 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     encoded.push(b'\n');
     writer.write_all(&encoded).await?;
     Ok(())
-}
-
-fn validate_frame_limit(max_frame_bytes: u64) -> Result<(), WireIoError> {
-    if max_frame_bytes == 0 {
-        Err(WireIoError::InvalidFrameLimit)
-    } else {
-        Ok(())
-    }
-}
-
-fn ensure_frame_size(encoded_bytes: usize, max_frame_bytes: u64) -> Result<(), WireIoError> {
-    let frame_bytes = (encoded_bytes as u64)
-        .checked_add(1)
-        .ok_or(WireIoError::FrameTooLarge {
-            limit: max_frame_bytes,
-        })?;
-    if frame_bytes > max_frame_bytes {
-        return Err(WireIoError::FrameTooLarge {
-            limit: max_frame_bytes,
-        });
-    }
-    Ok(())
-}
-
-type PendingResponse = oneshot::Sender<Result<Value, ClientReadFailure>>;
-
-#[derive(Debug, Clone)]
-enum ClientReadFailure {
-    FrameTooLarge { limit: u64 },
-    Closed,
-    Io(String),
-    Json(String),
-    InvalidResponse(String),
-}
-
-impl ClientReadFailure {
-    fn into_wire_error(self) -> WireIoError {
-        match self {
-            Self::FrameTooLarge { limit } => WireIoError::FrameTooLarge { limit },
-            Self::Closed => WireIoError::Closed,
-            Self::Io(message) => WireIoError::Io(io::Error::other(message)),
-            Self::Json(message) => {
-                WireIoError::InvalidResponse(format!("response is not valid JSON: {message}"))
-            }
-            Self::InvalidResponse(message) => WireIoError::InvalidResponse(message),
-        }
-    }
-}
-
-#[derive(Default)]
-struct ClientState {
-    pending: HashMap<RequestId, PendingResponse>,
-    failure: Option<ClientReadFailure>,
-}
-
-#[derive(Clone)]
-pub struct RpcClient {
-    writer: Arc<Mutex<OwnedWriteHalf>>,
-    state: Arc<StdMutex<ClientState>>,
-    next_id: Arc<AtomicU64>,
-    max_frame_bytes: u64,
-}
-
-impl RpcClient {
-    pub async fn connect(path: &Path) -> Result<Self, WireIoError> {
-        Self::connect_with_max_frame_bytes(path, DEFAULT_MAX_FRAME_BYTES).await
-    }
-
-    pub async fn connect_with_max_frame_bytes(
-        path: &Path,
-        max_frame_bytes: u64,
-    ) -> Result<Self, WireIoError> {
-        validate_frame_limit(max_frame_bytes)?;
-        let stream =
-            UnixStream::connect(path)
-                .await
-                .map_err(|source| WireIoError::Unreachable {
-                    path: path.to_owned(),
-                    source,
-                })?;
-        let (reader, writer) = stream.into_split();
-        let state = Arc::new(StdMutex::new(ClientState::default()));
-        tokio::spawn(read_responses(
-            BufReader::new(reader),
-            Arc::clone(&state),
-            max_frame_bytes,
-        ));
-        Ok(Self {
-            writer: Arc::new(Mutex::new(writer)),
-            state,
-            next_id: Arc::new(AtomicU64::new(1)),
-            max_frame_bytes,
-        })
-    }
-
-    pub async fn call(&self, method: &str, params: Option<Value>) -> Result<Value, WireIoError> {
-        let next_id = self
-            .next_id
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                current.checked_add(1)
-            })
-            .map_err(|_| {
-                WireIoError::InvalidResponse("RPC request ID counter overflowed".to_owned())
-            })?;
-        let id = RequestId::String(format!("cli-{next_id}"));
-        let request = RequestFrame {
-            id: id.clone(),
-            method: method.to_owned(),
-            params,
-        };
-        let mut encoded = serde_json::to_vec(&request)?;
-        ensure_frame_size(encoded.len(), self.max_frame_bytes)?;
-        encoded.push(b'\n');
-
-        let (sender, receiver) = oneshot::channel();
-        {
-            let mut state = self.state.lock().expect("RPC client state lock poisoned");
-            if let Some(failure) = state.failure.clone() {
-                return Err(failure.into_wire_error());
-            }
-            state.pending.insert(id.clone(), sender);
-        }
-
-        if let Err(error) = self.writer.lock().await.write_all(&encoded).await {
-            self.state
-                .lock()
-                .expect("RPC client state lock poisoned")
-                .pending
-                .remove(&id);
-            return Err(WireIoError::Io(error));
-        }
-
-        let response = receiver
-            .await
-            .map_err(|_| WireIoError::Closed)?
-            .map_err(ClientReadFailure::into_wire_error)?;
-        let object = response
-            .as_object()
-            .ok_or_else(|| WireIoError::InvalidResponse("response is not an object".to_owned()))?;
-        if let Some(result) = object.get("result") {
-            return Ok(result.clone());
-        }
-        if let Some(error) = object.get("error") {
-            let error: WireError = serde_json::from_value(error.clone())?;
-            return Err(WireIoError::Rpc(error.code, error.message, error.data));
-        }
-        Err(WireIoError::InvalidResponse(
-            "response has neither result nor error".to_owned(),
-        ))
-    }
-}
-
-async fn read_responses(
-    mut reader: BufReader<OwnedReadHalf>,
-    state: Arc<StdMutex<ClientState>>,
-    max_frame_bytes: u64,
-) {
-    loop {
-        let line = match read_line_limited(&mut reader, max_frame_bytes).await {
-            Ok(Some(line)) => line,
-            Ok(None) => {
-                fail_client(&state, ClientReadFailure::Closed);
-                return;
-            }
-            Err(WireIoError::FrameTooLarge { limit }) => {
-                fail_client(&state, ClientReadFailure::FrameTooLarge { limit });
-                return;
-            }
-            Err(error) => {
-                fail_client(&state, ClientReadFailure::Io(error.to_string()));
-                return;
-            }
-        };
-        let response: Value = match serde_json::from_slice(&line) {
-            Ok(response) => response,
-            Err(error) => {
-                fail_client(&state, ClientReadFailure::Json(error.to_string()));
-                return;
-            }
-        };
-        let response_id = response
-            .as_object()
-            .and_then(|object| object.get("id"))
-            .cloned()
-            .ok_or_else(|| "response has no id".to_owned())
-            .and_then(|id| {
-                serde_json::from_value::<RequestId>(id)
-                    .map_err(|error| format!("response has an invalid id: {error}"))
-            });
-        let response_id = match response_id {
-            Ok(response_id) => response_id,
-            Err(error) => {
-                fail_client(&state, ClientReadFailure::InvalidResponse(error));
-                return;
-            }
-        };
-        let sender = state
-            .lock()
-            .expect("RPC client state lock poisoned")
-            .pending
-            .remove(&response_id);
-        let Some(sender) = sender else {
-            fail_client(
-                &state,
-                ClientReadFailure::InvalidResponse(format!(
-                    "response id {response_id:?} has no pending request"
-                )),
-            );
-            return;
-        };
-        let _ = sender.send(Ok(response));
-    }
-}
-
-fn fail_client(state: &Arc<StdMutex<ClientState>>, failure: ClientReadFailure) {
-    let pending = {
-        let mut state = state.lock().expect("RPC client state lock poisoned");
-        if state.failure.is_none() {
-            state.failure = Some(failure.clone());
-        }
-        std::mem::take(&mut state.pending)
-    };
-    for (_, sender) in pending {
-        let _ = sender.send(Err(failure.clone()));
-    }
 }
 
 pub fn split_invocation(invocation: &str) -> Result<Vec<String>, WireError> {
@@ -1171,6 +811,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use tally_client::RpcClient;
     use tokio::io::AsyncWriteExt;
     use tokio::net::UnixListener;
     use tokio::sync::{mpsc, Semaphore};

@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/tally-core", "crates/tally-flow", "crates/tally"]
+members = [
+  "crates/tally-client",
+  "crates/tally-core",
+  "crates/tally-flow",
+  "crates/tally",
+]
 
 [workspace.package]
 version = "0.1.0"
