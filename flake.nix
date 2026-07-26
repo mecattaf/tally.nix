@@ -625,6 +625,18 @@
                     args.task = "manual";
                     catalog = catalogFixture;
                   };
+                  monthly-dedup = {
+                    script = ./test/fixtures/flows/valid.js;
+                    onCalendar = "monthly";
+                    dedupKey = "monthly-local-ai-review-%Y-%m";
+                    evidence = [
+                      "exit:0"
+                      "artifact:/tmp/monthly-review-receipt.json"
+                      "hash:sha256"
+                    ];
+                    args.task = "monthly";
+                    catalog = catalogFixture;
+                  };
                 };
               };
             }
@@ -1948,6 +1960,9 @@
           assert homeTimers ? tally-producer-flow-fixture;
           assert homeTimers.tally-producer-flow-fixture.Timer.OnCalendar == "daily";
           assert homeServices ? tally-producer-flow-fixture;
+          assert homeTimers ? tally-producer-flow-monthly-dedup;
+          assert homeTimers.tally-producer-flow-monthly-dedup.Timer.OnCalendar == "monthly";
+          assert homeServices ? tally-producer-flow-monthly-dedup;
           assert !(homeTimers ? tally-producer-flow-manual);
           assert !(homeServices ? tally-producer-flow-manual);
           assert builtins.elem "tally flow bad-budget references unknown budgetPool missing-budget"
@@ -2056,6 +2071,8 @@
               .producers["flow-fixture"].enqueue.noEnqueue == false and
               .producers["flow-fixture"].enqueue.adapterOptions.environment.FLOW_MODE == "fixture" and
               .producers["flow-fixture"].enqueue.credentials.FLOW_TOKEN == "/run/credentials/tally-flow" and
+              .producers["flow-monthly-dedup"].enqueue.dedupKey == "monthly-local-ai-review-%Y-%m" and
+              .producers["flow-monthly-dedup"].enqueue.evidence == ["exit:0","artifact:/tmp/monthly-review-receipt.json","hash:sha256"] and
               (.producers | has("flow-manual") | not) and
               (has("flows") | not) and
               .producers.daily.enqueue.pool == ["programmatic", "stock"] and
