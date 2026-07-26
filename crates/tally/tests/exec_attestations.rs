@@ -18,12 +18,7 @@ fn tally() -> Command {
     Command::new(env!("CARGO_BIN_EXE_tally"))
 }
 
-fn run_attested(
-    ledger: &Path,
-    task_uuid: &str,
-    artifact: &Path,
-    payload_hash: &str,
-) -> Output {
+fn run_attested(ledger: &Path, task_uuid: &str, artifact: &Path, payload_hash: &str) -> Output {
     tally()
         .args([
             "attest",
@@ -53,12 +48,7 @@ fn run_attested(
         .unwrap()
 }
 
-fn append_canon(
-    ledger: &mut WitnessLedger,
-    task_uuid: &str,
-    artifact: &Path,
-    payload_hash: &str,
-) {
+fn append_canon(ledger: &mut WitnessLedger, task_uuid: &str, artifact: &Path, payload_hash: &str) {
     ledger
         .append(WitnessBody {
             task_uuid: Some(task_uuid.to_owned()),
@@ -217,7 +207,8 @@ fn attestation_append_failure_never_changes_child_exit_propagation() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(expected));
-        assert!(String::from_utf8_lossy(&output.stderr)
-            .contains("execution attestation append failed"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("execution attestation append failed")
+        );
     }
 }

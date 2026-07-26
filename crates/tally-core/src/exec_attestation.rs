@@ -282,7 +282,9 @@ fn validate_run_request(request: &ExecRunRequest) -> Result<(), ExecRunError> {
         ));
     }
     if request.ledger.as_os_str().is_empty() {
-        return Err(ExecRunError::Invalid("ledger path must not be empty".to_owned()));
+        return Err(ExecRunError::Invalid(
+            "ledger path must not be empty".to_owned(),
+        ));
     }
     if request.argv.is_empty() || request.argv[0].is_empty() {
         return Err(ExecRunError::Invalid(
@@ -507,8 +509,18 @@ pub fn compare(
 
     let canon = canon_records
         .iter()
-        .filter(|record| matches!(record.labor_class, LaborClass::Fresh | LaborClass::Recovered))
-        .filter_map(|record| record.task_uuid.as_deref().map(|task_uuid| (record, task_uuid)))
+        .filter(|record| {
+            matches!(
+                record.labor_class,
+                LaborClass::Fresh | LaborClass::Recovered
+            )
+        })
+        .filter_map(|record| {
+            record
+                .task_uuid
+                .as_deref()
+                .map(|task_uuid| (record, task_uuid))
+        })
         .collect::<Vec<_>>();
     let canon_ids = canon
         .iter()
@@ -680,9 +692,12 @@ fn canonical_timestamp(value: &str, field: &str) -> Result<DateTime<Utc>, String
 }
 
 fn sha256_shape(value: &str) -> bool {
-    value
-        .strip_prefix("sha256:")
-        .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+    value.strip_prefix("sha256:").is_some_and(|hex| {
+        hex.len() == 64
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    })
 }
 
 fn registry_component_shape(value: &str) -> bool {

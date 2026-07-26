@@ -399,7 +399,7 @@ impl LocalUnitFact {
     }
 }
 
-pub const REMOTE_EXECUTOR_PROTOCOL_VERSION: u32 = 3;
+pub const REMOTE_EXECUTOR_PROTOCOL_VERSION: u32 = 4;
 const MAX_REMOTE_REQUEST_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_REMOTE_REPLY_BYTES: usize = 48 * 1024 * 1024;
 const MAX_REMOTE_STDERR_BYTES: usize = 64 * 1024;
@@ -2209,7 +2209,9 @@ impl Executor {
         }
         argv.extend([
             "--ledger".into(),
-            self.state_dir.join(EXEC_ATTESTATION_LEDGER).into_os_string(),
+            self.state_dir
+                .join(EXEC_ATTESTATION_LEDGER)
+                .into_os_string(),
             "--".into(),
         ]);
         argv.extend(request.argv.iter().map(OsString::from));
@@ -4643,9 +4645,9 @@ mod tests {
         ] {
             assert!(args.windows(2).any(|window| window == pair));
         }
-        assert!(args.windows(2).any(|window| {
-            window == ["--evidence", "artifact:/work tree/result.json"]
-        }));
+        assert!(args
+            .windows(2)
+            .any(|window| { window == ["--evidence", "artifact:/work tree/result.json"] }));
         let child_separator = args.iter().rposition(|argument| argument == "--").unwrap();
         assert!(child_separator > systemd_separator);
         assert_eq!(&args[child_separator + 1..], child);

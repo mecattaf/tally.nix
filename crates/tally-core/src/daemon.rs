@@ -8268,6 +8268,15 @@ mod tests {
         }
     }
 
+    fn daemon_test_defaults() -> Config {
+        let mut config = Config::default();
+        // Most daemon tests use the Rust test harness as the executor binary.
+        // The production wrapper is exercised independently with a real tally
+        // binary, so keep these legacy fixtures focused on daemon behavior.
+        config.attestations.exec.enable = false;
+        config
+    }
+
     fn one_pool_config() -> Config {
         Config {
             pools: BTreeMap::from([(
@@ -8284,7 +8293,7 @@ mod tests {
             producers: BTreeMap::new(),
             executors: BTreeMap::new(),
             journald: JournaldConfig { native: false },
-            ..Config::default()
+            ..daemon_test_defaults()
         }
     }
 
@@ -8322,7 +8331,7 @@ mod tests {
             producers: BTreeMap::new(),
             executors: BTreeMap::new(),
             journald: JournaldConfig { native: false },
-            ..Config::default()
+            ..daemon_test_defaults()
         }
     }
 
