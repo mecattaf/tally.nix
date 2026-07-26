@@ -1708,6 +1708,7 @@ fn labor_class_name(class: LaborClass) -> &'static str {
         LaborClass::Fresh => "fresh",
         LaborClass::Recovered => "recovered",
         LaborClass::Reused => "reused",
+        LaborClass::Substituted => "substituted",
     }
 }
 
@@ -1747,7 +1748,8 @@ fn status_for_verdict(verdict: Verdict) -> Status {
         | Verdict::Reused
         | Verdict::PoolVanished
         | Verdict::Preempted
-        | Verdict::RuntimeExceeded => Status::Completed,
+        | Verdict::RuntimeExceeded
+        | Verdict::Substituted => Status::Completed,
         Verdict::Cancelled => Status::Deleted,
     }
 }

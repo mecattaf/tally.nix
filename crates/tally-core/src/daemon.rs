@@ -1505,6 +1505,8 @@ impl DaemonHandler {
                         verdict: Verdict::Reused,
                         exit_code: 0,
                         artifact_content_hash: Some(artifact_hash.clone()),
+                        store_paths: None,
+                        drv: None,
                         gpu_seconds: None,
                         wall_clock: 0.0,
                         attempt: row.attempt,
@@ -1512,16 +1514,23 @@ impl DaemonHandler {
                         dedup_key: row.dedup_key.clone(),
                         payload_hash: row.payload_hash.clone(),
                         brief_hash: row.brief_hash.clone(),
+                        origin: row
+                            .origin
+                            .clone()
+                            .expect("canonical row carries admission origin"),
                         orchestration: row.orchestration.clone(),
                         labor_class: LaborClass::Reused,
                         trace_ref: None,
-                        pools: Some(row.pools.clone()),
+                        pools: row.pools.clone(),
                         executor: row.executor.clone(),
+                        host_id: None,
                         charge: None,
                         model: row.model.clone(),
                         evidence_class: row.evidence_class.clone(),
                         manifest_hash: row.manifest_hash.clone(),
                         completion: None,
+                        result_revision: None,
+                        authorship: None,
                     }) {
                         Ok(record) => record,
                         Err(error) => return Err(self.fail_stop(error.into())),
@@ -4573,6 +4582,8 @@ fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
         verdict,
         exit_code: if verdict == Verdict::Cancelled { 0 } else { 1 },
         artifact_content_hash: None,
+        store_paths: None,
+        drv: None,
         gpu_seconds: None,
         wall_clock: 0.0,
         attempt: job.row.attempt,
@@ -4580,16 +4591,24 @@ fn forced_witness(job: &Job, verdict: Verdict) -> WitnessBody {
         dedup_key: job.row.dedup_key.clone(),
         payload_hash: job.row.payload_hash.clone(),
         brief_hash: job.row.brief_hash.clone(),
+        origin: job
+            .row
+            .origin
+            .clone()
+            .expect("canonical row carries admission origin"),
         orchestration: job.row.orchestration.clone(),
         labor_class: job.labor_class,
         trace_ref: None,
-        pools: Some(job.row.pools.clone()),
+        pools: job.row.pools.clone(),
         executor: job.row.executor.clone(),
+        host_id: None,
         charge: None,
         model: canonical_job_model(job),
         evidence_class: job.row.evidence_class.clone(),
         manifest_hash: job.row.manifest_hash.clone(),
         completion: None,
+        result_revision: None,
+        authorship: None,
     }
 }
 
@@ -5473,6 +5492,8 @@ impl Daemon {
                 verdict,
                 exit_code,
                 artifact_content_hash: artifact_hash.clone(),
+                store_paths: None,
+                drv: None,
                 gpu_seconds: None,
                 wall_clock: finished.elapsed.as_secs_f64(),
                 attempt: job.row.attempt,
@@ -5480,16 +5501,24 @@ impl Daemon {
                 dedup_key: job.row.dedup_key.clone(),
                 payload_hash: job.row.payload_hash.clone(),
                 brief_hash: job.row.brief_hash.clone(),
+                origin: job
+                    .row
+                    .origin
+                    .clone()
+                    .expect("canonical row carries admission origin"),
                 orchestration: job.row.orchestration.clone(),
                 labor_class: job.labor_class,
                 trace_ref: None,
-                pools: Some(job.row.pools.clone()),
+                pools: job.row.pools.clone(),
                 executor: job.row.executor.clone(),
+                host_id: None,
                 charge: None,
                 model: model.clone(),
                 evidence_class: job.row.evidence_class.clone(),
                 manifest_hash: job.row.manifest_hash.clone(),
                 completion: semantic_completion.clone(),
+                result_revision: None,
+                authorship: None,
             })?;
             let result = JobResult {
                 task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
@@ -6378,6 +6407,8 @@ fn reconcile_reuse_witnesses(
                     verdict: Verdict::Reused,
                     exit_code: 0,
                     artifact_content_hash: Some(reuse.artifact_content_hash.clone()),
+                    store_paths: None,
+                    drv: None,
                     gpu_seconds: None,
                     wall_clock: 0.0,
                     attempt: event.row.attempt,
@@ -6385,16 +6416,24 @@ fn reconcile_reuse_witnesses(
                     dedup_key: event.row.dedup_key.clone(),
                     payload_hash: event.row.payload_hash.clone(),
                     brief_hash: event.row.brief_hash.clone(),
+                    origin: event
+                        .row
+                        .origin
+                        .clone()
+                        .expect("canonical row carries admission origin"),
                     orchestration: event.row.orchestration.clone(),
                     labor_class: LaborClass::Reused,
                     trace_ref: None,
-                    pools: Some(event.row.pools.clone()),
+                    pools: event.row.pools.clone(),
                     executor: event.row.executor.clone(),
+                    host_id: None,
                     charge: None,
                     model: event.row.model.clone(),
                     evidence_class: event.row.evidence_class.clone(),
                     manifest_hash: event.row.manifest_hash.clone(),
                     completion: None,
+                    result_revision: None,
+                    authorship: None,
                 })?;
                 appended = true;
             }
@@ -6427,7 +6466,7 @@ fn reuse_record_matches(
         && record.brief_hash == event.row.brief_hash
         && record.orchestration == event.row.orchestration
         && record.labor_class == LaborClass::Reused
-        && record.pools.as_ref() == Some(&event.row.pools)
+        && record.pools == event.row.pools
         && record.executor == event.row.executor
 }
 
@@ -8184,6 +8223,46 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn old_format_witness_refuses_daemon_boot_with_archive_instruction() {
+        let temp = tempdir().unwrap();
+        let paths = fs1_paths(temp.path());
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test/fixtures/ledger/old-format.jsonl"),
+            paths.witness_path(),
+        )
+        .unwrap();
+        let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+            .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+            .with_unit_probe(ExitFileProbe);
+
+        let error = match Daemon::open_with_executor(
+            one_pool_config(),
+            paths.clone(),
+            settings(),
+            executor,
+        )
+        .await
+        {
+            Ok(_) => panic!("daemon unexpectedly booted over an old-format witness ledger"),
+            Err(error) => error,
+        };
+
+        match error {
+            DaemonError::Witness(WitnessError::OldFormat { path, archive }) => {
+                assert_eq!(path, paths.witness_path());
+                assert!(archive
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("witness.jsonl.pre-"));
+            }
+            other => panic!("expected typed old-format witness error, got {other:?}"),
+        }
+    }
+
     fn fs1_full_payload(
         dedup_key: &str,
         argv: &[&str],
@@ -8248,7 +8327,7 @@ mod tests {
             runtime_max_sec: None,
             no_enqueue: false,
             credentials: BTreeMap::new(),
-            origin: None,
+            origin: Some(AdmissionOrigin::direct(EnqueueSource::Manual)),
             gh_origin: None,
             related_trigger: None,
             evidence_class: None,
@@ -8313,6 +8392,8 @@ mod tests {
                 exit_code,
                 artifact_content_hash: (verdict == Verdict::Pass)
                     .then(|| format!("sha256:{}", "a".repeat(64))),
+                store_paths: None,
+                drv: None,
                 gpu_seconds: Some(f64::from(attempt)),
                 wall_clock: 10.0 + f64::from(attempt),
                 attempt,
@@ -8320,6 +8401,10 @@ mod tests {
                 dedup_key: row.dedup_key.clone(),
                 payload_hash: row.payload_hash.clone(),
                 brief_hash: row.brief_hash.clone(),
+                origin: row
+                    .origin
+                    .clone()
+                    .expect("fixture row carries admission origin"),
                 orchestration: row.orchestration.clone(),
                 labor_class: if attempt == 1 {
                     LaborClass::Fresh
@@ -8327,13 +8412,16 @@ mod tests {
                     LaborClass::Recovered
                 },
                 trace_ref: None,
-                pools: Some(row.pools.clone()),
+                pools: row.pools.clone(),
                 executor: row.executor.clone(),
+                host_id: None,
                 charge: None,
                 model: None,
                 evidence_class: Some(json!({"fixture": "acceptance-24"})),
                 manifest_hash: Some(json!("sha256:fixture-manifest")),
                 completion: None,
+                result_revision: None,
+                authorship: None,
             })
             .unwrap()
     }
@@ -8892,8 +8980,8 @@ mod tests {
                     .find(|record| record.task_uuid.as_deref() == Some(&task_uuid))
                     .unwrap();
                 assert_eq!(
-                    record.pools.as_deref(),
-                    Some(["slot".to_owned(), "zeta".to_owned()].as_slice())
+                    record.pools,
+                    ["slot".to_owned(), "zeta".to_owned()]
                 );
                 assert_eq!(record.evidence_class.as_ref(), Some(&evidence_class));
                 assert_eq!(
@@ -8911,11 +8999,11 @@ mod tests {
                     .find(|line| line.contains(&task_uuid))
                     .unwrap();
                 assert!(
-                    fielded_line.find("\"evidence_class\"").unwrap()
-                        < fielded_line.find("\"manifest_hash\"").unwrap()
+                    fielded_line.find("\"evidenceClass\"").unwrap()
+                        < fielded_line.find("\"manifestHash\"").unwrap()
                 );
                 assert!(
-                    fielded_line.find("\"manifest_hash\"").unwrap()
+                    fielded_line.find("\"manifestHash\"").unwrap()
                         < fielded_line.find("\"seq\"").unwrap()
                 );
 
@@ -9481,6 +9569,8 @@ mod tests {
                         verdict: Verdict::PoolVanished,
                         exit_code: 1,
                         artifact_content_hash: None,
+                        store_paths: None,
+                        drv: None,
                         gpu_seconds: None,
                         wall_clock: 0.0,
                         attempt: 1,
@@ -9488,16 +9578,20 @@ mod tests {
                         dedup_key: row.dedup_key.clone(),
                         payload_hash: row.payload_hash.clone(),
                         brief_hash: row.brief_hash.clone(),
+                        origin: AdmissionOrigin::direct(EnqueueSource::Manual),
                         orchestration: row.orchestration.clone(),
                         labor_class: LaborClass::Fresh,
                         trace_ref: None,
-                        pools: Some(vec!["slot".to_owned()]),
+                        pools: vec!["slot".to_owned()],
                         executor: None,
+                        host_id: None,
                         charge: None,
                         model: None,
                         evidence_class: None,
                         manifest_hash: None,
                         completion: None,
+                        result_revision: None,
+                        authorship: None,
                     })
                     .unwrap();
                 let mut config = one_pool_config();
@@ -12569,6 +12663,8 @@ mod tests {
                         verdict: Verdict::Pass,
                         exit_code: 0,
                         artifact_content_hash: Some(artifact_hash.clone()),
+                        store_paths: None,
+                        drv: None,
                         gpu_seconds: Some(0.0),
                         wall_clock: 0.0,
                         attempt: 1,
@@ -12576,16 +12672,20 @@ mod tests {
                         dedup_key: original.dedup_key.clone(),
                         payload_hash: original.payload_hash.clone(),
                         brief_hash: original.brief_hash.clone(),
+                        origin: AdmissionOrigin::direct(EnqueueSource::Manual),
                         orchestration: original.orchestration.clone(),
                         labor_class: LaborClass::Fresh,
                         trace_ref: None,
-                        pools: Some(vec!["slot".to_owned()]),
+                        pools: vec!["slot".to_owned()],
                         executor: None,
+                        host_id: None,
                         charge: None,
                         model: None,
                         evidence_class: None,
                         manifest_hash: None,
                         completion: None,
+                        result_revision: None,
+                        authorship: None,
                     })
                     .unwrap();
                 drop(ledger);

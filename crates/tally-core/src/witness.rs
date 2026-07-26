@@ -6,15 +6,24 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, SecondsFormat, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::completion::SemanticCompletion;
 use crate::provenance::Orchestration;
+use crate::taskdb::AdmissionOrigin;
 
 pub const GENESIS_PREV_HASH: &str =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+pub const WITNESS_SCHEMA_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecordType {
+    Verdict,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -27,6 +36,7 @@ pub enum Verdict {
     PoolVanished,
     Preempted,
     RuntimeExceeded,
+    Substituted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -35,9 +45,11 @@ pub enum LaborClass {
     Fresh,
     Recovered,
     Reused,
+    Substituted,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Charge {
     pub unit: String,
     pub amount: f64,
@@ -45,43 +57,99 @@ pub struct Charge {
     pub class_name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct DerivationOutput {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Derivation {
+    pub drv_path: String,
+    pub outputs: Vec<DerivationOutput>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AuthorshipStatus {
+    Bound,
+    Unavailable,
+    MissingNote,
+    Mismatch,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct Authorship {
+    pub provider: String,
+    pub provider_version: String,
+    pub note_ref: String,
+    pub status: AuthorshipStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes_ref_target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note_content_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WitnessRecord {
-    pub task_uuid: Option<String>,
+    pub schema_version: u32,
+    pub record_type: RecordType,
     pub transition_timestamp: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_uuid: Option<String>,
     pub verdict: Verdict,
     pub exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_paths: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drv: Option<Derivation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_seconds: Option<f64>,
     pub wall_clock: f64,
     pub attempt: u32,
     pub lease_epoch: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dedup_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub payload_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief_hash: Option<String>,
+    pub origin: AdmissionOrigin,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub orchestration: Option<Orchestration>,
     pub labor_class: LaborClass,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trace_ref: Option<String>,
-    #[serde(
-        rename = "pool",
-        serialize_with = "crate::poolset::serialize_optional",
-        deserialize_with = "crate::poolset::deserialize_optional"
-    )]
-    pub pools: Option<Vec<String>>,
+    pub pools: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub charge: Option<Charge>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_class: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_hash: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completion: Option<SemanticCompletion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_revision: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authorship: Option<Authorship>,
+    #[serde(flatten, default)]
+    pub extensions: Map<String, Value>,
     pub seq: u64,
     pub prev_hash: String,
     pub hash: String,
@@ -94,6 +162,8 @@ pub struct WitnessBody {
     pub verdict: Verdict,
     pub exit_code: i32,
     pub artifact_content_hash: Option<String>,
+    pub store_paths: Option<Vec<String>>,
+    pub drv: Option<Derivation>,
     pub gpu_seconds: Option<f64>,
     pub wall_clock: f64,
     pub attempt: u32,
@@ -101,16 +171,20 @@ pub struct WitnessBody {
     pub dedup_key: Option<String>,
     pub payload_hash: Option<String>,
     pub brief_hash: Option<String>,
+    pub origin: AdmissionOrigin,
     pub orchestration: Option<Orchestration>,
     pub labor_class: LaborClass,
     pub trace_ref: Option<String>,
-    pub pools: Option<Vec<String>>,
+    pub pools: Vec<String>,
     pub executor: Option<String>,
+    pub host_id: Option<String>,
     pub charge: Option<Charge>,
     pub model: Option<String>,
     pub evidence_class: Option<Value>,
     pub manifest_hash: Option<Value>,
     pub completion: Option<SemanticCompletion>,
+    pub result_revision: Option<String>,
+    pub authorship: Option<Authorship>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,6 +207,8 @@ impl Default for ChainHead {
 pub enum VerifyProblemKind {
     ParseError,
     InvalidRecord,
+    SchemaVersionInvalid,
+    RecordTypeInvalid,
     HashMismatch,
     PrevHashMismatch,
     SeqOrder,
@@ -168,6 +244,12 @@ pub enum WitnessError {
     },
     #[error("ledger is corrupt: {0}")]
     Corrupt(String),
+    #[error(
+        "old-format witness ledger at {path}; archive it aside before first boot: mv -- {path} {archive}"
+    )]
+    OldFormat { path: PathBuf, archive: PathBuf },
+    #[error("invalid host ID: {0}")]
+    InvalidHostId(String),
     #[error("cannot serialize ledger record: {0}")]
     Json(#[from] serde_json::Error),
 }
@@ -203,16 +285,41 @@ pub fn compute_hash(record: &WitnessRecord) -> Result<String, WitnessError> {
 
 pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord, WitnessError> {
     let mut pools = body.pools;
-    if let Some(pools) = &mut pools {
-        crate::poolset::canonicalize(pools)
-            .map_err(|error| WitnessError::Corrupt(error.to_string()))?;
+    crate::poolset::canonicalize(&mut pools)
+        .map_err(|error| WitnessError::Corrupt(error.to_string()))?;
+    let mut store_paths = body.store_paths;
+    if let Some(paths) = &mut store_paths {
+        paths.sort();
+        if paths.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(WitnessError::Corrupt(
+                "storePaths contains a duplicate path".to_owned(),
+            ));
+        }
+    }
+    let mut drv = body.drv;
+    if let Some(drv) = &mut drv {
+        drv.outputs
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        if drv
+            .outputs
+            .windows(2)
+            .any(|pair| pair[0].name == pair[1].name)
+        {
+            return Err(WitnessError::Corrupt(
+                "drv outputs contains a duplicate name".to_owned(),
+            ));
+        }
     }
     let mut record = WitnessRecord {
-        task_uuid: body.task_uuid,
+        schema_version: WITNESS_SCHEMA_VERSION,
+        record_type: RecordType::Verdict,
         transition_timestamp: body.transition_timestamp,
+        task_uuid: body.task_uuid,
         verdict: body.verdict,
         exit_code: body.exit_code,
         artifact_content_hash: body.artifact_content_hash,
+        store_paths,
+        drv,
         gpu_seconds: body.gpu_seconds,
         wall_clock: body.wall_clock,
         attempt: body.attempt,
@@ -220,100 +327,470 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
         dedup_key: body.dedup_key,
         payload_hash: body.payload_hash,
         brief_hash: body.brief_hash,
+        origin: body.origin,
         orchestration: body.orchestration,
         labor_class: body.labor_class,
         trace_ref: body.trace_ref,
         pools,
         executor: body.executor,
+        host_id: body.host_id,
         charge: body.charge,
         model: body.model,
         evidence_class: body.evidence_class,
         manifest_hash: body.manifest_hash,
         completion: body.completion,
+        result_revision: body.result_revision,
+        authorship: body.authorship,
+        extensions: Map::new(),
         seq: head.seq + 1,
         prev_hash: head.hash.clone(),
         hash: String::new(),
     };
     record.hash = compute_hash(&record)?;
+    let raw = serde_json::to_value(&record)?;
+    validate_record(&raw).map_err(|failure| WitnessError::Corrupt(failure.reason))?;
     Ok(record)
 }
 
 fn sha256_shape(value: &str) -> bool {
     value.len() == 71
         && value.starts_with("sha256:")
-        && value[7..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value[7..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn validate_record(raw: &Value) -> Result<WitnessRecord, String> {
+fn git_oid_shape(value: &str) -> bool {
+    matches!(value.len(), 40 | 64)
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn store_path_shape(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("/nix/store/") else {
+        return false;
+    };
+    let Some((hash, name)) = rest.split_once('-') else {
+        return false;
+    };
+    hash.len() == 32
+        && hash.bytes().all(|byte| {
+            byte.is_ascii_digit()
+                || matches!(byte, b'a'..=b'd' | b'f'..=b'n' | b'p'..=b's' | b'v'..=b'z')
+        })
+        && !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'_' | b'?' | b'=' | b'-')
+        })
+}
+
+fn registry_component_shape(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 96
+        && !matches!(value, "." | "..")
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+pub fn validate_host_id(value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        return Err("hostId must be non-empty".to_owned());
+    }
+    if value.len() > 96 {
+        return Err("hostId must be at most 96 bytes".to_owned());
+    }
+    if value.chars().any(char::is_control) {
+        return Err("hostId must contain no control characters".to_owned());
+    }
+    Ok(())
+}
+
+pub fn current_host_id() -> Result<String, WitnessError> {
+    let host_id = gethostname::gethostname()
+        .to_string_lossy()
+        .trim()
+        .to_owned();
+    validate_host_id(&host_id).map_err(WitnessError::InvalidHostId)?;
+    Ok(host_id)
+}
+
+#[derive(Debug)]
+struct ValidationFailure {
+    kind: VerifyProblemKind,
+    reason: String,
+}
+
+impl ValidationFailure {
+    fn new(kind: VerifyProblemKind, reason: impl Into<String>) -> Self {
+        Self {
+            kind,
+            reason: reason.into(),
+        }
+    }
+
+    fn invalid(reason: impl Into<String>) -> Self {
+        Self::new(VerifyProblemKind::InvalidRecord, reason)
+    }
+}
+
+fn canonical_field_index(field: &str) -> Option<usize> {
+    [
+        "schemaVersion",
+        "recordType",
+        "transitionTimestamp",
+        "taskUuid",
+        "verdict",
+        "exitCode",
+        "artifactContentHash",
+        "storePaths",
+        "drv",
+        "gpuSeconds",
+        "wallClock",
+        "attempt",
+        "leaseEpoch",
+        "dedupKey",
+        "payloadHash",
+        "briefHash",
+        "origin",
+        "orchestration",
+        "laborClass",
+        "traceRef",
+        "pools",
+        "executor",
+        "hostId",
+        "charge",
+        "model",
+        "evidenceClass",
+        "manifestHash",
+        "completion",
+        "resultRevision",
+        "authorship",
+        "seq",
+        "prevHash",
+        "hash",
+    ]
+    .iter()
+    .position(|candidate| *candidate == field)
+}
+
+fn validate_canonical_field_value(
+    object: &Map<String, Value>,
+    field: &str,
+    canonical: &impl Serialize,
+) -> Result<(), ValidationFailure> {
+    let raw = object
+        .get(field)
+        .ok_or_else(|| ValidationFailure::invalid(format!("missing field {field}")))?;
+    let canonical = serde_json::to_value(canonical)
+        .map_err(|error| ValidationFailure::invalid(error.to_string()))?;
+    if serde_json::to_string(raw).map_err(|error| ValidationFailure::invalid(error.to_string()))?
+        != serde_json::to_string(&canonical)
+            .map_err(|error| ValidationFailure::invalid(error.to_string()))?
+    {
+        return Err(ValidationFailure::invalid(format!(
+            "field {field} is not in canonical serialized form"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_record(raw: &Value) -> Result<WitnessRecord, ValidationFailure> {
     let object = raw
         .as_object()
-        .ok_or_else(|| "line is not a JSON object".to_owned())?;
-    for forbidden in ["parent", "parent_uuid", "kind"] {
+        .ok_or_else(|| ValidationFailure::invalid("line is not a JSON object"))?;
+    for forbidden in ["parent", "parent_uuid", "parentUuid", "kind"] {
         if object.contains_key(forbidden) {
-            return Err(format!("{forbidden} is not a canonical witness field"));
+            return Err(ValidationFailure::invalid(format!(
+                "{forbidden} is not a canonical witness field"
+            )));
         }
     }
-    let record: WitnessRecord =
-        serde_json::from_value(raw.clone()).map_err(|error| error.to_string())?;
-    if let Some(pools) = &record.pools {
-        let mut canonical = pools.clone();
-        crate::poolset::canonicalize(&mut canonical).map_err(|error| error.to_string())?;
-        if &canonical != pools {
-            return Err("pool set is not in canonical order".to_owned());
+    if let Some((field, _)) = object.iter().find(|(_, value)| value.is_null()) {
+        return Err(ValidationFailure::invalid(format!(
+            "top-level field {field} must be omitted instead of null"
+        )));
+    }
+    if object.get("schemaVersion").and_then(Value::as_u64)
+        != Some(u64::from(WITNESS_SCHEMA_VERSION))
+    {
+        return Err(ValidationFailure::new(
+            VerifyProblemKind::SchemaVersionInvalid,
+            format!("schemaVersion must be the integer {WITNESS_SCHEMA_VERSION}"),
+        ));
+    }
+    if object.get("recordType").and_then(Value::as_str) != Some("verdict") {
+        return Err(ValidationFailure::new(
+            VerifyProblemKind::RecordTypeInvalid,
+            "recordType must be verdict",
+        ));
+    }
+    let mut last_known = None;
+    for field in object.keys() {
+        let Some(index) = canonical_field_index(field) else {
+            continue;
+        };
+        if last_known.is_some_and(|previous| index <= previous) {
+            return Err(ValidationFailure::invalid(format!(
+                "field {field} is not in canonical witness order"
+            )));
         }
+        last_known = Some(index);
     }
-    if record.executor.as_ref().is_some_and(|executor| {
-        executor.is_empty()
-            || executor.len() > 96
-            || matches!(executor.as_str(), "." | "..")
-            || !executor
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-            || !executor
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-    }) {
-        return Err("executor is not a safe registry component".to_owned());
+    let record: WitnessRecord = serde_json::from_value(raw.clone())
+        .map_err(|error| ValidationFailure::invalid(error.to_string()))?;
+    if record.schema_version != WITNESS_SCHEMA_VERSION {
+        return Err(ValidationFailure::new(
+            VerifyProblemKind::SchemaVersionInvalid,
+            format!("schemaVersion must be the integer {WITNESS_SCHEMA_VERSION}"),
+        ));
     }
-    if record.payload_hash.as_ref().is_some_and(|payload_hash| {
-        payload_hash.len() != 71
-            || !payload_hash.starts_with("sha256:")
-            || !payload_hash[7..]
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) {
-        return Err("payload_hash is not lowercase sha256 hex".to_owned());
+    if record.record_type != RecordType::Verdict {
+        return Err(ValidationFailure::new(
+            VerifyProblemKind::RecordTypeInvalid,
+            "recordType must be verdict",
+        ));
     }
-    if record.brief_hash.as_ref().is_some_and(|brief_hash| {
-        brief_hash.len() != 71
-            || !brief_hash.starts_with("sha256:")
-            || !brief_hash[7..]
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-    }) {
-        return Err("brief_hash is not lowercase sha256 hex".to_owned());
+    validate_canonical_field_value(object, "wallClock", &record.wall_clock)?;
+    if let Some(gpu_seconds) = record.gpu_seconds {
+        validate_canonical_field_value(object, "gpuSeconds", &gpu_seconds)?;
+    }
+    validate_canonical_field_value(object, "origin", &record.origin)?;
+    if let Some(drv) = &record.drv {
+        validate_canonical_field_value(object, "drv", drv)?;
     }
     if let Some(orchestration) = &record.orchestration {
-        orchestration.validate()?;
+        validate_canonical_field_value(object, "orchestration", orchestration)?;
+    }
+    if let Some(charge) = &record.charge {
+        validate_canonical_field_value(object, "charge", charge)?;
+    }
+    if let Some(authorship) = &record.authorship {
+        validate_canonical_field_value(object, "authorship", authorship)?;
+    }
+    let parsed_timestamp = DateTime::parse_from_rfc3339(&record.transition_timestamp)
+        .map_err(|_| ValidationFailure::invalid("transitionTimestamp is not RFC3339 UTC millis"))?;
+    if parsed_timestamp
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(SecondsFormat::Millis, true)
+        != record.transition_timestamp
+    {
+        return Err(ValidationFailure::invalid(
+            "transitionTimestamp is not canonical RFC3339 UTC millis",
+        ));
+    }
+    if record
+        .task_uuid
+        .as_ref()
+        .is_some_and(|task_uuid| Uuid::parse_str(task_uuid).is_err())
+    {
+        return Err(ValidationFailure::invalid("taskUuid is not a UUID"));
+    }
+    for (field, hash) in [
+        ("artifactContentHash", record.artifact_content_hash.as_ref()),
+        ("payloadHash", record.payload_hash.as_ref()),
+        ("briefHash", record.brief_hash.as_ref()),
+    ] {
+        if hash.is_some_and(|hash| !sha256_shape(hash)) {
+            return Err(ValidationFailure::invalid(format!(
+                "{field} is not lowercase sha256 hex"
+            )));
+        }
+    }
+    if let Some(store_paths) = &record.store_paths {
+        if store_paths.is_empty() {
+            return Err(ValidationFailure::invalid(
+                "storePaths must be non-empty when present",
+            ));
+        }
+        if store_paths.iter().any(|path| !store_path_shape(path)) {
+            return Err(ValidationFailure::invalid(
+                "storePaths contains an invalid Nix store path",
+            ));
+        }
+        if store_paths.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(ValidationFailure::invalid(
+                "storePaths must be byte-ascending sorted and unique",
+            ));
+        }
+    }
+    if let Some(drv) = &record.drv {
+        if !store_path_shape(&drv.drv_path) || !drv.drv_path.ends_with(".drv") {
+            return Err(ValidationFailure::invalid(
+                "drvPath must be a Nix store path ending in .drv",
+            ));
+        }
+        if drv.outputs.is_empty() {
+            return Err(ValidationFailure::invalid("drv outputs must be non-empty"));
+        }
+        if drv
+            .outputs
+            .iter()
+            .any(|output| !store_path_shape(&output.path))
+        {
+            return Err(ValidationFailure::invalid(
+                "drv output path is not a Nix store path",
+            ));
+        }
+        if drv
+            .outputs
+            .windows(2)
+            .any(|pair| pair[0].name >= pair[1].name)
+        {
+            return Err(ValidationFailure::invalid(
+                "drv outputs must be sorted by name and unique",
+            ));
+        }
+    }
+    if record
+        .executor
+        .as_ref()
+        .is_some_and(|executor| !registry_component_shape(executor))
+    {
+        return Err(ValidationFailure::invalid(
+            "executor is not a safe registry component",
+        ));
+    }
+    if let Some(host_id) = &record.host_id {
+        validate_host_id(host_id).map_err(ValidationFailure::invalid)?;
+    }
+    if let Some(orchestration) = &record.orchestration {
+        orchestration
+            .validate()
+            .map_err(ValidationFailure::invalid)?;
+    }
+    record
+        .origin
+        .validate()
+        .map_err(|error| ValidationFailure::invalid(error.to_string()))?;
+    if (record.verdict == Verdict::Reused) != (record.labor_class == LaborClass::Reused) {
+        return Err(ValidationFailure::invalid(
+            "verdict reused and laborClass reused must appear together",
+        ));
+    }
+    if (record.verdict == Verdict::Substituted) != (record.labor_class == LaborClass::Substituted) {
+        return Err(ValidationFailure::invalid(
+            "verdict substituted and laborClass substituted must appear together",
+        ));
+    }
+    if matches!(record.verdict, Verdict::Reused | Verdict::Substituted) && record.exit_code != 0 {
+        return Err(ValidationFailure::invalid(
+            "reused and substituted verdicts require exitCode 0",
+        ));
+    }
+    if record.verdict == Verdict::Substituted {
+        let drv = record
+            .drv
+            .as_ref()
+            .ok_or_else(|| ValidationFailure::invalid("substituted verdict requires drv"))?;
+        let expected_dedup_key = format!("drv:{}", drv.drv_path);
+        if record.task_uuid.is_none()
+            || record.store_paths.is_none()
+            || record.artifact_content_hash.is_some()
+            || record.gpu_seconds.is_some()
+            || record.charge.is_some()
+            || record.wall_clock != 0.0
+            || record.attempt != 1
+            || record.lease_epoch != 1
+            || record.pools != ["build"]
+            || record.dedup_key.as_deref() != Some(expected_dedup_key.as_str())
+        {
+            return Err(ValidationFailure::invalid(
+                "substituted verdict does not satisfy the cheap drv witness invariants",
+            ));
+        }
     }
     if record.seq == 0 {
-        return Err("seq missing or not a positive integer".to_owned());
+        return Err(ValidationFailure::invalid(
+            "seq missing or not a positive integer",
+        ));
     }
     if !sha256_shape(&record.prev_hash) {
-        return Err("prev_hash missing or not a sha256: hash".to_owned());
+        return Err(ValidationFailure::invalid(
+            "prevHash missing or not a lowercase sha256 hash",
+        ));
     }
     if !sha256_shape(&record.hash) {
-        return Err("hash missing or not a sha256: hash".to_owned());
+        return Err(ValidationFailure::invalid(
+            "hash missing or not a lowercase sha256 hash",
+        ));
     }
     if !record.wall_clock.is_finite()
+        || record.wall_clock < 0.0
         || record.gpu_seconds.is_some_and(|value| !value.is_finite())
         || record
             .charge
             .as_ref()
             .is_some_and(|charge| !charge.amount.is_finite())
     {
-        return Err("numeric fields must be finite".to_owned());
+        return Err(ValidationFailure::invalid(
+            "numeric fields must be finite and wallClock must be non-negative",
+        ));
+    }
+    if record.attempt == 0 {
+        return Err(ValidationFailure::invalid("attempt must be at least 1"));
+    }
+    if record.lease_epoch == 0 {
+        return Err(ValidationFailure::invalid("leaseEpoch must be at least 1"));
+    }
+    let mut canonical_pools = record.pools.clone();
+    crate::poolset::canonicalize(&mut canonical_pools)
+        .map_err(|error| ValidationFailure::invalid(error.to_string()))?;
+    if canonical_pools != record.pools {
+        return Err(ValidationFailure::invalid(
+            "pools is not in canonical order",
+        ));
+    }
+    if record
+        .result_revision
+        .as_ref()
+        .is_some_and(|revision| !git_oid_shape(revision))
+    {
+        return Err(ValidationFailure::invalid(
+            "resultRevision must be a 40- or 64-character lowercase Git object ID",
+        ));
+    }
+    if let Some(authorship) = &record.authorship {
+        if record.result_revision.is_none() {
+            return Err(ValidationFailure::invalid(
+                "authorship requires resultRevision",
+            ));
+        }
+        if authorship.provider != "git-ai" || authorship.note_ref != "refs/notes/ai" {
+            return Err(ValidationFailure::invalid(
+                "authorship provider and noteRef must identify git-ai refs/notes/ai",
+            ));
+        }
+        if authorship
+            .notes_ref_target
+            .as_ref()
+            .is_some_and(|target| !git_oid_shape(target))
+        {
+            return Err(ValidationFailure::invalid(
+                "authorship notesRefTarget must be a lowercase Git object ID",
+            ));
+        }
+        if authorship
+            .note_content_sha256
+            .as_ref()
+            .is_some_and(|hash| !sha256_shape(hash))
+        {
+            return Err(ValidationFailure::invalid(
+                "authorship noteContentSha256 must be lowercase sha256 hex",
+            ));
+        }
+        if authorship.status == AuthorshipStatus::Bound
+            && (authorship.notes_ref_target.is_none() || authorship.note_content_sha256.is_none())
+        {
+            return Err(ValidationFailure::invalid(
+                "bound authorship requires notesRefTarget and noteContentSha256",
+            ));
+        }
     }
     Ok(record)
 }
@@ -325,25 +802,43 @@ struct ParsedRecord {
     line: usize,
 }
 
-pub fn verify_reader(reader: impl BufRead) -> VerifyReport {
+pub fn verify_reader(mut reader: impl BufRead) -> VerifyReport {
     let mut problems = Vec::new();
     let mut valid = Vec::new();
+    let mut line_number = 0;
 
-    for (index, line_result) in reader.lines().enumerate() {
-        let line_number = index + 1;
-        let line = match line_result {
-            Ok(line) => line,
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => line_number += 1,
             Err(error) => {
                 problems.push(VerifyProblem {
                     seq: None,
-                    line: line_number,
+                    line: line_number + 1,
                     kind: VerifyProblemKind::ParseError,
                     reason: format!("cannot read line: {error}"),
                 });
-                continue;
+                break;
             }
-        };
+        }
+        if !line.ends_with('\n') {
+            problems.push(VerifyProblem {
+                seq: None,
+                line: line_number,
+                kind: VerifyProblemKind::ParseError,
+                reason: "record is not LF-terminated".to_owned(),
+            });
+            continue;
+        }
+        line.pop();
         if line.trim().is_empty() {
+            problems.push(VerifyProblem {
+                seq: None,
+                line: line_number,
+                kind: VerifyProblemKind::ParseError,
+                reason: "blank lines are not canonical witness records".to_owned(),
+            });
             continue;
         }
         let raw: Value = match serde_json::from_str(&line) {
@@ -358,17 +853,43 @@ pub fn verify_reader(reader: impl BufRead) -> VerifyReport {
                 continue;
             }
         };
+        let canonical_line = match serde_json::to_string(&raw) {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                problems.push(VerifyProblem {
+                    seq: raw.get("seq").and_then(Value::as_u64),
+                    line: line_number,
+                    kind: VerifyProblemKind::InvalidRecord,
+                    reason: format!("record cannot be canonically serialized: {error}"),
+                });
+                continue;
+            }
+        };
+        if canonical_line != line {
+            let offset = line
+                .bytes()
+                .zip(canonical_line.bytes())
+                .position(|(actual, canonical)| actual != canonical)
+                .unwrap_or_else(|| line.len().min(canonical_line.len()));
+            problems.push(VerifyProblem {
+                seq: raw.get("seq").and_then(Value::as_u64),
+                line: line_number,
+                kind: VerifyProblemKind::InvalidRecord,
+                reason: format!("record bytes are not compact canonical JSON at byte {offset}"),
+            });
+            continue;
+        }
         match validate_record(&raw) {
             Ok(record) => valid.push(ParsedRecord {
                 record,
                 raw,
                 line: line_number,
             }),
-            Err(reason) => problems.push(VerifyProblem {
+            Err(failure) => problems.push(VerifyProblem {
                 seq: raw.get("seq").and_then(Value::as_u64),
                 line: line_number,
-                kind: VerifyProblemKind::InvalidRecord,
-                reason,
+                kind: failure.kind,
+                reason: failure.reason,
             }),
         }
     }
@@ -509,7 +1030,7 @@ pub fn read_verified_records(
         .map(|line| {
             let line = line.map_err(|source| io_error(path, source))?;
             let raw = serde_json::from_str(&line)?;
-            validate_record(&raw).map_err(WitnessError::Corrupt)
+            validate_record(&raw).map_err(|failure| WitnessError::Corrupt(failure.reason))
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok((report, records))
@@ -526,7 +1047,7 @@ pub fn read_records(path: &Path) -> Result<Vec<WitnessRecord>, WitnessError> {
         .map(|line| {
             let line = line.map_err(|source| io_error(path, source))?;
             let raw = serde_json::from_str(&line)?;
-            validate_record(&raw).map_err(WitnessError::Corrupt)
+            validate_record(&raw).map_err(|failure| WitnessError::Corrupt(failure.reason))
         })
         .collect()
 }
@@ -539,6 +1060,7 @@ pub fn counts_toward_canonical_gpu_seconds(record: &WitnessRecord) -> bool {
                 | Verdict::PoolVanished
                 | Verdict::Preempted
                 | Verdict::Cancelled
+                | Verdict::Substituted
         )
 }
 
@@ -550,6 +1072,36 @@ pub fn canonical_gpu_seconds(records: impl IntoIterator<Item = WitnessRecord>) -
         .sum()
 }
 
+fn looks_like_old_format(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .any(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()
+                .and_then(|value| value.as_object().cloned())
+                .is_some_and(|object| {
+                    !object.contains_key("schemaVersion")
+                        && ["task_uuid", "transition_timestamp", "pool", "prev_hash"]
+                            .iter()
+                            .any(|field| object.contains_key(*field))
+                })
+        })
+}
+
+fn old_format_error(path: &Path) -> WitnessError {
+    WitnessError::OldFormat {
+        path: path.to_owned(),
+        archive: PathBuf::from(format!(
+            "{}.pre-{}",
+            path.display(),
+            Utc::now().format("%Y-%m-%d")
+        )),
+    }
+}
+
 fn scan_head(file: &mut File, path: &Path) -> Result<ChainHead, WitnessError> {
     file.seek(SeekFrom::Start(0))
         .map_err(|source| io_error(path, source))?;
@@ -558,6 +1110,9 @@ fn scan_head(file: &mut File, path: &Path) -> Result<ChainHead, WitnessError> {
         .map_err(|source| io_error(path, source))?;
     if bytes.is_empty() {
         return Ok(ChainHead::default());
+    }
+    if looks_like_old_format(&bytes) {
+        return Err(old_format_error(path));
     }
     let complete_len = bytes
         .iter()
@@ -586,7 +1141,7 @@ fn scan_head(file: &mut File, path: &Path) -> Result<ChainHead, WitnessError> {
         .find(|line| !line.trim().is_empty())
         .ok_or_else(|| WitnessError::Corrupt("ledger has no complete record".to_owned()))?;
     let raw: Value = serde_json::from_str(last)?;
-    let record = validate_record(&raw).map_err(WitnessError::Corrupt)?;
+    let record = validate_record(&raw).map_err(|failure| WitnessError::Corrupt(failure.reason))?;
     Ok(ChainHead {
         seq: record.seq,
         hash: record.hash,
@@ -890,6 +1445,7 @@ pub fn parse_rfc3339(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::taskdb::EnqueueSource;
 
     fn fixture(name: &str) -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -904,6 +1460,8 @@ mod tests {
             verdict: Verdict::Pass,
             exit_code: 0,
             artifact_content_hash: Some(format!("sha256:{}", "a".repeat(64))),
+            store_paths: None,
+            drv: None,
             gpu_seconds: Some(42.5),
             wall_clock: 44.0,
             attempt: 1,
@@ -911,11 +1469,13 @@ mod tests {
             dedup_key: Some("ocr:paper-0001".to_owned()),
             payload_hash: None,
             brief_hash: None,
+            origin: AdmissionOrigin::direct(EnqueueSource::Manual),
             orchestration: None,
             labor_class: LaborClass::Fresh,
             trace_ref: None,
-            pools: Some(vec!["worker-gpu".to_owned()]),
+            pools: vec!["worker-gpu".to_owned()],
             executor: None,
+            host_id: None,
             charge: Some(Charge {
                 unit: "gpu-seconds".to_owned(),
                 amount: 42.5,
@@ -925,7 +1485,146 @@ mod tests {
             evidence_class: None,
             manifest_hash: None,
             completion: None,
+            result_revision: None,
+            authorship: None,
         }
+    }
+
+    fn fully_populated_body() -> WitnessBody {
+        WitnessBody {
+            task_uuid: Some("b2c40001-0000-4000-8000-000000000002".to_owned()),
+            transition_timestamp: "2026-07-26T12:34:56.789Z".to_owned(),
+            verdict: Verdict::Pass,
+            exit_code: 0,
+            artifact_content_hash: Some(format!("sha256:{}", "a".repeat(64))),
+            store_paths: Some(vec![
+                format!("/nix/store/{}-dev", "2".repeat(32)),
+                format!("/nix/store/{}-out", "3".repeat(32)),
+            ]),
+            drv: Some(Derivation {
+                drv_path: format!("/nix/store/{}-package.drv", "1".repeat(32)),
+                outputs: vec![
+                    DerivationOutput {
+                        name: "out".to_owned(),
+                        path: format!("/nix/store/{}-out", "3".repeat(32)),
+                    },
+                    DerivationOutput {
+                        name: "dev".to_owned(),
+                        path: format!("/nix/store/{}-dev", "2".repeat(32)),
+                    },
+                ],
+            }),
+            gpu_seconds: Some(42.5),
+            wall_clock: 44.0,
+            attempt: 2,
+            lease_epoch: 42,
+            dedup_key: Some("drv:package".to_owned()),
+            payload_hash: Some(format!("sha256:{}", "b".repeat(64))),
+            brief_hash: Some(format!("sha256:{}", "c".repeat(64))),
+            origin: AdmissionOrigin::producer("calendar", EnqueueSource::Calendar),
+            orchestration: Some(
+                serde_json::from_value(serde_json::json!({
+                    "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+                    "maxNodes": 12,
+                    "promptRevision": format!("sha256:{}", "d".repeat(64)),
+                    "skillRevision": "review-agent-v3",
+                    "selection": {"members": ["b", "a"]}
+                }))
+                .unwrap(),
+            ),
+            labor_class: LaborClass::Fresh,
+            trace_ref: Some("trace:session-2".to_owned()),
+            pools: vec!["worker-gpu".to_owned(), "worker-cpu".to_owned()],
+            executor: Some("ssh-worker-1".to_owned()),
+            host_id: Some("worker-1".to_owned()),
+            charge: Some(Charge {
+                unit: "gpu-seconds".to_owned(),
+                amount: 42.5,
+                class_name: "verifiable".to_owned(),
+            }),
+            model: Some("vllm/qwen2-vl-ocr".to_owned()),
+            evidence_class: Some(serde_json::json!({"kind": "artifact", "rank": 1})),
+            manifest_hash: Some(serde_json::json!(format!("sha256:{}", "e".repeat(64)))),
+            completion: Some(
+                serde_json::from_value(serde_json::json!({
+                    "schemaVersion": 1,
+                    "execution": {"status": "success", "exitCode": 0, "reason": "process exited with code 0"},
+                    "gates": {"status": "pass", "artifact": {"commit": "abc"}, "gates": []},
+                    "acceptance": {"status": "accepted", "policy": "execution-and-gates", "reason": "all gates passed"}
+                }))
+                .unwrap(),
+            ),
+            result_revision: Some("f".repeat(40)),
+            authorship: Some(Authorship {
+                provider: "git-ai".to_owned(),
+                provider_version: "1.2.3".to_owned(),
+                note_ref: "refs/notes/ai".to_owned(),
+                status: AuthorshipStatus::Bound,
+                notes_ref_target: Some("a".repeat(40)),
+                note_content_sha256: Some(format!("sha256:{}", "f".repeat(64))),
+                reason: Some("matched".to_owned()),
+            }),
+        }
+    }
+
+    fn fixture_records() -> Vec<WitnessRecord> {
+        let first = build_record(body(), &ChainHead::default()).unwrap();
+        let mut head = ChainHead {
+            seq: first.seq,
+            hash: first.hash.clone(),
+        };
+
+        let drv_path = format!("/nix/store/{}-fixture.drv", "1".repeat(32));
+        let output_path = format!("/nix/store/{}-fixture", "2".repeat(32));
+        let mut with_store = body();
+        with_store.task_uuid = Some("b2c40001-0000-4000-8000-000000000003".to_owned());
+        with_store.transition_timestamp = "2026-07-26T12:00:02.000Z".to_owned();
+        with_store.store_paths = Some(vec![output_path.clone()]);
+        with_store.drv = Some(Derivation {
+            drv_path: drv_path.clone(),
+            outputs: vec![DerivationOutput {
+                name: "out".to_owned(),
+                path: output_path.clone(),
+            }],
+        });
+        with_store.dedup_key = Some(format!("drv:{drv_path}"));
+        with_store.pools = vec!["build".to_owned()];
+        let second = build_record(with_store, &head).unwrap();
+        head = ChainHead {
+            seq: second.seq,
+            hash: second.hash.clone(),
+        };
+
+        let mut substituted = body();
+        substituted.task_uuid = Some("b2c40001-0000-4000-8000-000000000004".to_owned());
+        substituted.transition_timestamp = "2026-07-26T12:00:03.000Z".to_owned();
+        substituted.verdict = Verdict::Substituted;
+        substituted.exit_code = 0;
+        substituted.artifact_content_hash = None;
+        substituted.store_paths = Some(vec![output_path.clone()]);
+        substituted.drv = Some(Derivation {
+            drv_path: drv_path.clone(),
+            outputs: vec![DerivationOutput {
+                name: "out".to_owned(),
+                path: output_path,
+            }],
+        });
+        substituted.gpu_seconds = None;
+        substituted.wall_clock = 0.0;
+        substituted.attempt = 1;
+        substituted.lease_epoch = 1;
+        substituted.dedup_key = Some(format!("drv:{drv_path}"));
+        substituted.labor_class = LaborClass::Substituted;
+        substituted.pools = vec!["build".to_owned()];
+        substituted.charge = None;
+        let third = build_record(substituted, &head).unwrap();
+        head = ChainHead {
+            seq: third.seq,
+            hash: third.hash.clone(),
+        };
+
+        let fourth = build_record(fully_populated_body(), &head).unwrap();
+        vec![first, second, third, fourth]
     }
 
     #[test]
@@ -943,48 +1642,60 @@ mod tests {
     }
 
     #[test]
-    fn legacy_job_without_wave_three_features_keeps_identical_hash_input() {
-        let record = build_record(body(), &ChainHead::default()).unwrap();
-        assert!(record.completion.is_none());
+    fn valid_fixture_is_the_exact_builder_output() {
+        let actual = fixture_records()
+            .iter()
+            .map(|record| serde_json::to_string(record).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        assert_eq!(
+            std::fs::read_to_string(fixture("valid.jsonl")).unwrap(),
+            actual
+        );
+    }
+
+    #[test]
+    fn old_format_is_red_and_open_returns_an_actionable_archive_error() {
+        let report = verify_file(&fixture("old-format.jsonl")).unwrap();
+        assert!(!report.ok);
+        assert!(report
+            .problems
+            .iter()
+            .any(|problem| problem.kind == VerifyProblemKind::SchemaVersionInvalid));
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("witness.jsonl");
+        std::fs::copy(fixture("old-format.jsonl"), &path).unwrap();
+        let error = match WitnessLedger::open(&path) {
+            Err(error) => error,
+            Ok(_) => panic!("old-format ledger unexpectedly opened"),
+        };
+        assert!(matches!(error, WitnessError::OldFormat { .. }));
+        let message = error.to_string();
+        assert!(message.contains("archive it aside before first boot"));
+        assert!(message.contains("mv --"));
+        assert!(message.contains(".pre-"));
+    }
+
+    #[test]
+    fn fully_populated_record_pins_canonical_hash_input_bytes() {
+        let record = build_record(fully_populated_body(), &ChainHead::default()).unwrap();
         let raw = serde_json::to_value(&record).unwrap();
         assert_eq!(
             canonical_hash_input(&raw).unwrap(),
-            concat!(
-                "{\"task_uuid\":\"b2c40001-0000-4000-8000-000000000001\",",
-                "\"transition_timestamp\":\"2026-07-09T10:00:01.100Z\",",
-                "\"verdict\":\"pass\",\"exit_code\":0,",
-                "\"artifact_content_hash\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",",
-                "\"gpu_seconds\":42.5,\"wall_clock\":44.0,\"attempt\":1,\"lease_epoch\":42,",
-                "\"dedup_key\":\"ocr:paper-0001\",\"labor_class\":\"fresh\",",
-                "\"pool\":\"worker-gpu\",",
-                "\"charge\":{\"unit\":\"gpu-seconds\",\"amount\":42.5,\"class\":\"verifiable\"},",
-                "\"model\":\"vllm/qwen2-vl-ocr\",\"seq\":1,",
-                "\"prev_hash\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\",",
-                "\"hash\":\"\"}"
-            )
+            r#"{"schemaVersion":2,"recordType":"verdict","transitionTimestamp":"2026-07-26T12:34:56.789Z","taskUuid":"b2c40001-0000-4000-8000-000000000002","verdict":"pass","exitCode":0,"artifactContentHash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","storePaths":["/nix/store/22222222222222222222222222222222-dev","/nix/store/33333333333333333333333333333333-out"],"drv":{"drvPath":"/nix/store/11111111111111111111111111111111-package.drv","outputs":[{"name":"dev","path":"/nix/store/22222222222222222222222222222222-dev"},{"name":"out","path":"/nix/store/33333333333333333333333333333333-out"}]},"gpuSeconds":42.5,"wallClock":44.0,"attempt":2,"leaseEpoch":42,"dedupKey":"drv:package","payloadHash":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","briefHash":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","origin":{"schemaVersion":1,"source":"calendar","producer":{"name":"calendar","kind":"calendar"}},"orchestration":{"flowRunId":"018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321","maxNodes":12,"promptRevision":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","skillRevision":"review-agent-v3","selection":{"members":["b","a"]}},"laborClass":"fresh","traceRef":"trace:session-2","pools":["worker-cpu","worker-gpu"],"executor":"ssh-worker-1","hostId":"worker-1","charge":{"unit":"gpu-seconds","amount":42.5,"class":"verifiable"},"model":"vllm/qwen2-vl-ocr","evidenceClass":{"kind":"artifact","rank":1},"manifestHash":"sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","completion":{"schemaVersion":1,"execution":{"status":"success","exitCode":0,"reason":"process exited with code 0"},"gates":{"status":"pass","artifact":{"commit":"abc"},"gates":[]},"acceptance":{"status":"accepted","policy":"execution-and-gates","reason":"all gates passed"}},"resultRevision":"ffffffffffffffffffffffffffffffffffffffff","authorship":{"provider":"git-ai","providerVersion":"1.2.3","noteRef":"refs/notes/ai","status":"bound","notesRefTarget":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","noteContentSha256":"sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","reason":"matched"},"seq":1,"prevHash":"sha256:0000000000000000000000000000000000000000000000000000000000000000","hash":""}"#
         );
-        assert!(!serde_json::to_string(&record)
-            .unwrap()
-            .contains("\"completion\""));
-        assert!(!serde_json::to_string(&record)
-            .unwrap()
-            .contains("\"payload_hash\""));
-        assert!(!serde_json::to_string(&record)
-            .unwrap()
-            .contains("\"brief_hash\""));
-        assert!(!serde_json::to_string(&record)
-            .unwrap()
-            .contains("\"orchestration\""));
     }
 
     #[test]
     fn optional_metadata_is_ordered_before_seq_and_absent_stays_absent() {
         let absent = build_record(body(), &ChainHead::default()).unwrap();
         let absent_json = serde_json::to_string(&absent).unwrap();
-        assert!(!absent_json.contains("evidence_class"));
-        assert!(!absent_json.contains("manifest_hash"));
-        assert!(!absent_json.contains("payload_hash"));
-        assert!(!absent_json.contains("brief_hash"));
+        assert!(!absent_json.contains("evidenceClass"));
+        assert!(!absent_json.contains("manifestHash"));
+        assert!(!absent_json.contains("payloadHash"));
+        assert!(!absent_json.contains("briefHash"));
         assert!(!absent_json.contains("orchestration"));
 
         let mut present_body = body();
@@ -1001,33 +1712,29 @@ mod tests {
         present_body.manifest_hash = Some(Value::String("urn:manifest:anything".to_owned()));
         let present = build_record(present_body, &ChainHead::default()).unwrap();
         let json = serde_json::to_string(&present).unwrap();
-        assert!(json.find("payload_hash").unwrap() < json.find("labor_class").unwrap());
-        assert!(json.find("brief_hash").unwrap() < json.find("orchestration").unwrap());
-        assert!(json.find("orchestration").unwrap() < json.find("labor_class").unwrap());
-        assert!(json.find("evidence_class").unwrap() < json.find("manifest_hash").unwrap());
-        assert!(json.find("manifest_hash").unwrap() < json.find("\"seq\"").unwrap());
-        let report = verify_reader(BufReader::new(json.as_bytes()));
+        assert!(json.find("payloadHash").unwrap() < json.find("laborClass").unwrap());
+        assert!(json.find("briefHash").unwrap() < json.find("orchestration").unwrap());
+        assert!(json.find("orchestration").unwrap() < json.find("laborClass").unwrap());
+        assert!(json.find("evidenceClass").unwrap() < json.find("manifestHash").unwrap());
+        assert!(json.find("manifestHash").unwrap() < json.find("\"seq\"").unwrap());
+        let report = verify_reader(BufReader::new(format!("{json}\n").as_bytes()));
         assert!(report.ok, "{:?}", report.problems);
     }
 
     #[test]
-    fn absent_revision_keys_preserve_legacy_orchestration_witness_hash() {
-        let mut legacy_body = body();
-        legacy_body.orchestration = Some(
+    fn optional_revision_keys_are_absent_unless_supplied_and_change_the_hash() {
+        let mut baseline_body = body();
+        baseline_body.orchestration = Some(
             serde_json::from_value(serde_json::json!({
                 "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
                 "scriptHash": "sha256:legacy"
             }))
             .unwrap(),
         );
-        let legacy = build_record(legacy_body, &ChainHead::default()).unwrap();
-        assert_eq!(
-            legacy.hash,
-            "sha256:0f87223e228b7753a01e85f2c45d8d37c9b1d059f4acb4c1dc630297a439deb2"
-        );
-        let legacy_json = serde_json::to_string(&legacy).unwrap();
-        assert!(!legacy_json.contains("promptRevision"));
-        assert!(!legacy_json.contains("skillRevision"));
+        let baseline = build_record(baseline_body, &ChainHead::default()).unwrap();
+        let baseline_json = serde_json::to_string(&baseline).unwrap();
+        assert!(!baseline_json.contains("promptRevision"));
+        assert!(!baseline_json.contains("skillRevision"));
 
         let mut revised_body = body();
         revised_body.orchestration = Some(
@@ -1040,26 +1747,176 @@ mod tests {
             .unwrap(),
         );
         let revised = build_record(revised_body, &ChainHead::default()).unwrap();
-        assert_ne!(revised.hash, legacy.hash);
+        assert_ne!(revised.hash, baseline.hash);
+    }
+
+    fn validation_failure(record: WitnessRecord) -> ValidationFailure {
+        validate_record(&serde_json::to_value(record).unwrap()).unwrap_err()
     }
 
     #[test]
-    fn witness_pool_encoding_preserves_legacy_bytes_and_canonicalizes_multi() {
+    fn final_schema_rejects_invalid_envelope_and_field_shapes() {
+        let valid = build_record(body(), &ChainHead::default()).unwrap();
+
+        let mut wrong_version = serde_json::to_value(&valid).unwrap();
+        wrong_version["schemaVersion"] = Value::from(1);
+        assert_eq!(
+            validate_record(&wrong_version).unwrap_err().kind,
+            VerifyProblemKind::SchemaVersionInvalid
+        );
+
+        let mut wrong_type = serde_json::to_value(&valid).unwrap();
+        wrong_type["recordType"] = Value::String("boundary".to_owned());
+        assert_eq!(
+            validate_record(&wrong_type).unwrap_err().kind,
+            VerifyProblemKind::RecordTypeInvalid
+        );
+
+        let mut forbidden = serde_json::to_value(&valid).unwrap();
+        forbidden["parentUuid"] = Value::String(Uuid::nil().to_string());
+        assert!(validate_record(&forbidden)
+            .unwrap_err()
+            .reason
+            .contains("not a canonical witness field"));
+
+        let mut top_level_null = serde_json::to_value(&valid).unwrap();
+        top_level_null["futureProof"] = Value::Null;
+        assert!(validate_record(&top_level_null)
+            .unwrap_err()
+            .reason
+            .contains("must be omitted instead of null"));
+
+        let mut integer_float = serde_json::to_value(&valid).unwrap();
+        integer_float["wallClock"] = Value::from(44);
+        assert!(validate_record(&integer_float)
+            .unwrap_err()
+            .reason
+            .contains("canonical serialized form"));
+
+        let mut reordered_charge = serde_json::to_value(&valid).unwrap();
+        reordered_charge["charge"] =
+            serde_json::from_str(r#"{"amount":42.5,"unit":"gpu-seconds","class":"verifiable"}"#)
+                .unwrap();
+        assert!(validate_record(&reordered_charge)
+            .unwrap_err()
+            .reason
+            .contains("field charge"));
+
+        let mut invalid = valid.clone();
+        invalid.transition_timestamp = "2026-07-26T12:00:00Z".to_owned();
+        assert!(validation_failure(invalid)
+            .reason
+            .contains("canonical RFC3339 UTC millis"));
+
+        let mut invalid = valid.clone();
+        invalid.attempt = 0;
+        assert!(validation_failure(invalid).reason.contains("attempt"));
+
+        let mut invalid = valid.clone();
+        invalid.pools.clear();
+        assert!(validation_failure(invalid).reason.contains("pool set"));
+
+        let mut invalid = valid.clone();
+        invalid.store_paths = Some(vec!["/tmp/not-store".to_owned()]);
+        assert!(validation_failure(invalid)
+            .reason
+            .contains("Nix store path"));
+
+        let mut invalid = valid.clone();
+        invalid.host_id = Some("bad\nhost".to_owned());
+        assert!(validation_failure(invalid)
+            .reason
+            .contains("control characters"));
+
+        let mut invalid = valid.clone();
+        invalid.result_revision = Some("ABC".to_owned());
+        assert!(validation_failure(invalid)
+            .reason
+            .contains("resultRevision"));
+
+        let mut invalid = valid;
+        invalid.authorship = Some(Authorship {
+            provider: "git-ai".to_owned(),
+            provider_version: "1.2.3".to_owned(),
+            note_ref: "refs/notes/ai".to_owned(),
+            status: AuthorshipStatus::Bound,
+            notes_ref_target: None,
+            note_content_sha256: None,
+            reason: None,
+        });
+        assert!(validation_failure(invalid)
+            .reason
+            .contains("requires resultRevision"));
+    }
+
+    #[test]
+    fn substituted_is_a_strict_non_metered_drv_witness() {
+        let record = fixture_records()[2].clone();
+        assert_eq!(record.verdict, Verdict::Substituted);
+        assert_eq!(record.labor_class, LaborClass::Substituted);
+        assert!(!counts_toward_canonical_gpu_seconds(&record));
+
+        let mut invalid = record.clone();
+        invalid.wall_clock = 1.0;
+        assert!(validation_failure(invalid)
+            .reason
+            .contains("cheap drv witness invariants"));
+
+        let mut invalid = record;
+        invalid.drv = None;
+        assert!(validation_failure(invalid).reason.contains("requires drv"));
+    }
+
+    #[test]
+    fn unknown_additive_fields_verify_and_round_trip_in_raw_order() {
+        let record = build_record(body(), &ChainHead::default()).unwrap();
+        let line = serde_json::to_string(&record)
+            .unwrap()
+            .replace(",\"seq\":", ",\"futureProof\":{\"z\":1,\"a\":2},\"seq\":");
+        let mut raw: Value = serde_json::from_str(&line).unwrap();
+        raw["hash"] = Value::String(compute_hash_value(&raw).unwrap());
+        let line = serde_json::to_string(&raw).unwrap();
+        let report = verify_reader(BufReader::new(format!("{line}\n").as_bytes()));
+        assert!(report.ok, "{:?}", report.problems);
+
+        let parsed = validate_record(&raw).unwrap();
+        assert_eq!(
+            parsed.extensions["futureProof"],
+            serde_json::json!({"z": 1, "a": 2})
+        );
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), line);
+
+        let padded = format!(" {line}\n");
+        let report = verify_reader(BufReader::new(padded.as_bytes()));
+        assert!(report
+            .problems
+            .iter()
+            .any(|problem| problem.reason.contains("compact canonical JSON")));
+    }
+
+    #[test]
+    fn hostname_mechanism_trims_and_validates_the_process_hostname() {
+        let host_id = current_host_id().unwrap();
+        assert_eq!(host_id, host_id.trim());
+        validate_host_id(&host_id).unwrap();
+        assert!(validate_host_id("").is_err());
+        assert!(validate_host_id("bad\nhost").is_err());
+        assert!(validate_host_id(&"x".repeat(97)).is_err());
+    }
+
+    #[test]
+    fn witness_pool_encoding_is_always_an_array_and_canonicalizes() {
         let singleton = build_record(body(), &ChainHead::default()).unwrap();
         let singleton_json = serde_json::to_string(&singleton).unwrap();
-        assert!(singleton_json.contains(r#""pool":"worker-gpu""#));
-        assert!(!singleton_json.contains(r#""pool":["#));
+        assert!(singleton_json.contains(r#""pools":["worker-gpu"]"#));
 
         let mut multi_body = body();
-        multi_body.pools = Some(vec!["zeta".to_owned(), "alpha".to_owned()]);
+        multi_body.pools = vec!["zeta".to_owned(), "alpha".to_owned()];
         let multi = build_record(multi_body, &ChainHead::default()).unwrap();
-        assert_eq!(
-            multi.pools.as_deref(),
-            Some(["alpha".to_owned(), "zeta".to_owned()].as_slice())
-        );
+        assert_eq!(multi.pools, ["alpha".to_owned(), "zeta".to_owned()]);
         let multi_json = serde_json::to_string(&multi).unwrap();
-        assert!(multi_json.contains(r#""pool":["alpha","zeta"]"#));
-        let report = verify_reader(BufReader::new(multi_json.as_bytes()));
+        assert!(multi_json.contains(r#""pools":["alpha","zeta"]"#));
+        let report = verify_reader(BufReader::new(format!("{multi_json}\n").as_bytes()));
         assert!(report.ok, "{:?}", report.problems);
     }
 

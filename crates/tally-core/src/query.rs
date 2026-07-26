@@ -545,7 +545,7 @@ fn project_job_details(
             continue;
         }
         job.output.task_uuid = record.task_uuid.clone();
-        job.output.pools = record.pools.clone().or(job.output.pools.take());
+        job.output.pools = Some(record.pools.clone());
         job.output.executor = record.executor.clone().or(job.output.executor.take());
         job.output.brief_hash = record.brief_hash.clone().or(job.output.brief_hash.take());
         job.output.orchestration = record
@@ -784,10 +784,7 @@ pub fn query_log(
                 .trace_ref
                 .clone()
                 .or_else(|| row.and_then(|row| row.session_ref.clone())),
-            pools: record
-                .pools
-                .clone()
-                .or_else(|| row.and_then(|row| row.pools.clone())),
+            pools: Some(record.pools.clone()),
             executor: record
                 .executor
                 .clone()
@@ -1095,8 +1092,8 @@ pub fn standup_session_refs(digest: &StandupDigest) -> BTreeSet<&str> {
 mod tests {
     use crate::config::Priority;
     use crate::journal::{EmitEvent, TallyFields};
-    use crate::taskdb::EnqueueSource;
-    use crate::witness::{Charge, GENESIS_PREV_HASH};
+    use crate::taskdb::{AdmissionOrigin, EnqueueSource};
+    use crate::witness::{Charge, RecordType, GENESIS_PREV_HASH, WITNESS_SCHEMA_VERSION};
 
     use super::*;
 
@@ -1174,11 +1171,15 @@ mod tests {
 
     fn witness(task: Option<&str>, verdict: Verdict, labor: LaborClass, seq: u64) -> WitnessRecord {
         WitnessRecord {
+            schema_version: WITNESS_SCHEMA_VERSION,
+            record_type: RecordType::Verdict,
+            transition_timestamp: format!("2026-07-19T12:00:{seq:02}.000Z"),
             task_uuid: task.map(ToOwned::to_owned),
-            transition_timestamp: format!("2026-07-19T12:00:{seq:02}Z"),
             verdict,
             exit_code: if verdict == Verdict::Failed { 1 } else { 0 },
             artifact_content_hash: (verdict == Verdict::Pass).then(|| "sha256:artifact".to_owned()),
+            store_paths: None,
+            drv: None,
             gpu_seconds: Some(10.0),
             wall_clock: 10.0,
             attempt: 1,
@@ -1186,11 +1187,13 @@ mod tests {
             dedup_key: None,
             payload_hash: None,
             brief_hash: None,
+            origin: AdmissionOrigin::direct(EnqueueSource::Manual),
             orchestration: None,
             labor_class: labor,
             trace_ref: None,
-            pools: Some(vec!["gpu".to_owned()]),
+            pools: vec!["gpu".to_owned()],
             executor: None,
+            host_id: None,
             charge: Some(Charge {
                 unit: "gpu-second".to_owned(),
                 amount: 10.0,
@@ -1200,6 +1203,9 @@ mod tests {
             evidence_class: None,
             manifest_hash: None,
             completion: None,
+            result_revision: None,
+            authorship: None,
+            extensions: serde_json::Map::new(),
             seq,
             prev_hash: GENESIS_PREV_HASH.to_owned(),
             hash: format!("sha256:{seq:064x}"),

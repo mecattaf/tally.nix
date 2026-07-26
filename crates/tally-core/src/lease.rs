@@ -1415,6 +1415,7 @@ mod tests {
     use std::thread;
 
     use crate::config::{CoResidencyPredicate, WindowedConsumptionPredicate};
+    use crate::taskdb::{AdmissionOrigin, EnqueueSource};
     use crate::witness::{LaborClass, WitnessBody, WitnessLedger};
 
     use super::*;
@@ -2480,6 +2481,8 @@ mod tests {
             verdict: Verdict::Pass,
             exit_code: 0,
             artifact_content_hash: None,
+            store_paths: None,
+            drv: None,
             gpu_seconds: Some(99.0),
             wall_clock: 99.0,
             attempt: 1,
@@ -2487,11 +2490,13 @@ mod tests {
             dedup_key: None,
             payload_hash: None,
             brief_hash: None,
+            origin: AdmissionOrigin::direct(EnqueueSource::Manual),
             orchestration: None,
             labor_class: LaborClass::Fresh,
             trace_ref: None,
-            pools: Some(vec!["api".to_owned()]),
+            pools: vec!["api".to_owned()],
             executor: None,
+            host_id: None,
             charge: Some(crate::witness::Charge {
                 unit: "seconds".to_owned(),
                 amount: 99.0,
@@ -2501,6 +2506,8 @@ mod tests {
             evidence_class: None,
             manifest_hash: None,
             completion: None,
+            result_revision: None,
+            authorship: None,
         }
     }
 

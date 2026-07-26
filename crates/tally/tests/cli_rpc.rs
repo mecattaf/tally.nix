@@ -521,7 +521,7 @@ async fn witness_verify_json_is_complete_and_red_exits_nonzero() {
     let valid = verify("valid.jsonl").await;
     assert!(valid.status.success());
     let valid_json: Value = serde_json::from_slice(&valid.stdout).unwrap();
-    assert_eq!(valid_json["schemaVersion"], 1);
+    assert_eq!(valid_json["schemaVersion"], 2);
     assert_eq!(valid_json["protocolVersion"], 3);
     assert_eq!(valid_json["ok"], true);
     assert_eq!(valid_json["chains"]["verdict"]["report"]["records"], 4);
@@ -534,4 +534,14 @@ async fn witness_verify_json_is_complete_and_red_exits_nonzero() {
     assert!(tampered_json["chains"]["verdict"]["report"]["problems"]
         .as_array()
         .is_some_and(|problems| !problems.is_empty()));
+
+    let old_format = verify("old-format.jsonl").await;
+    assert!(!old_format.status.success());
+    let old_format_json: Value = serde_json::from_slice(&old_format.stdout).unwrap();
+    assert_eq!(old_format_json["ok"], false);
+    assert!(old_format_json["chains"]["verdict"]["report"]["problems"]
+        .as_array()
+        .is_some_and(|problems| problems
+            .iter()
+            .any(|problem| { problem["kind"] == "schema-version-invalid" })));
 }
