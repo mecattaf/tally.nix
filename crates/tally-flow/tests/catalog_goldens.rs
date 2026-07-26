@@ -11,12 +11,19 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 #[test]
-fn selector_resolution_matches_the_nix_catalog_goldens() {
-    let (catalog, catalog_hash) = load_catalog(&fixture("catalog-resolution.json")).unwrap();
+fn selector_resolution_matches_the_helper_rendered_nix_catalog_goldens() {
+    let catalog_path = std::env::var_os("TALLY_NIX_CATALOG_FIXTURE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| fixture("catalog-resolution.json"));
+    let (catalog, catalog_hash) = load_catalog(&catalog_path).unwrap();
     let golden: Value =
         serde_json::from_slice(&fs::read(fixture("catalog-resolution.golden.json")).unwrap())
             .unwrap();
 
+    assert!(catalog.members.iter().all(|member| member
+        .classes
+        .iter()
+        .any(|class| class == "pooled-strongest")));
     assert_eq!(golden["pool"]["name"], "worker-gpu");
     assert_eq!(golden["pool"]["capacity"], 1);
     assert!(golden["capacityNote"]
@@ -30,8 +37,7 @@ fn selector_resolution_matches_the_nix_catalog_goldens() {
         let expected = case["expectedIds"].as_array().unwrap();
 
         for _ in 0..3 {
-            let resolved =
-                resolve_members(&catalog, &catalog_hash, selector, &options).unwrap();
+            let resolved = resolve_members(&catalog, &catalog_hash, selector, &options).unwrap();
             let ids = resolved
                 .members
                 .iter()

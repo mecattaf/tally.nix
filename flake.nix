@@ -174,6 +174,9 @@
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
           doCheck = true;
+          preCheck = ''
+            export TALLY_NIX_CATALOG_FIXTURE=${catalogFixtureUnchecked}
+          '';
           nativeCheckInputs = [
             pkgs.git
             pkgs.taskwarrior3
@@ -184,6 +187,12 @@
           meta.mainProgram = "tally";
         };
         catalogFixtureInput = import ./test/fixtures/catalog/valid.nix;
+        catalogFixtureUnchecked = catalogLibrary.renderCatalog (
+          catalogFixtureInput
+          // {
+            inherit pkgs;
+          }
+        );
         catalogFixture = catalogLibrary.mkCatalog (
           catalogFixtureInput
           // {

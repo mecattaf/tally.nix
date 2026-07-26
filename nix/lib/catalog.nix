@@ -15,8 +15,7 @@ let
     unique
     ;
 
-  nonEmptyString =
-    value: builtins.isString value && builtins.match ".*[^[:space:]].*" value != null;
+  nonEmptyString = value: builtins.isString value && builtins.match ".*[^[:space:]].*" value != null;
 
   nullableStringOption =
     description:
@@ -357,10 +356,8 @@ let
     in
     map (name: renderMember enabled.${name}) names;
 
-  mkCatalog =
+  validatedCatalogConfig =
     {
-      pkgs,
-      package ? self.packages.${pkgs.stdenv.hostPlatform.system}.tally,
       classes,
       pools,
       members,
@@ -370,13 +367,46 @@ let
         inherit classes pools members;
       };
       failure = firstCatalogFailure cfg;
-      unchecked = pkgs.writeText "tally-flow-catalog-unchecked.json" (
-        builtins.toJSON {
-          version = 1;
-          members = renderMembers cfg;
-        }
-        + "\n"
-      );
+    in
+    assert lib.assertMsg (failure == null) (
+      if failure == null then "tally catalog assertion failed" else failure.message
+    );
+    cfg;
+
+  renderCatalogConfig =
+    pkgs: cfg:
+    pkgs.writeText "tally-flow-catalog-unchecked.json" (
+      builtins.toJSON {
+        version = 1;
+        members = renderMembers cfg;
+      }
+      + "\n"
+    );
+
+  renderCatalog =
+    {
+      pkgs,
+      classes,
+      pools,
+      members,
+    }:
+    renderCatalogConfig pkgs (validatedCatalogConfig {
+      inherit classes pools members;
+    });
+
+  mkCatalog =
+    {
+      pkgs,
+      package ? self.packages.${pkgs.stdenv.hostPlatform.system}.tally,
+      classes,
+      pools,
+      members,
+    }:
+    let
+      cfg = validatedCatalogConfig {
+        inherit classes pools members;
+      };
+      unchecked = renderCatalogConfig pkgs cfg;
       validationScript = pkgs.writeText "tally-flow-catalog-check.js" ''
         export const meta = ${
           builtins.toJSON {
@@ -393,9 +423,6 @@ let
         null;
       '';
     in
-    assert lib.assertMsg (failure == null) (
-      if failure == null then "tally catalog assertion failed" else failure.message
-    );
     pkgs.runCommand "tally-flow-catalog.json"
       {
         nativeBuildInputs = [ package ];
@@ -410,5 +437,6 @@ in
     evalCatalog
     mkCatalog
     mkCatalogAssertions
+    renderCatalog
     ;
 }
