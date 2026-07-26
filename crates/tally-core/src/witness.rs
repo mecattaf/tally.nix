@@ -570,9 +570,6 @@ fn validate_record(raw: &Value) -> Result<WitnessRecord, ValidationFailure> {
     if let Some(charge) = &record.charge {
         validate_canonical_field_value(object, "charge", charge)?;
     }
-    if let Some(completion) = &record.completion {
-        validate_canonical_field_value(object, "completion", completion)?;
-    }
     if let Some(authorship) = &record.authorship {
         validate_canonical_field_value(object, "authorship", authorship)?;
     }
