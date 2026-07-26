@@ -183,6 +183,12 @@
           inherit pkgs;
           tallyPackage = tally;
         };
+        atticServerEnvironment = pkgs.runCommand "tally-attic-server-environment" { } ''
+          echo ATTIC_SERVER_TOKEN_RS256_SECRET_BASE64="$(
+            ${pkgs.lib.getExe pkgs.openssl} genrsa -traditional 4096 \
+              | ${pkgs.coreutils}/bin/base64 -w0
+          )" >"$out"
+        '';
         flowWorkerHandoff = pkgs.writeShellApplication {
           name = "tally-fs7-worker-handoff";
           runtimeInputs = [
@@ -994,6 +1000,11 @@
 
                 system.stateVersion = "26.11";
                 virtualisation.memorySize = 1536;
+                networking.firewall.allowedTCPPorts = [ 8080 ];
+                nix.settings.trusted-users = [
+                  "root"
+                  "tally"
+                ];
                 users.users.tally = {
                   isNormalUser = true;
                   uid = 1000;
@@ -1003,9 +1014,14 @@
                 };
                 environment.systemPackages = [
                   tally
+                  pkgs.attic-client
                   pkgs.git
                   pkgs.jq
                 ];
+                services.atticd = {
+                  enable = true;
+                  environmentFile = atticServerEnvironment;
+                };
                 environment.etc = {
                   "tally-fs7/id_ed25519" = {
                     source = ./test/fixtures/ssh/fs7_coordinator_ed25519;
@@ -1165,6 +1181,26 @@
           };
           testScript = ''
             start_all()
+
+            coordinator.wait_for_unit("atticd.service")
+            coordinator.wait_for_open_port(8080)
+            attic_token = coordinator.succeed(
+              "atticd-atticadm make-token --sub tally-multi-host --validity 1h "
+              "--create-cache '*' --pull '*' --push '*' --delete '*' "
+              "--configure-cache '*' --configure-cache-retention '*'"
+            ).strip()
+            coordinator.succeed(
+              "${pkgs.attic-client}/bin/attic login tally "
+              "http://coordinator:8080 " + attic_token
+            )
+            coordinator.succeed(
+              "${pkgs.attic-client}/bin/attic cache create --public tally-handoff"
+            )
+            worker.succeed(
+              "runuser -u tally-worker -- env HOME=/var/lib/tally-worker "
+              "${pkgs.attic-client}/bin/attic login tally "
+              "http://coordinator:8080 " + attic_token
+            )
 
             worker.wait_for_unit("sshd.service")
             worker.wait_for_unit("tally-fs7-git.service")
