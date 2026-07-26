@@ -82,7 +82,8 @@ Each job's Nix store cache is keyed by runner OS, `flake.lock`, and job name. Th
 store paths only: it never caches a gate status or the Cargo target directory. Every run still
 invokes each gate against the checked-out tree, and Nix evaluates that tree before deciding
 whether a content-addressed store path can be reused. CI disables Determinate Nix's lazy trees so
-the checked-out source is materialized as a real store path before sandboxed checks consume it.
+the checked-out source is materialized as a real store path before sandboxed checks consume it,
+and uses serial evaluation for checks that assert expected derivation failures.
 
 ## Live-system tests
 

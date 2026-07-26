@@ -23,6 +23,7 @@ jobs:
         with:
           extra-conf: |
             lazy-trees = false
+            eval-cores = 1
 
       - name: Restore and save the Nix store
         uses: nix-community/cache-nix-action@v7
@@ -102,9 +103,11 @@ jobs:
         uses: DeterminateSystems/nix-installer-action@v22
         with:
           # The checks pass the repository source to sandboxed derivations.
-          # Materialize it as a real store path before any build or cache lookup.
+          # Materialize it as a real store path and preserve serial evaluation
+          # for the checks that assert expected derivation failures.
           extra-conf: |
             lazy-trees = false
+            eval-cores = 1
 
       - name: Restore and save the Nix store
         uses: nix-community/cache-nix-action@v7
