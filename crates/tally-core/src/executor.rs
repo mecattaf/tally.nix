@@ -4602,6 +4602,56 @@ mod tests {
     }
 
     #[test]
+    fn exec_attestation_wrapper_is_argv_safe_and_preserves_the_exact_child() {
+        let mut request = request();
+        let child = request.argv.clone();
+        request.exec_attestation = Some(ExecAttestationContext {
+            adapter: "codex".to_owned(),
+            executor: Some("worker-1".to_owned()),
+            payload_hash: Some(format!("sha256:{}", "a".repeat(64))),
+            brief_hash: Some(format!("sha256:{}", "b".repeat(64))),
+            evidence: vec![
+                "exit:0".to_owned(),
+                "artifact:/work tree/result.json".to_owned(),
+            ],
+        });
+        let args = strings(
+            &executor(Path::new("/state tree"))
+                .build_systemd_argv(&request)
+                .unwrap(),
+        );
+        let systemd_separator = args.iter().position(|argument| argument == "--").unwrap();
+        assert_eq!(
+            &args[systemd_separator + 1..systemd_separator + 4],
+            ["/nix/store/example/bin/tally", "attest", "exec"]
+        );
+        for pair in [
+            ["--task-uuid", "00000000-0000-4000-8000-000000000002"],
+            ["--attempt", "1"],
+            ["--lease-epoch", "7"],
+            ["--adapter", "codex"],
+            ["--executor", "worker-1"],
+            [
+                "--payload-hash",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ],
+            [
+                "--brief-hash",
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            ],
+            ["--ledger", "/state tree/exec-attestations.jsonl"],
+        ] {
+            assert!(args.windows(2).any(|window| window == pair));
+        }
+        assert!(args.windows(2).any(|window| {
+            window == ["--evidence", "artifact:/work tree/result.json"]
+        }));
+        let child_separator = args.iter().rposition(|argument| argument == "--").unwrap();
+        assert!(child_separator > systemd_separator);
+        assert_eq!(&args[child_separator + 1..], child);
+    }
+
+    #[test]
     fn hardening_preset_names_stamp_only_the_normative_property_bundles() {
         let executor = executor(Path::new("/state tree"));
         let mut strict = request();
