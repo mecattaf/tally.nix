@@ -66,34 +66,23 @@ $ grep -rn 'todo!\|unimplemented!\|TODO' crates/
 
 The expected result is no output and grep exit 1.
 
-## Continuous integration
+## Merge verification
 
-`.github/workflows/ci.yml` runs one light Rust smoke check for every pull request and every push
-to `main`: `cargo test --workspace`, Clippy with warnings denied, and the no-stubs grep. The job
-uses a GitHub-hosted `ubuntu-latest` runner, installs the stable Rust toolchain and the stock
-Taskwarrior 3 test dependency, and restores a Cargo cache. GitHub Actions never runs Nix builds,
-KVM preflights, or VM checks, and tally does not register a self-hosted coordinator as a CI
-runner.
-
-GitHub supplies an advisory smoke signal; it is never the arbiter of merge readiness. A red
-smoke check blocks merge, but a green check is not the full verdict. Before every merge, the
-implementing worker runs the authoritative gate ladder on this KVM-capable fleet host:
+This repository has no GitHub Actions workflows or GitHub-hosted checks. GitHub is used for
+issues, pull requests, and merges, never for verification. Before every merge, the implementing
+worker runs the authoritative gate ladder on this KVM-capable fleet host:
 
 ```console
 $ env -u TALLY_TEST_REMOTE_HOST nix develop --command cargo test --workspace
 $ nix develop --command cargo clippy --workspace --all-targets -- -D warnings
 $ nix flake check -L
-$ nix develop --command cargo run --quiet -p tally -- \
-    witness verify test/fixtures/ledger/valid.jsonl
-$ nix develop --command cargo run --quiet -p tally -- \
-    witness verify test/fixtures/ledger/tampered.jsonl
 $ grep -rn 'todo!\|unimplemented!\|TODO' crates/
 ```
 
 The `nix flake check -L` run must include the `flow-multi-host` coordinator-and-worker NixOS VM
-check. The valid witness command must exit 0, the tampered witness command must exit 1, and the
-no-stubs grep must produce no output and exit 1. The worker pastes the gate transcript into the
-pull request. That transcript plus a green GitHub Rust smoke check is the merge evidence.
+check. The no-stubs grep must produce no output and exit 1. The worker pastes the gate transcript
+into the pull request, and that transcript alone is the merge evidence. Nothing waits on, blocks
+on, or schedules a GitHub-hosted check because none exists.
 
 ## Live-system tests
 
