@@ -836,4 +836,40 @@ const x = args.task;
             "undeclared-pool"
         );
     }
+
+    #[test]
+    fn literal_selector_cardinality_is_checked_against_the_catalog() {
+        let source = format!(
+            "{VALID}\nmembers('pooled-fast', {{ count: 2, diversity: 'maker' }});"
+        );
+        let catalog: Catalog = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "members": [{
+                "id": "only-member",
+                "family": "fixture",
+                "maker": "fixture-maker",
+                "classes": ["pooled-fast"],
+                "adapter": "pi",
+                "pools": ["worker-gpu"],
+                "launch": {"model": "only-member"}
+            }]
+        }))
+        .unwrap();
+
+        let error = check_script(
+            &source,
+            None,
+            CheckOptions {
+                catalog: Some(&catalog),
+                catalog_hash: Some("sha256:fixture"),
+                ..CheckOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "selector-insufficient-members");
+        assert_eq!(error.details["selector"], "pooled-fast");
+        assert_eq!(error.details["requested"], 2);
+        assert_eq!(error.details["available"], 1);
+    }
 }
