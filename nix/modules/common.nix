@@ -1752,6 +1752,37 @@ let
         default = { };
         description = "Age-based Nix GC-root retention with a live-witness floor.";
       };
+      gitAi = mkOption {
+        type = types.submodule {
+          options = {
+            enable = mkOption {
+              type = types.bool;
+              default = false;
+              description = "Bind code-result revisions to externally provisioned Git AI notes.";
+            };
+            mode = mkOption {
+              type = types.enum [
+                "advisory"
+                "required"
+              ];
+              default = "advisory";
+              description = "Whether a missing or invalid Git AI binding is advisory or fails the result.";
+            };
+            awaitTimeoutSec = mkOption {
+              type = types.ints.positive;
+              default = 60;
+              description = "Maximum Git AI settlement-barrier duration in seconds.";
+            };
+            globalAwaitOk = mkOption {
+              type = types.bool;
+              default = false;
+              description = "Permit git-ai's process-global await barrier on an isolated execution host.";
+            };
+          };
+        };
+        default = { };
+        description = "External Git AI authorship binding policy; tally.nix does not provide the binary.";
+      };
       pools = mkOption {
         type = types.attrsOf mkPoolType;
         default = { };
@@ -2076,6 +2107,14 @@ let
     };
     retention = {
       inherit (cfg.retention) enable horizon onCalendar;
+    };
+    gitAi = {
+      inherit (cfg.gitAi)
+        enable
+        mode
+        awaitTimeoutSec
+        globalAwaitOk
+        ;
     };
     pools = mapAttrs renderPool cfg.pools;
     executors = mapAttrs renderExecutor cfg.executors;
