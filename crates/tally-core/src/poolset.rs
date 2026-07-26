@@ -40,6 +40,13 @@ where
     }
 }
 
+pub fn serialize_array<S>(pools: &[String], serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    pools.serialize(serializer)
+}
+
 pub fn deserialize_optional<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: Deserializer<'de>,
@@ -130,6 +137,12 @@ mod tests {
         pool: Vec<String>,
     }
 
+    #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+    struct ArraySurface {
+        #[serde(serialize_with = "serialize_array", deserialize_with = "deserialize")]
+        pool: Vec<String>,
+    }
+
     #[test]
     fn legacy_scalar_and_canonical_multi_encoding_round_trip() {
         let scalar: Surface = serde_json::from_str(r#"{"pool":"slot"}"#).unwrap();
@@ -145,6 +158,16 @@ mod tests {
         assert_eq!(multi, ["alpha", "zeta"]);
         assert_eq!(encoded(&multi).unwrap(), r#"["alpha","zeta"]"#);
         assert_eq!(decoded(r#"["alpha","zeta"]"#).unwrap(), multi);
+    }
+
+    #[test]
+    fn array_emission_keeps_legacy_scalar_input_compatible() {
+        let scalar: ArraySurface = serde_json::from_str(r#"{"pool":"slot"}"#).unwrap();
+        assert_eq!(scalar.pool, ["slot"]);
+        assert_eq!(
+            serde_json::to_string(&scalar).unwrap(),
+            r#"{"pool":["slot"]}"#
+        );
     }
 
     #[test]

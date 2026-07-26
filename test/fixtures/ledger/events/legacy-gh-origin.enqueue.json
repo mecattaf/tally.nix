@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "eventId": "00000000-0000-4000-8000-000000000305",
+  "acknowledged": true,
+  "row": {
+    "uuid": "00000000-0000-4000-8000-000000000315",
+    "description": "literal legacy GitHub row",
+    "priority": "high",
+    "source": "gh",
+    "adapter": "shell",
+    "pool": "worker-gpu",
+    "leaseEpoch": 7,
+    "argv": ["true"],
+    "evidence": [],
+    "ghOrigin": {
+      "producer": "github",
+      "source": "notifications",
+      "itemId": "I_legacy",
+      "actor": "contributor",
+      "selfActor": "tally-bot",
+      "actorExclude": "self"
+    }
+  }
+}

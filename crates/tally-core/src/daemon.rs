@@ -69,9 +69,9 @@ use crate::recovery::{
     RecoveryTriggers,
 };
 use crate::taskdb::{
-    admits_durable_row, read_acknowledged_events, update_enqueue_event_atomic,
-    write_enqueue_event_atomic, AdmissionInput, AdmissionOrigin, DurableEnqueueEvent, DurableRetry,
-    EnqueueSource, RowSeed, TaskDb, TaskDbError,
+    admits_durable_row, migrate_acknowledged_events, read_acknowledged_events,
+    update_enqueue_event_atomic, write_enqueue_event_atomic, AdmissionInput, AdmissionOrigin,
+    DurableEnqueueEvent, DurableRetry, EnqueueSource, RowSeed, TaskDb, TaskDbError,
 };
 use crate::trace::{query_trace, trace_availability, TraceError, TraceLane};
 use crate::watch::{ChangeError, ChangeKind, ChangeStore};
@@ -1231,6 +1231,7 @@ impl DaemonHandler {
             .transpose()
             .map_err(|_| WireError::invalid("parent must be a UUID"))?;
         let row = RowSeed {
+            row_version: crate::taskdb::CURRENT_ROW_VERSION,
             uuid: row_uuid,
             description: resolved.argv.join(" "),
             priority: resolved.priority,
@@ -4842,10 +4843,14 @@ impl Daemon {
         let settings = settings.validate()?;
         prepare_paths(&paths)?;
         let state_lock = acquire_daemon_lock(&paths.state_dir)?;
+        // Preserve the clean-cut refusal: predecessor bytes are never parsed.
+        // Once the final ledger is confirmed, migrate under this lock before
+        // any acknowledged-event reader or recovery reconciliation can run.
         require_fresh_events_for_new_ledger(&paths)?;
-        let host_id = current_host_id()?;
         let witness_path = paths.witness_path();
         let mut witness_ledger = WitnessLedger::open(&witness_path)?;
+        migrate_acknowledged_events(&paths.events_dir())?;
+        let host_id = current_host_id()?;
         let epoch = bump_epoch(&paths.state_dir)?;
         reconcile_pool_loss_intents(&paths, &executor, &mut witness_ledger, &host_id).await?;
         let mut durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
@@ -8390,6 +8395,53 @@ mod tests {
             .any(|job| job.task_uuid == Some(row.uuid)));
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn non_empty_current_state_migrates_before_recovery_and_is_restart_stable() {
+        let temp = tempdir().unwrap();
+        let paths = fs1_paths(temp.path());
+
+        let initialized = fs1_daemon(&paths).await;
+        assert!(paths.witness_path().is_file());
+        drop(initialized);
+
+        let legacy = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../test/fixtures/ledger/events/legacy-no-origin.enqueue.json"
+        ))
+        .replace("\"pool\": \"worker-gpu\"", "\"pool\": \"slot\"")
+        .replace("\"leaseEpoch\": 7", "\"leaseEpoch\": 1");
+        assert!(!legacy.contains("\"rowVersion\""));
+        assert!(!legacy.contains("\"origin\""));
+        fs::create_dir_all(paths.events_dir()).unwrap();
+        let event_path = paths
+            .events_dir()
+            .join("00000000-0000-4000-8000-000000000301.enqueue.json");
+        fs::write(&event_path, legacy).unwrap();
+
+        let restarted = fs1_daemon(&paths).await;
+        let row_uuid = Uuid::parse_str("00000000-0000-4000-8000-000000000311").unwrap();
+        assert!(restarted
+            .initial_jobs
+            .iter()
+            .any(|job| job.task_uuid == Some(row_uuid)));
+        let migrated = fs::read(&event_path).unwrap();
+        let event = read_acknowledged_events(&paths.events_dir()).unwrap();
+        assert_eq!(event.len(), 1);
+        assert_eq!(event[0].row.row_version, crate::taskdb::CURRENT_ROW_VERSION);
+        assert_eq!(
+            event[0].row.origin,
+            Some(AdmissionOrigin::direct(EnqueueSource::Calendar))
+        );
+        drop(restarted);
+
+        let second_restart = fs1_daemon(&paths).await;
+        assert!(second_restart
+            .initial_jobs
+            .iter()
+            .any(|job| job.task_uuid == Some(row_uuid)));
+        assert_eq!(fs::read(event_path).unwrap(), migrated);
+    }
+
     fn fs1_full_payload(
         dedup_key: &str,
         argv: &[&str],
@@ -8426,6 +8478,7 @@ mod tests {
 
     fn durable_row(uuid: Uuid, dedup_key: &str, lease_epoch: u64) -> RowSeed {
         RowSeed {
+            row_version: crate::taskdb::CURRENT_ROW_VERSION,
             uuid,
             description: "durable reuse fixture".to_owned(),
             priority: Priority::High,
