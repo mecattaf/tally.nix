@@ -66,23 +66,23 @@ $ grep -rn 'todo!\|unimplemented!\|TODO' crates/
 
 The expected result is no output and grep exit 1.
 
-## Continuous integration
+## Merge verification
 
-`.github/workflows/ci.yml` runs the gate ladder for every pull request and every push to `main`.
-Both jobs use GitHub-hosted `ubuntu-latest` runners; tally does not register a self-hosted
-coordinator as a CI runner.
+This repository has no GitHub Actions workflows or GitHub-hosted checks. GitHub is used for
+issues, pull requests, and merges, never for verification. Before every merge, the implementing
+worker runs the authoritative gate ladder on this KVM-capable fleet host:
 
-The Nix job requires `/dev/kvm` before it checks out or builds anything. A runner without KVM
-fails with an explicit annotation instead of skipping VM coverage. The job runs the complete
-`nix flake check -L` set and then requires
-`checks.x86_64-linux.flow-multi-host` by name, so the coordinator-and-worker NixOS VM result is
-part of every green run.
+```console
+$ env -u TALLY_TEST_REMOTE_HOST nix develop --command cargo test --workspace
+$ nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+$ nix flake check -L
+$ grep -rn 'todo!\|unimplemented!\|TODO' crates/
+```
 
-Each job's Nix store cache is keyed by runner OS, `flake.lock`, and job name. The cache contains
-store paths only: it never caches a gate status or the Cargo target directory. Every run still
-invokes each gate against the checked-out tree, and Nix evaluates that tree before deciding
-whether a content-addressed store path can be reused. CI disables Determinate Nix's lazy trees so
-the checked-out source is materialized as a real store path before sandboxed checks consume it.
+The `nix flake check -L` run must include the `flow-multi-host` coordinator-and-worker NixOS VM
+check. The no-stubs grep must produce no output and exit 1. The worker pastes the gate transcript
+into the pull request, and that transcript alone is the merge evidence. Nothing waits on, blocks
+on, or schedules a GitHub-hosted check because none exists.
 
 ## Live-system tests
 
