@@ -1,0 +1,122 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  rust-gates:
+    name: Rust, witness, and no-stubs gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the current tree
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          extra-conf: |
+            lazy-trees = false
+
+      - name: Restore and save the Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ github.job }}
+          restore-prefixes-first-match: |
+            nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
+            nix-${{ runner.os }}-
+          gc-max-store-size-linux: 4G
+
+      - name: Run workspace tests
+        run: nix develop -c cargo test --workspace
+
+      - name: Run Clippy with warnings denied
+        run: nix develop -c cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Witness oracle — valid GREEN, tampered RED
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Verifying valid ledger (expected exit 0 / GREEN)"
+          nix develop -c cargo run --quiet -p tally -- \
+            witness verify test/fixtures/ledger/valid.jsonl
+
+          echo "Verifying tampered ledger (expected exit 1 / RED)"
+          set +e
+          nix develop -c cargo run --quiet -p tally -- \
+            witness verify test/fixtures/ledger/tampered.jsonl
+          tampered_status=$?
+          set -e
+
+          if [ "$tampered_status" -ne 1 ]; then
+            echo "::error title=Witness oracle failed::Tampered ledger exited $tampered_status; expected 1"
+            exit 1
+          fi
+
+      - name: Reject Rust stubs and TODOs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          set +e
+          grep -rn 'todo!\|unimplemented!\|TODO' crates/
+          grep_status=$?
+          set -e
+
+          if [ "$grep_status" -eq 0 ]; then
+            echo "::error title=Rust placeholders found::Remove the matches printed above"
+            exit 1
+          fi
+
+          if [ "$grep_status" -ne 1 ]; then
+            echo "::error title=No-stubs gate failed::grep exited $grep_status"
+            exit "$grep_status"
+          fi
+
+  nix-flake-checks:
+    name: Nix flake checks — KVM required, includes flow-multi-host
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Require KVM for flow-multi-host
+        shell: bash
+        run: |
+          if ! test -e /dev/kvm; then
+            echo "::error title=KVM unavailable::The mandatory flow-multi-host NixOS VM check requires /dev/kvm; this job never skips it"
+            exit 1
+          fi
+          echo "/dev/kvm is present; flow-multi-host remains mandatory"
+          ls -l /dev/kvm
+
+      - name: Check out the current tree
+        uses: actions/checkout@v7
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          # The checks pass source files to sandboxed derivations.
+          # Materialize the checkout before any build or cache lookup.
+          extra-conf: |
+            lazy-trees = false
+
+      - name: Restore and save the Nix store
+        uses: nix-community/cache-nix-action@v7
+        with:
+          primary-key: nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}-${{ github.job }}
+          restore-prefixes-first-match: |
+            nix-${{ runner.os }}-${{ hashFiles('flake.lock') }}-
+            nix-${{ runner.os }}-
+          gc-max-store-size-linux: 4G
+
+      - name: Run every Nix flake check
+        run: nix flake check -L
+
+      - name: Require the flow-multi-host result by name
+        run: nix build -L .#checks.x86_64-linux.flow-multi-host --no-link

@@ -609,18 +609,12 @@
             "tally flow fixture maxNodes 4 is less than script meta.maxNodes 5"
           ];
         };
-        invalidFlowCatalog = pkgs.writeText "tally-invalid-flow-catalog.json" (
-          builtins.toJSON {
-            version = 1;
-            members = [ { id = "only"; } ];
-          }
-        );
         flowCatalogFailure = pkgs.testers.testBuildFailure' {
           name = "tally-flow-catalog-schema-failure";
           drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
             script = ./test/fixtures/flows/valid.js;
             args.task = "ship";
-            catalog = invalidFlowCatalog;
+            catalog = ./test/fixtures/flows/invalid-catalog.json;
           });
           expectedBuilderExitCode = 1;
           expectedBuilderLogEntries = [
