@@ -17,6 +17,7 @@ async fn stock_taskwarrior_reads_the_in_process_replica() {
         let mut db = TaskDb::open(temp.path()).await.unwrap();
         taskdata_dir = db.taskdata_dir().to_owned();
         let seed = RowSeed {
+            row_version: tally_core::taskdb::CURRENT_ROW_VERSION,
             uuid,
             description: "stock viewer compatibility".to_owned(),
             priority: Priority::Medium,

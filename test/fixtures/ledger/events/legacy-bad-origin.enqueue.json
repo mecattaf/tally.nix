@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "eventId": "00000000-0000-4000-8000-000000000304",
+  "acknowledged": true,
+  "row": {
+    "uuid": "00000000-0000-4000-8000-000000000314",
+    "description": "legacy row with mismatched origin",
+    "priority": "high",
+    "source": "calendar",
+    "adapter": "shell",
+    "pool": "worker-gpu",
+    "leaseEpoch": 7,
+    "argv": ["true"],
+    "evidence": [],
+    "origin": {
+      "schemaVersion": 1,
+      "source": "manual"
+    }
+  }
+}

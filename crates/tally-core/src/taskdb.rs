@@ -20,6 +20,8 @@ use crate::provenance::Orchestration;
 use crate::recovery::{RecoveryPlan, RecoveryRowState};
 use crate::witness::{read_verified_records, LaborClass, Verdict, WitnessError, WitnessRecord};
 
+pub mod migrations;
+
 pub const TASKDATA_DIRECTORY: &str = "taskdata";
 const MAX_DURABLE_EVENT_BYTES: u64 = 1024 * 1024;
 pub const MAX_GH_ORIGIN_FIELD_BYTES: usize = 4096;
@@ -27,6 +29,7 @@ pub const MAX_GH_CONTEXT_BYTES: usize = 256 * 1024;
 pub const GH_ORIGIN_SCHEMA_VERSION: u32 = 2;
 pub const GH_CONTEXT_SCHEMA_VERSION: u32 = 2;
 pub const ADMISSION_ORIGIN_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_ROW_VERSION: u32 = 2;
 const MAX_GH_PRODUCER_BYTES: usize = 96;
 const MAX_GH_TITLE_BYTES: usize = 16 * 1024;
 const MAX_GH_BODY_BYTES: usize = 128 * 1024;
@@ -872,6 +875,8 @@ pub fn admits_durable_row(input: &AdmissionInput) -> bool {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RowSeed {
+    #[serde(default = "default_row_version")]
+    pub row_version: u32,
     pub uuid: Uuid,
     pub description: String,
     pub priority: Priority,
@@ -879,7 +884,7 @@ pub struct RowSeed {
     pub adapter: String,
     #[serde(
         rename = "pool",
-        serialize_with = "crate::poolset::serialize",
+        serialize_with = "crate::poolset::serialize_array",
         deserialize_with = "crate::poolset::deserialize"
     )]
     pub pools: Vec<String>,
@@ -939,6 +944,10 @@ pub struct RowSeed {
     pub manifest_hash: Option<Value>,
 }
 
+const fn default_row_version() -> u32 {
+    1
+}
+
 const fn default_attempt() -> u32 {
     1
 }
@@ -962,6 +971,12 @@ fn validate_absolute_path(path: &Path, label: &str) -> Result<(), TaskDbError> {
 
 impl RowSeed {
     pub fn validate(&self) -> Result<(), TaskDbError> {
+        if self.row_version == 0 || self.row_version > CURRENT_ROW_VERSION {
+            return Err(TaskDbError::InvalidSeed(format!(
+                "rowVersion {} is unsupported; current rowVersion is {CURRENT_ROW_VERSION}",
+                self.row_version
+            )));
+        }
         if self.description.trim().is_empty() {
             return Err(TaskDbError::InvalidSeed(
                 "description must not be empty".to_owned(),
@@ -1125,6 +1140,17 @@ impl RowSeed {
             .render();
         Ok(())
     }
+
+    fn canonicalize_for_current_write(&mut self) -> Result<(), TaskDbError> {
+        if self.row_version == 0 || self.row_version > CURRENT_ROW_VERSION {
+            return Err(TaskDbError::InvalidSeed(format!(
+                "rowVersion {} is unsupported; current rowVersion is {CURRENT_ROW_VERSION}",
+                self.row_version
+            )));
+        }
+        self.row_version = CURRENT_ROW_VERSION;
+        self.canonicalize()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1164,7 +1190,7 @@ impl DurableEnqueueEvent {
     }
 
     pub fn new_with_depth(mut row: RowSeed, guardrail_depth: u32) -> Result<Self, TaskDbError> {
-        row.canonicalize()?;
+        row.canonicalize_for_current_write()?;
         Ok(Self {
             schema_version: 1,
             event_id: Uuid::new_v4(),
@@ -1183,7 +1209,7 @@ impl DurableEnqueueEvent {
         matched_witness_seq: u64,
         artifact_content_hash: String,
     ) -> Result<Self, TaskDbError> {
-        row.canonicalize()?;
+        row.canonicalize_for_current_write()?;
         let event = Self {
             schema_version: 2,
             event_id: Uuid::new_v4(),
@@ -1785,6 +1811,15 @@ pub fn update_enqueue_event_atomic(
 ) -> Result<PathBuf, TaskDbError> {
     let mut event = event.clone();
     event.row.canonicalize()?;
+    if event.row.row_version != CURRENT_ROW_VERSION {
+        return Err(TaskDbError::InvalidEvent {
+            path: events_dir.to_owned(),
+            reason: format!(
+                "rowVersion {} requires the ordered startup migration to rowVersion {CURRENT_ROW_VERSION}",
+                event.row.row_version
+            ),
+        });
+    }
     event.validate()?;
     let bytes = serde_json::to_vec(&event)?;
     if bytes.len().saturating_add(1) > MAX_DURABLE_EVENT_BYTES as usize {
@@ -1837,7 +1872,7 @@ fn write_enqueue_event_atomic_with_sync(
     mut sync_directory: impl FnMut(&Path) -> Result<(), TaskDbError>,
 ) -> Result<PathBuf, TaskDbError> {
     let mut event = event.clone();
-    event.row.canonicalize()?;
+    event.row.canonicalize_for_current_write()?;
     event.validate()?;
     let bytes = serde_json::to_vec(&event)?;
     if bytes.len().saturating_add(1) > MAX_DURABLE_EVENT_BYTES as usize {
@@ -1875,9 +1910,7 @@ fn write_enqueue_event_atomic_with_sync(
     Ok(final_path)
 }
 
-pub fn read_acknowledged_events(
-    events_dir: &Path,
-) -> Result<Vec<DurableEnqueueEvent>, TaskDbError> {
+fn enqueue_event_paths(events_dir: &Path) -> Result<Vec<PathBuf>, TaskDbError> {
     if !events_dir.exists() {
         return Ok(Vec::new());
     }
@@ -1893,59 +1926,127 @@ pub fn read_acknowledged_events(
         }
     }
     paths.sort();
-    let mut events = Vec::new();
-    for path in paths {
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(&path)
-            .map_err(|source| io_error(&path, source))?;
-        let metadata = file.metadata().map_err(|source| io_error(&path, source))?;
-        if !metadata.is_file() {
-            return Err(TaskDbError::InvalidEvent {
-                path,
-                reason: "event is not a regular file".to_owned(),
-            });
+    Ok(paths)
+}
+
+fn read_enqueue_event(path: &Path) -> Result<DurableEnqueueEvent, TaskDbError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    if !metadata.is_file() {
+        return Err(TaskDbError::InvalidEvent {
+            path: path.to_owned(),
+            reason: "event is not a regular file".to_owned(),
+        });
+    }
+    if metadata.len() > MAX_DURABLE_EVENT_BYTES {
+        return Err(TaskDbError::InvalidEvent {
+            path: path.to_owned(),
+            reason: format!("event exceeds the {MAX_DURABLE_EVENT_BYTES} byte durable-event limit"),
+        });
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_DURABLE_EVENT_BYTES.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error(path, source))?;
+    if bytes.len() as u64 > MAX_DURABLE_EVENT_BYTES {
+        return Err(TaskDbError::InvalidEvent {
+            path: path.to_owned(),
+            reason: format!(
+                "event grew beyond the {MAX_DURABLE_EVENT_BYTES} byte durable-event limit while reading"
+            ),
+        });
+    }
+    serde_json::from_slice(&bytes).map_err(TaskDbError::Json)
+}
+
+fn validate_enqueue_event_path(
+    path: &Path,
+    event: &DurableEnqueueEvent,
+) -> Result<(), TaskDbError> {
+    event.validate().map_err(|error| match error {
+        TaskDbError::EventVersion { version, .. } => TaskDbError::EventVersion {
+            path: path.to_owned(),
+            version,
+        },
+        other => TaskDbError::InvalidEvent {
+            path: path.to_owned(),
+            reason: other.to_string(),
+        },
+    })?;
+    let expected_name = format!("{}.enqueue.json", event.event_id);
+    if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        return Err(TaskDbError::InvalidEvent {
+            path: path.to_owned(),
+            reason: "file name does not match eventId".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+pub fn migrate_acknowledged_events(events_dir: &Path) -> Result<usize, TaskDbError> {
+    let mut rewrites = Vec::new();
+    for path in enqueue_event_paths(events_dir)? {
+        let event = read_enqueue_event(&path)?;
+        validate_enqueue_event_path(&path, &event)?;
+        if !event.acknowledged {
+            continue;
         }
-        if metadata.len() > MAX_DURABLE_EVENT_BYTES {
-            return Err(TaskDbError::InvalidEvent {
-                path,
-                reason: format!(
-                    "event exceeds the {MAX_DURABLE_EVENT_BYTES} byte durable-event limit"
-                ),
-            });
-        }
-        let mut bytes = Vec::with_capacity(metadata.len() as usize);
-        file.take(MAX_DURABLE_EVENT_BYTES.saturating_add(1))
-            .read_to_end(&mut bytes)
-            .map_err(|source| io_error(&path, source))?;
-        if bytes.len() as u64 > MAX_DURABLE_EVENT_BYTES {
-            return Err(TaskDbError::InvalidEvent {
-                path,
-                reason: format!(
-                    "event grew beyond the {MAX_DURABLE_EVENT_BYTES} byte durable-event limit while reading"
-                ),
-            });
-        }
-        let event: DurableEnqueueEvent = serde_json::from_slice(&bytes)?;
-        event.validate().map_err(|error| match error {
-            TaskDbError::EventVersion { version, .. } => TaskDbError::EventVersion {
+        let migrated = migrations::migrate_to_current(&event.row).map_err(|reason| {
+            TaskDbError::InvalidEvent {
                 path: path.clone(),
-                version,
-            },
-            other => TaskDbError::InvalidEvent {
-                path: path.clone(),
-                reason: other.to_string(),
-            },
+                reason,
+            }
         })?;
-        let expected_name = format!("{}.enqueue.json", event.event_id);
-        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+        let mut canonical = migrated.clone();
+        canonical
+            .canonicalize()
+            .map_err(|error| TaskDbError::InvalidEvent {
+                path: path.clone(),
+                reason: error.to_string(),
+            })?;
+        if canonical != migrated {
             return Err(TaskDbError::InvalidEvent {
                 path,
-                reason: "file name does not match eventId".to_owned(),
+                reason: "acknowledged row is not canonical after migration".to_owned(),
             });
         }
+        if migrated != event.row {
+            let mut migrated_event = event;
+            migrated_event.row = migrated;
+            rewrites.push(migrated_event);
+        }
+    }
+
+    // Classification above completes before the first mutation. Per-file
+    // replacement is atomic, so a crash leaves only untouched files for the
+    // next ordered startup pass.
+    for event in &rewrites {
+        update_enqueue_event_atomic(events_dir, event)?;
+    }
+    Ok(rewrites.len())
+}
+
+pub fn read_acknowledged_events(
+    events_dir: &Path,
+) -> Result<Vec<DurableEnqueueEvent>, TaskDbError> {
+    let mut events = Vec::new();
+    for path in enqueue_event_paths(events_dir)? {
+        let event = read_enqueue_event(&path)?;
+        validate_enqueue_event_path(&path, &event)?;
         if event.acknowledged {
+            if event.row.row_version != CURRENT_ROW_VERSION {
+                return Err(TaskDbError::InvalidEvent {
+                    path,
+                    reason: format!(
+                        "rowVersion {} requires the ordered startup migration to rowVersion {CURRENT_ROW_VERSION}",
+                        event.row.row_version
+                    ),
+                });
+            }
             event.row.validate()?;
             let mut canonical = event.row.clone();
             canonical.canonicalize()?;
@@ -1964,12 +2065,56 @@ pub fn read_acknowledged_events(
 #[cfg(test)]
 mod tests {
     use std::ffi::CString;
+    use std::fs;
     use std::os::unix::ffi::OsStrExt;
 
     use super::*;
 
+    const LEGACY_NO_ORIGIN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/ledger/events/legacy-no-origin.enqueue.json"
+    ));
+    const LEGACY_BAD_POOLS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/ledger/events/legacy-bad-pools.enqueue.json"
+    ));
+    const LEGACY_BAD_EVIDENCE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/ledger/events/legacy-bad-evidence.enqueue.json"
+    ));
+    const LEGACY_BAD_ORIGIN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/ledger/events/legacy-bad-origin.enqueue.json"
+    ));
+    const LEGACY_GH_ORIGIN: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/ledger/events/legacy-gh-origin.enqueue.json"
+    ));
+
+    fn install_literal_event(events_dir: &Path, bytes: &[u8]) -> PathBuf {
+        let value: Value = serde_json::from_slice(bytes).unwrap();
+        let event_id = value["eventId"].as_str().unwrap();
+        fs::create_dir_all(events_dir).unwrap();
+        let path = events_dir.join(format!("{event_id}.enqueue.json"));
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    fn enqueue_bytes(events_dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        fs::read_dir(events_dir)
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                let name = path.file_name()?.to_str()?.to_owned();
+                name.ends_with(".enqueue.json")
+                    .then(|| (name, fs::read(path).unwrap()))
+            })
+            .collect()
+    }
+
     fn seed(uuid: Uuid) -> RowSeed {
         RowSeed {
+            row_version: CURRENT_ROW_VERSION,
             uuid,
             description: "durable OCR leaf".to_owned(),
             priority: Priority::High,
@@ -2020,10 +2165,14 @@ mod tests {
     }
 
     #[test]
-    fn durable_pool_compatibility_migrates_legacy_scalars_and_canonicalizes_multi() {
+    fn durable_pool_emission_is_always_array_and_legacy_scalars_still_load() {
         let singleton = seed(Uuid::new_v4());
-        let scalar = serde_json::to_value(&singleton).unwrap();
-        assert_eq!(scalar["pool"], "worker-gpu");
+        let encoded = serde_json::to_value(&singleton).unwrap();
+        assert_eq!(encoded["rowVersion"], CURRENT_ROW_VERSION);
+        assert_eq!(encoded["pool"], serde_json::json!(["worker-gpu"]));
+
+        let mut scalar = encoded;
+        scalar["pool"] = serde_json::json!("worker-gpu");
         let restored: RowSeed = serde_json::from_value(scalar).unwrap();
         assert_eq!(restored.pools, ["worker-gpu"]);
 
@@ -2042,6 +2191,175 @@ mod tests {
                 .pools,
             ["alpha", "zeta"]
         );
+    }
+
+    #[test]
+    fn literal_legacy_origin_migration_rewrites_once_then_is_byte_stable() {
+        assert!(!LEGACY_NO_ORIGIN.contains("\"rowVersion\""));
+        assert!(!LEGACY_NO_ORIGIN.contains("\"origin\""));
+        let temp = tempfile::tempdir().unwrap();
+        let events = temp.path().join("events");
+        let path = install_literal_event(&events, LEGACY_NO_ORIGIN.as_bytes());
+        let legacy_bytes = fs::read(&path).unwrap();
+
+        let error = read_acknowledged_events(&events).unwrap_err();
+        assert!(error.to_string().contains("ordered startup migration"));
+        assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+
+        assert_eq!(migrate_acknowledged_events(&events).unwrap(), 1);
+        let migrated_bytes = fs::read(&path).unwrap();
+        assert_ne!(migrated_bytes, legacy_bytes);
+        let migrated_json: Value = serde_json::from_slice(&migrated_bytes).unwrap();
+        assert_eq!(migrated_json["row"]["rowVersion"], CURRENT_ROW_VERSION);
+        assert_eq!(
+            migrated_json["row"]["pool"],
+            serde_json::json!(["worker-gpu"])
+        );
+        assert_eq!(
+            migrated_json["row"]["origin"],
+            serde_json::json!({
+                "schemaVersion": ADMISSION_ORIGIN_SCHEMA_VERSION,
+                "source": "calendar"
+            })
+        );
+        assert_eq!(read_acknowledged_events(&events).unwrap().len(), 1);
+        assert!(events.read_dir().unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with('.')));
+
+        assert_eq!(migrate_acknowledged_events(&events).unwrap(), 0);
+        assert_eq!(fs::read(path).unwrap(), migrated_bytes);
+    }
+
+    #[test]
+    fn unacknowledged_legacy_event_is_ignored_and_untouched() {
+        let temp = tempfile::tempdir().unwrap();
+        let events = temp.path().join("events");
+        let bytes = LEGACY_NO_ORIGIN
+            .replacen("\"acknowledged\": true", "\"acknowledged\": false", 1)
+            .into_bytes();
+        let path = install_literal_event(&events, &bytes);
+
+        assert_eq!(migrate_acknowledged_events(&events).unwrap(), 0);
+        assert!(read_acknowledged_events(&events).unwrap().is_empty());
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn origin_migration_rejects_every_delta_outside_its_allowlist() {
+        for (fixture, expected) in [
+            (LEGACY_BAD_POOLS, "beyond origin back-fill"),
+            (LEGACY_BAD_EVIDENCE, "beyond origin back-fill"),
+            (LEGACY_BAD_ORIGIN, "origin source does not match"),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let events = temp.path().join("events");
+            let path = install_literal_event(&events, fixture.as_bytes());
+            let before = fs::read(&path).unwrap();
+            let error = migrate_acknowledged_events(&events).unwrap_err();
+            assert!(
+                error.to_string().contains(expected),
+                "expected {expected:?} in {error}"
+            );
+            assert_eq!(fs::read(path).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn row_migration_registry_is_ordered_and_refuses_a_preexisting_origin() {
+        assert_eq!(
+            migrations::ROW_MIGRATIONS
+                .iter()
+                .map(|migration| (migration.from, migration.to))
+                .collect::<Vec<_>>(),
+            [(1, 2)]
+        );
+        let mut legacy = seed(Uuid::new_v4());
+        legacy.row_version = 1;
+        legacy.canonicalize().unwrap();
+        let error = migrations::migrate_to_current(&legacy).unwrap_err();
+        assert!(error.contains("requires the legacy origin field to be absent"));
+    }
+
+    #[test]
+    fn migration_classifies_the_full_directory_before_rewriting() {
+        let temp = tempfile::tempdir().unwrap();
+        let events = temp.path().join("events");
+        let valid = install_literal_event(&events, LEGACY_NO_ORIGIN.as_bytes());
+        install_literal_event(&events, LEGACY_BAD_POOLS.as_bytes());
+        let before = fs::read(&valid).unwrap();
+
+        assert!(migrate_acknowledged_events(&events).is_err());
+        assert_eq!(fs::read(valid).unwrap(), before);
+    }
+
+    #[test]
+    fn legacy_gh_origin_migrates_into_the_nested_generic_origin() {
+        let temp = tempfile::tempdir().unwrap();
+        let events = temp.path().join("events");
+        let path = install_literal_event(&events, LEGACY_GH_ORIGIN.as_bytes());
+
+        assert_eq!(migrate_acknowledged_events(&events).unwrap(), 1);
+        let migrated: DurableEnqueueEvent =
+            serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let github = migrated.row.gh_origin.as_ref().unwrap();
+        let origin = migrated.row.origin.as_ref().unwrap();
+        assert_eq!(origin.source, EnqueueSource::Gh);
+        assert_eq!(origin.producer.as_ref().unwrap().name, "github");
+        assert_eq!(origin.github.as_ref(), Some(github));
+    }
+
+    #[test]
+    fn synthesized_coordinator_corpus_migrates_reloads_and_stabilizes() {
+        let temp = tempfile::tempdir().unwrap();
+        let events = temp.path().join("events");
+        let template: Value = serde_json::from_str(LEGACY_NO_ORIGIN).unwrap();
+        let mut expected_sources = BTreeMap::<&str, usize>::new();
+
+        for index in 0..45_u128 {
+            let source = match index {
+                0..=20 => "calendar",
+                21..=43 => "orchestrator",
+                44 => "manual",
+                _ => unreachable!(),
+            };
+            *expected_sources.entry(source).or_default() += 1;
+            let event_id = Uuid::from_u128(0x4000_8000_0000_0000_0000 + index);
+            let row_id = Uuid::from_u128(0x4000_8000_0000_0001_0000 + index);
+            let mut value = template.clone();
+            value["eventId"] = Value::String(event_id.to_string());
+            value["row"]["uuid"] = Value::String(row_id.to_string());
+            value["row"]["source"] = Value::String(source.to_owned());
+            value["row"]["description"] =
+                Value::String(format!("coordinator legacy fixture {index}"));
+            let object = value["row"].as_object_mut().unwrap();
+            object.remove("rowVersion");
+            object.remove("origin");
+            let bytes = serde_json::to_vec(&value).unwrap();
+            install_literal_event(&events, &bytes);
+        }
+
+        assert_eq!(
+            expected_sources,
+            BTreeMap::from([("calendar", 21), ("manual", 1), ("orchestrator", 23)])
+        );
+        assert_eq!(migrate_acknowledged_events(&events).unwrap(), 45);
+        let first_boot_bytes = enqueue_bytes(&events);
+        let loaded = read_acknowledged_events(&events).unwrap();
+        assert_eq!(loaded.len(), 45);
+        let mut actual_sources = BTreeMap::<&str, usize>::new();
+        for event in &loaded {
+            assert_eq!(event.row.row_version, CURRENT_ROW_VERSION);
+            assert_eq!(event.row.origin.as_ref().unwrap().source, event.row.source);
+            *actual_sources.entry(event.row.source.as_str()).or_default() += 1;
+        }
+        assert_eq!(actual_sources, expected_sources);
+
+        assert_eq!(migrate_acknowledged_events(&events).unwrap(), 0);
+        assert_eq!(read_acknowledged_events(&events).unwrap(), loaded);
+        assert_eq!(enqueue_bytes(&events), first_boot_bytes);
     }
 
     #[test]

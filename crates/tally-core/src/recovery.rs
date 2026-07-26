@@ -994,6 +994,7 @@ mod tests {
 
     fn row(uuid: Uuid, pool: &str, lease_epoch: u64) -> RowSeed {
         RowSeed {
+            row_version: crate::taskdb::CURRENT_ROW_VERSION,
             uuid,
             description: "recover this durable leaf".to_owned(),
             priority: Priority::High,
