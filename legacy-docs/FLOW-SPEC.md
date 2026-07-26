@@ -756,9 +756,19 @@ encoding cleanup is a reserved Tom-led session (Trustix brief is its input). The
 frame cap and concurrent serving are behavior changes, not encoding changes; both get
 ORACLE-DELTAS entries when the BS-13 harness runs.
 
+> **Superseded 2026-07-26:** The no-break reservation above was discharged by
+> [issue #84](https://github.com/mecattaf/tally.nix/issues/84), Amendments 1–2. The final witness
+> schema replaced the predecessor encoding in place; it introduced no epoch model. See
+> [`doc/witness.md`](../doc/witness.md).
+
 ## 20. Explicitly out of scope (design chapters reserved, not corners cut)
 
 Witness v2 epoch break; script patching/versioning for in-flight runs; `drv()` derivation
 nodes and store-native memoization; attic-backed evidence retention via GC roots;
 query.watch-driven web/TUI; cross-machine witness comparison; microvm executor tier;
 multi-tenant anything.
+
+> **Superseded entries 2026-07-26:** [Issue #84](https://github.com/mecattaf/tally.nix/issues/84)
+> discharged the witness-schema, store-evidence/GC-root retention, and cross-machine comparison
+> reservations. Its amendments make the schema plain rather than epoch-named. The `drv()` dialect
+> surface remains separately tracked by issue #71; this note does not claim that later unit.
