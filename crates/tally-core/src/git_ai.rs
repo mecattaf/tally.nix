@@ -1430,7 +1430,7 @@ fn command_detail(output: &std::process::Output) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::symlink;
     use std::path::Path;
 
     use serde_json::json;
@@ -1489,23 +1489,16 @@ mod tests {
         let bin = root.join("bin");
         fs::create_dir(&bin).unwrap();
         let program = bin.join("git-ai");
-        let shell = resolve_program("sh", &CommandContext::default())
-            .expect("the test environment must provide sh on PATH");
-        let shell = shell
-            .to_str()
-            .expect("the test shell path must be valid UTF-8");
-        assert!(
-            !shell.contains(['\n', '\r', ' ']),
-            "the test shell path must be valid in a shebang"
-        );
-        fs::write(
-            &program,
-            format!(
-                "#!{shell}\ncase \"$1\" in\n  --version) printf '1.6.17\\n' ;;\n  await) {await_command} ;;\n  *) exit 64 ;;\nesac\n"
-            ),
-        )
-        .unwrap();
-        fs::set_permissions(&program, fs::Permissions::from_mode(0o755)).unwrap();
+        let fixture = match await_command {
+            "exit 0" => "success",
+            "exit 86" => "failure",
+            "exec sleep 30" => "stall",
+            other => panic!("unsupported Git AI await fixture command {other:?}"),
+        };
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/git-ai")
+            .join(format!("unit-provider-{fixture}"));
+        symlink(fixture, &program).unwrap();
         let mut paths = vec![bin];
         paths.extend(std::env::split_paths(
             &std::env::var_os("PATH").unwrap_or_default(),
