@@ -2464,8 +2464,8 @@ mod tests {
                     lease_epoch: Some(7),
                     format: WitnessVerifyFormat::Json,
                 }
-            }) if ledger == PathBuf::from("/tmp/witness.jsonl")
-                && repository == PathBuf::from("/tmp/repository")
+            }) if ledger == Path::new("/tmp/witness.jsonl")
+                && repository == Path::new("/tmp/repository")
                 && task == "00000000-0000-4000-8000-000000000053"
         ));
     }
