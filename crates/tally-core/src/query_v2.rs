@@ -11,7 +11,9 @@ use crate::provenance::Orchestration;
 use crate::query::{
     GhOriginProjection, HeadroomSignal, RowStatus, QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
 };
-use crate::taskdb::{AdmissionOrigin, ProducerOrigin, RowSeed};
+use crate::taskdb::{
+    related_trigger_from_gh_origin, AdmissionOrigin, ProducerOrigin, RelatedTrigger, RowSeed,
+};
 use crate::witness::{
     counts_toward_canonical_gpu_seconds, AttestationRecord, Charge, LaborClass, Verdict,
     VerifyReport, WitnessRecord,
@@ -74,6 +76,7 @@ pub struct RowDetailFact {
     pub evidence_class: Option<Value>,
     pub manifest_hash: Option<Value>,
     pub origin: OriginProjection,
+    pub related_trigger: Option<RelatedTrigger>,
 }
 
 impl RowDetailFact {
@@ -116,6 +119,11 @@ impl RowDetailFact {
             evidence_class: row.evidence_class.clone(),
             manifest_hash: row.manifest_hash.clone(),
             origin: OriginProjection::from_admission(origin),
+            related_trigger: row.related_trigger.clone().or_else(|| {
+                row.gh_origin
+                    .as_ref()
+                    .and_then(|origin| related_trigger_from_gh_origin(origin).ok())
+            }),
         }
     }
 }
@@ -237,6 +245,8 @@ pub struct JobSummary {
     pub adapter: Option<String>,
     pub source: Option<String>,
     pub origin: Option<SourcedValue<OriginProjection>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub related_trigger: Option<RelatedTrigger>,
     pub model: Vec<SourcedValue<String>>,
     pub session_ref: Option<SourcedValue<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -924,6 +934,7 @@ fn build_summary(
                 "durable-task-admission",
             )
         }),
+        related_trigger: detail.and_then(|detail| detail.related_trigger.clone()),
         model,
         session_ref: detail.and_then(|detail| {
             detail.session_ref.clone().map(|value| {
@@ -1514,6 +1525,7 @@ mod tests {
                 producer: None,
                 github: None,
             },
+            related_trigger: None,
         }
     }
 

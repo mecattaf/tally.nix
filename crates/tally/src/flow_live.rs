@@ -5,6 +5,7 @@ use std::time::Duration;
 use serde_json::{json, Map, Value};
 use tally_client::{RpcClient, WireErrorCode, WireIoError};
 use tally_core::query::QUERY_PROTOCOL_VERSION;
+use tally_core::taskdb::RelatedTrigger;
 use tally_flow::{
     Admission, ClientError, Disposition, FlowClient, FlowFuture, FlowSubmission, NodeFailure,
     NodeResult, RunInspection, Verdict,
@@ -17,6 +18,7 @@ const RECONNECT_DELAY: Duration = Duration::from_millis(50);
 pub(crate) struct RunnerIdentity {
     pub(crate) task_uuid: Option<String>,
     pub(crate) job_id: Option<String>,
+    pub(crate) related_trigger: Option<RelatedTrigger>,
 }
 
 #[derive(Default)]
@@ -34,7 +36,7 @@ struct ConnectionState {
 pub(crate) struct LiveFlowClient {
     socket: PathBuf,
     max_frame_bytes: u64,
-    runner: RunnerIdentity,
+    runner: Mutex<RunnerIdentity>,
     connection: Mutex<ConnectionState>,
 }
 
@@ -47,9 +49,23 @@ impl LiveFlowClient {
         Self {
             socket: socket.into(),
             max_frame_bytes,
-            runner,
+            runner: Mutex::new(runner),
             connection: Mutex::new(ConnectionState::default()),
         }
+    }
+
+    async fn resolve_runner_related_trigger(&self) -> Result<(), ClientError> {
+        let task_uuid = self.runner.lock().await.task_uuid.clone();
+        let Some(task_uuid) = task_uuid else {
+            return Ok(());
+        };
+        let response = self
+            .call("query.job", json!({"id": task_uuid}))
+            .await
+            .map_err(client_error)?;
+        let related_trigger = parse_runner_related_trigger(&response, &task_uuid)?;
+        self.runner.lock().await.related_trigger = related_trigger;
+        Ok(())
     }
 
     async fn connection(&self) -> Result<(u64, RpcClient), WireIoError> {
@@ -105,6 +121,7 @@ impl FlowClient for LiveFlowClient {
         flow_run_id: &'a str,
     ) -> FlowFuture<'a, Result<RunInspection, ClientError>> {
         Box::pin(async move {
+            self.resolve_runner_related_trigger().await?;
             'snapshot: loop {
                 let mut cursor: Option<String> = None;
                 let mut hashes = BTreeSet::new();
@@ -180,7 +197,8 @@ impl FlowClient for LiveFlowClient {
         submission: FlowSubmission,
     ) -> FlowFuture<'a, Result<Admission, ClientError>> {
         Box::pin(async move {
-            let payload = enqueue_payload(&submission, &self.runner)?;
+            let runner = self.runner.lock().await.clone();
+            let payload = enqueue_payload(&submission, &runner)?;
             match self.call("queue.enqueue", payload).await {
                 Ok(response) => {
                     validate_recorded_script_identity(&response, &submission)?;
@@ -292,6 +310,12 @@ fn enqueue_payload(
         if let Some(job_id) = runner.job_id.as_deref() {
             payload.insert("callerJobId".to_owned(), Value::String(job_id.to_owned()));
         }
+    }
+    if let Some(related_trigger) = &runner.related_trigger {
+        payload.insert(
+            "relatedTrigger".to_owned(),
+            serde_json::to_value(related_trigger).map_err(json_client_error)?,
+        );
     }
     Ok(Value::Object(payload))
 }
@@ -551,15 +575,59 @@ fn client_error(error: WireIoError) -> ClientError {
     }
 }
 
+fn parse_runner_related_trigger(
+    value: &Value,
+    task_uuid: &str,
+) -> Result<Option<RelatedTrigger>, ClientError> {
+    require_query_envelope(value)?;
+    let job = value
+        .get("job")
+        .and_then(Value::as_object)
+        .ok_or_else(|| protocol_error("query.job response omitted its job object"))?;
+    if job.get("taskUuid").and_then(Value::as_str) != Some(task_uuid) {
+        return Err(protocol_error(
+            "query.job response did not identify the running flow parent",
+        ));
+    }
+    let source = job
+        .get("source")
+        .and_then(Value::as_str)
+        .ok_or_else(|| protocol_error("query.job response omitted the parent source"))?;
+    // A fallback reference on another non-GitHub row is not authority to relay
+    // that reference again. Only the directly triggered GitHub parent threads it.
+    if source != "gh" {
+        return Ok(None);
+    }
+    let related_trigger = job
+        .get("relatedTrigger")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .ok_or_else(|| {
+            protocol_error("GitHub flow parent query omitted its trigger receipt reference")
+        })?;
+    let related_trigger =
+        serde_json::from_value::<RelatedTrigger>(related_trigger).map_err(|error| {
+            protocol_error(format!(
+                "query.job returned an invalid relatedTrigger: {error}"
+            ))
+        })?;
+    related_trigger.validate().map_err(|error| {
+        protocol_error(format!(
+            "query.job returned an invalid relatedTrigger: {error}"
+        ))
+    })?;
+    Ok(Some(related_trigger))
+}
+
 fn require_query_envelope(value: &Value) -> Result<(), ClientError> {
     if required_u32(value, &["schemaVersion"])? != 1 {
         return Err(protocol_error(
-            "query.jobs returned an unsupported schemaVersion",
+            "flow query returned an unsupported schemaVersion",
         ));
     }
     if required_u32(value, &["protocolVersion"])? != QUERY_PROTOCOL_VERSION {
         return Err(protocol_error(format!(
-            "query.jobs requires protocolVersion {QUERY_PROTOCOL_VERSION}"
+            "flow queries require protocolVersion {QUERY_PROTOCOL_VERSION}"
         )));
     }
     Ok(())
@@ -618,7 +686,7 @@ mod tests {
     use std::path::Path;
     use tally_core::adapters::AdapterJobOptions;
     use tally_core::config::Priority;
-    use tally_core::taskdb::EnqueueSource;
+    use tally_core::taskdb::{EnqueueSource, RelatedTriggerOutcome};
     use tally_core::wire::{
         canonical_payload, canonical_payload_hash, EnqueuePayload, GuardrailConfig, GuardrailState,
         ProducerDefaults,
@@ -671,6 +739,15 @@ mod tests {
         }
     }
 
+    fn related_trigger() -> RelatedTrigger {
+        RelatedTrigger {
+            producer: "github-flow".to_owned(),
+            event_id: "comment-61".to_owned(),
+            outcome: RelatedTriggerOutcome::NotObserved,
+            receipt_id: Some("receipt-61".to_owned()),
+        }
+    }
+
     #[test]
     fn live_payload_is_full_mode_orchestrator_work_with_captured_ancestry() {
         let mut submission = submission();
@@ -683,6 +760,7 @@ mod tests {
             &RunnerIdentity {
                 task_uuid: Some("00000000-0000-4000-8000-000000000048".to_owned()),
                 job_id: Some("00000000-0000-4000-8000-000000000048".to_owned()),
+                related_trigger: Some(related_trigger()),
             },
         )
         .unwrap();
@@ -700,9 +778,62 @@ mod tests {
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         );
         assert_eq!(payload["orchestration"]["skillRevision"], "review-agent-v3");
+        assert_eq!(payload["relatedTrigger"]["eventId"], "comment-61");
+        assert_eq!(payload["relatedTrigger"]["outcome"], "not-observed");
         assert_eq!(payload["adapterOptions"]["environment"]["SAFE"], "yes");
         assert!(payload.get("payloadHash").is_none());
         assert!(payload.get("label").is_none());
+    }
+
+    #[test]
+    fn runner_resolves_query_projected_receipt_and_fails_closed_for_github_without_one() {
+        let task_uuid = "00000000-0000-4000-8000-000000000048";
+        let projected = json!({
+            "schemaVersion": 1,
+            "protocolVersion": QUERY_PROTOCOL_VERSION,
+            "job": {
+                "taskUuid": task_uuid,
+                "source": "gh",
+                "relatedTrigger": related_trigger()
+            }
+        });
+        assert_eq!(
+            parse_runner_related_trigger(&projected, task_uuid).unwrap(),
+            Some(related_trigger())
+        );
+
+        let manual = json!({
+            "schemaVersion": 1,
+            "protocolVersion": QUERY_PROTOCOL_VERSION,
+            "job": {"taskUuid": task_uuid, "source": "manual"}
+        });
+        assert_eq!(
+            parse_runner_related_trigger(&manual, task_uuid).unwrap(),
+            None
+        );
+        let fallback_only = json!({
+            "schemaVersion": 1,
+            "protocolVersion": QUERY_PROTOCOL_VERSION,
+            "job": {
+                "taskUuid": task_uuid,
+                "source": "orchestrator",
+                "relatedTrigger": related_trigger()
+            }
+        });
+        assert_eq!(
+            parse_runner_related_trigger(&fallback_only, task_uuid).unwrap(),
+            None
+        );
+
+        let missing = json!({
+            "schemaVersion": 1,
+            "protocolVersion": QUERY_PROTOCOL_VERSION,
+            "job": {"taskUuid": task_uuid, "source": "gh"}
+        });
+        assert!(parse_runner_related_trigger(&missing, task_uuid)
+            .unwrap_err()
+            .message
+            .contains("omitted its trigger receipt"));
     }
 
     #[test]

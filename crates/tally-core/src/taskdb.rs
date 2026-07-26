@@ -707,6 +707,34 @@ pub fn gh_trigger_receipt_id(origin: &GhOrigin) -> Result<String, TaskDbError> {
     Ok(format!("{:x}", hash.finalize()))
 }
 
+/// Project a GitHub-triggered parent into the fallback provenance carried by
+/// work that it orchestrates. The child did not observe the GitHub event
+/// directly, so it retains its honest source and links back to the accepted
+/// receipt as `not-observed` provenance.
+pub fn related_trigger_from_gh_origin(origin: &GhOrigin) -> Result<RelatedTrigger, TaskDbError> {
+    let event_id = match origin.trigger_kind.as_str() {
+        "command-comment" | "mention" => origin.comment_id.clone().ok_or_else(|| {
+            TaskDbError::InvalidSeed("GitHub comment trigger omitted commentId".to_owned())
+        })?,
+        "assignment" | "label" => origin.event_id.clone().ok_or_else(|| {
+            TaskDbError::InvalidSeed("GitHub event trigger omitted eventId".to_owned())
+        })?,
+        _ => {
+            return Err(TaskDbError::InvalidSeed(
+                "GitHub trigger kind cannot form related provenance".to_owned(),
+            ));
+        }
+    };
+    let related = RelatedTrigger {
+        producer: origin.producer.clone(),
+        event_id,
+        outcome: RelatedTriggerOutcome::NotObserved,
+        receipt_id: Some(gh_trigger_receipt_id(origin)?),
+    };
+    related.validate()?;
+    Ok(related)
+}
+
 pub fn gh_trigger_dedup_key(origin: &GhOrigin) -> Result<String, TaskDbError> {
     Ok(format!(
         "gh:{}:{}",

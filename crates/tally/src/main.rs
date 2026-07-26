@@ -833,6 +833,7 @@ fn captured_runner_identity(
             Ok(RunnerIdentity {
                 task_uuid: Some(task_uuid),
                 job_id: Some(job_id),
+                related_trigger: None,
             })
         }
         _ => Err(Box::new(FlowError::new(
