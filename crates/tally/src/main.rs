@@ -78,6 +78,7 @@ enum Command {
     #[command(name = "__producer-dispatch", hide = true)]
     ProducerDispatch(ProducerDispatchArgs),
     Enqueue(Box<EnqueueArgs>),
+    Gc(GcArgs),
     Queue {
         #[command(subcommand)]
         command: QueueCommand,
@@ -301,6 +302,18 @@ struct EnqueueArgs {
     wait: bool,
     #[arg(last = true)]
     argv: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct GcArgs {
+    #[arg(long, value_name = "DURATION")]
+    horizon: String,
+    #[arg(long)]
+    dry_run: bool,
+    #[arg(long)]
+    collect: bool,
+    #[arg(long, value_name = "PATH")]
+    data_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1008,6 +1021,7 @@ async fn execute(opts: Opts) -> Result<()> {
             .await
         }
         Some(Command::Enqueue(args)) => run_enqueue(&socket, opts.config.as_deref(), *args).await,
+        Some(Command::Gc(args)) => run_gc(args),
         Some(Command::Queue {
             command: QueueCommand::Enqueue(args),
         }) => run_enqueue(&socket, opts.config.as_deref(), *args).await,
@@ -1521,6 +1535,7 @@ async fn run_enqueue(
         orchestration: args.orchestration,
         parent: args.parent,
         evidence: args.evidence,
+        drv: None,
         evidence_class: args.evidence_class,
         manifest_hash: args.manifest_hash,
         consumption_estimate: args.consumption_estimate,
@@ -1648,6 +1663,7 @@ async fn run_queue(socket: &Path, config_path: Option<&Path>, command: QueueComm
                 orchestration: None,
                 parent: None,
                 evidence: Vec::new(),
+                drv: None,
                 evidence_class: None,
                 manifest_hash: None,
                 consumption_estimate: None,
@@ -2055,6 +2071,23 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+fn run_gc(args: GcArgs) -> Result<()> {
+    let data_dir = args.data_dir.map_or_else(default_data_dir, Ok)?;
+    if !data_dir.is_absolute() {
+        return Err(invalid("--data-dir must be absolute"));
+    }
+    let report = tally_core::retention::run_gc(
+        &data_dir,
+        &args.horizon,
+        Utc::now(),
+        args.dry_run,
+        args.collect,
+        &tally_core::nix_store::NixStore::default(),
+    )?;
+    println!("{}", serde_json::to_string(&report)?);
+    Ok(())
 }
 
 fn error_exit_code(error: &anyhow::Error) -> i32 {

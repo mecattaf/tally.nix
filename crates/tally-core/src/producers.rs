@@ -263,6 +263,7 @@ impl ProducerEnqueue {
             orchestration: None,
             parent: None,
             evidence: self.evidence.clone(),
+            drv: None,
             evidence_class: self.evidence_class.clone(),
             manifest_hash: self.manifest_hash.clone(),
             consumption_estimate: self.consumption_estimate,

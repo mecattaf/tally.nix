@@ -71,6 +71,49 @@ pub struct Derivation {
     pub outputs: Vec<DerivationOutput>,
 }
 
+impl Derivation {
+    pub fn canonicalize(&mut self) -> Result<(), String> {
+        self.outputs
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        self.validate()
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if !is_nix_store_path(&self.drv_path) || !self.drv_path.ends_with(".drv") {
+            return Err("drvPath must be a Nix store path ending in .drv".to_owned());
+        }
+        if self.outputs.is_empty() {
+            return Err("drv outputs must be non-empty".to_owned());
+        }
+        if self
+            .outputs
+            .iter()
+            .any(|output| !is_nix_store_path(&output.path))
+        {
+            return Err("drv output path is not a Nix store path".to_owned());
+        }
+        if self
+            .outputs
+            .windows(2)
+            .any(|pair| pair[0].name >= pair[1].name)
+        {
+            return Err("drv outputs must be sorted by name and unique".to_owned());
+        }
+        Ok(())
+    }
+
+    pub fn output_paths(&self) -> Vec<String> {
+        let mut paths = self
+            .outputs
+            .iter()
+            .map(|output| output.path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AuthorshipStatus {
@@ -298,17 +341,7 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
     }
     let mut drv = body.drv;
     if let Some(drv) = &mut drv {
-        drv.outputs
-            .sort_by(|left, right| left.name.cmp(&right.name));
-        if drv
-            .outputs
-            .windows(2)
-            .any(|pair| pair[0].name == pair[1].name)
-        {
-            return Err(WitnessError::Corrupt(
-                "drv outputs contains a duplicate name".to_owned(),
-            ));
-        }
+        drv.canonicalize().map_err(WitnessError::Corrupt)?;
     }
     let mut record = WitnessRecord {
         schema_version: WITNESS_SCHEMA_VERSION,
@@ -367,7 +400,7 @@ fn git_oid_shape(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-fn store_path_shape(value: &str) -> bool {
+pub fn is_nix_store_path(value: &str) -> bool {
     let Some(rest) = value.strip_prefix("/nix/store/") else {
         return false;
     };
@@ -608,7 +641,7 @@ fn validate_record(raw: &Value) -> Result<WitnessRecord, ValidationFailure> {
                 "storePaths must be non-empty when present",
             ));
         }
-        if store_paths.iter().any(|path| !store_path_shape(path)) {
+        if store_paths.iter().any(|path| !is_nix_store_path(path)) {
             return Err(ValidationFailure::invalid(
                 "storePaths contains an invalid Nix store path",
             ));
@@ -620,32 +653,7 @@ fn validate_record(raw: &Value) -> Result<WitnessRecord, ValidationFailure> {
         }
     }
     if let Some(drv) = &record.drv {
-        if !store_path_shape(&drv.drv_path) || !drv.drv_path.ends_with(".drv") {
-            return Err(ValidationFailure::invalid(
-                "drvPath must be a Nix store path ending in .drv",
-            ));
-        }
-        if drv.outputs.is_empty() {
-            return Err(ValidationFailure::invalid("drv outputs must be non-empty"));
-        }
-        if drv
-            .outputs
-            .iter()
-            .any(|output| !store_path_shape(&output.path))
-        {
-            return Err(ValidationFailure::invalid(
-                "drv output path is not a Nix store path",
-            ));
-        }
-        if drv
-            .outputs
-            .windows(2)
-            .any(|pair| pair[0].name >= pair[1].name)
-        {
-            return Err(ValidationFailure::invalid(
-                "drv outputs must be sorted by name and unique",
-            ));
-        }
+        drv.validate().map_err(ValidationFailure::invalid)?;
     }
     if record
         .executor

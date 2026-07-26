@@ -41,6 +41,7 @@ async fn stock_taskwarrior_reads_the_in_process_replica() {
             attempt: 1,
             argv: vec!["true".to_owned()],
             evidence: Vec::new(),
+            drv: None,
             parent_uuid: None,
             consumption_estimate: None,
             runtime_max_sec: None,

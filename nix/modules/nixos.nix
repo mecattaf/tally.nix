@@ -64,7 +64,11 @@ in
           WatchdogSec = "30s";
           Restart = "always";
           RestartSec = "2s";
-          Environment = [ "TALLY_CONFIG_GENERATION=${checkedConfig}" ];
+          Environment = [
+            "TALLY_CONFIG_GENERATION=${checkedConfig}"
+            "TALLY_NIX_PROGRAM=${pkgs.nix}/bin/nix"
+            "TALLY_NIX_STORE_PROGRAM=${pkgs.nix}/bin/nix-store"
+          ];
           RuntimeDirectory = "tally";
           RuntimeDirectoryMode = "0700";
           StateDirectory = "tally";

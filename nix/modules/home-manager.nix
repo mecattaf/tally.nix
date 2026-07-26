@@ -387,7 +387,11 @@ in
             WatchdogSec = "30s";
             Restart = "always";
             RestartSec = "2s";
-            Environment = [ "TALLY_CONFIG_GENERATION=${checkedConfig}" ];
+            Environment = [
+              "TALLY_CONFIG_GENERATION=${checkedConfig}"
+              "TALLY_NIX_PROGRAM=${pkgs.nix}/bin/nix"
+              "TALLY_NIX_STORE_PROGRAM=${pkgs.nix}/bin/nix-store"
+            ];
             RuntimeDirectory = "tally";
             RuntimeDirectoryMode = "0700";
             ExecStartPre = lib.escapeShellArgs [
@@ -461,6 +465,33 @@ in
           };
           Install.WantedBy = [ "default.target" ];
         };
+
+        tally-retention = lib.mkIf cfg.retention.enable {
+          Unit = {
+            Description = "prune expired tally Nix GC roots and collect the store";
+            After = [ "tally-daemon.service" ];
+            Requires = [ "tally-daemon.service" ];
+          };
+          Service = {
+            Type = "oneshot";
+            TimeoutStartSec = "infinity";
+            ExecStart = lib.escapeShellArgs [
+              "${cfg.package}/bin/tally"
+              "gc"
+              "--horizon"
+              cfg.retention.horizon
+              "--collect"
+              "--data-dir"
+              (toString cfg.dataDir)
+            ];
+            Environment = [ "PATH=${lib.makeBinPath [ pkgs.nix ]}" ];
+            UMask = "0077";
+            NoNewPrivileges = true;
+            PrivateTmp = true;
+            ProtectSystem = "strict";
+            ReadWritePaths = [ (toString cfg.dataDir) ];
+          };
+        };
       }
       // producerUnits.services
       // meterUnits.services;
@@ -472,6 +503,15 @@ in
             OnActiveSec = "1s";
             OnUnitActiveSec = "5s";
             Unit = "tally-drain.service";
+          };
+          Install.WantedBy = [ "timers.target" ];
+        };
+        tally-retention = lib.mkIf cfg.retention.enable {
+          Unit.Description = "schedule tally store-evidence retention";
+          Timer = {
+            OnCalendar = cfg.retention.onCalendar;
+            Persistent = true;
+            Unit = "tally-retention.service";
           };
           Install.WantedBy = [ "timers.target" ];
         };

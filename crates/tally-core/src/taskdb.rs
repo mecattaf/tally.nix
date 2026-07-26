@@ -18,7 +18,9 @@ use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::provenance::Orchestration;
 use crate::recovery::{RecoveryPlan, RecoveryRowState};
-use crate::witness::{read_verified_records, LaborClass, Verdict, WitnessError, WitnessRecord};
+use crate::witness::{
+    read_verified_records, Derivation, LaborClass, Verdict, WitnessError, WitnessRecord,
+};
 
 pub mod migrations;
 
@@ -29,7 +31,7 @@ pub const MAX_GH_CONTEXT_BYTES: usize = 256 * 1024;
 pub const GH_ORIGIN_SCHEMA_VERSION: u32 = 2;
 pub const GH_CONTEXT_SCHEMA_VERSION: u32 = 2;
 pub const ADMISSION_ORIGIN_SCHEMA_VERSION: u32 = 1;
-pub const CURRENT_ROW_VERSION: u32 = 2;
+pub const CURRENT_ROW_VERSION: u32 = 3;
 const MAX_GH_PRODUCER_BYTES: usize = 96;
 const MAX_GH_TITLE_BYTES: usize = 16 * 1024;
 const MAX_GH_BODY_BYTES: usize = 128 * 1024;
@@ -920,6 +922,8 @@ pub struct RowSeed {
     pub argv: Vec<String>,
     #[serde(default)]
     pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drv: Option<Derivation>,
     #[serde(default)]
     pub parent_uuid: Option<Uuid>,
     #[serde(default)]
@@ -1114,8 +1118,21 @@ impl RowSeed {
             }
             related.validate()?;
         }
-        parse_evidence_specs(&self.evidence)
+        let evidence = parse_evidence_specs(&self.evidence)
             .map_err(|error| TaskDbError::InvalidSeed(format!("invalid evidence: {error}")))?;
+        if let Some(drv) = &self.drv {
+            drv.validate().map_err(TaskDbError::InvalidSeed)?;
+            let expected_key = format!("drv:{}", drv.drv_path);
+            if self.pools != ["build"]
+                || self.dedup_key.as_deref() != Some(expected_key.as_str())
+                || evidence.declared_store_paths() != drv.output_paths()
+            {
+                return Err(TaskDbError::InvalidSeed(
+                    "drv rows require pool [\"build\"], dedupKey drv:<drvPath>, and store evidence exactly matching all outputs"
+                        .to_owned(),
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -1138,6 +1155,9 @@ impl RowSeed {
         self.evidence = parse_evidence_specs(&self.evidence)
             .map_err(|error| TaskDbError::InvalidSeed(format!("invalid evidence: {error}")))?
             .render();
+        if let Some(drv) = &mut self.drv {
+            drv.canonicalize().map_err(TaskDbError::InvalidSeed)?;
+        }
         Ok(())
     }
 
@@ -1157,7 +1177,10 @@ impl RowSeed {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DurableReuse {
     pub matched_witness_seq: u64,
-    pub artifact_content_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_content_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store_paths: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1207,17 +1230,19 @@ impl DurableEnqueueEvent {
         mut row: RowSeed,
         guardrail_depth: u32,
         matched_witness_seq: u64,
-        artifact_content_hash: String,
+        artifact_content_hash: Option<String>,
+        store_paths: Option<Vec<String>>,
     ) -> Result<Self, TaskDbError> {
         row.canonicalize_for_current_write()?;
         let event = Self {
-            schema_version: 2,
+            schema_version: 3,
             event_id: Uuid::new_v4(),
             acknowledged: true,
             guardrail_depth,
             reuse: Some(DurableReuse {
                 matched_witness_seq,
                 artifact_content_hash,
+                store_paths,
             }),
             ingress_id: None,
             retries: Vec::new(),
@@ -1238,28 +1263,64 @@ impl DurableEnqueueEvent {
         }
         match (self.schema_version, &self.reuse) {
             (1, None) => {}
-            (2, Some(reuse)) => {
+            (2 | 3, Some(reuse)) => {
                 if reuse.matched_witness_seq == 0 {
                     return Err(TaskDbError::InvalidEvent {
                         path: PathBuf::from(format!("event: {}", self.event_id)),
                         reason: "reuse matchedWitnessSeq must be positive".to_owned(),
                     });
                 }
-                let Some(hash) = reuse.artifact_content_hash.strip_prefix("sha256:") else {
-                    return Err(TaskDbError::InvalidEvent {
-                        path: PathBuf::from(format!("event: {}", self.event_id)),
-                        reason: "reuse artifactContentHash must be sha256:<hex>".to_owned(),
-                    });
-                };
-                if hash.len() != 64
-                    || !hash
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                if self.schema_version == 2
+                    && (reuse.artifact_content_hash.is_none() || reuse.store_paths.is_some())
                 {
                     return Err(TaskDbError::InvalidEvent {
                         path: PathBuf::from(format!("event: {}", self.event_id)),
-                        reason: "reuse artifactContentHash must be lowercase sha256 hex".to_owned(),
+                        reason: "schemaVersion 2 reuse requires only artifactContentHash"
+                            .to_owned(),
                     });
+                }
+                if self.schema_version == 3
+                    && reuse.artifact_content_hash.is_none()
+                    && reuse.store_paths.is_none()
+                {
+                    return Err(TaskDbError::InvalidEvent {
+                        path: PathBuf::from(format!("event: {}", self.event_id)),
+                        reason: "schemaVersion 3 reuse requires artifactContentHash or storePaths"
+                            .to_owned(),
+                    });
+                }
+                if let Some(artifact_content_hash) = &reuse.artifact_content_hash {
+                    let Some(hash) = artifact_content_hash.strip_prefix("sha256:") else {
+                        return Err(TaskDbError::InvalidEvent {
+                            path: PathBuf::from(format!("event: {}", self.event_id)),
+                            reason: "reuse artifactContentHash must be sha256:<hex>".to_owned(),
+                        });
+                    };
+                    if hash.len() != 64
+                        || !hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                    {
+                        return Err(TaskDbError::InvalidEvent {
+                            path: PathBuf::from(format!("event: {}", self.event_id)),
+                            reason: "reuse artifactContentHash must be lowercase sha256 hex"
+                                .to_owned(),
+                        });
+                    }
+                }
+                if let Some(store_paths) = &reuse.store_paths {
+                    if store_paths.is_empty()
+                        || store_paths
+                            .iter()
+                            .any(|path| !crate::witness::is_nix_store_path(path))
+                        || store_paths.windows(2).any(|pair| pair[0] >= pair[1])
+                    {
+                        return Err(TaskDbError::InvalidEvent {
+                            path: PathBuf::from(format!("event: {}", self.event_id)),
+                            reason: "reuse storePaths must be non-empty, valid, sorted, and unique"
+                                .to_owned(),
+                        });
+                    }
                 }
                 if self.row.dedup_key.as_deref().is_none_or(str::is_empty) {
                     return Err(TaskDbError::InvalidEvent {
@@ -2086,6 +2147,10 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../test/fixtures/ledger/events/legacy-bad-origin.enqueue.json"
     ));
+    const LEGACY_NO_DRV: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/ledger/events/legacy-no-drv.enqueue.json"
+    ));
     const LEGACY_GH_ORIGIN: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../test/fixtures/ledger/events/legacy-gh-origin.enqueue.json"
@@ -2138,6 +2203,7 @@ mod tests {
             attempt: 1,
             argv: vec!["ocr".to_owned(), "paper.pdf".to_owned()],
             evidence: vec!["artifact:/work/paper.txt".to_owned()],
+            drv: None,
             parent_uuid: Some(Uuid::new_v4()),
             consumption_estimate: Some(60),
             runtime_max_sec: Some(300),
@@ -2234,6 +2300,26 @@ mod tests {
     }
 
     #[test]
+    fn literal_row_version_two_migrates_only_drv_absence_then_stabilizes() {
+        assert!(LEGACY_NO_DRV.contains("\"rowVersion\": 2"));
+        assert!(!LEGACY_NO_DRV.contains("\"drv\""));
+        let temp = tempfile::tempdir().unwrap();
+        let events = temp.path().join("events");
+        let path = install_literal_event(&events, LEGACY_NO_DRV.as_bytes());
+        let legacy_bytes = fs::read(&path).unwrap();
+
+        assert!(read_acknowledged_events(&events).is_err());
+        assert_eq!(fs::read(&path).unwrap(), legacy_bytes);
+        assert_eq!(migrate_acknowledged_events(&events).unwrap(), 1);
+        let migrated_bytes = fs::read(&path).unwrap();
+        let migrated: Value = serde_json::from_slice(&migrated_bytes).unwrap();
+        assert_eq!(migrated["row"]["rowVersion"], CURRENT_ROW_VERSION);
+        assert!(migrated["row"].get("drv").is_none());
+        assert_eq!(migrate_acknowledged_events(&events).unwrap(), 0);
+        assert_eq!(fs::read(path).unwrap(), migrated_bytes);
+    }
+
+    #[test]
     fn unacknowledged_legacy_event_is_ignored_and_untouched() {
         let temp = tempfile::tempdir().unwrap();
         let events = temp.path().join("events");
@@ -2274,7 +2360,7 @@ mod tests {
                 .iter()
                 .map(|migration| (migration.from, migration.to))
                 .collect::<Vec<_>>(),
-            [(1, 2)]
+            [(1, 2), (2, 3)]
         );
         let mut legacy = seed(Uuid::new_v4());
         legacy.row_version = 1;

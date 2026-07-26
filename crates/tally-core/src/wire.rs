@@ -23,6 +23,7 @@ use crate::taskdb::{
     gh_trigger_task_uuid, AdmissionOrigin, EnqueueSource, GhOrigin, RelatedTrigger,
     WorkspaceMetadata,
 };
+use crate::witness::Derivation;
 
 pub const FRAME_CAP_BYTES: usize = DEFAULT_MAX_FRAME_BYTES as usize;
 pub const MAX_IN_FLIGHT_REQUESTS: usize = 64;
@@ -285,6 +286,8 @@ pub struct EnqueuePayload {
     pub parent: Option<String>,
     #[serde(default)]
     pub evidence: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drv: Option<Derivation>,
     #[serde(default)]
     pub evidence_class: Option<Value>,
     #[serde(default)]
@@ -352,6 +355,7 @@ pub struct ResolvedEnqueue {
     pub orchestration: Option<Orchestration>,
     pub parent: Option<String>,
     pub evidence: Vec<String>,
+    pub drv: Option<Derivation>,
     pub evidence_class: Option<Value>,
     pub manifest_hash: Option<String>,
     pub consumption_estimate: Option<u64>,
@@ -384,6 +388,8 @@ struct CanonicalPayload<'a> {
     gate_manifest: Option<&'a GateManifestSpec>,
     evidence: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
+    drv: Option<&'a Derivation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     evidence_class: Option<&'a Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     manifest_hash: Option<&'a str>,
@@ -406,6 +412,7 @@ pub fn canonical_payload(resolved: &ResolvedEnqueue) -> Result<Vec<u8>, serde_js
         adapter_options: &resolved.adapter_options,
         gate_manifest: resolved.gate_manifest.as_ref(),
         evidence: &resolved.evidence,
+        drv: resolved.drv.as_ref(),
         evidence_class: resolved.evidence_class.as_ref(),
         manifest_hash: resolved.manifest_hash.as_deref(),
         runtime_max_sec: resolved.runtime_max_sec,
@@ -571,9 +578,9 @@ impl GuardrailState {
             }
         }
         validate_credentials(&payload.credentials)?;
-        let evidence = parse_evidence_specs(&payload.evidence)
-            .map_err(|error| WireError::invalid(error.to_string()))?
-            .render();
+        let evidence_spec = parse_evidence_specs(&payload.evidence)
+            .map_err(|error| WireError::invalid(error.to_string()))?;
+        let evidence = evidence_spec.render();
 
         let source = payload.source.unwrap_or(defaults.source);
         if payload.gh_origin.is_none() {
@@ -627,15 +634,20 @@ impl GuardrailState {
             }
         }
         if let Some(task_uuid) = &payload.task_uuid {
-            let origin = payload.gh_origin.as_ref().ok_or_else(|| {
-                WireError::invalid("taskUuid may be preassigned only by a GitHub trigger")
-            })?;
-            let expected = gh_trigger_task_uuid(origin)
-                .map_err(|error| WireError::invalid(error.to_string()))?
-                .to_string();
-            if task_uuid != &expected {
+            taskchampion::Uuid::parse_str(task_uuid)
+                .map_err(|_| WireError::invalid("taskUuid must be a UUID"))?;
+            if let Some(origin) = payload.gh_origin.as_ref() {
+                let expected = gh_trigger_task_uuid(origin)
+                    .map_err(|error| WireError::invalid(error.to_string()))?
+                    .to_string();
+                if task_uuid != &expected {
+                    return Err(WireError::invalid(
+                        "preassigned GitHub taskUuid does not match its trigger identity",
+                    ));
+                }
+            } else if payload.drv.is_none() {
                 return Err(WireError::invalid(
-                    "preassigned GitHub taskUuid does not match its trigger identity",
+                    "taskUuid may be preassigned only by a GitHub trigger or drv seed",
                 ));
             }
         }
@@ -669,6 +681,24 @@ impl GuardrailState {
         let mut pools = payload.pools.unwrap_or_else(|| defaults.pools.clone());
         crate::poolset::canonicalize(&mut pools)
             .map_err(|error| WireError::invalid(error.to_string()))?;
+        let mut drv = payload.drv;
+        if let Some(drv) = &mut drv {
+            drv.canonicalize().map_err(WireError::invalid)?;
+            if payload.task_uuid.is_none() {
+                return Err(WireError::invalid(
+                    "drv enqueue requires the submitted seed taskUuid",
+                ));
+            }
+            let expected_key = format!("drv:{}", drv.drv_path);
+            if pools != ["build"]
+                || payload.dedup_key.as_deref() != Some(expected_key.as_str())
+                || evidence_spec.declared_store_paths() != drv.output_paths()
+            {
+                return Err(WireError::invalid(
+                    "drv enqueue requires pool [\"build\"], dedupKey drv:<drvPath>, and store evidence exactly matching all outputs",
+                ));
+            }
+        }
         let adapter = payload.adapter.unwrap_or_else(|| defaults.adapter.clone());
         if adapter.trim().is_empty() {
             return Err(WireError::invalid("adapter must not be empty"));
@@ -742,6 +772,7 @@ impl GuardrailState {
             orchestration: payload.orchestration,
             parent,
             evidence,
+            drv,
             evidence_class: payload.evidence_class,
             manifest_hash: payload.manifest_hash,
             consumption_estimate: payload.consumption_estimate,
@@ -1204,6 +1235,7 @@ mod tests {
             orchestration: None,
             parent: None,
             evidence: Vec::new(),
+            drv: None,
             evidence_class: None,
             manifest_hash: None,
             consumption_estimate: None,
