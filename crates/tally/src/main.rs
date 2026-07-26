@@ -761,6 +761,15 @@ async fn run_flow(socket: &Path, config_path: Option<&Path>, command: FlowComman
                 .as_ref()
                 .map_or(DEFAULT_MAX_FRAME_BYTES, |config| config.max_frame_bytes);
             if let Some(config) = client_config {
+                options.adapter_skill_revisions = config
+                    .adapters
+                    .iter()
+                    .filter_map(|(name, adapter)| {
+                        adapter
+                            .resolved_skill_revision()
+                            .map(|revision| (name.clone(), revision))
+                    })
+                    .collect();
                 options.pool_credentials = config
                     .pools
                     .into_iter()

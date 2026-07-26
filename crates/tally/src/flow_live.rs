@@ -664,6 +664,8 @@ mod tests {
                 node_ordinal: 0,
                 node_label: Some("first".to_owned()),
                 max_nodes: 10,
+                prompt_revision: None,
+                skill_revision: None,
                 selection: None,
             },
         }
@@ -671,8 +673,13 @@ mod tests {
 
     #[test]
     fn live_payload_is_full_mode_orchestrator_work_with_captured_ancestry() {
+        let mut submission = submission();
+        submission.orchestration.prompt_revision = Some(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        );
+        submission.orchestration.skill_revision = Some("review-agent-v3".to_owned());
         let payload = enqueue_payload(
-            &submission(),
+            &submission,
             &RunnerIdentity {
                 task_uuid: Some("00000000-0000-4000-8000-000000000048".to_owned()),
                 job_id: Some("00000000-0000-4000-8000-000000000048".to_owned()),
@@ -688,6 +695,11 @@ mod tests {
             "00000000-0000-4000-8000-000000000048"
         );
         assert_eq!(payload["orchestration"]["nodeOrdinal"], 0);
+        assert_eq!(
+            payload["orchestration"]["promptRevision"],
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(payload["orchestration"]["skillRevision"], "review-agent-v3");
         assert_eq!(payload["adapterOptions"]["environment"]["SAFE"], "yes");
         assert!(payload.get("payloadHash").is_none());
         assert!(payload.get("label").is_none());

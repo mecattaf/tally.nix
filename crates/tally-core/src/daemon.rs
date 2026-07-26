@@ -8140,6 +8140,8 @@ mod tests {
             env: BTreeMap::from([("CUSTOM_AGENT_MODE".to_owned(), "batch".to_owned())]),
             launch: crate::adapters::AdapterLaunchConfig::default(),
             hardening: Default::default(),
+            skill_bundle: None,
+            skill_revision: None,
             extra_config: BTreeMap::from([(
                 "modelFlag".to_owned(),
                 Value::String("--model".to_owned()),
@@ -8854,6 +8856,11 @@ mod tests {
                     "label": "opaque"
                 });
                 let manifest_hash = "deliberately-not-validated://manifest value";
+                let orchestration = json!({
+                    "flowRunId": "00000000-0000-4000-8000-000000000062",
+                    "promptRevision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "skillRevision": "review-agent-v3"
+                });
                 let admitted = client
                     .call(
                         "queue.enqueue",
@@ -8865,7 +8872,8 @@ mod tests {
                             "source": "manual",
                             "evidence": ["exit:0"],
                             "evidenceClass": evidence_class,
-                            "manifestHash": manifest_hash
+                            "manifestHash": manifest_hash,
+                            "orchestration": orchestration
                         })),
                     )
                     .await
@@ -8891,6 +8899,10 @@ mod tests {
                 assert_eq!(
                     record.manifest_hash,
                     Some(Value::String(manifest_hash.to_owned()))
+                );
+                assert_eq!(
+                    record.orchestration.as_ref().unwrap().as_value(),
+                    &orchestration
                 );
 
                 let raw_witness = fs::read_to_string(paths.witness_path()).unwrap();
@@ -8928,6 +8940,10 @@ mod tests {
                     .find(|event| event.row.uuid.to_string() == task_uuid)
                     .unwrap();
                 assert_eq!(durable.row.pools, ["slot", "zeta"]);
+                assert_eq!(
+                    durable.row.orchestration.as_ref().unwrap().as_value(),
+                    &orchestration
+                );
                 let status = client.call("query.status", Some(json!({}))).await.unwrap();
                 let projected = status["jobs"]
                     .as_array()
@@ -9039,6 +9055,8 @@ mod tests {
                         env: BTreeMap::new(),
                         launch: crate::adapters::AdapterLaunchConfig::default(),
                         hardening: Default::default(),
+                        skill_bundle: None,
+                        skill_revision: None,
                         extra_config: BTreeMap::new(),
                     },
                 );

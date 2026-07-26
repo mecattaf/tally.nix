@@ -1011,6 +1011,39 @@ mod tests {
     }
 
     #[test]
+    fn absent_revision_keys_preserve_legacy_orchestration_witness_hash() {
+        let mut legacy_body = body();
+        legacy_body.orchestration = Some(
+            serde_json::from_value(serde_json::json!({
+                "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+                "scriptHash": "sha256:legacy"
+            }))
+            .unwrap(),
+        );
+        let legacy = build_record(legacy_body, &ChainHead::default()).unwrap();
+        assert_eq!(
+            legacy.hash,
+            "sha256:0f87223e228b7753a01e85f2c45d8d37c9b1d059f4acb4c1dc630297a439deb2"
+        );
+        let legacy_json = serde_json::to_string(&legacy).unwrap();
+        assert!(!legacy_json.contains("promptRevision"));
+        assert!(!legacy_json.contains("skillRevision"));
+
+        let mut revised_body = body();
+        revised_body.orchestration = Some(
+            serde_json::from_value(serde_json::json!({
+                "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+                "scriptHash": "sha256:legacy",
+                "promptRevision": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "skillRevision": "review-agent-v3"
+            }))
+            .unwrap(),
+        );
+        let revised = build_record(revised_body, &ChainHead::default()).unwrap();
+        assert_ne!(revised.hash, legacy.hash);
+    }
+
+    #[test]
     fn witness_pool_encoding_preserves_legacy_bytes_and_canonicalizes_multi() {
         let singleton = build_record(body(), &ChainHead::default()).unwrap();
         let singleton_json = serde_json::to_string(&singleton).unwrap();

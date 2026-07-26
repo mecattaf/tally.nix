@@ -33,6 +33,8 @@ let
       yieldHook ? null,
       env ? { },
       launch ? { },
+      skillBundle ? null,
+      skillRevision ? null,
       extraConfig ? { },
     }:
     assert lib.assertMsg (validArgv argv) "tally adapter argv must be a list of strings";
@@ -58,6 +60,15 @@ let
       builtins.isAttrs env && builtins.all builtins.isString (builtins.attrValues env)
     ) "tally adapter env must be an attrset of strings";
     assert lib.assertMsg (builtins.isAttrs launch) "tally adapter launch must be an attrset";
+    assert lib.assertMsg (
+      skillBundle == null || builtins.isString skillBundle
+    ) "tally adapter skillBundle must be null or a string";
+    assert lib.assertMsg (
+      skillRevision == null || builtins.isString skillRevision
+    ) "tally adapter skillRevision must be null or a string";
+    assert lib.assertMsg (
+      skillBundle == null || skillRevision == null
+    ) "tally adapter skillBundle and skillRevision are mutually exclusive";
     assert lib.assertMsg (builtins.isAttrs extraConfig) "tally adapter extraConfig must be an attrset";
     {
       inherit
@@ -70,7 +81,9 @@ let
         launch
         extraConfig
         ;
-    };
+    }
+    // lib.optionalAttrs (skillBundle != null) { inherit skillBundle; }
+    // lib.optionalAttrs (skillRevision != null) { inherit skillRevision; };
 
   checkpointHook = [
     "tally"

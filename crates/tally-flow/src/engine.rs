@@ -64,6 +64,7 @@ pub struct RunOptions {
     pub catalog: Option<Catalog>,
     pub catalog_hash: Option<String>,
     pub pool_credentials: BTreeMap<String, BTreeMap<String, PathBuf>>,
+    pub adapter_skill_revisions: BTreeMap<String, String>,
 }
 
 impl RunOptions {
@@ -76,8 +77,15 @@ impl RunOptions {
             catalog: None,
             catalog_hash: None,
             pool_credentials: BTreeMap::new(),
+            adapter_skill_revisions: BTreeMap::new(),
         }
     }
+}
+
+#[derive(Debug, Default)]
+struct NodeRevisions {
+    prompt_revision: Option<String>,
+    skill_revision: Option<String>,
 }
 
 #[derive(Clone, Finalize, JsData, Trace)]
@@ -115,6 +123,7 @@ pub(crate) struct HostShared {
     catalog: Option<Catalog>,
     catalog_hash: Option<String>,
     pool_credentials: BTreeMap<String, BTreeMap<String, PathBuf>>,
+    adapter_skill_revisions: BTreeMap<String, String>,
     state: RefCell<HostState>,
 }
 
@@ -314,6 +323,7 @@ impl HostShared {
     fn prepare_submission(
         &self,
         mut spec: NodeSpec,
+        revisions: NodeRevisions,
         settle: bool,
         location: SourceLocation,
     ) -> Result<SubmissionPlan, FlowError> {
@@ -395,6 +405,8 @@ impl HostShared {
             node_ordinal: ordinal,
             node_label: spec.label.clone(),
             max_nodes: self.effective_max_nodes,
+            prompt_revision: revisions.prompt_revision,
+            skill_revision: revisions.skill_revision,
             selection: spec.selection.clone(),
         };
         let submission = FlowSubmission {
@@ -414,6 +426,13 @@ impl HostShared {
             location,
             ordinal,
         })
+    }
+
+    fn agent_revisions(&self, adapter: &str, prompt: &str) -> NodeRevisions {
+        NodeRevisions {
+            prompt_revision: Some(sha256(prompt.as_bytes())),
+            skill_revision: self.adapter_skill_revisions.get(adapter).cloned(),
+        }
     }
 
     async fn execute_submission(&self, plan: SubmissionPlan) -> Result<NodeResult, FlowError> {
@@ -731,6 +750,7 @@ pub fn run_script(
         catalog: options.catalog,
         catalog_hash: options.catalog_hash,
         pool_credentials: options.pool_credentials,
+        adapter_skill_revisions: options.adapter_skill_revisions,
         state: RefCell::default(),
     });
     let hooks = Rc::new(FlowHooks::new());
@@ -963,7 +983,7 @@ fn native_job(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         )
     })?;
     let settle = settle_option(args.get(1), context)?;
-    make_job_promise(spec, settle, location, context)
+    make_job_promise(spec, NodeRevisions::default(), settle, location, context)
 }
 
 fn native_claude(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -989,12 +1009,13 @@ fn native_agent_sugar(
         location,
         context,
     )?;
+    let revisions = host(context)?.agent_revisions(adapter, &prompt);
     options.insert("adapter".to_owned(), Value::String(adapter.to_owned()));
     options.insert("pools".to_owned(), json!([pool]));
     options.insert("argv".to_owned(), json!([BRIEF_SENTINEL]));
     options.insert("brief".to_owned(), json!({"mission": prompt}));
     let spec = decode_sugar_spec(options, location, context)?;
-    make_job_promise(spec, settle, location, context)
+    make_job_promise(spec, revisions, settle, location, context)
 }
 
 fn native_sh(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -1009,7 +1030,7 @@ fn native_sh(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResu
     options.insert("argv".to_owned(), argv);
     options.insert("adapter".to_owned(), Value::String("shell".to_owned()));
     let spec = decode_sugar_spec(options, location, context)?;
-    make_job_promise(spec, settle, location, context)
+    make_job_promise(spec, NodeRevisions::default(), settle, location, context)
 }
 
 fn native_local(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -1140,6 +1161,7 @@ fn native_local(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsR
         ));
     }
 
+    let revisions = shared.agent_revisions(&member.adapter, &prompt);
     options.insert("adapter".to_owned(), Value::String(member.adapter));
     options.insert(
         "pools".to_owned(),
@@ -1174,7 +1196,7 @@ fn native_local(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsR
             context,
         )
     })?;
-    make_job_promise(spec, settle, location, context)
+    make_job_promise(spec, revisions, settle, location, context)
 }
 
 fn native_members(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsResult<JsValue> {
@@ -1342,13 +1364,14 @@ fn native_location(_this: &JsValue, _args: &[JsValue], context: &mut Context) ->
 
 fn make_job_promise(
     spec: NodeSpec,
+    revisions: NodeRevisions,
     settle: bool,
     location: SourceLocation,
     context: &mut Context,
 ) -> JsResult<JsValue> {
     let shared = host(context)?;
     let plan = shared
-        .prepare_submission(spec, settle, location)
+        .prepare_submission(spec, revisions, settle, location)
         .map_err(|error| flow_to_js_error(error, context))?;
     let promise = JsPromise::from_async_fn(
         async move |context| match shared.execute_submission(plan).await {
@@ -2929,11 +2952,15 @@ mod tests {
             .borrow()
             .iter()
             .take(3)
-            .all(|submission| { submission.orchestration.selection.is_some() }));
+            .all(|submission| {
+                submission.orchestration.selection.is_some()
+                    && submission.orchestration.prompt_revision.is_some()
+                    && submission.orchestration.skill_revision.is_none()
+            }));
     }
 
     #[test]
-    fn every_agent_sugar_carries_its_prompt_only_in_the_structured_brief() {
+    fn every_agent_sugar_carries_revision_and_prompt_only_in_the_structured_brief() {
         let source = format!(
             "{}\n(async () => {{\n\
              const member = members('pooled', {{count: 1}})[0];\n\
@@ -2950,6 +2977,11 @@ mod tests {
         let mut options = RunOptions::new("run-1", json!({}));
         options.catalog = Some(catalog());
         options.catalog_hash = Some("sha256:catalog".to_owned());
+        options.adapter_skill_revisions = BTreeMap::from([
+            ("claude-code".to_owned(), "claude-skill-v2".to_owned()),
+            ("codex".to_owned(), "sha256:codex-skill-content".to_owned()),
+            ("pi".to_owned(), "local-skill-v4".to_owned()),
+        ]);
         run_script(
             &source,
             Some(Path::new("sugar.js")),
@@ -2959,17 +2991,38 @@ mod tests {
         )
         .unwrap();
         let submissions = client.submissions.borrow();
-        for (submission, mission) in
-            submissions
-                .iter()
-                .take(3)
-                .zip(["claude mission", "codex mission", "local mission"])
+        for (submission, (mission, prompt_revision, skill_revision)) in
+            submissions.iter().take(3).zip([
+                (
+                    "claude mission",
+                    "sha256:fb26460aa413216cbc1ff6d4a4f1d248e88b54966fecdb18c220b3cdd46635bb",
+                    "claude-skill-v2",
+                ),
+                (
+                    "codex mission",
+                    "sha256:ee65191fbc19d66fba6d51c4350e3bfaeaf779afba302312680ef6ea5d1d664a",
+                    "sha256:codex-skill-content",
+                ),
+                (
+                    "local mission",
+                    "sha256:d07d2dee7383b022e8c9da1cb4767c119a0e31c7b03528a44f5b940524dc985e",
+                    "local-skill-v4",
+                ),
+            ])
         {
             assert_eq!(
                 submission.spec.argv.as_deref(),
                 Some(&[BRIEF_SENTINEL.to_owned()][..])
             );
             assert_eq!(submission.spec.brief, Some(json!({"mission": mission})));
+            assert_eq!(
+                submission.orchestration.prompt_revision.as_deref(),
+                Some(prompt_revision)
+            );
+            assert_eq!(
+                submission.orchestration.skill_revision.as_deref(),
+                Some(skill_revision)
+            );
             assert!(!submission
                 .spec
                 .argv
@@ -2984,6 +3037,47 @@ mod tests {
         );
         assert_eq!(submissions[3].spec.adapter.as_deref(), Some("shell"));
         assert!(submissions[3].spec.brief.is_none());
+        assert!(submissions[3].orchestration.prompt_revision.is_none());
+        assert!(submissions[3].orchestration.skill_revision.is_none());
+    }
+
+    #[test]
+    fn resolved_prompt_revision_and_payload_identity_are_replay_stable() {
+        let source = format!(
+            "{}\n(async () => claude('resolved ' + args.suffix))()",
+            meta(&["claude-window"], &[])
+        );
+        let mut streams = Vec::new();
+        for suffix in ["α\n", "α\n", "β\n"] {
+            let client = MockClient::new(Vec::new());
+            let mut options = RunOptions::new("run-1", json!({"suffix": suffix}));
+            options
+                .adapter_skill_revisions
+                .insert("claude-code".to_owned(), "agent-v3".to_owned());
+            run_script(
+                &source,
+                Some(Path::new("resolved-prompt.js")),
+                client.clone(),
+                Rc::new(VecLifecycleSink::default()),
+                options,
+            )
+            .unwrap();
+            let submission = client.submissions.borrow()[0].clone();
+            streams.push((
+                submission.orchestration.prompt_revision,
+                submission.orchestration.skill_revision,
+                submission.payload_hash,
+            ));
+        }
+
+        assert_eq!(streams[0], streams[1]);
+        assert_eq!(
+            streams[0].0.as_deref(),
+            Some("sha256:100a1b066fe86cc024edd00424d7695640634d2fbf6d5ad195cad42cf9c59a72")
+        );
+        assert_eq!(streams[0].1.as_deref(), Some("agent-v3"));
+        assert_ne!(streams[0].0, streams[2].0);
+        assert_ne!(streams[0].2, streams[2].2);
     }
 
     #[test]

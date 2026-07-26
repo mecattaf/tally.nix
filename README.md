@@ -336,12 +336,21 @@ Adapters are structured data, not a Rust enum. Each named adapter can define:
 - a direct cooperative `yieldHook` argv;
 - non-reserved environment variables;
 - a closed `launch` policy for cwd argv, pre-prompt argv, named approval/sandbox policies, and
-  allowlisted model/effort overrides; and
+  allowlisted model/effort overrides;
+- either resolved `skillBundle` content or a stable `skillRevision` identifier for flow
+  provenance; and
 - opaque JSON `extraConfig`.
 
 The included presets are `shell`, `pi`, `claude-code`, and `codex`. The Codex launch prefix is
 exactly `["codex", "exec", "--json", "--"]`. Custom adapters use
 `tally.lib.adapters.mkAdapter` and need no Rust recompile.
+
+`skillBundle` and `skillRevision` are optional and mutually exclusive. `skillBundle` is the exact
+UTF-8 content of the adapter-side skill or agent definition; use an evaluation-time expression
+such as `builtins.readFile ./agent-skill.md`, never a runtime path. The flow host records
+`sha256:<hex>` over those configured bytes. If only a stable version or name is available, set
+`skillRevision`; tally records that string verbatim. When neither is known, no revision is
+fabricated.
 
 For example, the Codex preset renders these enqueue options as direct argv, records the workspace,
 and exposes it in query projections and `TALLY_WORKSPACE_*`:
@@ -390,6 +399,16 @@ $ tally witness verify /path/to/witness.jsonl --format json
 
 The TaskChampion SQLite database is a rebuildable query cache. Durable enqueue events and the
 witness ledger remain authoritative across restart recovery.
+
+Flow agent sugar (`claude()`, `codex()`, and `local()`) reserves two optional keys in the
+orchestration provenance capsule. `promptRevision` is
+`"sha256:" + hex(Sha256(prompt_bytes))`, where `prompt_bytes` is the exact UTF-8 sequence of the
+resolved prompt submitted in the structured brief. `skillRevision` is the adapter configuration's
+resolved bundle hash or stable identifier described above. The host stamps these values without
+script participation, and the kernel carries the capsule unchanged from the durable row into the
+witness. Both values are replay-stable inputs; changing a prompt changes `promptRevision` and,
+through the brief hash, `payloadHash`, so existing replay-divergence handling remains authoritative.
+Absent revision keys remain absent, preserving legacy witness bytes and hashes exactly.
 
 ## Durable query projections
 

@@ -414,6 +414,8 @@ async fn real_user_manager_adapter_capture_scrape() {
                     ]),
                     launch: tally_core::adapters::AdapterLaunchConfig::default(),
                     hardening: Default::default(),
+                    skill_bundle: None,
+                    skill_revision: None,
                     extra_config: BTreeMap::from([(
                         "modelFlag".to_owned(),
                         serde_json::Value::String("--model".to_owned()),
