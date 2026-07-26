@@ -12,6 +12,7 @@ pub enum Disposition {
     Created,
     Attached,
     Reused,
+    Substituted,
     Terminal,
 }
 
@@ -19,6 +20,7 @@ pub enum Disposition {
 #[serde(rename_all = "kebab-case")]
 pub enum Verdict {
     Pass,
+    Substituted,
     CleanExitNoArtifact,
     Failed,
     Skipped,
@@ -31,8 +33,84 @@ pub enum Verdict {
 impl Verdict {
     #[must_use]
     pub const fn is_pass(self) -> bool {
-        matches!(self, Self::Pass)
+        matches!(self, Self::Pass | Self::Substituted)
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DerivationOutput {
+    pub name: String,
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct Derivation {
+    pub drv_path: String,
+    pub outputs: Vec<DerivationOutput>,
+}
+
+impl Derivation {
+    pub(crate) fn canonicalize(&mut self) -> Result<(), String> {
+        self.outputs
+            .sort_by(|left, right| left.name.cmp(&right.name));
+        self.validate()
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), String> {
+        if !is_nix_store_path(&self.drv_path) || !self.drv_path.ends_with(".drv") {
+            return Err("drvPath must be a Nix store path ending in .drv".to_owned());
+        }
+        if self.outputs.is_empty() {
+            return Err("drv outputs must be non-empty".to_owned());
+        }
+        if self
+            .outputs
+            .iter()
+            .any(|output| !is_nix_store_path(&output.path))
+        {
+            return Err("drv output path is not a Nix store path".to_owned());
+        }
+        if self
+            .outputs
+            .windows(2)
+            .any(|pair| pair[0].name >= pair[1].name)
+        {
+            return Err("drv outputs must be sorted by name and unique".to_owned());
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) fn output_paths(&self) -> Vec<String> {
+        let mut paths = self
+            .outputs
+            .iter()
+            .map(|output| output.path.clone())
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+}
+
+pub(crate) fn is_nix_store_path(value: &str) -> bool {
+    let Some(rest) = value.strip_prefix("/nix/store/") else {
+        return false;
+    };
+    let Some((hash, name)) = rest.split_once('-') else {
+        return false;
+    };
+    hash.len() == 32
+        && hash.bytes().all(|byte| {
+            byte.is_ascii_digit()
+                || matches!(byte, b'a'..=b'd' | b'f'..=b'n' | b'p'..=b's' | b'v'..=b'z')
+        })
+        && !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'.' | b'_' | b'?' | b'=' | b'-')
+        })
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -156,6 +234,8 @@ pub struct NodeSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drv: Option<Derivation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_class: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manifest_hash: Option<String>,
@@ -185,6 +265,8 @@ pub struct FlowSubmission {
     pub mode: String,
     pub dedup_key: String,
     pub payload_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_uuid: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub credentials: BTreeMap<String, PathBuf>,
     pub spec: NodeSpec,

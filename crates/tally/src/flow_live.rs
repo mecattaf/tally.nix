@@ -284,6 +284,12 @@ fn enqueue_payload(
         serde_json::to_value(&submission.orchestration).map_err(json_client_error)?,
     );
     payload.insert("evidence".to_owned(), json!(spec.evidence));
+    if let Some(drv) = &spec.drv {
+        payload.insert(
+            "drv".to_owned(),
+            serde_json::to_value(drv).map_err(json_client_error)?,
+        );
+    }
     payload.insert("noEnqueue".to_owned(), Value::Bool(true));
     payload.insert("wait".to_owned(), Value::Bool(false));
     payload.insert(
@@ -302,6 +308,7 @@ fn enqueue_payload(
     insert_optional_value(&mut payload, "brief", spec.brief.as_ref());
     insert_optional_value(&mut payload, "evidenceClass", spec.evidence_class.as_ref());
     insert_optional_string(&mut payload, "manifestHash", spec.manifest_hash.as_deref());
+    insert_optional_string(&mut payload, "taskUuid", submission.task_uuid.as_deref());
     if let Some(runtime_max_sec) = spec.runtime_max_sec {
         payload.insert("runtimeMaxSec".to_owned(), json!(runtime_max_sec));
     }
@@ -343,7 +350,10 @@ fn parse_admission(value: &Value) -> Result<Admission, ClientError> {
             "full-mode enqueue response attempt must be positive",
         ));
     }
-    let terminal = if matches!(disposition, Disposition::Reused | Disposition::Terminal) {
+    let terminal = if matches!(
+        disposition,
+        Disposition::Reused | Disposition::Substituted | Disposition::Terminal
+    ) {
         Some(parse_node_result(value, disposition)?)
     } else {
         None
@@ -458,6 +468,7 @@ fn parse_disposition(value: &str) -> Result<Disposition, ClientError> {
         "created" => Ok(Disposition::Created),
         "attached" => Ok(Disposition::Attached),
         "reused" => Ok(Disposition::Reused),
+        "substituted" => Ok(Disposition::Substituted),
         "terminal" => Ok(Disposition::Terminal),
         other => Err(protocol_error(format!(
             "unknown enqueue disposition {other:?}"
@@ -468,6 +479,7 @@ fn parse_disposition(value: &str) -> Result<Disposition, ClientError> {
 fn parse_verdict(value: &str) -> Result<Verdict, ClientError> {
     match value {
         "pass" => Ok(Verdict::Pass),
+        "substituted" => Ok(Verdict::Substituted),
         "clean-exit-no-artifact" => Ok(Verdict::CleanExitNoArtifact),
         "failed" => Ok(Verdict::Failed),
         "skipped" => Ok(Verdict::Skipped),
@@ -691,7 +703,7 @@ mod tests {
         canonical_payload, canonical_payload_hash, EnqueuePayload, GuardrailConfig, GuardrailState,
         ProducerDefaults,
     };
-    use tally_flow::{NodeSpec, Orchestration};
+    use tally_flow::{Derivation, NodeSpec, Orchestration};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -700,6 +712,7 @@ mod tests {
             mode: "full".to_owned(),
             dedup_key: "flow:00000000-0000-4000-8000-000000000047:0".to_owned(),
             payload_hash: "sha256:expected".to_owned(),
+            task_uuid: None,
             credentials: BTreeMap::new(),
             spec: NodeSpec {
                 argv: Some(vec!["true".to_owned()]),
@@ -710,6 +723,7 @@ mod tests {
                 priority: Some("low".to_owned()),
                 runtime_max_sec: None,
                 evidence: vec!["exit:0".to_owned()],
+                drv: None,
                 evidence_class: None,
                 manifest_hash: None,
                 workspace: None,
@@ -886,6 +900,87 @@ mod tests {
             canonical_payload_hash(&resolved).unwrap(),
             "sha256:aa09bfa03f0d0a01e824d28d383c029490bc6adbc6917dee5140355e166acada"
         );
+    }
+
+    #[test]
+    fn drv_payload_matches_the_landed_kernel_contract_and_hash() {
+        const DRV: &str = "/nix/store/00000000000000000000000000000000-fixture.drv";
+        const DEV: &str = "/nix/store/11111111111111111111111111111111-fixture-dev";
+        const OUT: &str = "/nix/store/22222222222222222222222222222222-fixture";
+        let mut submission = submission();
+        submission.dedup_key = format!("drv:{DRV}");
+        submission.payload_hash =
+            "sha256:7420a9161793b05545bbb806bf1449a9554f756b8e4d800718050b6447b31f7f".to_owned();
+        submission.task_uuid = Some("0a50391c-9427-586d-8bdf-6e5b9a4feb0d".to_owned());
+        submission.spec.argv = Some(vec![
+            "nix".to_owned(),
+            "build".to_owned(),
+            "--no-link".to_owned(),
+            format!("{DRV}^*"),
+        ]);
+        submission.spec.pools = vec!["build".to_owned()];
+        submission.spec.priority = None;
+        submission.spec.evidence = vec![format!("store:{DEV}"), format!("store:{OUT}")];
+        submission.spec.drv = Some(
+            serde_json::from_value::<Derivation>(json!({
+                "drvPath": DRV,
+                "outputs": [
+                    {"name": "dev", "path": DEV},
+                    {"name": "out", "path": OUT}
+                ]
+            }))
+            .unwrap(),
+        );
+        submission.spec.label = None;
+        submission.spec.adapter_options = Some(json!({"prePromptArgv": [], "environment": {}}));
+
+        let raw = enqueue_payload(&submission, &RunnerIdentity::default()).unwrap();
+        assert_eq!(raw["taskUuid"], submission.task_uuid.unwrap());
+        assert_eq!(raw["drv"]["drvPath"], DRV);
+        assert_eq!(
+            raw["evidence"],
+            json!([format!("store:{DEV}"), format!("store:{OUT}")])
+        );
+
+        let payload: EnqueuePayload = serde_json::from_value(raw).unwrap();
+        let defaults = ProducerDefaults {
+            pools: vec!["build".to_owned()],
+            executor: None,
+            priority: Priority::Medium,
+            adapter: "shell".to_owned(),
+            source: EnqueueSource::Manual,
+            cwd: None,
+            workspace: None,
+            adapter_options: AdapterJobOptions::default(),
+        };
+        let resolved = GuardrailState::new(GuardrailConfig::default())
+            .unwrap()
+            .validate_enqueue(payload, &defaults)
+            .unwrap();
+        assert_eq!(
+            canonical_payload_hash(&resolved).unwrap(),
+            submission.payload_hash
+        );
+    }
+
+    #[test]
+    fn substituted_admission_is_an_inline_success() {
+        let admission = parse_admission(&json!({
+            "schemaVersion": 1,
+            "disposition": "substituted",
+            "taskUuid": "0a50391c-9427-586d-8bdf-6e5b9a4feb0d",
+            "payloadHash": "sha256:payload",
+            "attempt": 1,
+            "verdict": "substituted",
+            "exitCode": 0,
+            "witnessSeq": 7
+        }))
+        .unwrap();
+        assert_eq!(admission.disposition, Disposition::Substituted);
+        let terminal = admission.terminal.unwrap();
+        assert_eq!(terminal.verdict, Verdict::Substituted);
+        assert!(terminal.verdict.is_pass());
+        assert_eq!(terminal.disposition, Disposition::Substituted);
     }
 
     #[test]
