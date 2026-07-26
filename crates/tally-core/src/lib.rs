@@ -24,6 +24,7 @@ pub mod recovery;
 pub mod retention;
 pub mod taskdb;
 pub mod trace;
+pub mod view;
 pub mod watch;
 pub mod wire;
 pub mod witness;
