@@ -21,7 +21,8 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
         with:
-          determinate: false
+          extra-conf: |
+            lazy-trees = false
 
       - name: Restore and save the Nix store
         uses: nix-community/cache-nix-action@v7
@@ -100,8 +101,10 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
         with:
-          # testBuildFailure' relies on upstream Nix's store-path context semantics.
-          determinate: false
+          # The checks pass source files to sandboxed derivations.
+          # Materialize the checkout before any build or cache lookup.
+          extra-conf: |
+            lazy-trees = false
 
       - name: Restore and save the Nix store
         uses: nix-community/cache-nix-action@v7
