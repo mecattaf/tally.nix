@@ -78,6 +78,9 @@ flake's package for `pkgs.stdenv.hostPlatform.system`.
 The flow module performs the consuming half of the check. Because `catalog` is set,
 `mkCheckedConfig` runs the script and rendered catalog together; every class in
 `meta.selectors` must resolve to at least one member before activation can succeed.
+Direct `members()` calls with compatible literal selectors and options are resolved
+too, so a literal count above the enabled class membership or an invalid diversity
+key fails before activation. Dynamically assembled requests retain runtime validation.
 
 Selectors resolve membership, not concurrency. With the capacity-1 pool above, the three members
 drain sequentially and correctly. To buy real parallelism, declare a co-resident VRAM pool with

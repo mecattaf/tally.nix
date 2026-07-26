@@ -166,8 +166,9 @@ It exposed these platform gaps:
   equivalent and needs a ruling before the runner lease surface changes.
 - [#108](https://github.com/mecattaf/tally.nix/issues/108): catalog checking proves that
   a selector class is nonempty, not that a literal `count: 3` request has three members.
-  The workload fails closed before inference; activation-time cardinality proof remains
-  follow-up work.
+  Catalog checking now resolves compatible literal requests through the runtime selector
+  resolver, so this flow fails activation against a shorter catalog. Its explicit length
+  guard remains defense in depth before inference.
 
 The period clock is not a missing host primitive. `Date` remains forbidden in the
 dialect; the impure capture node resolves the period once, witnesses it, and replay
