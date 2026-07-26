@@ -395,7 +395,11 @@ impl HostShared {
             format!("flow:{}:{ordinal}", self.flow_run_id)
         };
 
-        let result_schema = spec.result_schema.take();
+        // Keep the host-only schema on the in-process submission so the live
+        // client knows whether it must join the daemon's post-ack result
+        // projection. canonical_payload_hash() and the wire binding both omit
+        // it, preserving the resultSchema boundary.
+        let result_schema = spec.result_schema.clone();
         let credentials = resolve_pool_credentials(&spec.pools, &self.pool_credentials);
         let payload_hash = canonical_payload_hash(&spec, &credentials)?;
         let orchestration = Orchestration {

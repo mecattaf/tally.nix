@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use tally_client::RpcClient;
-use tally_core::adapters::AdapterConfig;
+use tally_core::adapters::{AdapterConfig, ScrapeCapture, ScrapeMode, ScrapeStream};
 use tally_core::config::{
     CoResidencyPredicate, Config, JournaldConfig, PoolConfig, PoolPredicate, ResourceKind,
 };
@@ -36,6 +36,7 @@ const RESTARTED_RUN: &str = "00000000-0000-4000-8000-000000000503";
 const DIVERGENT_RUN: &str = "00000000-0000-4000-8000-000000000504";
 const DRV_BUILD_RUN: &str = "00000000-0000-4000-8000-000000000505";
 const DRV_SUBSTITUTE_RUN: &str = "00000000-0000-4000-8000-000000000506";
+const STRUCTURED_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000507";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -396,6 +397,40 @@ export const meta = {{
 }}))()
 "#
     )
+}
+
+fn structured_result_source() -> &'static str {
+    r#"
+export const meta = {
+  name: "structured-result-replay",
+  description: "live adapter result survives terminal acknowledgement and restart",
+  pools: ["alpha"],
+  argsSchema: { type: "object", additionalProperties: false },
+  selectors: [],
+  maxNodes: 1
+};
+
+(async () => {
+  const node = await job({
+    argv: [
+      "/bin/sh",
+      "-c",
+      "printf '%s\n' '{\"final_message\":\"{\\\"answer\\\":42}\"}'"
+    ],
+    adapter: "structured",
+    pools: ["alpha"],
+    evidence: ["exit:0"],
+    resultSchema: {
+      type: "object",
+      required: ["answer"],
+      properties: { answer: { const: 42 } },
+      additionalProperties: false
+    },
+    label: "structured-result"
+  });
+  return node.result;
+})()
+"#
 }
 
 fn runner(
@@ -1151,6 +1186,92 @@ async fn drv_second_run_substitutes_without_a_second_build() {
                 records[1].orchestration.as_ref().unwrap().flow_run_id(),
                 DRV_SUBSTITUTE_RUN
             );
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn structured_result_is_observed_after_terminal_ack_and_replayed_after_restart() {
+    let _environment = ENVIRONMENT_LOCK.lock().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = config();
+            config.adapters.insert(
+                "structured".to_owned(),
+                AdapterConfig {
+                    scrape: BTreeMap::from([(
+                        "finalMessage".to_owned(),
+                        ScrapeCapture {
+                            stream: ScrapeStream::Stdout,
+                            mode: ScrapeMode::JsonPath,
+                            pattern: "$..final_message".to_owned(),
+                        },
+                    )]),
+                    ..AdapterConfig::default()
+                },
+            );
+            config.validate().unwrap();
+            let config_path = temp.path().join("config.json");
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let script = temp.path().join("structured-result.js");
+            fs::write(&script, structured_result_source()).unwrap();
+            let daemon_paths = paths(&temp.path().join("daemon"));
+
+            let daemon = start_daemon(&daemon_paths, config.clone()).await;
+            let first = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                STRUCTURED_REPLAY_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let first = runner_output(first).await;
+            assert!(
+                first.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&first.stdout),
+                String::from_utf8_lossy(&first.stderr)
+            );
+            assert_eq!(
+                flow_report(&first)["report"]["finalValue"],
+                json!({"answer": 42})
+            );
+            daemon.stop().await;
+
+            let restarted = start_daemon(&daemon_paths, config).await;
+            let replay = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                STRUCTURED_REPLAY_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let replay = runner_output(replay).await;
+            assert!(
+                replay.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&replay.stdout),
+                String::from_utf8_lossy(&replay.stderr)
+            );
+            assert_eq!(
+                flow_report(&replay)["report"]["finalValue"],
+                json!({"answer": 42})
+            );
+            assert_eq!(
+                read_acknowledged_events(&daemon_paths.events_dir())
+                    .unwrap()
+                    .len(),
+                1,
+                "result replay must not materialize a second row"
+            );
+            restarted.stop().await;
         })
         .await;
 }
