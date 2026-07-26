@@ -20,6 +20,9 @@ jobs:
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          extra-conf: |
+            lazy-trees = false
 
       - name: Restore and save the Nix store
         uses: nix-community/cache-nix-action@v7
@@ -97,6 +100,11 @@ jobs:
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v22
+        with:
+          # The checks pass the repository source to sandboxed derivations.
+          # Materialize it as a real store path before any build or cache lookup.
+          extra-conf: |
+            lazy-trees = false
 
       - name: Restore and save the Nix store
         uses: nix-community/cache-nix-action@v7
