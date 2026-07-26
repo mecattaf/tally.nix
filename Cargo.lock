@@ -1944,11 +1944,23 @@ dependencies = [
  "chrono",
  "clap",
  "serde_json",
+ "tally-client",
  "tally-core",
  "tally-flow",
  "tempfile",
  "tokio",
  "uuid",
+]
+
+[[package]]
+name = "tally-client"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -1963,6 +1975,7 @@ dependencies = [
  "serde_json",
  "serde_json_path",
  "sha2",
+ "tally-client",
  "taskchampion",
  "tempfile",
  "thiserror",

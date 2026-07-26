@@ -3,8 +3,8 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
+use tally_client::{RpcClient, WireErrorCode, WireIoError};
 use tally_core::query::QUERY_PROTOCOL_VERSION;
-use tally_core::wire::{RpcClient, WireErrorCode, WireIoError};
 use tally_flow::{
     Admission, ClientError, Disposition, FlowClient, FlowFuture, FlowSubmission, NodeFailure,
     NodeResult, RunInspection, Verdict,

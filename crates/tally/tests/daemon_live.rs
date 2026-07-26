@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use tally_client::RpcClient;
 use tally_core::adapters::{AdapterConfig, ScrapeCapture, ScrapeMode, ScrapeStream};
 use tally_core::config::{
     CoResidencyPredicate, Config, JournaldConfig, PoolConfig, PoolPredicate, ResourceKind,
@@ -14,7 +15,6 @@ use tally_core::evidence::RetryPolicy;
 use tally_core::executor::UnitLimits;
 use tally_core::recovery::RecoveryPolicy;
 use tally_core::taskdb::read_acknowledged_events;
-use tally_core::wire::RpcClient;
 use tally_core::witness::read_verified_records;
 use tokio::process::Command;
 use tokio::sync::watch;

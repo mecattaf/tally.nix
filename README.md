@@ -69,6 +69,11 @@ $ tally --socket "$XDG_RUNTIME_DIR/tally/tally.sock" \
 The Home Manager socket is `$XDG_RUNTIME_DIR/tally/tally.sock`. The NixOS socket is
 `/run/tally/tally.sock`.
 
+Rust surfaces should use the workspace's `tally-client` crate, the reference implementation of
+the versioned Unix-socket NDJSON-RPC contract. It provides the multiplexed client, shared wire
+types and error codes, and the same rendered-config frame-limit resolution used by the CLI without
+linking `tally-core` or any daemon implementation.
+
 ## Home Manager module
 
 Add the flake input and import the module in an existing Home Manager configuration:

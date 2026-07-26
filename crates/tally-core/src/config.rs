@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+pub use tally_client::DEFAULT_MAX_FRAME_BYTES;
 use thiserror::Error;
 
 use crate::adapters::{AdapterConfig, AdapterEngine, AdapterError};
 use crate::producers::{validate_registry, ProducerConfig, ProducerError};
 
-pub const DEFAULT_MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
 pub const DEFAULT_AGING_THRESHOLD_SEC: u64 = 3_600;
 
 fn default_ssh_port() -> u16 {

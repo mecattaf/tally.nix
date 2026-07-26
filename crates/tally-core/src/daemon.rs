@@ -7714,7 +7714,7 @@ mod tests {
         GhContextSnapshot, GhItemState, GhItemType, GhOrigin, GH_CONTEXT_SCHEMA_VERSION,
         GH_ORIGIN_SCHEMA_VERSION,
     };
-    use crate::wire::RpcClient;
+    use tally_client::RpcClient;
 
     struct ExitFileProbe;
 

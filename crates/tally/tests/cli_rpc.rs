@@ -3,7 +3,8 @@ use std::path::Path;
 use std::pin::Pin;
 
 use serde_json::Value;
-use tally_core::wire::{serve_connection, RequestFrame, RpcHandler, WireError};
+use tally_client::{RequestFrame, WireError};
+use tally_core::wire::{serve_connection, RpcHandler};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
