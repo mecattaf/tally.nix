@@ -2107,6 +2107,14 @@ impl Executor {
         &self,
         request: &ExecutionRequest,
     ) -> Result<Vec<OsString>, ExecutorError> {
+        self.build_systemd_argv_with_git_ai(request, None)
+    }
+
+    fn build_systemd_argv_with_git_ai(
+        &self,
+        request: &ExecutionRequest,
+        git_ai_runtime: Option<&git_ai::PrivateDaemon>,
+    ) -> Result<Vec<OsString>, ExecutorError> {
         self.validate_request(request)?;
         let paths = self.paths(&request.identity);
         let unit_stem = self.unit_stem(&request.identity);
@@ -2166,7 +2174,11 @@ impl Executor {
             .as_ref()
             .filter(|origin| origin.is_current())
             .map(|_| self.gh_context_path(&request.identity));
-        for (name, value) in execution_environment(request, gh_context_path.as_deref())? {
+        let mut environment = execution_environment(request, gh_context_path.as_deref())?;
+        if let Some(runtime) = git_ai_runtime {
+            environment.extend(runtime.child_environment());
+        }
+        for (name, value) in environment {
             push_pair(&mut args, "--setenv", format!("{name}={value}"));
         }
         let unset_environment = environment_to_unset(request);
@@ -2270,22 +2282,24 @@ impl Executor {
         &self,
         request: ExecutionRequest,
     ) -> Result<ExecutionOutcome, ExecutorError> {
-        let preflight = match &request.git_ai {
-            Some(execution) => Some(
-                git_ai::preflight(execution)
+        let (preflight, runtime) = self.prepare_git_ai(&request).await?;
+        let result = match self.execute_raw(request.clone(), runtime.as_ref()).await {
+            Ok(outcome) => {
+                self.finalize_outcome(outcome, &request, preflight.as_ref(), runtime.as_ref())
                     .await
-                    .map_err(ExecutorError::GitAiRequired)?,
-            ),
-            None => None,
+            }
+            Err(error) => Err(error),
         };
-        let outcome = self.execute_raw(request.clone()).await?;
-        self.finalize_outcome(outcome, &request, preflight.as_ref())
-            .await
+        if let Some(runtime) = runtime {
+            runtime.shutdown().await;
+        }
+        result
     }
 
     async fn execute_raw(
         &self,
         mut request: ExecutionRequest,
+        git_ai_runtime: Option<&git_ai::PrivateDaemon>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
         self.validate_request(&request)?;
         self.materialize_brief(&mut request)?;
@@ -2372,13 +2386,13 @@ impl Executor {
             },
         )?;
         self.materialize_gh_context(&request)?;
-        let args = self.build_systemd_argv(&request)?;
+        let args = self.build_systemd_argv_with_git_ai(&request, git_ai_runtime)?;
         let output = match Command::new(&self.systemd_run).args(&args).output().await {
             Ok(output) => output,
             Err(source)
                 if source.kind() == std::io::ErrorKind::NotFound && self.allow_direct_fallback =>
             {
-                return self.execute_direct(request, paths).await;
+                return self.execute_direct(request, paths, git_ai_runtime).await;
             }
             Err(source) => {
                 return Err(ExecutorError::Spawn {
@@ -2427,19 +2441,69 @@ impl Executor {
         request: ExecutionRequest,
         expected_invocation_id: &str,
     ) -> Result<ExecutionOutcome, ExecutorError> {
-        let preflight = match &request.git_ai {
-            Some(execution) => Some(
-                git_ai::preflight(execution)
-                    .await
-                    .map_err(ExecutorError::GitAiRequired)?,
-            ),
-            None => None,
-        };
-        let outcome = self
+        let (preflight, runtime) = self.prepare_git_ai(&request).await?;
+        let result = match self
             .adopt_raw(request.clone(), expected_invocation_id)
-            .await?;
-        self.finalize_outcome(outcome, &request, preflight.as_ref())
             .await
+        {
+            Ok(outcome) => {
+                self.finalize_outcome(outcome, &request, preflight.as_ref(), runtime.as_ref())
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let Some(runtime) = runtime {
+            runtime.shutdown().await;
+        }
+        result
+    }
+
+    async fn prepare_git_ai(
+        &self,
+        request: &ExecutionRequest,
+    ) -> Result<(Option<git_ai::Preflight>, Option<git_ai::PrivateDaemon>), ExecutorError> {
+        let Some(execution) = &request.git_ai else {
+            return Ok((None, None));
+        };
+        let mut preflight = git_ai::preflight(execution)
+            .await
+            .map_err(ExecutorError::GitAiRequired)?;
+        let Some(workspace) = &request.workspace else {
+            return Ok((Some(preflight), None));
+        };
+        if matches!(preflight, git_ai::Preflight::Failed { .. }) {
+            return Ok((Some(preflight), None));
+        }
+        let runtime_key = format!(
+            "{}:{}:{}",
+            request.identity.unit_uuid(),
+            request.attempt,
+            request.lease_epoch
+        );
+        let mut repository_write_paths = git_repository_write_paths(&workspace.worktree_path);
+        repository_write_paths.push(workspace.worktree_path.clone());
+        match git_ai::start_private_daemon(
+            execution,
+            &preflight,
+            git_ai::PrivateDaemonLaunch {
+                state_dir: &self.state_dir,
+                runtime_key: &runtime_key,
+                worktree: &workspace.worktree_path,
+                repository_write_paths: &repository_write_paths,
+                systemd_run: &self.systemd_run,
+                systemctl: &self.systemctl,
+                allow_direct_fallback: self.allow_direct_fallback,
+            },
+        )
+        .await
+        {
+            Ok(runtime) => Ok((Some(preflight), Some(runtime))),
+            Err(reason) => {
+                preflight = git_ai::runtime_failure(execution, &preflight, reason)
+                    .map_err(ExecutorError::GitAiRequired)?;
+                Ok((Some(preflight), None))
+            }
+        }
     }
 
     async fn adopt_raw(
@@ -2531,6 +2595,7 @@ impl Executor {
         mut outcome: ExecutionOutcome,
         request: &ExecutionRequest,
         preflight: Option<&git_ai::Preflight>,
+        git_ai_runtime: Option<&git_ai::PrivateDaemon>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
         let Some(spec) = &request.gate_manifest else {
             return Ok(outcome);
@@ -2542,7 +2607,8 @@ impl Executor {
                 .workspace
                 .as_ref()
                 .map(|workspace| workspace.worktree_path.as_path());
-            let binding = git_ai::bind(git_ai, preflight, &completion, worktree).await;
+            let binding =
+                git_ai::bind(git_ai, preflight, &completion, worktree, git_ai_runtime).await;
             outcome.result_revision = binding.result_revision;
             outcome.authorship = binding.authorship;
             outcome.authorship_sessions = binding.authorship_sessions;
@@ -2815,6 +2881,7 @@ impl Executor {
         &self,
         request: ExecutionRequest,
         paths: ExecutionPaths,
+        git_ai_runtime: Option<&git_ai::PrivateDaemon>,
     ) -> Result<ExecutionOutcome, ExecutorError> {
         if !request.credentials.is_empty() {
             return Err(ExecutorError::CredentialedFallback);
@@ -2846,7 +2913,11 @@ impl Executor {
             .as_ref()
             .filter(|origin| origin.is_current())
             .map(|_| self.gh_context_path(&request.identity));
-        for (name, value) in execution_environment(&request, gh_context_path.as_deref())? {
+        let mut environment = execution_environment(&request, gh_context_path.as_deref())?;
+        if let Some(runtime) = git_ai_runtime {
+            environment.extend(runtime.child_environment());
+        }
+        for (name, value) in environment {
             command.env(name, value);
         }
         let mut child = command.spawn().map_err(|source| ExecutorError::Spawn {
@@ -4881,6 +4952,40 @@ mod tests {
             .unwrap()
             .get("gitAi")
             .is_none());
+    }
+
+    #[test]
+    fn private_git_ai_runtime_routes_only_the_job_to_its_control_and_trace_sockets() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let executor = executor(&state_dir);
+        let mut enabled = request();
+        enabled.git_ai = Some(git_ai_execution());
+        let runtime = git_ai::private_daemon_paths(
+            Path::new("/opt/dotfiles/bin/git-ai"),
+            "1.6.17",
+            &state_dir,
+            "task-53:1:7",
+            Path::new("/run/current-system/sw/bin/systemctl"),
+        )
+        .unwrap();
+        let expected = runtime
+            .child_environment()
+            .into_iter()
+            .collect::<BTreeMap<_, _>>();
+        let args = strings(
+            &executor
+                .build_systemd_argv_with_git_ai(&enabled, Some(&runtime))
+                .unwrap(),
+        );
+        for (name, value) in expected {
+            assert!(
+                args.windows(2)
+                    .any(|pair| pair[0] == "--setenv" && pair[1] == format!("{name}={value}")),
+                "job unit omitted {name}"
+            );
+        }
+        std::mem::forget(runtime);
     }
 
     #[test]
