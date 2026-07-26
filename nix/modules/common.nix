@@ -1752,6 +1752,23 @@ let
         default = { };
         description = "Age-based Nix GC-root retention with a live-witness floor.";
       };
+      attestations = mkOption {
+        type = types.submodule {
+          options.exec = mkOption {
+            type = types.submodule {
+              options.enable = mkOption {
+                type = types.bool;
+                default = true;
+                description = "Wrap fresh and recovered child executions with per-host advisory attestations.";
+              };
+            };
+            default = { };
+            description = "Per-host execution attestation chain.";
+          };
+        };
+        default = { };
+        description = "Advisory attestation policy.";
+      };
       gitAi = mkOption {
         type = types.submodule {
           options = {
@@ -2107,6 +2124,9 @@ let
     };
     retention = {
       inherit (cfg.retention) enable horizon onCalendar;
+    };
+    attestations.exec = {
+      inherit (cfg.attestations.exec) enable;
     };
     gitAi = {
       inherit (cfg.gitAi)

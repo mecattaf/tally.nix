@@ -692,6 +692,7 @@ mod tests {
         assert_eq!(legacy.max_frame_bytes, DEFAULT_MAX_FRAME_BYTES);
         assert_eq!(legacy.aging_threshold_sec, DEFAULT_AGING_THRESHOLD_SEC);
         assert_eq!(legacy.retention, RetentionConfig::default());
+        assert_eq!(legacy.attestations, AttestationsConfig::default());
         legacy.validate().unwrap();
 
         let configured: Config = serde_json::from_str(
@@ -711,6 +712,18 @@ mod tests {
                 Err(ConfigError::InvalidFlowRuntimeLimit)
             ));
         }
+    }
+
+    #[test]
+    fn execution_attestations_are_default_on_and_strictly_shaped() {
+        let configured: Config =
+            serde_json::from_str(r#"{"pools":{},"attestations":{"exec":{"enable":false}}}"#)
+                .unwrap();
+        assert!(!configured.attestations.exec.enable);
+        assert!(serde_json::from_str::<Config>(
+            r#"{"pools":{},"attestations":{"exec":{"enable":true,"ledger":"elsewhere"}}}"#
+        )
+        .is_err());
     }
 
     #[test]
