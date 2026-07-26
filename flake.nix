@@ -205,7 +205,10 @@
             git -C "$work/repository" config user.email "tally-fs7-worker@example.invalid"
             printf '%s\n' 'artifact-created-on-worker' >"$work/repository/artifact.txt"
             printf '%s\n' 'artifact-created-on-worker-through-attic' >"$work/attic-artifact"
-            store_path="$(nix store add --name tally-attic-handoff "$work/attic-artifact")"
+            store_path="$(
+              nix --extra-experimental-features nix-command \
+                store add --name tally-attic-handoff "$work/attic-artifact"
+            )"
             attic push tally:tally-handoff "$store_path"
             printf '%s\n' "$store_path" >"$work/repository/attic-store-path.txt"
             git -C "$work/repository" add artifact.txt attic-store-path.txt
