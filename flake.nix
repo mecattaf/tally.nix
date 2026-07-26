@@ -2161,6 +2161,7 @@
                 for example in \
                   ${./examples/flows/agency-nightly.js} \
                   ${./examples/flows/fleet-deploy.js} \
+                  ${./examples/flows/monthly-review.js} \
                   ${./examples/flows/pooled-review.js}; do
                   ${tally}/bin/tally flow check "$example" >/dev/null
                 done
