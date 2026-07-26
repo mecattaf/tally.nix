@@ -5081,6 +5081,37 @@ struct LeaseTickHook {
     release: watch::Receiver<bool>,
 }
 
+struct StartupDaemonLock {
+    file: Option<File>,
+}
+
+impl StartupDaemonLock {
+    fn acquire(state_dir: &Path) -> Result<Self, DaemonError> {
+        Ok(Self {
+            file: Some(acquire_daemon_lock(state_dir)?),
+        })
+    }
+
+    fn into_file(mut self) -> File {
+        self.file
+            .take()
+            .expect("the startup daemon lock must still be armed")
+    }
+}
+
+impl Drop for StartupDaemonLock {
+    fn drop(&mut self) {
+        let Some(file) = self.file.as_ref() else {
+            return;
+        };
+        // flock follows the open-file description across fork. A concurrent
+        // child can therefore retain the lock after this process closes its
+        // descriptor but before exec applies CLOEXEC. Explicit unlock makes
+        // every rejected startup release its fence immediately.
+        let _ = FileExt::unlock(file);
+    }
+}
+
 pub struct Daemon {
     _state_lock: File,
     listener: UnixListener,
@@ -5124,7 +5155,7 @@ impl Daemon {
         let executor = executor.with_remote_executors(config.executors.clone());
         let settings = settings.validate()?;
         prepare_paths(&paths)?;
-        let state_lock = acquire_daemon_lock(&paths.state_dir)?;
+        let state_lock = StartupDaemonLock::acquire(&paths.state_dir)?;
         // Preserve the clean-cut refusal: predecessor bytes are never parsed.
         // Once the final ledger is confirmed, migrate under this lock before
         // any acknowledged-event reader or recovery reconciliation can run.
@@ -5273,7 +5304,7 @@ impl Daemon {
         plan: crate::recovery::RecoveryPlan,
         committer: Box<dyn ReplicaCommitter>,
     ) -> Result<Self, DaemonError> {
-        let state_lock = acquire_daemon_lock(&paths.state_dir)?;
+        let state_lock = StartupDaemonLock::acquire(&paths.state_dir)?;
         let host_id = current_host_id()?;
         Self::build_locked(
             config, paths, settings, executor, host_id, epoch, plan, committer, state_lock,
@@ -5290,7 +5321,7 @@ impl Daemon {
         epoch: u64,
         plan: crate::recovery::RecoveryPlan,
         committer: Box<dyn ReplicaCommitter>,
-        state_lock: File,
+        state_lock: StartupDaemonLock,
     ) -> Result<Self, DaemonError> {
         validate_recovery_briefs(&plan, &paths.data_dir)?;
         let event_log = LeaseEventLog::in_state_dir(&paths.state_dir);
@@ -5421,7 +5452,7 @@ impl Daemon {
             exec_attestations: config.attestations.exec.enable,
         };
         Ok(Self {
-            _state_lock: state_lock,
+            _state_lock: state_lock.into_file(),
             listener,
             handler,
             completion_rx,
@@ -8753,6 +8784,19 @@ mod tests {
         assert_eq!(fs::read(legacy_event).unwrap(), legacy_bytes);
         assert!(!paths.witness_path().exists());
         drop(acquire_daemon_lock(&paths.state_dir).unwrap());
+    }
+
+    #[test]
+    fn rejected_startup_explicitly_unlocks_before_an_inherited_duplicate_closes() {
+        let temp = tempdir().unwrap();
+        let paths = fs1_paths(temp.path());
+        prepare_paths(&paths).unwrap();
+        let startup_lock = StartupDaemonLock::acquire(&paths.state_dir).unwrap();
+        let inherited = startup_lock.file.as_ref().unwrap().try_clone().unwrap();
+
+        drop(startup_lock);
+        drop(acquire_daemon_lock(&paths.state_dir).unwrap());
+        drop(inherited);
     }
 
     #[tokio::test(flavor = "current_thread")]
