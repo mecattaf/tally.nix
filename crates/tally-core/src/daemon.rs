@@ -10004,15 +10004,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                daemon
-                    .handler
+                let handler = daemon.handler.clone();
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                handler
                     .pause(Some(json!({"all": true})))
                     .await
                     .unwrap();
-                assert_eq!(daemon.handler.drain(None).await.unwrap()["enqueued"], 1);
+                assert_eq!(handler.drain(None).await.unwrap()["enqueued"], 1);
 
-                let job = daemon
-                    .handler
+                let job = handler
                     .context
                     .read()
                     .await
@@ -10092,8 +10093,7 @@ mod tests {
                 };
                 let task_uuid = job.row.uuid.to_string();
                 assert_eq!(row.gh_origin, Some(expected_projection.clone()));
-                let status = daemon
-                    .handler
+                let status = handler
                     .query("query.status", Some(json!({})))
                     .await
                     .unwrap();
@@ -10124,8 +10124,8 @@ mod tests {
                     Some(expected_projection.clone())
                 );
 
-                drop(daemon);
-                tokio::task::yield_now().await;
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
                 let restarted =
                     Daemon::open_with_executor(config, paths, settings(), executor)
                         .await
