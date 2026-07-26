@@ -245,6 +245,7 @@ async fn view_rebuild_archives_and_reconstructs_the_query_golden() {
             let paths = paths(temp.path());
             let uuid = Uuid::parse_str("00000000-0000-4000-8000-000000000084").unwrap();
             seed_durable_facts(&paths, uuid);
+            let witness_before = fs::read(paths.witness_path()).unwrap();
 
             let daemon = start_daemon(&paths).await;
             let before_query = query_golden(&paths.socket).await;
@@ -309,7 +310,9 @@ async fn view_rebuild_archives_and_reconstructs_the_query_golden() {
             assert_eq!(after_query, before_query);
             restarted.stop().await;
 
-            let ledger = fs::read_to_string(paths.witness_path()).unwrap();
+            let witness_after = fs::read(paths.witness_path()).unwrap();
+            assert_eq!(witness_after, witness_before);
+            let ledger = String::from_utf8(witness_after).unwrap();
             assert_eq!(ledger.lines().count(), 1);
             assert!(ledger.contains("\"schemaVersion\":2"));
         })
