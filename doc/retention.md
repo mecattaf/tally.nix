@@ -72,11 +72,12 @@ Nix GC collect a path, this check becomes a normal dedup miss and the work runs 
 reconstructs a store path from witness bytes and never substitutes byte hashing for Nix validity.
 
 For a flow `drv()` node, the declared derivation and outputs become the witness's `drv` and
-`storePaths` fields. The node uses `drv:<drvPath>` as both its cross-run dedup key and the seed for
-its stable task UUID. If all outputs are valid, the daemon emits a `substituted` witness without
-admitting a row or leasing the reserved `build` pool. Otherwise it admits
-`nix build --no-link <drvPath>^*` under that pool, then applies the same store validation and
-root-registration rules.
+`storePaths` fields. The node uses `drv:<drvPath>` as its cross-run dedup key and derives its
+submitted task UUID from the flow-local run ID and ordinal. The latter is stable on replay but
+distinct in a later flow run, so each run gets its own cheap witness. If all outputs are valid, the
+daemon emits a `substituted` witness without admitting a row or leasing the reserved `build` pool.
+Otherwise it admits `nix build --no-link <drvPath>^*` under that pool, then applies the same store
+validation and root-registration rules.
 
 `build-effect` remains an observation surface rather than an implicit callback from witness
 append. To trigger downstream work for locally built outputs, configure the host's Nix

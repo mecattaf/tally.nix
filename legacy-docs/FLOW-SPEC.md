@@ -527,8 +527,9 @@ a raw global `dedupKey` in spec (advanced; documented as escaping run scoping).
 top-level Nix store path ending in `.drv`; outputs are canonicalized by name and must be
 non-empty, uniquely named top-level store paths. The fixed mapping is
 `nix build --no-link <drvPath>^*`, pool `build`, `store:<path>` evidence for every
-output, and dedup key `drv:<drvPath>`. The same key seed produces a stable task UUID
-across flow runs.
+output, and dedup key `drv:<drvPath>`. The submitted task UUID is derived from the
+flow-local `flowRunId` and ordinal: it is byte-stable on replay, while a later flow run
+gets a distinct seed and therefore its own witness.
 
 The `build` pool is reserved in `meta.pools` and auto-declared beside `flow` with resource
 `build-slot`, cooperative enforcement, no hard preemption, and default capacity 2. If

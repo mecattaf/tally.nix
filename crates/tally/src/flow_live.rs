@@ -911,7 +911,7 @@ mod tests {
         submission.dedup_key = format!("drv:{DRV}");
         submission.payload_hash =
             "sha256:7420a9161793b05545bbb806bf1449a9554f756b8e4d800718050b6447b31f7f".to_owned();
-        submission.task_uuid = Some("0a50391c-9427-586d-8bdf-6e5b9a4feb0d".to_owned());
+        submission.task_uuid = Some("35c1f3a2-0ec5-53bf-8019-62ac60ca5bb0".to_owned());
         submission.spec.argv = Some(vec![
             "nix".to_owned(),
             "build".to_owned(),
@@ -968,7 +968,7 @@ mod tests {
         let admission = parse_admission(&json!({
             "schemaVersion": 1,
             "disposition": "substituted",
-            "taskUuid": "0a50391c-9427-586d-8bdf-6e5b9a4feb0d",
+            "taskUuid": "35c1f3a2-0ec5-53bf-8019-62ac60ca5bb0",
             "payloadHash": "sha256:payload",
             "attempt": 1,
             "verdict": "substituted",

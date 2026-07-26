@@ -416,7 +416,7 @@ impl HostShared {
             task_uuid: spec
                 .drv
                 .as_ref()
-                .map(|drv| stable_drv_task_uuid(&drv.drv_path)),
+                .map(|_| stable_drv_task_uuid(&self.flow_run_id, ordinal)),
             credentials,
             spec,
             orchestration,
@@ -2190,8 +2190,8 @@ fn canonical_payload_hash(
     Ok(sha256(&bytes))
 }
 
-fn stable_drv_task_uuid(drv_path: &str) -> String {
-    let digest = sha256(format!("drv:{drv_path}").as_bytes());
+fn stable_drv_task_uuid(flow_run_id: &str, ordinal: u64) -> String {
+    let digest = sha256(format!("flow:{flow_run_id}:{ordinal}").as_bytes());
     let hex = digest
         .strip_prefix("sha256:")
         .expect("sha256 helper always returns a tagged digest");
@@ -3211,7 +3211,7 @@ mod tests {
             assert_eq!(submission.dedup_key, format!("drv:{DRV}"));
             assert_eq!(
                 submission.task_uuid.as_deref(),
-                Some("0a50391c-9427-586d-8bdf-6e5b9a4feb0d")
+                Some("35c1f3a2-0ec5-53bf-8019-62ac60ca5bb0")
             );
             assert_eq!(submission.spec.pools, ["build"]);
             assert_eq!(submission.spec.adapter.as_deref(), Some("shell"));

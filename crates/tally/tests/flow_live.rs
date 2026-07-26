@@ -1047,11 +1047,11 @@ async fn drv_second_run_substitutes_without_a_second_build() {
             let script = temp.path().join("drv.js");
             fs::write(&script, drv_source()).unwrap();
 
-            let first_paths = paths(&temp.path().join("first"));
-            let first_daemon = start_daemon(&first_paths, config.clone()).await;
+            let daemon_paths = paths(&temp.path().join("daemon"));
+            let daemon = start_daemon(&daemon_paths, config).await;
             let first = runner(
                 &config_path,
-                &first_paths.socket,
+                &daemon_paths.socket,
                 &script,
                 DRV_BUILD_RUN,
                 "{}",
@@ -1071,27 +1071,28 @@ async fn drv_second_run_substitutes_without_a_second_build() {
                 "created"
             );
             assert_eq!(first_report["report"]["finalValue"]["verdict"], "pass");
-            first_daemon.stop().await;
+            assert_eq!(
+                first_report["report"]["finalValue"]["taskUuid"],
+                "39cd245e-fb7a-5bf0-8b59-46475d6ff96e"
+            );
 
             assert_eq!(fs::read_to_string(&builds).unwrap().lines().count(), 1);
-            let first_events = read_acknowledged_events(&first_paths.events_dir()).unwrap();
+            let first_events = read_acknowledged_events(&daemon_paths.events_dir()).unwrap();
             assert_eq!(first_events.len(), 1);
             assert_eq!(first_events[0].row.pools, ["build"]);
             assert_eq!(
                 first_events[0].row.dedup_key.as_deref(),
                 Some(format!("drv:{DRV_PATH}").as_str())
             );
-            let (report, records) = read_verified_records(&first_paths.witness_path()).unwrap();
+            let (report, records) = read_verified_records(&daemon_paths.witness_path()).unwrap();
             assert!(report.ok);
             assert_eq!(records.len(), 1);
             assert_eq!(records[0].verdict, tally_core::witness::Verdict::Pass);
             assert_eq!(records[0].store_paths, Some(vec![DRV_OUTPUT.to_owned()]));
 
-            let second_paths = paths(&temp.path().join("second"));
-            let second_daemon = start_daemon(&second_paths, config).await;
             let second = runner(
                 &config_path,
-                &second_paths.socket,
+                &daemon_paths.socket,
                 &script,
                 DRV_SUBSTITUTE_RUN,
                 "{}",
@@ -1115,29 +1116,46 @@ async fn drv_second_run_substitutes_without_a_second_build() {
                 second_report["report"]["finalValue"]["verdict"],
                 "substituted"
             );
-            second_daemon.stop().await;
+            assert_eq!(
+                second_report["report"]["finalValue"]["taskUuid"],
+                "63c56d72-e3bf-5bcf-93c6-1577d6a20f8d"
+            );
+            daemon.stop().await;
 
             assert_eq!(
                 fs::read_to_string(&builds).unwrap().lines().count(),
                 1,
                 "the store-native second run must not execute nix build"
             );
-            assert!(
-                read_acknowledged_events(&second_paths.events_dir())
-                    .unwrap()
-                    .is_empty(),
-                "the substituted fast path must not admit a row"
-            );
-            let (report, records) = read_verified_records(&second_paths.witness_path()).unwrap();
-            assert!(report.ok);
-            assert_eq!(records.len(), 1);
+            let events = read_acknowledged_events(&daemon_paths.events_dir()).unwrap();
             assert_eq!(
-                records[0].verdict,
+                events.len(),
+                1,
+                "the substituted fast path must not admit a second row"
+            );
+            assert_eq!(
+                events[0].row.orchestration.as_ref().unwrap().flow_run_id(),
+                DRV_BUILD_RUN
+            );
+            let (report, records) = read_verified_records(&daemon_paths.witness_path()).unwrap();
+            assert!(report.ok);
+            assert_eq!(records.len(), 2);
+            assert_ne!(records[0].task_uuid, records[1].task_uuid);
+            assert_eq!(
+                records[1].verdict,
                 tally_core::witness::Verdict::Substituted
             );
-            assert_eq!(records[0].pools, ["build"]);
-            assert_eq!(records[0].drv.as_ref().unwrap().drv_path, DRV_PATH);
-            assert_eq!(records[0].store_paths, Some(vec![DRV_OUTPUT.to_owned()]));
+            assert_eq!(records[1].pools, ["build"]);
+            assert_eq!(
+                records[1].dedup_key.as_deref(),
+                Some(format!("drv:{DRV_PATH}").as_str())
+            );
+            assert_eq!(records[1].drv.as_ref().unwrap().drv_path, DRV_PATH);
+            assert_eq!(records[1].store_paths, Some(vec![DRV_OUTPUT.to_owned()]));
+            assert_eq!(
+                records[1].orchestration.as_ref().unwrap().flow_run_id(),
+                DRV_SUBSTITUTE_RUN
+            );
         })
         .await;
 }

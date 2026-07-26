@@ -42,14 +42,15 @@ await drv({
 });
 ```
 
-The host sorts outputs by name, rejects malformed or duplicate store paths, and
-maps the node to `nix build --no-link <drvPath>^*`. Its pool is always the
-reserved, automatically declared `build` pool. Its dedup key is
-`drv:<drvPath>`, and its task UUID is derived deterministically from that same
-seed. A missing output admits an ordinary build row and leases one build slot.
-When every output is already valid in the Nix store, the daemon skips the row
-and lease, then appends a cheap witness with `substituted` disposition, the
-derivation, and `store:<path>` evidence for every output.
+The host sorts outputs by name, rejects malformed paths and duplicate output
+names, and maps the node to `nix build --no-link <drvPath>^*`. Its pool is always
+the reserved, automatically declared `build` pool. Its dedup key is
+`drv:<drvPath>`. Its submitted task UUID is derived deterministically from the
+flow-local run ID and ordinal, so replay keeps the seed while a later flow run
+gets its own witness. A missing output admits an ordinary build row and leases
+one build slot. When every output is already valid in the Nix store, the daemon
+skips the row and lease, then appends a cheap witness with `substituted`
+disposition, the derivation, and `store:<path>` evidence for every output.
 
 > If a node is hermetic and replay-stable, it should be a derivation and Nix
 > memoizes it. `job()` exists only for the impure — and everything impure gets
