@@ -99,6 +99,19 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
     assert_eq!(meta["name"], "fixture-valid");
     assert_eq!(meta["selectors"], serde_json::json!(["pooled-fast"]));
 
+    let drv = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["flow", "check"])
+        .arg(fixture("valid-drv.js"))
+        .output()
+        .unwrap();
+    assert!(
+        drv.status.success(),
+        "{}",
+        String::from_utf8_lossy(&drv.stderr)
+    );
+    let drv_meta: Value = serde_json::from_slice(&drv.stdout).unwrap();
+    assert_eq!(drv_meta["pools"], json!([]));
+
     for (name, code) in [
         ("nonliteral-meta.js", "meta-nonliteral"),
         ("banned-global.js", "determinism-violation"),

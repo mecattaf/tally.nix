@@ -352,6 +352,7 @@ in
       '';
     }
     (lib.mkIf (cfg.flows != { }) {
+      services.tally.pools.build = common.buildPoolDefaults;
       services.tally.pools.flow = common.flowPoolDefaults;
     })
     (lib.mkIf cfg.enable {

@@ -34,6 +34,12 @@ fn nix_eval_time_fixture_contract_accepts_valid_and_rejects_each_class() {
     .unwrap();
     assert_eq!(checked.meta.name, "fixture-valid");
 
+    let drv_path = fixture("valid-drv.js");
+    let drv_source = fs::read_to_string(&drv_path).unwrap();
+    let drv_checked = check_script(&drv_source, Some(&drv_path), CheckOptions::default()).unwrap();
+    assert_eq!(drv_checked.meta.name, "fixture-valid-drv");
+    assert!(drv_checked.meta.pools.is_empty());
+
     for (name, code) in [
         ("nonliteral-meta.js", "meta-nonliteral"),
         ("banned-global.js", "determinism-violation"),
