@@ -132,6 +132,18 @@ Tally witness + result revision + Git AI authorship note
         optional Agent Trace compatibility document
 ```
 
+The adapter boundary is field-by-field:
+
+| Compatibility concept | Source of truth | Projection rule |
+|---|---|---|
+| Repository and exact revision | Tally workspace plus `resultRevision` | Emit the witnessed repository/revision pair; reject an unresolved or mismatched object. |
+| Conversation or agent session | Git AI prompt/session record | Carry Git AI's stable session identifier and keep the Tally task UUID only as an external correlation key. |
+| Model identity | Both, as separate observations | Preserve the requested/executing Tally model and the edit-producing Git AI model with their sources; never merge disagreement. |
+| Files, character spans, and line ranges | Git AI authorship record | Project Git AI's recorded ranges exactly; never infer them from a final diff or Tally captures. |
+| Prompt content | Git AI under its own retention policy | Reference or omit it according to the concrete consumer; never copy it into the Tally witness. |
+| Execution, gates, and acceptance | Tally witness | Expose them only as Tally provenance extensions; they do not become authorship percentages or ranges. |
+| Note integrity | Tally's note ref, target, and digest binding | Verify the live note before export and identify the historical witness separately from current repository state. |
+
 No exporter is part of the core witness contract. If a concrete consumer later requires one, it
 must derive sessions and ranges from Git AI and execution/result facts from Tally; it must not
 reconstruct attribution from final diffs.
