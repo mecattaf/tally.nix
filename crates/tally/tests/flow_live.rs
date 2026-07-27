@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -31,6 +30,9 @@ use tally_core::witness::read_verified_records;
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
+
+#[path = "support/shell_program.rs"]
+mod shell_program;
 
 const CONCURRENT_RUN: &str = "00000000-0000-4000-8000-000000000501";
 const KILLED_RUN: &str = "00000000-0000-4000-8000-000000000502";
@@ -152,7 +154,7 @@ fn install_fake_gh(root: &Path) -> (std::path::PathBuf, PathGuard) {
     fs::create_dir_all(&bin).unwrap();
     let requests = root.join("gh-requests.jsonl");
     let gh = bin.join("gh");
-    fs::write(
+    shell_program::install(
         &gh,
         format!(
             concat!(
@@ -168,9 +170,7 @@ fn install_fake_gh(root: &Path) -> (std::path::PathBuf, PathGuard) {
             ),
             requests.display(),
         ),
-    )
-    .unwrap();
-    fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let path_guard = PathGuard::prepend(&bin);
     (requests, path_guard)
 }
@@ -181,7 +181,7 @@ fn install_fake_nix(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, Pat
     let marker = root.join("store-output-valid");
     let builds = root.join("nix-builds");
     let nix = bin.join("nix");
-    fs::write(
+    shell_program::install(
         &nix,
         format!(
             concat!(
@@ -207,10 +207,9 @@ fn install_fake_nix(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, Pat
             marker.display(),
             builds.display(),
         ),
-    )
-    .unwrap();
+    );
     let nix_store = bin.join("nix-store");
-    fs::write(
+    shell_program::install(
         &nix_store,
         format!(
             concat!(
@@ -223,11 +222,7 @@ fn install_fake_nix(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, Pat
             ),
             marker.display(),
         ),
-    )
-    .unwrap();
-    for program in [&nix, &nix_store] {
-        fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    );
     let path_guard = PathGuard::prepend(&bin);
     (marker, builds, path_guard)
 }

@@ -1,7 +1,9 @@
-use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use serde_json::Value;
+
+#[path = "support/shell_program.rs"]
+mod shell_program;
 
 #[test]
 fn poll_once_no_enqueue_in_scratch_leaves_live_ingress_untouched() {
@@ -31,7 +33,7 @@ fn poll_once_no_enqueue_in_scratch_leaves_live_ingress_untouched() {
     .unwrap();
 
     let fake_gh = temp.path().join("gh");
-    std::fs::write(
+    shell_program::install(
         &fake_gh,
         concat!(
             "#!/bin/sh\n",
@@ -46,9 +48,7 @@ fn poll_once_no_enqueue_in_scratch_leaves_live_ingress_untouched() {
             "  *) exit 91 ;;\n",
             "esac\n",
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
 
     let live_state = temp.path().join("live-state");
     let live_events = live_state.join("events");
@@ -124,7 +124,7 @@ fn one_shot_test_is_read_only_and_reports_the_resolved_synthetic_trigger() {
     .unwrap();
 
     let fake_gh = temp.path().join("gh");
-    std::fs::write(
+    shell_program::install(
         &fake_gh,
         concat!(
             "#!/bin/sh\n",
@@ -135,9 +135,7 @@ fn one_shot_test_is_read_only_and_reports_the_resolved_synthetic_trigger() {
             "  *) exit 91 ;;\n",
             "esac\n",
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
 
     let live_state = temp.path().join("live-state");
     let live_events = live_state.join("events");

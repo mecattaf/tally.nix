@@ -22,6 +22,8 @@ use tokio::task::LocalSet;
 
 #[path = "support/live.rs"]
 mod live_support;
+#[path = "support/shell_program.rs"]
+mod shell_program;
 
 const BASH: &str = "/run/current-system/sw/bin/bash";
 
@@ -316,7 +318,7 @@ async fn real_user_manager_adapter_capture_scrape() {
             };
             let mut live_config = config();
             let harness = temp.path().join("checkpoint-harness");
-            fs::write(
+            shell_program::install(
                 &harness,
                 concat!(
                     "#!/bin/sh\n",
@@ -325,11 +327,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                     "exec \"$LIVE_JQ\" -cn --argjson hookStatus \"$hook_status\" --args ",
                     "'{session_id:\"live-session\",model:\"Live/Model.Exact\",usage:{input_tokens:12345},mode:env.LIVE_ADAPTER_MODE,hook:env.TALLY_YIELD_HOOK,socket:env.TALLY_SOCKET,hook_status:$hookStatus,workload:$ARGS.positional}' -- \"$@\"\n"
                 ),
-            )
-            .unwrap();
-            let mut permissions = fs::metadata(&harness).unwrap().permissions();
-            std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o700);
-            fs::set_permissions(&harness, permissions).unwrap();
+            );
             let jq = path_executable("jq");
             live_config.adapters.insert(
                 "live-json".to_owned(),

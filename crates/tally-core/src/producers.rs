@@ -5245,7 +5245,6 @@ pub enum ProducerError {
 mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::FileTypeExt;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Barrier};
 
     use chrono::TimeZone;
@@ -6150,7 +6149,7 @@ mod tests {
         let failed_close = temp.path().join("gh-failed-close");
         let completion_id = "task-1:attempt-1:witness-5";
         let remote_key = stable_key(&["gh-remote-completion", completion_id]);
-        std::fs::write(
+        crate::test_support::install_shell_program(
             &gh,
             format!(
                 concat!(
@@ -6180,11 +6179,7 @@ mod tests {
                 failed_close.display(),
                 failed_close.display(),
             ),
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&gh).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&gh, permissions).unwrap();
+        );
         let mut cli = GhCliMutationSink::with_program(&gh);
         let trailer_evidence = serde_json::json!({
             "taskUuid": "00000000-0000-4000-8000-000000000049",
@@ -6305,7 +6300,7 @@ mod tests {
         let gh = temp.path().join("fake-gh-ack");
         let requests = temp.path().join("ack-requests.jsonl");
         let marker = temp.path().join("ack-marker");
-        std::fs::write(
+        crate::test_support::install_shell_program(
             &gh,
             format!(
                 concat!(
@@ -6326,9 +6321,7 @@ mod tests {
                 marker.display(),
                 marker.display(),
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         File::open(&gh).unwrap().sync_all().unwrap();
         sync_directory(temp.path()).unwrap();
         let acknowledgement = GhTriggerAcknowledgement {
@@ -6712,7 +6705,7 @@ mod tests {
         let state = temp.path().join("state");
         let gh = temp.path().join("fake-gh-intake");
         let calls = temp.path().join("gh-intake-calls");
-        std::fs::write(
+        crate::test_support::install_shell_program(
             &gh,
             format!(
                 concat!(
@@ -6732,9 +6725,7 @@ mod tests {
                 ),
                 calls.display(),
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         let intake = GhCliIntake::with_program(&gh);
         let engine = ProducerEngine::new(&registry, &events, &state);
         let first = engine.poll_gh("github", &intake, fixed_now()).unwrap();
@@ -6823,7 +6814,7 @@ mod tests {
             .is_empty());
 
         let malformed_gh = temp.path().join("malformed-gh-intake");
-        std::fs::write(
+        crate::test_support::install_shell_program(
             &malformed_gh,
             concat!(
                 "#!/bin/sh\n",
@@ -6835,9 +6826,7 @@ mod tests {
                 "  *) exit 91 ;;\n",
                 "esac\n",
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&malformed_gh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        );
         assert!(engine
             .poll_gh(
                 "github",
