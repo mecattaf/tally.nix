@@ -38,18 +38,20 @@ rebuildable view. The current ruling is recorded in [`doc/witness.md`](../doc/wi
 
 - Flows (#67): pending.
 
-- CLI, RPC, witness, and errors reference (#68): pending.
+- CLI, RPC, witness, and errors reference (#68): present in the book, including the advertised
+  23-method wire table, current query protocol 4 and witness schema 2, offline verification,
+  complete exit/error taxonomy, and the flag-only catalog plus existence-only `budgetPool`
+  rulings.
 
 - Operating tally, FAQ, Conventions, and README landing page (#69): pending.
 
 - Architecture and rationale (#70): pending.
 
-## The seven known divergences (legacy vs current implementation)
+## Known divergences still being processed (legacy vs current implementation)
 
-The first six were recorded by the flow campaign as ORACLE-DELTAS 4–9. In every case the
-implementation followed the flow-era spec; the legacy sentence is the stale one. The seventh
-records the later final-witness ruling. These are resolved in prose exactly once, in the book,
-while the legacy statements remain visible as provenance.
+These were recorded by the flow campaign as ORACLE-DELTAS and by the later final-witness
+ruling. Entries are struck from this processing ledger as the book states the one current
+truth; the frozen legacy statements remain visible as provenance.
 
 1. `NIX-SPEC.md §4` requires a nonempty `requiredGateIds` and treats a missing manifest as
    failure; `FLOW-SPEC.md §13` requires empty preset defaults and treats an absent manifest
@@ -60,12 +62,6 @@ while the legacy statements remain visible as provenance.
    token-denominated; the live module documentation now states it.
 4. Catalog schema ownership: issue bodies and the §4 opening assign it to FS-7; the amended
    §4 assigns it to FS-4, which is how it shipped (FS-7 consumes it and adds goldens).
-5. `FLOW-SPEC.md §11.5` mentions a catalog path in the runner environment; the amended
-   `NIX-SPEC-FLOW.md §4` requires `--catalog` and forbids `TALLY_FLOW_CATALOG`. The CLI
-   contract won.
-6. `NIX-SPEC-FLOW.md §1` `budgetPool`: normative producer rendering fixes the runner pool to
-   `[ "flow" ]`; `budgetPool` is validated for existence only, and no extra render channel
-   was invented.
 7. `FLOW-SPEC.md` §§19–20 reserve a witness epoch break and say none occurs in that campaign.
    [Issue #84](https://github.com/mecattaf/tally.nix/issues/84), Amendments 1–2, supersedes that
    reservation with the final in-place schema, inert predecessor archives, and the rebuildable

@@ -286,6 +286,8 @@ $ tally witness verify-authorship \
 ```
 
 The verifier checks the canonical verdict chain first, then compares the witnessed
-`refs/notes/ai` target and note-content hash with Git plumbing in the selected repository.
-Statuses are `bound`, `unavailable`, `missing-note`, `mismatch`, or `error`; anything other than
-a successful binding exits 1.
+`refs/notes/ai` target and note-content hash with Git plumbing in the selected repository. Its
+result status is one of `match`, `ledger-invalid`, `witness-not-found`, `not-bound`,
+`revision-missing`, `missing-note`, `note-content-mismatch`, `notes-ref-target-mismatch`, or
+`error`; anything other than `match` exits 1. The nested witnessed authorship observation keeps
+its separate `bound`, `unavailable`, `missing-note`, `mismatch`, or `error` vocabulary.
