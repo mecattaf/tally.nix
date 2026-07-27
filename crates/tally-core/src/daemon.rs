@@ -12814,7 +12814,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn hard_preemption_witnesses_victim_before_replacement_runs() {
+    async fn fleet_conformance_cooperative_yield_obeys_grace_then_witnesses_preemption() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -12828,7 +12828,8 @@ mod tests {
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let mut fast_settings = settings();
-                fast_settings.yield_grace = Duration::from_millis(10);
+                let yield_grace = Duration::from_millis(50);
+                fast_settings.yield_grace = yield_grace;
                 let mut daemon = Daemon::open_with_executor(
                     hard_preempt_config(),
                     paths.clone(),
@@ -12849,6 +12850,7 @@ mod tests {
                     })))
                     .await
                     .unwrap();
+                let yield_requested_at = Instant::now();
                 let urgent = daemon
                     .handler
                     .enqueue(Some(json!({
@@ -12863,8 +12865,44 @@ mod tests {
                     .unwrap();
                 assert_eq!(low["state"], "running");
                 assert_eq!(urgent["state"], "queued");
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                let lease_status = daemon
+                    .handler
+                    .lease_status(Some(json!({"jobId": low["task_uuid"]})))
+                    .await
+                    .unwrap();
+                assert_eq!(lease_status["held"], true);
+                assert_eq!(lease_status["yieldRequested"], true);
+                assert!(lease_status["yieldDeadline"].as_str().is_some());
+
                 Daemon::tick_leases(daemon.handler.clone()).await.unwrap();
+                assert!(
+                    read_verified_records(&paths.witness_path())
+                        .unwrap()
+                        .1
+                        .is_empty(),
+                    "the holder was preempted before yieldGraceSec elapsed"
+                );
+                assert_eq!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .jobs
+                        .get(&Uuid::parse_str(low["job_id"].as_str().unwrap()).unwrap())
+                        .unwrap()
+                        .state,
+                    JobState::Running
+                );
+
+                tokio::time::sleep(yield_grace + Duration::from_millis(10)).await;
+                Daemon::tick_leases(daemon.handler.clone()).await.unwrap();
+                let preempted_after = yield_requested_at.elapsed();
+                assert!(preempted_after >= yield_grace);
+                assert!(
+                    preempted_after < Duration::from_millis(250),
+                    "preemption exceeded the bounded yield grace: {preempted_after:?}"
+                );
 
                 let low_result = daemon
                     .handler
@@ -13093,7 +13131,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn coordinator_restart_probes_and_adopts_remote_work_without_an_ensure() {
+    async fn fleet_conformance_coordinator_switch_bumps_epoch_and_re_adopts_remote_work() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -13104,6 +13142,11 @@ mod tests {
                     data_dir: temp.path().join("data"),
                 };
                 initialize_final_witness_state(&paths);
+                assert_eq!(
+                    bump_epoch(&paths.state_dir).unwrap(),
+                    1,
+                    "the first coordinator generation must exist before the switch"
+                );
                 let task_uuid = Uuid::new_v4();
                 let mut row = durable_row(task_uuid, "restart-remote", 1);
                 row.executor = Some("worker".to_owned());
@@ -13131,6 +13174,7 @@ mod tests {
                 .unwrap();
                 assert_eq!(daemon.initial_jobs.len(), 1);
                 assert!(daemon.initial_jobs[0].adopted);
+                assert_eq!(daemon.handler.context.read().await.epoch, 2);
                 assert_eq!(
                     daemon
                         .handler
@@ -13164,13 +13208,34 @@ mod tests {
                 let calls = calls.lock().unwrap();
                 assert_eq!(calls.len(), 2);
                 assert!(matches!(calls[0], RemoteExecutorRequest::Probe { .. }));
-                assert!(matches!(calls[1], RemoteExecutorRequest::Adopt { .. }));
+                match &calls[1] {
+                    RemoteExecutorRequest::Adopt { request, .. } => {
+                        assert_eq!(request.attempt, 1);
+                        assert_eq!(
+                            request.lease_epoch, 1,
+                            "re-adoption must target the exact pre-switch execution generation"
+                        );
+                    }
+                    other => panic!("expected remote adoption, got {other:?}"),
+                }
                 assert!(!calls
                     .iter()
                     .any(|request| matches!(request, RemoteExecutorRequest::Ensure { .. })));
+                let lease_events = LeaseEventLog::in_state_dir(&paths.state_dir)
+                    .read()
+                    .unwrap();
+                assert!(lease_events.iter().any(|event| {
+                    event.epoch == 2
+                        && matches!(
+                            &event.event,
+                            crate::lease::LeaseEventKind::Granted { grant, .. }
+                                if grant.epoch == 2 && grant.job_id == task_uuid.to_string()
+                        )
+                }));
                 let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
                 assert_eq!(records.len(), 1);
                 assert_eq!(records[0].executor.as_deref(), Some("worker"));
+                assert_eq!(records[0].lease_epoch, 1);
             })
             .await;
     }
@@ -14472,7 +14537,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fs1_concurrent_full_duplicate_creates_once_then_attaches_both_waiters() {
+    async fn fleet_conformance_submission_created_and_attached_materialize_once() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -14548,7 +14613,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fs1_full_conflicts_fail_closed_for_running_queued_and_duplicate_live_rows() {
+    async fn fleet_conformance_submission_conflicts_fail_closed_for_every_live_shape() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -14663,7 +14728,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fs1_full_terminal_pass_with_no_artifacts_reuses_purely_even_with_manifest() {
+    async fn fleet_conformance_submission_terminal_pass_is_reused_without_side_effects() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -14720,7 +14785,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fs1_full_pass_rehashes_clean_and_discloses_every_rerun_reason() {
+    async fn fleet_conformance_submission_artifact_drift_creates_with_disclosure() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -14853,7 +14918,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fs1_terminal_failure_is_memoized_retry_is_durable_and_pass_retry_is_invalid() {
+    async fn fleet_conformance_submission_terminal_failure_is_memoized_and_conflicts() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -15079,7 +15144,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn fs1_legacy_behavior_stays_pass_only_row_materializing_and_manifest_excluding() {
+    async fn fleet_conformance_submission_legacy_behavior_remains_byte_and_behavior_compatible() {
         let local = LocalSet::new();
         local
             .run_until(async {

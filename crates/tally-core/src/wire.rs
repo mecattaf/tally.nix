@@ -848,6 +848,8 @@ mod tests {
     use tokio::sync::{mpsc, Semaphore};
 
     use super::*;
+    use crate::pagination::PageCache;
+    use crate::watch::{change_cursor, ChangeKind, ChangeStore};
 
     #[derive(Clone, Copy)]
     struct EchoHandler;
@@ -897,6 +899,7 @@ mod tests {
     #[derive(Clone)]
     struct MultiplexHandler {
         started: mpsc::UnboundedSender<u64>,
+        completed: mpsc::UnboundedSender<u64>,
     }
 
     impl RpcHandler for MultiplexHandler {
@@ -905,8 +908,11 @@ mod tests {
             request: RequestFrame,
         ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
             Box::pin(async move {
-                if request.method == "query.status" {
-                    return Ok(serde_json::json!({"interleaved": true}));
+                if request.method.starts_with("query.") {
+                    return Ok(serde_json::json!({
+                        "interleaved": true,
+                        "method": request.method,
+                    }));
                 }
                 let index = request
                     .params
@@ -915,17 +921,19 @@ mod tests {
                     .ok_or_else(|| WireError::invalid("missing index"))?;
                 self.started.send(index).unwrap();
                 tokio::time::sleep(Duration::from_millis((7 - index) * 25)).await;
+                self.completed.send(index).unwrap();
                 Ok(serde_json::json!({"index": index}))
             })
         }
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn one_connection_multiplexes_six_awaits_and_an_interleaved_query() {
+    async fn fleet_conformance_concurrent_serving_correlates_six_awaits_and_queries() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("tally.sock");
         let listener = UnixListener::bind(&socket).unwrap();
         let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
@@ -935,6 +943,7 @@ mod tests {
                         stream,
                         MultiplexHandler {
                             started: started_tx,
+                            completed: completed_tx,
                         },
                     )
                     .await
@@ -956,14 +965,37 @@ mod tests {
                 for _ in 0..6 {
                     started_rx.recv().await.unwrap();
                 }
-                let status = tokio::time::timeout(
-                    Duration::from_millis(40),
-                    client.call("query.status", Some(serde_json::json!({}))),
-                )
-                .await
-                .expect("a query must not queue behind blocked awaits")
-                .unwrap();
-                assert_eq!(status, serde_json::json!({"interleaved": true}));
+                let (status, pools) = tokio::join!(
+                    tokio::time::timeout(
+                        Duration::from_millis(40),
+                        client.call("query.status", Some(serde_json::json!({}))),
+                    ),
+                    tokio::time::timeout(
+                        Duration::from_millis(40),
+                        client.call("query.pools", Some(serde_json::json!({}))),
+                    ),
+                );
+                let status = status
+                    .expect("a status query must not queue behind blocked awaits")
+                    .unwrap();
+                let pools = pools
+                    .expect("a pools query must not queue behind blocked awaits")
+                    .unwrap();
+                assert_eq!(status["method"], "query.status");
+                assert_eq!(pools["method"], "query.pools");
+
+                let mut completion_order = Vec::new();
+                for _ in 0..6 {
+                    completion_order.push(completed_rx.recv().await.unwrap());
+                }
+                let mut completed_set = completion_order.clone();
+                completed_set.sort_unstable();
+                assert_eq!(completed_set, (0..6).collect::<Vec<_>>());
+                assert_ne!(
+                    completion_order,
+                    (0..6).collect::<Vec<_>>(),
+                    "the fixture must deliver out of request order so ID correlation is exercised"
+                );
                 for call in calls {
                     let (requested, received) = call.await.unwrap();
                     assert_eq!(received, requested);
@@ -999,7 +1031,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn per_connection_in_flight_window_is_64_and_queues_excess_in_arrival_order() {
+    async fn fleet_conformance_in_flight_window_is_64_with_fifo_overflow() {
         let temp = tempfile::tempdir().unwrap();
         let socket = temp.path().join("tally.sock");
         let listener = UnixListener::bind(&socket).unwrap();
@@ -1069,7 +1101,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn default_16_mib_frame_boundary_is_symmetric() {
+    async fn fleet_conformance_default_frame_boundary_is_symmetric() {
         assert_eq!(DEFAULT_MAX_FRAME_BYTES, 16 * 1024 * 1024);
         let limit = DEFAULT_MAX_FRAME_BYTES as usize;
 
@@ -1106,6 +1138,383 @@ mod tests {
                 limit: DEFAULT_MAX_FRAME_BYTES
             })
         ));
+    }
+
+    #[derive(Clone, Copy)]
+    struct SizedFrameHandler;
+
+    impl RpcHandler for SizedFrameHandler {
+        fn handle<'a>(
+            &'a self,
+            request: RequestFrame,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+            Box::pin(async move {
+                match request.method.as_str() {
+                    "ping" => Ok(serde_json::json!({"pong": true})),
+                    "echo" => Ok(request.params.unwrap_or(Value::Null)),
+                    "sized-response" => {
+                        let target = request
+                            .params
+                            .as_ref()
+                            .and_then(|params| params["wireBytes"].as_u64())
+                            .ok_or_else(|| WireError::invalid("missing wireBytes"))?
+                            as usize;
+                        let empty = serde_json::to_vec(&ResponseOk {
+                            id: &request.id,
+                            result: Value::String(String::new()),
+                        })
+                        .unwrap()
+                        .len()
+                            + 1;
+                        let result = Value::String("x".repeat(target.checked_sub(empty).unwrap()));
+                        assert_eq!(
+                            serde_json::to_vec(&ResponseOk {
+                                id: &request.id,
+                                result: result.clone(),
+                            })
+                            .unwrap()
+                            .len()
+                                + 1,
+                            target
+                        );
+                        Ok(result)
+                    }
+                    _ => Err(WireError::not_found("missing frame fixture")),
+                }
+            })
+        }
+    }
+
+    fn request_string_for_wire_size(id: &str, method: &str, target: usize) -> Value {
+        let empty = RequestFrame {
+            id: RequestId::String(id.to_owned()),
+            method: method.to_owned(),
+            params: Some(Value::String(String::new())),
+        };
+        let overhead = serde_json::to_vec(&empty).unwrap().len() + 1;
+        let params = Value::String("x".repeat(target.checked_sub(overhead).unwrap()));
+        let request = RequestFrame {
+            id: RequestId::String(id.to_owned()),
+            method: method.to_owned(),
+            params: Some(params.clone()),
+        };
+        assert_eq!(serde_json::to_vec(&request).unwrap().len() + 1, target);
+        params
+    }
+
+    async fn frame_connection(
+        root: &Path,
+        name: &str,
+        server_limit: u64,
+        client_limit: u64,
+    ) -> (RpcClient, tokio::task::JoinHandle<Result<(), WireIoError>>) {
+        let socket = root.join(format!("{name}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::task::spawn_local(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_connection_with_max_frame_bytes(stream, SizedFrameHandler, server_limit).await
+        });
+        let client = RpcClient::connect_with_max_frame_bytes(&socket, client_limit)
+            .await
+            .unwrap();
+        (client, server)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fleet_conformance_configured_frame_limits_are_symmetric_without_negotiation() {
+        const LIMIT: u64 = 1_024;
+        let temp = tempfile::tempdir().unwrap();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (client, server) =
+                    frame_connection(temp.path(), "exact-request", LIMIT, LIMIT).await;
+                let exact =
+                    request_string_for_wire_size("cli-1", "echo", LIMIT.try_into().unwrap());
+                assert_eq!(
+                    client.call("echo", Some(exact.clone())).await.unwrap(),
+                    exact
+                );
+                drop(client);
+                server.await.unwrap().unwrap();
+
+                let (client, server) =
+                    frame_connection(temp.path(), "client-request-reject", LIMIT, LIMIT).await;
+                let oversized = request_string_for_wire_size("cli-1", "echo", (LIMIT + 1) as usize);
+                assert!(matches!(
+                    client.call("echo", Some(oversized)).await,
+                    Err(WireIoError::FrameTooLarge { limit: LIMIT })
+                ));
+                drop(client);
+                server.await.unwrap().unwrap();
+
+                let (client, server) =
+                    frame_connection(temp.path(), "server-request-reject", LIMIT, LIMIT * 2).await;
+                assert_eq!(client.call("ping", None).await.unwrap()["pong"], true);
+                let oversized = request_string_for_wire_size("cli-2", "echo", (LIMIT + 1) as usize);
+                assert!(matches!(
+                    client.call("echo", Some(oversized)).await,
+                    Err(WireIoError::Closed)
+                ));
+                drop(client);
+                assert!(matches!(
+                    server.await.unwrap(),
+                    Err(WireIoError::FrameTooLarge { limit: LIMIT })
+                ));
+
+                let (client, server) =
+                    frame_connection(temp.path(), "exact-response", LIMIT, LIMIT).await;
+                let exact = client
+                    .call(
+                        "sized-response",
+                        Some(serde_json::json!({"wireBytes": LIMIT})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_vec(&ResponseOk {
+                        id: &RequestId::String("cli-1".to_owned()),
+                        result: exact,
+                    })
+                    .unwrap()
+                    .len()
+                        + 1,
+                    LIMIT as usize
+                );
+                drop(client);
+                server.await.unwrap().unwrap();
+
+                let (client, server) =
+                    frame_connection(temp.path(), "client-response-reject", LIMIT * 2, LIMIT).await;
+                assert_eq!(client.call("ping", None).await.unwrap()["pong"], true);
+                assert!(matches!(
+                    client
+                        .call(
+                            "sized-response",
+                            Some(serde_json::json!({"wireBytes": LIMIT + 1})),
+                        )
+                        .await,
+                    Err(WireIoError::FrameTooLarge { limit: LIMIT })
+                ));
+                drop(client);
+                server.await.unwrap().unwrap();
+
+                let (client, server) =
+                    frame_connection(temp.path(), "server-response-reject", LIMIT, LIMIT * 2).await;
+                assert!(matches!(
+                    client
+                        .call(
+                            "sized-response",
+                            Some(serde_json::json!({"wireBytes": LIMIT + 1})),
+                        )
+                        .await,
+                    Err(WireIoError::Closed)
+                ));
+                drop(client);
+                assert!(matches!(
+                    server.await.unwrap(),
+                    Err(WireIoError::FrameTooLarge { limit: LIMIT })
+                ));
+            })
+            .await;
+    }
+
+    #[derive(Clone)]
+    struct ConcurrentObservationHandler {
+        started: mpsc::UnboundedSender<u64>,
+        permits: Arc<Semaphore>,
+        page_cache: Rc<RefCell<PageCache>>,
+        page_items: Rc<Vec<Value>>,
+        changes: Rc<ChangeStore>,
+    }
+
+    impl RpcHandler for ConcurrentObservationHandler {
+        fn handle<'a>(
+            &'a self,
+            request: RequestFrame,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+            Box::pin(async move {
+                match request.method.as_str() {
+                    "queue.await_job" => {
+                        let index = request
+                            .params
+                            .as_ref()
+                            .and_then(|params| params["index"].as_u64())
+                            .ok_or_else(|| WireError::invalid("missing index"))?;
+                        self.started.send(index).unwrap();
+                        self.permits.acquire().await.unwrap().forget();
+                        Ok(serde_json::json!({"index": index}))
+                    }
+                    "query.watch" => {
+                        let params = request.params.as_ref().unwrap();
+                        let after = params["after"].as_str();
+                        let limit = params["limit"].as_u64().map(|value| value as usize);
+                        serde_json::to_value(self.changes.watch(after, limit).map_err(|error| {
+                            WireError::new(WireErrorCode::Internal, error.to_string())
+                        })?)
+                        .map_err(|error| WireError::new(WireErrorCode::Internal, error.to_string()))
+                    }
+                    "query.jobs" => {
+                        let params = request.params.as_ref().unwrap();
+                        let cursor = params["cursor"].as_str();
+                        let envelope = cursor.is_none().then(|| {
+                            serde_json::json!({
+                                "schemaVersion": 1,
+                                "protocolVersion": 4,
+                                "items": self.page_items.as_ref().clone(),
+                                "nextCursor": null,
+                            })
+                        });
+                        self.page_cache
+                            .borrow_mut()
+                            .page(
+                                "query.jobs",
+                                "fleet-conformance",
+                                Some(1_000),
+                                cursor,
+                                envelope,
+                            )
+                            .map_err(|error| {
+                                WireError::new(WireErrorCode::Internal, error.to_string())
+                            })
+                    }
+                    "query.status" => Ok(serde_json::json!({"interleaved": true})),
+                    _ => Err(WireError::not_found("missing observation fixture")),
+                }
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fleet_conformance_watch_and_pagination_are_exact_under_concurrency() {
+        const RECORDS: u64 = 1_200;
+        const PAGE_CAP: usize = 48 * 1024;
+
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut changes =
+            ChangeStore::open_with_capacity(&temp.path().join("changes"), 2_000).unwrap();
+        for index in 0..RECORDS {
+            changes
+                .append_now(
+                    ChangeKind::Lifecycle,
+                    serde_json::json!({"index": index, "raw": "x".repeat(96)}),
+                )
+                .unwrap();
+        }
+        let page_items = Rc::new(
+            (0..RECORDS)
+                .map(|index| serde_json::json!({"index": index, "raw": "x".repeat(96)}))
+                .collect::<Vec<_>>(),
+        );
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(Semaphore::new(0));
+        let handler = ConcurrentObservationHandler {
+            started: started_tx,
+            permits: Arc::clone(&permits),
+            page_cache: Rc::new(RefCell::new(PageCache::default())),
+            page_items,
+            changes: Rc::new(changes),
+        };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async move {
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(stream, handler).await.unwrap();
+                });
+                let client = RpcClient::connect(&socket).await.unwrap();
+                let awaits = (0..6_u64)
+                    .map(|index| {
+                        let client = client.clone();
+                        tokio::task::spawn_local(async move {
+                            client
+                                .call("queue.await_job", Some(serde_json::json!({"index": index})))
+                                .await
+                                .unwrap()
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                for _ in 0..6 {
+                    started_rx.recv().await.unwrap();
+                }
+                let status = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    client.call("query.status", Some(serde_json::json!({}))),
+                )
+                .await
+                .expect("status must complete while six awaits are blocked")
+                .unwrap();
+                assert_eq!(status["interleaved"], true);
+
+                let mut watch_cursor = change_cursor(0);
+                let mut watched = Vec::new();
+                while watched.len() < RECORDS as usize {
+                    let page = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        client.call(
+                            "query.watch",
+                            Some(serde_json::json!({
+                                "after": watch_cursor,
+                                "limit": 1_000,
+                            })),
+                        ),
+                    )
+                    .await
+                    .expect("watch must complete while awaits are blocked")
+                    .unwrap();
+                    assert!(serde_json::to_vec(&page).unwrap().len() <= PAGE_CAP);
+                    watched.extend(
+                        page["items"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|item| item["payload"]["index"].as_u64().unwrap()),
+                    );
+                    watch_cursor = page["nextCursor"].as_str().unwrap().to_owned();
+                }
+                assert_eq!(watched, (0..RECORDS).collect::<Vec<_>>());
+
+                let mut page_cursor = None;
+                let mut paged = Vec::new();
+                loop {
+                    let page = tokio::time::timeout(
+                        Duration::from_secs(1),
+                        client.call(
+                            "query.jobs",
+                            Some(serde_json::json!({"cursor": page_cursor})),
+                        ),
+                    )
+                    .await
+                    .expect("pagination must complete while awaits are blocked")
+                    .unwrap();
+                    assert!(serde_json::to_vec(&page).unwrap().len() <= PAGE_CAP);
+                    paged.extend(
+                        page["items"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|item| item["index"].as_u64().unwrap()),
+                    );
+                    page_cursor = page["nextCursor"].as_str().map(ToOwned::to_owned);
+                    if page_cursor.is_none() {
+                        break;
+                    }
+                }
+                assert_eq!(paged, (0..RECORDS).collect::<Vec<_>>());
+
+                permits.add_permits(6);
+                for (index, await_call) in awaits.into_iter().enumerate() {
+                    assert_eq!(
+                        await_call.await.unwrap()["index"],
+                        serde_json::json!(index as u64)
+                    );
+                }
+                drop(client);
+                server.await.unwrap();
+            })
+            .await;
     }
 
     #[test]

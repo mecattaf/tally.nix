@@ -6943,12 +6943,25 @@ mod tests {
     }
 
     #[test]
-    fn pool_return_actions_require_symmetric_sustained_hysteresis() {
+    fn fleet_conformance_network_blip_and_true_vanish_are_distinguished_by_hysteresis() {
         let temp = tempdir().unwrap();
         let registry = registry(&temp.path().join("effects.jsonl"));
         let events = temp.path().join("events");
         let state = temp.path().join("state");
         let engine = ProducerEngine::new(&registry, &events, &state);
+
+        let blip = engine
+            .observe_reachability("health", false, fixed_now())
+            .unwrap();
+        assert_eq!(blip.stable, ReachabilityStable::Reachable);
+        assert_eq!(blip.transition, None);
+        assert!(blip.emitted.is_empty());
+        let recovered_blip = engine
+            .observe_reachability("health", true, fixed_now())
+            .unwrap();
+        assert_eq!(recovered_blip.stable, ReachabilityStable::Reachable);
+        assert_eq!(recovered_blip.transition, None);
+        assert!(recovered_blip.emitted.is_empty());
 
         for failed in 1..=2 {
             let outcome = engine

@@ -519,14 +519,18 @@ $ nix develop --command cargo fmt --all --check
 $ nix flake check -L
 ```
 
-Run the two single-machine scenarios:
+Run the three single-machine scenarios:
 
 ```console
+$ nix develop --command test/scenarios/run fleet-conformance
 $ nix develop --command test/scenarios/run fanout-guardrail
 $ nix develop --command test/scenarios/run slow-sqlite
 ```
 
-The third scenario proves exact-row recovery after a real second machine disappears and returns:
+`fleet-conformance` is the named gate for the remaining deterministic fault-injection coverage
+and the flow-era serving, frame, observation, submission, and fairness assertions.
+
+The fourth scenario proves exact-row recovery after a real second machine disappears and returns:
 
 ```console
 $ TALLY_TEST_REMOTE_HOST=example-host \

@@ -1570,7 +1570,7 @@ mod tests {
     }
 
     #[test]
-    fn fairness_braid_prevents_a_400_node_flow_from_starving_siblings() {
+    fn fleet_conformance_fairness_braids_400_node_flow_siblings_and_standalone_work() {
         let (mut first, first_holder) = fairness_fixture();
         let (mut second, second_holder) = fairness_fixture();
         let first_order = drain_prefix(&mut first, first_holder, 18);
@@ -1652,7 +1652,7 @@ mod tests {
     }
 
     #[test]
-    fn aging_is_strictly_after_threshold_and_advances_exactly_one_rank() {
+    fn fleet_conformance_fairness_ages_once_strictly_after_the_threshold() {
         let threshold = Duration::from_secs(3_600);
         let mut engine = LeaseEngine::new_with_aging_threshold(
             1,
