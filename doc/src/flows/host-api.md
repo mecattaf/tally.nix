@@ -344,6 +344,12 @@ options, catalog hash, and ordered member IDs. The event is runner capture rathe
 than a new daemon RPC; the same resolution is persisted on every selected node
 through its orchestration `selection` object.
 
+That selection object is provenance, not work identity: the daemon deliberately
+excludes orchestration metadata from `payloadHash`. Changing member adapter,
+pools, or launch options normally changes the work payload, but changing only a
+member ID, order, or catalog hash does not necessarily do so. Reuse an existing
+`flowRunId` only with the exact same catalog bytes.
+
 Missing or undeclared classes, zero or excessive counts, unsupported diversity,
 and insufficient members are typed `FlowSelectorError`s. No catalog or an invalid
 catalog is `FlowCatalogError`. Literal calls are also checked during activation;

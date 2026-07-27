@@ -37,6 +37,16 @@ payload hash. The former is recorded beside it; the latter is a runner-side
 projection check. Editing either in the source still changes `scriptHash` for an
 existing run.
 
+There is one sharp catalog consequence. Member-selection provenance—including
+`catalogHash`, selected member ID, and roster—is orchestration metadata, so it is
+also outside `payloadHash`; the run-level script-history scan pins only
+`scriptHash`. A catalog change that alters adapter, pools, launch options, or
+another canonical work field causes payload divergence. An ID-only or order-only
+catalog change with otherwise identical work can instead reuse the old node.
+Always replay a run with the exact original catalog bytes. A content-addressed
+declarative catalog makes that discipline practical, but the runner does not
+enforce it as a separate pin.
+
 ## The submission disposition table
 
 Flow nodes always use full-mode admission. The result's `disposition` says how the
@@ -161,6 +171,7 @@ ordinal. This distinction is why raw keys should be rare and domain-specific.
 | Daemon restarted while runner waits | The client reconnects and re-awaits the exact attempt; recovered/adopted work supplies the terminal result. |
 | Script edited after any node exists | `script-changed-mid-run`, exit 20, before new admission. |
 | Same key, changed payload | Same-run identity: fatal `replay-divergence`, exit 20. Raw cross-run identity: `dedup-key-conflict`, exit 1. |
+| Catalog changed, but selected work payload stayed byte-identical | Selection provenance is not payload identity; the prior node can reuse. Restore the original catalog before replaying. |
 | Prior artifact changed or vanished | Reuse is rejected with a drift reason and a fresh node is `created`. |
 | Prerequisite has a non-pass verdict | Default `await` rejects `terminal-failure`, exit 1, so dependent code is not run. Node settle mode returns the failed `NodeResult` for an explicit decision. |
 | Script syntax, determinism, loop, or runtime-limit failure | Structured script failure, exit 10. Already admitted children remain durable and are handled on the next replay. |
