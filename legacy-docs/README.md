@@ -18,7 +18,7 @@ rebuildable view. The current ruling is recorded in [`doc/witness.md`](../doc/wi
 | File | What it is | Status |
 |---|---|---|
 | `SPEC.md` | Pre-flow normative product spec — kernel, pools, leases, executors, evidence, witness, producers, adapters | Authority for everything the flow era did not amend; absorb into the book's Concepts + Reference chapters |
-| `NIX-SPEC.md` | Pre-flow normative Nix surface | Authority *except* the six divergences below; absorb into the generated options reference |
+| `NIX-SPEC.md` | Pre-flow normative Nix surface | Historical Nix authority where a remaining dispatch note below does not supersede it; absorb into the generated options reference |
 | `FLOW-SPEC.md` | Flow-era normative spec (§1–§20): submission idempotency, orchestration provenance, brief, counters, concurrent wire, fairness, runner, dialect, host API, replay, semantic truth, data plane, meter, trailers, blast radius | Current truth; absorb into the Flows chapters |
 | `NIX-SPEC-FLOW.md` | Flow-era normative Nix surface: `services.tally.flows`, flow pool, eval-time validation, catalog contract, gh→flow wiring, hardening presets, transport/scheduling options | Current truth; absorb into the module reference |
 | `FLOW-GAP.md` | Ground-truth extraction of the tree at `main = 1ff5f3d` (what existed, what was wrong, what was left alone) | Historical; useful only as archaeology |
@@ -36,7 +36,7 @@ rebuildable view. The current ruling is recorded in [`doc/witness.md`](../doc/wi
   from the evaluated module schema during every book build; the wrapper-topology boundary and
   exact flow evaluation failures are documented alongside them.
 
-- Intro, Getting started, and Concepts (#66): pending.
+- Intro, Getting started, and Concepts (#66): absorbed into the book.
 
 - Flows (#67): absorbed by the book's [authoring](../doc/src/flows/authoring.md),
   [dialect](../doc/src/flows/dialect.md), [host API](../doc/src/flows/host-api.md),
@@ -56,26 +56,15 @@ rebuildable view. The current ruling is recorded in [`doc/witness.md`](../doc/wi
 
 - Architecture and rationale (#70): pending.
 
-## Known divergences still being processed (legacy vs current implementation)
+## Remaining known divergences (legacy vs current implementation)
 
-These were recorded by the flow campaign as ORACLE-DELTAS and by the later final-witness
-ruling. Entries are struck from this processing ledger as the book states the one current
-truth; the frozen legacy statements remain visible as provenance.
+Completed divergences are removed as their owning book chapters land. The remaining entry
+belongs to a later dispatch:
 
-1. `NIX-SPEC.md §4` requires a nonempty `requiredGateIds` and treats a missing manifest as
-   failure; `FLOW-SPEC.md §13` requires empty preset defaults and treats an absent manifest
-   as `not-run`.
-2. `NIX-SPEC.md §5` lists only `regex | jsonPath` scrape modes; `FLOW-SPEC.md §13` adds
-   `jsonPathLast`.
-3. `NIX-SPEC.md §2` is silent on the built-in meter's `consumptionCap` being
-   token-denominated; the live module documentation now states it.
-4. Catalog schema ownership: issue bodies and the §4 opening assign it to FS-7; the amended
-   §4 assigns it to FS-4, which is how it shipped (FS-7 consumes it and adds goldens).
-7. `FLOW-SPEC.md` §§19–20 reserve a witness epoch break and say none occurs in that campaign.
+1. `FLOW-SPEC.md` §§19–20 reserve a witness epoch break and say none occurs in that campaign.
    [Issue #84](https://github.com/mecattaf/tally.nix/issues/84), Amendments 1–2, supersedes that
    reservation with the final in-place schema, inert predecessor archives, and the rebuildable
    TaskChampion view recorded in [`doc/witness.md`](../doc/witness.md).
-
 The former `README.md` claim that tally "is not a workflow scheduler" was retired by the
 flow-era doctrine amendment (`FLOW-SPEC.md §1`). The current
 [`README`](../README.md) states the narrower truth: tally never *originates intent*, while
