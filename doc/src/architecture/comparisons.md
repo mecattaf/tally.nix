@@ -29,7 +29,7 @@ complete starting point.
 
 Tally earns a separate category only when the scarce thing is not simply a build
 slot and the required result is not simply a store path: an exclusive GPU, a
-repository mutation, a remote hardware action, a token-denominated subscription
+repository mutation, a remote hardware action, a renewable subscription
 window, or an agent response that needs a durable evidence trail. A CI service can
 be a tally producer. It should not have to become tally's lease engine or witness
 authority.

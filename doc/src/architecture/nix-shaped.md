@@ -125,9 +125,10 @@ Pools can model a resource ordinary CI queues usually leave implicit: a renewabl
 five-hour subscription window. For example, an operator can declare a budget
 pool whose rolling `windowSec` is `18000` and whose `consumptionCap` is expressed
 in the resource's native unit. A job must supply `consumptionEstimate`; admission
-accounts that estimate against the window, while completion can reconcile actual
-usage. This is a capability of the shipped `windowed-consumption` predicate, not
-a predeclared five-hour pool. The module defaults to a seven-day window.
+records that estimate as the window debit. It ages out with the window; completion
+does not replace it with measured usage. This is a capability of the shipped
+`windowed-consumption` predicate, not a predeclared five-hour pool. The module
+defaults to a seven-day window.
 
 There are two current flow limits worth stating without designing their answers.
 Declaratively generated flow runners are always submitted to exactly `["flow"]`.
