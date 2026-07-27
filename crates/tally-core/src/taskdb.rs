@@ -19,7 +19,8 @@ use crate::evidence::parse_evidence_specs;
 use crate::provenance::Orchestration;
 use crate::recovery::{RecoveryPlan, RecoveryRowState};
 use crate::witness::{
-    read_verified_records, Derivation, LaborClass, Verdict, WitnessError, WitnessRecord,
+    read_verified_attestations, read_verified_records, Derivation, LaborClass, Verdict,
+    WitnessError, WitnessRecord,
 };
 
 pub mod migrations;
@@ -1585,6 +1586,27 @@ impl TaskDb {
         events_dir: &Path,
         witness_path: &Path,
     ) -> Result<RebuildStats, TaskDbError> {
+        self.rebuild_from_sources_inner(events_dir, witness_path, &BTreeMap::new())
+            .await
+    }
+
+    pub async fn rebuild_from_sources_with_adapter_attestations(
+        &mut self,
+        events_dir: &Path,
+        witness_path: &Path,
+        attestation_path: &Path,
+    ) -> Result<RebuildStats, TaskDbError> {
+        let final_messages = retained_final_messages(attestation_path);
+        self.rebuild_from_sources_inner(events_dir, witness_path, &final_messages)
+            .await
+    }
+
+    async fn rebuild_from_sources_inner(
+        &mut self,
+        events_dir: &Path,
+        witness_path: &Path,
+        final_messages: &BTreeMap<(Uuid, String, u32, u64), String>,
+    ) -> Result<RebuildStats, TaskDbError> {
         let events = read_acknowledged_events(events_dir)?;
         let (report, witness) = read_verified_records(witness_path)?;
         if !report.ok {
@@ -1610,6 +1632,14 @@ impl TaskDb {
                     .map_or((Status::Pending, LaborClass::Fresh), |record| {
                         row.attempt = record.attempt;
                         row.lease_epoch = record.lease_epoch;
+                        if let Some(final_message) = final_messages.get(&(
+                            row.uuid,
+                            row.adapter.clone(),
+                            record.attempt,
+                            record.lease_epoch,
+                        )) {
+                            row.final_message = Some(final_message.clone());
+                        }
                         (status_for_verdict(record.verdict), record.labor_class)
                     });
             authoritative.push((row, status, labor_class));
@@ -1691,6 +1721,66 @@ impl TaskDb {
         self.commit_prepared(prepared).await?;
         Ok(desired.len())
     }
+}
+
+fn retained_final_messages(path: &Path) -> BTreeMap<(Uuid, String, u32, u64), String> {
+    let (report, records) = match read_verified_attestations(path) {
+        Ok(attestations) => attestations,
+        Err(error) => {
+            eprintln!("tally: clean-view rebuild omitted adapter result projections: {error}");
+            return BTreeMap::new();
+        }
+    };
+    if !report.ok {
+        eprintln!(
+            "tally: clean-view rebuild omitted adapter result projections: {}",
+            report
+                .problem
+                .as_deref()
+                .unwrap_or("attestation verification failed")
+        );
+        return BTreeMap::new();
+    }
+
+    let mut final_messages = BTreeMap::new();
+    for record in records {
+        let payload = &record.payload;
+        if payload.get("kind").and_then(Value::as_str) != Some("adapter-scrape") {
+            continue;
+        }
+        let Some(task_uuid) = payload
+            .get("taskUuid")
+            .and_then(Value::as_str)
+            .and_then(|task_uuid| Uuid::parse_str(task_uuid).ok())
+        else {
+            continue;
+        };
+        let Some(adapter) = payload.get("adapter").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(attempt) = payload
+            .get("attempt")
+            .and_then(Value::as_u64)
+            .and_then(|attempt| u32::try_from(attempt).ok())
+        else {
+            continue;
+        };
+        let Some(lease_epoch) = payload.get("leaseEpoch").and_then(Value::as_u64) else {
+            continue;
+        };
+        let Some(final_message) = payload
+            .get("captures")
+            .and_then(|captures| captures.get("finalMessage"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        final_messages.insert(
+            (task_uuid, adapter.to_owned(), attempt, lease_epoch),
+            final_message.to_owned(),
+        );
+    }
+    final_messages
 }
 
 fn populate_task(

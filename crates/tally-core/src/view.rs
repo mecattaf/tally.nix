@@ -117,7 +117,11 @@ pub async fn rebuild_taskchampion_view(
         rows,
         witness_records,
     } = db
-        .rebuild_from_sources_with_stats(&state_dir.join("events"), &data_dir.join("witness.jsonl"))
+        .rebuild_from_sources_with_adapter_attestations(
+            &state_dir.join("events"),
+            &data_dir.join("witness.jsonl"),
+            &data_dir.join("attestations.jsonl"),
+        )
         .await?;
     Ok(ViewRebuildReport {
         rebuilt: true,

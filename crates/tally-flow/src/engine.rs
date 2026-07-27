@@ -533,16 +533,38 @@ impl HostShared {
 
         result.disposition = admission.disposition;
         validate_terminal_result(&result, &admission, plan.location, plan.ordinal)?;
+        if plan.result_schema.is_none()
+            && result
+                .error
+                .as_ref()
+                .is_some_and(|error| error.code == "result-projection-timeout")
+        {
+            result.error = None;
+        }
         if let Some(schema) = &plan.result_schema {
             let validation = result.result.as_ref().map_or_else(
                 || {
-                    Err(FlowError::new(
+                    let projection_error = result
+                        .error
+                        .as_ref()
+                        .filter(|error| error.code == "result-projection-timeout");
+                    let mut error = FlowError::new(
                         "FlowResultError",
                         "result-schema-mismatch",
-                        "node returned no structured result",
+                        projection_error.map_or("node returned no structured result", |error| {
+                            error.message.as_str()
+                        }),
                     )
                     .at(plan.location)
-                    .with_ordinal(plan.ordinal))
+                    .with_ordinal(plan.ordinal);
+                    if let Some(projection_error) = projection_error {
+                        error = error.detail(
+                            "projection",
+                            serde_json::to_value(projection_error)
+                                .expect("node projection failures always serialize"),
+                        );
+                    }
+                    Err(error)
                 },
                 |value| {
                     validate_instance(

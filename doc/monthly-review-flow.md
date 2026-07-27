@@ -152,8 +152,9 @@ It exposed these platform gaps:
 
 - [#104](https://github.com/mecattaf/tally.nix/issues/104): the daemon acknowledged a
   live terminal result before `finalMessage` reached `NodeResult`, and replay omitted it.
-  The minimum result-join path required by this migration is included here; the broader
-  timeout/query audit remains open.
+  The live join now covers typed and untyped results, bounds blocked projection queries,
+  reports required captures that never project, and rebuilds the projection from its
+  retained adapter attestation.
 - [#105](https://github.com/mecattaf/tally.nix/issues/105): scheduled flows could not
   override their daily dedup template. This migration adds the typed `dedupKey` option
   while retaining the daily default.

@@ -5249,7 +5249,12 @@ impl Daemon {
             &executor,
             &paths.attestations_path(),
         );
-        hydrate_completed_adapter_metadata(&mut plan, &config, &executor);
+        hydrate_completed_adapter_metadata(
+            &mut plan,
+            &config,
+            &executor,
+            &paths.attestations_path(),
+        );
         hydrate_adopted_adapter_metadata(&mut plan, &paths.attestations_path())?;
         hydrate_represent_adapter_metadata(
             &mut plan,
@@ -6947,13 +6952,34 @@ fn hydrate_completed_adapter_metadata(
     plan: &mut crate::recovery::RecoveryPlan,
     config: &Config,
     executor: &Executor,
+    attestation_path: &Path,
 ) {
     let engine = AdapterEngine::new(&config.adapters);
     for recovery in &mut plan.rows {
         if !matches!(
             recovery.state,
             RecoveryRowState::Completed | RecoveryRowState::Deleted
-        ) || config
+        ) {
+            continue;
+        }
+        match verified_adapter_attestation_captures(
+            attestation_path,
+            recovery.row.uuid,
+            &recovery.row.adapter,
+            recovery.row.attempt,
+            recovery.row.lease_epoch,
+        ) {
+            Ok(Some(captures)) => {
+                apply_adapter_metadata(&mut recovery.row, &captures);
+                continue;
+            }
+            Ok(None) => {}
+            Err(error) => eprintln!(
+                "tally: retained adapter attestation for {} could not be read: {error}",
+                recovery.row.uuid
+            ),
+        }
+        if config
             .adapters
             .get(&recovery.row.adapter)
             .is_none_or(|adapter| adapter.scrape.is_empty())
@@ -6981,22 +7007,24 @@ fn hydrate_completed_adapter_metadata(
         }
         let paths = executor.paths(&identity);
         match engine.scrape_paths(&recovery.row.adapter, &paths) {
-            Ok(captures) => {
-                if let Ok(Some(session_ref)) = captures.session_ref() {
-                    recovery.row.session_ref = Some(session_ref.to_owned());
-                }
-                if let Ok(Some(model)) = captures.model() {
-                    recovery.row.model = Some(model.to_owned());
-                }
-                if let Ok(Some(final_message)) = captures.final_message() {
-                    recovery.row.final_message = Some(final_message.to_owned());
-                }
-            }
+            Ok(captures) => apply_adapter_metadata(&mut recovery.row, &captures),
             Err(error) => eprintln!(
                 "tally: retained adapter metadata for {} could not be scraped: {error}",
                 recovery.row.uuid
             ),
         }
+    }
+}
+
+fn apply_adapter_metadata(row: &mut RowSeed, captures: &ScrapeResult) {
+    if let Ok(Some(session_ref)) = captures.session_ref() {
+        row.session_ref = Some(session_ref.to_owned());
+    }
+    if let Ok(Some(model)) = captures.model() {
+        row.model = Some(model.to_owned());
+    }
+    if let Ok(Some(final_message)) = captures.final_message() {
+        row.final_message = Some(final_message.to_owned());
     }
 }
 
@@ -12415,7 +12443,12 @@ mod tests {
         )
         .unwrap();
         fs::write(&capture_paths.stdout, original).unwrap();
-        hydrate_completed_adapter_metadata(&mut deleted_plan, &config, &executor);
+        hydrate_completed_adapter_metadata(
+            &mut deleted_plan,
+            &config,
+            &executor,
+            &attestation_path,
+        );
         assert_eq!(
             deleted_plan.rows[0].row.session_ref.as_deref(),
             Some("resume-me")
