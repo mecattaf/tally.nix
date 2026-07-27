@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll GitHub for tally commits requiring the fleet gate
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=3min
+RandomizedDelaySec=20s
+Persistent=true
+Unit=tally-fleet-gate.service
+
+[Install]
+WantedBy=timers.target

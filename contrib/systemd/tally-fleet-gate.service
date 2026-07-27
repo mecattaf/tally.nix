@@ -1,0 +1,25 @@
+[Unit]
+Description=Post the tally fleet gate status for unverified GitHub commits
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+Environment=TALLY_GATE_REPO=mecattaf/tally.nix
+Environment=TALLY_GATE_RUNNER=%h/.local/libexec/tally-fleet-gate/fleet-gate.sh
+Environment=TALLY_GATE_TOKEN_FILE=%h/.config/tally-fleet-gate/github-token
+EnvironmentFile=-%h/.config/tally-fleet-gate/environment
+ExecStart=%h/.local/libexec/tally-fleet-gate/fleet-gate-poll.sh
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=default.target
