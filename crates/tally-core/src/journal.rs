@@ -850,6 +850,7 @@ mod tests {
     use std::os::unix::net::UnixDatagram;
     use std::time::Duration;
 
+    use proptest::prelude::*;
     use tempfile::tempdir;
 
     use super::*;
@@ -1159,6 +1160,13 @@ mod tests {
             r#"{"SYSLOG_IDENTIFIER":"tally","TALLY_EVENT":"completed","TALLY_TASK_UUID":"task"}"#;
         assert!(parse_journal_json_line(incomplete).is_err());
         assert!(parse_journal_json_line("{torn").is_err());
+    }
+
+    proptest! {
+        #[test]
+        fn journal_json_line_parser_never_panics(line in any::<String>()) {
+            let _ = parse_journal_json_line(&line);
+        }
     }
 
     #[test]

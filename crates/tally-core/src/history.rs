@@ -373,6 +373,7 @@ mod tests {
     use crate::config::Priority;
     use crate::journal::EmitEvent;
     use crate::taskdb::EnqueueSource;
+    use proptest::prelude::*;
 
     fn fields(task: &str) -> TallyFields {
         let mut event = EmitEvent::enqueued(task, Priority::High, EnqueueSource::Manual);
@@ -446,6 +447,56 @@ mod tests {
             reopened.snapshot().retention.reason.as_deref(),
             Some("incomplete-tail-repaired-after-interrupted-append")
         );
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_incomplete_tail_repairs_to_the_exact_valid_prefix(
+            task_ids in prop::collection::vec(any::<u64>(), 1..9),
+            garbage in prop::collection::vec(
+                prop_oneof![0_u8..=9, 11_u8..=u8::MAX],
+                1..513,
+            ),
+        ) {
+            let temp = tempfile::tempdir().unwrap();
+            let path;
+            let expected;
+            {
+                let mut store = LifecycleStore::open(temp.path()).unwrap();
+                for (index, task_id) in task_ids.iter().enumerate() {
+                    store
+                        .append_at(
+                            fields(&format!("property-{index}-{task_id}")),
+                            1_700_000_000_000_000 + index as u64,
+                        )
+                        .unwrap();
+                }
+                path = store.path().to_owned();
+                expected = store.snapshot().records;
+            }
+            let valid_prefix = std::fs::read(&path).unwrap();
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(&garbage)
+                .unwrap();
+
+            let repaired = LifecycleStore::open(temp.path()).unwrap();
+            let snapshot = repaired.snapshot();
+            let expected_boundary = lifecycle_cursor(expected.len() as u64);
+            prop_assert_eq!(snapshot.records.as_slice(), expected.as_slice());
+            prop_assert!(!snapshot.retention.complete);
+            prop_assert_eq!(
+                snapshot.retention.truncation_boundary.as_deref(),
+                Some(expected_boundary.as_str()),
+            );
+            prop_assert_eq!(
+                snapshot.retention.reason.as_deref(),
+                Some("incomplete-tail-repaired-after-interrupted-append"),
+            );
+            prop_assert_eq!(std::fs::read(&path).unwrap(), valid_prefix);
+        }
     }
 
     #[test]
