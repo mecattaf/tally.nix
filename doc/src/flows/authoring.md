@@ -56,9 +56,11 @@ Two current limits matter when choosing pools:
 
 - There is no supported way for a flow to co-lease a workload mutex for the whole
   runner lifetime. The generated runner requests only `flow`; putting a mutex on
-  individual children protects only those children.
+  individual children protects only those children. The run-wide question remains
+  open in [#107](https://github.com/mecattaf/tally.nix/issues/107).
 - A flow node has no `consumptionEstimate` field. It therefore cannot satisfy the
-  admission contract of a `windowed-consumption` pool.
+  admission contract of a `windowed-consumption` pool. The missing input remains
+  open in [#116](https://github.com/mecattaf/tally.nix/issues/116).
 
 Those are descriptions of the shipped interface, not invitations to emulate a
 missing run-wide lease in JavaScript.
