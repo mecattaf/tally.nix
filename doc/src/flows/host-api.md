@@ -34,8 +34,7 @@ export const meta = {
   "witnessSeq": 42,
   "disposition": "created",
   "result": { "digest": "sha256:…" },
-  "gates": { "status": "pass" },
-  "error": null
+  "gates": { "status": "pass" }
 }
 ```
 
@@ -201,6 +200,12 @@ adapter, pools, argv, prompt, or brief with
 `FlowSpecError`/`sugar-option-conflict`. `sh` fixes argv and adapter but permits a
 structured `brief`.
 
+The first argument to `claude()`, `codex()`, and `local()` must be a string; a
+different type is `FlowSpecError`/`invalid-argument`. The sugar currently accepts
+an empty string because it places that value directly in the structured brief,
+even though a raw `job()` `prompt` must be non-empty. `sh()` takes the same argv
+shape as `job()` and reports malformed input through the ordinary spec errors.
+
 `local()` requires the exact member object returned by `members()`, including its
 selection provenance:
 
@@ -281,9 +286,11 @@ promise is observed, even while item `b` is still preparing. Continuations from
 the just-observed node are allowed to materialize their next ordinal before the
 runner releases another ready terminal result.
 
-The return and `{ settle: true }` shapes match `parallel()`. A failed item skips
-its later stages, but other item chains continue. Bad item, stage, or option shapes
-raise `FlowCombinatorError`/`pipeline-invalid`; branch failures aggregate as
+The return and `{ settle: true }` shapes match `parallel()`. A rejecting stage
+skips that item's later stages, but other item chains continue. A settled failed
+`NodeResult` is a resolved value and reaches the next stage unless the script
+checks it. Bad item, stage, or option shapes raise
+`FlowCombinatorError`/`pipeline-invalid`; branch failures aggregate as
 `FlowAggregateError`/`aggregate-failure`.
 
 ## `log(value)`
@@ -302,9 +309,11 @@ log({ phase: "complete", witnessSeq: result.witnessSeq });
 A log immediately before a node is emitted only when that node's disposition is
 `created`. Replaying an already admitted prefix therefore suppresses its earlier
 logs. Logs after the final node have no following disposition to key against and
-are flushed at script exit, so a tail log can appear again on replay. Log values
-must be JSON-serializable; a lifecycle serialization or output failure is reported
-as `FlowCaptureError`.
+are flushed at script exit, so a tail log can appear again on replay. `undefined`
+is recorded as JSON `null`. A cyclic or otherwise unconvertible value throws a
+JavaScript error and becomes a script failure. A later serialization or write
+failure in the lifecycle output itself is
+`FlowCaptureError`/`lifecycle-serialization` or `lifecycle-write`.
 
 ## `members(selector, options?)`
 
