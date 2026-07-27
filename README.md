@@ -400,6 +400,10 @@ The [monthly review flow](doc/monthly-review-flow.md) is the first production-wo
 It combines roster rendering, three maker-diverse members, bounded repair, attributed dissent,
 store-native stages, period deduplication, and the fixed publication receipt.
 
+The [mutation-ladder cookbook](doc/mutation-ladder.md) uses the academic OCR swarm to show
+deterministic tiered fan-out, input mutation under disagreement, bounded arbitration, 400-node
+fairness, and artifact-only data-plane handoff.
+
 ## Evidence and ledgers
 
 Evidence checks support `exit:<code>`, `artifact:<absolute-path>`, `store:<nix-store-path>`, and
