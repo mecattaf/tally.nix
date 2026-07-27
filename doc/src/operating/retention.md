@@ -160,7 +160,7 @@ The current storage story is intentionally uneven:
 | Worker `stateDir` | Captures, launch markers, exit records, and execution attestations accumulate | Preserve live/ambiguous generations. No worker-side GC is shipped. |
 | Ordinary `artifact:<path>` files | Owned by the workload; no tally GC root | Apply a workload-specific policy only after accepting the reuse and audit consequences below. |
 | Enqueue events and unit-exit state | Durable recovery inputs; no general pruner | Do not prune by age. |
-| In-memory drain barriers | At most 64 unclaimed barriers; disconnected waiters are evicted on the next tracker operation | Automatic and restart-local. |
+| In-memory barrier tracker | At most 64 unclaimed drain snapshots; connected waits scale with active calls, and disconnected waiters are evicted on the next tracker operation | Automatic and restart-local. |
 | In-memory parent guardrails | Terminal parents retire after their outstanding-child count reaches zero | Automatic; rebuilt from active durable rows. |
 
 Use ordinary filesystem accounting to locate growth:

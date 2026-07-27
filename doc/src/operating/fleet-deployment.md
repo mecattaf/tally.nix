@@ -76,13 +76,49 @@ generation. Enable lingering for the coordinator account so its user manager
 and timers survive logout:
 
 ```nix
-users.users.tally = {
-  isNormalUser = true;
-  createHome = true;
-  home = "/var/lib/tally-coordinator";
-  linger = true;
-};
+{ inputs, ... }:
+{
+  imports = [ inputs.home-manager.nixosModules.home-manager ];
+
+  users.users.tally = {
+    isNormalUser = true;
+    createHome = true;
+    home = "/var/lib/tally-coordinator";
+    linger = true;
+  };
+
+  home-manager = {
+    useGlobalPkgs = true;
+    useUserPackages = true;
+    users.tally = {
+      imports = [ inputs.tally.homeManagerModules.tally ];
+      home = {
+        username = "tally";
+        homeDirectory = "/var/lib/tally-coordinator";
+        stateVersion = "26.11";
+      };
+      services.tally = {
+        enable = true;
+        retention.enable = false;
+        pools = {
+          coordinator-slot = {
+            resource = "build-slot";
+            capacity = 1;
+          };
+          worker-slot = {
+            resource = "build-slot";
+            capacity = 1;
+          };
+        };
+      };
+    };
+  };
+}
 ```
+
+This is a complete single-host coordinator before adding the executor block
+below. Retention is disabled here because its default Home Manager timer calls
+host-wide Nix GC; choose the horizon deliberately before enabling it.
 
 Do not enable both a system daemon and a Home Manager daemon as though they
 formed one coordinator. They have different sockets and durable directories.
@@ -101,7 +137,7 @@ A worker runs no tally daemon. It needs:
 A minimal NixOS worker looks like this:
 
 ```nix
-{ pkgs, ... }:
+{ inputs, pkgs, ... }:
 {
   environment.systemPackages = [ inputs.tally.packages.${pkgs.system}.tally ];
 
@@ -130,6 +166,21 @@ A minimal NixOS worker looks like this:
   ];
 }
 ```
+
+Create a dedicated keypair in a private provisioning directory outside the
+repository:
+
+```console
+$ ssh-keygen -t ed25519 \
+    -f /secure/provisioning/tally-worker-key \
+    -C coordinator-for-tally
+```
+
+Put only `tally-worker-key.pub` in the worker's
+`openssh.authorizedKeys.keys`. Deliver the private key through the
+coordinator's encrypted-secret mechanism as
+`/run/credentials/tally-worker-key`, owned by `tally` and mode `0400`. Never
+import the private key as a Nix path or commit it.
 
 The remote helper uses `systemd-run --user`. Verify the user manager before
 admitting work:
@@ -164,12 +215,28 @@ services.tally.executors.worker = {
 `program` and `stateDir` are paths on the worker. `identityFile` and
 `knownHostsFile` are paths on the coordinator.
 
-Provision the private key outside the world-readable Nix store, for example
-with an encrypted-secret module or a systemd credential. The host key is
-public and should be pinned in the declared known-hosts file:
+The private key described above must be readable by the coordinator account,
+but no broader. The host key is public and should be pinned in the declared
+known-hosts file:
 
 ```console
 worker.example.net ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA...
+```
+
+Obtain the candidate during provisioning, compare its fingerprint with the
+worker console or another trusted channel, then place the verified public line
+at `/etc/tally/worker-known-hosts`:
+
+```console
+$ ssh-keyscan -t ed25519 worker.example.net > worker-known-hosts.candidate
+$ ssh-keygen -lf worker-known-hosts.candidate
+```
+
+The file can safely be declared because it contains only a public host key:
+
+```nix
+environment.etc."tally/worker-known-hosts".source =
+  ./worker-known-hosts;
 ```
 
 tally does not read ambient SSH configuration or an agent. Its transport uses
@@ -274,10 +341,11 @@ with the rest of the host generation.
 For a forward deployment:
 
 1. build both host configurations and run their evaluation checks;
-2. deploy workers first, including the exact remote `program` and all argv
-   dependencies;
+2. deploy workers first—`sudo nixos-rebuild switch --flake .#worker`—including
+   the exact remote `program` and all argv dependencies;
 3. verify the worker user manager, pinned SSH probe, and writable `stateDir`;
-4. deploy the coordinator configuration;
+4. provision the coordinator's private key, then deploy it with
+   `sudo nixos-rebuild switch --flake .#coordinator`;
 5. inspect `tally query pools`, start one bounded canary, and follow it with
    `tally watch`; and
 6. verify its witness and receiving-side artifact before expanding admission.
@@ -286,6 +354,19 @@ Deploying the worker first prevents a new coordinator from selecting a helper
 or executable absent on the worker. Existing remote leases remain owned by the
 coordinator during a transport outage; tally retries rather than silently
 running the work locally.
+
+The first remote canary can be deliberately boring:
+
+```console
+$ sudo -iu tally
+$ export XDG_RUNTIME_DIR=/run/user/$(id -u)
+$ result="$(tally enqueue --pool worker-slot --executor worker \
+    --evidence exit:0 --wait -- /run/current-system/sw/bin/true)"
+$ tally query proof --task "$(printf '%s\n' "$result" | jq -r .task_uuid)"
+```
+
+That proves pinned SSH, the worker user manager, remote unit execution,
+completion return, and coordinator witnessing before real argv are admitted.
 
 For rollback, first stop the relevant producer timers or otherwise quiesce new
 admission. Roll the coordinator back to a generation whose flow scripts and

@@ -271,7 +271,9 @@ Then verify on the worker:
 $ sudo -u tally-worker \
     XDG_RUNTIME_DIR=/run/user/$(id -u tally-worker) \
     systemctl --user is-active default.target
-$ systemctl --user list-units 'tally-job-*.service' --all
+$ sudo -u tally-worker \
+    XDG_RUNTIME_DIR=/run/user/$(id -u tally-worker) \
+    systemctl --user list-units 'tally-job-*.service' --all
 $ find /var/lib/tally-remote -maxdepth 2 -type f -print
 ```
 
