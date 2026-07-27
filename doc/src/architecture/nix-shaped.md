@@ -30,7 +30,8 @@ what happened.
 | successful realisation | a terminal witness verdict and its checked facts | The durable result says what was observed, including failure and uncertainty. |
 
 The argv claim is literal in the shipped executor: both the production systemd
-path and the narrow direct test backend construct a process from an argv array.
+path and the standalone/test direct fallback construct a process from an argv
+array. The daemon disables that fallback and requires durable systemd ownership.
 The built-in adapter called `shell` adds no shell by itself. If a caller wants
 shell language, it must say so in argv, for example `["/bin/sh", "-c", "..."]`.
 The [resolved payload fields](https://github.com/mecattaf/tally.nix/blob/4c85563a3899369f1aa4905f44e9806e424593f1/crates/tally-core/src/wire.rs#L375-L427)
@@ -42,8 +43,8 @@ rediscovered isomorphism. A process can exit zero while failing to produce a
 declared artifact or valid store path. The
 [evidence gate](https://github.com/mecattaf/tally.nix/blob/4c85563a3899369f1aa4905f44e9806e424593f1/crates/tally-core/src/evidence.rs#L378-L517)
 records that as a distinct failure, just as Nix rejects a builder that returns
-success without producing its declared output. Exit zero proves only that the
-program chose zero.
+success without producing its declared output, such as `$out`. Exit zero proves
+only that the program chose zero.
 
 The analogy must not be stretched into a reproducibility claim. Tally does not
 hash the internet, discover undeclared files read by an arbitrary program, or
@@ -121,6 +122,11 @@ The closest mappings are therefore:
 | remote SSH build | SSH executor with host-key pinning and a fixed remote helper |
 | daemon-held build lock | coordinator-held renewable lease, including across remote execution |
 
+This is a family resemblance, not a hidden build-machine algorithm. Tally does
+not probe advertised features or dynamically score executors by speed. A
+submission names its pools and, when remote placement is wanted, its executor;
+priority orders work rather than ranking hosts.
+
 Pools can model a resource ordinary CI queues usually leave implicit: a renewable
 five-hour subscription window. For example, an operator can declare a budget
 pool whose rolling `windowSec` is `18000` and whose `consumptionCap` is expressed
@@ -178,11 +184,12 @@ The default flow pool has capacity eight, not infinite or literally free.
 
 ## Generations govern automation
 
-For a declaratively configured flow, the Nix module turns the script and optional
-catalog into store paths in the producer's literal argv. The runner hashes the
-script bytes before execution; the daemon records that `scriptHash` for the run,
-and a later invocation with different bytes fails as `script-changed-mid-run`.
-Together these mechanisms give orchestration a generation:
+For a declaratively configured scheduled flow—one with `onCalendar` set—the Nix
+module turns the script and optional catalog into store paths in the producer's
+literal argv. The runner hashes the script bytes before execution; the daemon
+records that `scriptHash` for the run, and a later invocation with different
+bytes fails as `script-changed-mid-run`. Together these mechanisms give
+orchestration a generation:
 
 - the active NixOS or Home Manager generation selects the flow script;
 - rollback selects the previous store-pinned script along with the rest of the
@@ -193,9 +200,10 @@ Together these mechanisms give orchestration a generation:
 
 The guarantee is narrower than “every invocation is pinned.” `tally flow run
 ./local-script.js` remains a valid manual command and accepts an ordinary path.
-Store pinning and system rollback govern flows registered through
-`services.tally.flows`; the CLI does not silently copy arbitrary scripts into the
-store. Hash pinning still prevents one existing run from changing scripts midway.
+Store pinning and system rollback govern scheduled producers rendered from
+`services.tally.flows`; the CLI does not silently copy arbitrary scripts into
+the store. Hash pinning still prevents one existing run from changing scripts
+midway.
 
 ## Isolation by composition
 
@@ -219,6 +227,7 @@ fail-closed transport, the standard cross-host evidence reply, and no forwarded
 tally socket from which the guest could enqueue children.
 
 That final separation is the recurring design rule. Nix owns pure construction
-and system generations. Producers own intent. Tally owns bounded admission,
-controlled execution, and the durable proof of what the impure program actually
-did.
+and system generations. Callers and jobs originate intent; tally itself never
+does. Job-originated work returns through the same bounded, witnessed admission
+as every other submission. Tally owns controlled execution and the durable proof
+of what the impure program actually did.
