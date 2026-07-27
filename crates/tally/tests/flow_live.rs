@@ -6,6 +6,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
+use chrono::Utc;
 use serde_json::{json, Value};
 use tally_client::RpcClient;
 use tally_core::adapters::{AdapterConfig, ScrapeCapture, ScrapeMode, ScrapeStream};
@@ -24,6 +25,7 @@ use tally_core::taskdb::{
     read_acknowledged_events, related_trigger_from_gh_origin, EnqueueSource, GhContextSnapshot,
     GhItemState, GhItemType, GhTriggeringComment, GH_CONTEXT_SCHEMA_VERSION,
 };
+use tally_core::view::rebuild_taskchampion_view;
 use tally_core::wire::EnqueuePayload;
 use tally_core::witness::read_verified_records;
 use tokio::process::{Child, Command};
@@ -37,6 +39,7 @@ const DIVERGENT_RUN: &str = "00000000-0000-4000-8000-000000000504";
 const DRV_BUILD_RUN: &str = "00000000-0000-4000-8000-000000000505";
 const DRV_SUBSTITUTE_RUN: &str = "00000000-0000-4000-8000-000000000506";
 const STRUCTURED_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000507";
+const UNTYPED_RESULT_RUN: &str = "00000000-0000-4000-8000-000000000508";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -427,6 +430,34 @@ export const meta = {
       additionalProperties: false
     },
     label: "structured-result"
+  });
+  return node.result;
+})()
+"#
+}
+
+fn untyped_result_source() -> &'static str {
+    r#"
+export const meta = {
+  name: "untyped-result",
+  description: "live adapter result is observed without a result schema",
+  pools: ["alpha"],
+  argsSchema: { type: "object", additionalProperties: false },
+  selectors: [],
+  maxNodes: 1
+};
+
+(async () => {
+  const node = await job({
+    argv: [
+      "/bin/sh",
+      "-c",
+      "printf '%s\n' '{\"final_message\":\"{\\\"answer\\\":42}\"}'"
+    ],
+    adapter: "structured",
+    pools: ["alpha"],
+    evidence: ["exit:0"],
+    label: "untyped-result"
   });
   return node.result;
 })()
@@ -1242,6 +1273,19 @@ async fn structured_result_is_observed_after_terminal_ack_and_replayed_after_res
             );
             daemon.stop().await;
 
+            let rebuilt = rebuild_taskchampion_view(
+                &daemon_paths.state_dir,
+                &daemon_paths.data_dir,
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(rebuilt.rows, 1);
+            let capture_dir = daemon_paths.state_dir.join("capture");
+            if capture_dir.exists() {
+                fs::remove_dir_all(capture_dir).unwrap();
+            }
+
             let restarted = start_daemon(&daemon_paths, config).await;
             let replay = runner(
                 &config_path,
@@ -1272,6 +1316,61 @@ async fn structured_result_is_observed_after_terminal_ack_and_replayed_after_res
                 "result replay must not materialize a second row"
             );
             restarted.stop().await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn untyped_final_message_is_observed_after_terminal_ack() {
+    let _environment = ENVIRONMENT_LOCK.lock().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = config();
+            config.adapters.insert(
+                "structured".to_owned(),
+                AdapterConfig {
+                    scrape: BTreeMap::from([(
+                        "finalMessage".to_owned(),
+                        ScrapeCapture {
+                            stream: ScrapeStream::Stdout,
+                            mode: ScrapeMode::JsonPath,
+                            pattern: "$..final_message".to_owned(),
+                        },
+                    )]),
+                    ..AdapterConfig::default()
+                },
+            );
+            config.validate().unwrap();
+            let config_path = temp.path().join("config.json");
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let script = temp.path().join("untyped-result.js");
+            fs::write(&script, untyped_result_source()).unwrap();
+            let daemon_paths = paths(&temp.path().join("daemon"));
+
+            let daemon = start_daemon(&daemon_paths, config).await;
+            let output = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                UNTYPED_RESULT_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let output = runner_output(output).await;
+            assert!(
+                output.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                flow_report(&output)["report"]["finalValue"],
+                json!({"answer": 42})
+            );
+            daemon.stop().await;
         })
         .await;
 }

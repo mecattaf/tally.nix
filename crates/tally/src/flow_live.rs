@@ -1,6 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use tally_client::{RpcClient, WireErrorCode, WireIoError};
@@ -11,6 +11,7 @@ use tally_flow::{
     NodeResult, RunInspection, Verdict,
 };
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 const RECONNECT_DELAY: Duration = Duration::from_millis(50);
 const RESULT_PROJECTION_RETRY: Duration = Duration::from_millis(10);
@@ -30,6 +31,11 @@ struct ConnectionState {
     ever_connected: bool,
 }
 
+#[derive(Clone)]
+struct ResultProjectionExpectation {
+    adapter: String,
+}
+
 /// The live FS-5 binding for the deterministic flow engine.
 ///
 /// One `RpcClient` owns one Unix socket and multiplexes every concurrent request by
@@ -40,7 +46,9 @@ pub(crate) struct LiveFlowClient {
     max_frame_bytes: u64,
     runner: Mutex<RunnerIdentity>,
     connection: Mutex<ConnectionState>,
-    result_expected: Mutex<BTreeSet<(String, u32)>>,
+    final_message_adapters: BTreeSet<String>,
+    result_expected: Mutex<BTreeMap<(String, u32), ResultProjectionExpectation>>,
+    result_projection_timeout: Duration,
 }
 
 impl LiveFlowClient {
@@ -54,8 +62,19 @@ impl LiveFlowClient {
             max_frame_bytes,
             runner: Mutex::new(runner),
             connection: Mutex::new(ConnectionState::default()),
-            result_expected: Mutex::new(BTreeSet::new()),
+            final_message_adapters: BTreeSet::new(),
+            result_expected: Mutex::new(BTreeMap::new()),
+            result_projection_timeout: RESULT_PROJECTION_TIMEOUT,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_final_message_adapters(
+        mut self,
+        final_message_adapters: BTreeSet<String>,
+    ) -> Self {
+        self.final_message_adapters = final_message_adapters;
+        self
     }
 
     async fn resolve_runner_related_trigger(&self) -> Result<(), ClientError> {
@@ -119,12 +138,17 @@ impl LiveFlowClient {
     }
 
     async fn await_projected_result(&self, task_uuid: &str) -> Result<Option<Value>, ClientError> {
-        let deadline = Instant::now() + RESULT_PROJECTION_TIMEOUT;
+        let deadline = Instant::now() + self.result_projection_timeout;
         loop {
-            let response = self
-                .call("query.job", json!({"id": task_uuid}))
-                .await
-                .map_err(client_error)?;
+            let response = match tokio::time::timeout_at(
+                deadline,
+                self.call("query.job", json!({"id": task_uuid})),
+            )
+            .await
+            {
+                Ok(response) => response.map_err(client_error)?,
+                Err(_) => return Ok(None),
+            };
             require_query_envelope(&response)?;
             if let Some(message) = response
                 .get("job")
@@ -137,7 +161,7 @@ impl LiveFlowClient {
             if Instant::now() >= deadline {
                 return Ok(None);
             }
-            tokio::time::sleep(RESULT_PROJECTION_RETRY).await;
+            tokio::time::sleep_until(deadline.min(Instant::now() + RESULT_PROJECTION_RETRY)).await;
         }
     }
 
@@ -147,12 +171,29 @@ impl LiveFlowClient {
         attempt: u32,
     ) -> Result<(), ClientError> {
         let key = (result.task_uuid.clone(), attempt);
-        let expected = self.result_expected.lock().await.contains(&key);
-        if expected && result.verdict.is_pass() && result.result.is_none() {
-            result.result = self.await_projected_result(&result.task_uuid).await?;
-        }
-        if expected {
-            self.result_expected.lock().await.remove(&key);
+        let expectation = self.result_expected.lock().await.get(&key).cloned();
+        let projected = if expectation.is_some() && result.result.is_none() {
+            self.await_projected_result(&result.task_uuid).await
+        } else {
+            Ok(None)
+        };
+        if let Some(projected) = projected? {
+            result.result = Some(projected);
+        } else if let Some(expectation) = expectation.filter(|_| result.error.is_none()) {
+            result.error = Some(NodeFailure {
+                code: "result-projection-timeout".to_owned(),
+                message: format!(
+                    "configured finalMessage capture for adapter {:?} was not projected within {} ms",
+                    expectation.adapter,
+                    self.result_projection_timeout.as_millis()
+                ),
+                details: Some(json!({
+                    "adapter": expectation.adapter,
+                    "attempt": attempt,
+                    "taskUuid": result.task_uuid,
+                    "timeoutMs": self.result_projection_timeout.as_millis(),
+                })),
+            });
         }
         Ok(())
     }
@@ -240,22 +281,30 @@ impl FlowClient for LiveFlowClient {
         submission: FlowSubmission,
     ) -> FlowFuture<'a, Result<Admission, ClientError>> {
         Box::pin(async move {
-            let result_expected = submission.spec.result_schema.is_some();
+            let adapter = submission
+                .spec
+                .adapter
+                .clone()
+                .unwrap_or_else(|| "shell".to_owned());
+            let result_expected = self
+                .final_message_adapters
+                .contains(&adapter)
+                .then_some(ResultProjectionExpectation { adapter });
             let runner = self.runner.lock().await.clone();
             let payload = enqueue_payload(&submission, &runner)?;
             match self.call("queue.enqueue", payload).await {
                 Ok(response) => {
                     validate_recorded_script_identity(&response, &submission)?;
                     let mut admission = parse_admission(&response)?;
-                    if result_expected {
-                        self.result_expected
-                            .lock()
-                            .await
-                            .insert((admission.task_uuid.clone(), admission.attempt));
-                        if let Some(result) = &mut admission.terminal {
-                            self.enrich_terminal_result(result, admission.attempt)
-                                .await?;
-                        }
+                    if let Some(expectation) = result_expected {
+                        self.result_expected.lock().await.insert(
+                            (admission.task_uuid.clone(), admission.attempt),
+                            expectation,
+                        );
+                    }
+                    if let Some(result) = &mut admission.terminal {
+                        self.enrich_terminal_result(result, admission.attempt)
+                            .await?;
                     }
                     Ok(admission)
                 }
@@ -1218,6 +1267,49 @@ mod tests {
             RunnerIdentity::default(),
         );
         assert_eq!(client.socket, Path::new("/tmp/tally flow.sock"));
+    }
+
+    #[tokio::test]
+    async fn required_projection_timeout_bounds_a_blocked_query_and_names_the_capture() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, _write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            lines.next_line().await.unwrap().unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let mut client = LiveFlowClient::new(&socket, 16 * 1024 * 1024, RunnerIdentity::default());
+        client.result_projection_timeout = Duration::from_millis(40);
+        let task_uuid = "00000000-0000-4000-8000-000000000053";
+        client.result_expected.lock().await.insert(
+            (task_uuid.to_owned(), 1),
+            ResultProjectionExpectation {
+                adapter: "structured".to_owned(),
+            },
+        );
+        let mut result = NodeResult {
+            task_uuid: task_uuid.to_owned(),
+            verdict: Verdict::Pass,
+            exit_code: Some(0),
+            witness_seq: 1,
+            disposition: Disposition::Created,
+            result: None,
+            gates: None,
+            error: None,
+        };
+
+        let started = Instant::now();
+        client.enrich_terminal_result(&mut result, 1).await.unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        let error = result.error.unwrap();
+        assert_eq!(error.code, "result-projection-timeout");
+        assert!(error.message.contains("finalMessage"));
+        assert_eq!(error.details.unwrap()["adapter"], "structured");
+        server.abort();
     }
 
     #[tokio::test]

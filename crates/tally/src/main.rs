@@ -860,6 +860,17 @@ async fn run_flow(socket: &Path, config_path: Option<&Path>, command: FlowComman
             let max_frame_bytes = client_config
                 .as_ref()
                 .map_or(DEFAULT_MAX_FRAME_BYTES, |config| config.max_frame_bytes);
+            let final_message_adapters = client_config
+                .as_ref()
+                .map(|config| {
+                    config
+                        .adapters
+                        .iter()
+                        .filter(|(_, adapter)| adapter.scrape.contains_key("finalMessage"))
+                        .map(|(name, _)| name.clone())
+                        .collect()
+                })
+                .unwrap_or_default();
             if let Some(config) = client_config {
                 options.adapter_skill_revisions = config
                     .adapters
@@ -885,7 +896,10 @@ async fn run_flow(socket: &Path, config_path: Option<&Path>, command: FlowComman
                 run_script(
                     &source,
                     Some(&script),
-                    Rc::new(LiveFlowClient::new(socket, max_frame_bytes, runner)),
+                    Rc::new(
+                        LiveFlowClient::new(socket, max_frame_bytes, runner)
+                            .with_final_message_adapters(final_message_adapters),
+                    ),
                     Rc::new(JsonlLifecycleSink),
                     options,
                 )
