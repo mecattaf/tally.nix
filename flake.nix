@@ -2,6 +2,10 @@
   description = "tally: contention and proof for impure labor";
 
   inputs = {
+    advisory-db = {
+      url = "github:rustsec/advisory-db";
+      flake = false;
+    };
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     home-manager = {
@@ -13,6 +17,7 @@
   outputs =
     {
       self,
+      advisory-db,
       nixpkgs,
       flake-utils,
       home-manager,
@@ -40,6 +45,19 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+        advisoryDbRepository = pkgs.runCommand "tally-advisory-db" { nativeBuildInputs = [ pkgs.git ]; } ''
+          mkdir -p "$out"
+          cp -R ${advisory-db}/. "$out/"
+          chmod -R u+w "$out"
+          git init --quiet "$out"
+          git -C "$out" add --all
+          GIT_AUTHOR_DATE="@${toString advisory-db.lastModified}" \
+            GIT_COMMITTER_DATE="@${toString advisory-db.lastModified}" \
+            git -C "$out" \
+              -c user.name=tally-release-gate \
+              -c user.email=tally-release-gate@invalid \
+              commit --quiet --message="Pinned RustSec advisory database ${advisory-db.rev}"
+        '';
         adapterConfig = pkgs.writeText "tally-adapter-config.json" (
           builtins.toJSON {
             pools = { };
@@ -2898,9 +2916,13 @@
               '';
         };
         devShells.default = pkgs.mkShell {
+          TALLY_ADVISORY_DB_REPOSITORY = advisoryDbRepository;
+          TALLY_ADVISORY_DB_REVISION = advisory-db.rev;
           packages = with pkgs; [
             cargo
+            cargo-deny
             clippy
+            git
             jq
             mdbook
             mdbook-linkcheck2
