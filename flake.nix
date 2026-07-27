@@ -570,6 +570,17 @@
             exec ${pkgs.bash}/bin/bash ${./doc/publish.sh} ${documentation} "$@"
           '';
         };
+        agencyNightlyDriver = pkgs.writeShellApplication {
+          name = "agency-nightly-driver";
+          runtimeInputs = [
+            pkgs.gh
+            pkgs.git
+            pkgs.python3
+          ];
+          text = ''
+            exec ${pkgs.python3}/bin/python3 ${./examples/flows/agency_nightly_driver.py} "$@"
+          '';
+        };
         catalogFixtureInput = import ./test/fixtures/catalog/valid.nix;
         catalogFixtureUnchecked = catalogLibrary.renderCatalog (
           catalogFixtureInput
@@ -3055,6 +3066,7 @@
         packages = {
           inherit tally;
           doc = documentation;
+          agency-nightly-driver = agencyNightlyDriver;
           tally-witness-emit = tallyWitnessEmit;
           default = tally;
         };
@@ -3124,6 +3136,21 @@
                   --args "$(cat ${exampleArgs.pooled-review})" --catalog ${catalogFixture} >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/worklist-fanout.js} \
                   --args "$(cat ${exampleArgs.worklist-fanout})" >/dev/null
+                touch "$out"
+              '';
+          agency-nightly-driver =
+            pkgs.runCommand "tally-agency-nightly-driver"
+              {
+                nativeBuildInputs = [
+                  pkgs.git
+                  pkgs.python3
+                ];
+                AGENCY_NIGHTLY_DRIVER = ./examples/flows/agency_nightly_driver.py;
+              }
+              ''
+                export HOME="$TMPDIR/home"
+                mkdir -p "$HOME"
+                ${pkgs.python3}/bin/python3 ${./test/agency_nightly_driver_test.py}
                 touch "$out"
               '';
           flow-dialect-reject-nonliteral-meta = flowNonliteralFailure;

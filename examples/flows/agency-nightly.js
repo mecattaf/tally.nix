@@ -357,6 +357,7 @@ function reviewPrompt(task, workspace, implementation) {
         },
         checkout: args.checkout,
         baseRev: args.baseRev,
+        baseBranch: args.baseBranch,
         worktreeRoot: args.worktreeRoot,
         branchPrefix: args.branchPrefix,
         maxWaveSize: args.maxWaveSize
