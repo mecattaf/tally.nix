@@ -54,7 +54,8 @@ rebuildable view. The current ruling is recorded in [`doc/witness.md`](../doc/wi
   [`doc/src/conventions.md`](../doc/src/conventions.md), and the repository
   [`README`](../README.md).
 
-- Architecture and rationale (#70): pending.
+- Architecture and rationale (#70): absorbed by the three book pages under
+  `doc/src/architecture/`; the transfer briefs remain here as cited provenance.
 
 ## Remaining known divergences (legacy vs current implementation)
 
