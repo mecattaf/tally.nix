@@ -2202,6 +2202,7 @@
                 test "$(printf '%s' "$drv_meta" | jq -r '.name')" = fixture-valid-drv
                 test "$(printf '%s' "$drv_meta" | jq -c '.pools')" = '[]'
                 for example in \
+                  ${./examples/flows/academic-ocr.js} \
                   ${./examples/flows/agency-nightly.js} \
                   ${./examples/flows/fleet-deploy.js} \
                   ${./examples/flows/monthly-review.js} \
