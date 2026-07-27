@@ -32,7 +32,9 @@ rebuildable view. The current ruling is recorded in [`doc/witness.md`](../doc/wi
 - Book infrastructure (#63): the checked mdBook, fixed navigation, and direct Pages path are
   present; this infrastructure step absorbs no legacy subject matter.
 
-- Generated options (#65): pending.
+- Generated options (#65): the shared core, Home Manager, and NixOS references are generated
+  from the evaluated module schema during every book build; the wrapper-topology boundary and
+  exact flow evaluation failures are documented alongside them.
 
 - Intro, Getting started, and Concepts (#66): pending.
 

@@ -186,11 +186,155 @@
           '';
           meta.mainProgram = "tally";
         };
+        optionsJson = optionsDoc: "${optionsDoc.optionsJSON}/share/doc/nixos/options.json";
+        transformTallyOption =
+          option:
+          let
+            root = toString ./.;
+            transformed = option // {
+              declarations = map (
+                declaration:
+                let
+                  declarationString = toString declaration;
+                  relative = pkgs.lib.removePrefix root declarationString;
+                in
+                if pkgs.lib.hasPrefix root declarationString then
+                  {
+                    name = "tally.nix${relative}";
+                    url = "https://github.com/mecattaf/tally.nix/blob/main${relative}";
+                  }
+                else
+                  declaration
+              ) option.declarations;
+            };
+          in
+          if pkgs.lib.hasPrefix "_module." option.name then
+            transformed // { internal = true; }
+          else if option.name == "services.tally.producers.<name>.kind" then
+            builtins.removeAttrs (
+              transformed
+              // {
+                type = "one of \"calendar\", \"events-dir\", \"gh\", \"build-effect\", or \"pool-reachability\"";
+                example = pkgs.lib.literalExpression ''"calendar"'';
+                description = ''
+                  Required discriminator selecting this producer's field set.
+                  There is no producer-level default: every registry entry must
+                  name one of the five supported kinds explicitly.
+                '';
+              }
+            ) [ "default" ]
+          else if option.name == "services.tally.producers.<name>.pollIntervalSec" then
+            transformed
+            // {
+              description = ''
+                Polling interval in seconds. This controls GitHub intake for a
+                "gh" producer and the event-directory timer for an
+                "events-dir" producer.
+              '';
+            }
+          else if option.name == "services.tally.producers.<name>.enqueue" then
+            transformed
+            // {
+              description = ''
+                Job payload emitted by a "calendar" producer at each firing or
+                by a "gh" producer for each accepted trigger.
+              '';
+            }
+          else
+            transformed;
+        producerOptionsDoc = builtins.foldl' (
+          accumulated: producerType:
+          let
+            evaluated = pkgs.lib.evalModules {
+              modules = [
+                {
+                  options.services.tally.producers = pkgs.lib.mkOption {
+                    type = pkgs.lib.types.attrsOf producerType;
+                    default = { };
+                    description = "Producer registry.";
+                  };
+                }
+              ];
+            };
+          in
+          pkgs.nixosOptionsDoc {
+            inherit (evaluated) options;
+            transformOptions = transformTallyOption;
+            baseOptionsJSON = if accumulated == null then null else optionsJson accumulated;
+            variablelistId = "tally-producer-options";
+          }
+        ) null (builtins.attrValues moduleCommon.producerTypesForDocumentation);
+        tallyCoreOptions = pkgs.lib.evalModules {
+          modules = [
+            {
+              options.services.tally = moduleCommon.mkOptions {
+                defaultPackage = tally;
+                defaultDataDir = "/var/lib/tally/data";
+                defaultStateDir = "/var/lib/tally/state";
+              };
+            }
+          ];
+        };
+        onlyTallyOptions = options: {
+          services.tally = options.services.tally;
+        };
+        mkTallyOptionsDoc =
+          {
+            options,
+            variablelistId,
+          }:
+          pkgs.nixosOptionsDoc {
+            options = onlyTallyOptions options;
+            transformOptions = transformTallyOption;
+            baseOptionsJSON = optionsJson producerOptionsDoc;
+            inherit variablelistId;
+          };
+        coreOptionsDoc = mkTallyOptionsDoc {
+          options = tallyCoreOptions.options;
+          variablelistId = "tally-core-options";
+        };
+        homeManagerOptionsEvaluation = home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            self.homeManagerModules.tally
+            {
+              home = {
+                username = "tally-doc";
+                homeDirectory = "/var/empty/tally-doc";
+                stateVersion = "26.11";
+              };
+            }
+          ];
+        };
+        nixosOptionsEvaluation = pkgs.lib.evalModules {
+          specialArgs = { inherit pkgs; };
+          modules = [
+            self.nixosModules.tally
+            (
+              { lib, ... }:
+              {
+                config._module.check = false;
+                options._module.args = lib.mkOption {
+                  internal = true;
+                };
+              }
+            )
+          ];
+        };
+        homeManagerOptionsDoc = mkTallyOptionsDoc {
+          options = homeManagerOptionsEvaluation.options;
+          variablelistId = "tally-home-manager-options";
+        };
+        nixosOptionsDoc = mkTallyOptionsDoc {
+          options = nixosOptionsEvaluation.options;
+          variablelistId = "tally-nixos-options";
+        };
         documentation = pkgs.stdenvNoCC.mkDerivation {
           pname = "tally-doc";
           version = "0.1.0";
           src = ./doc;
           nativeBuildInputs = [
+            pkgs.jq
             pkgs.mdbook
             pkgs.mdbook-linkcheck2
           ];
@@ -199,6 +343,62 @@
           dontConfigure = true;
           buildPhase = ''
             runHook preBuild
+
+            generated_pages=(
+              src/configuration/core-options.md
+              src/configuration/home-manager-options.md
+              src/configuration/nixos-options.md
+            )
+            for page in "''${generated_pages[@]}"; do
+              if [ -e "$page" ]; then
+                echo "generated options page must not be checked in: $page" >&2
+                exit 1
+              fi
+            done
+
+            chmod u+w src/configuration
+            {
+              cat generated/core-options-intro.md
+              printf '\n'
+              cat ${coreOptionsDoc.optionsCommonMark}
+            } > src/configuration/core-options.md
+            {
+              cat generated/home-manager-options-intro.md
+              printf '\n'
+              cat ${homeManagerOptionsDoc.optionsCommonMark}
+            } > src/configuration/home-manager-options.md
+            {
+              cat generated/nixos-options-intro.md
+              printf '\n'
+              cat ${nixosOptionsDoc.optionsCommonMark}
+            } > src/configuration/nixos-options.md
+
+            core_json=${optionsJson coreOptionsDoc}
+            home_json=${optionsJson homeManagerOptionsDoc}
+            nixos_json=${optionsJson nixosOptionsDoc}
+            jq -S 'keys' "$core_json" > core-option-keys.json
+            jq -S 'keys' "$home_json" > home-option-keys.json
+            jq -S 'keys' "$nixos_json" > nixos-option-keys.json
+            cmp core-option-keys.json home-option-keys.json
+            cmp core-option-keys.json nixos-option-keys.json
+            jq -e '
+              all(to_entries[];
+                (.value.type | type == "string" and length > 0)
+                and (.value.description | type == "string" and length > 0)
+              )
+              and has("services.tally.producers.<name>.enqueue.gateManifest.requiredGateIds")
+              and has("services.tally.adapters.<name>.hardening")
+              and has("services.tally.transport.maxFrameBytes")
+              and has("services.tally.scheduling.agingThresholdSec")
+              and (
+                [
+                  keys[]
+                  | select(startswith("services.tally.flows.<name>."))
+                ]
+                | length == 12
+              )
+            ' "$core_json" >/dev/null
+
             ${pkgs.bash}/bin/bash ./check-summary.sh src
             mdbook build --dest-dir book
             runHook postBuild
