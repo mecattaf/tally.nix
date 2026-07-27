@@ -96,7 +96,6 @@ rsync \
   --exclude='/.git/' \
   "$artifact/" \
   "$pages_checkout/"
-printf '%s\n' "$source_commit" >"$pages_checkout/.tally-doc-source"
 
 git -C "$pages_checkout" config user.name "$source_author_name"
 git -C "$pages_checkout" config user.email "$source_author_email"
