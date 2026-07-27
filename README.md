@@ -88,5 +88,7 @@ $ nix flake check -L
 
 The flake exposes the `tally` package, NixOS and Home Manager modules, the
 checked mdBook as `packages.doc`, and its documentation check as `checks.doc`.
-There are intentionally no GitHub workflow files; release evidence comes from
-the fleet-side gate.
+There are intentionally no GitHub workflow files. A KVM fleet runs the full
+ladder for each exact pull-request head and posts the branch-protected external
+status `fleet/gate-ladder`; its linked `gate-evidence` transcript is the
+human-readable merge artifact.

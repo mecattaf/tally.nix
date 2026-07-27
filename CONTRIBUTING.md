@@ -70,21 +70,27 @@ The expected result is no output and grep exit 1.
 
 ## Merge verification
 
-This repository has no GitHub Actions workflows or GitHub-hosted checks. GitHub is used for
-issues, pull requests, and merges, never for verification. Before every merge, the implementing
-worker runs the authoritative gate ladder on this KVM-capable fleet host:
+This repository has no GitHub Actions workflows or GitHub-hosted checks. Verification runs on the
+KVM-capable fleet host, which posts the required external commit status `fleet/gate-ladder` for the
+exact pull-request head SHA. Branch protection is strict: GitHub refuses a stale, missing, red, or
+pending status. The implementing worker may reproduce the authoritative runner with:
 
 ```console
-$ env -u TALLY_TEST_REMOTE_HOST nix develop --command cargo test --workspace
-$ nix develop --command cargo clippy --workspace --all-targets -- -D warnings
-$ nix flake check -L
-$ grep -rn 'todo!\|unimplemented!\|TODO' crates/
+$ test/fleet-gate.sh "$(git rev-parse HEAD)"
 ```
 
-The `nix flake check -L` run must include the `flow-multi-host` coordinator-and-worker NixOS VM
-check. The no-stubs grep must produce no output and exit 1. The worker pastes the gate transcript
-into the pull request, and that transcript alone is the merge evidence. Nothing waits on, blocks
-on, or schedules a GitHub-hosted check because none exists.
+The runner starts from a pristine clone and disposable detached worktree. In order it runs
+`cargo fmt --all --check`, `env -u TALLY_TEST_REMOTE_HOST cargo test --workspace`, Clippy for all
+workspace targets and features with warnings denied, the dependency-policy stage, `nix flake
+check -L`, an evaluated-check assertion for the `flow-multi-host` VM, the no-stubs grep, the
+no-workflows assertion, and the changelog stage. Until their ratified policies land, dependency
+and changelog stages say **NOT RUN** in the transcript instead of pretending to pass.
+
+Each run commits `<sha>.log` to the dedicated `gate-evidence` branch. The green status links to
+that transcript; paste its tail into the pull request as human-readable evidence. The machine
+status is the blocking merge evidence. The repository's sole administrator retains a direct-push
+break-glass because `enforce_admins` is intentionally false, but ordinary pull-request merges must
+never use that bypass.
 
 ## Live-system tests
 
