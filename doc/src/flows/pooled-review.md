@@ -129,7 +129,7 @@ There is no `TALLY_FLOW_CATALOG` fallback. A manual invocation must therefore sa
 
 ```console
 $ tally flow run ./flows/pooled-review.js \
-    --flow-run-id pooled-review-manual-1 \
+    --flow-run-id 018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321 \
     --catalog "$catalog_path" \
     --args '{"subject":"the change under review","minimumValid":2}'
 ```
