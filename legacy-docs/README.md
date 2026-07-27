@@ -38,7 +38,11 @@ rebuildable view. The current ruling is recorded in [`doc/witness.md`](../doc/wi
 
 - Intro, Getting started, and Concepts (#66): pending.
 
-- Flows (#67): pending.
+- Flows (#67): absorbed by the book's [authoring](../doc/src/flows/authoring.md),
+  [dialect](../doc/src/flows/dialect.md), [host API](../doc/src/flows/host-api.md),
+  [replay](../doc/src/flows/submission-and-replay.md),
+  [pooled-review](../doc/src/flows/pooled-review.md), and
+  [cross-host handoff](../doc/src/flows/cross-host-handoff.md) chapters.
 
 - CLI, RPC, witness, and errors reference (#68): present in the book, including the advertised
   23-method wire table, current query protocol 4 and witness schema 2, offline verification,
