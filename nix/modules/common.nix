@@ -506,10 +506,8 @@ let
             "clippy"
           ];
           description = ''
-            Non-empty, unique gate IDs that an explicitly declared manifest
-            must contain exactly once. This field has no Nix default. The
-            daemon's separate codex and claude-code preset manifests use an
-            empty list when no manifest was declared.
+            Non-empty, unique gate IDs that this explicitly declared manifest
+            must contain exactly once. This field has no Nix default.
           '';
         };
         acceptancePolicy = mkOption {
@@ -577,12 +575,8 @@ let
           type = types.nullOr mkGateManifestType;
           default = null;
           description = ''
-            Optional explicit completion-artifact declaration. When this is
-            null, the durable enqueue carries no manifest. At execution time
-            only the adapters named "codex" and "claude-code" synthesize an
-            executor-owned manifest with no required gates and manual
-            acceptance; if its file is absent the gate status is "not-run",
-            not failure. Other adapter names receive no synthesized manifest.
+            Optional versioned completion-artifact declaration and acceptance
+            policy passed with this enqueue.
           '';
         };
         pool = mkOption {
@@ -1659,10 +1653,9 @@ let
           default = null;
           example = lib.literalExpression "./catalog.json";
           description = ''
-            Optional selector catalog whose schema is owned and validated by
-            tally. When non-null, the Home Manager runner passes the store path
-            exclusively as `--catalog <path>`; no catalog environment variable
-            is rendered. It is required only when meta declares selectors.
+            Optional selector catalog used by flow validation and execution.
+            It is required when meta declares selectors and may otherwise stay
+            null.
           '';
         };
         budgetPool = mkOption {

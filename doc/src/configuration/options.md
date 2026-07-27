@@ -38,13 +38,12 @@ weak-default pools:
 - `build`: `resource = "build-slot"`, capacity 2, cooperative enforcement, and no hard
   preemption.
 
-Flow scripts may not list either reserved name in `meta.pools`. The scheduled runner itself is
-always enqueued against exactly `["flow"]`.
-[`budgetPool`](home-manager-options.md#servicestallyflowsnamebudgetpool) is checked only to
-confirm that the named pool exists; it is not added to the runner or node pools and is not
-rendered through another channel. A non-null
-[`catalog`](home-manager-options.md#servicestallyflowsnamecatalog) is passed only through
-`--catalog <store-path>`.
+Flow scripts may not list either reserved name in `meta.pools`. The generated
+[`budgetPool`](home-manager-options.md#servicestallyflowsnamebudgetpool) and
+[`catalog`](home-manager-options.md#servicestallyflowsnamecatalog) entries cover their
+configuration validation. Runtime wiring is documented once in the CLI reference under
+[declarative runner pool and `budgetPool`](../operating/cli.md#declarative-runner-pool-and-budgetpool)
+and [catalog is flag-only](../operating/cli.md#catalog-is-flag-only).
 
 The generated flow entries are in the
 [Home Manager options](home-manager-options.md) and the wrapper-independent shape is in the
