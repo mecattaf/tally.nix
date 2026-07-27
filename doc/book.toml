@@ -1,0 +1,19 @@
+[book]
+authors = ["Thomas Mecattaf"]
+language = "en"
+src = "src"
+title = "tally"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+edit-url-template = "https://github.com/mecattaf/tally.nix/edit/main/doc/{path}"
+git-repository-url = "https://github.com/mecattaf/tally.nix"
+site-url = "/tally.nix/"
+
+[output.linkcheck2]
+follow-web-links = false
+traverse-parent-directories = false
+warning-policy = "error"
