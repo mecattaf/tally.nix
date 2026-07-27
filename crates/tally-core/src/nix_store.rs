@@ -314,21 +314,17 @@ fn require_success(program: &Path, output: &CommandOutput) -> Result<(), NixStor
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
 
-    fn executable(path: &Path, body: &str) {
-        fs::write(path, body).unwrap();
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    fn shell_program(path: &Path, body: &str) {
+        crate::test_support::install_shell_program(path, body);
     }
 
     #[test]
     fn validity_is_fail_closed_for_nonzero_and_spawn_failure() {
         let temp = tempfile::tempdir().unwrap();
         let failing = temp.path().join("failing-nix-store");
-        executable(&failing, "#!/bin/sh\nexit 7\n");
+        shell_program(&failing, "#!/bin/sh\nexit 7\n");
         let missing = temp.path().join("missing-nix");
         let store = NixStore::with_programs(failing, missing.clone());
         assert!(store

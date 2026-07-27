@@ -10050,7 +10050,7 @@ mod tests {
                 let program = temp.path().join("resumable-agent");
                 let started = temp.path().join("started");
                 let resumed = temp.path().join("resumed");
-                fs::write(
+                crate::test_support::install_shell_program(
                     &program,
                     format!(
                         concat!(
@@ -10066,9 +10066,7 @@ mod tests {
                         resumed.display(),
                         started.display(),
                     ),
-                )
-                .unwrap();
-                fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+                );
 
                 let mut config = two_pool_config();
                 config.pools.get_mut("slot").unwrap().auto_resume = Some(true);
@@ -10624,7 +10622,7 @@ mod tests {
                 let gh = temp.path().join("fake-gh");
                 let requests = temp.path().join("gh-requests.jsonl");
                 let calls = temp.path().join("gh-calls");
-                fs::write(
+                crate::test_support::install_shell_program(
                     &gh,
                     format!(
                         concat!(
@@ -10643,9 +10641,7 @@ mod tests {
                         requests.display(),
                         calls.display(),
                     ),
-                )
-                .unwrap();
-                fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+                );
                 daemon.handler.gh_program = gh;
 
                 let mut row = durable_row(Uuid::new_v4(), "gh:github:item-1", 1);
@@ -10996,7 +10992,7 @@ mod tests {
                 config.validate().unwrap();
 
                 let gh = temp.path().join("fake-gh-origin");
-                fs::write(
+                crate::test_support::install_shell_program(
                     &gh,
                     concat!(
                         "#!/bin/sh\n",
@@ -11011,9 +11007,7 @@ mod tests {
                         "  *) exit 91 ;;\n",
                         "esac\n",
                     ),
-                )
-                .unwrap();
-                fs::set_permissions(&gh, fs::Permissions::from_mode(0o700)).unwrap();
+                );
                 let engine =
                     ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir);
                 let outcomes = engine
@@ -11381,12 +11375,10 @@ mod tests {
                     data_dir: temp.path().join("data"),
                 };
                 let program = temp.path().join("resumable-agent");
-                fs::write(
+                crate::test_support::install_shell_program(
                     &program,
                     "#!/bin/sh\nprintf '%s\\n' '{\"thread_id\":\"session-28\"}'\n",
-                )
-                .unwrap();
-                fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+                );
                 let mut config = one_pool_config();
                 config.adapters.insert(
                     "resumable".to_owned(),
@@ -11517,8 +11509,7 @@ mod tests {
                 )
                 .unwrap();
                 let program = temp.path().join("successful-job");
-                fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
-                fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+                crate::test_support::install_shell_program(&program, "#!/bin/sh\nexit 0\n");
                 let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
@@ -11631,7 +11622,7 @@ mod tests {
                 };
                 let observed_path = temp.path().join("observed-manifest-path");
                 let program = temp.path().join("gate-aware-agent");
-                fs::write(
+                crate::test_support::install_shell_program(
                     &program,
                     format!(
                         concat!(
@@ -11644,9 +11635,7 @@ mod tests {
                         ),
                         observed_path.display(),
                     ),
-                )
-                .unwrap();
-                fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+                );
                 let mut config = one_pool_config();
                 config
                     .adapters
@@ -11742,7 +11731,7 @@ mod tests {
                     data_dir: temp.path().join("data"),
                 };
                 let program = temp.path().join("custom-agent");
-                fs::write(
+                crate::test_support::install_shell_program(
                     &program,
                     concat!(
                         "#!/bin/sh\n",
@@ -11757,9 +11746,7 @@ mod tests {
                         "printf '%s\\n' 'branch=adapter-test' >&2\n",
                         "sleep 0.1\n"
                     ),
-                )
-                .unwrap();
-                fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+                );
                 let mut config = one_pool_config();
                 let mut adapter = structured_adapter(&program);
                 adapter.trace = Some(AdapterTrace {
@@ -12222,16 +12209,14 @@ mod tests {
                     data_dir: temp.path().join("data"),
                 };
                 let program = temp.path().join("checkpoint-agent");
-                fs::write(
+                crate::test_support::install_shell_program(
                     &program,
                     concat!(
                         "#!/bin/sh\n",
                         "printf '%s\\n' '{\"event\":{\"session_id\":\"blocked-attestation\",\"model\":\"Exact/Blocked\",\"usage\":{\"tokens\":3}}}'\n",
                         "printf '%s\\n' 'branch=shutdown-test' >&2\n"
                     ),
-                )
-                .unwrap();
-                fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+                );
                 let mut config = one_pool_config();
                 config
                     .adapters
