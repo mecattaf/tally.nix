@@ -1562,6 +1562,9 @@ pub fn parse_rfc3339(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+
     use super::*;
     use crate::taskdb::EnqueueSource;
 
@@ -1749,6 +1752,97 @@ mod tests {
 
         let fourth = build_record(fully_populated_body(), &head).unwrap();
         vec![first, second, third, fourth]
+    }
+
+    fn generated_witness_chain(values: &[u64]) -> Vec<u8> {
+        let mut head = ChainHead::default();
+        let mut bytes = Vec::new();
+        for (ordinal, value) in values.iter().enumerate() {
+            let mut next = body();
+            next.task_uuid = Some(format!("b2c40001-0000-4000-8000-{ordinal:012x}"));
+            next.dedup_key = Some(format!("proptest:{ordinal}:{value}"));
+            let record = build_record(next, &head).unwrap();
+            bytes.extend(serde_json::to_vec(&record).unwrap());
+            bytes.push(b'\n');
+            head = ChainHead {
+                seq: record.seq,
+                hash: record.hash,
+            };
+        }
+        bytes
+    }
+
+    fn generated_attestation_chain(values: &[u64]) -> Vec<u8> {
+        let mut previous_hash = GENESIS_PREV_HASH.to_owned();
+        let mut bytes = Vec::new();
+        for (ordinal, value) in values.iter().enumerate() {
+            let mut record = AttestationRecord {
+                observed_at: "2026-07-27T00:00:00.000Z".to_owned(),
+                payload: serde_json::json!({"ordinal": ordinal, "value": value}),
+                seq: ordinal as u64 + 1,
+                prev_hash: previous_hash,
+                hash: String::new(),
+            };
+            record.hash = compute_hash_value(&serde_json::to_value(&record).unwrap()).unwrap();
+            bytes.extend(serde_json::to_vec(&record).unwrap());
+            bytes.push(b'\n');
+            previous_hash = record.hash;
+        }
+        bytes
+    }
+
+    proptest! {
+        #[test]
+        fn arbitrary_bytes_never_panic_chain_verification(
+            input in vec(any::<u8>(), 0..16_384),
+        ) {
+            let report = verify_reader(Cursor::new(input.as_slice()));
+            prop_assert!(report.records <= input.iter().filter(|byte| **byte == b'\n').count());
+
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("attestations.jsonl");
+            std::fs::write(&path, &input).unwrap();
+            let _ = verify_attestations(&path);
+        }
+
+        #[test]
+        fn every_single_byte_witness_mutation_is_detected(
+            values in vec(any::<u64>(), 1..=8),
+            mutation_offset in any::<usize>(),
+            mutation_mask in 1_u8..=u8::MAX,
+        ) {
+            let mut chain = generated_witness_chain(&values);
+            let original = verify_reader(Cursor::new(chain.as_slice()));
+            prop_assert!(original.ok, "generated chain was invalid: {:?}", original.problems);
+
+            let index = mutation_offset % chain.len();
+            chain[index] ^= mutation_mask;
+            let mutated = verify_reader(Cursor::new(chain.as_slice()));
+            prop_assert!(!mutated.ok, "mutation at byte {} was accepted", index);
+        }
+
+        #[test]
+        fn every_single_byte_attestation_mutation_is_detected(
+            values in vec(any::<u64>(), 1..=8),
+            mutation_offset in any::<usize>(),
+            mutation_mask in 1_u8..=u8::MAX,
+        ) {
+            let mut chain = generated_attestation_chain(&values);
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("attestations.jsonl");
+            std::fs::write(&path, &chain).unwrap();
+            let original = verify_attestations(&path).unwrap();
+            prop_assert!(original.ok, "generated attestation chain was invalid");
+
+            let index = mutation_offset % chain.len();
+            chain[index] ^= mutation_mask;
+            std::fs::write(&path, &chain).unwrap();
+            let detected = match verify_attestations(&path) {
+                Ok(report) => !report.ok,
+                Err(_) => true,
+            };
+            prop_assert!(detected, "mutation at byte {} was accepted", index);
+        }
     }
 
     #[test]
