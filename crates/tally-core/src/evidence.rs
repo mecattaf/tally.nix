@@ -46,10 +46,18 @@ impl FromStr for EvidenceCheck {
             EvidenceError::InvalidSpec(format!("evidence spec must be <kind>:<value>: {spec:?}"))
         })?;
         match kind {
-            "artifact" if !value.is_empty() => Ok(Self::Artifact(PathBuf::from(value))),
-            "artifact" => Err(EvidenceError::InvalidSpec(
+            "artifact" if value.is_empty() => Err(EvidenceError::InvalidSpec(
                 "artifact evidence requires a path".to_owned(),
             )),
+            "artifact" => {
+                let path = PathBuf::from(value);
+                if !path.is_absolute() {
+                    return Err(EvidenceError::InvalidSpec(
+                        "artifact evidence requires an absolute path".to_owned(),
+                    ));
+                }
+                Ok(Self::Artifact(path))
+            }
             "store" if crate::witness::is_nix_store_path(value) => {
                 Ok(Self::Store(PathBuf::from(value)))
             }
@@ -118,6 +126,11 @@ impl EvidenceSpec {
                 EvidenceCheck::Artifact(path) if path.to_str().is_none() => {
                     return Err(EvidenceError::InvalidSpec(
                         "artifact evidence paths must be valid UTF-8".to_owned(),
+                    ));
+                }
+                EvidenceCheck::Artifact(path) if !path.is_absolute() => {
+                    return Err(EvidenceError::InvalidSpec(
+                        "artifact evidence requires an absolute path".to_owned(),
                     ));
                 }
                 EvidenceCheck::Store(path)
@@ -857,6 +870,7 @@ mod tests {
 
         for invalid in [
             vec!["artifact:"],
+            vec!["artifact:relative/result.json"],
             vec!["hash:md5"],
             vec!["hash:sha256:short"],
             vec!["exit:not-a-number"],
@@ -868,6 +882,12 @@ mod tests {
             assert!(EvidenceSpec::parse(invalid).is_err());
         }
         assert!(EvidenceSpec::new(vec![EvidenceCheck::Artifact(PathBuf::new())]).is_err());
+        assert!(
+            EvidenceSpec::new(vec![EvidenceCheck::Artifact(PathBuf::from(
+                "relative/result.json",
+            ))])
+            .is_err()
+        );
         assert!(
             EvidenceSpec::new(vec![EvidenceCheck::Artifact(PathBuf::from(
                 std::ffi::OsString::from_vec(vec![0xff]),
