@@ -85,11 +85,13 @@ pub fn check_script(
         interner: &interner,
         meta: &meta,
         host_call_sites: Vec::new(),
+        literal_selector_calls: Vec::new(),
     };
     if let ControlFlow::Break(error) = module.visit_with(&mut lint) {
         return Err(error);
     }
     let host_call_sites = lint.host_call_sites;
+    let literal_selector_calls = lint.literal_selector_calls;
 
     if let Some(args) = options.args {
         validate_instance(
@@ -117,6 +119,10 @@ pub fn check_script(
         for selector in &meta.selectors {
             resolve_members(catalog, hash, selector, &SelectorOptions::default())
                 .map_err(|error| error.at_if_missing(export_location))?;
+        }
+        for call in &literal_selector_calls {
+            resolve_members(catalog, hash, &call.selector, &call.options)
+                .map_err(|error| error.at_if_missing(call.location))?;
         }
     }
 
@@ -433,6 +439,13 @@ struct DeterminismLint<'a> {
     interner: &'a Interner,
     meta: &'a Meta,
     host_call_sites: Vec<SourceLocation>,
+    literal_selector_calls: Vec<LiteralSelectorCall>,
+}
+
+struct LiteralSelectorCall {
+    selector: String,
+    options: SelectorOptions,
+    location: SourceLocation,
 }
 
 impl<'ast> Visitor<'ast> for DeterminismLint<'_> {
@@ -472,6 +485,15 @@ impl<'ast> Visitor<'ast> for DeterminismLint<'_> {
                                 .detail("selector", selector),
                             );
                         }
+                        if let Some(options) =
+                            literal_selector_options(call.args().get(1), self.interner)
+                        {
+                            self.literal_selector_calls.push(LiteralSelectorCall {
+                                selector,
+                                options,
+                                location: location(identifier.span()),
+                            });
+                        }
                     }
                 }
             }
@@ -508,6 +530,20 @@ impl<'ast> Visitor<'ast> for DeterminismLint<'_> {
         }
         call.visit_with(self)
     }
+}
+
+fn literal_selector_options(
+    expression: Option<&Expression>,
+    interner: &Interner,
+) -> Option<SelectorOptions> {
+    let Some(expression) = expression else {
+        return Some(SelectorOptions::default());
+    };
+    if !matches!(expression.flatten(), Expression::ObjectLiteral(_)) {
+        return None;
+    }
+    let value = literal_json(expression, interner).ok()?;
+    serde_json::from_value(value).ok()
 }
 
 fn banned_expression<'a>(
@@ -835,5 +871,88 @@ const x = args.task;
                 .code,
             "undeclared-pool"
         );
+    }
+
+    #[test]
+    fn literal_selector_cardinality_is_checked_against_the_catalog() {
+        let source =
+            format!("{VALID}\nmembers('pooled-fast', {{ count: 2, diversity: 'maker' }});");
+        let catalog: Catalog = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "members": [{
+                "id": "only-member",
+                "family": "fixture",
+                "maker": "fixture-maker",
+                "classes": ["pooled-fast"],
+                "adapter": "pi",
+                "pools": ["worker-gpu"],
+                "launch": {"model": "only-member"}
+            }]
+        }))
+        .unwrap();
+
+        let error = check_script(
+            &source,
+            None,
+            CheckOptions {
+                catalog: Some(&catalog),
+                catalog_hash: Some("sha256:fixture"),
+                ..CheckOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "selector-insufficient-members");
+        assert_eq!(error.details["selector"], "pooled-fast");
+        assert_eq!(error.details["requested"], 2);
+        assert_eq!(error.details["available"], 1);
+        assert_eq!(error.location, Some(SourceLocation::new(18, 1)));
+
+        let dynamic_options =
+            format!("{VALID}\nconst options = {{ count: 2 }};\nmembers('pooled-fast', options);");
+        check_script(
+            &dynamic_options,
+            None,
+            CheckOptions {
+                catalog: Some(&catalog),
+                catalog_hash: Some("sha256:fixture"),
+                ..CheckOptions::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn literal_selector_diversity_uses_runtime_validation() {
+        let source =
+            format!("{VALID}\nmembers('pooled-fast', {{ count: 1, diversity: 'vendor' }});");
+        let catalog: Catalog = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "members": [{
+                "id": "only-member",
+                "family": "fixture",
+                "maker": "fixture-maker",
+                "classes": ["pooled-fast"],
+                "adapter": "pi",
+                "pools": ["worker-gpu"],
+                "launch": {"model": "only-member"}
+            }]
+        }))
+        .unwrap();
+
+        let error = check_script(
+            &source,
+            None,
+            CheckOptions {
+                catalog: Some(&catalog),
+                catalog_hash: Some("sha256:fixture"),
+                ..CheckOptions::default()
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "selector-invalid-diversity");
+        assert_eq!(error.details["diversity"], "vendor");
+        assert_eq!(error.location, Some(SourceLocation::new(18, 1)));
     }
 }

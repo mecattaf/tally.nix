@@ -12,6 +12,11 @@ shape, applies the determinism lint, blanks only the `export` token to preserve
 source positions, and reparses the result as a Script. `args`, `meta`, and
 witnessed node results are the script-visible inputs.
 
+With `--catalog`, every declared selector must be nonempty. Direct `members()`
+calls whose selector and options are compatible literals are also resolved
+during the check, so their count and diversity constraints fail before a flow
+is activated. Calls assembled from runtime values remain runtime-validated.
+
 The globals are:
 
 - `job(spec, { settle })`
