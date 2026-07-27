@@ -22,10 +22,15 @@ Run the ordinary suite with no remote host selected:
 
 ```console
 $ env -u TALLY_TEST_REMOTE_HOST nix develop --command cargo test --workspace
-$ nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+$ nix develop --command cargo clippy --workspace --all-targets --all-features -- -D warnings
 $ nix develop --command cargo fmt --all --check
+$ nix develop --command test/cargo-deny.sh
 $ nix flake check -L
 ```
+
+`test/cargo-deny.sh` checks advisories, licenses, sources, and duplicate versions with Cargo in
+offline and locked mode. The development shell supplies the RustSec database revision pinned by
+the `advisory-db` flake input; refresh that input deliberately instead of fetching during the gate.
 
 Verify the good ledger and prove that the tampered ledger is rejected:
 
@@ -81,11 +86,10 @@ $ test/fleet-gate.sh "$(git rev-parse HEAD)"
 
 The runner starts from a pristine clone and disposable detached worktree. In order it runs
 `cargo fmt --all --check`, `env -u TALLY_TEST_REMOTE_HOST cargo test --workspace`, Clippy for all
-workspace targets and features with warnings denied, the dependency-policy stage, `nix flake
-check -L`, an evaluated-check assertion for the `flow-multi-host` VM, the no-stubs grep, the
-no-workflows assertion, and the changelog stage. Until their ratified policies land, dependency
-and changelog stages say **NOT RUN** in the transcript instead of pretending to pass. Once
-`CHANGELOG.md` exists, a pull request must touch it or carry the `no-changelog` label.
+workspace targets and features with warnings denied, the pinned offline dependency-policy stage,
+`nix flake check -L`, an evaluated-check assertion for the `flow-multi-host` VM, the no-stubs grep,
+the no-workflows assertion, and the changelog stage. The changelog stage says **NOT RUN** until
+`CHANGELOG.md` exists; after that, a pull request must touch it or carry the `no-changelog` label.
 
 Each run commits `<sha>.log` to the dedicated `gate-evidence` branch. The green status links to
 that transcript; paste its tail into the pull request as human-readable evidence. The machine
