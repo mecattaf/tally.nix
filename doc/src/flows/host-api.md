@@ -338,6 +338,12 @@ Each object includes `id`, `family`, `maker`, `classes`, `adapter`, `pools`,
 the selector, catalog hash, selected member ID, and the complete selected ID list.
 That provenance is what `local()` verifies.
 
+Resolution also emits a `selector-resolved` event to the runner's lifecycle
+stream before a selected member can be submitted. It contains the selector,
+options, catalog hash, and ordered member IDs. The event is runner capture rather
+than a new daemon RPC; the same resolution is persisted on every selected node
+through its orchestration `selection` object.
+
 Missing or undeclared classes, zero or excessive counts, unsupported diversity,
 and insufficient members are typed `FlowSelectorError`s. No catalog or an invalid
 catalog is `FlowCatalogError`. Literal calls are also checked during activation;

@@ -138,6 +138,14 @@ $ tally flow run ./flows/nightly.js \
     --max-nodes 20
 ```
 
+The explicit flag wins when present. Otherwise the runner takes `flowRunId` from
+its inherited `TALLY_TASK_UUID`; a job-launched runner requires that UUID and
+`TALLY_JOB_ID` together and uses them for child ancestry. Having neither identity
+source is `flow-run-id-missing` (exit 2); a malformed or half-present inherited
+identity also exits 2. After capturing identity, the CLI retains `TALLY_SOCKET`
+but removes other inherited `TALLY_*` variables before executing the script, so
+child tools cannot mistake the runner's identity for their own.
+
 ## Learn from the shipped flows
 
 The repository keeps its executable examples under `examples/flows/`, and the
