@@ -92,7 +92,7 @@ fi
 rsync \
   --archive \
   --delete \
-  --chmod=D=u+rwx,go+rx,F=u+rw,go+r \
+  --chmod=Du=rwx,Dgo=rx,Fu=rw,Fgo=r \
   --exclude='/.git/' \
   "$artifact/" \
   "$pages_checkout/"
