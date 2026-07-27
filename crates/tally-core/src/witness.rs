@@ -370,8 +370,8 @@ fn stable_canonical_value(value: &impl Serialize) -> Result<Value, WitnessError>
     Ok(normalized)
 }
 
-fn canonical_record_bytes(record: &WitnessRecord) -> Result<Vec<u8>, WitnessError> {
-    let encoded = serde_json::to_vec(record)?;
+fn canonical_record_bytes(raw: &Value) -> Result<Vec<u8>, WitnessError> {
+    let encoded = serde_json::to_vec(raw)?;
     let normalized: Value = serde_json::from_slice(&encoded)?;
     let canonical = serde_json::to_vec(&normalized)?;
     if canonical != encoded {
@@ -382,7 +382,10 @@ fn canonical_record_bytes(record: &WitnessRecord) -> Result<Vec<u8>, WitnessErro
     Ok(encoded)
 }
 
-pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord, WitnessError> {
+fn build_record_with_raw(
+    body: WitnessBody,
+    head: &ChainHead,
+) -> Result<(WitnessRecord, Value), WitnessError> {
     let mut pools = body.pools;
     crate::poolset::canonicalize(&mut pools)
         .map_err(|error| WitnessError::Corrupt(error.to_string()))?;
@@ -408,7 +411,7 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
             ));
         }
     }
-    let record = WitnessRecord {
+    let mut record = WitnessRecord {
         schema_version: WITNESS_SCHEMA_VERSION,
         record_type: RecordType::Verdict,
         transition_timestamp: body.transition_timestamp,
@@ -447,10 +450,17 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
     };
     let mut raw = stable_canonical_value(&record)?;
     let hash = compute_hash_value(&raw)?;
+    record.hash.clone_from(&hash);
     raw.as_object_mut()
         .expect("serialized witness record is an object")
         .insert("hash".to_owned(), Value::String(hash));
-    validate_record(&raw).map_err(|failure| WitnessError::Corrupt(failure.reason))
+    validate_record(&raw).map_err(|failure| WitnessError::Corrupt(failure.reason))?;
+    canonical_record_bytes(&raw)?;
+    Ok((record, raw))
+}
+
+pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord, WitnessError> {
+    build_record_with_raw(body, head).map(|(record, _)| record)
 }
 
 fn sha256_shape(value: &str) -> bool {
@@ -1301,8 +1311,8 @@ impl WitnessLedger {
             .map_err(|source| io_error(&self.path, source))?;
         let result = (|| {
             self.head = scan_head(&mut self.file, &self.path)?;
-            let record = build_record(body, &self.head)?;
-            let mut line = canonical_record_bytes(&record)?;
+            let (record, raw) = build_record_with_raw(body, &self.head)?;
+            let mut line = canonical_record_bytes(&raw)?;
             line.push(b'\n');
             self.file
                 .write_all(&line)
@@ -1780,10 +1790,11 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("witness.jsonl");
-        WitnessLedger::open(&path)
+        let record = WitnessLedger::open(&path)
             .unwrap()
             .append(observed)
             .unwrap();
+        assert_eq!(compute_hash(&record).unwrap(), record.hash);
 
         let report = verify_file(&path).unwrap();
         assert!(report.ok, "{:?}", report.problems);
