@@ -28,6 +28,15 @@ New `attrsOf mkFlowType` alongside pools/executors/producers/adapters in `mkOpti
 | `extraEnv` | attrsOf str | `{}` | non-`TALLY_`-prefixed (same rule as adapters, `common.nix` env assertion) |
 | `credentials` | attrsOf externalPath | `{}` | LoadCredential passthrough, as everywhere |
 
+`onCalendar` and `dedupKey` are intentionally orthogonal. The rendered calendar producer
+validates `dedupKey` as a strftime template, but tally does not infer a workload period from
+systemd's calendar expression or reject an explicitly chosen wider or narrower identity. The
+template is the authoritative period identity.
+
+`evidence` uses the ordinary producer evidence validator without a flow-specific policy layer.
+Artifact evidence paths must be absolute; invalid kinds, hashes, exit codes, duplicates, and
+paths make the checked configuration fail before activation.
+
 ### Rendering
 
 A flow with `onCalendar != null` renders as a **calendar producer** named `flow-<name>`
