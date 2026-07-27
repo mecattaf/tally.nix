@@ -186,6 +186,45 @@
           '';
           meta.mainProgram = "tally";
         };
+        documentation = pkgs.stdenvNoCC.mkDerivation {
+          pname = "tally-doc";
+          version = "0.1.0";
+          src = ./doc;
+          nativeBuildInputs = [
+            pkgs.mdbook
+            pkgs.mdbook-linkcheck2
+          ];
+          SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+          strictDeps = true;
+          dontConfigure = true;
+          buildPhase = ''
+            runHook preBuild
+            ${pkgs.bash}/bin/bash ./check-summary.sh src
+            mdbook build --dest-dir book
+            runHook postBuild
+          '';
+          installPhase = ''
+            runHook preInstall
+            mkdir -p "$out"
+            cp -R book/html/. "$out/"
+            runHook postInstall
+          '';
+          meta = {
+            description = "The checked tally documentation book";
+            license = pkgs.lib.licenses.mit;
+          };
+        };
+        documentationPublisher = pkgs.writeShellApplication {
+          name = "tally-publish-docs";
+          runtimeInputs = [
+            pkgs.coreutils
+            pkgs.git
+            pkgs.rsync
+          ];
+          text = ''
+            exec ${pkgs.bash}/bin/bash ${./doc/publish.sh} ${documentation} "$@"
+          '';
+        };
         catalogFixtureInput = import ./test/fixtures/catalog/valid.nix;
         catalogFixtureUnchecked = catalogLibrary.renderCatalog (
           catalogFixtureInput
@@ -2238,11 +2277,16 @@
       {
         packages = {
           inherit tally;
+          doc = documentation;
           tally-witness-emit = tallyWitnessEmit;
           default = tally;
         };
         apps = {
           default = flake-utils.lib.mkApp { drv = tally; };
+          publish-docs = {
+            type = "app";
+            program = "${documentationPublisher}/bin/tally-publish-docs";
+          };
           dev = {
             type = "app";
             program = "${pkgs.writeShellScript "tally-dev" ''
@@ -2252,6 +2296,7 @@
         };
         checks = {
           inherit tally;
+          doc = documentation;
           stock-home-activation = stockHome.activationPackage;
           stock-nixos-activation = stockNixos.config.system.build.toplevel;
           stock-host-activation = stockHostTest;
@@ -2606,6 +2651,8 @@
             cargo
             clippy
             jq
+            mdbook
+            mdbook-linkcheck2
             rustc
             rustfmt
             sqlite
