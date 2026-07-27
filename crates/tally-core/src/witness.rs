@@ -351,7 +351,35 @@ pub fn compute_hash_value(raw: &Value) -> Result<String, WitnessError> {
 }
 
 pub fn compute_hash(record: &WitnessRecord) -> Result<String, WitnessError> {
-    compute_hash_value(&serde_json::to_value(record)?)
+    compute_hash_value(&stable_canonical_value(record)?)
+}
+
+// Normalize producer-side numbers through the same Value parse used by verification.
+// serde_json's default float parser can otherwise shorten a duration-derived f64
+// differently when the persisted bytes are read back.
+fn stable_canonical_value(value: &impl Serialize) -> Result<Value, WitnessError> {
+    let encoded = serde_json::to_vec(value)?;
+    let normalized: Value = serde_json::from_slice(&encoded)?;
+    let canonical = serde_json::to_vec(&normalized)?;
+    let reparsed: Value = serde_json::from_slice(&canonical)?;
+    if serde_json::to_vec(&reparsed)? != canonical {
+        return Err(WitnessError::Corrupt(
+            "record cannot be encoded as stable compact canonical JSON".to_owned(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn canonical_record_bytes(record: &WitnessRecord) -> Result<Vec<u8>, WitnessError> {
+    let encoded = serde_json::to_vec(record)?;
+    let normalized: Value = serde_json::from_slice(&encoded)?;
+    let canonical = serde_json::to_vec(&normalized)?;
+    if canonical != encoded {
+        return Err(WitnessError::Corrupt(
+            "record producer generated non-canonical JSON".to_owned(),
+        ));
+    }
+    Ok(encoded)
 }
 
 pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord, WitnessError> {
@@ -380,7 +408,7 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
             ));
         }
     }
-    let mut record = WitnessRecord {
+    let record = WitnessRecord {
         schema_version: WITNESS_SCHEMA_VERSION,
         record_type: RecordType::Verdict,
         transition_timestamp: body.transition_timestamp,
@@ -417,10 +445,12 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
         prev_hash: head.hash.clone(),
         hash: String::new(),
     };
-    record.hash = compute_hash(&record)?;
-    let raw = serde_json::to_value(&record)?;
-    validate_record(&raw).map_err(|failure| WitnessError::Corrupt(failure.reason))?;
-    Ok(record)
+    let mut raw = stable_canonical_value(&record)?;
+    let hash = compute_hash_value(&raw)?;
+    raw.as_object_mut()
+        .expect("serialized witness record is an object")
+        .insert("hash".to_owned(), Value::String(hash));
+    validate_record(&raw).map_err(|failure| WitnessError::Corrupt(failure.reason))
 }
 
 fn sha256_shape(value: &str) -> bool {
@@ -1272,7 +1302,7 @@ impl WitnessLedger {
         let result = (|| {
             self.head = scan_head(&mut self.file, &self.path)?;
             let record = build_record(body, &self.head)?;
-            let mut line = serde_json::to_vec(&record)?;
+            let mut line = canonical_record_bytes(&record)?;
             line.push(b'\n');
             self.file
                 .write_all(&line)
@@ -1742,8 +1772,7 @@ mod tests {
     #[test]
     fn duration_derived_wall_clock_is_written_as_canonical_json() {
         let mut observed = body();
-        observed.wall_clock =
-            std::time::Duration::from_nanos(1_212_416_383).as_secs_f64();
+        observed.wall_clock = std::time::Duration::from_nanos(1_212_416_383).as_secs_f64();
         assert_eq!(
             serde_json::to_string(&observed.wall_clock).unwrap(),
             "1.2124163829999999"
@@ -1751,7 +1780,10 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("witness.jsonl");
-        WitnessLedger::open(&path).unwrap().append(observed).unwrap();
+        WitnessLedger::open(&path)
+            .unwrap()
+            .append(observed)
+            .unwrap();
 
         let report = verify_file(&path).unwrap();
         assert!(report.ok, "{:?}", report.problems);
