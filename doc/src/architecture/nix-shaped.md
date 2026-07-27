@@ -32,7 +32,7 @@ what happened.
 The argv claim is literal in the shipped executor: both the production systemd
 path and the narrow direct test backend construct a process from an argv array.
 The built-in adapter called `shell` adds no shell by itself. If a caller wants
-shell language, it must say so in argv, for example `['/bin/sh', '-c', '...']`.
+shell language, it must say so in argv, for example `["/bin/sh", "-c", "..."]`.
 The [resolved payload fields](https://github.com/mecattaf/tally.nix/blob/4c85563a3899369f1aa4905f44e9806e424593f1/crates/tally-core/src/wire.rs#L375-L427)
 and [direct process launch](https://github.com/mecattaf/tally.nix/blob/4c85563a3899369f1aa4905f44e9806e424593f1/crates/tally-core/src/executor.rs#L2879-L2920)
 are the executable contract.
@@ -59,6 +59,11 @@ substituted instead of rebuilt, and concurrent clients asking the daemon for the
 same derivation share one realisation rather than launching duplicate builders.
 Tally has the corresponding two paths, with an extra integrity check required by
 impure artifacts:
+
+This is at least a fifteen-year-old precedent, not a new scheduler trick. The
+[Nix 0.10 user guide](https://releases.nixos.org/nix/nix-0.10/manual/index.html)
+already documented that concurrent requests for the same derivation take a build
+lock: one process builds while the others wait or realise different derivations.
 
 1. A full submission combines `dedupKey` with a hash of its canonical resolved
    payload. If exactly one live job has both values, a new caller receives
@@ -122,15 +127,17 @@ pool whose rolling `windowSec` is `18000` and whose `consumptionCap` is expresse
 in the resource's native unit. A job must supply `consumptionEstimate`; admission
 accounts that estimate against the window, while completion can reconcile actual
 usage. This is a capability of the shipped `windowed-consumption` predicate, not
-a predeclared five-hour pool. The module defaults to a seven-day window, and the
-built-in usage feeder denominates its cap in tokens.
+a predeclared five-hour pool. The module defaults to a seven-day window.
 
 There are two current flow limits worth stating without designing their answers.
-Declaratively generated flow runners are always submitted to exactly `['flow']`.
-The `budgetPool` option is checked only for existence; despite the option's stale
-description, it adds no runner pool and creates no lease. There is consequently
-no sanctioned mechanism today for a flow to hold a workload mutex or budget lease
-for its whole run ([open question #107](https://github.com/mecattaf/tally.nix/issues/107)).
+Declaratively generated flow runners are always submitted to exactly `["flow"]`.
+The [producer renderer](https://github.com/mecattaf/tally.nix/blob/4c85563a3899369f1aa4905f44e9806e424593f1/nix/modules/common.nix#L2169-L2212)
+and [separate assertion](https://github.com/mecattaf/tally.nix/blob/4c85563a3899369f1aa4905f44e9806e424593f1/nix/modules/common.nix#L2302-L2312)
+make the boundary visible: `budgetPool` is checked only for existence; despite
+the option's stale description, it adds no runner pool and creates no lease.
+There is consequently no sanctioned mechanism today for a flow to hold a
+workload mutex or budget lease for its whole run
+([open question #107](https://github.com/mecattaf/tally.nix/issues/107)).
 Separately, a generic job can supply `consumptionEstimate`, but a flow node cannot;
 that means a node cannot currently enter a `windowed-consumption` pool
 ([open question #116](https://github.com/mecattaf/tally.nix/issues/116)). Neither
