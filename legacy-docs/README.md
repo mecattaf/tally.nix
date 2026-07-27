@@ -45,7 +45,10 @@ rebuildable view. The current ruling is recorded in [`doc/witness.md`](../doc/wi
   complete exit/error taxonomy, and the flag-only catalog plus existence-only `budgetPool`
   rulings.
 
-- Operating tally, FAQ, Conventions, and README landing page (#69): pending.
+- Operating tally, FAQ, Conventions, and README landing page (#69): absorbed into
+  [`doc/src/operating/`](../doc/src/operating/), [`doc/src/faq.md`](../doc/src/faq.md),
+  [`doc/src/conventions.md`](../doc/src/conventions.md), and the repository
+  [`README`](../README.md).
 
 - Architecture and rationale (#70): pending.
 
@@ -69,7 +72,7 @@ truth; the frozen legacy statements remain visible as provenance.
    reservation with the final in-place schema, inert predecessor archives, and the rebuildable
    TaskChampion view recorded in [`doc/witness.md`](../doc/witness.md).
 
-Additionally, `README.md`'s claim that tally "is not a workflow scheduler" predates the
-flow-era doctrine amendment (`FLOW-SPEC.md §1`: tally never *originates intent*;
-job-originated work passes the same admission, bounded and witnessed). The book's landing
-page states the amended doctrine.
+The former `README.md` claim that tally "is not a workflow scheduler" was retired by the
+flow-era doctrine amendment (`FLOW-SPEC.md §1`). The current
+[`README`](../README.md) states the narrower truth: tally never *originates intent*, while
+job-originated work passes the same bounded, witnessed admission door.
