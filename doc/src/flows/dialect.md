@@ -5,6 +5,10 @@ deterministic language features—objects, arrays, functions, promises, `async` 
 `await`—remain available. Sources of ambient state are removed, and all impure
 work crosses the [host API](host-api.md) as a tally node.
 
+The source is JavaScript, not TypeScript. The one `export const meta` declaration
+is parsed as a module prelude and then its `export` token is blanked; the remaining
+program is evaluated as a Script with no module loader.
+
 ## The literal `meta` block
 
 Every file has exactly one permitted export:
