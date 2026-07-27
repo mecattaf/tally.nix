@@ -23,6 +23,7 @@
       home-manager,
     }:
     let
+      supportedSystems = [ "x86_64-linux" ];
       adapterLibrary = import ./nix/lib/adapters.nix { lib = nixpkgs.lib; };
       catalogLibrary = import ./nix/lib/catalog.nix {
         lib = nixpkgs.lib;
@@ -41,7 +42,7 @@
       nixosModules.tally = import ./nix/modules/nixos.nix self;
       homeManagerModules.tally = import ./nix/modules/home-manager.nix self;
     }
-    // flake-utils.lib.eachDefaultSystem (
+    // flake-utils.lib.eachSystem supportedSystems (
       system:
       let
         pkgs = import nixpkgs { inherit system; };
@@ -58,6 +59,7 @@
               -c user.email=tally-release-gate@invalid \
               commit --quiet --message="Pinned RustSec advisory database ${advisory-db.rev}"
         '';
+        isLinux = pkgs.stdenv.hostPlatform.isLinux;
         adapterConfig = pkgs.writeText "tally-adapter-config.json" (
           builtins.toJSON {
             pools = { };
@@ -2567,9 +2569,6 @@
           nixfmt-check = nixfmtCheck;
           doc = documentation;
           stock-home-activation = stockHome.activationPackage;
-          stock-nixos-activation = stockNixos.config.system.build.toplevel;
-          stock-host-activation = stockHostTest;
-          retention-liveness-floor = retentionTest;
           module-layer = moduleContract;
           flow-dialect-accept =
             pkgs.runCommand "tally-flow-dialect-accept"
@@ -2705,7 +2704,6 @@
                   'qwen-a,qwen-b,llama-a,mistral-a,llama-b'
                 touch "$out"
               '';
-          flow-multi-host = flowMultiHostTest;
           bad-pool-rejected =
             assert !badPoolAttempt.success;
             pkgs.runCommand "tally-bad-pool-rejected" { } ''
@@ -2914,6 +2912,12 @@
                   | grep -Fx true >/dev/null
                 touch $out
               '';
+        }
+        // pkgs.lib.optionalAttrs isLinux {
+          stock-nixos-activation = stockNixos.config.system.build.toplevel;
+          stock-host-activation = stockHostTest;
+          retention-liveness-floor = retentionTest;
+          flow-multi-host = flowMultiHostTest;
         };
         devShells.default = pkgs.mkShell {
           TALLY_ADVISORY_DB_REPOSITORY = advisoryDbRepository;
