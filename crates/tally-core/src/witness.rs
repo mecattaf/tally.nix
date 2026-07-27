@@ -351,10 +351,41 @@ pub fn compute_hash_value(raw: &Value) -> Result<String, WitnessError> {
 }
 
 pub fn compute_hash(record: &WitnessRecord) -> Result<String, WitnessError> {
-    compute_hash_value(&serde_json::to_value(record)?)
+    compute_hash_value(&stable_canonical_value(record)?)
 }
 
-pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord, WitnessError> {
+// Normalize producer-side numbers through the same Value parse used by verification.
+// serde_json's default float parser can otherwise shorten a duration-derived f64
+// differently when the persisted bytes are read back.
+fn stable_canonical_value(value: &impl Serialize) -> Result<Value, WitnessError> {
+    let encoded = serde_json::to_vec(value)?;
+    let normalized: Value = serde_json::from_slice(&encoded)?;
+    let canonical = serde_json::to_vec(&normalized)?;
+    let reparsed: Value = serde_json::from_slice(&canonical)?;
+    if serde_json::to_vec(&reparsed)? != canonical {
+        return Err(WitnessError::Corrupt(
+            "record cannot be encoded as stable compact canonical JSON".to_owned(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn canonical_record_bytes(raw: &Value) -> Result<Vec<u8>, WitnessError> {
+    let encoded = serde_json::to_vec(raw)?;
+    let normalized: Value = serde_json::from_slice(&encoded)?;
+    let canonical = serde_json::to_vec(&normalized)?;
+    if canonical != encoded {
+        return Err(WitnessError::Corrupt(
+            "record producer generated non-canonical JSON".to_owned(),
+        ));
+    }
+    Ok(encoded)
+}
+
+fn build_record_with_raw(
+    body: WitnessBody,
+    head: &ChainHead,
+) -> Result<(WitnessRecord, Value), WitnessError> {
     let mut pools = body.pools;
     crate::poolset::canonicalize(&mut pools)
         .map_err(|error| WitnessError::Corrupt(error.to_string()))?;
@@ -417,10 +448,19 @@ pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord
         prev_hash: head.hash.clone(),
         hash: String::new(),
     };
-    record.hash = compute_hash(&record)?;
-    let raw = serde_json::to_value(&record)?;
+    let mut raw = stable_canonical_value(&record)?;
+    let hash = compute_hash_value(&raw)?;
+    record.hash.clone_from(&hash);
+    raw.as_object_mut()
+        .expect("serialized witness record is an object")
+        .insert("hash".to_owned(), Value::String(hash));
     validate_record(&raw).map_err(|failure| WitnessError::Corrupt(failure.reason))?;
-    Ok(record)
+    canonical_record_bytes(&raw)?;
+    Ok((record, raw))
+}
+
+pub fn build_record(body: WitnessBody, head: &ChainHead) -> Result<WitnessRecord, WitnessError> {
+    build_record_with_raw(body, head).map(|(record, _)| record)
 }
 
 fn sha256_shape(value: &str) -> bool {
@@ -1271,8 +1311,8 @@ impl WitnessLedger {
             .map_err(|source| io_error(&self.path, source))?;
         let result = (|| {
             self.head = scan_head(&mut self.file, &self.path)?;
-            let record = build_record(body, &self.head)?;
-            let mut line = serde_json::to_vec(&record)?;
+            let (record, raw) = build_record_with_raw(body, &self.head)?;
+            let mut line = canonical_record_bytes(&raw)?;
             line.push(b'\n');
             self.file
                 .write_all(&line)
@@ -1737,6 +1777,30 @@ mod tests {
             std::fs::read_to_string(fixture("valid.jsonl")).unwrap(),
             actual
         );
+    }
+
+    #[test]
+    fn duration_derived_wall_clock_is_written_as_canonical_json() {
+        let mut observed = body();
+        observed.wall_clock = std::time::Duration::from_nanos(1_212_416_383).as_secs_f64();
+        assert_eq!(
+            serde_json::to_string(&observed.wall_clock).unwrap(),
+            "1.2124163829999999"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("witness.jsonl");
+        let record = WitnessLedger::open(&path)
+            .unwrap()
+            .append(observed)
+            .unwrap();
+        assert_eq!(compute_hash(&record).unwrap(), record.hash);
+
+        let report = verify_file(&path).unwrap();
+        assert!(report.ok, "{:?}", report.problems);
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains(r#""wallClock":1.212416383,"#));
     }
 
     #[test]
