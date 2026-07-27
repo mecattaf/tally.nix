@@ -88,5 +88,6 @@ Inspect evidence, semantic completion, and canonical authority in one joined
 projection:
 
 ```console
-$ tally query proof --task "$task" | jq '{evidence, completion, canonical}'
+$ tally query proof --task "$task" |
+    jq '{status, evidence, completion: .witnessRecord.completion, canonicalVerdict: .witnessRecord.verdict, advisoryAttestations}'
 ```

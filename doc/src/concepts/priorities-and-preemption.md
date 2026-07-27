@@ -69,6 +69,6 @@ braiding, yield demand reconciliation, and hard-reclaim eligibility are in
 Compare queue order and current pool pressure together:
 
 ```console
-$ tally query jobs --pool local --state queued | jq '.items[] | {taskUuid, priority, parent, orchestration}'
+$ tally query jobs --pool local --state queued | jq '.items[] | {taskUuid, priority, parentTaskUuid, orchestration}'
 $ tally query pools | jq '.pools[] | select(.pool == "local")'
 ```

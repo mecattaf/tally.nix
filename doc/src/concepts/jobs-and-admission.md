@@ -89,5 +89,5 @@ the two admission rules described above.
 Inspect the job from the walkthrough without consulting the journal:
 
 ```console
-$ tally query job "$task" | jq '{taskUuid, argv, pool, priority, adapter, liveState, terminalVerdict}'
+$ tally query job "$task" | jq '.job | {taskUuid, argv, pool, priority, adapter, liveState, terminalVerdict}'
 ```
