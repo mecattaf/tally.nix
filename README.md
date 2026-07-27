@@ -86,7 +86,7 @@ remain provenance, not the current user manual.
 tally supports `x86_64-linux` only. That is the platform exercised by the full
 fleet gate and matches tally's systemd-based execution model.
 
-Project policy: [security](SECURITY.md).
+Project policy: [security](SECURITY.md) and [releasing](RELEASING.md).
 
 ## Development
 
