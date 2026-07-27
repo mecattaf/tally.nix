@@ -1,0 +1,6 @@
+#!/bin/sh
+case "${1:-}" in
+  --version) printf '1.6.17\n' ;;
+  await) exit 0 ;;
+  *) exit 64 ;;
+esac
