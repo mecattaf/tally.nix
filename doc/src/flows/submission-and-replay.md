@@ -32,10 +32,20 @@ The daemon also records two hashes:
   pools, adapter and options, workspace, evidence, runtime, resolved pool
   credentials, and the structured brief hash.
 
-The orchestration identity and `resultSchema` are deliberately outside the work
-payload hash. The former is recorded beside it; the latter is a runner-side
-projection check. Editing either in the source still changes `scriptHash` for an
-existing run.
+Admission metadata is deliberately outside the work payload hash. That includes
+the lookup key itself, priority, label, and orchestration fields such as
+`maxNodes`, prompt/skill revision, and selection; `resultSchema` is also excluded
+because it is a runner-side projection check. Editing any literal in the source
+still changes `scriptHash` for an existing run, but changing invocation data does
+not.
+
+In particular, a `flowRunId` pins source bytes—not `args`, catalog bytes, or the
+`--max-nodes` flag. Exact replay therefore requires the original invocation as an
+operator invariant. If changed arguments retain the same key but alter canonical
+work, the payload check catches them. If they derive a different author key, that
+different key can create another row instead of comparing with the old ordinal.
+Likewise, the daemon applies the `maxNodes` carried by each new submission, so a
+larger flag at a later frontier can enlarge the run without payload divergence.
 
 There is one sharp catalog consequence. Member-selection provenance—including
 `catalogHash`, selected member ID, and roster—is orchestration metadata, so it is
@@ -150,9 +160,10 @@ content-addressed Nix store path.
 
 If a same-run ordinal or flow-local key re-derives a different `payloadHash`, the
 runner reports both hashes, ordinal, and available labels, marks the replay error
-fatal, and admits nothing past that point. Common causes are changed `args`,
-changed adapter or pool configuration, changed resolved credentials, or deriving
-a spec from an unwitnessed input.
+fatal, and admits nothing past that point. Common causes are changed `args` that
+retain the key while feeding a canonical work field, changed adapter or pool
+configuration, changed resolved credentials, or deriving a spec from an
+unwitnessed input.
 
 Restore the original inputs and configuration, then replay. If the changed work is
 intentional, start a new run identity. Changing a key merely to evade the check
@@ -171,6 +182,8 @@ ordinal. This distinction is why raw keys should be rare and domain-specific.
 | Daemon restarted while runner waits | The client reconnects and re-awaits the exact attempt; recovered/adopted work supplies the terminal result. |
 | Script edited after any node exists | `script-changed-mid-run`, exit 20, before new admission. |
 | Same key, changed payload | Same-run identity: fatal `replay-divergence`, exit 20. Raw cross-run identity: `dedup-key-conflict`, exit 1. |
+| Arguments changed so an author-derived key also changes | The new key can create a second history at that ordinal; arguments are not independently pinned. Replay with the original arguments. |
+| `--max-nodes` increased on replay | The cap is orchestration metadata, not payload identity; a later new frontier can use the larger cap. |
 | Catalog changed, but selected work payload stayed byte-identical | Selection provenance is not payload identity; the prior node can reuse. Restore the original catalog before replaying. |
 | Prior artifact changed or vanished | Reuse is rejected with a drift reason and a fresh node is `created`. |
 | Prerequisite has a non-pass verdict | Default `await` rejects `terminal-failure`, exit 1, so dependent code is not run. Node settle mode returns the failed `NodeResult` for an explicit decision. |
