@@ -6,6 +6,9 @@ scenario_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 scenario="${1:-}"
 
 case "$scenario" in
+  fleet-conformance)
+    exec "${BASH:-bash}" "$scenario_dir/fleet-conformance.sh"
+    ;;
   fanout-guardrail)
     exec "${BASH:-bash}" "$scenario_dir/fanout-guardrail.sh"
     ;;
@@ -16,7 +19,7 @@ case "$scenario" in
     exec "${BASH:-bash}" "$scenario_dir/pool-vanished-return.sh"
     ;;
   *)
-    printf 'usage: %s {fanout-guardrail|slow-sqlite|pool-vanished/return}\n' "$0" >&2
+    printf 'usage: %s {fleet-conformance|fanout-guardrail|slow-sqlite|pool-vanished/return}\n' "$0" >&2
     exit 2
     ;;
 esac

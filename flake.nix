@@ -1419,6 +1419,10 @@
               "runuser -u tally -- env HOME=/var/lib/tally-coordinator "
               "XDG_RUNTIME_DIR=/run/user/1000"
             )
+            worker_user = (
+              "runuser -u tally-worker -- env HOME=/var/lib/tally-worker "
+              "XDG_RUNTIME_DIR=/run/user/1001"
+            )
             cli = (
               user
               + " ${tally}/bin/tally"
@@ -1465,6 +1469,33 @@
               + " query jobs --flow-run \"$(cat /tmp/tally-fs7-parent)\" "
               + "| jq -e '.items | length == 1 and .[0].executor == \"worker\"'"
             )
+            coordinator.succeed(
+              cli
+              + " query jobs --flow-run \"$(cat /tmp/tally-fs7-parent)\" "
+              + "| jq -er '.items[0].anchor' > /tmp/tally-fs7-child"
+            )
+            coordinator.succeed(
+              "epoch=/var/lib/tally-coordinator/.local/state/tally/lease_epoch; "
+              "grep -E '^[1-9][0-9]*$' \"$epoch\"; "
+              "cp \"$epoch\" /tmp/tally-fs7-old-epoch"
+            )
+            worker.succeed(
+              "unit=$("
+              + worker_user
+              + " systemctl --user list-units 'tally-job-*.service' "
+              + "--state=running --no-legend --plain "
+              + "| ${pkgs.gawk}/bin/awk 'NR == 1 { print $1 }'); "
+              + "test -n \"$unit\"; "
+              + "printf '%s\\n' \"$unit\" > /tmp/tally-fs7-worker-unit; "
+              + worker_user
+              + " systemctl --user show \"$unit\" --property=InvocationID --value "
+              + "> /tmp/tally-fs7-worker-invocation; "
+              + worker_user
+              + " systemctl --user show \"$unit\" --property=MainPID --value "
+              + "> /tmp/tally-fs7-worker-pid; "
+              + "grep -E '^[0-9a-f]{32}$' /tmp/tally-fs7-worker-invocation; "
+              + "grep -E '^[1-9][0-9]*$' /tmp/tally-fs7-worker-pid"
+            )
 
             coordinator.succeed(
               user
@@ -1484,6 +1515,47 @@
               + ")\" != \"$(cat /tmp/tally-fs7-old-daemon-pid)\""
             )
             coordinator.wait_until_succeeds("test -S /run/user/1000/tally/tally.sock")
+            coordinator.succeed(
+              "old=$(cat /tmp/tally-fs7-old-epoch); "
+              "current=$(cat /var/lib/tally-coordinator/.local/state/tally/lease_epoch); "
+              "test \"$current\" -eq \"$((old + 1))\""
+            )
+            coordinator.wait_until_succeeds(
+              cli
+              + " query jobs --flow-run \"$(cat /tmp/tally-fs7-parent)\" "
+              + "| jq -e --arg anchor \"$(cat /tmp/tally-fs7-child)\" "
+              + "--argjson epoch \"$(cat /tmp/tally-fs7-old-epoch)\" "
+              + "'.items | length == 1 and .[0].anchor == $anchor and "
+              + ".[0].executor == \"worker\" and .[0].liveState == \"running\" and "
+              + ".[0].currentAttempt == 1 and .[0].leaseEpoch == $epoch'"
+            )
+            coordinator.succeed(
+              "job=$(cat /tmp/tally-fs7-child); "
+              "epoch=$(cat /var/lib/tally-coordinator/.local/state/tally/lease_epoch); "
+              "jq -e --arg job \"$job\" --argjson epoch \"$epoch\" "
+              + "'select(.epoch == $epoch and .event.kind == \"granted\" and "
+              + ".event.grant.epoch == $epoch and .event.grant.jobId == $job)' "
+              + "/var/lib/tally-coordinator/.local/state/tally/lease-events.jsonl"
+            )
+            worker.succeed(
+              "unit=$(cat /tmp/tally-fs7-worker-unit); "
+              + worker_user
+              + " systemctl --user is-active --quiet \"$unit\"; "
+              + "test \"$("
+              + worker_user
+              + " systemctl --user show \"$unit\" --property=InvocationID --value"
+              + ")\" = \"$(cat /tmp/tally-fs7-worker-invocation)\"; "
+              + "test \"$("
+              + worker_user
+              + " systemctl --user show \"$unit\" --property=MainPID --value"
+              + ")\" = \"$(cat /tmp/tally-fs7-worker-pid)\"; "
+              + "test \"$("
+              + worker_user
+              + " systemctl --user list-units 'tally-job-*.service' "
+              + "--state=running --no-legend --plain "
+              + "| ${pkgs.gnugrep}/bin/grep -c '^tally-job-'"
+              + ")\" -eq 1"
+            )
 
             coordinator.succeed(
               user
