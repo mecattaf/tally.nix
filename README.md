@@ -13,6 +13,10 @@ The governing rule is:
 tally decides whether declared work may run now. It does not inspect the work's domain output,
 choose what work should happen next, or replace the program that already makes that choice.
 
+The checked documentation book is published at
+[mecattaf.github.io/tally.nix](https://mecattaf.github.io/tally.nix/); its source and local build
+instructions live in [`doc/`](doc/README.md).
+
 ## What tally is—and is not
 
 tally provides:
