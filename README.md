@@ -86,13 +86,15 @@ remain provenance, not the current user manual.
 tally supports `x86_64-linux` only. That is the platform exercised by the full
 fleet gate and matches tally's systemd-based execution model.
 
-Project policy: [security](SECURITY.md) and [releasing](RELEASING.md).
+Project policy: [security](SECURITY.md), [releasing](RELEASING.md),
+[changelog](CHANGELOG.md), and [dependency policy](deny.toml).
 
 ## Development
 
 ```console
 $ env -u TALLY_TEST_REMOTE_HOST nix develop --command cargo test --workspace
-$ nix develop --command cargo clippy --workspace --all-targets -- -D warnings
+$ nix develop --command cargo clippy --workspace --all-targets --all-features -- -D warnings
+$ nix develop --command test/cargo-deny.sh
 $ nix flake check -L
 ```
 
