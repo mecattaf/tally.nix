@@ -725,6 +725,7 @@
             args ? { },
             catalog ? null,
             maxNodes ? 1000,
+            flowOptions ? { },
             pools ? {
               build.resource = "build-slot";
               worker-gpu.resource = "vram";
@@ -754,9 +755,17 @@
                       catalog
                       maxNodes
                       ;
-                  };
+                  }
+                  // flowOptions;
                 };
               }
+              (
+                { config, ... }:
+                {
+                  config.services.tally.adapters = moduleCommon.adapterDefaults;
+                  config.services.tally.producers = moduleCommon.mkFlowProducers config.services.tally.flows;
+                }
+              )
             ];
           }).config.services.tally;
         flowValidCheckedConfig = moduleCommon.mkCheckedConfig (mkFlowConfig {
@@ -764,6 +773,40 @@
           args.task = "ship";
           catalog = catalogFixture;
         });
+        mkScheduledFlowConfig =
+          flowOptions:
+          mkFlowConfig {
+            script = ./test/fixtures/flows/valid.js;
+            args.task = "ship";
+            catalog = catalogFixture;
+            inherit flowOptions;
+          };
+        flowDedupTemplateFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-dedup-template-failure";
+          drv = moduleCommon.mkCheckedConfig (mkScheduledFlowConfig {
+            onCalendar = "monthly";
+            dedupKey = "monthly-review-%Q";
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            "dedupKey is not a valid strftime template"
+          ];
+        };
+        flowArtifactEvidenceFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-artifact-evidence-failure";
+          drv = moduleCommon.mkCheckedConfig (mkScheduledFlowConfig {
+            onCalendar = "monthly";
+            evidence = [
+              "exit:0"
+              "artifact:relative/monthly-review-receipt.json"
+              "hash:sha256"
+            ];
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            "artifact evidence requires an absolute path"
+          ];
+        };
         flowNonliteralFailure = pkgs.testers.testBuildFailure' {
           name = "tally-flow-nonliteral-meta-failure";
           drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
@@ -2169,6 +2212,17 @@
               '';
           flow-dialect-reject-nonliteral-meta = flowNonliteralFailure;
           flow-dialect-reject-banned-global = flowBannedGlobalFailure;
+          flow-scheduled-producer-validation =
+            pkgs.runCommand "tally-flow-scheduled-producer-validation"
+              {
+                dedupFailure = flowDedupTemplateFailure;
+                evidenceFailure = flowArtifactEvidenceFailure;
+              }
+              ''
+                test -e "$dedupFailure"
+                test -e "$evidenceFailure"
+                touch "$out"
+              '';
           flow-dialect-reject-bad-args-schema =
             pkgs.runCommand "tally-flow-dialect-reject-bad-args-schema"
               {
