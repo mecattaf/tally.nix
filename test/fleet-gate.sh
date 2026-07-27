@@ -182,6 +182,27 @@ run_cargo_deny_stage() {
   printf 'NOT RUN cargo deny check: the pinned dependency policy has not landed yet\n'
 }
 
+resolve_pull_request_metadata() {
+  local pull_json main_sha
+  pull_json="$(
+    github_api "repos/$gate_repo/commits/$gate_sha/pulls?per_page=100" \
+      --jq "[.[] | select(.state == \"open\" and .head.sha == \"$gate_sha\")][0] // {}"
+  )"
+  gate_pr_number="$(jq -r '.number // empty' <<<"$pull_json")"
+  gate_base_sha="$(jq -r '.base.sha // empty' <<<"$pull_json")"
+  gate_no_changelog_label="$(
+    jq -r 'any(.labels[]?; .name == "no-changelog")' <<<"$pull_json"
+  )"
+  gate_is_main_audit=false
+
+  if [[ -z "$gate_pr_number" ]]; then
+    main_sha="$(github_api "repos/$gate_repo/commits/main" --jq .sha)"
+    if [[ "$main_sha" == "$gate_sha" ]]; then
+      gate_is_main_audit=true
+    fi
+  fi
+}
+
 run_changelog_stage() {
   printf '\n==> changelog policy\n'
   if [[ ! -f CHANGELOG.md ]]; then
@@ -189,7 +210,31 @@ run_changelog_stage() {
     return
   fi
 
-  printf 'FAIL CHANGELOG.md exists but this runner has no ratified label-aware policy yet\n' >&2
+  if [[ "$gate_is_main_audit" == true ]]; then
+    printf 'PASS changelog policy was enforced on the pull-request head before this main audit\n'
+    return
+  fi
+  if [[ -z "$gate_pr_number" ]] || [[ -z "$gate_base_sha" ]]; then
+    printf 'FAIL CHANGELOG.md exists but no open pull request contains this head SHA\n' >&2
+    return 1
+  fi
+  if [[ "$gate_no_changelog_label" == true ]]; then
+    printf 'PASS PR #%s carries the no-changelog label\n' "$gate_pr_number"
+    return
+  fi
+  git cat-file -e "$gate_base_sha^{commit}" \
+    || {
+      printf 'FAIL PR #%s base SHA is not present: %s\n' "$gate_pr_number" "$gate_base_sha" >&2
+      return 1
+    }
+  if git diff --name-only "$gate_base_sha...$gate_sha" -- CHANGELOG.md | grep -Fx CHANGELOG.md \
+    >/dev/null; then
+    printf 'PASS PR #%s touches CHANGELOG.md\n' "$gate_pr_number"
+    return
+  fi
+
+  printf 'FAIL PR #%s neither touches CHANGELOG.md nor carries no-changelog\n' \
+    "$gate_pr_number" >&2
   return 1
 }
 
@@ -296,6 +341,7 @@ set +e
   set -e
   prepare_pristine_clone
   create_disposable_worktree
+  resolve_pull_request_metadata
   run_ladder
 ) 2>&1 | tee "$transcript"
 ladder_status="${PIPESTATUS[0]}"

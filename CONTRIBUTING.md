@@ -84,7 +84,8 @@ The runner starts from a pristine clone and disposable detached worktree. In ord
 workspace targets and features with warnings denied, the dependency-policy stage, `nix flake
 check -L`, an evaluated-check assertion for the `flow-multi-host` VM, the no-stubs grep, the
 no-workflows assertion, and the changelog stage. Until their ratified policies land, dependency
-and changelog stages say **NOT RUN** in the transcript instead of pretending to pass.
+and changelog stages say **NOT RUN** in the transcript instead of pretending to pass. Once
+`CHANGELOG.md` exists, a pull request must touch it or carry the `no-changelog` label.
 
 Each run commits `<sha>.log` to the dedicated `gate-evidence` branch. The green status links to
 that transcript; paste its tail into the pull request as human-readable evidence. The machine
