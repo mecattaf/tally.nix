@@ -20,6 +20,9 @@ scheduler. tally does not inspect domain output to choose the next objective,
 move workload artifacts between hosts, manage secrets, or provide a
 general-purpose distributed workflow service.
 
+There are no releases yet; deployments should pin a reviewed commit. Report suspected
+vulnerabilities through the private routes in the [security policy](SECURITY.md).
+
 Read the checked book at
 **[mecattaf.github.io/tally.nix](https://mecattaf.github.io/tally.nix/)**.
 
@@ -82,6 +85,8 @@ remain provenance, not the current user manual.
 
 tally supports `x86_64-linux` only. That is the platform exercised by the full
 fleet gate and matches tally's systemd-based execution model.
+
+Project policy: [security](SECURITY.md).
 
 ## Development
 
