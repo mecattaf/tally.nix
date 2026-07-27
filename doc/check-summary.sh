@@ -18,8 +18,11 @@ trap cleanup EXIT
 all_pages="$scratch/all-pages"
 summary_pages="$scratch/summary-pages"
 
-find "$source_dir" -type f -name '*.md' ! -name 'SUMMARY.md' -printf '%P\n' \
-  | LC_ALL=C sort -u >"$all_pages"
+(
+  cd "$source_dir"
+  find . -type f -name '*.md' ! -name 'SUMMARY.md' -print \
+    | sed 's@^\./@@'
+) | LC_ALL=C sort -u >"$all_pages"
 
 sed -nE \
   's@^[[:space:]]*([-*][[:space:]]+)?\[[^]]+\]\(([^)#]+)(#[^)]*)?\)[[:space:]]*$@\2@p' \
