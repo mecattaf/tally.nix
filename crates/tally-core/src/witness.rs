@@ -1740,6 +1740,27 @@ mod tests {
     }
 
     #[test]
+    fn duration_derived_wall_clock_is_written_as_canonical_json() {
+        let mut observed = body();
+        observed.wall_clock =
+            std::time::Duration::from_nanos(1_212_416_383).as_secs_f64();
+        assert_eq!(
+            serde_json::to_string(&observed.wall_clock).unwrap(),
+            "1.2124163829999999"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("witness.jsonl");
+        WitnessLedger::open(&path).unwrap().append(observed).unwrap();
+
+        let report = verify_file(&path).unwrap();
+        assert!(report.ok, "{:?}", report.problems);
+        assert!(std::fs::read_to_string(path)
+            .unwrap()
+            .contains(r#""wallClock":1.212416383,"#));
+    }
+
+    #[test]
     fn old_format_is_red_and_open_returns_an_actionable_archive_error() {
         let report = verify_file(&fixture("old-format.jsonl")).unwrap();
         assert!(!report.ok);
