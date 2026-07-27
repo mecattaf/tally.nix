@@ -455,7 +455,84 @@ fn fail_client(state: &Arc<StdMutex<ClientState>>, failure: ClientReadFailure) {
 
 #[cfg(test)]
 mod tests {
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use tokio::io::BufReader;
+
     use super::*;
+
+    proptest! {
+        #[test]
+        fn arbitrary_ndjson_input_is_bounded_by_the_frame_limit(
+            input in vec(any::<u8>(), 0..2_048),
+            max_frame_bytes in 1_u64..=512,
+            buffer_capacity in 1_usize..=128,
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut reader = BufReader::with_capacity(buffer_capacity, input.as_slice());
+            let result = runtime.block_on(framing::read_line_limited(
+                &mut reader,
+                max_frame_bytes,
+            ));
+            let wire_len = input
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(input.len(), |newline| newline + 1);
+
+            if wire_len as u64 > max_frame_bytes {
+                let is_frame_too_large = matches!(
+                    result,
+                    Err(WireIoError::FrameTooLarge { limit }) if limit == max_frame_bytes
+                );
+                prop_assert!(is_frame_too_large);
+            } else if input.is_empty() {
+                prop_assert!(matches!(result, Ok(None)));
+            } else {
+                let mut expected = input[..wire_len].to_vec();
+                if expected.last() == Some(&b'\n') {
+                    expected.pop();
+                }
+                if expected.last() == Some(&b'\r') {
+                    expected.pop();
+                }
+                let line = result.unwrap().unwrap();
+                prop_assert_eq!(&line, &expected);
+                prop_assert!(line.len() as u64 <= max_frame_bytes);
+            }
+        }
+
+        #[test]
+        fn valid_request_frames_round_trip_byte_for_byte(
+            id in any::<i64>(),
+            method in "[a-z]{1,16}(\\.[a-z_]{1,16}){0,2}",
+            value in any::<i64>(),
+            buffer_capacity in 1_usize..=64,
+        ) {
+            let request = RequestFrame {
+                id: RequestId::Number(id),
+                method,
+                params: Some(serde_json::json!({"value": value})),
+            };
+            let encoded = serde_json::to_vec(&request).unwrap();
+            let mut wire = encoded.clone();
+            wire.push(b'\n');
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let mut reader = BufReader::with_capacity(buffer_capacity, wire.as_slice());
+            let decoded = runtime
+                .block_on(framing::read_line_limited(&mut reader, wire.len() as u64))
+                .unwrap()
+                .unwrap();
+
+            prop_assert_eq!(&decoded, &encoded);
+            prop_assert_eq!(serde_json::from_slice::<RequestFrame>(&decoded).unwrap(), request);
+        }
+    }
 
     #[test]
     fn explicit_config_controls_the_transport_limit() {
