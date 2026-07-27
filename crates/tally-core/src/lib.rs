@@ -31,3 +31,29 @@ pub mod wire;
 pub mod witness;
 
 pub use config::{Config, ConfigError, Enforce, Priority};
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    const SHELL_COMMAND_PROVIDER: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/shell-command-provider"
+    );
+
+    fn shell_program_source(path: &Path) -> PathBuf {
+        let mut source = OsString::from(path.as_os_str());
+        source.push(".tally-test-script");
+        PathBuf::from(source)
+    }
+
+    pub(crate) fn install_shell_program(path: &Path, body: impl AsRef<[u8]>) {
+        std::fs::write(shell_program_source(path), body).unwrap();
+        std::os::unix::fs::symlink(SHELL_COMMAND_PROVIDER, path).unwrap();
+    }
+
+    pub(crate) fn rewrite_shell_program(path: &Path, body: impl AsRef<[u8]>) {
+        std::fs::write(shell_program_source(path), body).unwrap();
+    }
+}

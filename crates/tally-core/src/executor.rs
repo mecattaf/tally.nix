@@ -5729,10 +5729,7 @@ mod tests {
              [ \"$8\" = {unit} ] || exit 89\n\
              printf 'LoadState=not-found\\nActiveState=inactive\\nInvocationID=\\nEnvironment=\\n'\n"
         );
-        std::fs::write(&probe_program, expected_script).unwrap();
-        let mut permissions = std::fs::metadata(&probe_program).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&probe_program, permissions).unwrap();
+        crate::test_support::install_shell_program(&probe_program, expected_script);
 
         let absent = executor.inspect_identity(&request.identity).unwrap();
         assert_eq!(absent, LocalUnitFact::absent(&unit));
@@ -5757,12 +5754,7 @@ mod tests {
              printf 'LoadState=loaded\\nActiveState=inactive\\nInvocationID=durable-invocation\\nEnvironment=\\n'\n"
         );
         let loaded_probe_program = temp.path().join("fake-systemctl-loaded");
-        std::fs::write(&loaded_probe_program, loaded_script).unwrap();
-        let mut permissions = std::fs::metadata(&loaded_probe_program)
-            .unwrap()
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&loaded_probe_program, permissions).unwrap();
+        crate::test_support::install_shell_program(&loaded_probe_program, loaded_script);
         let loaded_executor = Executor::new(temp.path(), "/nix/store/example/bin/tally")
             .with_systemctl(&loaded_probe_program);
         let exited = loaded_executor.inspect_identity(&request.identity).unwrap();
@@ -5771,12 +5763,7 @@ mod tests {
         assert_eq!(exited.exit_record, Some(record));
 
         let failed_probe_program = temp.path().join("fake-systemctl-failed");
-        std::fs::write(&failed_probe_program, "#!/bin/sh\nexit 23\n").unwrap();
-        let mut permissions = std::fs::metadata(&failed_probe_program)
-            .unwrap()
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&failed_probe_program, permissions).unwrap();
+        crate::test_support::install_shell_program(&failed_probe_program, "#!/bin/sh\nexit 23\n");
         let failed_executor = Executor::new(temp.path(), "/nix/store/example/bin/tally")
             .with_systemctl(&failed_probe_program);
         assert!(matches!(
@@ -5790,14 +5777,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let request = request();
         let systemctl = temp.path().join("slow-systemctl");
-        std::fs::write(
+        crate::test_support::install_shell_program(
             &systemctl,
             "#!/bin/sh\nsleep 1\nprintf 'LoadState=not-found\\nActiveState=inactive\\nInvocationID=\\nEnvironment=\\n'\n",
-        )
-        .unwrap();
-        let mut permissions = std::fs::metadata(&systemctl).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&systemctl, permissions).unwrap();
+        );
         let executor =
             Executor::new(temp.path(), "/nix/store/example/bin/tally").with_systemctl(systemctl);
         let probe = executor.inspect_identity_async(&request.identity);
@@ -5827,10 +5810,7 @@ mod tests {
              printf '%s' \"$4\" > {}\n",
             marker.display()
         );
-        std::fs::write(&control, script).unwrap();
-        let mut permissions = std::fs::metadata(&control).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&control, permissions).unwrap();
+        crate::test_support::install_shell_program(&control, script);
         let running = LocalUnitFact {
             unit: unit.clone(),
             loaded: true,
@@ -5852,12 +5832,7 @@ mod tests {
         ));
         assert!(!marker.exists(), "replacement invocation was stopped");
 
-        let failing_control = temp.path().join("fake-systemctl-stop-failing");
-        std::fs::write(&failing_control, "#!/bin/sh\nexit 23\n").unwrap();
-        let mut permissions = std::fs::metadata(&failing_control).unwrap().permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&failing_control, permissions).unwrap();
-        std::fs::rename(&failing_control, &control).unwrap();
+        crate::test_support::rewrite_shell_program(&control, "#!/bin/sh\nexit 23\n");
         assert!(matches!(
             executor.reclaim_identity(&request.identity).await,
             Err(ExecutorError::UnitControl { .. })
@@ -5947,19 +5922,13 @@ mod tests {
             [LocalUnitFact::absent(&unit), running].into(),
         )));
         let systemd_run = temp.path().join("fake-systemd-run");
-        std::fs::write(&systemd_run, "#!/bin/sh\nexit 23\n").unwrap();
+        crate::test_support::install_shell_program(&systemd_run, "#!/bin/sh\nexit 23\n");
         let systemctl = temp.path().join("fake-systemctl");
         let marker = temp.path().join("stopped");
-        std::fs::write(
+        crate::test_support::install_shell_program(
             &systemctl,
             format!("#!/bin/sh\nprintf '%s' \"$4\" > {}\n", marker.display()),
-        )
-        .unwrap();
-        for program in [&systemd_run, &systemctl] {
-            let mut permissions = std::fs::metadata(program).unwrap().permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(program, permissions).unwrap();
-        }
+        );
         let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally")
             .with_systemd_run(systemd_run)
             .with_systemctl(systemctl)
