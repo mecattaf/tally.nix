@@ -34,6 +34,9 @@
 - [`services.tally.flows`](configuration/flows.md)
 - [Hardening presets](configuration/hardening.md)
 - [Options reference ⚙️](configuration/options.md)
+  - [Shared core options ⚙️](configuration/core-options.md)
+  - [Home Manager options ⚙️](configuration/home-manager-options.md)
+  - [NixOS options ⚙️](configuration/nixos-options.md)
 
 # Operating tally
 

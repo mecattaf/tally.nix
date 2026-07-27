@@ -341,6 +341,8 @@ in
     defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.tally;
     defaultDataDir = "${config.xdg.dataHome}/tally";
     defaultStateDir = "${config.xdg.stateHome}/tally";
+    defaultDataDirText = lib.literalExpression ''"''${config.xdg.dataHome}/tally"'';
+    defaultStateDirText = lib.literalExpression ''"''${config.xdg.stateHome}/tally"'';
   };
 
   config = lib.mkMerge [

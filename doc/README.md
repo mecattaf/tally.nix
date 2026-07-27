@@ -15,6 +15,12 @@ links, missing pages, duplicate summary entries, and pages orphaned from `SUMMAR
 `checks.<system>.doc` is the same derivation, so `nix flake check` cannot pass with a different
 book than `packages.<system>.doc`.
 
+The three `src/configuration/*-options.md` reference pages are generated during that derivation
+from the shared, Home Manager, and NixOS module evaluations. They are intentionally not checked
+in. The build also verifies that all three evaluations expose the same complete option-name set,
+that every entry has a type and description, and that the producer variants and flow-era options
+which a plain `types.oneOf` traversal would otherwise hide are present.
+
 ## Publishing
 
 The public site is served directly from this repository's `gh-pages` branch at

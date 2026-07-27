@@ -77,13 +77,20 @@ let
           ];
           default = "regex";
           example = "jsonPathLast";
-          description = "Structured scrape mode, including whole-stream last-match JSONPath selection.";
+          description = ''
+            How tally extracts this capture. "regex" applies pattern matching,
+            "jsonPath" returns JSONPath matches, and "jsonPathLast" applies the
+            same RFC 9535 expression but keeps the last whole-stream match.
+          '';
         };
         pattern = mkOption {
           type = types.str;
           default = "";
           example = "$..session_id";
-          description = "Regex or RFC 9535 JSONPath expression.";
+          description = ''
+            A non-empty regular expression or RFC 9535 JSONPath expression,
+            interpreted according to this capture's mode.
+          '';
         };
         _tallyAssertions = internalAssertionsOption;
       };
@@ -498,7 +505,10 @@ let
             "tests"
             "clippy"
           ];
-          description = "Required IDs that must occur exactly once in the completion artifact.";
+          description = ''
+            Non-empty, unique gate IDs that this explicitly declared manifest
+            must contain exactly once. This field has no Nix default.
+          '';
         };
         acceptancePolicy = mkOption {
           type = types.enum [
@@ -564,7 +574,10 @@ let
         gateManifest = mkOption {
           type = types.nullOr mkGateManifestType;
           default = null;
-          description = "Optional versioned completion artifact declaration and acceptance policy.";
+          description = ''
+            Optional versioned completion-artifact declaration and acceptance
+            policy passed with this enqueue.
+          '';
         };
         pool = mkOption {
           type = types.coercedTo types.str (pool: [ pool ]) (types.listOf types.str);
@@ -590,7 +603,11 @@ let
           ];
           default = "low";
           example = "high";
-          description = "Canonical priority tier.";
+          description = ''
+            Admission priority for this job. "interrupt" ranks above "high",
+            then "medium", then "low"; scheduling aging can promote a waiting
+            row by one rank.
+          '';
         };
         dedupKey = mkOption {
           type = types.nullOr types.str;
@@ -613,19 +630,29 @@ let
           example = {
             source = "module";
           };
-          description = "Optional opaque JSON evidence class passed through verbatim.";
+          description = ''
+            Optional JSON value copied into durable evidence and witness
+            records. tally does not interpret this application-defined value.
+          '';
         };
         manifestHash = mkOption {
           type = types.nullOr types.str;
           default = null;
           example = "sha256:opaque-to-tally";
-          description = "Optional opaque manifest hash passed through verbatim.";
+          description = ''
+            Optional application-supplied manifest identity copied verbatim
+            into durable evidence. tally neither computes nor verifies it.
+          '';
         };
         consumptionEstimate = mkOption {
           type = types.nullOr types.ints.unsigned;
           default = null;
           example = 900;
-          description = "Non-negative authoritative admission estimate for a windowed budget.";
+          description = ''
+            Authoritative non-negative charge supplied with this enqueue.
+            Every request that names a windowed-consumption pool must provide
+            an estimate; tally does not infer one from argv or adapter output.
+          '';
         };
         runtimeMaxSec = mkOption {
           type = types.nullOr types.ints.positive;
@@ -637,7 +664,11 @@ let
           type = types.bool;
           default = false;
           example = true;
-          description = "Give this leaf the one-hop capability that refuses child enqueue.";
+          description = ''
+            Refuse every child-enqueue attempt made by this job. Set this on
+            leaf or advisory work that must not receive the normal one-hop
+            enqueue capability.
+          '';
         };
         credentials = mkOption {
           type = credentialType;
@@ -736,7 +767,7 @@ let
         connectTimeoutSec = mkOption {
           type = types.ints.positive;
           default = 10;
-          description = "OpenSSH connection timeout.";
+          description = "OpenSSH connection-establishment timeout in seconds.";
         };
         serverAliveIntervalSec = mkOption {
           type = types.ints.positive;
@@ -751,7 +782,10 @@ let
         retryIntervalMs = mkOption {
           type = types.ints.positive;
           default = 1000;
-          description = "Delay between fail-closed transport retries.";
+          description = ''
+            Delay in milliseconds between fail-closed transport retries. The
+            module accepts values from 10 through 60000.
+          '';
         };
         _tallyAssertions = internalAssertionsOption;
       };
@@ -1334,6 +1368,18 @@ let
     invalidProducerType
   ];
 
+  # `types.oneOf` deliberately does not merge the sub-options of its variants.
+  # The runtime type stays discriminated and strict; the documentation builder
+  # evaluates these same types separately so every supported producer field is
+  # present in the generated reference.
+  producerTypesForDocumentation = {
+    calendar = calendarProducerType;
+    "build-effect" = buildEffectProducerType;
+    "pool-reachability" = poolReachabilityProducerType;
+    gh = ghProducerType;
+    "events-dir" = eventsDirProducerType;
+  };
+
   mkUsageMeterType = types.submodule (
     { config, name, ... }: {
       options = {
@@ -1382,13 +1428,21 @@ let
           ];
           default = "vram";
           example = "build-slot";
-          description = "Generalized scarce resource axis.";
+          description = ''
+            Resource accounted by this pool: memory co-residency ("vram"),
+            counted build or CPU slots, rolling spend ("budget"), or a
+            capacity-one exclusion lock ("mutex").
+          '';
         };
         capacity = mkOption {
           type = types.ints.positive;
           default = 1;
           example = 2;
-          description = "Maximum simultaneous co-resident holders.";
+          description = ''
+            Maximum concurrent holders for co-residency admission. Mutex pools
+            must keep this at one; windowed-consumption admission uses its
+            consumption cap instead.
+          '';
         };
         budgetGb = mkOption {
           type = types.nullOr types.ints.positive;
@@ -1433,7 +1487,11 @@ let
                 windowSec = 604800;
                 consumptionCap = 18000;
               };
-              description = "Rolling-window consumption admission.";
+              description = ''
+                Admit only when the supplied consumption estimate fits beneath
+                the configured cap over the rolling window. Requests without
+                an estimate are rejected.
+              '';
             };
           };
           default = {
@@ -1443,13 +1501,21 @@ let
             windowSec = 604800;
             consumptionCap = 18000;
           };
-          description = "Exactly one admission predicate tag.";
+          description = ''
+            Exactly one admission algorithm. Use "co-residency" for counted
+            holders, or "windowed-consumption" with resource = "budget" for a
+            rolling spend limit.
+          '';
         };
         enforce = mkOption {
           type = types.enum [ "cooperative" ];
           default = "cooperative";
           example = "cooperative";
-          description = "Portable cooperative enforcement; this is the complete accepted enum.";
+          description = ''
+            Enforcement implementation. "cooperative" is the only accepted
+            value; dmem, serving-slice, and patched-systemd modes are not part
+            of the shipped module.
+          '';
         };
         hardPreempt = mkOption {
           type = types.bool;
@@ -1483,7 +1549,12 @@ let
             pollIntervalSec = 120;
             budgetClass = "programmatic";
           };
-          description = "Optional supervised external meter for a programmatic windowed budget.";
+          description = ''
+            Optional supervised feeder for observed usage in a programmatic
+            windowed budget. This is valid only on resource = "budget" with
+            the windowed-consumption predicate, and only Home Manager renders
+            the feeder unit.
+          '';
         };
         _tallyAssertions = internalAssertionsOption;
       };
@@ -1581,13 +1652,22 @@ let
           type = types.nullOr types.path;
           default = null;
           example = lib.literalExpression "./catalog.json";
-          description = "Optional selector catalog validated by tally flow check.";
+          description = ''
+            Optional selector catalog used by flow validation and execution.
+            It is required when meta declares selectors and may otherwise stay
+            null.
+          '';
         };
         budgetPool = mkOption {
           type = types.nullOr types.str;
           default = null;
           example = "programmatic";
-          description = "Optional run-scoped budget pool leased with the flow runner.";
+          description = ''
+            Optional pool name checked for existence only. It is not added to
+            the runner or node pool set and creates no render channel; the
+            declarative runner remains admitted solely through the reserved
+            "flow" pool.
+          '';
         };
         extraEnv = mkOption {
           type = types.attrsOf types.str;
@@ -1637,6 +1717,8 @@ let
       defaultPackage,
       defaultDataDir,
       defaultStateDir,
+      defaultDataDirText ? null,
+      defaultStateDirText ? null,
     }:
     {
       enable = mkOption {
@@ -1658,18 +1740,28 @@ let
         example = false;
         description = "Expose the tallyd argv[0] alias alongside the CLI.";
       };
-      dataDir = mkOption {
-        type = types.path;
-        default = defaultDataDir;
-        example = "/var/lib/tally/data";
-        description = "Durable witness, attestation, and rebuildable TaskChampion data.";
-      };
-      stateDir = mkOption {
-        type = types.path;
-        default = defaultStateDir;
-        example = "/var/lib/tally/state";
-        description = "Mutable events, capture, exit-record, epoch, and producer state.";
-      };
+      dataDir = mkOption (
+        {
+          type = types.path;
+          default = defaultDataDir;
+          example = "/var/lib/tally/data";
+          description = "Durable witness, attestation, and rebuildable TaskChampion data.";
+        }
+        // optionalAttrs (defaultDataDirText != null) {
+          defaultText = defaultDataDirText;
+        }
+      );
+      stateDir = mkOption (
+        {
+          type = types.path;
+          default = defaultStateDir;
+          example = "/var/lib/tally/state";
+          description = "Mutable events, capture, exit-record, lease-epoch, and producer state.";
+        }
+        // optionalAttrs (defaultStateDirText != null) {
+          defaultText = defaultStateDirText;
+        }
+      );
       journald.native = mkOption {
         type = types.bool;
         default = false;
@@ -1857,7 +1949,11 @@ let
             pool = "worker-build";
           };
         };
-        description = "Five-kind producer registry with discriminator-specific submodules.";
+        description = ''
+          Registry of calendar, events-directory, GitHub, build-effect, and
+          pool-reachability producers. Every entry requires an explicit kind.
+          Only the Home Manager module renders their managed user units.
+        '';
       };
       flows = mkOption {
         type = types.attrsOf mkFlowType;
@@ -1867,7 +1963,12 @@ let
           onCalendar = "daily";
           args.repository = "mecattaf/tally.nix";
         };
-        description = "Declarative flow registrations, optionally rendered as calendar producers.";
+        description = ''
+          Declarative flow registrations. The shared schema validates every
+          entry, but only the Home Manager module turns scheduled entries into
+          producer units and auto-declares the reserved "flow" and "build"
+          pools. The NixOS module does not deploy flow runners.
+        '';
       };
       adapters = mkOption {
         type = types.attrsOf mkAdapterType;
@@ -2445,6 +2546,7 @@ in
     mkRuntimeConfig
     mkWitnessEmitter
     priorityRanks
+    producerTypesForDocumentation
     renderEnqueue
     ;
 }
