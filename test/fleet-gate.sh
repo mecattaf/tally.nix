@@ -174,12 +174,8 @@ run_flow_multi_host_assertion() {
 
 run_cargo_deny_stage() {
   printf '\n==> dependency policy\n'
-  if [[ -f deny.toml ]] \
-    && nix develop --command bash -c 'command -v cargo-deny >/dev/null 2>&1'; then
-    run_step "cargo deny check" nix develop --command cargo deny check
-    return
-  fi
-  printf 'NOT RUN cargo deny check: the pinned dependency policy has not landed yet\n'
+  run_step "cargo deny check (pinned and offline)" \
+    nix develop --command test/cargo-deny.sh
 }
 
 resolve_pull_request_metadata() {
