@@ -81,11 +81,16 @@ escape hatches:
 | `eval`, `Function` | Direct uses are rejected; Boa's compile-strings hook rejects indirect runtime compilation too. |
 | Timers | No timer API is installed. Any Boa timeout job that is reached aborts with `determinism-violation`. |
 
-The engine also has non-catchable backstops of 1,000,000 loop iterations and 512
-recursive calls. A breach is `FlowRuntimeLimitError`/`runtime-limit`. Separately,
-each node-producing call site may execute only `meta.iterationCap` times; the next
-call throws `FlowLoopError`/`iteration-cap`. Set a deliberate higher cap for a
-bounded fan-out rather than relying on the engine backstop.
+The engine has distinct non-catchable runtime backstops. A flow gets 1,000,000
+loop iterations and 512 recursive calls; breaching either is
+`FlowRuntimeLimitError`/`runtime-limit`. It may execute at most 100,000 promise or
+generic microtasks, reported as `FlowRuntimeBudgetError`/`microtask-budget`, and
+one evaluation gets a 24-hour total wall-clock budget, including awaited host
+work, reported as `FlowRuntimeBudgetError`/`wall-clock-budget`.
+
+Separately, each node-producing call site may execute only `meta.iterationCap`
+times; the next call throws `FlowLoopError`/`iteration-cap`. Set a deliberate
+higher cap for a bounded fan-out rather than relying on an engine backstop.
 
 ```javascript
 // Deterministic: the bound and order come from checked args.
