@@ -447,7 +447,17 @@
             jq -S 'keys' "$home_json" > home-option-keys.json
             jq -S 'keys' "$nixos_json" > nixos-option-keys.json
             cmp core-option-keys.json home-option-keys.json
-            cmp core-option-keys.json nixos-option-keys.json
+            jq -S '
+              keys - [
+                "services.tally.group",
+                "services.tally.user"
+              ]
+            ' "$nixos_json" > nixos-common-option-keys.json
+            cmp core-option-keys.json nixos-common-option-keys.json
+            jq -e '
+              has("services.tally.group")
+              and has("services.tally.user")
+            ' "$nixos_json" >/dev/null
             jq -e '
               all(to_entries[];
                 (.value.type | type == "string" and length > 0)
