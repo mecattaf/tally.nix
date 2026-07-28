@@ -26,8 +26,9 @@ use crate::model::{
 use crate::{
     check_script, resolve_members, Catalog, CheckOptions, Derivation, Disposition, FlowClient,
     FlowError, FlowSubmission, Meta, NodeFailure, NodeResult, NodeSpec, Orchestration, RunReport,
-    SelectionProvenance, SelectorOptions, SourceLocation, BRIEF_SENTINEL, DEFAULT_MAX_NODES,
-    ENGINE_LOOP_LIMIT, ENGINE_MICROTASK_LIMIT, ENGINE_RECURSION_LIMIT, ENGINE_WALL_CLOCK_LIMIT,
+    SelectionProvenance, SelectorOptions, SourceLocation, Verdict, BRIEF_SENTINEL,
+    DEFAULT_MAX_NODES, ENGINE_LOOP_LIMIT, ENGINE_MICROTASK_LIMIT, ENGINE_RECURSION_LIMIT,
+    ENGINE_WALL_CLOCK_LIMIT,
 };
 
 const BOOTSTRAP: &str = include_str!("bootstrap.js");
@@ -619,6 +620,20 @@ impl HostShared {
         }
 
         self.observe(result.witness_seq, plan.ordinal).await?;
+        if result.verdict == Verdict::Cancelled && !plan.settle {
+            return Err(FlowError::new(
+                "FlowCancelledError",
+                "flow-cancelled",
+                format!("node {} was cancelled", result.task_uuid),
+            )
+            .at(plan.location)
+            .with_ordinal(plan.ordinal)
+            .detail("taskUuid", result.task_uuid.clone())
+            .detail(
+                "node",
+                serde_json::to_value(&result).expect("serializing a node result cannot fail"),
+            ));
+        }
         if !result.verdict.is_pass() && !plan.settle {
             return Err(FlowError::new(
                 "FlowTerminalError",
@@ -3606,6 +3621,19 @@ mod tests {
         assert_eq!(error.name, "FlowTerminalError");
         assert_eq!(error.code, "terminal-failure");
         assert!(error.location.is_some());
+
+        let cancelled = Reply {
+            disposition: Disposition::Terminal,
+            witness_seq: 2,
+            verdict: Verdict::Cancelled,
+            result: None,
+            divergent_hash: false,
+            client_error: None,
+        };
+        let error = run(&source, MockClient::new(vec![cancelled])).unwrap_err();
+        assert_eq!(error.name, "FlowCancelledError");
+        assert_eq!(error.code, "flow-cancelled");
+        assert_eq!(error.details["node"]["verdict"], "cancelled");
     }
 
     #[test]

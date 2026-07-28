@@ -162,6 +162,7 @@ A pass cannot be retried.
 ```console
 $ tally queue cancel TASK-UUID
 $ tally queue cancel TASK-UUID --force
+$ tally flow cancel FLOW-RUN-ID
 $ tally queue pause local-ai
 $ tally queue pause --all
 $ tally queue resume local-ai
@@ -172,6 +173,10 @@ Without `--force`, cancel affects paused/queued work but leaves running work unt
 cancel reclaims running execution and emits a cancelled witness. Pausing a pool withdraws its
 queued lease requests and marks those jobs paused; it does not preempt running holders. Resume
 re-admits jobs only when none of their required pools remains paused or unreachable.
+
+`tally flow cancel` force-cancels every nonterminal child in the named flow run. This is a
+flow-scoped operation: unlike `tally queue cancel` without `--force`, running children are not
+silently left behind.
 
 ### Drain and await
 
@@ -296,7 +301,8 @@ literal `meta.maxNodes`. A run ID is required from `--flow-run-id` or inherited
 
 The runner emits lifecycle objects as JSONL and ends with either `flow-report` or
 `flow-failed`. Script/determinism errors exit 10; replay divergence or a changed script in the
-same run exits 20. See the [full mapping](../reference/errors.md#structured-flow-errors).
+same run exits 20; flow-scoped cancellation exits 4 unless the cancelled node used
+`settle: true`. See the [full mapping](../reference/errors.md#structured-flow-errors).
 
 ### Catalog is flag-only
 

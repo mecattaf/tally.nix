@@ -61,7 +61,9 @@ flow run <ID> already has <N> nodes; maxNodes is <M>
 Reduce concurrent outstanding children, remove accidental recursive enqueue,
 or make a deliberate configuration change to `fanoutCap`, `depthCap`, or the
 flow's `maxNodes`. `maxNodes` counts created rows for the lifetime of one flow
-run; waiting for earlier nodes to finish does not reduce it.
+run; waiting for earlier nodes to finish does not reduce it. A cancelled row is
+projected as Deleted and releases its slot, so a replay can continue past a
+cancelled frontier without raising the cap.
 
 A manual request for a `windowed-consumption` pool must include the debit:
 

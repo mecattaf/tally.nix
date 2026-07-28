@@ -80,9 +80,10 @@ daemon's per-node runtime controls. Likewise, `evidence` describes the runner's
 canonical completion. A runner with the default evidence must exit zero; every
 child has the evidence declared by its own node specification.
 
-`maxNodes` is a lifetime bound on created rows for one flow-run identity. Rows
-that finish do not free space under this cap. A literal `meta.maxNodes` may make
-the script stricter, but the Nix value may not be smaller than that declaration:
+`maxNodes` bounds non-deleted rows for one flow-run identity. Rows that finish
+normally do not free space under this cap; cancelled rows are projected as
+Deleted and do. A literal `meta.maxNodes` may make the script stricter, but the
+Nix value may not be smaller than that declaration:
 
 ```text
 tally flow <name> maxNodes <configured> is less than script meta.maxNodes <declared>

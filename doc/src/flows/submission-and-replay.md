@@ -116,7 +116,9 @@ diagnostics, not replay state.
 The runner uses one multiplexed daemon connection. On a broken connection, epoch
 change, or restart-related await error, it replaces that connection and reissues
 the idempotent query, submission, or `queue.await_job` call. Await includes the
-attempt number, so it cannot silently join a later retry.
+attempt number. When a daemon-side automatic requeue has advanced the same task
+UUID, a stale requested attempt follows the durable row's current attempt; a
+future attempt remains an error rather than being silently rewritten.
 
 The daemon recovers durable rows and reconciles live executor work. The shipped
 multi-host VM check kills the coordinator daemon while a remote child is running,

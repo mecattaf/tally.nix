@@ -45,6 +45,11 @@ const DRV_SUBSTITUTE_RUN: &str = "00000000-0000-4000-8000-000000000506";
 const STRUCTURED_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000507";
 const UNTYPED_RESULT_RUN: &str = "00000000-0000-4000-8000-000000000508";
 const CREDENTIAL_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000509";
+const AUTO_REQUEUE_RUN: &str = "00000000-0000-4000-8000-000000000510";
+const CANCELLED_RUN: &str = "00000000-0000-4000-8000-000000000511";
+const CAP_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000512";
+const PARTIAL_FAILURE_RUN: &str = "00000000-0000-4000-8000-000000000513";
+const REORDERED_RUN: &str = "00000000-0000-4000-8000-000000000514";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -333,15 +338,38 @@ async fn start_daemon(paths: &DaemonPaths, config: Config) -> RunningDaemon {
     start_daemon_with_systemd_run(paths, config, paths.state_dir.join("absent-systemd-run")).await
 }
 
+async fn start_daemon_with_settings(
+    paths: &DaemonPaths,
+    config: Config,
+    settings: DaemonSettings,
+) -> RunningDaemon {
+    start_daemon_with_systemd_run_and_settings(
+        paths,
+        config,
+        paths.state_dir.join("absent-systemd-run"),
+        settings,
+    )
+    .await
+}
+
 async fn start_daemon_with_systemd_run(
     paths: &DaemonPaths,
     config: Config,
     systemd_run: std::path::PathBuf,
 ) -> RunningDaemon {
+    start_daemon_with_systemd_run_and_settings(paths, config, systemd_run, settings()).await
+}
+
+async fn start_daemon_with_systemd_run_and_settings(
+    paths: &DaemonPaths,
+    config: Config,
+    systemd_run: std::path::PathBuf,
+    settings: DaemonSettings,
+) -> RunningDaemon {
     let executor = Executor::new(&paths.state_dir, env!("CARGO_BIN_EXE_tally"))
         .with_systemd_run(systemd_run)
         .with_unit_probe(ExitFileProbe);
-    let daemon = Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+    let daemon = Daemon::open_with_executor(config, paths.clone(), settings, executor)
         .await
         .unwrap();
     let (shutdown, receiver) = watch::channel(false);
@@ -423,6 +451,122 @@ export const meta = {
   evidence: ["exit:0"],
   label: "variant-" + args.variant
 }))()
+"#
+}
+
+fn automatic_requeue_source(sentinel: &Path) -> String {
+    let sentinel = serde_json::to_string(&sentinel.to_string_lossy()).unwrap();
+    format!(
+        r#"
+export const meta = {{
+  name: "automatic-requeue",
+  description: "the bounded retry reaches attempt two",
+  pools: ["alpha"],
+  argsSchema: {{ type: "object", additionalProperties: false }},
+  selectors: [],
+  maxNodes: 1
+}};
+
+(async () => sh(["/bin/sh", "-c",
+  "if test -e \"$1\"; then exit 0; else : > \"$1\"; sleep 30; fi",
+  "requeue", {sentinel}
+], {{
+  pools: ["alpha"], evidence: ["exit:0"], runtimeMaxSec: 1,
+  label: "bounded-requeue"
+}}))()
+"#
+    )
+}
+
+fn cancellation_source() -> &'static str {
+    r#"
+export const meta = {
+  name: "flow-cancellation",
+  description: "flow-scoped force cancellation",
+  pools: ["alpha"],
+  argsSchema: { type: "object", additionalProperties: false },
+  selectors: [],
+  maxNodes: 1
+};
+
+(async () => sh(["/bin/sh", "-c", "sleep 30"], {
+  pools: ["alpha"], evidence: ["exit:0"], label: "cancel-me"
+}))()
+"#
+}
+
+fn cancelled_cap_replay_source() -> &'static str {
+    r#"
+export const meta = {
+  name: "cancelled-cap-replay",
+  description: "cancelled rows release their flow node slot",
+  pools: ["alpha"],
+  argsSchema: { type: "object", additionalProperties: false },
+  selectors: [],
+  maxNodes: 2
+};
+
+(async () => {
+  const cancelled = await sh(["/bin/sh", "-c", "sleep 30"], {
+    pools: ["alpha"], evidence: ["exit:0"], label: "cancelled-slot",
+    settle: true
+  });
+  const replacement = await sh(["/bin/sh", "-c", "exit 0"], {
+    pools: ["alpha"], evidence: ["exit:0"], label: "replacement"
+  });
+  return [cancelled.verdict, replacement.verdict];
+})()
+"#
+}
+
+fn partial_parallel_failure_source() -> &'static str {
+    r#"
+export const meta = {
+  name: "partial-parallel-failure",
+  description: "all live branches become terminal when one fails",
+  pools: ["alpha", "beta"],
+  argsSchema: { type: "object", additionalProperties: false },
+  selectors: [],
+  maxNodes: 2
+};
+
+(async () => parallel([
+  () => sh(["/bin/sh", "-c", "exit 0"], {
+    pools: ["alpha"], evidence: ["exit:0"], label: "passing-branch"
+  }),
+  () => sh(["/bin/sh", "-c", "exit 7"], {
+    pools: ["beta"], evidence: ["exit:0"], label: "failing-branch"
+  })
+]))()
+"#
+}
+
+fn reordered_parallel_source() -> &'static str {
+    r#"
+export const meta = {
+  name: "reordered-parallel",
+  description: "ordinal identity survives a changed dedup key",
+  pools: ["alpha", "beta"],
+  argsSchema: {
+    type: "object",
+    required: ["reverse"],
+    properties: { reverse: { type: "boolean" } },
+    additionalProperties: false
+  },
+  selectors: [],
+  maxNodes: 2
+};
+
+const left = () => sh(["/bin/sh", "-c", "printf left"], {
+  pools: ["alpha"], evidence: ["exit:0"], dedupKey: "parallel-left",
+  label: "left"
+});
+const right = () => sh(["/bin/sh", "-c", "printf right"], {
+  pools: ["beta"], evidence: ["exit:0"], dedupKey: "parallel-right",
+  label: "right"
+});
+
+(async () => parallel(args.reverse ? [right, left] : [left, right]))()
 "#
 }
 
@@ -580,6 +724,24 @@ async fn wait_for_flow_items(client: &RpcClient, flow_run_id: &str, expected: us
     panic!("flow run {flow_run_id} did not reach {expected} durable rows");
 }
 
+async fn wait_for_flow_state(
+    client: &RpcClient,
+    flow_run_id: &str,
+    expected_items: usize,
+    expected_state: &str,
+) -> Vec<Value> {
+    for _ in 0..400 {
+        let items = flow_items(client, flow_run_id).await;
+        if items.len() == expected_items
+            && items.iter().all(|item| item["liveState"] == expected_state)
+        {
+            return items;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("flow run {flow_run_id} did not reach {expected_state} state");
+}
+
 async fn await_items(client: &RpcClient, items: &[Value]) {
     for item in items {
         let terminal = tokio::time::timeout(
@@ -611,6 +773,20 @@ fn flow_report(output: &std::process::Output) -> Value {
         .unwrap_or_else(|| {
             panic!(
                 "runner omitted flow-report\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })
+}
+
+fn flow_failure(output: &std::process::Output) -> Value {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|event| event["type"] == "flow-failed")
+        .unwrap_or_else(|| {
+            panic!(
+                "runner omitted flow-failed\nstdout:\n{}\nstderr:\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             )
@@ -1492,6 +1668,251 @@ async fn untyped_final_message_is_observed_after_terminal_ack() {
                 flow_report(&output)["report"]["finalValue"],
                 json!({"answer": 42})
             );
+            daemon.stop().await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn retry_cancellation_cap_and_partial_failure_are_live_end_to_end() {
+    let _environment = ENVIRONMENT_LOCK.lock().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let config = config();
+            config.validate().unwrap();
+            let config_path = temp.path().join("config.json");
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+            let automatic_script = temp.path().join("automatic-requeue.js");
+            fs::write(
+                &automatic_script,
+                automatic_requeue_source(&temp.path().join("attempt-one-seen")),
+            )
+            .unwrap();
+            let cancellation_script = temp.path().join("cancellation.js");
+            fs::write(&cancellation_script, cancellation_source()).unwrap();
+            let cap_script = temp.path().join("cancelled-cap-replay.js");
+            fs::write(&cap_script, cancelled_cap_replay_source()).unwrap();
+            let partial_script = temp.path().join("partial-parallel-failure.js");
+            fs::write(&partial_script, partial_parallel_failure_source()).unwrap();
+            let reordered_script = temp.path().join("reordered-parallel.js");
+            fs::write(&reordered_script, reordered_parallel_source()).unwrap();
+
+            let daemon_paths = paths(&temp.path().join("daemon"));
+            let mut retry_settings = settings();
+            retry_settings.recovery_policy.retry.auto_bounded_requeue = true;
+            retry_settings.recovery_policy.max_attempts = 2;
+            let daemon = start_daemon_with_settings(&daemon_paths, config, retry_settings).await;
+            let client = rpc(&daemon_paths.socket).await;
+
+            let automatic = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &automatic_script,
+                AUTO_REQUEUE_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let automatic = runner_output(automatic).await;
+            assert!(
+                automatic.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&automatic.stdout),
+                String::from_utf8_lossy(&automatic.stderr)
+            );
+            let events = read_acknowledged_events(&daemon_paths.events_dir()).unwrap();
+            let automatic_event = events
+                .iter()
+                .find(|event| {
+                    event
+                        .row
+                        .orchestration
+                        .as_ref()
+                        .is_some_and(|orchestration| {
+                            orchestration.flow_run_id() == AUTO_REQUEUE_RUN
+                        })
+                })
+                .unwrap();
+            assert_eq!(automatic_event.retries.len(), 1);
+            assert_eq!(automatic_event.retries[0].attempt, 2);
+            let (_, witnesses) = read_verified_records(&daemon_paths.witness_path()).unwrap();
+            let automatic_witnesses = witnesses
+                .iter()
+                .filter(|record| {
+                    record.orchestration.as_ref().is_some_and(|orchestration| {
+                        orchestration.flow_run_id() == AUTO_REQUEUE_RUN
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(automatic_witnesses.len(), 2);
+            assert_eq!(automatic_witnesses[0].attempt, 1);
+            assert_eq!(
+                automatic_witnesses[0].verdict,
+                tally_core::witness::Verdict::RuntimeExceeded
+            );
+            assert_eq!(automatic_witnesses[1].attempt, 2);
+            assert_eq!(
+                automatic_witnesses[1].verdict,
+                tally_core::witness::Verdict::Pass
+            );
+
+            let cancelled_runner = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &cancellation_script,
+                CANCELLED_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            wait_for_flow_state(&client, CANCELLED_RUN, 1, "running").await;
+            let cancel_output = Command::new(env!("CARGO_BIN_EXE_tally"))
+                .arg("--config")
+                .arg(&config_path)
+                .arg("--socket")
+                .arg(&daemon_paths.socket)
+                .args(["flow", "cancel", CANCELLED_RUN])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                cancel_output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&cancel_output.stderr)
+            );
+            let cancel_response: Value = serde_json::from_slice(&cancel_output.stdout).unwrap();
+            assert_eq!(cancel_response["affected"], 1);
+            assert_eq!(cancel_response["flowRunId"], CANCELLED_RUN);
+            assert_eq!(cancel_response["results"][0]["was"], "running");
+            let cancelled_runner = runner_output(cancelled_runner).await;
+            assert_eq!(cancelled_runner.status.code(), Some(4));
+            assert_eq!(
+                flow_failure(&cancelled_runner)["error"]["code"],
+                "flow-cancelled"
+            );
+            let (_, witnesses) = read_verified_records(&daemon_paths.witness_path()).unwrap();
+            assert!(witnesses.iter().any(|record| {
+                record.verdict == tally_core::witness::Verdict::Cancelled
+                    && record
+                        .orchestration
+                        .as_ref()
+                        .is_some_and(|orchestration| orchestration.flow_run_id() == CANCELLED_RUN)
+            }));
+
+            let cap_runner = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &cap_script,
+                CAP_REPLAY_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            wait_for_flow_state(&client, CAP_REPLAY_RUN, 1, "running").await;
+            let cap_cancelled = client
+                .call("queue.cancel", Some(json!({"flowRunId": CAP_REPLAY_RUN})))
+                .await
+                .unwrap();
+            assert_eq!(cap_cancelled["affected"], 1);
+            let cap_runner = runner_output(cap_runner).await;
+            assert!(
+                cap_runner.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&cap_runner.stdout),
+                String::from_utf8_lossy(&cap_runner.stderr)
+            );
+            assert_eq!(
+                flow_report(&cap_runner)["report"]["finalValue"],
+                json!(["cancelled", "pass"])
+            );
+            assert_eq!(flow_items(&client, CAP_REPLAY_RUN).await.len(), 2);
+            let cap_replay = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &cap_script,
+                CAP_REPLAY_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let cap_replay = runner_output(cap_replay).await;
+            assert!(
+                cap_replay.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&cap_replay.stdout),
+                String::from_utf8_lossy(&cap_replay.stderr)
+            );
+            assert_eq!(flow_items(&client, CAP_REPLAY_RUN).await.len(), 2);
+
+            let partial = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &partial_script,
+                PARTIAL_FAILURE_RUN,
+                "{}",
+                2,
+            )
+            .spawn()
+            .unwrap();
+            let partial = runner_output(partial).await;
+            assert_eq!(partial.status.code(), Some(1));
+            assert_eq!(flow_failure(&partial)["error"]["code"], "aggregate-failure");
+            let partial_items = wait_for_flow_items(&client, PARTIAL_FAILURE_RUN, 2).await;
+            let mut verdicts = Vec::new();
+            for item in partial_items {
+                let terminal = client
+                    .call(
+                        "queue.await_job",
+                        Some(json!({"task_uuid": item["anchor"]})),
+                    )
+                    .await
+                    .unwrap();
+                verdicts.push(terminal["verdict"].as_str().unwrap().to_owned());
+            }
+            verdicts.sort();
+            assert_eq!(verdicts, ["failed", "pass"]);
+
+            let ordered = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &reordered_script,
+                REORDERED_RUN,
+                r#"{"reverse":false}"#,
+                2,
+            )
+            .spawn()
+            .unwrap();
+            let ordered = runner_output(ordered).await;
+            assert!(
+                ordered.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&ordered.stdout),
+                String::from_utf8_lossy(&ordered.stderr)
+            );
+            let reordered = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &reordered_script,
+                REORDERED_RUN,
+                r#"{"reverse":true}"#,
+                2,
+            )
+            .spawn()
+            .unwrap();
+            let reordered = runner_output(reordered).await;
+            assert_eq!(reordered.status.code(), Some(20));
+            assert_eq!(
+                flow_failure(&reordered)["error"]["code"],
+                "replay-divergence"
+            );
+            assert_eq!(flow_items(&client, REORDERED_RUN).await.len(), 2);
+
             daemon.stop().await;
         })
         .await;

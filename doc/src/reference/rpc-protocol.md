@@ -119,7 +119,7 @@ The table between the markers is checked against the daemon's `RPC_METHODS` cons
 | `queue.enqueue` | [`EnqueueParams`](#enqueueparams) | [`EnqueueResult`](#enqueue-results) |
 | `queue.continue` | `EnqueueParams`, with `resumeFrom` required | `EnqueueResult` |
 | `queue.retry` | `{task_uuid: string}` (`taskUuid` is accepted as an alias) | Retry admission object |
-| `queue.cancel` | `{task_uuid: string, force?: boolean=false}` | Cancel result |
+| `queue.cancel` | Exactly one of `{task_uuid: string, force?: boolean=false}` or `{flowRunId: UUID}` | Single-job or flow-run cancel result |
 | `queue.pause` | `{pool?: string, all?: boolean=false}` | `{paused: string[], affected: integer}` |
 | `queue.resume` | `{pool?: string, all?: boolean=false}` | `{resumed: string[]}` |
 | `queue.drain` | `{producer?: string}` | Drain result and barrier |
@@ -169,7 +169,7 @@ canonicalized into ascending order and duplicates are rejected.
 | `source` | source enum; default `manual` | `manual`, `orchestrator`, `calendar`, `events-dir`, `gh`, `build-effect`, or `pool-reachability`. |
 | `dedupKey` | string, optional | Submission identity key. |
 | `submission` | `{"mode":"full"}`, optional | Selects full disposition semantics. Absence is legacy mode; there are no other mode values. |
-| `orchestration` | object, optional | Opaque flow capsule. `flowRunId` must be a UUID; `maxNodes`, when present, is positive. |
+| `orchestration` | object, optional | Opaque flow capsule. `flowRunId` must be a UUID; `maxNodes`, when present, is positive; `nodeOrdinal`, when present, is a non-negative integer. |
 | `parent` | UUID string, optional | Durable parent task. |
 | `evidence` | string array; default `[]` | Canonical evidence specifications. |
 | `drv` | object, optional | `{drvPath, outputs:[{name,path}, ...]}` for derivation-aware admission. |
@@ -239,7 +239,9 @@ payloadHash?}`. Only a terminal non-pass job with a governing witness can be ret
 
 `queue.cancel` returns `{ok:true, affected, task_uuid, was, lease_epoch, already_terminal?}`.
 A running job is unaffected unless `force` is true. Paused and queued jobs can be cancelled
-without `force`.
+without `force`. The flow-run form returns `{ok:true, affected, flow_run_id, flowRunId, results}`
+and force-cancels every nonterminal child carrying that `flowRunId`; it does not inherit the
+single-job form's running-job no-op.
 
 `queue.pause` and `queue.resume` require exactly one of a named `pool` or `all: true`. Pausing
 withdraws queued lease requests and changes those jobs to paused; it does not stop running jobs.
@@ -267,7 +269,10 @@ positive. Its terminal result is:
 For an active job the waiter is memory-resident. For a completed job the daemon reconstructs the
 answer from the verified witness ledger, including after restart. A client connection and its
 pending call do **not** survive daemon restart: reconnect and issue `queue.await_job` again for
-the same task and attempt.
+the same task and attempt. If that requested attempt is older than the row's current attempt,
+the daemon follows the current attempt. This keeps a waiter issued for attempt 1 attached when an
+automatic bounded requeue has already advanced the same task UUID to attempt 2. A requested
+future attempt is not rewritten.
 
 Job barriers have the deterministic form `barrier:<task-uuid>:<attempt>`. They can likewise be
 re-armed after restart because the daemon can reconstruct their one result from the witness.
