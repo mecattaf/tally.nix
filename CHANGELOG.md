@@ -61,6 +61,11 @@ authorized.
 
 ### Fixed
 
+- Reject a `parallel()` thunk or `pipeline()` stage that returns anything but a promise, naming the
+  branch index, so the brace mistake `() => { sh(...) }` fails the run instead of silently
+  computing on `undefined`.
+- Reject a flow-fixed sugar option such as `claude(prompt, { pools })` during `tally flow check` and
+  the generation build rather than only on the first node at 2am.
 - Detect canonical payload-hash drift on a flow's first admission instead of storing a mismatch
   that becomes an unrecoverable replay divergence on the next run.
 - Made full-mode flow credential resolution symmetric between the client and daemon, including a

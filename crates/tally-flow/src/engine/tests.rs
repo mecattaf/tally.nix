@@ -1373,3 +1373,82 @@ fn canonical_payload_includes_resolved_nonoptional_defaults() {
         sha256(&serde_json::to_vec(&expected).unwrap())
     );
 }
+
+#[test]
+fn a_brace_bodied_parallel_thunk_fails_the_run_instead_of_computing_on_undefined() {
+    let source = format!(
+        "{}\n(async () => parallel([\n\
+         () => sh(['one'], {{pools: ['cpu']}}),\n\
+         () => {{ sh(['two'], {{pools: ['cpu']}}); }}\n\
+         ]))()",
+        meta(&["cpu"], &[])
+    );
+    let client = MockClient::new(vec![
+        Reply::pass(Disposition::Created, 1),
+        Reply::pass(Disposition::Created, 2),
+    ]);
+    let error = run(&source, client).unwrap_err();
+    assert_eq!(error.name, "FlowCombinatorError");
+    assert_eq!(error.code, "parallel-invalid");
+    assert!(
+        error
+            .message
+            .starts_with("parallel() thunk 1 returned undefined instead of a promise;"),
+        "unexpected message: {}",
+        error.message
+    );
+    assert!(error.message.contains("remove the braces"));
+    assert_eq!(error.details.get("index"), Some(&json!(1)));
+    assert!(error.location.is_some_and(|location| location.line > 1));
+}
+
+#[test]
+fn a_brace_bodied_parallel_thunk_fails_even_in_settle_mode() {
+    let source = format!(
+        "{}\n(async () => parallel([\n\
+         () => {{ sh(['one'], {{pools: ['cpu']}}); }}\n\
+         ], {{settle: true}}))()",
+        meta(&["cpu"], &[])
+    );
+    let client = MockClient::new(vec![Reply::pass(Disposition::Created, 1)]);
+    let error = run(&source, client).unwrap_err();
+    assert_eq!(error.code, "parallel-invalid");
+}
+
+#[test]
+fn a_brace_bodied_pipeline_stage_fails_the_run_and_names_the_stage() {
+    let source = format!(
+        "{}\n(async () => pipeline(['a'],\n\
+         (_previous, item) => sh([item, 'stage-1'], {{pools: ['cpu']}}),\n\
+         (_previous, item) => {{ sh([item, 'stage-2'], {{pools: ['cpu']}}); }}\n\
+         ))()",
+        meta(&["cpu"], &[])
+    );
+    let client = MockClient::new(vec![
+        Reply::pass(Disposition::Created, 1),
+        Reply::pass(Disposition::Created, 2),
+    ]);
+    let error = run(&source, client).unwrap_err();
+    assert_eq!(error.name, "FlowCombinatorError");
+    assert_eq!(error.code, "pipeline-invalid");
+    assert!(
+        error
+            .message
+            .starts_with("pipeline() stage 1 for item 0 returned undefined instead of a promise;"),
+        "unexpected message: {}",
+        error.message
+    );
+    assert!(error.message.contains("declare the stage async"));
+    assert!(error.location.is_some_and(|location| location.line > 1));
+}
+
+#[test]
+fn a_sugar_helper_rejects_a_fixed_field_at_evaluation_time_too() {
+    let source = format!(
+        "{}\nclaude('review', {{pools: ['claude-window']}});",
+        meta(&["claude-window"], &[])
+    );
+    let error = run(&source, MockClient::new(Vec::new())).unwrap_err();
+    assert_eq!(error.name, "FlowSpecError");
+    assert_eq!(error.code, "sugar-option-conflict");
+}

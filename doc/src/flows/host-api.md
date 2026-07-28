@@ -230,6 +230,13 @@ fixed by the sugar raise `sugar-option-conflict`, other unknown fields raise
 `unknown-spec-field`, and the resulting promise has the ordinary `NodeResult` and
 failure behavior.
 
+Each sugar fixes a different set. `claude()` and `codex()` fix `adapter`, `pools`,
+`argv`, `prompt`, and `brief`; `local()` fixes those plus `adapterOptions` and
+`selection`; `sh()` fixes only `adapter`, `argv`, and `prompt`, so `sh()` is the
+one sugar whose caller chooses `pools`. A literal options object that sets a fixed
+field is rejected by `tally flow check` and by the generation build, not only at
+evaluation time — `claude(prompt, { pools: [...] })` fails at switch.
+
 ## `parallel(thunks, options?)`
 
 `parallel()` takes an array of zero-argument functions. Thunks are invoked in
@@ -260,6 +267,13 @@ This is separate from node settle mode. A `sh(..., { settle: true })` terminal
 failure is a successful branch whose `value` is a failed `NodeResult`; a rejecting
 `sh()` becomes `{ ok: false, error }`. Non-function entries or options other than
 boolean `settle` raise `FlowCombinatorError`/`parallel-invalid` synchronously.
+
+Every thunk must return a promise. A thunk that returns anything else — most often
+the brace mistake `() => { sh(...) }`, which creates a node and then returns
+`undefined` — raises `FlowCombinatorError`/`parallel-invalid` naming the thunk's
+index, located at the `parallel()` call. That failure is not a branch outcome: it
+fails the combinator even under `{ settle: true }`, because it is an authoring
+mistake rather than a domain failure.
 
 ## `pipeline(items, ...stages, options?)`
 
@@ -293,6 +307,12 @@ skips that item's later stages, but other item chains continue. A settled failed
 checks it. Bad item, stage, or option shapes raise
 `FlowCombinatorError`/`pipeline-invalid`; branch failures aggregate as
 `FlowAggregateError`/`aggregate-failure`.
+
+Every stage must return a promise, including a stage that only reshapes the
+previous value — declare such a stage `async`. A stage that returns anything else
+raises `FlowCombinatorError`/`pipeline-invalid` naming the stage index and the item
+index, located at the `pipeline()` call, and fails the combinator even under
+`{ settle: true }`.
 
 ## `log(value)`
 

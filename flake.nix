@@ -1217,6 +1217,16 @@
             ''tally: {"name":"FlowPoolError","code":"undeclared-pool","message":"pool \"worker-gpu\" is used by the script but absent from meta.pools","location":{"line":8,"column":31},"details":{"pool":"worker-gpu"}}''
           ];
         };
+        flowSugarPoolsFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-sugar-pools-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/sugar-pools.js;
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            ''tally: {"name":"FlowSpecError","code":"sugar-option-conflict","message":"sugar option \"pools\" is fixed by claude() and cannot be set by the script","location":{"line":8,"column":36},"details":{"field":"pools"}}''
+          ];
+        };
         flowBadArgsSchemaFailure = pkgs.testers.testBuildFailure' {
           name = "tally-flow-bad-args-schema-failure";
           drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
@@ -2888,6 +2898,7 @@
             pkgs.runCommand "tally-flow-pool-closure"
               {
                 lintFailure = flowUndeclaredPoolFailure;
+                sugarFailure = flowSugarPoolsFailure;
                 closureFailure = flowPoolClosureFailure;
                 windowedFailure = flowWindowedConsumptionFailure;
                 reservedFailure = flowReservedPoolFailure;
@@ -2896,6 +2907,7 @@
               }
               ''
                 test -e "$lintFailure"
+                test -e "$sugarFailure"
                 test -e "$closureFailure"
                 test -e "$windowedFailure"
                 test -e "$reservedFailure"

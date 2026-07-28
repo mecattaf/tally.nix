@@ -45,11 +45,25 @@ fn nix_eval_time_fixture_contract_accepts_valid_and_rejects_each_class() {
         ("banned-global.js", "determinism-violation"),
         ("undeclared-pool.js", "undeclared-pool"),
         ("bad-args-schema.js", "args-schema-invalid"),
+        ("sugar-pools.js", "sugar-option-conflict"),
     ] {
         let error = check_failure(name);
         assert_eq!(error.code, code, "wrong error for {name}: {error}");
         assert!(error.location.is_some(), "missing location for {name}");
     }
+}
+
+#[test]
+fn sugar_pools_fixture_names_the_field_and_the_helper() {
+    let error = check_failure("sugar-pools.js");
+    assert_eq!(error.name, "FlowSpecError");
+    assert_eq!(
+        error.message,
+        "sugar option \"pools\" is fixed by claude() and cannot be set by the script"
+    );
+    assert_eq!(error.details.get("field").unwrap(), "pools");
+    let location = error.location.unwrap();
+    assert_eq!(location.line, 8);
 }
 
 #[test]

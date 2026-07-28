@@ -20,7 +20,8 @@ use serde_json::{Map, Number, Value};
 
 use crate::catalog::{validate_catalog_semantics, validate_catalog_value};
 use crate::{
-    resolve_members, Catalog, FlowError, SelectorOptions, SourceLocation, DEFAULT_ITERATION_CAP,
+    resolve_members, sugar_reserved_fields, Catalog, FlowError, SelectorOptions, SourceLocation,
+    DEFAULT_ITERATION_CAP,
 };
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -532,22 +533,47 @@ impl<'ast> Visitor<'ast> for DeterminismLint<'_> {
                 if let Some(Expression::ObjectLiteral(object)) =
                     call.args().get(index).map(Expression::flatten)
                 {
-                    if let Some(pools) =
-                        literal_string_array_property(object, "pools", self.interner)
+                    // A sugar helper fixes some fields itself. Setting one is rejected at
+                    // evaluation time, so reject it here too rather than letting a script
+                    // pass `tally flow check` and die on its first node.
+                    if let Some(reserved) = sugar_reserved_fields(&function) {
+                        if let Some((field, span)) =
+                            literal_property(object, reserved, self.interner)
+                        {
+                            return ControlFlow::Break(
+                                FlowError::new(
+                                    "FlowSpecError",
+                                    "sugar-option-conflict",
+                                    format!(
+                                        "sugar option {field:?} is fixed by {function}() and cannot be set by the script"
+                                    ),
+                                )
+                                .at(location(span))
+                                .detail("field", field),
+                            );
+                        }
+                    }
+                    // `pools` is the script's to choose only where the sugar does not fix it.
+                    if !sugar_reserved_fields(&function)
+                        .is_some_and(|reserved| reserved.contains(&"pools"))
                     {
-                        for (pool, span) in pools {
-                            if !self.meta.pools.iter().any(|declared| declared == &pool) {
-                                return ControlFlow::Break(
-                                    FlowError::new(
-                                        "FlowPoolError",
-                                        "undeclared-pool",
-                                        format!(
-                                            "pool {pool:?} is used by the script but absent from meta.pools"
-                                        ),
-                                    )
-                                    .at(location(span))
-                                    .detail("pool", pool),
-                                );
+                        if let Some(pools) =
+                            literal_string_array_property(object, "pools", self.interner)
+                        {
+                            for (pool, span) in pools {
+                                if !self.meta.pools.iter().any(|declared| declared == &pool) {
+                                    return ControlFlow::Break(
+                                        FlowError::new(
+                                            "FlowPoolError",
+                                            "undeclared-pool",
+                                            format!(
+                                                "pool {pool:?} is used by the script but absent from meta.pools"
+                                            ),
+                                        )
+                                        .at(location(span))
+                                        .detail("pool", pool),
+                                    );
+                                }
                             }
                         }
                     }
@@ -663,6 +689,27 @@ fn property_field_name(field: &PropertyAccessField, interner: &Interner) -> Opti
             }
         }
     }
+}
+
+/// The first literal property naming one of `wanted`, with the span of its value.
+fn literal_property(
+    object: &ObjectLiteral,
+    wanted: &[&str],
+    interner: &Interner,
+) -> Option<(String, Span)> {
+    for property in object.properties() {
+        let PropertyDefinition::Property(name, value) = property else {
+            continue;
+        };
+        let Some(name) = name.literal() else {
+            continue;
+        };
+        let name = resolve_identifier(name, interner);
+        if wanted.contains(&name.as_str()) {
+            return Some((name, value.span()));
+        }
+    }
+    None
 }
 
 fn literal_string_array_property(
