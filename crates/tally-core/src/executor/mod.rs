@@ -171,7 +171,7 @@ impl Executor {
             unit_probe: Arc::new(SystemdLocalUnitProbe::default()),
             launching_units: Arc::new(Mutex::new(HashMap::new())),
             direct_processes: Arc::new(Mutex::new(HashMap::new())),
-            allow_direct_fallback: true,
+            allow_direct_fallback: false,
             remote_executors: Arc::new(BTreeMap::new()),
             remote_transport: Arc::new(SshRemoteTransport),
             host_id: crate::witness::current_host_id().ok(),
@@ -212,9 +212,17 @@ impl Executor {
         &self.recorder_program
     }
 
-    /// Require durable systemd ownership. The direct fallback remains available
-    /// to the standalone executor/test surface, but a crash-survivable
-    /// daemon must never launch work it cannot adopt or reclaim after SIGKILL.
+    /// Opt into the compatibility direct-process backend when `systemd-run`
+    /// is absent. Direct execution applies neither transient-unit limits nor
+    /// adapter hardening, so library consumers must request it explicitly.
+    pub fn with_direct_fallback(mut self) -> Self {
+        self.allow_direct_fallback = true;
+        self
+    }
+
+    /// Explicitly require durable systemd ownership. This is the default, and
+    /// remains available to make crash-survivable daemon policy conspicuous at
+    /// construction sites.
     pub fn require_systemd(mut self) -> Self {
         self.allow_direct_fallback = false;
         self
