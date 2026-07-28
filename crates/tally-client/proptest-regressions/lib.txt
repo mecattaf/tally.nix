@@ -1,0 +1,4 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+cc 7b8c6a10b0e82e18a5cd4deb815b2d02e786ad8af94b5eae58ff0f65ecf573db # shrinks to input = [13], max_frame_bytes = 1, buffer_capacity = 1
