@@ -23,10 +23,11 @@ agreement or when earlier disclosure is necessary to protect users.
 
 ## Supported trust model
 
-tally runs on one machine, under one trusted Unix user, running local AI plus authenticated
-claude-code/codex subscriptions whose utilization it maximizes. Keep the trust model that simple:
-one tally instance is not a multi-tenant service and does not isolate mutually hostile same-UID
-processes.
+tally has one operator on one machine. Agents run under that operator and act through the
+operator's existing `gh`, Claude Code, and Codex authentication. Those are the operator's own
+interactive tool sessions, not tally service credentials. There is no separate fleet, gate, or
+tally service credential to mint, store, or rotate. Keep the trust model that simple: one tally
+instance is not a multi-tenant service and does not isolate mutually hostile same-UID processes.
 
 The NixOS and Home Manager services place the Unix socket inside a runtime directory with mode
 `0700`. That filesystem boundary excludes other Unix users. A process already running as tally's
@@ -51,23 +52,3 @@ The canonical [witness chain](doc/src/concepts/witness-ledger.md#what-a-record-b
 and detects changed, missing, duplicated, or reordered records. It is unsigned. A valid chain does
 not authenticate the machine or prove which human or process wrote it; its authority comes from the
 single-writer deployment and acknowledgement boundary.
-
-## Operational credentials
-
-### Fleet merge-gate token
-
-The fleet-side merge gate uses a dedicated fine-grained GitHub personal access token. Limit it to
-the `mecattaf/tally.nix` repository with commit-status write and pull-request read access (plus the
-metadata access GitHub grants automatically). Do not reuse a developer, release, or broad `gh`
-login token.
-
-Store the token only on the fleet coordinator at
-`~/.config/tally-fleet-gate/github-token`, owned by the service user with mode `0600`. The poller
-rejects a token file with any other mode. Never put the token in this repository, a unit file, a
-command-line argument, a transcript, or a journal environment dump. Rotate it at least quarterly
-and immediately after suspected disclosure; revoke the old token after a green status has been
-posted with the replacement.
-
-Publishing transcripts to the `gate-evidence` branch uses the coordinator's separately configured
-Git credential. The status token deliberately does not gain repository-contents write access for
-that purpose.

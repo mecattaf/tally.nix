@@ -6,7 +6,9 @@
 > authorization.
 
 Every release names one immutable commit from `origin/main`. Prepare and merge the release commit
-before starting the live gate, and keep the worktree clean for every command below.
+before starting the live gate, and keep the worktree clean for every command below. GitHub
+operations use the operator's existing `gh` login; do not create a gate, release, or service
+credential.
 
 ## Prepare the release commit
 
@@ -56,16 +58,18 @@ $ nix flake check -L
 $ grep -rn 'todo!\|unimplemented!\|TODO' crates/
 ```
 
-The final grep passes only when it prints nothing and exits 1. The fleet runner additionally proves
-that no GitHub workflow exists, asserts the `flow-multi-host` VM inventory, enforces the changelog
-rule, publishes its transcript, and posts the required status for the exact SHA:
+The final grep passes only when it prints nothing and exits 1. The canonical local runner also
+proves that no GitHub workflow exists, asserts the `flow-multi-host` VM inventory, and enforces the
+changelog rule. Preserve its complete output as the pull-request merge evidence:
 
 ```console
-$ test/fleet-gate.sh "$release_sha"
+$ set -o pipefail
+$ test/fleet-gate.sh "$release_sha" 2>&1 | tee "release-$release_sha.log"
 ```
 
-Do not continue until `fleet/gate-ladder` is green for `release_sha`, `origin/main` still resolves to
-that SHA, and the linked transcript is complete.
+Do not continue until the transcript ends in a pass for `release_sha` and `origin/main` still
+resolves to that SHA. The single-operator phase deliberately has no independently posted commit
+status or branch-protection gate; the worker-run transcript is the evidence.
 
 ## Live gate on the designated host
 
@@ -101,9 +105,10 @@ Repeat the six-test live gate before every authorized release and after any chan
 `crates/tally-core/src/journal.rs`. The `pool-vanished/return` scenario reboots its target and is
 confined to a disposable microVM; never run it against the designated live host.
 
-Capture stdout and stderr with pipe-failure preservation. Retain the full fleet and live transcripts,
-including the commit SHA, host name, pinned advisory database revision, six live-test names, and both
-scenario results. Attach that evidence to the GitHub release rather than pasting only a summary.
+Capture stdout and stderr with pipe-failure preservation. Retain the full local-ladder and live
+transcripts, including the commit SHA, host name, pinned advisory database revision, six live-test
+names, and both scenario results. Attach that evidence to the GitHub release rather than pasting
+only a summary.
 
 ## Upgrade and rollback
 
