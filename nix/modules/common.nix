@@ -1890,10 +1890,55 @@ let
               example = "weekly";
               description = "Systemd calendar expression for store-evidence collection.";
             };
+            captureArchiveHorizon = mkOption {
+              type = types.str;
+              default = "30d";
+              example = "7d";
+              description = ''
+                Systemd timespan after which per-attempt capture archives under
+                the state directory expire. Archives are replay material and are
+                deliberately not pinned by the witness ledger: the witness record
+                remains the durable evidence once an archive is pruned.
+              '';
+            };
+            eventsDoneHorizon = mkOption {
+              type = types.str;
+              default = "180d";
+              example = "1y";
+              description = ''
+                Systemd timespan after which consumed producer event files under
+                events/done expire. This is the ingress audit trail, so it gets a
+                longer horizon and no count bound.
+              '';
+            };
+            eventsRejectedHorizon = mkOption {
+              type = types.str;
+              default = "30d";
+              example = "7d";
+              description = ''
+                Systemd timespan after which rejected producer event files under
+                events/rejected expire. This set is adversarially drivable, so it
+                expires more aggressively than the audit trail.
+              '';
+            };
+            eventsRejectedMaxCount = mkOption {
+              type = types.ints.unsigned;
+              default = 10000;
+              example = 1000;
+              description = ''
+                Maximum retained files under events/rejected. Whichever of this
+                bound and eventsRejectedHorizon is exceeded first prunes, oldest
+                file first.
+              '';
+            };
           };
         };
         default = { };
-        description = "Age-based Nix GC-root retention with a live-witness floor.";
+        description = ''
+          Age-based Nix GC-root retention with a live-witness floor, plus the
+          state-directory envelope for capture archives and ingress event files.
+          One sweep, one timer, one lock.
+        '';
       };
       attestations = mkOption {
         type = types.submodule {
@@ -2281,7 +2326,15 @@ let
       inherit (cfg.lease) graceSec yieldPollSec yieldGraceSec;
     };
     retention = {
-      inherit (cfg.retention) enable horizon onCalendar;
+      inherit (cfg.retention)
+        enable
+        horizon
+        onCalendar
+        captureArchiveHorizon
+        eventsDoneHorizon
+        eventsRejectedHorizon
+        eventsRejectedMaxCount
+        ;
     };
     attestations.exec = {
       inherit (cfg.attestations.exec) enable;
@@ -2370,6 +2423,27 @@ let
     else
       [ ];
 
+  # One sweep entry point, so both module layers must spell the same argv.
+  mkRetentionArgv = cfg: [
+    "${cfg.package}/bin/tally"
+    "gc"
+    "--horizon"
+    cfg.retention.horizon
+    "--collect"
+    "--data-dir"
+    (toString cfg.dataDir)
+    "--state-dir"
+    (toString cfg.stateDir)
+    "--capture-archive-horizon"
+    cfg.retention.captureArchiveHorizon
+    "--events-done-horizon"
+    cfg.retention.eventsDoneHorizon
+    "--events-rejected-horizon"
+    cfg.retention.eventsRejectedHorizon
+    "--events-rejected-max-count"
+    (toString cfg.retention.eventsRejectedMaxCount)
+  ];
+
   mkAssertions =
     cfg:
     flatten [
@@ -2380,6 +2454,18 @@ let
       {
         assertion = cfg.retention.onCalendar != "";
         message = "tally retention onCalendar must be non-empty";
+      }
+      {
+        assertion = cfg.retention.captureArchiveHorizon != "";
+        message = "tally retention captureArchiveHorizon must be non-empty";
+      }
+      {
+        assertion = cfg.retention.eventsDoneHorizon != "";
+        message = "tally retention eventsDoneHorizon must be non-empty";
+      }
+      {
+        assertion = cfg.retention.eventsRejectedHorizon != "";
+        message = "tally retention eventsRejectedHorizon must be non-empty";
       }
       (mapAttrsToList (name: pool: [
         {
@@ -2625,6 +2711,7 @@ in
     mkFlowProducers
     mkInstalledPackage
     mkOptions
+    mkRetentionArgv
     mkRuntimeConfig
     mkWitnessEmitter
     priorityRanks

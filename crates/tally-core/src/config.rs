@@ -249,6 +249,18 @@ pub struct RetentionConfig {
     pub horizon: String,
     #[serde(default = "default_retention_calendar")]
     pub on_calendar: String,
+    /// Ratified state-directory envelope. These horizons drive the pruners the
+    /// same single retention sweep runs; the daemon itself never reads them,
+    /// but rendering them here makes `--mode check-config` reject a bad value
+    /// at build time rather than at the next timer firing.
+    #[serde(default = "default_capture_archive_horizon")]
+    pub capture_archive_horizon: String,
+    #[serde(default = "default_events_done_horizon")]
+    pub events_done_horizon: String,
+    #[serde(default = "default_events_rejected_horizon")]
+    pub events_rejected_horizon: String,
+    #[serde(default = "default_events_rejected_max_count")]
+    pub events_rejected_max_count: usize,
 }
 
 impl Default for RetentionConfig {
@@ -257,6 +269,10 @@ impl Default for RetentionConfig {
             enable: true,
             horizon: DEFAULT_RETENTION_HORIZON.to_owned(),
             on_calendar: DEFAULT_RETENTION_CALENDAR.to_owned(),
+            capture_archive_horizon: default_capture_archive_horizon(),
+            events_done_horizon: default_events_done_horizon(),
+            events_rejected_horizon: default_events_rejected_horizon(),
+            events_rejected_max_count: default_events_rejected_max_count(),
         }
     }
 }
@@ -364,6 +380,22 @@ fn default_retention_horizon() -> String {
 
 fn default_retention_calendar() -> String {
     DEFAULT_RETENTION_CALENDAR.to_owned()
+}
+
+fn default_capture_archive_horizon() -> String {
+    crate::retention::DEFAULT_CAPTURE_ARCHIVE_MAX_AGE.to_owned()
+}
+
+fn default_events_done_horizon() -> String {
+    crate::retention::DEFAULT_EVENTS_DONE_MAX_AGE.to_owned()
+}
+
+fn default_events_rejected_horizon() -> String {
+    crate::retention::DEFAULT_EVENTS_REJECTED_MAX_AGE.to_owned()
+}
+
+const fn default_events_rejected_max_count() -> usize {
+    crate::retention::DEFAULT_EVENTS_REJECTED_MAX_COUNT
 }
 
 const fn default_lease_grace_sec() -> u64 {
@@ -509,8 +541,15 @@ impl Config {
         {
             return Err(ConfigError::InvalidLeaseGuardrail);
         }
-        crate::retention::parse_horizon(&self.retention.horizon)
-            .map_err(|error| ConfigError::InvalidRetentionHorizon(error.to_string()))?;
+        for horizon in [
+            &self.retention.horizon,
+            &self.retention.capture_archive_horizon,
+            &self.retention.events_done_horizon,
+            &self.retention.events_rejected_horizon,
+        ] {
+            crate::retention::parse_horizon(horizon)
+                .map_err(|error| ConfigError::InvalidRetentionHorizon(error.to_string()))?;
+        }
         if self.retention.on_calendar.trim().is_empty() {
             return Err(ConfigError::InvalidRetentionCalendar);
         }
@@ -822,10 +861,24 @@ mod tests {
         configured.validate().unwrap();
         assert!(!configured.retention.enable);
 
+        let envelope: Config = serde_json::from_str(
+            r#"{"pools":{},"retention":{"captureArchiveHorizon":"7d","eventsDoneHorizon":"1y","eventsRejectedHorizon":"12h","eventsRejectedMaxCount":25}}"#,
+        )
+        .unwrap();
+        envelope.validate().unwrap();
+        assert_eq!(envelope.retention.events_rejected_max_count, 25);
+        assert_eq!(
+            Config::default().retention.events_rejected_max_count,
+            crate::retention::DEFAULT_EVENTS_REJECTED_MAX_COUNT
+        );
+
         for invalid in [
             r#"{"pools":{},"retention":{"horizon":"never"}}"#,
             r#"{"pools":{},"retention":{"onCalendar":""}}"#,
             r#"{"pools":{},"retention":{"enable":true,"extra":false}}"#,
+            r#"{"pools":{},"retention":{"captureArchiveHorizon":"never"}}"#,
+            r#"{"pools":{},"retention":{"eventsDoneHorizon":""}}"#,
+            r#"{"pools":{},"retention":{"eventsRejectedHorizon":"1fortnight"}}"#,
         ] {
             let result = serde_json::from_str::<Config>(invalid)
                 .map_err(ConfigError::from)

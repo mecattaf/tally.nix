@@ -29,6 +29,13 @@ authorized.
 - Added characterization tests pinning the durable change-log window across reopen and crash
   artifacts, pagination cursor stability and deterministic page boundaries under the response
   byte cap, and client wire framing at and over the protocol frame limit.
+- Added retention pruners for the two on-disk sets that previously grew without bound: per-attempt
+  capture archives under the state directory (max age 30 days, independent of the witness ledger —
+  witness records do not pin archives) and consumed producer event files (`events/done` max age
+  180 days; `events/rejected`, the adversarially drivable set, max age 30 days or max count 10,000,
+  whichever is exceeded first, oldest pruned). They run inside the existing `tally gc` sweep under
+  the GC-roots lock, with no second timer, and `tally gc` reports the new counts. All four horizons
+  are configurable through `services.tally.retention`.
 - Documented the ratified trust boundary: what the per-job capability token enforces, that
   demotion to operator class and same-UID environment access are by design rather than gaps, and
   that hardening presets rather than the token are the containment story.

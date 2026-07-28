@@ -351,6 +351,35 @@ pub(super) struct GcArgs {
     pub(super) collect: bool,
     #[arg(long, value_name = "PATH")]
     pub(super) data_dir: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
+    /// Skip the state-directory pruners entirely and sweep GC roots only.
+    #[arg(long)]
+    pub(super) skip_state_dir: bool,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = tally_core::retention::DEFAULT_CAPTURE_ARCHIVE_MAX_AGE
+    )]
+    pub(super) capture_archive_horizon: String,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = tally_core::retention::DEFAULT_EVENTS_DONE_MAX_AGE
+    )]
+    pub(super) events_done_horizon: String,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = tally_core::retention::DEFAULT_EVENTS_REJECTED_MAX_AGE
+    )]
+    pub(super) events_rejected_horizon: String,
+    #[arg(
+        long,
+        value_name = "COUNT",
+        default_value_t = tally_core::retention::DEFAULT_EVENTS_REJECTED_MAX_COUNT
+    )]
+    pub(super) events_rejected_max_count: usize,
 }
 
 #[derive(Debug, Subcommand)]
