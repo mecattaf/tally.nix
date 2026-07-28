@@ -223,6 +223,119 @@ mod tests {
         }
     }
 
+    // Characterization: cursor and page-boundary behavior that any cache
+    // eviction or byte-budget change must preserve exactly.
+    #[test]
+    fn characterization_cursor_stays_stable_while_snapshot_is_retained() {
+        let mut cache = PageCache::default();
+        let envelope = serde_json::json!({
+            "snapshot": {"cursor": "fixture"},
+            "items": (0..10).map(|index| serde_json::json!({"index": index})).collect::<Vec<_>>(),
+            "nextCursor": null,
+        });
+        let first = cache
+            .page("query.jobs", "stable", Some(4), None, Some(envelope))
+            .unwrap();
+        let cursor = first["nextCursor"].as_str().unwrap().to_owned();
+        let reference = cache
+            .page("query.jobs", "stable", Some(4), Some(&cursor), None)
+            .unwrap();
+
+        // Churn newer snapshots up to one below the retention cap: the cursor
+        // must keep serving byte-identical pages.
+        for index in 0..(MAX_SNAPSHOTS - 2) {
+            cache
+                .page(
+                    "query.log",
+                    &format!("churn-{index}"),
+                    Some(2),
+                    None,
+                    Some(serde_json::json!({"items": [{"churn": index}], "nextCursor": null})),
+                )
+                .unwrap();
+        }
+        let replayed = cache
+            .page("query.jobs", "stable", Some(4), Some(&cursor), None)
+            .unwrap();
+        assert_eq!(replayed, reference);
+
+        // Continuation from the replayed page walks to the exact end.
+        let last_cursor = replayed["nextCursor"].as_str().unwrap().to_owned();
+        let last = cache
+            .page("query.jobs", "stable", Some(4), Some(&last_cursor), None)
+            .unwrap();
+        assert_eq!(
+            last["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![8, 9]
+        );
+        assert!(last["nextCursor"].is_null());
+    }
+
+    #[test]
+    fn characterization_page_boundaries_are_deterministic_under_the_byte_cap() {
+        // Items sized so the 48KiB response cap, not the item limit, decides
+        // the boundary. A byte-accounting refactor must not move it.
+        let items = (0..64)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "padding": "x".repeat(4_096),
+                })
+            })
+            .collect::<Vec<_>>();
+        let envelope = serde_json::json!({"items": items, "nextCursor": null});
+        let walk = || {
+            let mut boundaries = Vec::new();
+            let mut cache = PageCache::default();
+            let mut cursor: Option<String> = None;
+            loop {
+                let page = cache
+                    .page(
+                        "query.trace",
+                        "cap",
+                        Some(1_000),
+                        cursor.as_deref(),
+                        cursor.is_none().then(|| envelope.clone()),
+                    )
+                    .unwrap();
+                assert!(serde_json::to_vec(&page).unwrap().len() <= PAGE_RESULT_CAP_BYTES);
+                let page_items = page["items"].as_array().unwrap();
+                assert!(!page_items.is_empty());
+                boundaries.push((
+                    page_items.first().unwrap()["index"].as_u64().unwrap(),
+                    page_items.len(),
+                ));
+                cursor = page["nextCursor"].as_str().map(ToOwned::to_owned);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            boundaries
+        };
+        let boundaries = walk();
+        let total: usize = boundaries.iter().map(|(_, len)| len).sum();
+        assert_eq!(total, 64);
+        // Boundary starts must be the running sum of page lengths: no overlap
+        // and no gap.
+        let mut expected_start = 0;
+        for (start, len) in &boundaries {
+            assert_eq!(*start, expected_start);
+            expected_start += *len as u64;
+        }
+        assert!(
+            boundaries.len() >= 4,
+            "byte cap did not shape pages: {boundaries:?}"
+        );
+        // Walking the identical snapshot again must reproduce the identical
+        // boundaries: page assembly is deterministic, not incidental.
+        assert_eq!(walk(), boundaries);
+    }
+
     #[test]
     fn cursors_are_snapshot_bound_and_expire_explicitly() {
         let envelope = |value| {

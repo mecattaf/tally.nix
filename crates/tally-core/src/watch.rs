@@ -411,6 +411,179 @@ mod tests {
         assert_eq!(observed, (0..10).collect::<Vec<_>>());
     }
 
+    // Characterization: observable durable behavior only. These tests assert
+    // what a reopened store serves (envelopes and the durable tail), never how
+    // the store schedules its rewrites, so a rewrite-amortization change must
+    // keep them green.
+    #[test]
+    fn characterization_default_capacity_rollover_serves_exactly_the_newest_window() {
+        let temp = tempfile::tempdir().unwrap();
+        let total = CHANGE_RETENTION_RECORDS + 4;
+        {
+            let mut store = ChangeStore::open(temp.path()).unwrap();
+            for index in 0..total {
+                store
+                    .append_now(ChangeKind::Lifecycle, serde_json::json!({"index": index}))
+                    .unwrap();
+            }
+        }
+        let store = ChangeStore::open(temp.path()).unwrap();
+        let expired = store.watch(Some(&change_cursor(0)), Some(1)).unwrap();
+        assert_eq!(expired.status, WatchStatus::CursorExpired);
+        assert_eq!(expired.retention_limit, CHANGE_RETENTION_RECORDS);
+        assert_eq!(
+            expired.earliest_available_cursor.as_deref(),
+            Some(change_cursor((total - CHANGE_RETENTION_RECORDS) as u64 + 1).as_str())
+        );
+        assert_eq!(
+            expired.latest_cursor.as_deref(),
+            Some(change_cursor(total as u64).as_str())
+        );
+
+        let mut after = expired.resume_after_cursor.unwrap();
+        let mut observed = Vec::new();
+        loop {
+            let page = store.watch(Some(&after), Some(1_000)).unwrap();
+            assert_eq!(page.status, WatchStatus::Ok);
+            if page.items.is_empty() {
+                break;
+            }
+            observed.extend(
+                page.items
+                    .iter()
+                    .map(|record| record.payload["index"].as_u64().unwrap()),
+            );
+            after = page.next_cursor.unwrap();
+        }
+        let expected =
+            ((total - CHANGE_RETENTION_RECORDS) as u64..total as u64).collect::<Vec<_>>();
+        assert_eq!(observed, expected);
+    }
+
+    #[test]
+    fn characterization_durable_tail_survives_reopen_gap_free_and_duplicate_free() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let mut store = ChangeStore::open_with_capacity(temp.path(), 8).unwrap();
+            for index in 0..25 {
+                store
+                    .append_now(ChangeKind::Job, serde_json::json!({"index": index}))
+                    .unwrap();
+            }
+        }
+        // The durable file must always end with the newest `capacity` records
+        // in contiguous order, whatever rewrite strategy produced it.
+        let bytes = std::fs::read(temp.path().join(CHANGE_FILE)).unwrap();
+        let records = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<ChangeRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(records.len() >= 8, "durable tail lost records");
+        let sequences = records
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>();
+        let newest = sequences[sequences.len() - 8..].to_vec();
+        assert_eq!(newest, (18..=25).collect::<Vec<_>>());
+        assert!(sequences.windows(2).all(|pair| pair[1] == pair[0] + 1));
+
+        let reopened = ChangeStore::open_with_capacity(temp.path(), 8).unwrap();
+        let page = reopened
+            .watch(Some(&change_cursor(17)), Some(1_000))
+            .unwrap();
+        assert_eq!(page.status, WatchStatus::Ok);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            (18..=25).collect::<Vec<_>>()
+        );
+        let next = reopened
+            .watch(Some(page.next_cursor.as_deref().unwrap()), Some(1_000))
+            .unwrap();
+        assert!(next.items.is_empty(), "resume produced duplicates");
+    }
+
+    #[test]
+    fn characterization_crash_artifacts_do_not_break_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        {
+            let mut store = ChangeStore::open_with_capacity(temp.path(), 4).unwrap();
+            for index in 0..6 {
+                store
+                    .append_now(ChangeKind::Trace, serde_json::json!({"index": index}))
+                    .unwrap();
+            }
+        }
+        // A crash between the temp-file write and the rename leaves a stale
+        // sibling; a crash mid-append leaves a torn last line. Reopen must
+        // absorb both without losing acknowledged records.
+        std::fs::write(
+            temp.path().join("changes.jsonl.tmp-stale"),
+            b"{\"partial\":",
+        )
+        .unwrap();
+        let path = temp.path().join(CHANGE_FILE);
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"{\"schemaVersion\":1,\"torn").unwrap();
+        drop(file);
+
+        let store = ChangeStore::open_with_capacity(temp.path(), 4).unwrap();
+        let page = store.watch(Some(&change_cursor(2)), Some(1_000)).unwrap();
+        assert_eq!(page.status, WatchStatus::Ok);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|record| record.payload["index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn characterization_open_with_capacity_edges() {
+        let temp = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            ChangeStore::open_with_capacity(temp.path(), 0),
+            Err(ChangeError::Invalid(_))
+        ));
+
+        {
+            let mut store = ChangeStore::open_with_capacity(temp.path(), 1).unwrap();
+            for index in 0..3 {
+                store
+                    .append_now(ChangeKind::Pool, serde_json::json!({"index": index}))
+                    .unwrap();
+            }
+            let latest = store.watch(Some(&change_cursor(2)), None).unwrap();
+            assert_eq!(latest.items.len(), 1);
+            assert_eq!(latest.items[0].sequence, 3);
+        }
+
+        // Reopening with a smaller capacity than the durable record count must
+        // keep the newest window and the append sequence intact.
+        {
+            let mut wide = ChangeStore::open_with_capacity(temp.path(), 16).unwrap();
+            for index in 3..9 {
+                wide.append_now(ChangeKind::Pool, serde_json::json!({"index": index}))
+                    .unwrap();
+            }
+        }
+        let mut narrow = ChangeStore::open_with_capacity(temp.path(), 2).unwrap();
+        let expired = narrow.watch(Some(&change_cursor(1)), None).unwrap();
+        assert_eq!(expired.status, WatchStatus::CursorExpired);
+        assert_eq!(
+            expired.earliest_available_cursor.as_deref(),
+            Some(change_cursor(8).as_str())
+        );
+        let appended = narrow
+            .append_now(ChangeKind::Pool, serde_json::json!({"index": 9}))
+            .unwrap();
+        assert_eq!(appended.sequence, 10);
+    }
+
     #[test]
     fn acceptance_24_8_expired_slow_reader_gets_an_explicit_gap_and_resume_cursor() {
         let temp = tempfile::tempdir().unwrap();
