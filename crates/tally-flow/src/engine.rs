@@ -480,25 +480,43 @@ impl HostShared {
             return Err(error);
         }
 
-        if admission.disposition != Disposition::Created && admission.payload_hash != expected_hash
-        {
-            let error = FlowError::new(
-                "FlowReplayError",
-                "replay-divergence",
-                format!(
-                    "ordinal {} re-derived payload {} but the ledger recorded {}",
-                    plan.ordinal, expected_hash, admission.payload_hash
-                ),
-            )
-            .at(plan.location)
-            .with_ordinal(plan.ordinal)
-            .detail("expectedHash", expected_hash)
-            .detail("recordedHash", admission.payload_hash.clone())
-            .detail("expectedLabel", expected_label.unwrap_or_default())
-            .detail(
-                "recordedLabel",
-                admission.recorded_label.clone().unwrap_or_default(),
-            );
+        if admission.payload_hash != expected_hash {
+            let error = if admission.disposition == Disposition::Created {
+                FlowError::new(
+                    "FlowContractError",
+                    "payload-hash-contract-drift",
+                    format!(
+                        "ordinal {} ({}) hashed to {} in the flow runner but {} in the daemon",
+                        plan.ordinal,
+                        expected_label.as_deref().unwrap_or("<unlabelled>"),
+                        expected_hash,
+                        admission.payload_hash
+                    ),
+                )
+                .at(plan.location)
+                .with_ordinal(plan.ordinal)
+                .detail("expectedHash", expected_hash)
+                .detail("recordedHash", admission.payload_hash.clone())
+                .detail("label", expected_label.unwrap_or_default())
+            } else {
+                FlowError::new(
+                    "FlowReplayError",
+                    "replay-divergence",
+                    format!(
+                        "ordinal {} re-derived payload {} but the ledger recorded {}",
+                        plan.ordinal, expected_hash, admission.payload_hash
+                    ),
+                )
+                .at(plan.location)
+                .with_ordinal(plan.ordinal)
+                .detail("expectedHash", expected_hash)
+                .detail("recordedHash", admission.payload_hash.clone())
+                .detail("expectedLabel", expected_label.unwrap_or_default())
+                .detail(
+                    "recordedLabel",
+                    admission.recorded_label.clone().unwrap_or_default(),
+                )
+            };
             self.set_fatal(error.clone());
             return Err(error);
         }
@@ -2904,9 +2922,43 @@ mod tests {
             Reply::pass(Disposition::Created, 3),
         ]);
         let error = run(&source, client.clone()).unwrap_err();
+        assert_eq!(error.name, "FlowReplayError");
         assert_eq!(error.code, "replay-divergence");
         assert_eq!(error.ordinal, Some(1));
+        assert_eq!(
+            error.details.keys().map(String::as_str).collect::<Vec<_>>(),
+            [
+                "expectedHash",
+                "recordedHash",
+                "expectedLabel",
+                "recordedLabel"
+            ]
+        );
         assert_eq!(client.submissions.borrow().len(), 2);
+    }
+
+    #[test]
+    fn created_payload_mismatch_reports_contract_drift_on_first_admission() {
+        let source = format!(
+            "{}\n(async () => sh(['first'], {{pools: ['cpu'], label: 'first-node'}}))()",
+            meta(&["cpu"], &[])
+        );
+        let mut mismatch = Reply::pass(Disposition::Created, 1);
+        mismatch.divergent_hash = true;
+        let client = MockClient::new(vec![mismatch]);
+
+        let error = run(&source, client.clone()).unwrap_err();
+
+        assert_eq!(error.name, "FlowContractError");
+        assert_eq!(error.code, "payload-hash-contract-drift");
+        assert_eq!(error.ordinal, Some(0));
+        assert_eq!(error.details["recordedHash"], "sha256:divergent");
+        assert!(error.details["expectedHash"]
+            .as_str()
+            .unwrap()
+            .starts_with("sha256:"));
+        assert_eq!(error.details["label"], "first-node");
+        assert_eq!(client.submissions.borrow().len(), 1);
     }
 
     #[test]
