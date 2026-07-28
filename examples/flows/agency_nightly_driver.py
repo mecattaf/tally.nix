@@ -1,27 +1,42 @@
 #!/usr/bin/env python3
-"""Deterministic GitHub worklist and culmination driver for agency-nightly.js."""
+"""Deterministic worklist and culmination driver for agency-nightly.js.
+
+Two actions, both deterministic, both reporting domain failures as data:
+
+  worklist   Witness the wave the flow declared: pin the base commit, and cut one
+             git worktree and branch per task.
+  culminate  Push what each task committed, open or find its pull request, and
+             write the morning report.
+
+There is no worklist *source* here on purpose. The 2026-07-27 ruling on the
+agency wave settled that the worklist is the flow script and its arguments, not
+an external document this driver scrapes: no labelled-issue query, no tasks.md
+adapter. The wave arrives in the brief, already checked against the flow's
+argsSchema when the generation was built.
+
+Every failure is emitted as ``{"ok": false, "error": {...}}`` under exit 0, so
+the flow sees a typed, witnessed value rather than a dead node.
+
+Authentication is whatever ``gh`` and ``git`` already have on the machine. This
+driver never reads, writes, or asks for a token.
+"""
 
 from __future__ import annotations
 
-import heapq
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
-from pathlib import Path, PurePosixPath
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any
 
 FINAL_MESSAGE_PREFIX = "TALLY_FINAL_MESSAGE="
-PARALLEL_TITLE = re.compile(r"^\[P\](?:\s+|$)")
-ACCEPTANCE_HEADING = re.compile(r"^##\s+Acceptance\s*$")
-LEVEL_TWO_HEADING = re.compile(r"^##(?:\s+|$)")
-TASK_LIST_ITEM = re.compile(r"^\s*[-*+]\s+\[([ xX])\]\s+(.+?)\s*$")
-FILES_TRAILER = re.compile(r"^Files:\s*(.*?)\s*$")
-DEPENDS_TRAILER = re.compile(r"^Depends-on:\s*(.*?)\s*$")
-DEPENDENCY_REFERENCE = re.compile(r"#([1-9][0-9]*)")
+TASK_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
+ISSUE_ID = re.compile(r"^[1-9][0-9]*$")
 COMMIT_ID = re.compile(r"^[0-9a-f]{40,64}$")
+MAX_WAVE_SIZE = 6
 
 
 class DriverError(Exception):
@@ -68,24 +83,24 @@ def command(
     if check and result.returncode != 0:
         raise DriverError(
             error_code,
-            f"command {argv[0]!r} exited {result.returncode}",
+            f"{argv[0]} exited {result.returncode}",
             {
                 "argv": argv,
                 "exitCode": result.returncode,
-                "stderr": result.stderr[-4000:],
+                "stderr": result.stderr.strip()[:2000],
             },
         )
     return result
 
 
 def require_string(value: Any, field: str, *, absolute: bool = False) -> str:
-    if not isinstance(value, str) or not value or any(ord(char) < 32 for char in value):
+    if not isinstance(value, str) or not value or any(ord(c) < 32 for c in value):
         raise DriverError(
             "agency-driver-brief-invalid",
-            f"{field} must be a non-empty string without control characters",
+            f"{field} must be a non-empty single-line string",
             {"field": field},
         )
-    if absolute and not Path(value).is_absolute():
+    if absolute and not value.startswith("/"):
         raise DriverError(
             "agency-driver-brief-invalid",
             f"{field} must be an absolute path",
@@ -94,254 +109,97 @@ def require_string(value: Any, field: str, *, absolute: bool = False) -> str:
     return value
 
 
-def require_int(value: Any, field: str, minimum: int, maximum: int) -> int:
-    if (
-        not isinstance(value, int)
-        or isinstance(value, bool)
-        or value < minimum
-        or value > maximum
-    ):
-        raise DriverError(
-            "agency-driver-brief-invalid",
-            f"{field} must be an integer from {minimum} through {maximum}",
-            {"field": field},
-        )
-    return value
+def optional_string(value: Any, field: str) -> str | None:
+    if value is None:
+        return None
+    return require_string(value, field)
 
 
-def parse_acceptance(body: str, task_id: str) -> list[dict[str, Any]]:
-    lines = body.splitlines()
-    headings = [
-        index for index, line in enumerate(lines) if ACCEPTANCE_HEADING.fullmatch(line)
-    ]
-    if len(headings) != 1:
+def parse_task(value: Any, index: int) -> dict[str, Any]:
+    """Validate one wave entry. The flow already checked argsSchema; this is the
+    driver refusing to trust a brief it did not build."""
+    if not isinstance(value, dict):
         raise DriverError(
-            "worklist-acceptance-missing",
-            f"issue #{task_id} must contain exactly one ## Acceptance heading",
-            {"taskId": task_id, "headingCount": len(headings)},
+            "worklist-task-invalid",
+            f"wave entry {index} must be an object",
+            {"index": index},
         )
-    start = headings[0] + 1
-    end = next(
-        (
-            index
-            for index in range(start, len(lines))
-            if LEVEL_TWO_HEADING.match(lines[index])
-        ),
-        len(lines),
-    )
-    criteria = []
-    for line in lines[start:end]:
-        match = TASK_LIST_ITEM.match(line)
-        if match:
-            criteria.append(
-                {
-                    "text": match.group(2),
-                    "checked": match.group(1).lower() == "x",
-                }
-            )
-    if not criteria:
+    task_id = require_string(value.get("taskId"), f"wave[{index}].taskId")
+    if not TASK_ID.fullmatch(task_id):
         raise DriverError(
-            "worklist-acceptance-missing",
-            f"issue #{task_id} has no task-list checklist under ## Acceptance",
+            "worklist-task-invalid",
+            f"task ID {task_id!r} is not a lowercase slug",
             {"taskId": task_id},
         )
-    return criteria
-
-
-def parse_files(body: str, task_id: str) -> list[str]:
-    files: list[str] = []
-    for line in body.splitlines():
-        match = FILES_TRAILER.fullmatch(line)
-        if not match:
-            continue
-        values = [value.strip() for value in match.group(1).split(",")]
-        if not values or any(not value for value in values):
-            raise DriverError(
-                "worklist-files-invalid",
-                f"issue #{task_id} has an empty Files: trailer",
-                {"taskId": task_id},
-            )
-        for value in values:
-            path = PurePosixPath(value)
-            if (
-                path.is_absolute()
-                or value.startswith("./")
-                or "\\" in value
-                or any(part in ("", ".", "..") for part in path.parts)
-                or any(ord(char) < 32 for char in value)
-            ):
-                raise DriverError(
-                    "worklist-files-invalid",
-                    f"issue #{task_id} has an invalid repository-relative file path",
-                    {"taskId": task_id, "path": value},
-                )
-            if value not in files:
-                files.append(value)
-    return files
-
-
-def parse_dependencies(body: str, task_id: str) -> list[str]:
-    dependencies: list[str] = []
-    for line in body.splitlines():
-        match = DEPENDS_TRAILER.fullmatch(line)
-        if not match:
-            continue
-        value = match.group(1)
-        references = DEPENDENCY_REFERENCE.findall(value)
-        residual = DEPENDENCY_REFERENCE.sub("", value)
-        if not references or residual.strip(" ,\t"):
-            raise DriverError(
-                "worklist-dependency-invalid",
-                f"issue #{task_id} has an invalid Depends-on: trailer",
-                {"taskId": task_id, "trailer": value},
-            )
-        for dependency in references:
-            if dependency not in dependencies:
-                dependencies.append(dependency)
-    return dependencies
-
-
-def parse_issue(issue: dict[str, Any]) -> dict[str, Any]:
-    number = issue.get("number")
-    title = issue.get("title")
-    body = issue.get("body")
+    title = require_string(value.get("title"), f"wave[{index}].title")
+    mission = value.get("mission")
+    if not isinstance(mission, str) or not mission.strip():
+        raise DriverError(
+            "worklist-task-invalid",
+            f"task {task_id!r} has no mission",
+            {"taskId": task_id},
+        )
+    criteria = value.get("acceptanceCriteria")
     if (
-        not isinstance(number, int)
-        or number < 1
-        or not isinstance(title, str)
-        or not title
-        or not isinstance(body, str)
+        not isinstance(criteria, list)
+        or not criteria
+        or any(not isinstance(item, str) or not item.strip() for item in criteria)
     ):
         raise DriverError(
-            "worklist-issue-invalid",
-            "GitHub returned an issue without a positive number, title, or body",
-            {"issue": issue},
+            "worklist-task-invalid",
+            f"task {task_id!r} needs a non-empty list of acceptance criteria",
+            {"taskId": task_id},
         )
-    task_id = str(number)
-    entry: dict[str, Any] = {
+    task: dict[str, Any] = {
         "taskId": task_id,
         "title": title,
-        "acceptanceCriteria": parse_acceptance(body, task_id),
-        "parallelism": "parallel"
-        if PARALLEL_TITLE.match(title)
-        else "sequential",
+        "mission": mission,
+        "acceptanceCriteria": list(criteria),
     }
-    files = parse_files(body, task_id)
-    dependencies = parse_dependencies(body, task_id)
-    if files:
-        entry["files"] = files
-    if dependencies:
-        entry["dependsOn"] = dependencies
-    return entry
-
-
-def topological_order(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    by_id = {entry["taskId"]: entry for entry in entries}
-    if len(by_id) != len(entries):
-        raise DriverError(
-            "worklist-task-id-duplicate",
-            "the GitHub worklist contains a duplicate task ID",
-        )
-    indegree = {task_id: 0 for task_id in by_id}
-    dependents = {task_id: [] for task_id in by_id}
-    for task_id, entry in by_id.items():
-        for dependency in entry.get("dependsOn", []):
-            if dependency in by_id:
-                indegree[task_id] += 1
-                dependents[dependency].append(task_id)
-    ready = [int(task_id) for task_id, count in indegree.items() if count == 0]
-    heapq.heapify(ready)
-    ordered: list[dict[str, Any]] = []
-    while ready:
-        task_id = str(heapq.heappop(ready))
-        ordered.append(by_id[task_id])
-        for dependent in sorted(dependents[task_id], key=int):
-            indegree[dependent] -= 1
-            if indegree[dependent] == 0:
-                heapq.heappush(ready, int(dependent))
-    if len(ordered) != len(entries):
-        cycle = sorted(
-            (task_id for task_id, count in indegree.items() if count > 0), key=int
-        )
-        raise DriverError(
-            "worklist-dependency-cycle",
-            "the labeled GitHub worklist contains a dependency cycle",
-            {"taskIds": cycle},
-        )
-    return ordered
-
-
-def dependency_states(
-    entries: list[dict[str, Any]],
-    repository: str,
-    lookup: Callable[[str], str],
-) -> dict[str, str]:
-    states = {entry["taskId"]: "OPEN" for entry in entries}
-    for entry in entries:
-        for dependency in entry.get("dependsOn", []):
-            if dependency in states:
-                continue
-            state = lookup(dependency).upper()
-            if state not in ("OPEN", "CLOSED"):
-                raise DriverError(
-                    "worklist-dependency-lookup",
-                    f"dependency #{dependency} in {repository} has an unknown state",
-                    {"taskId": entry["taskId"], "dependency": dependency, "state": state},
-                )
-            states[dependency] = state
-    return states
-
-
-def select_wave(
-    ordered: list[dict[str, Any]], states: dict[str, str], max_wave_size: int
-) -> list[str]:
-    ready = [
-        entry
-        for entry in ordered
-        if all(states[dependency] == "CLOSED" for dependency in entry.get("dependsOn", []))
-    ]
-    if not ready:
-        return []
-    if ready[0]["parallelism"] == "sequential":
-        return [ready[0]["taskId"]]
-    wave = []
-    for entry in ready:
-        if entry["parallelism"] != "parallel" or len(wave) == max_wave_size:
-            break
-        wave.append(entry["taskId"])
-    return wave
-
-
-def gh_issue_state(repository: str, task_id: str) -> str:
-    result = command(
-        [
-            "gh",
-            "issue",
-            "view",
-            task_id,
-            "--repo",
-            repository,
-            "--json",
-            "state",
-        ],
-        error_code="worklist-dependency-lookup",
+    issue = optional_string(value.get("issue"), f"wave[{index}].issue")
+    if issue is not None:
+        if not ISSUE_ID.fullmatch(issue):
+            raise DriverError(
+                "worklist-task-invalid",
+                f"task {task_id!r} references an invalid issue number",
+                {"taskId": task_id, "issue": issue},
+            )
+        task["issue"] = issue
+    unknown = sorted(
+        set(value) - {"taskId", "title", "mission", "acceptanceCriteria", "issue"}
     )
-    try:
-        value = json.loads(result.stdout)
-        state = value["state"]
-    except (json.JSONDecodeError, KeyError, TypeError) as error:
+    if unknown:
         raise DriverError(
-            "worklist-dependency-lookup",
-            f"GitHub returned an invalid state for dependency #{task_id}",
-            {"taskId": task_id},
-        ) from error
-    if not isinstance(state, str):
-        raise DriverError(
-            "worklist-dependency-lookup",
-            f"GitHub returned a non-string state for dependency #{task_id}",
-            {"taskId": task_id},
+            "worklist-task-invalid",
+            f"task {task_id!r} has unknown fields",
+            {"taskId": task_id, "fields": unknown},
         )
-    return state
+    return task
+
+
+def read_wave(brief: dict[str, Any]) -> list[dict[str, Any]]:
+    wave = brief.get("wave")
+    if not isinstance(wave, list) or not wave:
+        raise DriverError(
+            "agency-driver-brief-invalid", "the brief carries no wave"
+        )
+    if len(wave) > MAX_WAVE_SIZE:
+        raise DriverError(
+            "worklist-wave-too-large",
+            f"the wave holds {len(wave)} tasks and the bound is {MAX_WAVE_SIZE}",
+            {"waveSize": len(wave), "maxWaveSize": MAX_WAVE_SIZE},
+        )
+    tasks = [parse_task(entry, index) for index, entry in enumerate(wave)]
+    seen: set[str] = set()
+    for task in tasks:
+        if task["taskId"] in seen:
+            raise DriverError(
+                "worklist-task-id-duplicate",
+                f"the wave names task {task['taskId']!r} twice",
+                {"taskId": task["taskId"]},
+            )
+        seen.add(task["taskId"])
+    return tasks
 
 
 def same_repository(checkout: Path, worktree: Path) -> bool:
@@ -365,17 +223,23 @@ def prepare_workspace(
     base_rev: str,
     task_id: str,
 ) -> dict[str, str]:
-    branch = f"{branch_prefix.rstrip('/')}/issue-{task_id}"
+    """One worktree and one branch per task, and never a shared one.
+
+    Re-running against an existing worktree is the resume path: the same branch
+    on the same repository is adopted as-is, work and all. Anything else in the
+    way is a conflict rather than something to clobber.
+    """
+    branch = f"{branch_prefix.rstrip('/')}/{task_id}"
     command(
         ["git", "check-ref-format", "--branch", branch],
         error_code="worklist-branch-invalid",
     )
-    worktree = worktree_root / f"issue-{task_id}"
+    worktree = worktree_root / task_id
     if worktree.exists():
         if not worktree.is_dir() or not same_repository(checkout, worktree):
             raise DriverError(
                 "worklist-worktree-conflict",
-                f"existing path for task #{task_id} is not a worktree of the configured checkout",
+                f"existing path for task {task_id!r} is not a worktree of the configured checkout",
                 {"taskId": task_id, "worktreePath": str(worktree)},
             )
         actual_branch = command(
@@ -385,7 +249,7 @@ def prepare_workspace(
         if actual_branch != branch:
             raise DriverError(
                 "worklist-worktree-conflict",
-                f"existing worktree for task #{task_id} is on a different branch",
+                f"existing worktree for task {task_id!r} is on a different branch",
                 {
                     "taskId": task_id,
                     "worktreePath": str(worktree),
@@ -422,25 +286,8 @@ def prepare_workspace(
     }
 
 
-def read_worklist(brief: dict[str, Any]) -> dict[str, Any]:
-    source = brief.get("source")
-    if not isinstance(source, dict):
-        raise DriverError(
-            "agency-driver-brief-invalid", "worklist source must be an object"
-        )
-    if source.get("kind") != "github-issues" or source.get("state") != "open":
-        raise DriverError(
-            "agency-driver-brief-invalid",
-            "worklist source must select open GitHub issues",
-        )
-    repository = require_string(source.get("repository"), "source.repository")
-    label = require_string(source.get("label"), "source.label")
-    if label != "tally:worklist":
-        raise DriverError(
-            "worklist-label-invalid",
-            "the canonical GitHub adapter requires the tally:worklist label",
-            {"label": label},
-        )
+def worklist(brief: dict[str, Any]) -> dict[str, Any]:
+    repository = require_string(brief.get("repository"), "repository")
     checkout = Path(require_string(brief.get("checkout"), "checkout", absolute=True))
     base_ref = require_string(brief.get("baseRev"), "baseRev")
     base_branch = require_string(brief.get("baseBranch"), "baseBranch")
@@ -448,69 +295,14 @@ def read_worklist(brief: dict[str, Any]) -> dict[str, Any]:
         require_string(brief.get("worktreeRoot"), "worktreeRoot", absolute=True)
     )
     branch_prefix = require_string(brief.get("branchPrefix"), "branchPrefix")
-    max_wave_size = require_int(brief.get("maxWaveSize"), "maxWaveSize", 1, 6)
-
-    result = command(
-        [
-            "gh",
-            "issue",
-            "list",
-            "--repo",
-            repository,
-            "--state",
-            "open",
-            "--label",
-            label,
-            "--limit",
-            "1000",
-            "--json",
-            "number,title,body",
-        ],
-        error_code="worklist-source-failed",
-    )
-    try:
-        raw_issues = json.loads(result.stdout)
-    except json.JSONDecodeError as error:
-        raise DriverError(
-            "worklist-source-failed",
-            "GitHub returned invalid JSON for the labeled worklist",
-        ) from error
-    if not isinstance(raw_issues, list):
-        raise DriverError(
-            "worklist-source-failed",
-            "GitHub returned a non-array labeled worklist",
-        )
-
-    entries = [parse_issue(issue) for issue in raw_issues]
-    ordered = topological_order(entries)
-    states = dependency_states(
-        entries,
-        repository,
-        lambda task_id: gh_issue_state(repository, task_id),
-    )
-    wave = select_wave(ordered, states, max_wave_size)
+    tasks = read_wave(brief)
 
     command(
-        [
-            "git",
-            "-C",
-            str(checkout),
-            "fetch",
-            "--prune",
-            "origin",
-            base_branch,
-        ],
+        ["git", "-C", str(checkout), "fetch", "--prune", "origin", base_branch],
         error_code="worklist-base-fetch-failed",
     )
     base_rev = command(
-        [
-            "git",
-            "-C",
-            str(checkout),
-            "rev-parse",
-            "--verify",
-            f"{base_ref}^{{commit}}",
-        ],
+        ["git", "-C", str(checkout), "rev-parse", "--verify", f"{base_ref}^{{commit}}"],
         error_code="worklist-base-revision-invalid",
     ).stdout.strip()
     if not COMMIT_ID.fullmatch(base_rev):
@@ -519,50 +311,55 @@ def read_worklist(brief: dict[str, Any]) -> dict[str, Any]:
             "git resolved the configured base revision to an invalid commit ID",
             {"baseRev": base_rev},
         )
+
     worktree_root.mkdir(parents=True, exist_ok=True)
     workspaces = [
         prepare_workspace(
-            checkout, worktree_root, branch_prefix, base_rev, task_id
+            checkout, worktree_root, branch_prefix, base_rev, task["taskId"]
         )
-        for task_id in wave
+        for task in tasks
     ]
     return {
         "schemaVersion": 1,
-        "source": {
-            "kind": "github-issues",
-            "repository": repository,
-            "label": label,
-        },
+        "repository": repository,
         "baseRev": base_rev,
-        "entries": ordered,
-        "wave": wave,
+        "tasks": tasks,
         "workspaces": workspaces,
     }
 
 
-def compact_title(title: str) -> str:
-    return PARALLEL_TITLE.sub("", title, count=1).strip()
+def pr_title(task: dict[str, Any]) -> str:
+    return task["title"].strip()
 
 
-def pr_body(task: dict[str, Any]) -> str:
-    entry = task["entry"]
-    implementation = task["implementation"]
-    review = task["review"]
-    lines = [
-        f"Worklist issue: #{entry['taskId']}",
-        "",
-        "## Acceptance",
-        "",
-    ]
-    for criterion in entry["acceptanceCriteria"]:
-        mark = "x" if criterion["checked"] else " "
-        lines.append(f"- [{mark}] {criterion['text']}")
+def pr_body(entry: dict[str, Any]) -> str:
+    task = entry["task"]
+    implementation = entry["implementation"]
+    review = entry["review"]
+    lines = [f"Agency wave task: `{task['taskId']}`"]
+    if task.get("issue"):
+        # A plain reference, never a closing keyword: the human culmination
+        # decides what a merge closes.
+        lines.append(f"Worklist issue: #{task['issue']}")
+    lines.extend(["", "## Acceptance", ""])
+    lines.extend(f"- {criterion}" for criterion in task["acceptanceCriteria"])
+    lines.extend(["", "## Implementation report", "", implementation["summary"]])
+    if implementation.get("tests"):
+        lines.extend(["", "Checks run:", ""])
+        lines.extend(f"- {check}" for check in implementation["tests"])
+    if review is None:
+        lines.extend(
+            [
+                "",
+                "## Cross-harness review",
+                "",
+                "The review did not complete. This pull request carries the",
+                "implementation only.",
+            ]
+        )
+        return "\n".join(lines).rstrip() + "\n"
     lines.extend(
         [
-            "",
-            "## Implementation report",
-            "",
-            implementation["summary"],
             "",
             "## Cross-harness review",
             "",
@@ -573,8 +370,10 @@ def pr_body(task: dict[str, Any]) -> str:
     )
     if review["findings"]:
         lines.extend(["", "### Findings", ""])
-        for finding in review["findings"]:
-            lines.append(f"- {finding['severity']}: {finding['text']}")
+        lines.extend(
+            f"- {finding['severity']}: {finding['text']}"
+            for finding in review["findings"]
+        )
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -662,51 +461,77 @@ def create_pr(
 
 def render_report(
     repository: str,
-    base_rev: str,
-    tasks: list[dict[str, Any]],
+    base_rev: str | None,
+    worklist_error: dict[str, Any] | None,
+    entries: list[dict[str, Any]],
     pull_requests: list[dict[str, Any]],
+    failures: list[dict[str, Any]],
 ) -> str:
+    by_task = {pull_request["taskId"]: pull_request for pull_request in pull_requests}
+    failure_by_task = {failure["taskId"]: failure for failure in failures}
     lines = [
         "# Agency morning report",
         "",
         f"Repository: `{repository}`",
-        f"Pinned base: `{base_rev}`",
-        f"Wave size: {len(tasks)}",
+        f"Pinned base: `{base_rev}`" if base_rev else "Pinned base: none",
+        f"Wave size: {len(entries)}",
+        f"Pull requests: {len(pull_requests)}",
+        f"Failed tasks: {len(failures)}",
         "",
     ]
-    if not tasks:
-        lines.append("No ready `tally:worklist` tasks were available.")
-        return "\n".join(lines).rstrip() + "\n"
-    for task, pull_request in zip(tasks, pull_requests, strict=True):
-        entry = task["entry"]
-        implementation = task["implementation"]
-        review = task["review"]
+    if worklist_error is not None:
         lines.extend(
             [
-                f"## #{entry['taskId']} — {entry['title'].replace(chr(10), ' ')}",
+                "## The wave did not start",
                 "",
-                f"- Branch: `{pull_request['branch']}`",
-                f"- Pull request: {pull_request['url'] or pull_request['status']}",
-                f"- Review verdict: **{review['verdict']}**",
-                f"- Reviewed head: `{review['reviewedHead']}`",
+                f"`{worklist_error['code']}`: {worklist_error['message']}",
                 "",
-                implementation["summary"],
-                "",
-                review["summary"],
+                "No task was dispatched. Nothing was pushed.",
                 "",
             ]
         )
-        if review["findings"]:
-            lines.append("Findings:")
-            lines.append("")
-            for finding in review["findings"]:
-                lines.append(f"- {finding['severity']}: {finding['text']}")
-            lines.append("")
+    if not entries and worklist_error is None:
+        lines.extend(["The wave was empty.", ""])
+    for entry in entries:
+        task = entry["task"]
+        task_id = task["taskId"]
+        pull_request = by_task.get(task_id)
+        failure = failure_by_task.get(task_id)
+        heading = f"## {task_id} — {task['title'].replace(chr(10), ' ')}"
+        lines.extend([heading, ""])
+        if entry["workspace"]:
+            lines.append(f"- Branch: `{entry['workspace']['branch']}`")
+        if pull_request:
+            lines.append(
+                f"- Pull request: {pull_request['url'] or pull_request['status']}"
+            )
+        if failure:
+            lines.append(f"- **Failed at {failure['stage']}**: `{failure['code']}`")
+            lines.append(f"  {failure['message']}")
+        review = entry.get("review")
+        if review:
+            lines.append(f"- Review verdict: **{review['verdict']}**")
+            lines.append(f"- Reviewed head: `{review['reviewedHead']}`")
+        lines.append("")
+        implementation = entry.get("implementation")
+        if implementation:
+            lines.extend([implementation["summary"], ""])
+        if review:
+            lines.extend([review["summary"], ""])
+            if review["findings"]:
+                lines.extend(["Findings:", ""])
+                lines.extend(
+                    f"- {finding['severity']}: {finding['text']}"
+                    for finding in review["findings"]
+                )
+                lines.append("")
     lines.extend(
         [
             "## Human culmination",
             "",
-            "Judge the pull requests and cross-harness findings here. The flow has no earlier human gate.",
+            "Judge the pull requests and the cross-harness findings here. The wave",
+            "had no earlier human gate, and the reviewing harness never certified",
+            "its own findings.",
             "",
         ]
     )
@@ -727,142 +552,195 @@ def write_atomic(path: Path, content: str) -> None:
     os.replace(temporary, path)
 
 
-def culminate(brief: dict[str, Any]) -> dict[str, Any]:
-    repository = require_string(brief.get("repository"), "repository")
-    base_rev = require_string(brief.get("baseRev"), "baseRev")
-    base_branch = require_string(brief.get("baseBranch"), "baseBranch")
-    report_path = Path(
-        require_string(brief.get("reportPath"), "reportPath", absolute=True)
-    )
-    tasks = brief.get("tasks")
-    if not isinstance(tasks, list) or len(tasks) > 6:
+def read_culmination_entry(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
         raise DriverError(
-            "agency-driver-brief-invalid", "culmination tasks must be an array of at most six"
+            "agency-driver-brief-invalid", "each culmination task must be an object"
         )
+    task = value.get("task")
+    if not isinstance(task, dict):
+        raise DriverError(
+            "agency-driver-brief-invalid", "each culmination task requires a task object"
+        )
+    task_id = require_string(task.get("taskId"), "task.taskId")
+    workspace = value.get("workspace")
+    if workspace is not None and not isinstance(workspace, dict):
+        raise DriverError(
+            "agency-driver-brief-invalid",
+            f"task {task_id!r} has an invalid workspace",
+            {"taskId": task_id},
+        )
+    for field in ("implementation", "review", "failure"):
+        if value.get(field) is not None and not isinstance(value.get(field), dict):
+            raise DriverError(
+                "agency-driver-brief-invalid",
+                f"task {task_id!r} has an invalid {field}",
+                {"taskId": task_id},
+            )
+    return {
+        "task": task,
+        "workspace": workspace,
+        "implementation": value.get("implementation"),
+        "review": value.get("review"),
+        "failure": value.get("failure"),
+    }
 
-    pull_requests = []
-    for task in tasks:
-        if not isinstance(task, dict):
-            raise DriverError(
-                "agency-driver-brief-invalid",
-                "each culmination task must be an object",
-            )
-        entry = task.get("entry")
-        workspace = task.get("workspace")
-        implementation = task.get("implementation")
-        review = task.get("review")
-        if not all(
-            isinstance(value, dict)
-            for value in (entry, workspace, implementation, review)
-        ):
-            raise DriverError(
-                "agency-driver-brief-invalid",
-                "each culmination task requires entry, workspace, implementation, and review objects",
-            )
-        task_id = require_string(entry.get("taskId"), "entry.taskId")
-        branch = require_string(workspace.get("branch"), "workspace.branch")
-        worktree = Path(
-            require_string(
-                workspace.get("worktreePath"), "workspace.worktreePath", absolute=True
-            )
+
+def publish(
+    repository: str,
+    base_branch: str,
+    base_rev: str,
+    entry: dict[str, Any],
+) -> dict[str, Any]:
+    """Push one task's committed work and open or find its pull request.
+
+    The review verdict is deliberately not consulted. A finder never certifies:
+    `changes-requested` reaches the human as pull-request text, not as a gate
+    that silently drops the night's work.
+    """
+    task_id = entry["task"]["taskId"]
+    workspace = entry["workspace"]
+    implementation = entry["implementation"]
+    branch = require_string(workspace.get("branch"), "workspace.branch")
+    worktree = Path(
+        require_string(
+            workspace.get("worktreePath"), "workspace.worktreePath", absolute=True
         )
-        head = require_string(implementation.get("head"), "implementation.head")
+    )
+    head = require_string(implementation.get("head"), "implementation.head")
+    if not COMMIT_ID.fullmatch(head):
+        raise DriverError(
+            "culmination-head-invalid",
+            f"task {task_id!r} reported an invalid head commit",
+            {"taskId": task_id, "head": head},
+        )
+    actual_head = command(
+        ["git", "-C", str(worktree), "rev-parse", "HEAD"],
+        error_code="culmination-head-invalid",
+    ).stdout.strip()
+    if head != actual_head:
+        raise DriverError(
+            "culmination-head-drift",
+            f"task {task_id!r} worktree moved after the implementation report",
+            {"taskId": task_id, "reportedHead": head, "actualHead": actual_head},
+        )
+    review = entry["review"]
+    if review is not None:
         reviewed_head = require_string(review.get("reviewedHead"), "review.reviewedHead")
-        actual_head = command(
-            ["git", "-C", str(worktree), "rev-parse", "HEAD"],
-            error_code="culmination-head-invalid",
-        ).stdout.strip()
-        if head != actual_head:
-            raise DriverError(
-                "culmination-head-drift",
-                f"task #{task_id} worktree moved after the implementation report",
-                {
-                    "taskId": task_id,
-                    "reportedHead": head,
-                    "actualHead": actual_head,
-                },
-            )
         if reviewed_head != head:
             raise DriverError(
                 "culmination-review-drift",
-                f"task #{task_id} review names a different commit",
+                f"task {task_id!r} review names a different commit",
                 {
                     "taskId": task_id,
                     "implementationHead": head,
                     "reviewedHead": reviewed_head,
                 },
             )
-        commit_count_text = command(
-            ["git", "-C", str(worktree), "rev-list", "--count", f"{base_rev}..{head}"],
-            error_code="culmination-history-invalid",
-        ).stdout.strip()
-        try:
-            commit_count = int(commit_count_text)
-        except ValueError as error:
-            raise DriverError(
-                "culmination-history-invalid",
-                f"git returned an invalid commit count for task #{task_id}",
-                {"taskId": task_id, "count": commit_count_text},
-            ) from error
-        if commit_count == 0:
-            pull_requests.append(
+    commit_count_text = command(
+        ["git", "-C", str(worktree), "rev-list", "--count", f"{base_rev}..{head}"],
+        error_code="culmination-history-invalid",
+    ).stdout.strip()
+    try:
+        commit_count = int(commit_count_text)
+    except ValueError as error:
+        raise DriverError(
+            "culmination-history-invalid",
+            f"git returned an invalid commit count for task {task_id!r}",
+            {"taskId": task_id, "count": commit_count_text},
+        ) from error
+    if commit_count == 0:
+        return {
+            "taskId": task_id,
+            "branch": branch,
+            "status": "no-changes",
+            "url": None,
+        }
+    command(
+        ["git", "-C", str(worktree), "push", "origin", f"{head}:refs/heads/{branch}"],
+        error_code="culmination-push-failed",
+    )
+    url = existing_pr(repository, branch)
+    status = "existing"
+    if url is None:
+        url = create_pr(
+            repository, base_branch, branch, pr_title(entry["task"]), pr_body(entry)
+        )
+        status = "created"
+    return {"taskId": task_id, "branch": branch, "status": status, "url": url}
+
+
+def culminate(brief: dict[str, Any]) -> dict[str, Any]:
+    repository = require_string(brief.get("repository"), "repository")
+    base_branch = require_string(brief.get("baseBranch"), "baseBranch")
+    base_rev = optional_string(brief.get("baseRev"), "baseRev")
+    report_path = Path(
+        require_string(brief.get("reportPath"), "reportPath", absolute=True)
+    )
+    worklist_error = brief.get("worklistError")
+    if worklist_error is not None and not isinstance(worklist_error, dict):
+        raise DriverError(
+            "agency-driver-brief-invalid", "worklistError must be an object or null"
+        )
+    raw_tasks = brief.get("tasks")
+    if not isinstance(raw_tasks, list) or len(raw_tasks) > MAX_WAVE_SIZE:
+        raise DriverError(
+            "agency-driver-brief-invalid",
+            f"culmination tasks must be an array of at most {MAX_WAVE_SIZE}",
+        )
+    entries = [read_culmination_entry(value) for value in raw_tasks]
+
+    pull_requests: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for entry in entries:
+        task_id = entry["task"]["taskId"]
+        if entry["failure"] is not None or entry["implementation"] is None:
+            failure = entry["failure"] or {}
+            failures.append(
                 {
                     "taskId": task_id,
-                    "branch": branch,
-                    "status": "no-changes",
-                    "url": None,
+                    "stage": failure.get("stage") or "implementation",
+                    "code": failure.get("code") or "task-incomplete",
+                    "message": failure.get("message") or "the task produced no result",
                 }
             )
             continue
-        command(
-            [
-                "git",
-                "-C",
-                str(worktree),
-                "push",
-                "origin",
-                f"{head}:refs/heads/{branch}",
-            ],
-            error_code="culmination-push-failed",
-        )
-        url = existing_pr(repository, branch)
-        status = "existing"
-        if url is None:
-            url = create_pr(
-                repository,
-                base_branch,
-                branch,
-                compact_title(require_string(entry.get("title"), "entry.title")),
-                pr_body(task),
+        if entry["workspace"] is None or base_rev is None:
+            failures.append(
+                {
+                    "taskId": task_id,
+                    "stage": "implementation",
+                    "code": "culmination-workspace-missing",
+                    "message": "the task has no witnessed workspace to publish from",
+                }
             )
-            status = "created"
-        pull_requests.append(
-            {
-                "taskId": task_id,
-                "branch": branch,
-                "status": status,
-                "url": url,
-            }
-        )
+            continue
+        pull_requests.append(publish(repository, base_branch, base_rev, entry))
 
-    status = "ready" if tasks else "empty"
+    if worklist_error is not None:
+        status = "worklist-failed"
+    elif failures:
+        status = "partial"
+    else:
+        status = "ready"
     write_atomic(
         report_path,
-        render_report(repository, base_rev, tasks, pull_requests),
+        render_report(
+            repository, base_rev, worklist_error, entries, pull_requests, failures
+        ),
     )
     return {
         "status": status,
         "reportPath": str(report_path),
         "pullRequests": pull_requests,
+        "failures": failures,
     }
 
 
 def read_brief() -> dict[str, Any]:
     raw = os.environ.get("TALLY_BRIEF")
     if raw is None:
-        raise DriverError(
-            "agency-driver-brief-invalid", "TALLY_BRIEF is not set"
-        )
+        raise DriverError("agency-driver-brief-invalid", "TALLY_BRIEF is not set")
     try:
         value = json.loads(raw)
     except json.JSONDecodeError as error:
@@ -876,24 +754,6 @@ def read_brief() -> dict[str, Any]:
     return value
 
 
-def load_github_credential() -> None:
-    if os.environ.get("GH_TOKEN"):
-        return
-    directory = os.environ.get("CREDENTIALS_DIRECTORY")
-    if not directory:
-        return
-    token_path = Path(directory) / "GH_TOKEN"
-    if not token_path.is_file():
-        return
-    token = token_path.read_text(encoding="utf-8").strip()
-    if not token:
-        raise DriverError(
-            "agency-driver-credential-invalid",
-            "the GH_TOKEN systemd credential is empty",
-        )
-    os.environ["GH_TOKEN"] = token
-
-
 def main() -> int:
     try:
         if len(sys.argv) != 2 or sys.argv[1] not in ("worklist", "culminate"):
@@ -901,9 +761,8 @@ def main() -> int:
                 "agency-driver-action-invalid",
                 "usage: agency-nightly-driver worklist|culminate",
             )
-        load_github_credential()
         brief = read_brief()
-        value = read_worklist(brief) if sys.argv[1] == "worklist" else culminate(brief)
+        value = worklist(brief) if sys.argv[1] == "worklist" else culminate(brief)
         emit({"ok": True, "value": value})
     except DriverError as error:
         emit(
@@ -927,6 +786,8 @@ def main() -> int:
                 },
             }
         )
+    # Always exit zero: the envelope carries the verdict, and `exit:0` evidence
+    # keeps a reported failure a witnessed result rather than a dead node.
     return 0
 
 

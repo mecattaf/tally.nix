@@ -595,8 +595,10 @@
             package = tally;
           }
         );
-        # Representative arguments for every checked-in example, so the flake
-        # exercises each argsSchema instead of only its meta block.
+        # Representative arguments for the checked-in examples, so the flake
+        # exercises each argsSchema instead of only its meta block. The agency
+        # wave is the exception: it ships its own documented argument file,
+        # because for that flow the arguments are the worklist.
         exampleArgs =
           builtins.mapAttrs
             (name: value: pkgs.writeText "tally-example-args-${name}.json" (builtins.toJSON value))
@@ -628,13 +630,6 @@
                 rasterDpi = 600;
                 maxMutationIterations = 2;
                 maxDisagreementPermille = 20;
-              };
-              agency-nightly = {
-                mission = "Close the open review comments on the parser";
-                repository = "mecattaf/tally.nix";
-                baseRev = "main";
-                branch = "agency/nightly";
-                worktree = "/var/lib/agency/worktree";
               };
               domain-failure = {
                 invoice = "INV-2026-0042";
@@ -3124,8 +3119,6 @@
                 done
                 ${tally}/bin/tally flow check ${./examples/flows/academic-ocr.js} \
                   --args "$(cat ${exampleArgs.academic-ocr})" >/dev/null
-                ${tally}/bin/tally flow check ${./examples/flows/agency-nightly.js} \
-                  --args "$(cat ${exampleArgs.agency-nightly})" >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/domain-failure.js} \
                   --args "$(cat ${exampleArgs.domain-failure})" >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/fleet-deploy.js} \
@@ -3136,6 +3129,17 @@
                   --args "$(cat ${exampleArgs.pooled-review})" --catalog ${catalogFixture} >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/worklist-fanout.js} \
                   --args "$(cat ${exampleArgs.worklist-fanout})" >/dev/null
+                # The agency wave's worklist IS its arguments, so its
+                # representative arguments are the checked-in documented wave
+                # rather than an inline attrset, and that file has to satisfy
+                # the flow's own argsSchema.
+                agency_meta="$(${tally}/bin/tally flow check ${./examples/flows/agency-nightly.js} \
+                  --args "$(cat ${./examples/flows/agency-nightly.args.json})")"
+                test "$(printf '%s' "$agency_meta" | jq -r '.name')" = agency-nightly
+                test "$(printf '%s' "$agency_meta" | jq -r '.maxNodes')" = 20
+                test "$(printf '%s' "$agency_meta" | jq -r '.iterationCap')" = 8
+                test "$(printf '%s' "$agency_meta" | jq -c '.pools')" = \
+                  '["agency-control","codex-window","claude-window"]'
                 touch "$out"
               '';
           agency-nightly-driver =
