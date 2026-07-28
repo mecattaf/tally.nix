@@ -380,82 +380,106 @@ pub struct SubmissionOptions {
     pub mode: SubmissionMode,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct EnqueuePayload {
+macro_rules! define_enqueue_payload {
+    (
+        $(
+            $(#[$field_attribute:meta])*
+            $field:ident: $field_type:ty => $json_name:literal
+        ),+ $(,)?
+    ) => {
+        #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        pub struct EnqueuePayload {
+            $(
+                $(#[$field_attribute])*
+                pub $field: $field_type,
+            )+
+        }
+
+        /// JSON field names accepted by the kernel enqueue boundary, in declaration order.
+        ///
+        /// Defining the struct and this list together makes additions visible to cross-crate
+        /// surface-parity tests instead of relying on a second hand-maintained enumeration.
+        pub const ENQUEUE_PAYLOAD_FIELDS: &[&str] = &[
+            $($json_name,)+
+        ];
+    };
+}
+
+define_enqueue_payload! {
     #[serde(default)]
-    pub invocation: Option<String>,
+    invocation: Option<String> => "invocation",
     #[serde(default)]
-    pub argv: Option<Vec<String>>,
+    argv: Option<Vec<String>> => "argv",
     #[serde(
         default,
         rename = "pool",
         serialize_with = "crate::poolset::serialize_optional",
         deserialize_with = "crate::poolset::deserialize_optional"
     )]
-    pub pools: Option<Vec<String>>,
+    pools: Option<Vec<String>> => "pool",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub executor: Option<String>,
+    executor: Option<String> => "executor",
     #[serde(default)]
-    pub priority: Option<Priority>,
+    priority: Option<Priority> => "priority",
     #[serde(default)]
-    pub adapter: Option<String>,
+    adapter: Option<String> => "adapter",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cwd: Option<PathBuf>,
+    cwd: Option<PathBuf> => "cwd",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace: Option<WorkspaceMetadata>,
+    workspace: Option<WorkspaceMetadata> => "workspace",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub adapter_options: Option<AdapterJobOptions>,
+    adapter_options: Option<AdapterJobOptions> => "adapterOptions",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub gate_manifest: Option<GateManifestSpec>,
+    gate_manifest: Option<GateManifestSpec> => "gateManifest",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub brief: Option<Value>,
+    brief: Option<Value> => "brief",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub brief_path: Option<PathBuf>,
+    brief_path: Option<PathBuf> => "briefPath",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_from: Option<String>,
+    resume_from: Option<String> => "resumeFrom",
     #[serde(default)]
-    pub source: Option<EnqueueSource>,
+    source: Option<EnqueueSource> => "source",
     #[serde(default)]
-    pub dedup_key: Option<String>,
+    dedup_key: Option<String> => "dedupKey",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub submission: Option<SubmissionOptions>,
+    submission: Option<SubmissionOptions> => "submission",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub orchestration: Option<Orchestration>,
+    orchestration: Option<Orchestration> => "orchestration",
     #[serde(default)]
-    pub parent: Option<String>,
+    parent: Option<String> => "parent",
     #[serde(default)]
-    pub evidence: Vec<String>,
+    evidence: Vec<String> => "evidence",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub drv: Option<Derivation>,
+    drv: Option<Derivation> => "drv",
     #[serde(default)]
-    pub evidence_class: Option<Value>,
+    evidence_class: Option<Value> => "evidenceClass",
     #[serde(default)]
-    pub manifest_hash: Option<String>,
+    manifest_hash: Option<String> => "manifestHash",
     #[serde(default)]
-    pub consumption_estimate: Option<u64>,
+    consumption_estimate: Option<u64> => "consumptionEstimate",
     #[serde(default)]
-    pub runtime_max_sec: Option<u64>,
+    runtime_max_sec: Option<u64> => "runtimeMaxSec",
     #[serde(default)]
-    pub no_enqueue: bool,
+    no_enqueue: bool => "noEnqueue",
     #[serde(default)]
-    pub credentials: BTreeMap<String, PathBuf>,
+    credentials: BTreeMap<String, PathBuf> => "credentials",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin: Option<AdmissionOrigin>,
+    origin: Option<AdmissionOrigin> => "origin",
     #[serde(default)]
-    pub caller_job_id: Option<String>,
+    caller_job_id: Option<String> => "callerJobId",
     #[serde(default, rename = "ghTriggerActor", alias = "ghActor")]
-    pub gh_trigger_actor: Option<String>,
+    gh_trigger_actor: Option<String> => "ghTriggerActor",
     #[serde(default)]
-    pub gh_self_actor: Option<String>,
+    gh_self_actor: Option<String> => "ghSelfActor",
     #[serde(default)]
-    pub gh_origin: Option<GhOrigin>,
+    gh_origin: Option<GhOrigin> => "ghOrigin",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub task_uuid: Option<String>,
+    task_uuid: Option<String> => "taskUuid",
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub related_trigger: Option<RelatedTrigger>,
+    related_trigger: Option<RelatedTrigger> => "relatedTrigger",
     #[serde(default)]
-    pub wait: bool,
+    wait: bool => "wait",
 }
 
 #[derive(Debug, Clone, PartialEq)]

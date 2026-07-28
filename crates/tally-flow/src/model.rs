@@ -397,6 +397,204 @@ pub struct NodeSpecFieldContract {
     pub canonical: NodeCanonicalProjection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowEnqueueFieldDisposition {
+    Exposed(&'static str),
+    Excluded(&'static str),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlowEnqueueFieldParity {
+    pub kernel_field: &'static str,
+    pub disposition: FlowEnqueueFieldDisposition,
+}
+
+/// Flow-dialect disposition for every kernel `EnqueuePayload` field.
+///
+/// The tally integration test compares this table with the kernel-owned field list. A kernel
+/// addition therefore has to become either a named flow surface or a deliberate exclusion with a
+/// recorded design reason before the workspace can pass.
+pub const FLOW_ENQUEUE_FIELD_PARITY: &[FlowEnqueueFieldParity] = &[
+    FlowEnqueueFieldParity {
+        kernel_field: "invocation",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "flows use canonical direct argv rather than shell-tokenized invocation",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "argv",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.argv"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "pool",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.pools"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "executor",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.executor"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "priority",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.priority"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "adapter",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.adapter"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "cwd",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "flows use structured workspace metadata instead of an unbound raw cwd",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "workspace",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.workspace"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "adapterOptions",
+        disposition: FlowEnqueueFieldDisposition::Exposed(
+            "normalized NodeSpec adapter options and environment",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "gateManifest",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "flow result and evidence contracts remain runner-side; no gate manifest is exposed",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "brief",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.brief or normalized prompt"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "briefPath",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "flows submit structured brief content and let the daemon materialize its path",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "resumeFrom",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "adapter session resumption is selected by durable daemon retry state",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "source",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the live flow client fixes source to orchestrator",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "dedupKey",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.key or NodeSpec.dedupKey"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "submission",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the live flow protocol fixes submission mode to full",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "orchestration",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the runner generates witnessed orchestration identity from the flow run",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "parent",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the live client derives parent from the admitted runner identity",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "evidence",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.evidence"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "drv",
+        disposition: FlowEnqueueFieldDisposition::Exposed("the drv() node surface"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "evidenceClass",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.evidenceClass"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "manifestHash",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.manifestHash"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "consumptionEstimate",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "flows are excluded from windowed-consumption admission by design; priorities control contention between workloads",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "runtimeMaxSec",
+        disposition: FlowEnqueueFieldDisposition::Exposed("NodeSpec.runtimeMaxSec"),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "noEnqueue",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the live flow client fixes children as leaves with noEnqueue=true",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "credentials",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the runner resolves credential references from configured node pools",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "origin",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the daemon derives admission origin from authenticated ingress",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "callerJobId",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the live client derives callerJobId from the admitted runner identity",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "ghTriggerActor",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "GitHub trigger identity belongs to producer ingress, not flow nodes",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "ghSelfActor",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "GitHub self identity belongs to producer ingress, not flow nodes",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "ghOrigin",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the live client inherits GitHub provenance from the admitted runner",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "taskUuid",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the engine derives the stable child UUID from flow admission identity",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "relatedTrigger",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the live client inherits related-trigger provenance from the admitted runner",
+        ),
+    },
+    FlowEnqueueFieldParity {
+        kernel_field: "wait",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the live client fixes enqueue wait=false and awaits through the flow protocol",
+        ),
+    },
+];
+
 macro_rules! define_node_spec {
     (
         $(

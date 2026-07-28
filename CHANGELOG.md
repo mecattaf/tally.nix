@@ -29,6 +29,8 @@ authorized.
   `no-changelog` label.
 - Single-sourced the declarative-flow node field contract across JavaScript validation, live-wire
   rendering, and canonical hashing.
+- Excluded flows from windowed-consumption admission at configured check time; flow contention
+  uses priorities while direct and producer enqueue retain consumption estimates.
 - Restricted system-indexed flake outputs to `x86_64-linux` and documented that supported platform.
 
 ### Fixed

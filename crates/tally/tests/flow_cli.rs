@@ -7,7 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use tally_core::config::Config;
+use tally_core::config::{
+    Config, PoolConfig, PoolPredicate, ResourceKind, WindowedConsumptionPredicate,
+};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -140,6 +142,39 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
         assert!(stderr.contains("\"line\":"), "{name}: {stderr}");
         assert!(stderr.contains("\"column\":"), "{name}: {stderr}");
     }
+}
+
+#[test]
+fn flow_check_cli_rejects_configured_windowed_consumption_pools() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.json");
+    let mut config = Config::default();
+    config.pools.insert(
+        "worker-gpu".to_owned(),
+        PoolConfig {
+            resource: ResourceKind::Budget,
+            predicate: PoolPredicate::WindowedConsumption(WindowedConsumptionPredicate {
+                window_sec: 18_000,
+                consumption_cap: 100,
+            }),
+            ..PoolConfig::default()
+        },
+    );
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .arg("--config")
+        .arg(&config_path)
+        .args(["flow", "check"])
+        .arg(fixture("valid.js"))
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    let stderr = String::from_utf8_lossy(&rejected.stderr);
+    assert!(stderr.contains("FlowPoolError"), "{stderr}");
+    assert!(stderr.contains("windowed-consumption-excluded"), "{stderr}");
+    assert!(stderr.contains("worker-gpu"), "{stderr}");
+    assert!(stderr.contains("priorities"), "{stderr}");
 }
 
 #[test]

@@ -106,10 +106,11 @@ The first argument must be a JSON-serializable object. Its public fields are:
 | `env` | Optional string map. Names beginning `TALLY_` and `CREDENTIALS_DIRECTORY` are reserved. |
 | `resultSchema` | Optional valid JSON Schema for the projected result. It is checked by the runner after terminal acknowledgement. |
 
-There is no `consumptionEstimate` field. An unknown field is
-`FlowSpecError`/`unknown-spec-field`; a node sent to a
-`windowed-consumption` pool consequently cannot meet that pool's current
-admission contract.
+There is deliberately no `consumptionEstimate` field. An unknown field is
+`FlowSpecError`/`unknown-spec-field`, and configured flow checking rejects a
+declared `windowed-consumption` pool with
+`FlowPoolError`/`windowed-consumption-excluded`. Priorities, rather than
+estimates, control contention between flow workloads.
 
 The optional second argument may contain only boolean `settle`. Shape and value
 errors are `FlowSpecError`/`invalid-options`. Other important classes are

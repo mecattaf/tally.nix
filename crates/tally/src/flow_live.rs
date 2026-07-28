@@ -1001,14 +1001,15 @@ mod tests {
     };
     use tally_core::wire::{
         canonical_payload, canonical_payload_hash, EnqueuePayload, GuardrailConfig, GuardrailState,
-        ProducerDefaults, ResolvedEnqueue,
+        ProducerDefaults, ResolvedEnqueue, ENQUEUE_PAYLOAD_FIELDS,
     };
     use tally_core::witness::{
         Derivation as KernelDerivation, DerivationOutput as KernelDrvOutput,
     };
     use tally_flow::{
-        flow_canonical_payload_fields, run_script, Derivation, NodeSpec, NodeWireProjection,
-        Orchestration, RunOptions, SelectionProvenance, VecLifecycleSink, NODE_SPEC_FIELD_CONTRACT,
+        flow_canonical_payload_fields, run_script, Derivation, FlowEnqueueFieldDisposition,
+        NodeSpec, NodeWireProjection, Orchestration, RunOptions, SelectionProvenance,
+        VecLifecycleSink, FLOW_ENQUEUE_FIELD_PARITY, NODE_SPEC_FIELD_CONTRACT,
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
@@ -1311,6 +1312,37 @@ mod tests {
                 field.json_name
             );
         }
+    }
+
+    #[test]
+    fn every_kernel_enqueue_field_has_a_recorded_flow_disposition() {
+        let classified_fields = FLOW_ENQUEUE_FIELD_PARITY
+            .iter()
+            .map(|field| field.kernel_field)
+            .collect::<Vec<_>>();
+        assert_eq!(ENQUEUE_PAYLOAD_FIELDS, classified_fields);
+
+        for field in FLOW_ENQUEUE_FIELD_PARITY {
+            let explanation = match field.disposition {
+                FlowEnqueueFieldDisposition::Exposed(via)
+                | FlowEnqueueFieldDisposition::Excluded(via) => via,
+            };
+            assert!(
+                !explanation.trim().is_empty(),
+                "kernel enqueue field {} has an empty flow disposition",
+                field.kernel_field
+            );
+        }
+
+        let consumption = FLOW_ENQUEUE_FIELD_PARITY
+            .iter()
+            .find(|field| field.kernel_field == "consumptionEstimate")
+            .unwrap();
+        let FlowEnqueueFieldDisposition::Excluded(reason) = consumption.disposition else {
+            panic!("consumptionEstimate must remain excluded from flow nodes");
+        };
+        assert!(reason.contains("windowed-consumption"));
+        assert!(reason.contains("priorities"));
     }
 
     #[test]
