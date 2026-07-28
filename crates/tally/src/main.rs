@@ -975,7 +975,9 @@ fn flow_error(error: FlowError) -> anyhow::Error {
         | "unhandled-rejection"
         | "determinism-violation"
         | "iteration-cap"
-        | "runtime-limit" => 10,
+        | "runtime-limit"
+        | "microtask-budget"
+        | "wall-clock-budget" => 10,
         _ => 1,
     };
     let message = serde_json::to_string(&error.report()).unwrap_or_else(|_| error.to_string());

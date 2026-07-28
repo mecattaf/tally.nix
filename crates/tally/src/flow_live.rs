@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -13,7 +14,10 @@ use tally_flow::{
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
-const RECONNECT_DELAY: Duration = Duration::from_millis(50);
+const LIVE_CALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+const LIVE_RETRY_LIMIT: u32 = 64;
+const LIVE_RETRY_BASE_DELAY: Duration = Duration::from_millis(25);
+const LIVE_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
 const RESULT_PROJECTION_RETRY: Duration = Duration::from_millis(10);
 const RESULT_PROJECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -49,6 +53,9 @@ pub(crate) struct LiveFlowClient {
     final_message_adapters: BTreeSet<String>,
     result_expected: Mutex<BTreeMap<(String, u32), ResultProjectionExpectation>>,
     result_projection_timeout: Duration,
+    call_timeout: Duration,
+    retry_limit: u32,
+    retry_base_delay: Duration,
 }
 
 impl LiveFlowClient {
@@ -65,6 +72,9 @@ impl LiveFlowClient {
             final_message_adapters: BTreeSet::new(),
             result_expected: Mutex::new(BTreeMap::new()),
             result_projection_timeout: RESULT_PROJECTION_TIMEOUT,
+            call_timeout: LIVE_CALL_TIMEOUT,
+            retry_limit: LIVE_RETRY_LIMIT,
+            retry_base_delay: LIVE_RETRY_BASE_DELAY,
         }
     }
 
@@ -93,28 +103,17 @@ impl LiveFlowClient {
 
     async fn connection(&self) -> Result<(u64, RpcClient), WireIoError> {
         let mut state = self.connection.lock().await;
-        loop {
-            if let Some(client) = &state.client {
-                return Ok((state.generation, client.clone()));
-            }
-            match RpcClient::connect_with_max_frame_bytes(&self.socket, self.max_frame_bytes).await
-            {
-                Ok(client) => {
-                    state.generation = state.generation.checked_add(1).ok_or_else(|| {
-                        WireIoError::InvalidResponse(
-                            "flow RPC connection generation overflowed".to_owned(),
-                        )
-                    })?;
-                    state.ever_connected = true;
-                    state.client = Some(client.clone());
-                    return Ok((state.generation, client));
-                }
-                Err(_error) if state.ever_connected => {
-                    tokio::time::sleep(RECONNECT_DELAY).await;
-                }
-                Err(error) => return Err(error),
-            }
+        if let Some(client) = &state.client {
+            return Ok((state.generation, client.clone()));
         }
+        let client =
+            RpcClient::connect_with_max_frame_bytes(&self.socket, self.max_frame_bytes).await?;
+        state.generation = state.generation.checked_add(1).ok_or_else(|| {
+            WireIoError::InvalidResponse("flow RPC connection generation overflowed".to_owned())
+        })?;
+        state.ever_connected = true;
+        state.client = Some(client.clone());
+        Ok((state.generation, client))
     }
 
     async fn invalidate(&self, generation: u64) {
@@ -125,16 +124,67 @@ impl LiveFlowClient {
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value, WireIoError> {
+        let deadline = Instant::now() + self.call_timeout;
+        let mut retries = 0;
         loop {
-            let (generation, client) = self.connection().await?;
-            match client.call(method, Some(params.clone())).await {
-                Ok(value) => return Ok(value),
-                Err(error) if reconnectable(method, &error) => {
+            let (generation, client) =
+                match tokio::time::timeout_at(deadline, self.connection()).await {
+                    Ok(Ok(connection)) => connection,
+                    Ok(Err(error)) => {
+                        if !self.connection.lock().await.ever_connected
+                            || !reconnectable(method, &error)
+                        {
+                            return Err(error);
+                        }
+                        self.wait_to_retry(method, &error, deadline, &mut retries)
+                            .await?;
+                        continue;
+                    }
+                    Err(_) => return Err(call_timeout_error(method, retries)),
+                };
+            match tokio::time::timeout_at(deadline, client.call(method, Some(params.clone()))).await
+            {
+                Ok(Ok(value)) => return Ok(value),
+                Ok(Err(error)) if reconnectable(method, &error) => {
                     self.invalidate(generation).await;
+                    self.wait_to_retry(method, &error, deadline, &mut retries)
+                        .await?;
                 }
-                Err(error) => return Err(error),
+                Ok(Err(error)) => return Err(error),
+                Err(_) => {
+                    self.invalidate(generation).await;
+                    return Err(call_timeout_error(method, retries));
+                }
             }
         }
+    }
+
+    async fn wait_to_retry(
+        &self,
+        method: &str,
+        last_error: &WireIoError,
+        deadline: Instant,
+        retries: &mut u32,
+    ) -> Result<(), WireIoError> {
+        if *retries >= self.retry_limit {
+            return Err(retry_limit_error(method, self.retry_limit, last_error));
+        }
+        *retries += 1;
+        let multiplier = 1_u32 << (*retries).saturating_sub(1).min(16);
+        let delay = self
+            .retry_base_delay
+            .saturating_mul(multiplier)
+            .min(LIVE_RETRY_MAX_DELAY);
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(call_timeout_error(method, *retries));
+        }
+        let wake = deadline.min(now + delay);
+        tokio::time::sleep_until(wake).await;
+        if Instant::now() >= deadline {
+            return Err(call_timeout_error(method, *retries));
+        }
+        Ok(())
     }
 
     async fn await_projected_result(&self, task_uuid: &str) -> Result<Option<Value>, ClientError> {
@@ -347,6 +397,20 @@ fn reconnectable(method: &str, error: &WireIoError) -> bool {
         }
         _ => false,
     }
+}
+
+fn call_timeout_error(method: &str, retries: u32) -> WireIoError {
+    WireIoError::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("flow RPC {method} exceeded its total deadline after {retries} retries"),
+    ))
+}
+
+fn retry_limit_error(method: &str, limit: u32, last_error: &WireIoError) -> WireIoError {
+    WireIoError::Io(io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("flow RPC {method} exhausted its {limit}-retry ceiling; last error: {last_error}"),
+    ))
 }
 
 fn enqueue_payload(
@@ -1569,6 +1633,76 @@ export const meta = {
             "queue.enqueue",
             &WireIoError::FrameTooLarge { limit: 1024 }
         ));
+    }
+
+    #[tokio::test]
+    async fn persistent_retryable_errors_obey_backoff_and_retry_ceiling() {
+        const RETRY_LIMIT: u32 = 2;
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let mut requests = 0;
+            for _ in 0..=RETRY_LIMIT {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut lines = BufReader::new(read).lines();
+                let request: Value =
+                    serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+                requests += 1;
+                let mut response = serde_json::to_vec(&json!({
+                    "id": request["id"],
+                    "error": {"code": "timeout", "message": "retry later"}
+                }))
+                .unwrap();
+                response.push(b'\n');
+                write.write_all(&response).await.unwrap();
+            }
+            requests
+        });
+
+        let mut client = LiveFlowClient::new(&socket, 16 * 1024 * 1024, RunnerIdentity::default());
+        client.call_timeout = Duration::from_secs(1);
+        client.retry_limit = RETRY_LIMIT;
+        client.retry_base_delay = Duration::from_millis(15);
+        let started = Instant::now();
+        let error = client.call("query.status", json!({})).await.unwrap_err();
+        let elapsed = started.elapsed();
+        match error {
+            WireIoError::Io(error) => {
+                assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                assert!(error.to_string().contains("2-retry ceiling"));
+            }
+            other => panic!("expected bounded retry timeout, got {other:?}"),
+        }
+        assert!(elapsed >= Duration::from_millis(40));
+        assert!(elapsed < Duration::from_millis(500));
+        assert_eq!(server.await.unwrap(), RETRY_LIMIT + 1);
+    }
+
+    #[tokio::test]
+    async fn total_call_deadline_bounds_a_server_that_never_replies() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, _write) = stream.into_split();
+            let mut lines = BufReader::new(read).lines();
+            lines.next_line().await.unwrap().unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let mut client = LiveFlowClient::new(&socket, 16 * 1024 * 1024, RunnerIdentity::default());
+        client.call_timeout = Duration::from_millis(40);
+        let started = Instant::now();
+        let error = client.call("query.status", json!({})).await.unwrap_err();
+        assert!(started.elapsed() < Duration::from_millis(500));
+        match error {
+            WireIoError::Io(error) => assert_eq!(error.kind(), io::ErrorKind::TimedOut),
+            other => panic!("expected total call deadline, got {other:?}"),
+        }
+        server.abort();
     }
 
     #[test]

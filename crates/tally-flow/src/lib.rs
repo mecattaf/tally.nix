@@ -4,6 +4,8 @@
     reason = "FlowError is the public structured dialect report, including typed details and stack"
 )]
 
+use std::time::Duration;
+
 mod catalog;
 mod client;
 mod dialect;
@@ -42,6 +44,12 @@ pub const ENGINE_LOOP_LIMIT: u64 = 1_000_000;
 
 /// Uncatchable Boa recursion backstop.
 pub const ENGINE_RECURSION_LIMIT: usize = 512;
+
+/// Total number of synchronous promise/generic jobs one flow evaluation may run.
+pub const ENGINE_MICROTASK_LIMIT: u64 = 100_000;
+
+/// Total elapsed budget for one flow evaluation, including awaited host work.
+pub const ENGINE_WALL_CLOCK_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[cfg(test)]
 mod tests {

@@ -131,7 +131,7 @@ Exit classification uses the stable `code` field, not `name`:
 | Exit | Flow codes |
 |---:|---|
 | 2 | `flow-run-id-missing`, `flow-run-id-invalid`, `runner-identity-invalid`, `runner-identity-incomplete` |
-| 10 | `script-syntax`, `script-encoding`, `script-evaluation`, `script-exception`, `unhandled-rejection`, `determinism-violation`, `iteration-cap`, `runtime-limit` |
+| 10 | `script-syntax`, `script-encoding`, `script-evaluation`, `script-exception`, `unhandled-rejection`, `determinism-violation`, `iteration-cap`, `runtime-limit`, `microtask-budget`, `wall-clock-budget` |
 | 20 | `replay-divergence`, `script-changed-mid-run` |
 | 1 | Every other flow error code, including admission, catalog, schema, node, capture, and client failures |
 

@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::task::{Poll, Waker};
+use std::time::Duration;
 
 use boa_engine::builtins::promise::{OperationType, PromiseState};
 use boa_engine::context::{ContextBuilder, HostHooks};
@@ -26,7 +27,7 @@ use crate::{
     check_script, resolve_members, Catalog, CheckOptions, Derivation, Disposition, FlowClient,
     FlowError, FlowSubmission, Meta, NodeFailure, NodeResult, NodeSpec, Orchestration, RunReport,
     SelectionProvenance, SelectorOptions, SourceLocation, BRIEF_SENTINEL, DEFAULT_MAX_NODES,
-    ENGINE_LOOP_LIMIT, ENGINE_RECURSION_LIMIT,
+    ENGINE_LOOP_LIMIT, ENGINE_MICROTASK_LIMIT, ENGINE_RECURSION_LIMIT, ENGINE_WALL_CLOCK_LIMIT,
 };
 
 const BOOTSTRAP: &str = include_str!("bootstrap.js");
@@ -68,6 +69,8 @@ pub struct RunOptions {
     pub catalog_hash: Option<String>,
     pub pool_credentials: BTreeMap<String, BTreeMap<String, PathBuf>>,
     pub adapter_skill_revisions: BTreeMap<String, String>,
+    pub microtask_budget: u64,
+    pub wall_clock_budget: Duration,
 }
 
 impl RunOptions {
@@ -81,6 +84,8 @@ impl RunOptions {
             catalog_hash: None,
             pool_credentials: BTreeMap::new(),
             adapter_skill_revisions: BTreeMap::new(),
+            microtask_budget: ENGINE_MICROTASK_LIMIT,
+            wall_clock_budget: ENGINE_WALL_CLOCK_LIMIT,
         }
     }
 }
@@ -805,7 +810,11 @@ pub fn run_script(
         state: RefCell::default(),
     });
     let hooks = Rc::new(FlowHooks::new());
-    let executor = Rc::new(FlowJobExecutor::new(shared.clone()));
+    let executor = Rc::new(FlowJobExecutor::new(
+        shared.clone(),
+        options.wall_clock_budget,
+        options.microtask_budget,
+    ));
     let mut context = ContextBuilder::new()
         .host_hooks(hooks.clone())
         .job_executor(executor)
@@ -2493,7 +2502,7 @@ fn flow_error_value(error: &FlowError, context: &mut Context) -> JsResult<JsValu
     Ok(value)
 }
 
-fn flow_to_js_error(error: FlowError, context: &mut Context) -> JsError {
+pub(crate) fn flow_to_js_error(error: FlowError, context: &mut Context) -> JsError {
     match flow_error_value(&error, context) {
         Ok(value) => JsError::from_opaque(value),
         Err(_) => JsNativeError::error()
@@ -2626,6 +2635,7 @@ mod tests {
         submissions: RefCell<Vec<FlowSubmission>>,
         terminals: RefCell<BTreeMap<String, NodeResult>>,
         delayed_submissions: RefCell<BTreeSet<usize>>,
+        hang_submissions: bool,
     }
 
     impl MockClient {
@@ -2636,6 +2646,7 @@ mod tests {
                 submissions: RefCell::default(),
                 terminals: RefCell::default(),
                 delayed_submissions: RefCell::default(),
+                hang_submissions: false,
             })
         }
 
@@ -2648,6 +2659,18 @@ mod tests {
                 submissions: RefCell::default(),
                 terminals: RefCell::default(),
                 delayed_submissions: RefCell::default(),
+                hang_submissions: false,
+            })
+        }
+
+        fn hanging() -> Rc<Self> {
+            Rc::new(Self {
+                inspection: RunInspection { script_hash: None },
+                replies: RefCell::default(),
+                submissions: RefCell::default(),
+                terminals: RefCell::default(),
+                delayed_submissions: RefCell::default(),
+                hang_submissions: true,
             })
         }
 
@@ -2668,6 +2691,10 @@ mod tests {
             &'a self,
             submission: FlowSubmission,
         ) -> FlowFuture<'a, Result<Admission, ClientError>> {
+            if self.hang_submissions {
+                self.submissions.borrow_mut().push(submission);
+                return Box::pin(std::future::pending());
+            }
             let index = self.submissions.borrow().len();
             let reply = self
                 .replies
@@ -3443,6 +3470,68 @@ mod tests {
         assert_eq!(error.name, "FlowUnhandledRejection");
         assert_eq!(error.code, "unhandled-rejection");
         assert!(error.location.is_some());
+    }
+
+    #[test]
+    fn microtask_wall_clock_and_recursion_backstops_are_distinct() {
+        let microtask_bomb = format!(
+            "{}\nfunction spin() {{ Promise.resolve().then(spin); }} spin();",
+            meta(&["cpu"], &[])
+        );
+        let mut options = RunOptions::new("run-1", json!({}));
+        options.microtask_budget = 32;
+        options.wall_clock_budget = Duration::from_secs(1);
+        let error = run_script(
+            &microtask_bomb,
+            Some(Path::new("microtask-bomb.js")),
+            MockClient::new(Vec::new()),
+            Rc::new(VecLifecycleSink::default()),
+            options,
+        )
+        .unwrap_err();
+        assert_eq!(error.name, "FlowRuntimeBudgetError");
+        assert_eq!(error.code, "microtask-budget");
+
+        let wall_clock = format!("{}\nPromise.resolve(42);", meta(&["cpu"], &[]));
+        let mut options = RunOptions::new("run-1", json!({}));
+        options.wall_clock_budget = Duration::ZERO;
+        let error = run_script(
+            &wall_clock,
+            Some(Path::new("wall-clock.js")),
+            MockClient::new(Vec::new()),
+            Rc::new(VecLifecycleSink::default()),
+            options,
+        )
+        .unwrap_err();
+        assert_eq!(error.name, "FlowRuntimeBudgetError");
+        assert_eq!(error.code, "wall-clock-budget");
+
+        let pending_host_work = format!(
+            "{}\n(async () => sh(['hang'], {{pools: ['cpu']}}))()",
+            meta(&["cpu"], &[])
+        );
+        let mut options = RunOptions::new("run-1", json!({}));
+        options.wall_clock_budget = Duration::from_millis(30);
+        let started = std::time::Instant::now();
+        let error = run_script(
+            &pending_host_work,
+            Some(Path::new("pending-host-work.js")),
+            MockClient::hanging(),
+            Rc::new(VecLifecycleSink::default()),
+            options,
+        )
+        .unwrap_err();
+        assert_eq!(error.name, "FlowRuntimeBudgetError");
+        assert_eq!(error.code, "wall-clock-budget");
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let recursion = format!(
+            "{}\nfunction recurse() {{ return recurse(); }} recurse();",
+            meta(&["cpu"], &[])
+        );
+        let error = run(&recursion, MockClient::new(Vec::new())).unwrap_err();
+        assert_eq!(error.name, "FlowRuntimeLimitError");
+        assert_eq!(error.code, "runtime-limit");
     }
 
     #[test]

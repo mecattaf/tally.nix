@@ -179,6 +179,7 @@ ordinal. This distinction is why raw keys should be rare and domain-specific.
 | Event | Observable outcome |
 |---|---|
 | Runner killed | Re-execute from the top with the same identity; completed nodes reuse, a live node attaches, and only the frontier creates work. |
+| Runner exceeds `MemoryMax` and is OOM-killed | Treat it as a killed runner, not a catchable JavaScript error. Re-execute from the top with the same identity; admitted children remain durable and replay reuses or attaches them. |
 | Daemon restarted while runner waits | The client reconnects and re-awaits the exact attempt; recovered/adopted work supplies the terminal result. |
 | Script edited after any node exists | `script-changed-mid-run`, exit 20, before new admission. |
 | Same key, changed payload | Same-run identity: fatal `replay-divergence`, exit 20. Raw cross-run identity: `dedup-key-conflict`, exit 1. |
@@ -187,8 +188,17 @@ ordinal. This distinction is why raw keys should be rare and domain-specific.
 | Catalog changed, but selected work payload stayed byte-identical | Selection provenance is not payload identity; the prior node can reuse. Restore the original catalog before replaying. |
 | Prior artifact changed or vanished | Reuse is rejected with a drift reason and a fresh node is `created`. |
 | Prerequisite has a non-pass verdict | Default `await` rejects `terminal-failure`, exit 1, so dependent code is not run. Node settle mode returns the failed `NodeResult` for an explicit decision. |
-| Script syntax, determinism, loop, or runtime-limit failure | Structured script failure, exit 10. Already admitted children remain durable and are handled on the next replay. |
+| Script syntax, determinism, loop, microtask-budget, wall-clock-budget, or runtime-limit failure | Structured script failure, exit 10. Already admitted children remain durable and are handled on the next replay. |
 | Missing or malformed runner identity | Startup failure, exit 2. |
+
+Boa does not impose a separate JavaScript heap quota. When the flow runner is
+itself a tally job, including a declaratively rendered runner, daemon execution
+gives its process the finite `--memory-max-bytes`/systemd `MemoryMax` limit. An
+ad-hoc `tally flow run` launched outside the daemon instead inherits the
+operator's process limits and should likewise run under a finite memory limit.
+Crossing that boundary terminates the runner process, so no `FlowError` can be
+emitted from that process; the durable ledger and same-identity replay are the
+recovery mechanism.
 
 ## The author rule
 
