@@ -2241,6 +2241,8 @@ mod tests {
     use std::fs;
     use std::os::unix::ffi::OsStrExt;
 
+    use proptest::prelude::*;
+
     use super::*;
 
     const LEGACY_NO_ORIGIN: &str = include_str!(concat!(
@@ -2326,6 +2328,142 @@ mod tests {
             related_trigger: None,
             evidence_class: Some(Value::String("artifact".to_owned())),
             manifest_hash: Some(Value::String("sha256:manifest".to_owned())),
+        }
+    }
+
+    fn property_source(selector: u8) -> EnqueueSource {
+        match selector % 6 {
+            0 => EnqueueSource::Manual,
+            1 => EnqueueSource::Orchestrator,
+            2 => EnqueueSource::Calendar,
+            3 => EnqueueSource::EventsDir,
+            4 => EnqueueSource::BuildEffect,
+            5 => EnqueueSource::PoolReachability,
+            _ => unreachable!(),
+        }
+    }
+
+    fn property_seed(
+        ids: (u128, u128),
+        source: u8,
+        pool_ids: &std::collections::BTreeSet<u16>,
+        ordering: (usize, bool),
+        evidence: (u8, [u8; 32]),
+    ) -> RowSeed {
+        let (uuid, parent_uuid) = ids;
+        let (rotation, reversed) = ordering;
+        let (exit_code, hash_bytes) = evidence;
+        let mut row = seed(Uuid::from_u128(uuid));
+        row.parent_uuid = Some(Uuid::from_u128(parent_uuid));
+        row.source = property_source(source);
+        row.origin = None;
+        row.gh_origin = None;
+        row.description = format!("property row {uuid}");
+        row.pools = pool_ids.iter().map(|id| format!("pool-{id}")).collect();
+        let pool_count = row.pools.len();
+        row.pools.rotate_left(rotation % pool_count);
+        if reversed {
+            row.pools.reverse();
+        }
+        let uppercase_hash = hash_bytes
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        row.evidence = vec![
+            format!("hash:sha256:{uppercase_hash}"),
+            format!("exit:{exit_code}"),
+            format!("artifact:/work/property-{uuid}"),
+        ];
+        row
+    }
+
+    proptest! {
+        #[test]
+        fn generated_rows_canonicalize_to_a_fixed_point(
+            uuid in any::<u128>(),
+            parent_uuid in any::<u128>(),
+            source in any::<u8>(),
+            pool_ids in prop::collection::btree_set(any::<u16>(), 1..9),
+            rotation in any::<usize>(),
+            reversed in any::<bool>(),
+            exit_code in any::<u8>(),
+            hash_bytes in any::<[u8; 32]>(),
+        ) {
+            let mut row = property_seed(
+                (uuid, parent_uuid),
+                source,
+                &pool_ids,
+                (rotation, reversed),
+                (exit_code, hash_bytes),
+            );
+            let mut expected_pools = row.pools.clone();
+            expected_pools.sort();
+
+            row.canonicalize().unwrap();
+            prop_assert_eq!(row.pools.as_slice(), expected_pools.as_slice());
+            let canonical = row.clone();
+            row.canonicalize().unwrap();
+            prop_assert_eq!(row, canonical);
+        }
+
+        #[test]
+        fn acknowledged_row_migration_is_idempotent_and_canonical(
+            row_uuid in any::<u128>(),
+            parent_uuid in any::<u128>(),
+            event_uuid in any::<u128>(),
+            source in any::<u8>(),
+            pool_ids in prop::collection::btree_set(any::<u16>(), 1..9),
+            rotation in any::<usize>(),
+            reversed in any::<bool>(),
+            exit_code in any::<u8>(),
+            hash_bytes in any::<[u8; 32]>(),
+            legacy_version in 1_u32..=2,
+        ) {
+            let mut legacy = property_seed(
+                (row_uuid, parent_uuid),
+                source,
+                &pool_ids,
+                (rotation, reversed),
+                (exit_code, hash_bytes),
+            );
+            legacy.canonicalize().unwrap();
+            legacy.row_version = legacy_version;
+            if legacy_version == 1 {
+                legacy.origin = None;
+            }
+
+            let migrated = migrations::migrate_to_current(&legacy).unwrap();
+            let migrated_again = migrations::migrate_to_current(&migrated).unwrap();
+            prop_assert_eq!(&migrated_again, &migrated);
+            let mut recanonicalized = migrated.clone();
+            recanonicalized.canonicalize().unwrap();
+            prop_assert_eq!(&recanonicalized, &migrated);
+
+            let event = DurableEnqueueEvent {
+                schema_version: 1,
+                event_id: Uuid::from_u128(event_uuid),
+                acknowledged: true,
+                guardrail_depth: 0,
+                reuse: None,
+                ingress_id: None,
+                retries: Vec::new(),
+                row: legacy,
+            };
+            let temp = tempfile::tempdir().unwrap();
+            let events = temp.path().join("events");
+            fs::create_dir_all(&events).unwrap();
+            let path = events.join(format!("{}.enqueue.json", event.event_id));
+            let mut bytes = serde_json::to_vec(&event).unwrap();
+            bytes.push(b'\n');
+            fs::write(&path, bytes).unwrap();
+
+            prop_assert_eq!(migrate_acknowledged_events(&events).unwrap(), 1);
+            let once = fs::read(&path).unwrap();
+            prop_assert_eq!(migrate_acknowledged_events(&events).unwrap(), 0);
+            prop_assert_eq!(fs::read(&path).unwrap(), once);
+            let loaded = read_acknowledged_events(&events).unwrap();
+            prop_assert_eq!(loaded.len(), 1);
+            prop_assert_eq!(&loaded[0].row, &migrated);
         }
     }
 

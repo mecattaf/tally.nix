@@ -130,6 +130,7 @@ pub fn decoded(value: &str) -> Result<Vec<String>, serde_json::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
     struct Surface {
@@ -181,5 +182,43 @@ mod tests {
             canonicalize(&mut ["bad\nname".to_owned()]),
             Err(PoolSetError::InvalidName("bad\nname".to_owned()))
         );
+    }
+
+    proptest! {
+        #[test]
+        fn canonical_pool_sets_are_sorted_and_idempotent(
+            pool_ids in prop::collection::btree_set(any::<u16>(), 1..17),
+            rotation in any::<usize>(),
+            reversed in any::<bool>(),
+        ) {
+            let mut pools = pool_ids
+                .into_iter()
+                .map(|id| format!("pool-{id}"))
+                .collect::<Vec<_>>();
+            let pool_count = pools.len();
+            pools.rotate_left(rotation % pool_count);
+            if reversed {
+                pools.reverse();
+            }
+            let mut expected = pools.clone();
+            expected.sort();
+
+            canonicalize(&mut pools).unwrap();
+            prop_assert_eq!(pools.as_slice(), expected.as_slice());
+            let canonical = pools.clone();
+            canonicalize(&mut pools).unwrap();
+            prop_assert_eq!(pools, canonical);
+        }
+
+        #[test]
+        fn every_repeated_valid_pool_is_rejected(
+            pool in "[A-Za-z][A-Za-z0-9_.-]{0,31}",
+        ) {
+            let mut pools = vec![pool.clone(), pool.clone()];
+            prop_assert_eq!(
+                canonicalize(&mut pools),
+                Err(PoolSetError::Duplicate(pool)),
+            );
+        }
     }
 }
