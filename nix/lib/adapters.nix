@@ -33,6 +33,8 @@ let
       yieldHook ? null,
       env ? { },
       launch ? { },
+      hardening ? null,
+      extraWritablePaths ? [ ],
       skillBundle ? null,
       skillRevision ? null,
       extraConfig ? { },
@@ -61,6 +63,21 @@ let
     ) "tally adapter env must be an attrset of strings";
     assert lib.assertMsg (builtins.isAttrs launch) "tally adapter launch must be an attrset";
     assert lib.assertMsg (
+      hardening == null
+      || builtins.elem hardening [
+        "production"
+        "strict"
+        "workspace"
+        "none"
+      ]
+    ) "tally adapter hardening must be null, production, strict, workspace, or none";
+    assert lib.assertMsg (
+      builtins.isList extraWritablePaths
+      && builtins.all (
+        path: builtins.isString path && lib.hasPrefix "/" path && !(lib.hasInfix "%" path)
+      ) extraWritablePaths
+    ) "tally adapter extraWritablePaths must contain absolute strings without systemd specifiers";
+    assert lib.assertMsg (
       skillBundle == null || builtins.isString skillBundle
     ) "tally adapter skillBundle must be null or a string";
     assert lib.assertMsg (
@@ -80,8 +97,10 @@ let
         env
         launch
         extraConfig
+        extraWritablePaths
         ;
     }
+    // lib.optionalAttrs (hardening != null) { inherit hardening; }
     // lib.optionalAttrs (skillBundle != null) { inherit skillBundle; }
     // lib.optionalAttrs (skillRevision != null) { inherit skillRevision; };
 

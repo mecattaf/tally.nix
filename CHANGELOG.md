@@ -101,6 +101,8 @@ authorized.
 
 ### Security
 
+- Exposed opt-in hardening and scoped writable-path declarations through the Nix adapter library
+  without changing the intentionally un-hardened default.
 - Added the opt-in `production` adapter hardening bundle and narrowed `strict` and `production`
   transient jobs to execution-scoped state writes, with explicit per-adapter writable-path
   extensions for required agent state.

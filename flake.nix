@@ -95,6 +95,8 @@
                   pattern = "$.session";
                 };
                 env.CUSTOM_AGENT_MODE = "batch";
+                hardening = "production";
+                extraWritablePaths = [ "/var/lib/custom-agent" ];
                 skillBundle = "review protocol α\n";
                 extraConfig.origin = "pure-nix-check";
               };
@@ -221,6 +223,37 @@
             ln -s tally $out/bin/tallyd
           '';
           meta.mainProgram = "tally";
+        };
+        hardeningProbe = pkgs.writeShellApplication {
+          name = "tally-hardening-probe";
+          runtimeInputs = [ pkgs.coreutils ];
+          text = ''
+            set -euo pipefail
+
+            printf 'allowed\n' > /srv/tally/production-agent/allowed
+            if printf 'overwritten\n' > /srv/tally/state/forbidden; then
+              echo "production job wrote an undeclared state-root file" >&2
+              exit 21
+            fi
+            if printf 'overwritten\n' > /srv/tally/state/capture/foreign.out; then
+              echo "production job wrote another execution's capture" >&2
+              exit 22
+            fi
+
+            socket="$TALLY_SOCKET"
+            test -S "$socket"
+            ${tally}/bin/tally --socket "$socket" query pools >/dev/null
+            printf 'reachable\n' > /srv/tally/production-agent/socket
+            printf 'ready\n' > /srv/tally/production-agent/ready
+            for ((attempt = 0; attempt < 240; attempt++)); do
+              if test -e /srv/tally/production-agent/release; then
+                exit 0
+              fi
+              sleep 0.25
+            done
+            echo "timed out waiting for the VM property inspection" >&2
+            exit 23
+          '';
         };
         mkCargoCheck =
           {
@@ -481,6 +514,7 @@
               )
               and has("services.tally.producers.<name>.enqueue.gateManifest.requiredGateIds")
               and has("services.tally.adapters.<name>.hardening")
+              and has("services.tally.adapters.<name>.extraWritablePaths")
               and has("services.tally.transport.maxFrameBytes")
               and has("services.tally.scheduling.agingThresholdSec")
               and (
@@ -507,6 +541,24 @@
             license = pkgs.lib.licenses.mit;
           };
         };
+        hardeningDocDrift =
+          pkgs.runCommand "tally-hardening-doc-drift" { nativeBuildInputs = [ pkgs.ripgrep ]; }
+            ''
+              properties="$PWD/hardening-properties"
+              ${pkgs.ripgrep}/bin/rg --only-matching '`[^`]+=[^`]*`' \
+                ${./doc/src/configuration/hardening-properties.md.inc} \
+                | tr -d '`' \
+                | sort -u > "$properties"
+              test -s "$properties"
+              while IFS= read -r property; do
+                if ! ${pkgs.ripgrep}/bin/rg --fixed-strings --quiet -- "$property" \
+                  ${./crates/tally-core/src/executor}; then
+                  echo "documented hardening property is absent from executor source: $property" >&2
+                  exit 1
+                fi
+              done < "$properties"
+              touch "$out"
+            '';
         documentationPublisher = pkgs.writeShellApplication {
           name = "tally-publish-docs";
           runtimeInputs = [
@@ -934,6 +986,11 @@
                 adapters.explicit-none = {
                   argv = [ "true" ];
                   hardening = "none";
+                };
+                adapters.production = {
+                  argv = [ "true" ];
+                  hardening = "production";
+                  extraWritablePaths = [ "/var/lib/tally-stock/agent-state" ];
                 };
                 executors.worker = {
                   host = "worker.example";
@@ -1647,6 +1704,10 @@
               imports = [ self.nixosModules.tally ];
               system.stateVersion = "26.11";
 
+              systemd.tmpfiles.rules = [
+                "d /srv/tally/production-agent 0700 tally tally -"
+              ];
+
               services.tally = {
                 enable = true;
                 dataDir = "/srv/tally/data";
@@ -1656,6 +1717,10 @@
                   resource = "build-slot";
                   capacity = 1;
                   enforce = "cooperative";
+                };
+                adapters.production-probe = {
+                  hardening = "production";
+                  extraWritablePaths = [ "/srv/tally/production-agent" ];
                 };
               };
             };
@@ -1689,6 +1754,85 @@
             exit_record = f"/srv/tally/state/unit-exit/{task}.json"
             machine.succeed(f"test \"$(stat -c '%U:%G' {exit_record})\" = tally:tally")
             machine.succeed(f"test \"$(stat -c '%u' {exit_record})\" != 0")
+
+            machine.succeed("install -o tally -g tally -m 0600 /dev/null /srv/tally/state/forbidden")
+            machine.succeed("printf 'sentinel\\n' > /srv/tally/state/forbidden")
+            machine.succeed("install -d -o tally -g tally -m 0700 /srv/tally/state/capture")
+            machine.succeed("install -o tally -g tally -m 0600 /dev/null /srv/tally/state/capture/foreign.out")
+            machine.succeed("printf 'sentinel\\n' > /srv/tally/state/capture/foreign.out")
+
+            submitted = json.loads(machine.succeed(
+              "${tally}/bin/tally --socket /run/tally/tally.sock "
+              "enqueue --pool stock --adapter production-probe -- "
+              "${hardeningProbe}/bin/tally-hardening-probe"
+            ))
+            hardened_task = submitted["task_uuid"]
+            unit = f"tally-job-{hardened_task}.service"
+            userctl = (
+              f"runuser -u tally -- env XDG_RUNTIME_DIR=/run/user/{uid} "
+              "systemctl --user"
+            )
+            machine.wait_until_succeeds(userctl + f" is-active {unit}")
+            machine.wait_until_succeeds("test -s /srv/tally/production-agent/ready")
+
+            def unit_property(name):
+                return machine.succeed(
+                  userctl + f" show {unit} --property={name} --value"
+                ).strip()
+
+            expected_properties = {
+              "ProtectHome": "read-only",
+              "PrivateTmp": "yes",
+              "ProtectSystem": "strict",
+              "NoNewPrivileges": "yes",
+              "PrivateDevices": "yes",
+              "ProtectKernelTunables": "yes",
+              "ProtectKernelModules": "yes",
+              "ProtectKernelLogs": "yes",
+              "ProtectControlGroups": "yes",
+              "ProtectClock": "yes",
+              "RestrictSUIDSGID": "yes",
+              "LockPersonality": "yes",
+              "RestrictRealtime": "yes",
+              "CapabilityBoundingSet": "",
+              "ProtectProc": "invisible",
+            }
+            for name, expected in expected_properties.items():
+                actual = unit_property(name)
+                assert actual == expected, (name, actual, expected)
+
+            address_families = set(unit_property("RestrictAddressFamilies").split())
+            assert address_families == {"AF_UNIX", "AF_INET", "AF_INET6"}, address_families
+            system_calls = set(unit_property("SystemCallFilter").split())
+            assert {"read", "write", "socket"} <= system_calls, system_calls
+            assert {"mount", "reboot", "kexec_load"}.isdisjoint(system_calls), system_calls
+
+            writable_paths = set(unit_property("ReadWritePaths").split())
+            expected_writable_paths = {
+              "/srv/tally/state/unit-exit",
+              f"/srv/tally/state/capture/{hardened_task}.out",
+              f"/srv/tally/state/capture/{hardened_task}.err",
+              "/srv/tally/state/exec-attestations.jsonl",
+              "/srv/tally/production-agent",
+            }
+            assert writable_paths == expected_writable_paths, writable_paths
+
+            machine.succeed("touch /srv/tally/production-agent/release")
+            hardened = json.loads(machine.succeed(
+              "${tally}/bin/tally --socket /run/tally/tally.sock --rpc-timeout-sec 60 "
+              f"queue await-job {hardened_task}"
+            ))
+            assert hardened["verdict"] == "pass", hardened
+            assert hardened["exit_code"] == 0, hardened
+            machine.succeed("test \"$(cat /srv/tally/production-agent/allowed)\" = allowed")
+            machine.succeed("test \"$(cat /srv/tally/production-agent/socket)\" = reachable")
+            machine.succeed("test \"$(cat /srv/tally/state/forbidden)\" = sentinel")
+            machine.succeed("test \"$(cat /srv/tally/state/capture/foreign.out)\" = sentinel")
+            machine.succeed(
+              "${pkgs.jq}/bin/jq -e --arg task " + hardened_task +
+              " 'select(.payload.taskUuid == $task and .payload.adapter == \"production-probe\")' "
+              "/srv/tally/state/exec-attestations.jsonl"
+            )
           '';
         };
         retentionTest = pkgs.testers.runNixOSTest {
@@ -2897,6 +3041,8 @@
               .adapters["project-codex"].skillRevision == "project-codex-v3" and
               .adapters.shell.hardening == "workspace" and
               .adapters["explicit-none"].hardening == "none" and
+              .adapters.production.hardening == "production" and
+              .adapters.production.extraWritablePaths == ["/var/lib/tally-stock/agent-state"] and
               (.adapters.pi | has("hardening") | not) and
               .adapters["project-codex"].launch.cwdArgv == ["-C", "%<cwd>%"] and
               .adapters["project-codex"].launch.model.allowedValues == ["gpt-5-codex"] and
@@ -2931,6 +3077,7 @@
           clippy = clippyCheck;
           nixfmt-check = nixfmtCheck;
           doc = documentation;
+          hardening-doc-drift = hardeningDocDrift;
           stock-home-activation = stockHome.activationPackage;
           module-layer = moduleContract;
           flow-dialect-accept =
@@ -3158,6 +3305,8 @@
             test "$(jq -r '.adapters["project-codex"].skillRevision' ${checkedHomeConfig})" = project-codex-v3
             test "$(jq -r '.adapters.shell.hardening' ${checkedHomeConfig})" = workspace
             test "$(jq -r '.adapters["explicit-none"].hardening' ${checkedHomeConfig})" = none
+            test "$(jq -r '.adapters.production.hardening' ${checkedHomeConfig})" = production
+            test "$(jq -c '.adapters.production.extraWritablePaths' ${checkedHomeConfig})" = '["/var/lib/tally-stock/agent-state"]'
             test "$(jq -r '.adapters.pi.hardening // "absent"' ${checkedHomeConfig})" = absent
             strict_launch="$(${tally}/bin/tally --config ${checkedHomeConfig} __adapter-render project-codex -- payload)"
             test "$(printf '%s' "$strict_launch" | jq -r '.hardening')" = strict
@@ -3165,6 +3314,8 @@
             test "$(printf '%s' "$workspace_launch" | jq -r '.hardening')" = workspace
             none_launch="$(${tally}/bin/tally --config ${checkedHomeConfig} __adapter-render explicit-none -- payload)"
             test "$(printf '%s' "$none_launch" | jq -r '.hardening')" = none
+            production_launch="$(${tally}/bin/tally --config ${checkedHomeConfig} __adapter-render production -- payload)"
+            test "$(printf '%s' "$production_launch" | jq -r '.hardening')" = production
             grep -F '"nix-custom"' ${adapterConfig} >/dev/null
             grep -F '"claude-code"' ${adapterConfig} >/dev/null
             grep -F '"codex"' ${adapterConfig} >/dev/null
@@ -3182,7 +3333,7 @@
             test "$(jq -c '.adapters.codex.resume' ${adapterConfig})" = '["codex","-C","%<cwd>%","exec","resume","--json","--model","%<model>%","%<sessionRef>%","--"]'
             test "$(jq -c '.adapters.codex.launch.cwdArgv' ${adapterConfig})" = '["-C","%<cwd>%"]'
             test "$(jq -c '.adapters.codex.launch.sandboxPolicies["dangerously-bypass"]' ${adapterConfig})" = '["--dangerously-bypass-approvals-and-sandbox"]'
-            test "$(jq -c '.adapters.shell' ${adapterConfig})" = '{"argv":[],"env":{},"extraConfig":{},"launch":{},"resume":null,"scrape":{},"trace":null,"yieldHook":null}'
+            test "$(jq -c '.adapters.shell' ${adapterConfig})" = '{"argv":[],"env":{},"extraConfig":{},"extraWritablePaths":[],"launch":{},"resume":null,"scrape":{},"trace":null,"yieldHook":null}'
             for preset in pi claude-code codex; do
               test "$(jq -c --arg preset "$preset" '.adapters[$preset].yieldHook' ${adapterConfig})" = '["tally","lease","status"]'
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.sessionRef.mode' ${adapterConfig})" = jsonPath
@@ -3197,9 +3348,12 @@
             test "$(jq -r '.adapters.codex.extraConfig.modelFlag' ${adapterConfig})" = '--model'
             jq -e '.adapters["nix-custom"].skillBundle == "review protocol α\n"' ${adapterConfig} >/dev/null
             test "$(jq -r '.adapters["nix-custom"].env.CUSTOM_AGENT_MODE' ${adapterConfig})" = batch
+            test "$(jq -r '.adapters["nix-custom"].hardening' ${adapterConfig})" = production
+            test "$(jq -c '.adapters["nix-custom"].extraWritablePaths' ${adapterConfig})" = '["/var/lib/custom-agent"]'
             launch="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render nix-custom -- 'payload arg' "")"
             test "$(printf '%s' "$launch" | jq -c '.argv')" = '["custom-agent","--structured","payload arg",""]'
             test "$(printf '%s' "$launch" | jq -r '.env.CUSTOM_AGENT_MODE')" = batch
+            test "$(printf '%s' "$launch" | jq -r '.hardening')" = production
             resume="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render nix-custom --captures '{"sessionRef":"nix-session"}' -- '--option-looking')"
             test "$(printf '%s' "$resume" | jq -c '.argv')" = '["custom-agent","--resume","nix-session","--option-looking"]'
             : > empty.err

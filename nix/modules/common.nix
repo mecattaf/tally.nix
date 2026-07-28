@@ -300,6 +300,7 @@ let
         hardening = mkOption {
           type = types.nullOr (
             types.enum [
+              "production"
               "strict"
               "workspace"
               "none"
@@ -311,6 +312,15 @@ let
             Optional transient-unit hardening preset. Null preserves the
             compatibility behavior and renders no preset name; "none" is the
             explicit spelling of that behavior.
+          '';
+        };
+        extraWritablePaths = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "/var/lib/tally-agent/.codex" ];
+          description = ''
+            Absolute paths added to the transient unit's ReadWritePaths. Keep
+            this list minimal and provision each path for the daemon user.
           '';
         };
         skillBundle = mkOption {
@@ -368,6 +378,10 @@ let
           assertion = config.skillBundle == null || config.skillRevision == null;
           message = "tally adapter ${name} skillBundle and skillRevision are mutually exclusive";
         }
+        (map (path: {
+          assertion = lib.hasPrefix "/" path && !(lib.hasInfix "%" path);
+          message = "tally adapter ${name} extraWritablePaths entry ${path} must be absolute and contain no systemd specifier";
+        }) config.extraWritablePaths)
         (mapAttrsToList (capture: value: value._tallyAssertions) config.scrape)
         (mapAttrsToList (environment: _: {
           assertion =
@@ -2196,6 +2210,7 @@ let
         yieldHook
         env
         extraConfig
+        extraWritablePaths
         ;
       launch = renderAdapterLaunch adapter.launch;
       scrape = mapAttrs (_: capture: {
