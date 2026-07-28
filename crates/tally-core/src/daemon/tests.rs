@@ -5638,6 +5638,19 @@ mod tests {
                     daemon.handler.job_tokens.borrow().get(&token_hash),
                     Some(&row.uuid)
                 );
+                let mut adopted = daemon.initial_jobs[0].clone();
+                assert!(daemon
+                    .handler
+                    .prepare_execution(&mut adopted)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_none());
+                assert_eq!(adopted.row.job_token_hash, Some(token_hash.clone()));
+                assert_eq!(
+                    daemon.handler.job_tokens.borrow().get(&token_hash),
+                    Some(&row.uuid)
+                );
 
                 let lease_log =
                     fs::read_to_string(paths.state_dir.join(crate::lease::LEASE_EVENTS_FILE))
