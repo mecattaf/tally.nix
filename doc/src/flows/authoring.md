@@ -165,6 +165,11 @@ flake checks every one with `tally flow check`.
 - [`fleet-deploy.js`](https://github.com/mecattaf/tally.nix/blob/main/examples/flows/fleet-deploy.js)
   is a zero-LLM cross-host handoff through Git, explained in
   [Cross-host handoff](cross-host-handoff.md).
+- [`worklist-fanout.js`](https://github.com/mecattaf/tally.nix/blob/main/examples/flows/worklist-fanout.js)
+  fans out over a worklist the flow itself discovered, and
+  [`domain-failure.js`](https://github.com/mecattaf/tally.nix/blob/main/examples/flows/domain-failure.js)
+  says "this input is unacceptable" without pretending the script broke. Both are
+  explained in [Two more cookbook recipes](cookbook.md).
 
 The newer `monthly-review.js` and `academic-ocr.js` examples show store-native
 `drv()` stages and a bounded mutation ladder respectively. They use the same

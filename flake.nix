@@ -532,6 +532,80 @@
             package = tally;
           }
         );
+        # Representative arguments for every checked-in example, so the flake
+        # exercises each argsSchema instead of only its meta block.
+        exampleArgs =
+          builtins.mapAttrs
+            (name: value: pkgs.writeText "tally-example-args-${name}.json" (builtins.toJSON value))
+            {
+              academic-ocr = {
+                pages = [
+                  {
+                    paperId = "paper-1";
+                    pageNumber = 1;
+                    sourcePath = "/var/lib/ocr/paper-1/page-1.tif";
+                  }
+                ];
+                protocols = [
+                  {
+                    id = "cheap-pass";
+                    tier = "cheap";
+                  }
+                  {
+                    id = "specialist-pass";
+                    tier = "specialist";
+                  }
+                ];
+                driver = {
+                  adapter = "shell";
+                  program = "/run/current-system/sw/bin/ocr-driver";
+                  runtimeMaxSec = 900;
+                };
+                outputDir = "/var/lib/ocr/out";
+                rasterDpi = 600;
+                maxMutationIterations = 2;
+                maxDisagreementPermille = 20;
+              };
+              agency-nightly = {
+                mission = "Close the open review comments on the parser";
+                repository = "mecattaf/tally.nix";
+                baseRev = "main";
+                branch = "agency/nightly";
+                worktree = "/var/lib/agency/worktree";
+              };
+              domain-failure = {
+                invoice = "INV-2026-0042";
+              };
+              fleet-deploy = {
+                remote = "origin";
+                revision = "main";
+                coordinatorCheckout = "/var/lib/fleet/coordinator";
+                workerCheckout = "/var/lib/fleet/worker";
+              };
+              monthly-review = {
+                minimumValid = 2;
+                publish = false;
+                dotfilesUrl = "https://github.com/mecattaf/dotfiles";
+                baseBranch = "main";
+                period = "2026-07";
+                driver = {
+                  adapter = "shell";
+                  program = "/run/current-system/sw/bin/review-driver";
+                  stateDir = "/var/lib/review/state";
+                  receiptPath = "/var/lib/review/receipt.json";
+                  runtimeMaxSec = 1800;
+                };
+              };
+              pooled-review = {
+                subject = "https://example.invalid/change/42";
+                minimumValid = 2;
+              };
+              worklist-fanout = {
+                repository = "mecattaf/tally.nix";
+                label = "ready";
+                waveSize = 4;
+              };
+            };
         mkCatalogRejectionCheck =
           {
             name,
@@ -2875,14 +2949,34 @@
                 drv_meta="$(${tally}/bin/tally flow check ${./test/fixtures/flows/valid-drv.js})"
                 test "$(printf '%s' "$drv_meta" | jq -r '.name')" = fixture-valid-drv
                 test "$(printf '%s' "$drv_meta" | jq -c '.pools')" = '[]'
+                # Checking an example without --args never exercises its
+                # argsSchema, which is most of what the example teaches. Every
+                # example is checked bare and again against representative
+                # arguments; the two that declare selectors also get the catalog.
                 for example in \
                   ${./examples/flows/academic-ocr.js} \
                   ${./examples/flows/agency-nightly.js} \
+                  ${./examples/flows/domain-failure.js} \
                   ${./examples/flows/fleet-deploy.js} \
                   ${./examples/flows/monthly-review.js} \
-                  ${./examples/flows/pooled-review.js}; do
+                  ${./examples/flows/pooled-review.js} \
+                  ${./examples/flows/worklist-fanout.js}; do
                   ${tally}/bin/tally flow check "$example" >/dev/null
                 done
+                ${tally}/bin/tally flow check ${./examples/flows/academic-ocr.js} \
+                  --args "$(cat ${exampleArgs.academic-ocr})" >/dev/null
+                ${tally}/bin/tally flow check ${./examples/flows/agency-nightly.js} \
+                  --args "$(cat ${exampleArgs.agency-nightly})" >/dev/null
+                ${tally}/bin/tally flow check ${./examples/flows/domain-failure.js} \
+                  --args "$(cat ${exampleArgs.domain-failure})" >/dev/null
+                ${tally}/bin/tally flow check ${./examples/flows/fleet-deploy.js} \
+                  --args "$(cat ${exampleArgs.fleet-deploy})" >/dev/null
+                ${tally}/bin/tally flow check ${./examples/flows/monthly-review.js} \
+                  --args "$(cat ${exampleArgs.monthly-review})" --catalog ${catalogFixture} >/dev/null
+                ${tally}/bin/tally flow check ${./examples/flows/pooled-review.js} \
+                  --args "$(cat ${exampleArgs.pooled-review})" --catalog ${catalogFixture} >/dev/null
+                ${tally}/bin/tally flow check ${./examples/flows/worklist-fanout.js} \
+                  --args "$(cat ${exampleArgs.worklist-fanout})" >/dev/null
                 touch "$out"
               '';
           flow-dialect-reject-nonliteral-meta = flowNonliteralFailure;
