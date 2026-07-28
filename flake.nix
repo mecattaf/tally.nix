@@ -1379,7 +1379,8 @@
           testScript = ''
             machine.start()
             machine.wait_for_unit("multi-user.target")
-            machine.wait_for_unit("linger-users.service")
+            machine.succeed("systemctl start linger-users.service")
+            machine.succeed("test -e /var/lib/systemd/linger/tally")
             machine.wait_for_unit("tally-daemon.service")
             machine.succeed("systemctl is-active tally-daemon.service")
             machine.succeed("test \"$(systemctl show tally-daemon.service --property=User --value)\" = tally")
@@ -1450,7 +1451,8 @@
 
             machine.start()
             machine.wait_for_unit("multi-user.target")
-            machine.wait_for_unit("linger-users.service")
+            machine.succeed("systemctl start linger-users.service")
+            machine.succeed("test -e /var/lib/systemd/linger/tally")
             machine.wait_for_unit("tally-daemon.service")
             uid = machine.succeed("id -u tally").strip()
             machine.wait_for_unit(f"user@{uid}.service")
