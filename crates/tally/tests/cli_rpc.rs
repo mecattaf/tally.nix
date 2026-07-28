@@ -1,6 +1,7 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tally_client::{RequestFrame, WireError};
@@ -201,9 +202,73 @@ impl RpcHandler for CliHandler {
     }
 }
 
+const NO_ENQUEUE_JOB: &str = "00000000-0000-4000-8000-000000000132";
+
+#[derive(Clone, Default)]
+struct ContinueGuardrailHandler {
+    admitted_no_enqueue: Arc<Mutex<Option<String>>>,
+}
+
+impl RpcHandler for ContinueGuardrailHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        Box::pin(async move {
+            let params = request.params.as_ref().unwrap();
+            match request.method.as_str() {
+                "queue.enqueue" => {
+                    assert_eq!(params["noEnqueue"], true);
+                    assert!(params["callerJobId"].is_null());
+                    *self.admitted_no_enqueue.lock().unwrap() = Some(NO_ENQUEUE_JOB.to_owned());
+                    Ok(serde_json::json!({
+                        "task_uuid": NO_ENQUEUE_JOB,
+                        "job_id": NO_ENQUEUE_JOB,
+                        "state": "queued"
+                    }))
+                }
+                "queue.continue" => {
+                    assert_eq!(params["resumeFrom"], NO_ENQUEUE_JOB);
+                    let caller = params["callerJobId"].as_str();
+                    let admitted = self.admitted_no_enqueue.lock().unwrap().clone();
+                    match caller {
+                        Some(caller) if admitted.as_deref() == Some(caller) => {
+                            Err(WireError::invalid(format!(
+                                "job {caller} carries the noEnqueue capability"
+                            )))
+                        }
+                        None => Ok(serde_json::json!({
+                            "task_uuid": "00000000-0000-4000-8000-000000000133",
+                            "job_id": "00000000-0000-4000-8000-000000000133",
+                            "verdict": "pass"
+                        })),
+                        Some(caller) => panic!("unexpected caller job {caller}"),
+                    }
+                }
+                method => panic!("unexpected method {method}"),
+            }
+        })
+    }
+}
+
 async fn run_tally(socket: &Path, args: &[&str]) -> std::process::Output {
+    run_tally_with_job_id(socket, args, None).await
+}
+
+async fn run_tally_with_job_id(
+    socket: &Path,
+    args: &[&str],
+    job_id: Option<&str>,
+) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
-    command.arg("--socket").arg(socket).args(args);
+    command
+        .arg("--socket")
+        .arg(socket)
+        .args(args)
+        .env_remove("TALLY_JOB_ID");
+    if let Some(job_id) = job_id {
+        command.env("TALLY_JOB_ID", job_id);
+    }
     command.output().await.unwrap()
 }
 
@@ -240,6 +305,50 @@ async fn cli_maps_rpc_and_waited_verdict_exit_codes() {
     let absent = temp.path().join("absent.sock");
     let unreachable = run_tally(&absent, &["query", "status"]).await;
     assert_eq!(unreachable.status.code(), Some(3));
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn no_enqueue_job_cannot_continue_and_empty_job_id_is_unset() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let handler = ContinueGuardrailHandler::default();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                for _ in 0..3 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(stream, handler.clone()).await.unwrap();
+                }
+            });
+
+            let admitted = run_tally_with_job_id(
+                &socket,
+                &["enqueue", "--pool", "gpu", "--no-enqueue", "--", "true"],
+                Some(""),
+            )
+            .await;
+            assert_eq!(admitted.status.code(), Some(0));
+
+            let rejected = run_tally_with_job_id(
+                &socket,
+                &["queue", "continue", NO_ENQUEUE_JOB, "--", "true"],
+                Some(NO_ENQUEUE_JOB),
+            )
+            .await;
+            assert_eq!(rejected.status.code(), Some(2));
+
+            let cooperative = run_tally_with_job_id(
+                &socket,
+                &["queue", "continue", NO_ENQUEUE_JOB, "--", "true"],
+                Some("  "),
+            )
+            .await;
+            assert_eq!(cooperative.status.code(), Some(0));
+            server.await.unwrap();
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]
