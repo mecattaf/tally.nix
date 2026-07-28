@@ -26,6 +26,7 @@ const RESULT_PROJECTION_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) struct RunnerIdentity {
     pub(crate) task_uuid: Option<String>,
     pub(crate) job_id: Option<String>,
+    pub(crate) job_token: Option<String>,
     pub(crate) related_trigger: Option<RelatedTrigger>,
 }
 
@@ -554,6 +555,12 @@ fn enqueue_payload(
         if let Some(job_id) = runner.job_id.as_deref() {
             payload.insert("callerJobId".to_owned(), Value::String(job_id.to_owned()));
         }
+    }
+    if let Some(job_token) = runner.job_token.as_deref() {
+        payload.insert(
+            "callerJobToken".to_owned(),
+            Value::String(job_token.to_owned()),
+        );
     }
     if let Some(related_trigger) = &runner.related_trigger {
         payload.insert(
@@ -1136,6 +1143,7 @@ mod tests {
             &RunnerIdentity {
                 task_uuid: Some("00000000-0000-4000-8000-000000000048".to_owned()),
                 job_id: Some("00000000-0000-4000-8000-000000000048".to_owned()),
+                job_token: Some("ab".repeat(32)),
                 related_trigger: Some(related_trigger()),
             },
         )
@@ -1148,6 +1156,7 @@ mod tests {
             payload["callerJobId"],
             "00000000-0000-4000-8000-000000000048"
         );
+        assert_eq!(payload["callerJobToken"], "ab".repeat(32));
         assert_eq!(payload["orchestration"]["nodeOrdinal"], 0);
         assert_eq!(payload["orchestration"]["argsHash"], "sha256:args");
         assert!(payload["orchestration"]["catalogHash"].is_null());

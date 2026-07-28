@@ -25,6 +25,11 @@ pub const ROW_MIGRATIONS: &[RowMigration] = &[
         to: 3,
         migrate: migrate_drv_v2_to_v3,
     },
+    RowMigration {
+        from: 3,
+        to: 4,
+        migrate: migrate_job_token_hash_v3_to_v4,
+    },
 ];
 
 pub fn migrate_to_current(row: &RowSeed) -> Result<RowSeed, String> {
@@ -117,6 +122,38 @@ fn migrate_drv_v2_to_v3(original: &RowSeed) -> Result<RowSeed, String> {
     if allowed_delta != canonical {
         return Err(
             "rowVersion 2 differs from canonical rowVersion 3 beyond drv absence".to_owned(),
+        );
+    }
+    Ok(canonical)
+}
+
+fn migrate_job_token_hash_v3_to_v4(original: &RowSeed) -> Result<RowSeed, String> {
+    if original.row_version != 3 {
+        return Err(format!(
+            "job token hash migration requires rowVersion 3, got {}",
+            original.row_version
+        ));
+    }
+    original.validate().map_err(|error| error.to_string())?;
+    if original.job_token_hash.is_some() {
+        return Err(
+            "rowVersion 3 job token hash migration requires the new jobTokenHash field to be absent"
+                .to_owned(),
+        );
+    }
+
+    let mut canonical = original.clone();
+    canonical.row_version = 4;
+    canonical
+        .canonicalize()
+        .map_err(|error| error.to_string())?;
+
+    let mut allowed_delta = original.clone();
+    allowed_delta.row_version = 4;
+    if allowed_delta != canonical {
+        return Err(
+            "rowVersion 3 differs from canonical rowVersion 4 beyond jobTokenHash absence"
+                .to_owned(),
         );
     }
     Ok(canonical)

@@ -68,6 +68,7 @@ pub(super) async fn run_queue(
                 credentials: BTreeMap::new(),
                 origin: None,
                 caller_job_id: inherited_caller_job_id(),
+                caller_job_token: inherited_caller_job_token(),
                 gh_trigger_actor: None,
                 gh_self_actor: None,
                 gh_origin: None,

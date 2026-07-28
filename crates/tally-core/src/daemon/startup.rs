@@ -290,6 +290,7 @@ impl Daemon {
         restore_completed_aliases(&mut context, &completed_witness)?;
         let initial_jobs = install_recovery_jobs(&mut context, &plan, &executor)?;
         restore_guardrail_parents(&mut context, &plan)?;
+        let job_tokens = restore_job_tokens(&context)?;
 
         let notifier = SystemdNotifier::from_environment()?;
         if paths.socket.exists() {
@@ -335,6 +336,7 @@ impl Daemon {
             .collect::<BTreeSet<_>>();
         let handler = DaemonHandler {
             context: Rc::new(RwLock::new(context)),
+            job_tokens: Rc::new(RefCell::new(job_tokens)),
             settings,
             executor,
             completion: completion_tx,
@@ -1470,6 +1472,28 @@ pub(super) fn install_recovery_jobs(
         context.jobs.insert(job_id, job);
     }
     Ok(launches)
+}
+
+fn restore_job_tokens(context: &Context) -> Result<HashMap<String, Uuid>, DaemonError> {
+    let mut restored = HashMap::new();
+    for job in context.jobs.values().filter(|job| job.adopted) {
+        let Some(job_token_hash) = &job.row.job_token_hash else {
+            continue;
+        };
+        if job.row.executor.is_some() {
+            return Err(DaemonError::Invalid(format!(
+                "remote recovered job {} carries a local job token hash",
+                job.stable_key()
+            )));
+        }
+        if let Some(other) = restored.insert(job_token_hash.clone(), job.job_id) {
+            return Err(DaemonError::Invalid(format!(
+                "recovered jobs {other} and {} carry the same job token hash",
+                job.stable_key()
+            )));
+        }
+    }
+    Ok(restored)
 }
 
 pub(super) fn recovery_action_already_installed(

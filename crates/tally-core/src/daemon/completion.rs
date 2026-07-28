@@ -17,6 +17,21 @@ pub(super) struct GhTerminalWork {
 
 impl DaemonHandler {
     pub(super) fn complete_terminal_post_ack(&self, work: TerminalWork) {
+        if let Some(job_token_hash) = &work.job.row.job_token_hash {
+            if self
+                .job_tokens
+                .borrow_mut()
+                .remove(job_token_hash)
+                .is_some_and(|job_id| job_id != work.job.job_id)
+            {
+                let error = DaemonError::Invalid(format!(
+                    "job token hash for {} was registered to another job",
+                    work.job.stable_key()
+                ));
+                eprintln!("tally: {error}");
+                let _ = self.fatal.send(error);
+            }
+        }
         if self.commits.send(CommitCommand::Rebuild).is_err() {
             eprintln!("tally: post-ack replica worker stopped before terminal projection");
         }
@@ -308,20 +323,37 @@ impl DaemonHandler {
         self.emit_post_ack(execution_event(&job, TallyEvent::Started));
         let executor = self.executor.clone();
         let completion = self.completion.clone();
-        let request = execution_request(
-            &executor,
-            &job,
-            self.settings.unit_limits,
-            &self.tally_socket,
-            &self.brief_root,
-            &self.git_ai,
-            self.exec_attestations,
-        );
+        let handler = self.clone();
+        let limits = self.settings.unit_limits;
+        let tally_socket = self.tally_socket.clone();
+        let brief_root = self.brief_root.clone();
+        let git_ai = self.git_ai.clone();
+        let exec_attestations = self.exec_attestations;
         let execution_target = job.row.executor.clone();
         let evidence = job.row.evidence.clone();
         let mut shutdown = self.execution_shutdown.clone();
         let mut cancellation = self.execution_cancel.subscribe();
         tokio::task::spawn_local(async move {
+            let mut job = job;
+            let job_token = match handler.prepare_execution(&mut job).await {
+                Ok(Some(job_token)) => job_token,
+                Ok(None) => return,
+                Err(error) => {
+                    eprintln!("tally: execution preparation failed: {error}");
+                    let _ = handler.fatal.send(error);
+                    return;
+                }
+            };
+            let request = execution_request(
+                &executor,
+                &job,
+                limits,
+                &tally_socket,
+                job_token.as_deref(),
+                &brief_root,
+                &git_ai,
+                exec_attestations,
+            );
             let started = Instant::now();
             let execution = async {
                 let request = request?;
@@ -361,6 +393,86 @@ impl DaemonHandler {
                 outcome,
             });
         });
+    }
+
+    async fn prepare_execution(
+        &self,
+        job: &mut Job,
+    ) -> Result<Option<Option<String>>, DaemonError> {
+        let mut context = self.context.write().await;
+        let Some(stored) = context.jobs.get(&job.job_id) else {
+            return Ok(None);
+        };
+        if stored.state != JobState::Running
+            || stored.row.attempt != job.row.attempt
+            || stored.row.lease_epoch != job.row.lease_epoch
+        {
+            return Ok(None);
+        }
+        job.row.clone_from(&stored.row);
+
+        // Remote workers cannot reach this daemon. Adopted local units already
+        // carry the token in their fixed systemd environment, so relaunching it
+        // here would break identity across a daemon restart.
+        if job.row.executor.is_some() || job.adopted {
+            return Ok(Some(None));
+        }
+
+        if let Some(existing_hash) = &job.row.job_token_hash {
+            if self.job_tokens.borrow().contains_key(existing_hash) {
+                return Err(DaemonError::Invalid(format!(
+                    "job {} generation {}:{} was prepared more than once",
+                    job.stable_key(),
+                    job.row.attempt,
+                    job.row.lease_epoch
+                )));
+            }
+        }
+
+        let (job_token, job_token_hash) = loop {
+            let token = mint_job_token()?;
+            let digest = hash_job_token(&token);
+            if !self.job_tokens.borrow().contains_key(&digest) {
+                break (token, digest);
+            }
+        };
+
+        if let Some(task_uuid) = job.task_uuid {
+            let events_dir = context.paths.events_dir();
+            let mut matching_events = read_acknowledged_events(&events_dir)?
+                .into_iter()
+                .filter(|event| event.row.uuid == task_uuid)
+                .collect::<Vec<_>>();
+            if matching_events.len() != 1 {
+                return Err(DaemonError::Invalid(format!(
+                    "job {task_uuid} has {} acknowledged enqueue events while persisting its token hash",
+                    matching_events.len()
+                )));
+            }
+            let mut event = matching_events
+                .pop()
+                .expect("exactly one matching event was checked");
+            event.row.job_token_hash = Some(job_token_hash.clone());
+            update_enqueue_event_atomic(&events_dir, &event)?;
+        }
+
+        let mut updated_row = job.row.clone();
+        updated_row.job_token_hash = Some(job_token_hash.clone());
+        updated_row.validate()?;
+        context
+            .jobs
+            .get_mut(&job.job_id)
+            .expect("prepared job remains installed")
+            .row
+            .clone_from(&updated_row);
+        if let Some(task_uuid) = job.task_uuid {
+            context.rows.insert(task_uuid, updated_row.clone());
+        }
+        job.row = updated_row;
+        self.job_tokens
+            .borrow_mut()
+            .insert(job_token_hash, job.job_id);
+        Ok(Some(Some(job_token)))
     }
 
     pub(super) fn emit_post_ack(&self, event: EmitEvent) {
@@ -465,6 +577,7 @@ pub(super) fn execution_request(
     job: &Job,
     limits: UnitLimits,
     tally_socket: &str,
+    job_token: Option<&str>,
     brief_root: &Path,
     git_ai_config: &GitAiConfig,
     exec_attestations: bool,
@@ -514,6 +627,13 @@ pub(super) fn execution_request(
         // A remote worker has no tally daemon and cannot use the coordinator's
         // Unix socket. The SSH transport itself never forwards ambient sockets.
         tally_socket: job.row.executor.is_none().then(|| tally_socket.to_owned()),
+        job_token: job
+            .row
+            .executor
+            .is_none()
+            .then_some(job_token)
+            .flatten()
+            .map(str::to_owned),
         environment: job.invocation.env.clone(),
         gh_origin: job.row.gh_origin.clone(),
         brief_hash: job.row.brief_hash.clone(),
@@ -536,6 +656,17 @@ pub(super) fn execution_request(
         limits,
         runtime_max_sec: job.row.runtime_max_sec,
     })
+}
+
+fn mint_job_token() -> Result<String, DaemonError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| DaemonError::Invalid(format!("job token entropy failed: {error}")))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn hash_job_token(job_token: &str) -> String {
+    format!("sha256:{:x}", Sha256::digest(job_token.as_bytes()))
 }
 
 pub(super) fn effective_gate_manifest(

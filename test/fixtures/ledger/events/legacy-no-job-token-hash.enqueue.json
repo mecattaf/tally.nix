@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "eventId": "00000000-0000-4000-8000-000000000501",
+  "acknowledged": true,
+  "row": {
+    "rowVersion": 3,
+    "uuid": "00000000-0000-4000-8000-000000000511",
+    "description": "literal rowVersion 3 row before job token hashes",
+    "priority": "high",
+    "source": "calendar",
+    "adapter": "shell",
+    "pool": ["worker-gpu"],
+    "leaseEpoch": 7,
+    "argv": ["true"],
+    "evidence": [],
+    "origin": {
+      "schemaVersion": 1,
+      "source": "calendar"
+    }
+  }
+}

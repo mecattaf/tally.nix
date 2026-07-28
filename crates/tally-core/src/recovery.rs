@@ -1014,6 +1014,7 @@ mod tests {
             orchestration: None,
             session_ref: None,
             final_message: None,
+            job_token_hash: None,
             lease_epoch,
             attempt: 1,
             argv: vec!["worker".to_owned(), "leaf".to_owned()],

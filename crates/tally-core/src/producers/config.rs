@@ -242,6 +242,7 @@ impl ProducerEnqueue {
                 (None, _) => AdmissionOrigin::direct(source),
             }),
             caller_job_id: None,
+            caller_job_token: None,
             gh_trigger_actor: None,
             gh_self_actor: None,
             gh_origin: None,

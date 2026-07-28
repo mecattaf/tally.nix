@@ -400,6 +400,7 @@ struct ExecutionFinished {
 #[derive(Clone)]
 struct DaemonHandler {
     context: SharedContext,
+    job_tokens: Rc<RefCell<HashMap<String, Uuid>>>,
     settings: DaemonSettings,
     executor: Executor,
     completion: mpsc::UnboundedSender<ExecutionFinished>,

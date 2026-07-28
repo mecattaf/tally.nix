@@ -505,6 +505,8 @@ define_enqueue_payload! {
     origin: Option<AdmissionOrigin> => "origin",
     #[serde(default)]
     caller_job_id: Option<String> => "callerJobId",
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caller_job_token: Option<String> => "callerJobToken",
     #[serde(default, rename = "ghTriggerActor", alias = "ghActor")]
     gh_trigger_actor: Option<String> => "ghTriggerActor",
     #[serde(default)]
@@ -2153,6 +2155,7 @@ mod tests {
             credentials: BTreeMap::new(),
             origin: None,
             caller_job_id: Some("job-parent".to_owned()),
+            caller_job_token: None,
             gh_trigger_actor: None,
             gh_self_actor: None,
             gh_origin: None,
