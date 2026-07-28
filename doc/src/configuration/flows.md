@@ -150,8 +150,8 @@ $ tally enqueue \
 
 The admitted job supplies `TALLY_TASK_UUID` and `TALLY_JOB_ID`, so
 `tally flow run` derives the durable flow-run identity and applies ordinary
-parent depth and fanout accounting. Tally runs for one trusted local user; this
-is an operator contract, not a hostile-user authorization boundary.
+parent depth and fanout accounting. Tally runs on one machine for one trusted
+user, using local AI plus authenticated Claude Code and Codex subscriptions.
 
 ## `budgetPool` is existence-check-only
 
