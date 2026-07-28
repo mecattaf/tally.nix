@@ -1636,7 +1636,7 @@ async fn run_enqueue(
         no_enqueue: args.no_enqueue,
         credentials: Default::default(),
         origin: None,
-        caller_job_id: std::env::var("TALLY_JOB_ID").ok(),
+        caller_job_id: inherited_caller_job_id(),
         gh_trigger_actor: None,
         gh_self_actor: None,
         gh_origin: None,
@@ -1684,17 +1684,7 @@ async fn submit_payload(
     };
     let waited = client.call("queue.await_job", Some(key)).await?;
     println!("{}", serde_json::to_string(&waited)?);
-    let code = waited
-        .get("verdict")
-        .and_then(Value::as_str)
-        .map(verdict_exit_code)
-        .or_else(|| {
-            waited
-                .get("exit_code")
-                .and_then(Value::as_i64)
-                .map(|value| value.clamp(0, 255) as i32)
-        })
-        .unwrap_or(1);
+    let code = waited_exit_code(&waited);
     if code == 0 {
         Ok(())
     } else {
@@ -1764,7 +1754,7 @@ async fn run_queue(socket: &Path, config_path: Option<&Path>, command: QueueComm
                 no_enqueue: false,
                 credentials: BTreeMap::new(),
                 origin: None,
-                caller_job_id: None,
+                caller_job_id: inherited_caller_job_id(),
                 gh_trigger_actor: None,
                 gh_self_actor: None,
                 gh_origin: None,
@@ -2385,6 +2375,32 @@ fn verdict_exit_code(verdict: &str) -> i32 {
     }
 }
 
+fn waited_exit_code(waited: &Value) -> i32 {
+    waited
+        .get("verdict")
+        .and_then(Value::as_str)
+        .map(verdict_exit_code)
+        .or_else(|| {
+            waited
+                .get("exit_code")
+                .and_then(Value::as_i64)
+                .map(|value| {
+                    if value == 0 {
+                        0
+                    } else {
+                        value.clamp(1, 255) as i32
+                    }
+                })
+        })
+        .unwrap_or(1)
+}
+
+fn inherited_caller_job_id() -> Option<String> {
+    std::env::var("TALLY_JOB_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 fn default_socket_path() -> PathBuf {
     if let Some(socket) = std::env::var_os("TALLY_SOCKET") {
         return PathBuf::from(socket);
@@ -2613,6 +2629,13 @@ mod tests {
         for verdict in ["failed", "pool-vanished", "preempted", "runtime-exceeded"] {
             assert_eq!(verdict_exit_code(verdict), 1);
         }
+    }
+
+    #[test]
+    fn waited_signal_exit_is_never_success() {
+        let waited = json!({"exit_code": -9});
+        assert!(waited.get("verdict").is_none());
+        assert_eq!(waited_exit_code(&waited), 1);
     }
 
     #[test]
