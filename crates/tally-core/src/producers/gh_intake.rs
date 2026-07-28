@@ -910,10 +910,10 @@ pub(super) struct GhObservationHints<'a> {
 
 #[derive(Clone)]
 pub(super) struct GhEventTrigger {
-    id: String,
-    kind: &'static str,
-    actor: String,
-    value: String,
+    pub(super) id: String,
+    pub(super) kind: &'static str,
+    pub(super) actor: String,
+    pub(super) value: String,
 }
 
 pub(super) fn gh_api_candidate(
