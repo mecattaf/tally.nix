@@ -68,6 +68,7 @@
             ./crates
             ./doc/src/reference/rpc-protocol.md
             ./examples/flows/academic-ocr.js
+            ./examples/flows/agency-nightly.js
             ./examples/flows/monthly-review.js
             ./test/fixtures/flows
             ./test/fixtures/git-ai
