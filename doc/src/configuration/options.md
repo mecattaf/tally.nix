@@ -73,7 +73,7 @@ tally: {"name":"FlowMetaError","code":"meta-nonliteral","message":"meta must con
 **Banned global:**
 
 ```text
-tally: {"name":"FlowDeterminismError","code":"determinism-violation","message":"banned global Math.random is unavailable in flow scripts","location":{"line":8,"column":1},"details":{"global":"Math.random"}}
+tally: {"name":"FlowDeterminismError","code":"determinism-violation","message":"banned global Math.random is unavailable in flow scripts because it would break replay; derive the choice from witnessed input, or let members() pick, instead","location":{"line":8,"column":1},"details":{"global":"Math.random"}}
 ```
 
 **A pool used by the script but not declared in `meta.pools`:**

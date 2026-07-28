@@ -12,7 +12,9 @@ pub(super) fn native_job(
         context,
     )?;
     let allowed = node_spec_fields(NodeSpecSurface::Job).collect::<Vec<_>>();
-    reject_unknown_keys(&raw, &allowed, location)
+    reject_unknown_keys(&raw, SpecSurface::JobSpec, &allowed, location)
+        .map_err(|error| flow_to_js_error(error, context))?;
+    reject_nonintegral_numbers(&raw, SpecSurface::JobSpec, location)
         .map_err(|error| flow_to_js_error(error, context))?;
     let spec: NodeSpec = serde_json::from_value(raw).map_err(|error| {
         flow_to_js_error(
@@ -40,8 +42,13 @@ pub(super) fn native_drv(
         "derivation spec",
         context,
     )?;
-    reject_unknown_keys(&raw, &["drvPath", "outputs"], location)
-        .map_err(|error| flow_to_js_error(error, context))?;
+    reject_unknown_keys(
+        &raw,
+        SpecSurface::DerivationSpec,
+        &["drvPath", "outputs"],
+        location,
+    )
+    .map_err(|error| flow_to_js_error(error, context))?;
     let mut drv: Derivation = serde_json::from_value(raw).map_err(|error| {
         flow_to_js_error(
             FlowError::new(
@@ -110,7 +117,7 @@ pub(super) fn native_agent_sugar(
     options.insert("pools".to_owned(), json!([pool]));
     options.insert("argv".to_owned(), json!([BRIEF_SENTINEL]));
     options.insert("brief".to_owned(), json!({"mission": prompt}));
-    let spec = decode_sugar_spec(options, location, context)?;
+    let spec = decode_sugar_spec(options, helper, location, context)?;
     make_job_promise(spec, revisions, settle, location, context)
 }
 
@@ -129,7 +136,7 @@ pub(super) fn native_sh(
     reject_sugar_conflicts(&options, reserved_fields("sh"), location, context)?;
     options.insert("argv".to_owned(), argv);
     options.insert("adapter".to_owned(), Value::String("shell".to_owned()));
-    let spec = decode_sugar_spec(options, location, context)?;
+    let spec = decode_sugar_spec(options, "sh", location, context)?;
     make_job_promise(spec, NodeRevisions::default(), settle, location, context)
 }
 
@@ -143,8 +150,19 @@ pub(super) fn native_local(
     let (mut options, settle) = sugar_options(args.get(1), location, context)?;
     let mut allowed = node_spec_fields(NodeSpecSurface::Sugar).collect::<Vec<_>>();
     allowed.push("member");
-    reject_unknown_keys(&Value::Object(options.clone()), &allowed, location)
-        .map_err(|error| flow_to_js_error(error, context))?;
+    reject_unknown_keys(
+        &Value::Object(options.clone()),
+        SpecSurface::SugarOptions("local"),
+        &allowed,
+        location,
+    )
+    .map_err(|error| flow_to_js_error(error, context))?;
+    reject_nonintegral_numbers(
+        &Value::Object(options.clone()),
+        SpecSurface::SugarOptions("local"),
+        location,
+    )
+    .map_err(|error| flow_to_js_error(error, context))?;
     reject_sugar_conflicts(&options, reserved_fields("local"), location, context)?;
     let member_value = options.remove("member").ok_or_else(|| {
         flow_to_js_error(
@@ -419,11 +437,7 @@ pub(super) fn native_random(
     context: &mut Context,
 ) -> JsResult<JsValue> {
     Err(flow_to_js_error(
-        FlowError::determinism(
-            "Math.random",
-            "Math.random is forbidden because it would break replay",
-            call_site(context),
-        ),
+        FlowError::banned_global("Math.random", call_site(context)),
         context,
     ))
 }
@@ -545,12 +559,24 @@ pub(super) fn sugar_options(
 
 pub(super) fn decode_sugar_spec(
     options: Map<String, Value>,
+    helper: &str,
     location: SourceLocation,
     context: &mut Context,
 ) -> JsResult<NodeSpec> {
     let allowed = node_spec_fields(NodeSpecSurface::Sugar).collect::<Vec<_>>();
-    reject_unknown_keys(&Value::Object(options.clone()), &allowed, location)
-        .map_err(|error| flow_to_js_error(error, context))?;
+    reject_unknown_keys(
+        &Value::Object(options.clone()),
+        SpecSurface::SugarOptions(helper),
+        &allowed,
+        location,
+    )
+    .map_err(|error| flow_to_js_error(error, context))?;
+    reject_nonintegral_numbers(
+        &Value::Object(options.clone()),
+        SpecSurface::SugarOptions(helper),
+        location,
+    )
+    .map_err(|error| flow_to_js_error(error, context))?;
     serde_json::from_value(Value::Object(options)).map_err(|error| {
         flow_to_js_error(
             FlowError::new(

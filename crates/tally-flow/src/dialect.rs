@@ -480,11 +480,7 @@ impl<'ast> Visitor<'ast> for DeterminismLint<'_> {
 
     fn visit_expression(&mut self, expression: &'ast Expression) -> ControlFlow<Self::BreakTy> {
         if let Some((global, span)) = banned_expression(expression, self.interner) {
-            return ControlFlow::Break(FlowError::determinism(
-                global,
-                format!("banned global {global} is unavailable in flow scripts"),
-                location(span),
-            ));
+            return ControlFlow::Break(FlowError::banned_global(global, location(span)));
         }
         expression.visit_with(self)
     }

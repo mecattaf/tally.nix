@@ -772,6 +772,13 @@ pub fn node_spec_fields(surface: NodeSpecSurface) -> impl Iterator<Item = &'stat
         .map(|field| field.json_name)
 }
 
+/// Node spec fields that deserialize into a Rust integer.
+///
+/// A JavaScript number is a float, and Boa only narrows one back to an integer
+/// when it can, so `Math.floor(x)` reaches serde as `600.0` and fails `u64`
+/// deserialization. These fields get a message that says so.
+pub const NODE_SPEC_INTEGER_FIELDS: &[&str] = &["runtimeMaxSec"];
+
 /// The spec fields each sugar helper fixes for itself.
 ///
 /// Setting one of these is `FlowSpecError`/`sugar-option-conflict`. The dialect

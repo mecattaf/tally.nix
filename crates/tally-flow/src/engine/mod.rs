@@ -21,7 +21,7 @@ use crate::dialect::validate_instance;
 use crate::executor::FlowJobExecutor;
 use crate::model::{
     flow_canonical_payload_fields, is_nix_store_path, node_spec_fields, sugar_reserved_fields,
-    NodeSpecSurface, SubmissionPlan,
+    NodeSpecSurface, SubmissionPlan, NODE_SPEC_INTEGER_FIELDS,
 };
 use crate::{
     check_script, resolve_members, Catalog, CheckOptions, Derivation, Disposition, FlowClient,
