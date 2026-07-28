@@ -26,6 +26,7 @@
 - [Host API reference](flows/host-api.md)
 - [Submission identity and replay](flows/submission-and-replay.md)
 - [Pooled-review cookbook](flows/pooled-review.md)
+- [Two more cookbook recipes](flows/cookbook.md)
 - [Cross-host handoff](flows/cross-host-handoff.md)
 
 # Declarative configuration

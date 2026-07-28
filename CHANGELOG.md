@@ -15,6 +15,8 @@ authorized.
   persisted by hash in the durable row so a running job keeps one identity across daemon restarts,
   and forwarded by the CLI as the `callerJobToken` enqueue field. Remote and SSH-executed jobs
   never receive it.
+- Added two cookbook recipes with executable examples — bounded fan-out over a witnessed worklist,
+  and expressing domain failure as a validated envelope instead of a thrown error.
 - Added an evaluation-time flow width check: a script whose explicit `meta.maxNodes` exceeds
   `services.tally.enqueue.fanoutCap` now fails the generation build instead of hitting the cap at
   run time.
