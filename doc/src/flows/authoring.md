@@ -130,9 +130,8 @@ The implementation is narrower than the option tree suggests:
   generation is built. A script without `workloadMutex` can run directly; a
   mutex-declaring script must be enqueued as a parent holding both pools.
 - A generated runner always requests `flow` and additionally requests its one
-  configured `workloadMutex`, if any. The configuration's `budgetPool` value
-  is checked only to ensure that the named pool exists; it is not added to the
-  runner or its children.
+  configured `workloadMutex`, if any. The removed `budgetPool` option never
+  added a runner or child lease and is now rejected during configuration.
 
 For an unscheduled run, supply a UUID explicitly unless tally is launching the
 runner as a parent job:

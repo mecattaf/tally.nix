@@ -30,7 +30,7 @@ the [Home Manager reference](home-manager-options.md) for a deployed topology an
 
 ## Declarative flows
 
-Each flow currently has thirteen generated leaf options. In Home Manager, a non-empty
+Each flow currently has twelve generated leaf options. In Home Manager, a non-empty
 [`services.tally.flows`](home-manager-options.md#servicestallyflows) registry also declares two
 weak-default pools:
 
@@ -39,10 +39,9 @@ weak-default pools:
   preemption.
 
 Flow scripts may not list either reserved name in `meta.pools`. The generated
-[`budgetPool`](home-manager-options.md#servicestallyflowsnamebudgetpool) and
-[`catalog`](home-manager-options.md#servicestallyflowsnamecatalog) entries cover their
-configuration validation. Runtime wiring is documented once in the CLI reference under
-[declarative runner pools](../operating/cli.md#declarative-runner-pool-workloadmutex-and-budgetpool)
+[`catalog`](home-manager-options.md#servicestallyflowsnamecatalog) entry covers
+selector configuration validation. Runtime wiring is documented once in the CLI reference under
+[declarative runner pools](../operating/cli.md#declarative-runner-pool-and-workloadmutex)
 and [catalog is flag-only](../operating/cli.md#catalog-is-flag-only).
 
 [`workloadMutex`](home-manager-options.md#servicestallyflowsnameworkloadmutex)

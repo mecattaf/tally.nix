@@ -325,7 +325,7 @@ adds the flag only when `services.tally.flows.<name>.catalog` is non-null. The o
 optional; a script whose literal meta declares selector use fails checking unless a catalog is
 provided.
 
-### Declarative runner pool, `workloadMutex`, and `budgetPool`
+### Declarative runner pool and `workloadMutex`
 
 The generated calendar producer renders the runner with:
 
@@ -348,15 +348,11 @@ returns `FlowStartupError` code `workload-mutex-parent-required` before daemon
 connection. Flows without a mutex may still run directly, with the documented
 depth/fanout bypass.
 
-`services.tally.flows.<name>.budgetPool` is validated only to be null or the
-name of an existing configured pool. Its value is not added to the runner
-pool, passed as an argument, exported in the environment, or used as a
-child-admission estimate.
-
-The live option description at `4c85563` calls `budgetPool` a pool “leased with the flow
-runner.” That sentence is stale and contradicts both the renderer and the final ruling. The
-existence-only behavior above is the contract. `workloadMutex` is the sole
-typed extra runner pool; it is not a general run-lifetime pool list.
+The former `budgetPool` option has been removed because it never affected the
+runner or child pool set. Declaring it now fails configuration with guidance to
+use priorities for flow contention or `workloadMutex` for process-scoped
+exclusion. `workloadMutex` is the sole typed extra runner pool; it is not a
+general run-lifetime pool list.
 
 ## Witness
 

@@ -288,8 +288,8 @@ typed capacity-1 `workloadMutex` for the runner process lifetime. Runner death
 releases that mutex; replay waits behind the next holder while durable children
 may complete. A direct manual flow run has no lease, so a mutex-declaring flow
 must be enqueued as an admitted parent holding both pools.
-`budgetPool` currently validates that the named pool exists; it does not add
-that pool to runner admission. Separately, flow nodes deliberately have no
+The former `budgetPool` option has been removed because it never added a pool
+to runner admission. Separately, flow nodes deliberately have no
 `consumptionEstimate` field and configured flow checking excludes
 `windowed-consumption` pools by design. Use priorities for contention between
 flow workloads. Manual and producer enqueue retain

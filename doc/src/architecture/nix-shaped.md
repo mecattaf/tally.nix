@@ -139,13 +139,12 @@ defaults to a seven-day window.
 There are two explicit flow boundaries. Declaratively generated flow runners
 always request `flow` and may co-lease one typed capacity-1 `workloadMutex` for
 the runner process lifetime.
-The [producer renderer](https://github.com/mecattaf/tally.nix/blob/4c85563a3899369f1aa4905f44e9806e424593f1/nix/modules/common.nix#L2169-L2212)
-and [separate assertion](https://github.com/mecattaf/tally.nix/blob/4c85563a3899369f1aa4905f44e9806e424593f1/nix/modules/common.nix#L2302-L2312)
-make the boundary visible: `budgetPool` is checked only for existence and adds
-no runner pool. The mutex is process-scoped because runner death releases its
-lease; interrupted replay waits behind the next holder while durable children
-may complete. A mutex-declaring flow must use an admitted parent rather than
-direct manual invocation.
+The producer renderer and module assertions make the boundary visible. The
+former `budgetPool` option was removed because it added no runner pool. The
+mutex is process-scoped because runner death releases its lease; interrupted
+replay waits behind the next holder while durable children may complete. A
+mutex-declaring flow must use an admitted parent rather than direct manual
+invocation.
 Separately, a generic job can supply `consumptionEstimate`, while flow nodes
 deliberately cannot. Configured flow checking excludes
 `windowed-consumption` pools and points to priorities as the contention
