@@ -4,8 +4,8 @@ use taskchampion::Uuid;
 
 pub const DEFAULT_FLOW_MAX_NODES: u64 = 1_000;
 
-/// An orchestration capsule is intentionally opaque apart from the two
-/// admission fields the kernel owns. Keeping the original `Value` preserves
+/// An orchestration capsule is intentionally opaque apart from the admission
+/// fields the kernel owns. Keeping the original `Value` preserves
 /// object member order and every uninterpreted field unchanged across
 /// row-to-witness serialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +36,14 @@ impl Orchestration {
             if max_nodes.as_u64().is_none_or(|value| value == 0) {
                 return Err("orchestration maxNodes must be a positive integer when set".to_owned());
             }
+        }
+        if object
+            .get("nodeOrdinal")
+            .is_some_and(|ordinal| ordinal.as_u64().is_none())
+        {
+            return Err(
+                "orchestration nodeOrdinal must be a non-negative integer when set".to_owned(),
+            );
         }
         if object.get("promptRevision").is_some_and(|revision| {
             revision.as_str().is_none_or(|revision| {
@@ -74,6 +82,10 @@ impl Orchestration {
 
     pub fn max_nodes(&self) -> Option<u64> {
         self.0.get("maxNodes").and_then(Value::as_u64)
+    }
+
+    pub fn node_ordinal(&self) -> Option<u64> {
+        self.0.get("nodeOrdinal").and_then(Value::as_u64)
     }
 
     pub fn effective_max_nodes(&self) -> u64 {
@@ -116,6 +128,7 @@ mod tests {
             "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321"
         );
         assert_eq!(capsule.effective_max_nodes(), 12);
+        assert_eq!(capsule.node_ordinal(), Some(7));
         assert_eq!(serde_json::to_string(&capsule).unwrap(), raw);
     }
 
@@ -127,6 +140,10 @@ mod tests {
             serde_json::json!({
                 "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
                 "maxNodes": 0
+            }),
+            serde_json::json!({
+                "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+                "nodeOrdinal": -1
             }),
             serde_json::json!({
                 "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",

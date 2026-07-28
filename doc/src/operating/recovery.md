@@ -20,6 +20,7 @@ That distinction is the recovery contract:
 | A running local job | tally probes `tally-job-<uuid>.service`. A matching attempt, lease epoch, and systemd invocation ID are adopted; the argv is not run twice. |
 | A running remote job | The coordinator repeatedly sends the same bounded `Probe`/`Adopt` operation to the named SSH executor. Its logical leases remain held while transport state is unknown. |
 | A terminal job | The canonical witness reconstructs `queue.await_job` and that job's deterministic `barrier:<task>:<attempt>` result without re-execution. |
+| A runtime-exceeded job eligible for automatic bounded requeue | The first witness is retained, a durable retry advances the same task UUID, and existing stale-attempt waiters resolve to the new current attempt up to `maxAttempts`. |
 | A job-originated parent | Active child rows rebuild the parent's depth and outstanding-child count. Terminal parents disappear when their last child becomes terminal. |
 | A reuse acknowledged just before a crash | Startup reconciles the durable reuse event with its governing witness and appends only a missing, unambiguous legacy reuse witness. It refuses conflicting history. |
 | A blocked socket call | The connection and its waiter disappear. The caller must reconnect and send the idempotent await again. The shipped flow client does this automatically. |

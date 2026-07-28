@@ -1314,6 +1314,41 @@ impl DaemonHandler {
             return Err(WireError::invalid(error.to_string()));
         }
 
+        if full_mode {
+            if let (Some(orchestration), Some(dedup_key), Some(payload_hash)) = (
+                row.orchestration.as_ref(),
+                row.dedup_key.as_deref(),
+                row.payload_hash.as_deref(),
+            ) {
+                if let Some(node_ordinal) = orchestration.node_ordinal() {
+                    let conflicts = context
+                        .rows
+                        .values()
+                        .filter(|existing| existing.dedup_key.as_deref() != Some(dedup_key))
+                        .filter(|existing| {
+                            existing.orchestration.as_ref().is_some_and(|recorded| {
+                                recorded.flow_run_id() == orchestration.flow_run_id()
+                                    && recorded.node_ordinal() == Some(node_ordinal)
+                            })
+                        })
+                        .map(|existing| DedupConflictCandidate {
+                            task_uuid: existing.uuid.to_string(),
+                            payload_hash: existing.payload_hash.clone(),
+                            orchestration: existing.orchestration.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    if !conflicts.is_empty() {
+                        rollback_child_charge(
+                            &mut context,
+                            caller_job_id.as_deref(),
+                            child_charged,
+                        )?;
+                        return Err(dedup_conflict(dedup_key, payload_hash, conflicts));
+                    }
+                }
+            }
+        }
+
         if let Some(drv) = row.drv.clone() {
             if let Some(existing) = latest_witness_for_task(&context.paths.witness_path(), job_id)?
             {
@@ -1972,20 +2007,23 @@ impl DaemonHandler {
                 .map(Job::stable_key)
                 .unwrap_or_else(|| job_id.to_string());
             let current = context.jobs.get(&job_id);
+            let current_attempt = current
+                .map(|job| job.row.attempt)
+                .or_else(|| context.rows.get(&job_id).map(|row| row.attempt));
+            let resolved_attempt = match (requested_attempt, current_attempt) {
+                (Some(requested), Some(current)) if requested < current => Some(current),
+                (Some(requested), _) => Some(requested),
+                (None, current) => current,
+            };
             if current.is_some_and(|job| {
                 job.state != JobState::Completed
-                    && requested_attempt.is_none_or(|attempt| job.row.attempt == attempt)
+                    && resolved_attempt.is_none_or(|attempt| job.row.attempt == attempt)
             }) {
                 (Some(context.barriers.wait_job(&stable)), None)
             } else {
                 (
                     None,
-                    Some((
-                        context.paths.witness_path(),
-                        stable,
-                        requested_attempt
-                            .or_else(|| context.rows.get(&job_id).map(|row| row.attempt)),
-                    )),
+                    Some((context.paths.witness_path(), stable, resolved_attempt)),
                 )
             }
         };
@@ -2650,13 +2688,62 @@ impl DaemonHandler {
     async fn cancel(&self, params: Option<Value>) -> Result<Value, WireError> {
         #[derive(Deserialize)]
         struct Params {
-            task_uuid: String,
+            #[serde(default)]
+            task_uuid: Option<String>,
+            #[serde(default, alias = "flowRunId")]
+            flow_run_id: Option<String>,
             #[serde(default)]
             force: bool,
         }
         let params: Params = decode_params(params)?;
+        match (params.task_uuid, params.flow_run_id) {
+            (Some(task_uuid), None) => self.cancel_one(&task_uuid, params.force).await,
+            (None, Some(flow_run_id)) => self.cancel_flow(&flow_run_id).await,
+            _ => Err(WireError::invalid(
+                "provide exactly one of task_uuid or flow_run_id",
+            )),
+        }
+    }
+
+    async fn cancel_flow(&self, flow_run_id: &str) -> Result<Value, WireError> {
+        Uuid::parse_str(flow_run_id)
+            .map_err(|_| WireError::invalid("flow_run_id must be a UUID"))?;
+        let mut task_uuids = {
+            let context = self.context.read().await;
+            context
+                .jobs
+                .values()
+                .filter(|job| job.state != JobState::Completed)
+                .filter(|job| {
+                    job.row
+                        .orchestration
+                        .as_ref()
+                        .is_some_and(|orchestration| orchestration.flow_run_id() == flow_run_id)
+                })
+                .map(Job::stable_key)
+                .collect::<Vec<_>>()
+        };
+        task_uuids.sort();
+        let mut affected = 0_u64;
+        let mut results = Vec::with_capacity(task_uuids.len());
+        for task_uuid in task_uuids {
+            let result = self.cancel_one(&task_uuid, true).await?;
+            affected = affected
+                .saturating_add(result.get("affected").and_then(Value::as_u64).unwrap_or(0));
+            results.push(result);
+        }
+        Ok(json!({
+            "ok": true,
+            "affected": affected,
+            "flow_run_id": flow_run_id,
+            "flowRunId": flow_run_id,
+            "results": results,
+        }))
+    }
+
+    async fn cancel_one(&self, task_uuid: &str, force: bool) -> Result<Value, WireError> {
         let mut context = self.context.write().await;
-        let job = find_job(&context, &params.task_uuid)?.clone();
+        let job = find_job(&context, task_uuid)?.clone();
         let was = state_name(job.state);
         if job.state == JobState::Completed {
             return Ok(json!({
@@ -2668,7 +2755,7 @@ impl DaemonHandler {
                 "already_terminal": true,
             }));
         }
-        if job.state == JobState::Running && !params.force {
+        if job.state == JobState::Running && !force {
             return Ok(json!({
                 "ok": true,
                 "affected": 0,
@@ -3888,6 +3975,10 @@ fn enforce_flow_node_cap(context: &Context, row: &RowSeed) -> Result<(), WireErr
                 .orchestration
                 .as_ref()
                 .is_some_and(|capsule| capsule.flow_run_id() == flow_run_id)
+                && !context
+                    .query_rows
+                    .get(&existing.uuid)
+                    .is_some_and(|projection| projection.status == RowStatus::Deleted)
         })
         .count();
     let existing_nodes =
@@ -5911,7 +6002,7 @@ impl Daemon {
             };
         let computed_verdict = canonical_verdict(evidence_verdict, semantic_completion.as_ref());
 
-        let (result, evidence, launches) = {
+        let (result, evidence, launches, auto_requeue) = {
             let mut context = self.handler.context.write().await;
             if context.jobs.get(&finished.job_id).is_some_and(|job| {
                 job.state == JobState::Completed
@@ -5978,7 +6069,17 @@ impl Daemon {
                 completion: semantic_completion,
             };
             let stable = job.stable_key();
-            context.barriers.complete_job(&stable, result.value());
+            let auto_requeue = verdict == Verdict::RuntimeExceeded
+                && self
+                    .handler
+                    .settings
+                    .recovery_policy
+                    .retry
+                    .auto_bounded_requeue
+                && job.row.attempt < self.handler.settings.recovery_policy.max_attempts;
+            if !auto_requeue {
+                context.barriers.complete_job(&stable, result.value());
+            }
             let stored = context.jobs.get_mut(&finished.job_id).expect("job exists");
             stored.state = JobState::Completed;
             release_child_charge(&mut context, &job)?;
@@ -6000,13 +6101,16 @@ impl Daemon {
                 context.lease_jobs.remove(lease_id);
                 launches.extend(promoted_jobs(&mut context, released.promoted));
             }
-            (result, evidence, launches)
+            (result, evidence, launches, auto_requeue)
         };
 
-        // Waiters become runnable immediately after the only terminal ack dependency:
-        // the witness fsync above. Lease release, scrape, attestations, replica commit,
-        // and journald are post-ack.
+        // Ordinary waiters become runnable immediately after the only terminal ack
+        // dependency: the witness fsync above. An automatic bounded requeue holds
+        // the same stable waiter until the replacement attempt is terminal. Lease
+        // release, scrape, attestations, replica commit, and journald are post-ack.
         tokio::task::yield_now().await;
+        let stable = job.stable_key();
+        let terminal_value = result.value();
         self.handler.complete_terminal_post_ack(TerminalWork {
             job,
             result,
@@ -6015,6 +6119,24 @@ impl Daemon {
             launches,
             scrape_capture,
         });
+        if auto_requeue {
+            if let Err(error) = self
+                .handler
+                .retry_job(Some(json!({"task_uuid": stable})))
+                .await
+            {
+                self.handler
+                    .context
+                    .write()
+                    .await
+                    .barriers
+                    .complete_job(&stable, terminal_value);
+                return Err(DaemonError::Invalid(format!(
+                    "automatic bounded requeue for job {stable} failed: {}",
+                    error.message
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -14440,6 +14562,19 @@ mod tests {
                     .unwrap();
                 assert_eq!(admitted["state"], "running");
                 let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let untouched = client
+                    .call(
+                        "queue.cancel",
+                        Some(json!({"task_uuid": task_uuid, "force": false})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(untouched["affected"], 0);
+                assert_eq!(untouched["was"], "running");
+                assert!(read_verified_records(&paths.witness_path())
+                    .unwrap()
+                    .1
+                    .is_empty());
                 let cancelled = client
                     .call(
                         "queue.cancel",
@@ -15127,6 +15262,7 @@ mod tests {
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
                 let client = RpcClient::connect(&paths.socket).await.unwrap();
                 let attached_client = RpcClient::connect(&paths.socket).await.unwrap();
+                let stale_client = RpcClient::connect(&paths.socket).await.unwrap();
                 let failed_payload =
                     fs1_full_payload("fs1-memoized-failure", &["false"], ["exit:0".to_owned()]);
                 let created = client
@@ -15190,19 +15326,6 @@ mod tests {
                     events[0].retries[0].previous_witness_seq,
                     failed["witness_seq"].as_u64().unwrap()
                 );
-                let original_attempt = client
-                    .call(
-                        "queue.await_job",
-                        Some(json!({
-                            "task_uuid": created["task_uuid"],
-                            "attempt": 1
-                        })),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(original_attempt["attempt"], 1);
-                assert_eq!(original_attempt["witness_seq"], failed["witness_seq"]);
-
                 let attached = attached_client
                     .call("queue.enqueue", Some(failed_payload.clone()))
                     .await
@@ -15210,10 +15333,20 @@ mod tests {
                 assert_eq!(attached["disposition"], "attached");
                 assert_eq!(attached["task_uuid"], created["task_uuid"]);
                 assert_eq!(attached["attempt"], 2);
-                client
-                    .call("queue.resume", Some(json!({"pool": "slot", "all": false})))
-                    .await
-                    .unwrap();
+                let stale_wait = stale_client.call(
+                    "queue.await_job",
+                    Some(json!({
+                        "task_uuid": created["task_uuid"],
+                        "attempt": 1
+                    })),
+                );
+                let resume =
+                    client.call("queue.resume", Some(json!({"pool": "slot", "all": false})));
+                let (stale_wait, resume) = tokio::join!(stale_wait, resume);
+                resume.unwrap();
+                let stale_wait = stale_wait.unwrap();
+                assert_eq!(stale_wait["attempt"], 2);
+                assert_ne!(stale_wait["witness_seq"], failed["witness_seq"]);
                 let wait_params = json!({"task_uuid": created["task_uuid"]});
                 let (retried_wait, attached_wait) = tokio::join!(
                     client.call("queue.await_job", Some(wait_params.clone())),

@@ -125,6 +125,13 @@ enum Command {
 enum FlowCommand {
     Run(FlowRunArgs),
     Check(FlowCheckArgs),
+    Cancel(FlowCancelArgs),
+}
+
+#[derive(Debug, Args)]
+struct FlowCancelArgs {
+    #[arg(value_name = "FLOW_RUN_ID")]
+    flow_run_id: String,
 }
 
 #[derive(Debug, Args)]
@@ -794,6 +801,15 @@ impl LifecycleSink for JsonlLifecycleSink {
 
 async fn run_flow(socket: &Path, config_path: Option<&Path>, command: FlowCommand) -> Result<()> {
     match command {
+        FlowCommand::Cancel(args) => {
+            print_rpc(
+                socket,
+                config_path,
+                "queue.cancel",
+                Some(json!({"flowRunId": args.flow_run_id})),
+            )
+            .await
+        }
         FlowCommand::Check(args) => {
             let source = std::fs::read_to_string(&args.script)
                 .with_context(|| format!("cannot read flow script {}", args.script.display()))?;
@@ -964,6 +980,7 @@ fn sanitize_inherited_tally_environment() {
 fn flow_error(error: FlowError) -> anyhow::Error {
     let code = match error.code.as_str() {
         "replay-divergence" | "script-changed-mid-run" => 20,
+        "flow-cancelled" => 4,
         "flow-run-id-missing"
         | "flow-run-id-invalid"
         | "runner-identity-invalid"
@@ -2549,6 +2566,7 @@ mod tests {
         assert_eq!(exit_code("script-changed-mid-run"), 20);
         assert_eq!(exit_code("flow-run-id-missing"), 2);
         assert_eq!(exit_code("runner-identity-incomplete"), 2);
+        assert_eq!(exit_code("flow-cancelled"), 4);
         assert_eq!(exit_code("terminal-failure"), 1);
     }
 
@@ -2713,6 +2731,20 @@ mod tests {
                     ..
                 })
             }) if flow_run_id == "run-47"
+        ));
+
+        let cancel = Opts::try_parse_from([
+            "tally",
+            "flow",
+            "cancel",
+            "00000000-0000-4000-8000-000000000145",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cancel.command,
+            Some(Command::Flow {
+                command: FlowCommand::Cancel(FlowCancelArgs { flow_run_id })
+            }) if flow_run_id == "00000000-0000-4000-8000-000000000145"
         ));
     }
 

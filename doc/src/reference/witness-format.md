@@ -138,9 +138,9 @@ revisions are known.
 
 This guarantee belongs to the flow-runner path, not to a strong kernel schema for the opaque
 capsule. The kernel requires a UUID `flowRunId`, validates a positive optional `maxNodes`, and
-validates the optional prompt/skill revision shapes; it otherwise preserves object members
-verbatim. A generic RPC client can submit a thinner capsule, so consumers should not assume
-`scriptHash` exists on non-flow records.
+validates a non-negative optional `nodeOrdinal` and the optional prompt/skill revision shapes;
+it otherwise preserves object members verbatim. A generic RPC client can submit a thinner
+capsule, so consumers should not assume `scriptHash` exists on non-flow records.
 
 `query.proof` returns the selected canonical record verbatim as `witnessRecord`. No separate
 “proof copy” drops the capsule; its hash, including `scriptHash`, is the record hash input.
