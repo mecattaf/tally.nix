@@ -297,7 +297,11 @@ fn complete_replies() -> Vec<Reply> {
             .iter()
             .map(|task_id| Reply::created(implementation(task_id))),
     );
-    replies.extend(TASK_IDS.iter().map(|task_id| Reply::created(review(task_id))));
+    replies.extend(
+        TASK_IDS
+            .iter()
+            .map(|task_id| Reply::created(review(task_id))),
+    );
     replies.push(Reply::created(ok(culmination("ready", 6, Vec::new()))));
     replies
 }
@@ -454,7 +458,12 @@ fn one_failed_task_does_not_suppress_the_culmination() {
     assert_eq!(client.submissions.borrow().len(), 13);
     assert!(!client.labels().contains(&format!("review-{failing}")));
 
-    let brief = client.labelled("agency-culminate").spec.brief.clone().unwrap();
+    let brief = client
+        .labelled("agency-culminate")
+        .spec
+        .brief
+        .clone()
+        .unwrap();
     let tasks = brief["tasks"].as_array().unwrap();
     assert_eq!(tasks.len(), 6);
     let failed = tasks
@@ -508,7 +517,12 @@ fn a_worklist_that_cannot_prepare_the_wave_still_reaches_the_culmination() {
     assert_eq!(final_value["wave"], json!([]));
 
     assert_eq!(client.submissions.borrow().len(), 2);
-    let brief = client.labelled("agency-culminate").spec.brief.clone().unwrap();
+    let brief = client
+        .labelled("agency-culminate")
+        .spec
+        .brief
+        .clone()
+        .unwrap();
     assert_eq!(brief["worklistError"]["code"], "worklist-worktree-conflict");
     assert_eq!(brief["tasks"], json!([]));
     assert!(brief["baseRev"].is_null());
@@ -548,7 +562,11 @@ fn restart_mid_wave_reuses_finished_tasks_and_attaches_the_in_flight_one() {
         };
         replies.push(Reply::new(disposition, implementation(task_id)));
     }
-    replies.extend(TASK_IDS.iter().map(|task_id| Reply::created(review(task_id))));
+    replies.extend(
+        TASK_IDS
+            .iter()
+            .map(|task_id| Reply::created(review(task_id))),
+    );
     replies.push(Reply::created(ok(culmination("ready", 6, Vec::new()))));
     let client = TestClient::new(replies);
 
@@ -567,7 +585,9 @@ fn restart_mid_wave_reuses_finished_tasks_and_attaches_the_in_flight_one() {
     );
     // Keys survive the restart because they derive from the witnessed worklist.
     assert_eq!(
-        client.labelled(&format!("implement-{}", TASK_IDS[2])).dedup_key,
+        client
+            .labelled(&format!("implement-{}", TASK_IDS[2]))
+            .dedup_key,
         format!("flow:agency-run:k:implement-{}", TASK_IDS[2])
     );
     assert_eq!(
