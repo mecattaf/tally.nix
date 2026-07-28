@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use tally_client::RpcClient;
+use tally_client::{RequestFrame, RpcClient};
 use tally_core::adapters::{AdapterConfig, ScrapeCapture, ScrapeMode, ScrapeStream};
 use tally_core::config::{
     CoResidencyPredicate, Config, JournaldConfig, PoolConfig, PoolPredicate, ResourceKind,
@@ -16,6 +16,8 @@ use tally_core::executor::UnitLimits;
 use tally_core::recovery::RecoveryPolicy;
 use tally_core::taskdb::read_acknowledged_events;
 use tally_core::witness::read_verified_records;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::UnixListener;
 use tokio::process::Command;
 use tokio::sync::watch;
 use tokio::task::LocalSet;
@@ -89,6 +91,143 @@ fn settings() -> DaemonSettings {
         },
         max_connections: DEFAULT_MAX_CONNECTIONS,
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn enqueue_wait_rearms_after_restart_and_observes_terminal_verdict() {
+    const TASK_UUID: &str = "00000000-0000-4000-8000-000000000132";
+
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let replacement_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+
+        let enqueue: RequestFrame =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(enqueue.method, "queue.enqueue");
+        let mut admitted = serde_json::to_vec(&serde_json::json!({
+            "id": enqueue.id,
+            "result": {"task_uuid": TASK_UUID, "state": "queued"},
+        }))
+        .unwrap();
+        admitted.push(b'\n');
+        write.write_all(&admitted).await.unwrap();
+
+        let first_await: RequestFrame =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(first_await.method, "queue.await_job");
+        assert_eq!(
+            first_await.params,
+            Some(serde_json::json!({"task_uuid": TASK_UUID}))
+        );
+        drop(lines);
+        drop(write);
+        drop(listener);
+        fs::remove_file(&replacement_socket).unwrap();
+
+        let replacement = UnixListener::bind(&replacement_socket).unwrap();
+        let (stream, _) = replacement.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let rearmed: RequestFrame =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(rearmed.method, "queue.await_job");
+        assert_eq!(rearmed.params, first_await.params);
+        let mut terminal = serde_json::to_vec(&serde_json::json!({
+            "id": rearmed.id,
+            "result": {
+                "task_uuid": TASK_UUID,
+                "verdict": "pass",
+                "exit_code": 0,
+            },
+        }))
+        .unwrap();
+        terminal.push(b'\n');
+        write.write_all(&terminal).await.unwrap();
+    });
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new(env!("CARGO_BIN_EXE_tally"))
+            .arg("--socket")
+            .arg(&socket)
+            .args([
+                "--rpc-timeout-sec",
+                "2",
+                "enqueue",
+                "--pool",
+                "test-slot",
+                "--wait",
+                "--",
+                BASH,
+                "-c",
+                "exit 0",
+            ])
+            .output(),
+    )
+    .await
+    .expect("enqueue --wait did not finish after the replacement daemon replied")
+    .unwrap();
+    server.await.unwrap();
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["task_uuid"], TASK_UUID);
+    assert_eq!(terminal["verdict"], "pass");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn await_job_exits_unreachable_after_rearm_window_is_exhausted() {
+    const TASK_UUID: &str = "00000000-0000-4000-8000-000000000133";
+
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let removed_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, _write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let request: RequestFrame =
+            serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(request.method, "queue.await_job");
+        assert_eq!(
+            request.params,
+            Some(serde_json::json!({"task_uuid": TASK_UUID}))
+        );
+        drop(lines);
+        drop(listener);
+        fs::remove_file(removed_socket).unwrap();
+    });
+
+    let output = tokio::time::timeout(
+        Duration::from_secs(5),
+        Command::new(env!("CARGO_BIN_EXE_tally"))
+            .arg("--socket")
+            .arg(&socket)
+            .args(["--rpc-timeout-sec", "1", "queue", "await-job", TASK_UUID])
+            .output(),
+    )
+    .await
+    .expect("queue await-job exceeded its bounded reconnect window")
+    .unwrap();
+    server.await.unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("did not return within 1s"), "{stderr}");
+    assert!(
+        stderr.contains("re-arming RPC method queue.await_job"),
+        "{stderr}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
