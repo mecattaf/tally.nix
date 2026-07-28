@@ -5104,39 +5104,39 @@ struct LeaseTickHook {
     release: watch::Receiver<bool>,
 }
 
-struct StartupDaemonLock {
-    file: Option<File>,
+struct DaemonLockGuard {
+    file: File,
 }
 
-impl StartupDaemonLock {
+impl DaemonLockGuard {
     fn acquire(state_dir: &Path) -> Result<Self, DaemonError> {
         Ok(Self {
-            file: Some(acquire_daemon_lock(state_dir)?),
+            file: acquire_daemon_lock(state_dir)?,
         })
     }
 
-    fn into_file(mut self) -> File {
-        self.file
-            .take()
-            .expect("the startup daemon lock must still be armed")
+    fn file(&self) -> &File {
+        &self.file
+    }
+
+    fn unlock(&self) -> io::Result<()> {
+        FileExt::unlock(&self.file)
     }
 }
 
-impl Drop for StartupDaemonLock {
+impl Drop for DaemonLockGuard {
     fn drop(&mut self) {
-        let Some(file) = self.file.as_ref() else {
-            return;
-        };
         // flock follows the open-file description across fork. A concurrent
         // child can therefore retain the lock after this process closes its
         // descriptor but before exec applies CLOEXEC. Explicit unlock makes
-        // every rejected startup release its fence immediately.
-        let _ = FileExt::unlock(file);
+        // every daemon lifetime release its fence immediately, including a
+        // successful open that is dropped before entering the run loop.
+        let _ = self.unlock();
     }
 }
 
 pub struct Daemon {
-    _state_lock: File,
+    _state_lock: DaemonLockGuard,
     listener: UnixListener,
     handler: DaemonHandler,
     completion_rx: mpsc::UnboundedReceiver<ExecutionFinished>,
@@ -5180,7 +5180,7 @@ impl Daemon {
         let executor = executor.with_remote_executors(config.executors.clone());
         let settings = settings.validate()?;
         prepare_paths(&paths)?;
-        let state_lock = StartupDaemonLock::acquire(&paths.state_dir)?;
+        let state_lock = DaemonLockGuard::acquire(&paths.state_dir)?;
         // Preserve the clean-cut refusal: predecessor bytes are never parsed.
         // Once the final ledger is confirmed, migrate under this lock before
         // any acknowledged-event reader or recovery reconciliation can run.
@@ -5334,7 +5334,7 @@ impl Daemon {
         plan: crate::recovery::RecoveryPlan,
         committer: Box<dyn ReplicaCommitter>,
     ) -> Result<Self, DaemonError> {
-        let state_lock = StartupDaemonLock::acquire(&paths.state_dir)?;
+        let state_lock = DaemonLockGuard::acquire(&paths.state_dir)?;
         let host_id = current_host_id()?;
         Self::build_locked(
             config, paths, settings, executor, host_id, epoch, plan, committer, state_lock,
@@ -5351,7 +5351,7 @@ impl Daemon {
         epoch: u64,
         plan: crate::recovery::RecoveryPlan,
         committer: Box<dyn ReplicaCommitter>,
-        state_lock: StartupDaemonLock,
+        state_lock: DaemonLockGuard,
     ) -> Result<Self, DaemonError> {
         validate_recovery_briefs(&plan, &paths.data_dir)?;
         let event_log = LeaseEventLog::in_state_dir(&paths.state_dir);
@@ -5482,7 +5482,7 @@ impl Daemon {
             exec_attestations: config.attestations.exec.enable,
         };
         Ok(Self {
-            _state_lock: state_lock.into_file(),
+            _state_lock: state_lock,
             listener,
             handler,
             completion_rx,
@@ -5537,10 +5537,10 @@ impl Daemon {
             .commit_rx
             .take()
             .ok_or(DaemonError::CommitWorkerStopped)?;
-        let worker_lock = self
-            ._state_lock
-            .try_clone()
-            .map_err(|error| DaemonError::Invalid(format!("cannot clone daemon lock: {error}")))?;
+        let worker_lock =
+            self._state_lock.file().try_clone().map_err(|error| {
+                DaemonError::Invalid(format!("cannot clone daemon lock: {error}"))
+            })?;
         let commit_worker = match spawn_commit_worker(committer, commit_rx, worker_lock) {
             Ok(worker) => worker,
             Err(error) => {
@@ -5761,7 +5761,7 @@ impl Daemon {
         // only closes an inherited descriptor at exec, so relying on last-close can
         // leave a clean shutdown briefly fenced by a concurrently spawned child.
         // Explicitly unlock after every lock-protected task and writer has joined.
-        if let Err(source) = FileExt::unlock(&self._state_lock) {
+        if let Err(source) = self._state_lock.unlock() {
             if result.is_ok() {
                 result = Err(io_error(&state_lock_path, source));
             }
@@ -6019,9 +6019,15 @@ impl Daemon {
     }
 
     async fn tick_leases(handler: DaemonHandler) -> Result<(), DaemonError> {
+        Self::tick_leases_at(handler, Utc::now()).await
+    }
+
+    async fn tick_leases_at(
+        handler: DaemonHandler,
+        now: chrono::DateTime<Utc>,
+    ) -> Result<(), DaemonError> {
         let mut context = handler.context.write().await;
         let mut launches = retry_unleased_jobs(&mut context, &handler.executor);
-        let now = Utc::now();
         let planned = context.lease.engine_mut().plan_tick(now)?;
         let targets = planned
             .iter()
@@ -6103,7 +6109,7 @@ impl Daemon {
         let outcome = context
             .lease
             .engine_mut()
-            .commit_preemptions(&reclaimed, Utc::now())?;
+            .commit_preemptions(&reclaimed, now)?;
         for (lease_id, job_id, ..) in &targets {
             context.lease_jobs.remove(lease_id);
             if let Some(job) = context.jobs.get_mut(job_id) {
@@ -8978,10 +8984,22 @@ mod tests {
         let temp = tempdir().unwrap();
         let paths = fs1_paths(temp.path());
         prepare_paths(&paths).unwrap();
-        let startup_lock = StartupDaemonLock::acquire(&paths.state_dir).unwrap();
-        let inherited = startup_lock.file.as_ref().unwrap().try_clone().unwrap();
+        let startup_lock = DaemonLockGuard::acquire(&paths.state_dir).unwrap();
+        let inherited = startup_lock.file().try_clone().unwrap();
 
         drop(startup_lock);
+        drop(acquire_daemon_lock(&paths.state_dir).unwrap());
+        drop(inherited);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn opened_daemon_explicitly_unlocks_before_an_inherited_duplicate_closes() {
+        let temp = tempdir().unwrap();
+        let paths = fs1_paths(temp.path());
+        let daemon = fs1_daemon(&paths).await;
+        let inherited = daemon._state_lock.file().try_clone().unwrap();
+
+        drop(daemon);
         drop(acquire_daemon_lock(&paths.state_dir).unwrap());
         drop(inherited);
     }
@@ -13024,7 +13042,6 @@ mod tests {
                     })))
                     .await
                     .unwrap();
-                let yield_requested_at = Instant::now();
                 let urgent = daemon
                     .handler
                     .enqueue(Some(json!({
@@ -13046,9 +13063,18 @@ mod tests {
                     .unwrap();
                 assert_eq!(lease_status["held"], true);
                 assert_eq!(lease_status["yieldRequested"], true);
-                assert!(lease_status["yieldDeadline"].as_str().is_some());
+                let yield_deadline = chrono::DateTime::parse_from_rfc3339(
+                    lease_status["yieldDeadline"].as_str().unwrap(),
+                )
+                .unwrap()
+                .with_timezone(&Utc);
 
-                Daemon::tick_leases(daemon.handler.clone()).await.unwrap();
+                Daemon::tick_leases_at(
+                    daemon.handler.clone(),
+                    yield_deadline - chrono::Duration::milliseconds(1),
+                )
+                .await
+                .unwrap();
                 assert!(
                     read_verified_records(&paths.witness_path())
                         .unwrap()
@@ -13069,14 +13095,12 @@ mod tests {
                     JobState::Running
                 );
 
-                tokio::time::sleep(yield_grace + Duration::from_millis(10)).await;
-                Daemon::tick_leases(daemon.handler.clone()).await.unwrap();
-                let preempted_after = yield_requested_at.elapsed();
-                assert!(preempted_after >= yield_grace);
-                assert!(
-                    preempted_after < Duration::from_millis(250),
-                    "preemption exceeded the bounded yield grace: {preempted_after:?}"
-                );
+                Daemon::tick_leases_at(
+                    daemon.handler.clone(),
+                    yield_deadline + chrono::Duration::milliseconds(1),
+                )
+                .await
+                .unwrap();
 
                 let low_result = daemon
                     .handler
@@ -14396,7 +14420,7 @@ mod tests {
                 // A concurrently forked child temporarily inherits this same open-file
                 // description until exec applies CLOEXEC. Keep the equivalent duplicate
                 // alive across shutdown so reopen cannot depend on last-close timing.
-                let inherited_lock = daemon._state_lock.try_clone().unwrap();
+                let inherited_lock = daemon._state_lock.file().try_clone().unwrap();
                 let (shutdown_tx, shutdown_rx) = watch::channel(false);
                 let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
                 let client = RpcClient::connect(&paths.socket).await.unwrap();
