@@ -6,6 +6,7 @@ mod rpc;
 mod run;
 mod startup;
 mod supervise;
+mod witness_view;
 
 pub use barriers::BarrierTracker;
 pub use notify::SystemdNotifier;
@@ -54,6 +55,7 @@ use startup::{
     hydrate_represent_adapter_metadata, install_recovery_jobs, recovery_adapter_invocation,
     DaemonLockGuard,
 };
+use witness_view::WitnessView;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -397,6 +399,7 @@ pub struct Context {
     lease: LocalLease<SystemdUnitLiveness>,
     guardrails: GuardrailState,
     witness: WitnessLedger,
+    witness_view: WitnessView,
     derivation_store: Arc<dyn DerivationAvailability>,
     jobs: HashMap<Uuid, Job>,
     aliases: HashMap<String, Uuid>,

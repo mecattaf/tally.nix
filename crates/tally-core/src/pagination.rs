@@ -7,6 +7,10 @@ pub const DEFAULT_PAGE_ITEMS: usize = 100;
 pub const MAX_PAGE_ITEMS: usize = 1_000;
 const PAGE_RESULT_CAP_BYTES: usize = 48 * 1024;
 const MAX_SNAPSHOTS: usize = 32;
+// Total approximate bytes of retained snapshots. The count cap alone lets 32
+// arbitrarily large result sets pin unbounded memory; the byte budget evicts
+// the oldest snapshots first once the cache would exceed it.
+const SNAPSHOT_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PaginationError {
@@ -31,12 +35,16 @@ struct Snapshot {
     fingerprint: String,
     template: Value,
     items: Vec<Value>,
+    // Approximate retained size: serialized template plus serialized items.
+    bytes: usize,
 }
 
 #[derive(Debug)]
 pub struct PageCache {
     next_id: u64,
     snapshots: VecDeque<Snapshot>,
+    budget_bytes: usize,
+    used_bytes: usize,
 }
 
 impl Default for PageCache {
@@ -44,6 +52,8 @@ impl Default for PageCache {
         Self {
             next_id: 1,
             snapshots: VecDeque::new(),
+            budget_bytes: SNAPSHOT_BUDGET_BYTES,
+            used_bytes: 0,
         }
     }
 }
@@ -76,15 +86,32 @@ impl PageCache {
             object.insert("nextCursor".to_owned(), Value::Null);
             let id = self.next_id;
             self.next_id = self.next_id.checked_add(1).unwrap_or(1);
-            if self.snapshots.len() == MAX_SNAPSHOTS {
-                self.snapshots.pop_front();
+            let bytes = approximate_size(&template)?.saturating_add(
+                items
+                    .iter()
+                    .map(approximate_size)
+                    .try_fold(0_usize, |total, size| {
+                        size.map(|size| total.saturating_add(size))
+                    })?,
+            );
+            while !self.snapshots.is_empty()
+                && (self.snapshots.len() == MAX_SNAPSHOTS
+                    || self.used_bytes.saturating_add(bytes) > self.budget_bytes)
+            {
+                let evicted = self
+                    .snapshots
+                    .pop_front()
+                    .expect("nonempty snapshot deque pops");
+                self.used_bytes = self.used_bytes.saturating_sub(evicted.bytes);
             }
+            self.used_bytes = self.used_bytes.saturating_add(bytes);
             self.snapshots.push_back(Snapshot {
                 id,
                 method: method.to_owned(),
                 fingerprint: fingerprint.to_owned(),
                 template,
                 items,
+                bytes,
             });
             (id, 0)
         };
@@ -100,32 +127,47 @@ impl PageCache {
             return Err(PaginationError::InvalidCursor);
         }
 
+        // Running byte accounting reproduces the serialized candidate size
+        // exactly: page cursors are fixed-width, so the rendered envelope with
+        // N items is the empty render plus each item's serialized bytes plus
+        // one comma separator per item after the first. This keeps page
+        // boundaries byte-identical to full re-serialization while assembling
+        // each page in O(page) instead of O(page^2) bytes.
+        let empty_render = render(
+            &snapshot.template,
+            &[],
+            Some(page_cursor(snapshot.id, offset)),
+        )?;
+        let mut used = serde_json::to_vec(&empty_render)
+            .map_err(|_| PaginationError::InvalidEnvelope)?
+            .len();
         let mut page_items = Vec::new();
         let mut next_offset = offset;
         while next_offset < snapshot.items.len() && page_items.len() < limit {
-            page_items.push(snapshot.items[next_offset].clone());
-            let candidate = render(
-                &snapshot.template,
-                &page_items,
-                Some(page_cursor(snapshot.id, next_offset + 1)),
-            )?;
-            if serde_json::to_vec(&candidate)
-                .map_err(|_| PaginationError::InvalidEnvelope)?
-                .len()
-                > PAGE_RESULT_CAP_BYTES
-            {
-                page_items.pop();
+            let item_bytes = approximate_size(&snapshot.items[next_offset])?;
+            let candidate = used
+                .saturating_add(item_bytes)
+                .saturating_add(usize::from(!page_items.is_empty()));
+            if candidate > PAGE_RESULT_CAP_BYTES {
                 if page_items.is_empty() {
                     return Err(PaginationError::ItemTooLarge);
                 }
                 break;
             }
+            page_items.push(snapshot.items[next_offset].clone());
+            used = candidate;
             next_offset += 1;
         }
         let next_cursor =
             (next_offset < snapshot.items.len()).then(|| page_cursor(snapshot.id, next_offset));
         render(&snapshot.template, &page_items, next_cursor)
     }
+}
+
+fn approximate_size(value: &Value) -> Result<usize, PaginationError> {
+    serde_json::to_vec(value)
+        .map(|encoded| encoded.len())
+        .map_err(|_| PaginationError::InvalidEnvelope)
 }
 
 fn render(
@@ -334,6 +376,104 @@ mod tests {
         // Walking the identical snapshot again must reproduce the identical
         // boundaries: page assembly is deterministic, not incidental.
         assert_eq!(walk(), boundaries);
+    }
+
+    #[test]
+    fn byte_budget_evicts_oldest_snapshots_before_the_count_cap() {
+        let mut cache = PageCache {
+            budget_bytes: 8 * 1024,
+            ..PageCache::default()
+        };
+        let envelope = |tag: usize| {
+            serde_json::json!({
+                "items": [{"tag": tag, "padding": "x".repeat(3_000)}],
+                "nextCursor": null,
+            })
+        };
+        let first = cache
+            .page("query.jobs", "budget-0", Some(1), None, Some(envelope(0)))
+            .unwrap();
+        assert_eq!(first["items"][0]["tag"], 0);
+        let first_cursor = page_cursor(1, 0);
+        // Two more ~3KiB snapshots blow the 8KiB budget: the oldest goes even
+        // though only 3 of 32 count slots are used.
+        for tag in 1..3 {
+            cache
+                .page(
+                    "query.jobs",
+                    &format!("budget-{tag}"),
+                    Some(1),
+                    None,
+                    Some(envelope(tag)),
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            cache
+                .page("query.jobs", "budget-0", Some(1), Some(&first_cursor), None)
+                .unwrap_err(),
+            PaginationError::CursorExpired
+        );
+        assert!(cache.snapshots.len() < 3);
+        assert!(cache.used_bytes <= cache.budget_bytes);
+    }
+
+    #[test]
+    fn running_byte_accounting_matches_full_serialization_boundaries() {
+        // Differential check: every page must be maximal under the byte cap
+        // exactly as full re-serialization would compute it — the page fits,
+        // and appending the next item (with a continuation cursor) would not.
+        let items = (0..48)
+            .map(|index| {
+                serde_json::json!({
+                    "index": index,
+                    "padding": "y".repeat(3_000 + (index % 7) * 411),
+                })
+            })
+            .collect::<Vec<_>>();
+        let envelope = serde_json::json!({
+            "schemaVersion": 1,
+            "snapshot": {"cursor": "differential"},
+            "items": items.clone(),
+            "nextCursor": null,
+        });
+        let mut cache = PageCache::default();
+        let mut cursor: Option<String> = None;
+        let mut consumed = 0_usize;
+        loop {
+            let page = cache
+                .page(
+                    "query.log",
+                    "diff",
+                    Some(1_000),
+                    cursor.as_deref(),
+                    cursor.is_none().then(|| envelope.clone()),
+                )
+                .unwrap();
+            let rendered = serde_json::to_vec(&page).unwrap();
+            assert!(rendered.len() <= PAGE_RESULT_CAP_BYTES);
+            let page_len = page["items"].as_array().unwrap().len();
+            assert!(page_len > 0);
+            consumed += page_len;
+            if consumed < items.len() {
+                // Re-render this page with one more item and a cursor, the way
+                // the pre-optimization code sized candidates: it must overflow.
+                let mut widened = page["items"].as_array().unwrap().clone();
+                widened.push(items[consumed].clone());
+                let mut candidate = page.clone();
+                candidate["items"] = Value::Array(widened);
+                candidate["nextCursor"] = Value::String(page_cursor(1, consumed + 1));
+                assert!(
+                    serde_json::to_vec(&candidate).unwrap().len() > PAGE_RESULT_CAP_BYTES,
+                    "page ending at {consumed} is not maximal"
+                );
+            }
+            cursor = page["nextCursor"].as_str().map(ToOwned::to_owned);
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert_eq!(consumed, items.len());
     }
 
     #[test]

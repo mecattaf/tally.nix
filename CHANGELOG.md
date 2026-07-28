@@ -54,6 +54,12 @@ authorized.
 
 ### Changed
 
+- Collapsed daemon startup to at most two full witness verifications and gave the daemon a
+  verified in-memory witness view with per-task and per-dedup-key indexes. Queries, retry
+  admission, dedup probes, and completed-job waits now verify only newly appended ledger bytes
+  instead of re-reading and re-hashing the whole chain per operation; continuation pages for
+  paginated queries are served from the page cache with zero witness reads, and the page cache
+  enforces a 64MiB byte budget with byte-identical page boundaries.
 - Made witness, attestation, and change-log appends O(1) in steady state. The witness and
   attestation ledgers cache their verified head and byte offset, verifying only bytes other
   writers appended since instead of rescanning the whole chain on every append; prefix tampering

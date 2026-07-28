@@ -56,160 +56,35 @@ impl DaemonHandler {
             .map_err(internal_wire);
         }
 
-        let history = self.history.borrow().snapshot();
-        let journal = history
-            .records
-            .iter()
-            .map(|record| JournalEntry {
-                fields: record.fields.clone(),
-                realtime_us: Some(record.realtime_us),
-            })
-            .collect::<Vec<_>>();
-        let (rows, details, witness_path, attestations_path, live_states, live) = {
-            let context = self.context.read().await;
-            (
-                context.query_rows.values().cloned().collect::<Vec<_>>(),
-                context.query_details.values().cloned().collect::<Vec<_>>(),
-                context.paths.witness_path(),
-                context.paths.attestations_path(),
-                context
-                    .jobs
-                    .values()
-                    .filter(|job| job.state != JobState::Completed)
-                    .map(|job| (job.stable_key(), state_name(job.state).to_owned()))
-                    .collect::<HashMap<_, _>>(),
-                context
-                    .jobs
-                    .values()
-                    .filter(|job| job.state != JobState::Completed)
-                    .map(|job| LiveJobFact {
-                        anchor: job.stable_key(),
-                        job_id: job.job_id.to_string(),
-                        live_state: state_name(job.state).to_owned(),
-                        attempt: job.row.attempt,
-                        lease_epoch: job.row.lease_epoch,
-                        unit: format!("tally-job-{}.service", job.stable_key()),
-                        labor_class: job.labor_class,
-                    })
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let (report, witness) = tokio::task::spawn_blocking(move || {
-            crate::witness::read_verified_records(&witness_path)
-        })
-        .await
-        .map_err(|error| internal_wire(format!("witness query worker failed: {error}")))?
-        .map_err(internal_wire)?;
-        if !report.ok {
-            return Err(internal_wire("witness verification failed during query"));
+        // Paginated methods decode their parameters first: a continuation
+        // cursor is served straight from the page cache without touching the
+        // lifecycle history, live jobs, or the witness ledger. Snapshot-cursor
+        // semantics already promise that page content is frozen at snapshot
+        // time, so continuation pages intentionally skip re-verifying the
+        // ledger.
+        if method == "query.jobs" {
+            return self.query_jobs(params).await;
+        }
+        if method == "query.log" {
+            return self.query_log(params).await;
+        }
+        if method == "query.trace" {
+            return self.query_trace(params).await;
         }
 
+        let QueryProjection {
+            history,
+            journal,
+            rows,
+            details,
+            attestations_path,
+            live_states,
+            live,
+            report,
+            witness,
+        } = self.query_projection().await?;
+
         match method {
-            "query.jobs" => {
-                #[derive(Deserialize)]
-                #[serde(deny_unknown_fields, rename_all = "camelCase")]
-                struct Params {
-                    #[serde(default, alias = "state")]
-                    live_state: Option<String>,
-                    #[serde(default, alias = "verdict")]
-                    terminal_verdict: Option<Verdict>,
-                    #[serde(default)]
-                    pool: Option<String>,
-                    #[serde(default)]
-                    executor: Option<String>,
-                    #[serde(default)]
-                    adapter: Option<String>,
-                    #[serde(default)]
-                    source: Option<String>,
-                    #[serde(default)]
-                    origin: Option<String>,
-                    #[serde(default)]
-                    parent: Option<String>,
-                    #[serde(default)]
-                    flow_run: Option<String>,
-                    #[serde(default)]
-                    session: Option<String>,
-                    #[serde(default)]
-                    since: Option<String>,
-                    #[serde(default)]
-                    until: Option<String>,
-                    #[serde(default)]
-                    limit: Option<usize>,
-                    #[serde(default)]
-                    cursor: Option<String>,
-                }
-                let params: Params = decode_params(params)?;
-                let fingerprint = serde_json::to_string(&json!({
-                    "liveState": params.live_state.clone(),
-                    "terminalVerdict": params.terminal_verdict,
-                    "pool": params.pool.clone(),
-                    "executor": params.executor.clone(),
-                    "adapter": params.adapter.clone(),
-                    "source": params.source.clone(),
-                    "origin": params.origin.clone(),
-                    "parent": params.parent.clone(),
-                    "flowRun": params.flow_run.clone(),
-                    "session": params.session.clone(),
-                    "since": params.since.clone(),
-                    "until": params.until.clone(),
-                }))
-                .map_err(internal_wire)?;
-                let envelope = if params.cursor.is_none() {
-                    let pool_signals = {
-                        let mut context = self.context.write().await;
-                        query_pools(&pool_headroom_facts(&mut context)?)
-                            .map_err(query_wire)?
-                            .pools
-                            .into_iter()
-                            .map(|pool| (pool.pool, pool.signal))
-                            .collect::<BTreeMap<_, _>>()
-                    };
-                    let lanes = trace_lanes(&details, &live, &history);
-                    let adapters = {
-                        let context = self.context.read().await;
-                        context.config.adapters.clone()
-                    };
-                    let mut result = query_jobs_v2(
-                        &details,
-                        &live,
-                        &history,
-                        &witness,
-                        &pool_signals,
-                        &JobsFilter {
-                            live_state: params.live_state,
-                            terminal_verdict: params.terminal_verdict,
-                            pool: params.pool,
-                            executor: params.executor,
-                            adapter: params.adapter,
-                            source: params.source,
-                            origin: params.origin,
-                            parent: params.parent,
-                            flow_run: params.flow_run,
-                            session: params.session,
-                            since: params.since,
-                            until: params.until,
-                        },
-                    )
-                    .map_err(observability_wire)?;
-                    for item in &mut result.items {
-                        item.trace =
-                            trace_availability(&item.anchor, &lanes, &adapters, &self.executor);
-                    }
-                    Some(serde_json::to_value(result).map_err(internal_wire)?)
-                } else {
-                    None
-                };
-                self.pages
-                    .borrow_mut()
-                    .page(
-                        method,
-                        &fingerprint,
-                        params.limit,
-                        params.cursor.as_deref(),
-                        envelope,
-                    )
-                    .map_err(pagination_wire)
-            }
             "query.job" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -264,79 +139,6 @@ impl DaemonHandler {
                         .map_err(query_wire)?;
                 overlay_live_states(&mut view.jobs, &live_states);
                 serde_json::to_value(view).map_err(internal_wire)
-            }
-            "query.log" => {
-                #[derive(Deserialize)]
-                #[serde(deny_unknown_fields, rename_all = "camelCase")]
-                struct Params {
-                    #[serde(default)]
-                    task: Option<String>,
-                    #[serde(default)]
-                    flow_run: Option<String>,
-                    #[serde(default)]
-                    attempt: Option<u32>,
-                    #[serde(default)]
-                    session: Option<String>,
-                    #[serde(default)]
-                    event: Option<TallyEvent>,
-                    #[serde(default)]
-                    source: Option<String>,
-                    #[serde(default)]
-                    since: Option<String>,
-                    #[serde(default)]
-                    until: Option<String>,
-                    #[serde(default)]
-                    limit: Option<usize>,
-                    #[serde(default)]
-                    cursor: Option<String>,
-                }
-                let params: Params = decode_params(params)?;
-                let fingerprint = serde_json::to_string(&json!({
-                    "task": params.task.clone(),
-                    "flowRun": params.flow_run.clone(),
-                    "attempt": params.attempt,
-                    "session": params.session.clone(),
-                    "event": params.event,
-                    "source": params.source.clone(),
-                    "since": params.since.clone(),
-                    "until": params.until.clone(),
-                }))
-                .map_err(internal_wire)?;
-                let envelope = if params.cursor.is_none() {
-                    Some(
-                        serde_json::to_value(
-                            query_lifecycle_log(
-                                &details,
-                                &history,
-                                &witness,
-                                &LifecycleLogFilter {
-                                    task: params.task,
-                                    flow_run: params.flow_run,
-                                    attempt: params.attempt,
-                                    session: params.session,
-                                    event: params.event,
-                                    source: params.source,
-                                    since: params.since,
-                                    until: params.until,
-                                },
-                            )
-                            .map_err(observability_wire)?,
-                        )
-                        .map_err(internal_wire)?,
-                    )
-                } else {
-                    None
-                };
-                self.pages
-                    .borrow_mut()
-                    .page(
-                        method,
-                        &fingerprint,
-                        params.limit,
-                        params.cursor.as_deref(),
-                        envelope,
-                    )
-                    .map_err(pagination_wire)
             }
             "query.proof" => {
                 #[derive(Deserialize)]
@@ -423,62 +225,7 @@ impl DaemonHandler {
                     .map_err(internal_wire),
                 }
             }
-            "query.trace" => {
-                #[derive(Deserialize)]
-                #[serde(deny_unknown_fields)]
-                struct Params {
-                    task: String,
-                    #[serde(default)]
-                    attempt: Option<u32>,
-                    #[serde(default)]
-                    limit: Option<usize>,
-                    #[serde(default)]
-                    cursor: Option<String>,
-                }
-                let params: Params = decode_params(params)?;
-                if params.task.trim().is_empty() {
-                    return Err(WireError::invalid("query trace task must not be empty"));
-                }
-                let fingerprint = serde_json::to_string(&json!({
-                    "task": params.task.clone(),
-                    "attempt": params.attempt,
-                }))
-                .map_err(internal_wire)?;
-                let envelope = if params.cursor.is_none() {
-                    let lanes = trace_lanes(&details, &live, &history);
-                    let adapters = {
-                        let context = self.context.read().await;
-                        context.config.adapters.clone()
-                    };
-                    Some(
-                        serde_json::to_value(
-                            query_trace(
-                                &params.task,
-                                params.attempt,
-                                &lanes,
-                                &adapters,
-                                &self.executor,
-                                snapshot_metadata(&history, &witness),
-                            )
-                            .map_err(trace_wire)?,
-                        )
-                        .map_err(internal_wire)?,
-                    )
-                } else {
-                    None
-                };
-                self.pages
-                    .borrow_mut()
-                    .page(
-                        method,
-                        &fingerprint,
-                        params.limit,
-                        params.cursor.as_deref(),
-                        envelope,
-                    )
-                    .map_err(pagination_wire)
-            }
-            "query.producers" | "query.watch" => {
+            "query.producers" | "query.watch" | "query.jobs" | "query.log" | "query.trace" => {
                 unreachable!("early read-only query paths return before projection setup")
             }
             "query.render" => {
@@ -570,6 +317,332 @@ impl DaemonHandler {
             }
             _ => unreachable!("query methods are filtered by the RPC dispatcher"),
         }
+    }
+}
+
+// The shared read-only projection every fresh (non-continuation) query
+// envelope is built from. Assembling it re-verifies the witness ledger, so
+// continuation pages never construct one.
+struct QueryProjection {
+    history: crate::history::LifecycleSnapshot,
+    journal: Vec<JournalEntry>,
+    rows: Vec<RowFact>,
+    details: Vec<RowDetailFact>,
+    attestations_path: PathBuf,
+    live_states: HashMap<String, String>,
+    live: Vec<LiveJobFact>,
+    report: crate::witness::VerifyReport,
+    witness: std::sync::Arc<Vec<WitnessRecord>>,
+}
+
+impl DaemonHandler {
+    async fn query_projection(&self) -> Result<QueryProjection, WireError> {
+        let history = self.history.borrow().snapshot();
+        let journal = history
+            .records
+            .iter()
+            .map(|record| JournalEntry {
+                fields: record.fields.clone(),
+                realtime_us: Some(record.realtime_us),
+            })
+            .collect::<Vec<_>>();
+        let (rows, details, attestations_path, live_states, live, report, witness) = {
+            let mut context = self.context.write().await;
+            // The cached view verifies only bytes appended since the last
+            // read; a broken suffix or shrunken ledger fails the query.
+            let witness = context.witness_view.records().map_err(internal_wire)?;
+            let report = context.witness_view.report();
+            (
+                context.query_rows.values().cloned().collect::<Vec<_>>(),
+                context.query_details.values().cloned().collect::<Vec<_>>(),
+                context.paths.attestations_path(),
+                context
+                    .jobs
+                    .values()
+                    .filter(|job| job.state != JobState::Completed)
+                    .map(|job| (job.stable_key(), state_name(job.state).to_owned()))
+                    .collect::<HashMap<_, _>>(),
+                context
+                    .jobs
+                    .values()
+                    .filter(|job| job.state != JobState::Completed)
+                    .map(|job| LiveJobFact {
+                        anchor: job.stable_key(),
+                        job_id: job.job_id.to_string(),
+                        live_state: state_name(job.state).to_owned(),
+                        attempt: job.row.attempt,
+                        lease_epoch: job.row.lease_epoch,
+                        unit: format!("tally-job-{}.service", job.stable_key()),
+                        labor_class: job.labor_class,
+                    })
+                    .collect::<Vec<_>>(),
+                report,
+                witness,
+            )
+        };
+        Ok(QueryProjection {
+            history,
+            journal,
+            rows,
+            details,
+            attestations_path,
+            live_states,
+            live,
+            report,
+            witness,
+        })
+    }
+
+    async fn query_jobs(&self, params: Option<Value>) -> Result<Value, WireError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct Params {
+            #[serde(default, alias = "state")]
+            live_state: Option<String>,
+            #[serde(default, alias = "verdict")]
+            terminal_verdict: Option<Verdict>,
+            #[serde(default)]
+            pool: Option<String>,
+            #[serde(default)]
+            executor: Option<String>,
+            #[serde(default)]
+            adapter: Option<String>,
+            #[serde(default)]
+            source: Option<String>,
+            #[serde(default)]
+            origin: Option<String>,
+            #[serde(default)]
+            parent: Option<String>,
+            #[serde(default)]
+            flow_run: Option<String>,
+            #[serde(default)]
+            session: Option<String>,
+            #[serde(default)]
+            since: Option<String>,
+            #[serde(default)]
+            until: Option<String>,
+            #[serde(default)]
+            limit: Option<usize>,
+            #[serde(default)]
+            cursor: Option<String>,
+        }
+        let params: Params = decode_params(params)?;
+        let fingerprint = serde_json::to_string(&json!({
+            "liveState": params.live_state.clone(),
+            "terminalVerdict": params.terminal_verdict,
+            "pool": params.pool.clone(),
+            "executor": params.executor.clone(),
+            "adapter": params.adapter.clone(),
+            "source": params.source.clone(),
+            "origin": params.origin.clone(),
+            "parent": params.parent.clone(),
+            "flowRun": params.flow_run.clone(),
+            "session": params.session.clone(),
+            "since": params.since.clone(),
+            "until": params.until.clone(),
+        }))
+        .map_err(internal_wire)?;
+        if let Some(cursor) = params.cursor.as_deref() {
+            return self
+                .pages
+                .borrow_mut()
+                .page("query.jobs", &fingerprint, params.limit, Some(cursor), None)
+                .map_err(pagination_wire);
+        }
+        let QueryProjection {
+            history,
+            details,
+            live,
+            witness,
+            ..
+        } = self.query_projection().await?;
+        let pool_signals = {
+            let mut context = self.context.write().await;
+            query_pools(&pool_headroom_facts(&mut context)?)
+                .map_err(query_wire)?
+                .pools
+                .into_iter()
+                .map(|pool| (pool.pool, pool.signal))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let lanes = trace_lanes(&details, &live, &history);
+        let adapters = {
+            let context = self.context.read().await;
+            context.config.adapters.clone()
+        };
+        let mut result = query_jobs_v2(
+            &details,
+            &live,
+            &history,
+            &witness,
+            &pool_signals,
+            &JobsFilter {
+                live_state: params.live_state,
+                terminal_verdict: params.terminal_verdict,
+                pool: params.pool,
+                executor: params.executor,
+                adapter: params.adapter,
+                source: params.source,
+                origin: params.origin,
+                parent: params.parent,
+                flow_run: params.flow_run,
+                session: params.session,
+                since: params.since,
+                until: params.until,
+            },
+        )
+        .map_err(observability_wire)?;
+        for item in &mut result.items {
+            item.trace = trace_availability(&item.anchor, &lanes, &adapters, &self.executor);
+        }
+        let envelope = Some(serde_json::to_value(result).map_err(internal_wire)?);
+        self.pages
+            .borrow_mut()
+            .page("query.jobs", &fingerprint, params.limit, None, envelope)
+            .map_err(pagination_wire)
+    }
+
+    async fn query_log(&self, params: Option<Value>) -> Result<Value, WireError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct Params {
+            #[serde(default)]
+            task: Option<String>,
+            #[serde(default)]
+            flow_run: Option<String>,
+            #[serde(default)]
+            attempt: Option<u32>,
+            #[serde(default)]
+            session: Option<String>,
+            #[serde(default)]
+            event: Option<TallyEvent>,
+            #[serde(default)]
+            source: Option<String>,
+            #[serde(default)]
+            since: Option<String>,
+            #[serde(default)]
+            until: Option<String>,
+            #[serde(default)]
+            limit: Option<usize>,
+            #[serde(default)]
+            cursor: Option<String>,
+        }
+        let params: Params = decode_params(params)?;
+        let fingerprint = serde_json::to_string(&json!({
+            "task": params.task.clone(),
+            "flowRun": params.flow_run.clone(),
+            "attempt": params.attempt,
+            "session": params.session.clone(),
+            "event": params.event,
+            "source": params.source.clone(),
+            "since": params.since.clone(),
+            "until": params.until.clone(),
+        }))
+        .map_err(internal_wire)?;
+        if let Some(cursor) = params.cursor.as_deref() {
+            return self
+                .pages
+                .borrow_mut()
+                .page("query.log", &fingerprint, params.limit, Some(cursor), None)
+                .map_err(pagination_wire);
+        }
+        let QueryProjection {
+            details,
+            history,
+            witness,
+            ..
+        } = self.query_projection().await?;
+        let envelope = Some(
+            serde_json::to_value(
+                query_lifecycle_log(
+                    &details,
+                    &history,
+                    &witness,
+                    &LifecycleLogFilter {
+                        task: params.task,
+                        flow_run: params.flow_run,
+                        attempt: params.attempt,
+                        session: params.session,
+                        event: params.event,
+                        source: params.source,
+                        since: params.since,
+                        until: params.until,
+                    },
+                )
+                .map_err(observability_wire)?,
+            )
+            .map_err(internal_wire)?,
+        );
+        self.pages
+            .borrow_mut()
+            .page("query.log", &fingerprint, params.limit, None, envelope)
+            .map_err(pagination_wire)
+    }
+
+    async fn query_trace(&self, params: Option<Value>) -> Result<Value, WireError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Params {
+            task: String,
+            #[serde(default)]
+            attempt: Option<u32>,
+            #[serde(default)]
+            limit: Option<usize>,
+            #[serde(default)]
+            cursor: Option<String>,
+        }
+        let params: Params = decode_params(params)?;
+        if params.task.trim().is_empty() {
+            return Err(WireError::invalid("query trace task must not be empty"));
+        }
+        let fingerprint = serde_json::to_string(&json!({
+            "task": params.task.clone(),
+            "attempt": params.attempt,
+        }))
+        .map_err(internal_wire)?;
+        if let Some(cursor) = params.cursor.as_deref() {
+            return self
+                .pages
+                .borrow_mut()
+                .page(
+                    "query.trace",
+                    &fingerprint,
+                    params.limit,
+                    Some(cursor),
+                    None,
+                )
+                .map_err(pagination_wire);
+        }
+        let QueryProjection {
+            history,
+            details,
+            live,
+            witness,
+            ..
+        } = self.query_projection().await?;
+        let lanes = trace_lanes(&details, &live, &history);
+        let adapters = {
+            let context = self.context.read().await;
+            context.config.adapters.clone()
+        };
+        let envelope = Some(
+            serde_json::to_value(
+                query_trace(
+                    &params.task,
+                    params.attempt,
+                    &lanes,
+                    &adapters,
+                    &self.executor,
+                    snapshot_metadata(&history, &witness),
+                )
+                .map_err(trace_wire)?,
+            )
+            .map_err(internal_wire)?,
+        );
+        self.pages
+            .borrow_mut()
+            .page("query.trace", &fingerprint, params.limit, None, envelope)
+            .map_err(pagination_wire)
     }
 }
 
