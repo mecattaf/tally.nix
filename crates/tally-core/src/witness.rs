@@ -1815,7 +1815,12 @@ mod tests {
             let original = verify_reader(Cursor::new(chain.as_slice()));
             prop_assert!(original.ok, "generated chain was invalid: {:?}", original.problems);
 
-            let index = mutation_offset % chain.len();
+            // The final LF frames the last record rather than carrying any of
+            // it. Replacing it leaves every record byte-identical and the chain
+            // legitimately valid, so it is not a mutation this property covers.
+            // Interior LFs stay in the domain: corrupting one merges records and
+            // must still be caught.
+            let index = mutation_offset % (chain.len() - 1);
             chain[index] ^= mutation_mask;
             let mutated = verify_reader(Cursor::new(chain.as_slice()));
             prop_assert!(!mutated.ok, "mutation at byte {} was accepted", index);
@@ -1834,7 +1839,9 @@ mod tests {
             let original = verify_attestations(&path).unwrap();
             prop_assert!(original.ok, "generated attestation chain was invalid");
 
-            let index = mutation_offset % chain.len();
+            // See the witness-chain property above: the trailing LF is framing,
+            // not content.
+            let index = mutation_offset % (chain.len() - 1);
             chain[index] ^= mutation_mask;
             std::fs::write(&path, &chain).unwrap();
             let detected = match verify_attestations(&path) {
