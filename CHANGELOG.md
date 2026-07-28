@@ -8,6 +8,9 @@ authorized.
 
 ### Added
 
+- Documented the ratified trust boundary: what the per-job capability token enforces, that
+  demotion to operator class and same-UID environment access are by design rather than gaps, and
+  that hardening presets rather than the token are the containment story.
 - Added a daemon-minted per-job capability token, delivered to local jobs as `TALLY_JOB_TOKEN`,
   persisted by hash in the durable row so a running job keeps one identity across daemon restarts,
   and forwarded by the CLI as the `callerJobToken` enqueue field. Remote and SSH-executed jobs

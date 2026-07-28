@@ -37,11 +37,19 @@ in [RPC protocol contract](doc/src/reference/rpc-protocol.md#socket-and-framing)
 
 [Job-origin admission](doc/src/concepts/jobs-and-admission.md#admission-is-a-boundary-not-a-queue-append)
 uses identity to enforce ancestry, depth, fan-out, and `noEnqueue`. Environment and request fields
-such as `TALLY_JOB_ID` and `callerJobId` are context, not authorization on their own. The ratified
-job-identity contract binds a daemon-minted per-job token to the running job so a job cannot
-impersonate a sibling or evade those guardrails. On a commit without token enforcement, treat the
-job guardrails as cooperative and run only trusted workloads. The token makes guardrails real; it
-does not turn hostile same-user code into a supported tenancy model.
+such as `TALLY_JOB_ID` and `callerJobId` are context, not authorization on their own. The daemon
+mints a per-job token, delivers it to the job as `TALLY_JOB_TOKEN`, and revokes it when the job
+becomes terminal. A request presenting that token has its caller identity resolved from the token
+rather than from the request, so a job can neither impersonate a sibling nor evade the guardrails
+by omitting its own identity, and it is refused the administrative and producer-internal method
+classes.
+
+What that token is not: a sandbox. Presenting no token is Client class, which is trusted as an
+operator, so a job that unsets `TALLY_JOB_TOKEN` is demoted rather than rejected — and a same-UID
+process can read the value out of `/proc/<pid>/environ` in any case. Both facts follow from the
+supported trust model above rather than contradicting it. The token makes the guardrails real; it
+does not turn hostile same-user code into a supported tenancy model. A local job that must not
+reach the daemon at all is denied socket access by a hardening preset, not by this mechanism.
 
 [Hardening presets](doc/src/configuration/hardening.md) reduce ambient filesystem, device, kernel,
 and credential access when an operator opts into them. They are defense in depth, not a hostile-code

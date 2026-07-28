@@ -45,6 +45,38 @@ caps, refuses children from a parent carrying `noEnqueue`, and attaches the
 parent relationship itself. A flow uses this same guarded path; it does not
 write child rows directly.
 
+That identification is not taken on the caller's word. When the daemon launches
+a local job it mints a 256-bit capability token for that job generation, passes
+it in as `TALLY_JOB_TOKEN`, and revokes it when the job reaches a terminal
+state. Only the hash is persisted, in the durable row, so a job keeps one
+identity across a daemon restart; a retry starts a new generation with a new
+token. Remote and SSH-executed jobs never receive one, because they cannot
+reach the coordinator socket at all.
+
+A request that presents its token is Job class. The daemon resolves *who the
+caller is* from the token rather than from the request, which is what makes the
+caps above enforced rather than cooperative:
+
+- omitting `callerJobId` no longer converts a child into a root submission;
+- naming another job's `callerJobId` is rejected, so a job cannot spend a
+  sibling's fan-out budget or attribute children to it;
+- an unknown or revoked token is a hard error, not a fallback to operator class;
+- Job class is refused the administrative and `__producer.*` method classes.
+
+The [method capability classes](../reference/rpc-protocol.md#advertised-method-table)
+define that last split.
+
+This boundary has a deliberate limit. Presenting no token is Client class,
+which tally trusts as an operator, so a job that unsets `TALLY_JOB_TOKEN` is
+demoted rather than rejected — and a same-UID process can read the token out of
+`/proc/<pid>/environ` regardless. That is by design: tally runs on one machine
+under one trusted Unix user. The token exists to make these guardrails real and
+to stop one job impersonating another, not to contain hostile same-user code.
+[SECURITY.md](https://github.com/mecattaf/tally.nix/blob/main/SECURITY.md)
+states the supported trust model, and
+[hardening presets](../configuration/hardening.md) — not this token — are the
+containment story.
+
 The acknowledgement boundary is durable. The enqueue event is written and
 acknowledged before the caller is told that a new job exists. A lease grant is
 also fsynced before execution is launched, and terminal waiters are released
