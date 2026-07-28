@@ -16,6 +16,7 @@ Global options may appear before or after a subcommand:
 ```text
 --config PATH
 --socket PATH
+--rpc-timeout-sec SECONDS
 ```
 
 The default config is `$XDG_CONFIG_HOME/tally/config.json`, falling back to
@@ -23,6 +24,11 @@ The default config is `$XDG_CONFIG_HOME/tally/config.json`, falling back to
 `maxFrameBytes`; an explicitly selected file must exist and parse. The socket order is
 `--socket`, `TALLY_SOCKET`, `$XDG_RUNTIME_DIR/tally/tally.sock`, then the temporary directory's
 `tally/tally.sock`.
+
+One-shot RPC commands have a 60-second client deadline. Override it with
+`--rpc-timeout-sec SECONDS` or `TALLY_RPC_TIMEOUT_SEC`; the flag takes precedence. Both values
+must be positive whole seconds. Long-polling `queue.await_job` and `query.watch` calls are not
+subject to this per-call deadline.
 
 Check a rendered configuration without starting the daemon:
 

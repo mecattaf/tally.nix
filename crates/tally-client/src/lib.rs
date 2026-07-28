@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -95,6 +96,8 @@ pub enum WireIoError {
     InvalidResponse(String),
     #[error("RPC request task failed: {0}")]
     RequestTask(String),
+    #[error("RPC method {method} exceeded its {deadline:?} deadline")]
+    DeadlineExceeded { method: String, deadline: Duration },
     #[error("RPC error {0:?}: {1}")]
     Rpc(WireErrorCode, String, Option<Value>),
 }
@@ -322,6 +325,24 @@ impl RpcClient {
     }
 
     pub async fn call(&self, method: &str, params: Option<Value>) -> Result<Value, WireIoError> {
+        self.call_inner(method, params, None).await
+    }
+
+    pub async fn call_with_deadline(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        deadline: Duration,
+    ) -> Result<Value, WireIoError> {
+        self.call_inner(method, params, Some(deadline)).await
+    }
+
+    async fn call_inner(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        deadline: Option<Duration>,
+    ) -> Result<Value, WireIoError> {
         let next_id = self
             .next_id
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
@@ -349,19 +370,37 @@ impl RpcClient {
             state.pending.insert(id.clone(), sender);
         }
 
-        if let Err(error) = self.writer.lock().await.write_all(&encoded).await {
+        let exchange = async {
+            self.writer
+                .lock()
+                .await
+                .write_all(&encoded)
+                .await
+                .map_err(WireIoError::Io)?;
+            receiver
+                .await
+                .map_err(|_| WireIoError::Closed)?
+                .map_err(ClientReadFailure::into_wire_error)
+        };
+        let response = if let Some(deadline) = deadline {
+            match tokio::time::timeout(deadline, exchange).await {
+                Ok(response) => response,
+                Err(_) => Err(WireIoError::DeadlineExceeded {
+                    method: method.to_owned(),
+                    deadline,
+                }),
+            }
+        } else {
+            exchange.await
+        };
+        if response.is_err() {
             self.state
                 .lock()
                 .expect("RPC client state lock poisoned")
                 .pending
                 .remove(&id);
-            return Err(WireIoError::Io(error));
         }
-
-        let response = receiver
-            .await
-            .map_err(|_| WireIoError::Closed)?
-            .map_err(ClientReadFailure::into_wire_error)?;
+        let response = response?;
         let object = response
             .as_object()
             .ok_or_else(|| WireIoError::InvalidResponse("response is not an object".to_owned()))?;
@@ -457,7 +496,8 @@ fn fail_client(state: &Arc<StdMutex<ClientState>>, failure: ClientReadFailure) {
 mod tests {
     use proptest::collection::vec;
     use proptest::prelude::*;
-    use tokio::io::BufReader;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
 
     use super::*;
 
@@ -576,5 +616,71 @@ mod tests {
             serde_json::to_string(&request).unwrap(),
             r#"{"id":"cli-1","method":"query.status","params":{"pool":"gpu"}}"#
         );
+    }
+
+    #[tokio::test]
+    async fn deadline_removes_pending_request_and_late_response_fails_cleanly() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: RequestFrame = serde_json::from_str(line.trim_end()).unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let mut response = serde_json::to_vec(&serde_json::json!({
+                "id": request.id,
+                "result": {"ok": true},
+            }))
+            .unwrap();
+            response.push(b'\n');
+            writer.write_all(&response).await.unwrap();
+        });
+
+        let client = RpcClient::connect(&socket).await.unwrap();
+        let deadline = Duration::from_millis(20);
+        let error = client
+            .call_with_deadline("query.status", None, deadline)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WireIoError::DeadlineExceeded {
+                ref method,
+                deadline: actual,
+            } if method == "query.status" && actual == deadline
+        ));
+        assert!(client
+            .state
+            .lock()
+            .expect("RPC client state lock poisoned")
+            .pending
+            .is_empty());
+
+        server.await.unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let failure = client
+                    .state
+                    .lock()
+                    .expect("RPC client state lock poisoned")
+                    .failure
+                    .clone();
+                if let Some(failure) = failure {
+                    break failure;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late response should fail the connection cleanly");
+        assert!(matches!(
+            failure,
+            ClientReadFailure::InvalidResponse(message)
+                if message.contains("has no pending request")
+        ));
     }
 }
