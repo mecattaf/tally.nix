@@ -115,16 +115,16 @@ services.tally.flows.nightly = {
 };
 ```
 
-Building the generation runs the real `tally flow check` binary. It validates the
-literal metadata, configured arguments, declared pools, node ceiling, and selector
-catalog. A bad script consequently fails `home-manager switch` (or a NixOS
-generation build) rather than its timer at night.
+Building the Home Manager generation runs the real `tally flow check` binary. It
+validates the literal metadata, configured arguments, declared pools, node
+ceiling, and selector catalog. A bad script consequently fails `home-manager
+switch` rather than its timer at night.
 
 The implementation is narrower than the option tree suggests:
 
-- Only the Home Manager module generates the calendar producer and the automatic
-  `flow` and `build` pools. The NixOS module exposes and checks flow entries but
-  does not render them into scheduled producers.
+- Only the Home Manager module accepts flow entries and generates the calendar
+  producer and automatic `flow` and `build` pools. The NixOS module rejects flow
+  entries with a pointer to the Home Manager module.
 - `onCalendar = null` creates no producer. The entry is still checked while the
   generation is built, and the script can be run directly.
 - A generated runner's pool set is exactly `[ "flow" ]`. The configuration's

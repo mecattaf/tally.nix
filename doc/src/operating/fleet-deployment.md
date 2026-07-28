@@ -8,9 +8,9 @@ captures.
 
 The shipped multi-host check uses a Home Manager coordinator embedded in a
 NixOS host. That distinction matters: the NixOS module renders the system
-daemon and witness emitter, but it does not render producers, meters, flow
-calendar units, the drain timer, or the retention timer. Those scheduling
-units currently exist only in the Home Manager module.
+daemon, witness emitter, drain timer, and retention timer. It rejects producers,
+meters, and flow calendar declarations; those workload-scheduling units exist
+only in the Home Manager module.
 
 ## Choose the coordinator shape
 
@@ -30,9 +30,11 @@ Use the NixOS module when the host needs a machine-wide daemon:
 }
 ```
 
-This installs `tally-daemon.service`, listens on
+This creates the dedicated `tally` service account, installs
+`tally-daemon.service` plus its drain and retention timers, listens on
 `/run/tally/tally.sock`, and stores durable state under
-`/var/lib/tally/{data,state}`.
+`/var/lib/tally/{data,state}`. Set `retention.enable = false` when host-wide Nix
+store collection is not part of this machine's policy.
 
 Use Home Manager when tally itself should materialise scheduled work:
 
