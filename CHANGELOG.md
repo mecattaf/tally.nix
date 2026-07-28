@@ -17,6 +17,7 @@ authorized.
 - Added this changelog and the contribution rule that keeps `[Unreleased]` current.
 - Added randomized checks for bounded NDJSON framing, byte-exact request round trips, witness
   mutation detection, durable JSONL tail repair, and canonical pool-set and migration behavior.
+- Added flake-native rustfmt, Clippy, and repository-wide Nix formatting checks.
 
 ### Changed
 
@@ -26,6 +27,7 @@ authorized.
   `no-changelog` label.
 - Single-sourced the declarative-flow node field contract across JavaScript validation, live-wire
   rendering, and canonical hashing.
+- Restricted system-indexed flake outputs to `x86_64-linux` and documented that supported platform.
 
 ### Fixed
 
@@ -35,6 +37,8 @@ authorized.
   hard error when `tally flow run` has no client configuration.
 - Preserved inherited job identity and `noEnqueue` guardrails through CLI continuation, and made
   negative or signalled waited process outcomes return a nonzero CLI status.
+- Preserved the original launcher-failure status and stderr when transient-unit reclamation cannot
+  find or clean up the failed launch.
 
 ### Security
 
