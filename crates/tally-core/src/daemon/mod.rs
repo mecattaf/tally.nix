@@ -423,37 +423,89 @@ struct DaemonHandler {
     exec_attestations: bool,
 }
 
+#[derive(Clone, Copy)]
+enum DispatchMethod {
+    Enqueue,
+    Continue,
+    Retry,
+    AwaitJob,
+    AwaitBarrier,
+    Drain,
+    Pause,
+    Resume,
+    Cancel,
+    PoolTransition,
+    ProducerRuntimeObserved,
+    Acquire,
+    Release,
+    LeaseStatus,
+    Query,
+}
+
+const DISPATCHER_METHODS: &[(&str, DispatchMethod)] = &[
+    ("queue.enqueue", DispatchMethod::Enqueue),
+    ("queue.continue", DispatchMethod::Continue),
+    ("queue.retry", DispatchMethod::Retry),
+    ("queue.await_job", DispatchMethod::AwaitJob),
+    ("queue.await_barrier", DispatchMethod::AwaitBarrier),
+    ("queue.drain", DispatchMethod::Drain),
+    ("queue.pause", DispatchMethod::Pause),
+    ("queue.resume", DispatchMethod::Resume),
+    ("queue.cancel", DispatchMethod::Cancel),
+    ("__producer.pool-transition", DispatchMethod::PoolTransition),
+    (
+        "__producer.runtime-observed",
+        DispatchMethod::ProducerRuntimeObserved,
+    ),
+    ("lease.acquire", DispatchMethod::Acquire),
+    ("lease.release", DispatchMethod::Release),
+    ("lease.status", DispatchMethod::LeaseStatus),
+    ("query.jobs", DispatchMethod::Query),
+    ("query.job", DispatchMethod::Query),
+    ("query.status", DispatchMethod::Query),
+    ("query.log", DispatchMethod::Query),
+    ("query.proof", DispatchMethod::Query),
+    ("query.trace", DispatchMethod::Query),
+    ("query.producers", DispatchMethod::Query),
+    ("query.watch", DispatchMethod::Query),
+    ("query.render", DispatchMethod::Query),
+    ("query.standup", DispatchMethod::Query),
+    ("query.pools", DispatchMethod::Query),
+];
+
+fn dispatch_method(method: &str) -> Option<DispatchMethod> {
+    DISPATCHER_METHODS
+        .iter()
+        .find_map(|(candidate, dispatched)| (*candidate == method).then_some(*dispatched))
+}
+
 impl RpcHandler for DaemonHandler {
     fn handle<'a>(
         &'a self,
         request: RequestFrame,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
         Box::pin(async move {
-            match request.method.as_str() {
-                "queue.enqueue" => self.enqueue(request.params).await,
-                "queue.continue" => self.continue_job(request.params).await,
-                "queue.retry" => self.retry_job(request.params).await,
-                "queue.await_job" => self.await_job(request.params).await,
-                "queue.await_barrier" => self.await_barrier(request.params).await,
-                "queue.drain" => self.drain(request.params).await,
-                "queue.pause" => self.pause(request.params).await,
-                "queue.resume" => self.resume(request.params).await,
-                "queue.cancel" => self.cancel(request.params).await,
-                "__producer.pool-transition" => self.pool_transition(request.params).await,
-                "__producer.runtime-observed" => {
+            match dispatch_method(&request.method) {
+                Some(DispatchMethod::Enqueue) => self.enqueue(request.params).await,
+                Some(DispatchMethod::Continue) => self.continue_job(request.params).await,
+                Some(DispatchMethod::Retry) => self.retry_job(request.params).await,
+                Some(DispatchMethod::AwaitJob) => self.await_job(request.params).await,
+                Some(DispatchMethod::AwaitBarrier) => self.await_barrier(request.params).await,
+                Some(DispatchMethod::Drain) => self.drain(request.params).await,
+                Some(DispatchMethod::Pause) => self.pause(request.params).await,
+                Some(DispatchMethod::Resume) => self.resume(request.params).await,
+                Some(DispatchMethod::Cancel) => self.cancel(request.params).await,
+                Some(DispatchMethod::PoolTransition) => self.pool_transition(request.params).await,
+                Some(DispatchMethod::ProducerRuntimeObserved) => {
                     self.producer_runtime_observed(request.params).await
                 }
-                "lease.acquire" => self.acquire(request.params).await,
-                "lease.release" => self.release(request.params).await,
-                "lease.status" => self.lease_status(request.params).await,
-                "query.jobs" | "query.job" | "query.status" | "query.log" | "query.proof"
-                | "query.trace" | "query.producers" | "query.watch" | "query.render"
-                | "query.standup" | "query.pools" => {
-                    self.query(&request.method, request.params).await
-                }
-                other => Err(WireError::new(
+                Some(DispatchMethod::Acquire) => self.acquire(request.params).await,
+                Some(DispatchMethod::Release) => self.release(request.params).await,
+                Some(DispatchMethod::LeaseStatus) => self.lease_status(request.params).await,
+                Some(DispatchMethod::Query) => self.query(&request.method, request.params).await,
+                None => Err(WireError::new(
                     WireErrorCode::UnknownMethod,
-                    format!("unknown RPC method {other}"),
+                    format!("unknown RPC method {}", request.method),
                 )),
             }
         })
