@@ -8304,6 +8304,76 @@ mod tests {
             .await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn continuation_pages_skip_witness_reads_and_stay_frozen() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                for _ in 0..3 {
+                    daemon
+                        .handler
+                        .enqueue_as_client(Some(json!({
+                            "argv": ["true"],
+                            "pool": "slot",
+                            "priority": "high",
+                            "adapter": "shell",
+                            "source": "manual",
+                            "evidence": ["exit:0"]
+                        })))
+                        .await
+                        .unwrap();
+                }
+                let first = daemon
+                    .handler
+                    .query("query.jobs", Some(json!({"limit": 1})))
+                    .await
+                    .unwrap();
+                assert_eq!(first["items"].as_array().unwrap().len(), 1);
+                let cursor = first["nextCursor"].as_str().unwrap().to_owned();
+                let reference = daemon
+                    .handler
+                    .query("query.jobs", Some(json!({"limit": 1, "cursor": cursor})))
+                    .await
+                    .unwrap();
+
+                // Corrupt the witness ledger: a fresh envelope must refuse...
+                fs::write(paths.witness_path(), b"garbage\n").unwrap();
+                assert!(daemon
+                    .handler
+                    .query("query.jobs", Some(json!({"limit": 1})))
+                    .await
+                    .is_err());
+
+                // ...while continuation pages serve the frozen snapshot with
+                // zero witness reads, byte-identical to the pre-mutation page.
+                let replayed = daemon
+                    .handler
+                    .query("query.jobs", Some(json!({"limit": 1, "cursor": cursor})))
+                    .await
+                    .unwrap();
+                assert_eq!(replayed, reference);
+                let final_cursor = replayed["nextCursor"].as_str().unwrap().to_owned();
+                let last = daemon
+                    .handler
+                    .query(
+                        "query.jobs",
+                        Some(json!({"limit": 1, "cursor": final_cursor})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(last["items"].as_array().unwrap().len(), 1);
+            })
+            .await;
+    }
+
     #[test]
     fn daemon_paths_create_no_docs_or_deferred_scope() {
         let temp = tempdir().unwrap();
