@@ -3,6 +3,10 @@
 Thank you for helping improve tally. Keep changes inside its defining boundary: tally arbitrates
 contention and emits proof. A driver decides what work should run and interprets domain output.
 
+Read the project [security policy](SECURITY.md) before handling vulnerability reports or
+credentials. Release preparation follows the [release runbook](RELEASING.md); documenting its tag
+commands is not authorization to execute them.
+
 ## Development environment
 
 Use the flake development shell; it provides Rust, Cargo, Clippy, rustfmt, jq, SQLite,
