@@ -1407,24 +1407,8 @@ impl GhCliIntake {
             }
             match source.kind() {
                 "notifications" => {
-                    let notifications: Value = self.json(&[
-                        "api",
-                        "--method",
-                        "GET",
-                        "notifications",
-                        "-f",
-                        "all=false",
-                        "-f",
-                        "participating=false",
-                        "-f",
-                        "per_page=100",
-                    ])?;
-                    let notifications = notifications.as_array().ok_or_else(|| {
-                        ProducerError::GitHub(
-                            "gh notifications response must be an array".to_owned(),
-                        )
-                    })?;
-                    for notification in notifications {
+                    let notifications = self.paginated_notifications()?;
+                    for notification in &notifications {
                         let subject = notification.get("subject").ok_or_else(|| {
                             ProducerError::GitHub("GitHub notification omitted subject".to_owned())
                         })?;
@@ -1689,6 +1673,43 @@ impl GhCliIntake {
         }
         normalize_gh_candidates(config, &mut observations);
         Ok(observations)
+    }
+
+    fn paginated_notifications(&self) -> Result<Vec<Value>, ProducerError> {
+        let mut collected = Vec::new();
+        for page in 1..=MAX_GH_COMMENT_PAGES {
+            let page_field = format!("page={page}");
+            let mut args = vec![
+                "api",
+                "--method",
+                "GET",
+                "notifications",
+                "-f",
+                "all=false",
+                "-f",
+                "participating=false",
+                "-f",
+                "per_page=100",
+            ];
+            if page > 1 {
+                args.extend(["-f", page_field.as_str()]);
+            }
+            let response = self.json(&args)?;
+            let Value::Array(notifications) = response else {
+                return Err(ProducerError::GitHub(
+                    "gh notifications response must be an array".to_owned(),
+                ));
+            };
+            let complete = notifications.len() < 100;
+            collected.extend(notifications);
+            if complete {
+                return Ok(collected);
+            }
+        }
+        Err(ProducerError::GitHub(format!(
+            "GitHub notifications truncated at the \
+             {MAX_GH_COMMENT_PAGES}-page intake cap"
+        )))
     }
 
     fn json(&self, args: &[&str]) -> Result<Value, ProducerError> {
@@ -6915,6 +6936,66 @@ mod tests {
         assert_eq!(receipt["primaryDecision"], "filtered");
         assert_eq!(receipt["rule"], "trigger-actor-not-allowed");
         assert_eq!(receipt["primaryAcknowledged"], true);
+    }
+
+    #[test]
+    fn github_cli_paginates_notifications_until_a_short_page() {
+        let temp = tempdir().unwrap();
+        let mut registry = registry(&temp.path().join("effects.jsonl"));
+        let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+            unreachable!()
+        };
+        github.sources = vec![GhSource::Notifications(GhSourceConstraints {
+            repo: Some("acme/repo".to_owned()),
+            ..GhSourceConstraints::default()
+        })];
+        github.triggers = GhTriggers {
+            mentions: vec!["@tally-bot please run".to_owned()],
+            ..GhTriggers::default()
+        };
+        github.allowed_actors = vec!["contributor".to_owned()];
+        let gh = temp.path().join("fake-gh-pages");
+        let calls = temp.path().join("gh-page-calls");
+        crate::test_support::install_shell_program(
+            &gh,
+            format!(
+                concat!(
+                    "#!/bin/sh\n",
+                    "printf '%s\\n' \"$*\" >> '{}'\n",
+                    "case \"$*\" in\n",
+                    "  'api user') printf '{{\"login\":\"tally-bot\"}}' ;;\n",
+                    "  'api --method GET notifications -f all=false -f participating=false -f per_page=100')\n",
+                    "    printf '['\n",
+                    "    i=1\n",
+                    "    while [ \"$i\" -le 100 ]; do\n",
+                    "      [ \"$i\" -eq 1 ] || printf ','\n",
+                    "      printf '{{\"id\":\"skip-%s\",\"subject\":{{\"type\":\"CheckSuite\"}}}}' \"$i\"\n",
+                    "      i=$((i + 1))\n",
+                    "    done\n",
+                    "    printf ']'\n",
+                    "    ;;\n",
+                    "  'api --method GET notifications -f all=false -f participating=false -f per_page=100 -f page=2')\n",
+                    "    printf '[{{\"id\":\"N101\",\"reason\":\"mention\",\"updated_at\":\"2026-07-20T12:00:00Z\",\"repository\":{{\"full_name\":\"acme/repo\"}},\"subject\":{{\"type\":\"Issue\",\"url\":\"https://api.github.com/repos/acme/repo/issues/101\",\"latest_comment_url\":\"https://api.github.com/repos/acme/repo/issues/comments/1101\"}}}}]'\n",
+                    "    ;;\n",
+                    "  'api /repos/acme/repo/issues/101') printf '{{\"node_id\":\"I_node_101\",\"number\":101,\"html_url\":\"https://github.com/acme/repo/issues/101\",\"title\":\"Paged issue\",\"body\":null,\"state\":\"open\",\"user\":{{\"login\":\"issue-author\"}},\"labels\":[],\"assignees\":[]}}' ;;\n",
+                    "  'api /repos/acme/repo/issues/comments/1101') printf '{{\"id\":1101,\"body\":\"@tally-bot please run\",\"created_at\":\"2026-07-20T12:00:00Z\",\"updated_at\":\"2026-07-20T12:00:00Z\",\"user\":{{\"login\":\"contributor\"}}}}' ;;\n",
+                    "  *) exit 91 ;;\n",
+                    "esac\n"
+                ),
+                calls.display(),
+            ),
+        );
+
+        let candidates = GhCliIntake::with_program(gh).poll(github).unwrap();
+        assert_eq!(candidates.len(), 1);
+        let GhIntakeCandidate::Observation(observation) = &candidates[0] else {
+            panic!("expected a hydrated second-page notification");
+        };
+        assert_eq!(observation.number, 101);
+        assert_eq!(observation.comment_id.as_deref(), Some("1101"));
+        let calls = std::fs::read_to_string(calls).unwrap();
+        assert!(calls.contains("per_page=100 -f page=2"));
+        assert_eq!(calls.lines().count(), 5);
     }
 
     #[test]
