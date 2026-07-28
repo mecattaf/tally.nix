@@ -113,10 +113,10 @@ pub(super) async fn run_flow(
                 let windowed_consumption_pools = config
                     .pools
                     .iter()
-                    .filter_map(|(name, pool)| {
+                    .filter(|(_, pool)| {
                         matches!(pool.predicate, PoolPredicate::WindowedConsumption(_))
-                            .then(|| name.clone())
                     })
+                    .map(|(name, _)| name.clone())
                     .collect::<BTreeSet<_>>();
                 validate_flow_pool_predicates(&checked.meta, &windowed_consumption_pools)
                     .map_err(flow_error)?;
