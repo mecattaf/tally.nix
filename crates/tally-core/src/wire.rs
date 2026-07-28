@@ -265,7 +265,6 @@ fn is_abandonable_wait(method: &str) -> bool {
 }
 
 async fn peer_write_half_hung_up(fd: RawFd) -> io::Result<bool> {
-    tokio::time::sleep(PEER_HANGUP_PROBE_INTERVAL).await;
     loop {
         // SAFETY: `fd` belongs to the live `OwnedWriteHalf` for this connection, and a null
         // buffer is valid for a zero-length send. MSG_NOSIGNAL prevents a closed peer from
@@ -279,20 +278,22 @@ async fn peer_write_half_hung_up(fd: RawFd) -> io::Result<bool> {
             )
         };
         if sent >= 0 {
-            return Ok(false);
+            break;
         }
         let error = io::Error::last_os_error();
         if error.kind() == io::ErrorKind::Interrupted {
             continue;
         }
         if error.kind() == io::ErrorKind::WouldBlock {
-            return Ok(false);
+            break;
         }
-        return match error.raw_os_error() {
-            Some(libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN) => Ok(true),
-            _ => Err(error),
-        };
+        match error.raw_os_error() {
+            Some(libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN) => return Ok(true),
+            _ => return Err(error),
+        }
     }
+    tokio::time::sleep(PEER_HANGUP_PROBE_INTERVAL).await;
+    Ok(false)
 }
 
 async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
@@ -1278,9 +1279,9 @@ mod tests {
                 assert_eq!(started_rx.recv().await.as_deref(), Some("queue.await_job"));
 
                 drop(client);
-                tokio::time::timeout(PEER_HANGUP_PROBE_INTERVAL * 5, server)
+                tokio::time::timeout(PEER_HANGUP_PROBE_INTERVAL, server)
                     .await
-                    .expect("an abandoned await must end after the peer probe")
+                    .expect("an abandoned await must end within one peer-probe interval")
                     .unwrap()
                     .unwrap();
             })
