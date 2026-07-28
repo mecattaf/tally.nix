@@ -673,6 +673,144 @@ mod tests {
         }
     }
 
+    // Characterization: exact behavior at and over the protocol frame limit,
+    // including frames delivered across many split reads.
+    #[test]
+    fn frames_at_the_default_limit_pass_and_one_byte_over_fails() {
+        // ensure_frame_size counts the LF terminator: an encoded body of
+        // limit-1 bytes fills the frame exactly; limit bytes overflow it.
+        assert!(framing::ensure_frame_size(
+            (DEFAULT_MAX_FRAME_BYTES - 1) as usize,
+            DEFAULT_MAX_FRAME_BYTES
+        )
+        .is_ok());
+        assert!(matches!(
+            framing::ensure_frame_size(DEFAULT_MAX_FRAME_BYTES as usize, DEFAULT_MAX_FRAME_BYTES),
+            Err(WireIoError::FrameTooLarge {
+                limit: DEFAULT_MAX_FRAME_BYTES
+            })
+        ));
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut at_limit = vec![b'x'; (DEFAULT_MAX_FRAME_BYTES - 1) as usize];
+        at_limit.push(b'\n');
+        let mut reader = BufReader::new(at_limit.as_slice());
+        let line = runtime
+            .block_on(framing::read_line_limited(
+                &mut reader,
+                DEFAULT_MAX_FRAME_BYTES,
+            ))
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.len(), (DEFAULT_MAX_FRAME_BYTES - 1) as usize);
+
+        let mut over_limit = vec![b'x'; DEFAULT_MAX_FRAME_BYTES as usize];
+        over_limit.push(b'\n');
+        let mut reader = BufReader::new(over_limit.as_slice());
+        let error = runtime
+            .block_on(framing::read_line_limited(
+                &mut reader,
+                DEFAULT_MAX_FRAME_BYTES,
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WireIoError::FrameTooLarge {
+                limit: DEFAULT_MAX_FRAME_BYTES
+            }
+        ));
+    }
+
+    #[test]
+    fn split_reads_reassemble_the_frame_and_still_enforce_the_limit() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let limit = 1_024_u64;
+        let mut frame = vec![b'y'; (limit - 1) as usize];
+        frame.push(b'\n');
+        // A tiny buffer forces the frame across many fill_buf calls.
+        let mut reader = BufReader::with_capacity(7, frame.as_slice());
+        let line = runtime
+            .block_on(framing::read_line_limited(&mut reader, limit))
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.len(), (limit - 1) as usize);
+
+        let mut over = vec![b'y'; limit as usize];
+        over.push(b'\n');
+        let mut reader = BufReader::with_capacity(7, over.as_slice());
+        assert!(matches!(
+            runtime
+                .block_on(framing::read_line_limited(&mut reader, limit))
+                .unwrap_err(),
+            WireIoError::FrameTooLarge { limit: observed } if observed == limit
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_refused_before_any_bytes_reach_the_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let limit = 256_u64;
+        let client = RpcClient::connect_with_max_frame_bytes(&socket, limit)
+            .await
+            .unwrap();
+        let error = client
+            .call(
+                "query.status",
+                Some(serde_json::json!({"pad": "z".repeat(512)})),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WireIoError::FrameTooLarge { limit: observed } if observed == limit
+        ));
+        // The refusal happens before the request is registered: no pending
+        // entry leaks.
+        assert!(client
+            .state
+            .lock()
+            .expect("RPC client state lock poisoned")
+            .pending
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn oversized_response_fails_the_pending_call_with_frame_too_large() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let limit = 512_u64;
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let mut oversized = vec![b'{'; 1];
+            oversized.extend(vec![b' '; 2_048]);
+            oversized.push(b'\n');
+            writer.write_all(&oversized).await.unwrap();
+        });
+        let client = RpcClient::connect_with_max_frame_bytes(&socket, limit)
+            .await
+            .unwrap();
+        let error = client.call("query.status", None).await.unwrap_err();
+        assert!(matches!(
+            error,
+            WireIoError::FrameTooLarge { limit: observed } if observed == limit
+        ));
+        server.await.unwrap();
+    }
+
     #[test]
     fn explicit_config_controls_the_transport_limit() {
         let temp = tempfile::tempdir().unwrap();
