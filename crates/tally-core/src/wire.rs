@@ -1,5 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
+use std::io;
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::Duration;
@@ -28,6 +30,7 @@ use crate::witness::Derivation;
 
 pub const FRAME_CAP_BYTES: usize = DEFAULT_MAX_FRAME_BYTES as usize;
 pub const MAX_IN_FLIGHT_REQUESTS: usize = 64;
+const PEER_HANGUP_PROBE_INTERVAL: Duration = Duration::from_millis(100);
 
 pub const RPC_METHODS: &[&str] = &[
     "queue.enqueue",
@@ -106,13 +109,51 @@ where
     let mut reader = BufReader::new(reader);
     let mut reader_open = true;
     let mut requests = JoinSet::new();
+    let mut wait_requests = 0;
     while reader_open || !requests.is_empty() {
-        if !reader_open || requests.len() == MAX_IN_FLIGHT_REQUESTS {
+        if !reader_open {
+            if wait_requests == requests.len() {
+                tokio::select! {
+                    completed = requests.join_next() => {
+                        let completed = completed.expect("an in-flight request must be present");
+                        write_completed_request(
+                            &mut writer,
+                            completed,
+                            max_frame_bytes,
+                            &mut wait_requests,
+                        )
+                        .await?;
+                    }
+                    peer_hung_up = peer_write_half_hung_up(writer.as_ref().as_raw_fd()) => {
+                        if peer_hung_up? {
+                            requests.shutdown().await;
+                            return Ok(());
+                        }
+                    }
+                }
+            } else {
+                let completed = requests
+                    .join_next()
+                    .await
+                    .expect("an in-flight request must be present");
+                write_completed_request(
+                    &mut writer,
+                    completed,
+                    max_frame_bytes,
+                    &mut wait_requests,
+                )
+                .await?;
+            }
+            continue;
+        }
+
+        if requests.len() == MAX_IN_FLIGHT_REQUESTS {
             let completed = requests
                 .join_next()
                 .await
                 .expect("an in-flight request must be present");
-            write_completed_request(&mut writer, completed, max_frame_bytes).await?;
+            write_completed_request(&mut writer, completed, max_frame_bytes, &mut wait_requests)
+                .await?;
             continue;
         }
 
@@ -146,23 +187,37 @@ where
                     }
                 };
                 let request_handler = handler.clone();
+                let method = request.method.clone();
+                if is_abandonable_wait(&method) {
+                    wait_requests += 1;
+                }
                 requests.spawn_local(async move {
-                    let encoded = match request_handler.handle(request.clone()).await {
-                        Ok(result) => serde_json::to_value(ResponseOk {
-                            id: &request.id,
-                            result,
-                        })?,
-                        Err(error) => serde_json::to_value(ResponseErr {
-                            id: &request.id,
-                            error,
-                        })?,
-                    };
-                    Ok(encoded)
+                    let response = async {
+                        let encoded = match request_handler.handle(request.clone()).await {
+                            Ok(result) => serde_json::to_value(ResponseOk {
+                                id: &request.id,
+                                result,
+                            })?,
+                            Err(error) => serde_json::to_value(ResponseErr {
+                                id: &request.id,
+                                error,
+                            })?,
+                        };
+                        Ok(encoded)
+                    }
+                    .await;
+                    (method, response)
                 });
             }
             completed = requests.join_next(), if !requests.is_empty() => {
                 let completed = completed.expect("an in-flight request must be present");
-                write_completed_request(&mut writer, completed, max_frame_bytes).await?;
+                write_completed_request(
+                    &mut writer,
+                    completed,
+                    max_frame_bytes,
+                    &mut wait_requests,
+                )
+                .await?;
             }
         }
     }
@@ -189,11 +244,55 @@ where
 
 async fn write_completed_request(
     writer: &mut OwnedWriteHalf,
-    completed: Result<Result<Value, WireIoError>, tokio::task::JoinError>,
+    completed: Result<(String, Result<Value, WireIoError>), tokio::task::JoinError>,
     max_frame_bytes: u64,
+    wait_requests: &mut usize,
 ) -> Result<(), WireIoError> {
-    let response = completed.map_err(|error| WireIoError::RequestTask(error.to_string()))??;
-    write_frame(writer, &response, max_frame_bytes).await
+    let (method, response) =
+        completed.map_err(|error| WireIoError::RequestTask(error.to_string()))?;
+    let response = response?;
+    write_frame(writer, &response, max_frame_bytes).await?;
+    if is_abandonable_wait(&method) {
+        *wait_requests = wait_requests
+            .checked_sub(1)
+            .expect("a completed wait must have an in-flight tag");
+    }
+    Ok(())
+}
+
+fn is_abandonable_wait(method: &str) -> bool {
+    matches!(method, "queue.await_job" | "queue.await_barrier")
+}
+
+async fn peer_write_half_hung_up(fd: RawFd) -> io::Result<bool> {
+    tokio::time::sleep(PEER_HANGUP_PROBE_INTERVAL).await;
+    loop {
+        // SAFETY: `fd` belongs to the live `OwnedWriteHalf` for this connection, and a null
+        // buffer is valid for a zero-length send. MSG_NOSIGNAL prevents a closed peer from
+        // delivering SIGPIPE to the daemon.
+        let sent = unsafe {
+            libc::send(
+                fd,
+                std::ptr::null(),
+                0,
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent >= 0 {
+            return Ok(false);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(false);
+        }
+        return match error.raw_os_error() {
+            Some(libc::EPIPE | libc::ECONNRESET | libc::ENOTCONN) => Ok(true),
+            _ => Err(error),
+        };
+    }
 }
 
 async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
@@ -1126,6 +1225,157 @@ mod tests {
                 Ok(serde_json::json!({"index": index}))
             })
         }
+    }
+
+    #[derive(Clone)]
+    struct NeverCompletesHandler {
+        started: mpsc::UnboundedSender<String>,
+    }
+
+    impl RpcHandler for NeverCompletesHandler {
+        fn handle<'a>(
+            &'a self,
+            request: RequestFrame,
+        ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+            self.started.send(request.method).unwrap();
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[test]
+    fn abandonable_wait_classifier_is_exact() {
+        assert!(is_abandonable_wait("queue.await_job"));
+        assert!(is_abandonable_wait("queue.await_barrier"));
+        assert!(!is_abandonable_wait("queue.enqueue"));
+        assert!(!is_abandonable_wait("query.watch"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abandoned_never_completing_await_ends_after_the_peer_probe() {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut client, server_stream) = UnixStream::pair().unwrap();
+                let server = tokio::task::spawn_local(async move {
+                    serve_connection(
+                        server_stream,
+                        NeverCompletesHandler {
+                            started: started_tx,
+                        },
+                    )
+                    .await
+                });
+
+                let request = RequestFrame {
+                    id: RequestId::Number(1),
+                    method: "queue.await_job".to_owned(),
+                    params: None,
+                };
+                let mut encoded = serde_json::to_vec(&request).unwrap();
+                encoded.push(b'\n');
+                client.write_all(&encoded).await.unwrap();
+                assert_eq!(started_rx.recv().await.as_deref(), Some("queue.await_job"));
+
+                drop(client);
+                tokio::time::timeout(PEER_HANGUP_PROBE_INTERVAL * 5, server)
+                    .await
+                    .expect("an abandoned await must end after the peer probe")
+                    .unwrap()
+                    .unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn peer_probe_never_aborts_a_non_wait_request() {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut client, server_stream) = UnixStream::pair().unwrap();
+                let mut server = tokio::task::spawn_local(async move {
+                    serve_connection(
+                        server_stream,
+                        NeverCompletesHandler {
+                            started: started_tx,
+                        },
+                    )
+                    .await
+                });
+
+                let request = RequestFrame {
+                    id: RequestId::Number(1),
+                    method: "query.watch".to_owned(),
+                    params: None,
+                };
+                let mut encoded = serde_json::to_vec(&request).unwrap();
+                encoded.push(b'\n');
+                client.write_all(&encoded).await.unwrap();
+                assert_eq!(started_rx.recv().await.as_deref(), Some("query.watch"));
+
+                drop(client);
+                assert!(
+                    tokio::time::timeout(PEER_HANGUP_PROBE_INTERVAL * 2, &mut server)
+                        .await
+                        .is_err(),
+                    "a non-wait request must not be aborted after reader EOF"
+                );
+                server.abort();
+                assert!(server.await.unwrap_err().is_cancelled());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn half_closed_client_keeps_its_pending_await_response() {
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(Semaphore::new(0));
+        let server_permits = Arc::clone(&permits);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut client, server_stream) = UnixStream::pair().unwrap();
+                let server = tokio::task::spawn_local(async move {
+                    serve_connection(
+                        server_stream,
+                        WindowHandler {
+                            started: started_tx,
+                            permits: server_permits,
+                        },
+                    )
+                    .await
+                });
+
+                let request = RequestFrame {
+                    id: RequestId::Number(1),
+                    method: "queue.await_barrier".to_owned(),
+                    params: Some(serde_json::json!({"index": 9})),
+                };
+                let mut encoded = serde_json::to_vec(&request).unwrap();
+                encoded.push(b'\n');
+                client.write_all(&encoded).await.unwrap();
+                assert_eq!(started_rx.recv().await, Some(9));
+                client.shutdown().await.unwrap();
+
+                tokio::time::sleep(PEER_HANGUP_PROBE_INTERVAL * 2).await;
+                assert!(
+                    !server.is_finished(),
+                    "a write-half shutdown must not look like a full peer hangup"
+                );
+
+                permits.add_permits(1);
+                let mut reader = BufReader::new(client);
+                let response = read_line_limited(&mut reader, DEFAULT_MAX_FRAME_BYTES)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let response: Value = serde_json::from_slice(&response).unwrap();
+                assert_eq!(response["id"], 1);
+                assert_eq!(response["result"]["index"], 9);
+                server.await.unwrap().unwrap();
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]
