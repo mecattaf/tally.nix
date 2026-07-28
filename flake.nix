@@ -567,11 +567,12 @@
           inherit pkgs;
           tallyPackage = tally;
         };
+        # Public test-only key for the isolated Attic VM; never use it as a secret.
         atticServerEnvironment = pkgs.runCommand "tally-attic-server-environment" { } ''
-          echo ATTIC_SERVER_TOKEN_RS256_SECRET_BASE64="$(
-            ${pkgs.lib.getExe pkgs.openssl} genrsa -traditional 4096 \
-              | ${pkgs.coreutils}/bin/base64 -w0
-          )" >"$out"
+          printf 'ATTIC_SERVER_TOKEN_RS256_SECRET_BASE64=' >"$out"
+          ${pkgs.coreutils}/bin/base64 -w0 \
+            ${./test/fixtures/attic/throwaway-token-rs256.pem} >>"$out"
+          printf '\n' >>"$out"
         '';
         flowWorkerHandoff = pkgs.writeShellApplication {
           name = "tally-fs7-worker-handoff";
