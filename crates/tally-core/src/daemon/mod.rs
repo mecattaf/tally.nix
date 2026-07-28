@@ -13,17 +13,19 @@ pub use supervise::{
     spawn_supervised, SupervisedFactory, SupervisedFuture, SupervisedTask, SupervisionEvent,
 };
 
+use crate::wire::{method_class, MethodClass};
 #[cfg(test)]
 pub(crate) use barriers::WaitRegistration;
 pub(crate) use barriers::{await_registration, parse_job_barrier, single_job_barrier_value};
+#[cfg(test)]
+use completion::execution_request;
+use completion::hash_job_token;
 use completion::{
     append_context_witness, append_daemon_witness, canonical_job_model, canonical_verdict,
     completed_event, effective_gate_manifest, enqueued_event, execution_fact_for_termination,
     finalize_forced_locked, forced_witness, lock_gcroot_registration, release_child_charge,
     substituted_witness, GhTerminalWork, TerminalWork,
 };
-#[cfg(test)]
-use completion::{execution_request, hash_job_token};
 pub(crate) use notify::watchdog_tick;
 pub(crate) use replica::{spawn_commit_worker, CommitCommand, ReplicaCommitter, TaskDbCommitter};
 use rpc::control::{find_job, lease_request, lease_wire, state_name};
@@ -486,9 +488,10 @@ impl RpcHandler for DaemonHandler {
         request: RequestFrame,
     ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
         Box::pin(async move {
+            let caller = self.resolve_caller(&request)?;
             match dispatch_method(&request.method) {
-                Some(DispatchMethod::Enqueue) => self.enqueue(request.params).await,
-                Some(DispatchMethod::Continue) => self.continue_job(request.params).await,
+                Some(DispatchMethod::Enqueue) => self.enqueue(request.params, caller).await,
+                Some(DispatchMethod::Continue) => self.continue_job(request.params, caller).await,
                 Some(DispatchMethod::Retry) => self.retry_job(request.params).await,
                 Some(DispatchMethod::AwaitJob) => self.await_job(request.params).await,
                 Some(DispatchMethod::AwaitBarrier) => self.await_barrier(request.params).await,
@@ -513,7 +516,59 @@ impl RpcHandler for DaemonHandler {
     }
 }
 
+/// Server-resolved caller identity for one request.
+///
+/// A request that presents no `callerJobToken` is Client class. Under the
+/// ratified tenancy model — one machine, one trusted Unix user — that class is
+/// trusted as an operator, so this type carries no "untrusted" variant. The
+/// token exists so that a request which *does* identify as a job cannot pick
+/// which job it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallerIdentity {
+    Client,
+    Job(Uuid),
+}
+
+impl CallerIdentity {
+    fn job(self) -> Option<Uuid> {
+        match self {
+            Self::Client => None,
+            Self::Job(job_id) => Some(job_id),
+        }
+    }
+}
+
 impl DaemonHandler {
+    /// Derive the caller's class from the capability token it presented, and
+    /// deny the method classes a job may not reach.
+    ///
+    /// A job that simply omits its token is demoted to Client class rather than
+    /// rejected. That is deliberate and is not a hole: same-UID processes are
+    /// trusted per the tenancy model, and containment of hostile same-user code
+    /// belongs to the hardening presets, not to this token.
+    fn resolve_caller(&self, request: &RequestFrame) -> Result<CallerIdentity, WireError> {
+        let Some(token) = presented_job_token(request.params.as_ref())? else {
+            return Ok(CallerIdentity::Client);
+        };
+        let job_id = self
+            .job_tokens
+            .borrow()
+            .get(&hash_job_token(token))
+            .copied()
+            .ok_or_else(|| {
+                WireError::invalid(
+                    "callerJobToken is not a live job capability; it was never minted or has been revoked",
+                )
+            })?;
+        match method_class(&request.method) {
+            Some(MethodClass::Admin | MethodClass::Producer) => Err(WireError::invalid(format!(
+                "method {} is not available to a job capability",
+                request.method
+            ))),
+            _ => Ok(CallerIdentity::Job(job_id)),
+        }
+    }
+
     fn fail_stop(&self, error: DaemonError) -> WireError {
         let message = error.to_string();
         let _ = self.fatal.send(error);
@@ -526,6 +581,20 @@ impl DaemonHandler {
             .append_now(kind, payload)
             .map(|_| ())
             .map_err(|error| self.fail_stop(error.into()))
+    }
+}
+
+/// Read `callerJobToken` out of any request's params without consuming them.
+///
+/// Only the enqueue payload declares the field, so presenting it to another
+/// method still fails that method's own `deny_unknown_fields` decode. Reading it
+/// here first means the class denial reports the actual reason instead of a
+/// deserialization error.
+fn presented_job_token(params: Option<&Value>) -> Result<Option<&str>, WireError> {
+    match params.and_then(|params| params.get("callerJobToken")) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(token)) => Ok(Some(token)),
+        Some(_) => Err(WireError::invalid("callerJobToken must be a string")),
     }
 }
 

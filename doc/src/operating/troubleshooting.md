@@ -98,10 +98,15 @@ producer enqueues.
 
 ## `unknown parent job`
 
-Every admitted child receives `TALLY_JOB_ID`; the CLI turns that value into
-`callerJobId`. `TALLY_SOCKET` selects the daemon. A process launched as a tally
-job can therefore accidentally present coordinator A's parent ID to
-coordinator B:
+Every admitted local job receives three related values. `TALLY_JOB_ID` is its
+identity, `TALLY_SOCKET` selects the daemon, and `TALLY_JOB_TOKEN` is the
+capability the daemon minted for that job. The CLI forwards the first as
+`callerJobId` and the third as `callerJobToken`.
+
+**Identity comes from the token, not from `TALLY_JOB_ID`.** When a request
+presents a token, the daemon resolves the caller from it and ignores
+`callerJobId` except as a consistency check. A process launched as a tally job
+can therefore accidentally route to the wrong coordinator:
 
 ```text
 unknown parent job <ID>
@@ -113,23 +118,67 @@ Inspect the inherited routing before retrying:
 $ env | grep '^TALLY_'
 ```
 
-For an independent root submission to the same daemon, remove only the parent
-capability:
+Unsetting `TALLY_JOB_ID` alone no longer converts a child into a root
+submission — the token still resolves the caller, and the guardrails
+(`depthCap`, `fanoutCap`, `noEnqueue`, ancestry) still apply. Naming a
+different job's ID while holding your own token is rejected:
 
-```console
-$ env -u TALLY_JOB_ID tally enqueue --pool <pool> -- <program>
+```text
+callerJobId is not accepted as authorization; identity derives from TALLY_JOB_TOKEN
 ```
 
-For a child intentionally driving a different daemon, remove both inherited
-values and name the target explicitly:
+For a genuinely independent root submission from inside a job, drop the
+capability itself:
 
 ```console
-$ env -u TALLY_JOB_ID -u TALLY_SOCKET \
+$ env -u TALLY_JOB_TOKEN -u TALLY_JOB_ID tally enqueue --pool <pool> -- <program>
+```
+
+That is a supported operator action, not a bypass: under tally's tenancy model
+this machine has one trusted Unix user, and a process running as that user is
+trusted as an operator. The token exists so guardrails are real rather than
+cooperative and so one job cannot claim another job's identity — not to contain
+hostile same-user code. See [SECURITY.md](https://github.com/mecattaf/tally.nix/blob/main/SECURITY.md)
+for the full boundary.
+
+For a child intentionally driving a different daemon, remove all three
+inherited values and name the target explicitly. The other coordinator never
+minted your token, so carrying it there fails with
+`callerJobToken is not a live job capability`:
+
+```console
+$ env -u TALLY_JOB_ID -u TALLY_JOB_TOKEN -u TALLY_SOCKET \
     tally --socket /run/other/tally.sock enqueue --pool <pool> -- <program>
 ```
 
 Do not make an unknown UUID valid by editing durable rows. Fix the process
 environment or the explicit socket.
+
+## `callerJobToken is not a live job capability`
+
+The daemon mints one token per job generation and revokes it when the job
+reaches a terminal state. This error means the presented token was never minted
+by this daemon or has already been revoked:
+
+```text
+callerJobToken is not a live job capability; it was never minted or has been revoked
+```
+
+Common causes, in order of likelihood: the value was inherited by a process
+that outlived its job; `TALLY_SOCKET` points at a different coordinator than
+the one that minted the token; or the job was retried, which starts a new
+generation with a new token. A live job always sees its current token in its
+own environment — re-read it rather than caching it across a retry.
+
+Jobs are also denied the administrative and producer-internal method classes.
+Presenting a token to `queue.pause`, `queue.resume`, `queue.cancel`,
+`queue.retry`, `queue.drain`, or a `__producer.*` method fails with:
+
+```text
+method <NAME> is not available to a job capability
+```
+
+Run those as the operator, from a shell that does not carry `TALLY_JOB_TOKEN`.
 
 ## `dedup-key-conflict`
 

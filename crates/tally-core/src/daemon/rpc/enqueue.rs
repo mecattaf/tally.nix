@@ -1,19 +1,46 @@
 use super::super::*;
 
 impl DaemonHandler {
-    pub(crate) async fn enqueue(&self, params: Option<Value>) -> Result<Value, WireError> {
-        let payload: EnqueuePayload = decode_params(params)?;
-        self.enqueue_payload(payload, None).await
+    /// Submit as an operator, the class a connection presenting no capability
+    /// token falls into. Tests that exercise job-originated admission call
+    /// [`DaemonHandler::enqueue`] with a `CallerIdentity::Job` instead.
+    #[cfg(test)]
+    pub(crate) async fn enqueue_as_client(
+        &self,
+        params: Option<Value>,
+    ) -> Result<Value, WireError> {
+        self.enqueue(params, CallerIdentity::Client).await
     }
 
-    pub(crate) async fn continue_job(&self, params: Option<Value>) -> Result<Value, WireError> {
+    #[cfg(test)]
+    pub(crate) async fn continue_job_as_client(
+        &self,
+        params: Option<Value>,
+    ) -> Result<Value, WireError> {
+        self.continue_job(params, CallerIdentity::Client).await
+    }
+
+    pub(crate) async fn enqueue(
+        &self,
+        params: Option<Value>,
+        caller: CallerIdentity,
+    ) -> Result<Value, WireError> {
+        let payload: EnqueuePayload = decode_params(params)?;
+        self.enqueue_payload(payload, None, caller).await
+    }
+
+    pub(crate) async fn continue_job(
+        &self,
+        params: Option<Value>,
+        caller: CallerIdentity,
+    ) -> Result<Value, WireError> {
         let payload: EnqueuePayload = decode_params(params)?;
         if payload.resume_from.is_none() {
             return Err(WireError::invalid(
                 "queue.continue requires a resumeFrom task UUID",
             ));
         }
-        self.enqueue_payload(payload, None).await
+        self.enqueue_payload(payload, None, caller).await
     }
 
     pub(crate) async fn retry_job(&self, params: Option<Value>) -> Result<Value, WireError> {
@@ -300,6 +327,7 @@ impl DaemonHandler {
         &self,
         mut payload: EnqueuePayload,
         ingress_id: Option<String>,
+        caller: CallerIdentity,
     ) -> Result<Value, WireError> {
         let inline_brief = payload.brief.take();
         let brief_source_path = payload.brief_path.take();
@@ -312,8 +340,29 @@ impl DaemonHandler {
             .submission
             .as_ref()
             .is_some_and(|submission| submission.mode == SubmissionMode::Full);
-        let caller_job_id = payload.caller_job_id.clone();
+        payload.caller_job_token = None;
         let mut context = self.context.write().await;
+        if let Some(token_job_id) = caller.job() {
+            let resolved = stable_parent_key(&context, &token_job_id.to_string()).ok_or_else(
+                || {
+                    WireError::invalid(
+                        "callerJobToken is not a live job capability; it was never minted or has been revoked",
+                    )
+                },
+            )?;
+            // The token, not the request, decides who the caller is. A caller
+            // that also names itself must name the identity the token already
+            // resolved to; a mismatch is a sibling-impersonation attempt.
+            if payload.caller_job_id.as_deref().is_some_and(|presented| {
+                stable_parent_key(&context, presented).as_deref() != Some(resolved.as_str())
+            }) {
+                return Err(WireError::invalid(
+                    "callerJobId is not accepted as authorization; identity derives from TALLY_JOB_TOKEN",
+                ));
+            }
+            payload.caller_job_id = Some(resolved);
+        }
+        let caller_job_id = payload.caller_job_id.clone();
         if let Some(caller_job_id) = caller_job_id.as_deref() {
             ensure_guardrail_parent(&mut context, caller_job_id, false)?;
         }
@@ -1234,6 +1283,29 @@ impl DaemonHandler {
         }
         Ok(response)
     }
+}
+
+/// Canonical guardrail key for a presented job reference, without registering it.
+///
+/// `ensure_guardrail_parent` performs the same alias/UUID resolution but mutates
+/// the guardrail table as a side effect. Comparing a presented `callerJobId`
+/// against a token-resolved identity has to happen before that registration, so
+/// that a rejected impersonation attempt leaves no parent entry behind.
+fn stable_parent_key(context: &Context, presented: &str) -> Option<String> {
+    if let Some(info) = context.guardrails.parent(presented) {
+        return Some(info.parent_uuid.clone());
+    }
+    let job_id = context
+        .aliases
+        .get(presented)
+        .copied()
+        .or_else(|| Uuid::parse_str(presented).ok())?;
+    context
+        .jobs
+        .get(&job_id)
+        .map(|job| &job.row)
+        .or_else(|| context.rows.get(&job_id))
+        .map(|row| row.uuid.to_string())
 }
 
 fn ensure_guardrail_parent(
