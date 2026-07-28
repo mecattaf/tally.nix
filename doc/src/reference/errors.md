@@ -134,7 +134,7 @@ Exit classification uses the stable `code` field, not `name`:
 
 | Exit | Flow codes |
 |---:|---|
-| 2 | `flow-run-id-missing`, `flow-run-id-invalid`, `runner-identity-invalid`, `runner-identity-incomplete` |
+| 2 | `flow-run-id-missing`, `flow-run-id-invalid`, `runner-identity-invalid`, `runner-identity-incomplete`, `workload-mutex-parent-required` |
 | 4 | `flow-cancelled` |
 | 10 | `script-syntax`, `script-encoding`, `script-evaluation`, `script-exception`, `unhandled-rejection`, `determinism-violation`, `iteration-cap`, `runtime-limit`, `microtask-budget`, `wall-clock-budget` |
 | 20 | `replay-divergence`, `script-changed-mid-run`, `args-changed-mid-run`, `catalog-changed-mid-run` |

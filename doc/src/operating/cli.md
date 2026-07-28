@@ -342,8 +342,11 @@ replay waits behind whichever run acquired it next.
 
 Direct `tally flow run` holds no runner lease. For a mutex-declaring flow,
 enqueue the runner as a parent job with both `--pool flow` and
-`--pool <mutex>`; direct invocation is not sanctioned. Flows without a mutex
-may still run directly, with the documented depth/fanout bypass.
+`--pool <mutex>`; direct invocation is not sanctioned. When the configured
+flow registry matches the invoked script, a missing inherited parent identity
+returns `FlowStartupError` code `workload-mutex-parent-required` before daemon
+connection. Flows without a mutex may still run directly, with the documented
+depth/fanout bypass.
 
 `services.tally.flows.<name>.budgetPool` is validated only to be null or the
 name of an existing configured pool. Its value is not added to the runner

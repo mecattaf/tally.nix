@@ -150,8 +150,15 @@ $ tally enqueue \
 
 The admitted job supplies `TALLY_TASK_UUID` and `TALLY_JOB_ID`, so
 `tally flow run` derives the durable flow-run identity and applies ordinary
-parent depth and fanout accounting. Tally runs on one machine for one trusted
-user, using local AI plus authenticated Claude Code and Codex subscriptions.
+parent depth and fanout accounting. With a configured registry, the CLI matches
+the invoked script path to `services.tally.flows`, canonicalizing existing
+paths. A matching `workloadMutex` registration without that inherited parent
+identity fails before daemon connection with
+`workload-mutex-parent-required`. A matching registration without a mutex is
+allowed to run directly and keeps the documented depth/fanout bypass.
+
+Tally runs on one machine for one trusted user, using local AI plus
+authenticated Claude Code and Codex subscriptions.
 
 ## `budgetPool` is existence-check-only
 
