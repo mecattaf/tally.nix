@@ -13,7 +13,8 @@ use chrono::Utc;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use tally_client::{
-    default_config_path, resolve_max_frame_bytes, RpcClient, WireErrorCode, WireIoError,
+    await_job_with_rearm, default_config_path, resolve_max_frame_bytes, RpcClient, WireErrorCode,
+    WireIoError,
 };
 use tally_core::authorship::verify_authorship;
 use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
@@ -1149,11 +1150,13 @@ async fn execute(opts: Opts) -> Result<()> {
             )
             .await
         }
-        Some(Command::Enqueue(args)) => run_enqueue(&socket, opts.config.as_deref(), *args).await,
+        Some(Command::Enqueue(args)) => {
+            run_enqueue(&socket, opts.config.as_deref(), rpc_timeout, *args).await
+        }
         Some(Command::Gc(args)) => run_gc(args),
         Some(Command::Queue {
             command: QueueCommand::Enqueue(args),
-        }) => run_enqueue(&socket, opts.config.as_deref(), *args).await,
+        }) => run_enqueue(&socket, opts.config.as_deref(), rpc_timeout, *args).await,
         Some(Command::Queue { command }) => {
             run_queue(&socket, opts.config.as_deref(), rpc_timeout, command).await
         }
@@ -1574,6 +1577,7 @@ where
 async fn run_enqueue(
     socket: &Path,
     config_path: Option<&Path>,
+    rpc_timeout: Duration,
     mut args: EnqueueArgs,
 ) -> Result<()> {
     let has_invocation = args.invocation.is_some();
@@ -1685,12 +1689,21 @@ async fn run_enqueue(
         related_trigger: args.related_trigger,
         wait: args.wait,
     };
-    submit_payload(socket, config_path, "queue.enqueue", payload, args.wait).await
+    submit_payload(
+        socket,
+        config_path,
+        rpc_timeout,
+        "queue.enqueue",
+        payload,
+        args.wait,
+    )
+    .await
 }
 
 async fn submit_payload(
     socket: &Path,
     config_path: Option<&Path>,
+    rearm_window: Duration,
     method: &str,
     payload: EnqueuePayload,
     wait: bool,
@@ -1714,16 +1727,12 @@ async fn submit_payload(
         }
         return Ok(());
     }
-    let key = if let Some(task_uuid) = result.get("task_uuid").filter(|value| !value.is_null()) {
-        json!({"task_uuid": task_uuid})
-    } else if let Some(job_id) = result.get("job_id").filter(|value| !value.is_null()) {
-        json!({"job_id": job_id})
-    } else {
-        return Err(invalid(
-            "queue.enqueue returned neither task_uuid nor job_id for --wait",
-        ));
-    };
-    let waited = client.call("queue.await_job", Some(key)).await?;
+    let task_uuid = result
+        .get("task_uuid")
+        .and_then(Value::as_str)
+        .filter(|task_uuid| !task_uuid.is_empty())
+        .ok_or_else(|| invalid(format!("{method} returned no task_uuid for --wait")))?;
+    let waited = await_job_with_rearm(client, socket, task_uuid, rearm_window).await?;
     println!("{}", serde_json::to_string(&waited)?);
     let code = waited_exit_code(&waited);
     if code == 0 {
@@ -1811,7 +1820,15 @@ async fn run_queue(
                 related_trigger: None,
                 wait,
             };
-            submit_payload(socket, config_path, "queue.continue", payload, wait).await
+            submit_payload(
+                socket,
+                config_path,
+                rpc_timeout,
+                "queue.continue",
+                payload,
+                wait,
+            )
+            .await
         }
         QueueCommand::Retry { job } => {
             print_rpc(
@@ -1834,14 +1851,10 @@ async fn run_queue(
             .await
         }
         QueueCommand::AwaitJob { job } => {
-            print_rpc(
-                socket,
-                config_path,
-                rpc_timeout,
-                "queue.await_job",
-                Some(json!({"task_uuid": job})),
-            )
-            .await
+            let client = connect_rpc(socket, config_path).await?;
+            let result = await_job_with_rearm(client, socket, &job, rpc_timeout).await?;
+            println!("{}", serde_json::to_string(&result)?);
+            Ok(())
         }
         QueueCommand::AwaitBarrier { barrier } => {
             print_rpc(
@@ -2098,7 +2111,7 @@ async fn print_rpc(
     params: Option<Value>,
 ) -> Result<()> {
     let client = connect_rpc(socket, config_path).await?;
-    let result = if matches!(method, "queue.await_job" | "query.watch") {
+    let result = if method == "query.watch" {
         client.call(method, params).await?
     } else {
         client
@@ -2465,7 +2478,7 @@ fn error_exit_code(error: &anyhow::Error) -> i32 {
         }
         if let Some(wire) = cause.downcast_ref::<WireIoError>() {
             return match wire {
-                WireIoError::Unreachable { .. } => 3,
+                WireIoError::Unreachable { .. } | WireIoError::RearmDeadlineExceeded { .. } => 3,
                 WireIoError::Rpc(WireErrorCode::InvalidParams, _, _) => 2,
                 WireIoError::Rpc(WireErrorCode::NotFound, _, _) => 4,
                 _ => 1,
@@ -2777,6 +2790,12 @@ mod tests {
             source: io::Error::from(io::ErrorKind::NotFound),
         });
         assert_eq!(error_exit_code(&unreachable), 3);
+        let rearm_exhausted = anyhow::Error::new(WireIoError::RearmDeadlineExceeded {
+            method: "queue.await_job".to_owned(),
+            path: PathBuf::from("/missing"),
+            window: Duration::from_secs(60),
+        });
+        assert_eq!(error_exit_code(&rearm_exhausted), 3);
         for (wire_code, exit_code) in [
             (WireErrorCode::InvalidParams, 2),
             (WireErrorCode::NotFound, 4),

@@ -14,6 +14,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::{oneshot, Mutex};
+use tokio::time::Instant;
 
 /// The protocol's default symmetric request and response frame limit (16 MiB).
 pub const DEFAULT_MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
@@ -98,8 +99,103 @@ pub enum WireIoError {
     RequestTask(String),
     #[error("RPC method {method} exceeded its {deadline:?} deadline")]
     DeadlineExceeded { method: String, deadline: Duration },
+    #[error(
+        "daemon socket {path} did not return within {window:?} while re-arming RPC method {method}"
+    )]
+    RearmDeadlineExceeded {
+        method: String,
+        path: PathBuf,
+        window: Duration,
+    },
     #[error("RPC error {0:?}: {1}")]
     Rpc(WireErrorCode, String, Option<Value>),
+}
+
+/// Whether an idempotent RPC may be reissued after replacing its connection.
+///
+/// Callers still decide which operations are idempotent and how long to retry. This
+/// classifier only captures the transport and daemon-restart failures shared by the
+/// flow runner and the CLI's `queue.await_job` path.
+pub fn is_rearmable_rpc_error(method: &str, error: &WireIoError) -> bool {
+    match error {
+        WireIoError::Unreachable { .. }
+        | WireIoError::Io(_)
+        | WireIoError::Closed
+        | WireIoError::RequestTask(_) => true,
+        WireIoError::Rpc(WireErrorCode::EpochChanged | WireErrorCode::Timeout, _, _) => true,
+        WireIoError::Rpc(WireErrorCode::Internal, message, _)
+            if method == "queue.await_job" && message.contains("daemon stopped while waiting") =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+const AWAIT_JOB_METHOD: &str = "queue.await_job";
+const INITIAL_REARM_DELAY: Duration = Duration::from_millis(50);
+const MAX_REARM_DELAY: Duration = Duration::from_secs(2);
+
+/// Await a task across bounded daemon reconnects without resubmitting it.
+///
+/// The initial client is normally the connection that returned the task UUID
+/// from `queue.enqueue`. Only the idempotent `queue.await_job` request is
+/// reissued. A successfully armed long-poll has no deadline; `rearm_window`
+/// bounds only the time spent replacing a failed connection and reissuing the
+/// await after a reconnectable error.
+pub async fn await_job_with_rearm(
+    initial_client: RpcClient,
+    path: &Path,
+    task_uuid: &str,
+    rearm_window: Duration,
+) -> Result<Value, WireIoError> {
+    let params = Some(serde_json::json!({"task_uuid": task_uuid}));
+    let max_frame_bytes = initial_client.max_frame_bytes;
+    let mut client = initial_client;
+    let mut rearm_deadline = None;
+    let mut retry_delay = Duration::ZERO;
+
+    loop {
+        match client.call(AWAIT_JOB_METHOD, params.clone()).await {
+            Ok(result) => return Ok(result),
+            Err(error) if is_rearmable_rpc_error(AWAIT_JOB_METHOD, &error) => {}
+            Err(error) => return Err(error),
+        }
+
+        let deadline = *rearm_deadline.get_or_insert_with(|| Instant::now() + rearm_window);
+        loop {
+            if retry_delay != Duration::ZERO {
+                tokio::time::sleep_until(deadline.min(Instant::now() + retry_delay)).await;
+            }
+            if Instant::now() >= deadline {
+                return Err(WireIoError::RearmDeadlineExceeded {
+                    method: AWAIT_JOB_METHOD.to_owned(),
+                    path: path.to_owned(),
+                    window: rearm_window,
+                });
+            }
+
+            match RpcClient::connect_with_max_frame_bytes(path, max_frame_bytes).await {
+                Ok(replacement) => {
+                    client = replacement;
+                    retry_delay = next_rearm_delay(retry_delay);
+                    break;
+                }
+                Err(error) if is_rearmable_rpc_error(AWAIT_JOB_METHOD, &error) => {
+                    retry_delay = next_rearm_delay(retry_delay);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+fn next_rearm_delay(current: Duration) -> Duration {
+    if current == Duration::ZERO {
+        INITIAL_REARM_DELAY
+    } else {
+        current.saturating_mul(2).min(MAX_REARM_DELAY)
+    }
 }
 
 /// Errors resolving a client's frame limit from tally's rendered configuration.
@@ -618,6 +714,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn rearmable_errors_match_the_flow_runner_restart_contract() {
+        assert!(is_rearmable_rpc_error(
+            "queue.await_job",
+            &WireIoError::Closed
+        ));
+        assert!(is_rearmable_rpc_error(
+            "query.job",
+            &WireIoError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        ));
+        assert!(is_rearmable_rpc_error(
+            "query.job",
+            &WireIoError::Rpc(WireErrorCode::EpochChanged, "new epoch".to_owned(), None)
+        ));
+        assert!(is_rearmable_rpc_error(
+            "queue.await_job",
+            &WireIoError::Rpc(
+                WireErrorCode::Internal,
+                "daemon stopped while waiting for terminal state".to_owned(),
+                None,
+            )
+        ));
+        assert!(!is_rearmable_rpc_error(
+            "query.job",
+            &WireIoError::Rpc(
+                WireErrorCode::Internal,
+                "daemon stopped while waiting for terminal state".to_owned(),
+                None,
+            )
+        ));
+        assert!(!is_rearmable_rpc_error(
+            "queue.await_job",
+            &WireIoError::InvalidResponse("bad response id".to_owned())
+        ));
+        assert!(!is_rearmable_rpc_error(
+            "queue.await_job",
+            &WireIoError::RearmDeadlineExceeded {
+                method: "queue.await_job".to_owned(),
+                path: PathBuf::from("/run/tally.sock"),
+                window: Duration::from_secs(60),
+            }
+        ));
+    }
+
     #[tokio::test]
     async fn deadline_removes_pending_request_and_late_response_fails_cleanly() {
         let temp = tempfile::tempdir().unwrap();
@@ -682,5 +822,88 @@ mod tests {
             ClientReadFailure::InvalidResponse(message)
                 if message.contains("has no pending request")
         ));
+    }
+
+    #[tokio::test]
+    async fn await_job_rearms_only_the_await_after_a_disconnect() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let replacement_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let first: RequestFrame = serde_json::from_str(line.trim_end()).unwrap();
+            assert_eq!(first.method, AWAIT_JOB_METHOD);
+            assert_eq!(
+                first.params,
+                Some(serde_json::json!({"task_uuid": "task-7"}))
+            );
+            drop(reader);
+            drop(listener);
+            std::fs::remove_file(&replacement_socket).unwrap();
+
+            let replacement = UnixListener::bind(&replacement_socket).unwrap();
+            let (stream, _) = replacement.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let second: RequestFrame = serde_json::from_str(line.trim_end()).unwrap();
+            assert_eq!(second.method, AWAIT_JOB_METHOD);
+            assert_eq!(second.params, first.params);
+            let mut response = serde_json::to_vec(&serde_json::json!({
+                "id": second.id,
+                "result": {"task_uuid": "task-7", "verdict": "pass"},
+            }))
+            .unwrap();
+            response.push(b'\n');
+            writer.write_all(&response).await.unwrap();
+        });
+
+        let client = RpcClient::connect(&socket).await.unwrap();
+        let result = await_job_with_rearm(client, &socket, "task-7", Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(result["verdict"], "pass");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn await_job_rearm_exhaustion_is_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let removed_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            let request: RequestFrame = serde_json::from_str(line.trim_end()).unwrap();
+            assert_eq!(request.method, AWAIT_JOB_METHOD);
+            drop(reader);
+            drop(listener);
+            std::fs::remove_file(removed_socket).unwrap();
+        });
+
+        let client = RpcClient::connect(&socket).await.unwrap();
+        let window = Duration::from_millis(120);
+        let started = Instant::now();
+        let error = await_job_with_rearm(client, &socket, "task-8", window)
+            .await
+            .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            error,
+            WireIoError::RearmDeadlineExceeded {
+                ref method,
+                ref path,
+                window: actual,
+            } if method == AWAIT_JOB_METHOD && path == &socket && actual == window
+        ));
+        server.await.unwrap();
     }
 }

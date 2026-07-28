@@ -28,7 +28,9 @@ The default config is `$XDG_CONFIG_HOME/tally/config.json`, falling back to
 One-shot RPC commands have a 60-second client deadline. Override it with
 `--rpc-timeout-sec SECONDS` or `TALLY_RPC_TIMEOUT_SEC`; the flag takes precedence. Both values
 must be positive whole seconds. Long-polling `queue.await_job` and `query.watch` calls are not
-subject to this per-call deadline.
+subject to this per-call deadline. For job awaits, the same duration instead bounds only the
+reconnect/re-arm window after a re-armable daemon or transport failure; an intact long poll can
+remain open indefinitely.
 
 Check a rendered configuration without starting the daemon:
 
@@ -138,7 +140,9 @@ The flow runner uses full mode. A foreign client that needs the full disposition
 current limitation, not an implied default.
 
 `--wait` does not make enqueue one blocking RPC. The CLI first admits, then calls
-`queue.await_job` on the returned identity. This makes reconnect/re-arm behavior explicit.
+`queue.await_job` using the returned `task_uuid`. If a daemon restart interrupts that await, the
+CLI reconnects with backoff and reissues only the idempotent await for up to 60 seconds by
+default (or the selected RPC timeout). The legacy enqueue RPC is never retried.
 
 ## Queue control
 
@@ -199,7 +203,8 @@ files and return a snapshot barrier for all active jobs. The CLI does not expose
 
 `await-job` and `await-barrier` print raw terminal JSON. Unlike `enqueue --wait`, they do not map
 a failed returned verdict to a non-zero process exit; inspect the JSON in scripts. Job awaits
-can be reissued after daemon restart. Drain barriers cannot.
+use the same bounded reconnect/re-arm window as `enqueue --wait`. Exhausting that window is an
+unreachable-daemon exit (3). Drain barriers cannot be re-armed.
 
 ## Query
 

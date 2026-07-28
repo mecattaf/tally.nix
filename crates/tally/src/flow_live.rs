@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
-use tally_client::{RpcClient, WireErrorCode, WireIoError};
+use tally_client::{is_rearmable_rpc_error, RpcClient, WireErrorCode, WireIoError};
 use tally_core::query::QUERY_PROTOCOL_VERSION;
 use tally_core::taskdb::RelatedTrigger;
 use tally_flow::{
@@ -432,19 +432,7 @@ impl FlowClient for LiveFlowClient {
 }
 
 fn reconnectable(method: &str, error: &WireIoError) -> bool {
-    match error {
-        WireIoError::Unreachable { .. }
-        | WireIoError::Io(_)
-        | WireIoError::Closed
-        | WireIoError::RequestTask(_) => true,
-        WireIoError::Rpc(WireErrorCode::EpochChanged | WireErrorCode::Timeout, _, _) => true,
-        WireIoError::Rpc(WireErrorCode::Internal, message, _)
-            if method == "queue.await_job" && message.contains("daemon stopped while waiting") =>
-        {
-            true
-        }
-        _ => false,
-    }
+    is_rearmable_rpc_error(method, error)
 }
 
 fn call_timeout_error(method: &str, retries: u32) -> WireIoError {
