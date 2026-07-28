@@ -223,7 +223,7 @@ in
       };
 
       systemd.services.tally-retention = lib.mkIf cfg.retention.enable {
-        description = "prune expired tally Nix GC roots and collect the store";
+        description = "prune expired tally GC roots, capture archives, and ingress event files";
         after = [ "tally-daemon.service" ];
         requires = [ "tally-daemon.service" ];
         serviceConfig = {
@@ -231,21 +231,16 @@ in
           User = cfg.user;
           Group = cfg.group;
           TimeoutStartSec = "infinity";
-          ExecStart = lib.escapeShellArgs [
-            "${cfg.package}/bin/tally"
-            "gc"
-            "--horizon"
-            cfg.retention.horizon
-            "--collect"
-            "--data-dir"
-            (toString cfg.dataDir)
-          ];
+          ExecStart = lib.escapeShellArgs (common.mkRetentionArgv cfg);
           Environment = [ "PATH=${lib.makeBinPath [ pkgs.nix ]}" ];
           UMask = "0077";
           NoNewPrivileges = true;
           PrivateTmp = true;
           ProtectSystem = "strict";
-          ReadWritePaths = [ (toString cfg.dataDir) ];
+          ReadWritePaths = [
+            (toString cfg.dataDir)
+            (toString cfg.stateDir)
+          ];
         };
       };
 

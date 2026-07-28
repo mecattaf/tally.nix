@@ -471,28 +471,23 @@ in
 
         tally-retention = lib.mkIf cfg.retention.enable {
           Unit = {
-            Description = "prune expired tally Nix GC roots and collect the store";
+            Description = "prune expired tally GC roots, capture archives, and ingress event files";
             After = [ "tally-daemon.service" ];
             Requires = [ "tally-daemon.service" ];
           };
           Service = {
             Type = "oneshot";
             TimeoutStartSec = "infinity";
-            ExecStart = lib.escapeShellArgs [
-              "${cfg.package}/bin/tally"
-              "gc"
-              "--horizon"
-              cfg.retention.horizon
-              "--collect"
-              "--data-dir"
-              (toString cfg.dataDir)
-            ];
+            ExecStart = lib.escapeShellArgs (common.mkRetentionArgv cfg);
             Environment = [ "PATH=${lib.makeBinPath [ pkgs.nix ]}" ];
             UMask = "0077";
             NoNewPrivileges = true;
             PrivateTmp = true;
             ProtectSystem = "strict";
-            ReadWritePaths = [ (toString cfg.dataDir) ];
+            ReadWritePaths = [
+              (toString cfg.dataDir)
+              (toString cfg.stateDir)
+            ];
           };
         };
       }

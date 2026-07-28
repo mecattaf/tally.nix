@@ -1882,6 +1882,8 @@
               };
             };
           testScript = ''
+            import json
+
             machine.start()
             machine.wait_for_unit("multi-user.target")
             machine.wait_for_unit("home-manager-tally.service")
@@ -1927,15 +1929,87 @@
               "${pkgs.coreutils}/bin/sha256sum " + data + "/witness.jsonl"
             ).split()[0]
 
+            # Real aged files in the real state directory. Age is injected with
+            # mtimes rather than slept for, so the sweep is exercised against a
+            # live system without a wall-clock dependency.
+            state = "/var/lib/tally-retention/.local/state/tally"
+            coreutils = "${pkgs.coreutils}/bin"
+            archive_unit = state + "/capture/archive/00000000-0000-4000-8000-000000000001"
+            for directory in [
+              archive_unit,
+              state + "/events/done",
+              state + "/events/rejected",
+              state + "/events/processing",
+            ]:
+              machine.succeed(user + " " + coreutils + "/mkdir -p " + directory)
+
+            aged = [
+              (archive_unit + "/attempt-0000000001-epoch-00000000000000000001.out", "60 days ago"),
+              (archive_unit + "/attempt-0000000001-epoch-00000000000000000001.err", "60 days ago"),
+              (archive_unit + "/attempt-0000000002-epoch-00000000000000000001.out", "1 hour ago"),
+              (state + "/events/done/expired.json", "200 days ago"),
+              (state + "/events/done/recent.json", "10 days ago"),
+              (state + "/events/rejected/expired.json", "60 days ago"),
+              (state + "/events/rejected/recent.json", "1 hour ago"),
+              (state + "/events/processing/inflight.json", "400 days ago"),
+            ]
+            for path, age in aged:
+              machine.succeed(user + " " + coreutils + "/touch " + path)
+              machine.succeed(user + " " + coreutils + "/touch -d " + repr(age) + " " + path)
+
             report = machine.succeed(
-              user + " ${tally}/bin/tally gc --horizon 3s --collect --data-dir " + data
+              user + " ${tally}/bin/tally gc --horizon 3s --collect --data-dir " + data +
+              " --state-dir " + state
             )
-            assert '"rootsPruned":1' in report, report
+            swept = json.loads(report)
+            assert swept["rootsPruned"] == 1, report
+            assert swept["stateDirSwept"], report
+            # The daemon may archive captures of its own; only the two files
+            # aged past the horizon are eligible.
+            assert swept["captureArchivesExamined"] >= 3, report
+            assert swept["captureArchivesPruned"] == 2, report
+            assert swept["eventsDoneExamined"] == 2, report
+            assert swept["eventsDonePruned"] == 1, report
+            assert swept["eventsRejectedExamined"] == 2, report
+            assert swept["eventsRejectedPruned"] == 1, report
             assert ledger_hash == machine.succeed(
               "${pkgs.coreutils}/bin/sha256sum " + data + "/witness.jsonl"
             ).split()[0]
             machine.fail(nix_store + " --check-validity " + old_only)
             machine.succeed(nix_store + " --check-validity " + shared)
+
+            for expired in [
+              archive_unit + "/attempt-0000000001-epoch-00000000000000000001.out",
+              archive_unit + "/attempt-0000000001-epoch-00000000000000000001.err",
+              state + "/events/done/expired.json",
+              state + "/events/rejected/expired.json",
+            ]:
+              machine.fail("test -e " + expired)
+            for retained in [
+              archive_unit + "/attempt-0000000002-epoch-00000000000000000001.out",
+              state + "/events/done/recent.json",
+              state + "/events/rejected/recent.json",
+              state + "/events/processing/inflight.json",
+            ]:
+              machine.succeed("test -e " + retained)
+
+            # The count bound is the other half of the rejected envelope.
+            for index in range(4):
+              machine.succeed(
+                user + " " + coreutils + "/touch " + state +
+                "/events/rejected/hostile-" + str(index) + ".json"
+              )
+            capped = machine.succeed(
+              user + " ${tally}/bin/tally gc --horizon 3s --data-dir " + data +
+              " --state-dir " + state + " --events-rejected-max-count 2"
+            )
+            capped_report = json.loads(capped)
+            assert capped_report["eventsRejectedExamined"] == 5, capped
+            assert capped_report["eventsRejectedPruned"] == 3, capped
+            surviving = machine.succeed(
+              coreutils + "/ls " + state + "/events/rejected | " + coreutils + "/wc -l"
+            ).strip()
+            assert surviving == "2", surviving
           '';
         };
         flowMultiHostTest = pkgs.testers.runNixOSTest {
@@ -2820,6 +2894,10 @@
               enable = true;
               horizon = "30d";
               onCalendar = "daily";
+              captureArchiveHorizon = "30d";
+              eventsDoneHorizon = "180d";
+              eventsRejectedHorizon = "30d";
+              eventsRejectedMaxCount = 10000;
             };
           assert stockHome.config.services.tally.attestations.exec.enable;
           assert
@@ -2833,6 +2911,9 @@
           assert homeTimers ? tally-retention;
           assert homeTimers.tally-retention.Timer.OnCalendar == "daily";
           assert pkgs.lib.hasInfix "gc --horizon 30d --collect" (homeServiceExec "tally-retention");
+          assert pkgs.lib.hasInfix
+            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000"
+            (homeServiceExec "tally-retention");
           assert systemServices ? tally-drain;
           assert systemTimers ? tally-drain;
           assert systemTimers.tally-drain.timerConfig.OnActiveSec == "1s";
@@ -2844,9 +2925,17 @@
           assert systemServices ? tally-retention;
           assert systemTimers ? tally-retention;
           assert systemTimers.tally-retention.timerConfig.OnCalendar == "daily";
-          assert pkgs.lib.hasInfix "gc --horizon 30d --collect --data-dir /var/lib/tally/data" (
-            systemServiceExec "tally-retention"
-          );
+          assert pkgs.lib.hasInfix
+            "gc --horizon 30d --collect --data-dir /var/lib/tally/data --state-dir /var/lib/tally/state"
+            (systemServiceExec "tally-retention");
+          assert pkgs.lib.hasInfix
+            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000"
+            (systemServiceExec "tally-retention");
+          assert
+            systemServices.tally-retention.serviceConfig.ReadWritePaths == [
+              "/var/lib/tally/data"
+              "/var/lib/tally/state"
+            ];
           assert systemServices.tally-retention.serviceConfig.User == "tally";
           assert builtins.elem
             "services.tally.producers must be empty in the NixOS module; configure producers with the Home Manager module (tally.homeManagerModules.tally)"

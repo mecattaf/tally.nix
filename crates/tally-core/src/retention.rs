@@ -1,17 +1,86 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use fs2::FileExt;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::executor::CAPTURE_ARCHIVE_DIRECTORY;
 use crate::nix_store::GcRootBackend;
+use crate::producers::INGRESS_LOCK_FILE_NAME;
 use crate::witness::{is_nix_store_path, read_verified_records, WitnessError, WitnessRecord};
 
 const ROOT_DIRECTORY_PREFIX: &str = "witness-";
+const EVENTS_DIRECTORY: &str = "events";
+
+/// Ratified state-directory retention envelope.
+///
+/// `events/rejected` is the adversarially drivable set and carries both an age
+/// and a count bound; whichever is exceeded first prunes oldest-first.
+/// `events/done` is the audit trail and carries only the longer age bound.
+/// Capture archives expire on their own age bound and are deliberately *not*
+/// pinned by the witness ledger: the witness record is the durable evidence and
+/// an archive is only replay material.
+pub const DEFAULT_CAPTURE_ARCHIVE_MAX_AGE: &str = "30d";
+pub const DEFAULT_EVENTS_DONE_MAX_AGE: &str = "180d";
+pub const DEFAULT_EVENTS_REJECTED_MAX_AGE: &str = "30d";
+pub const DEFAULT_EVENTS_REJECTED_MAX_COUNT: usize = 10_000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StateRetentionPolicy {
+    pub capture_archive_max_age: Duration,
+    pub events_done_max_age: Duration,
+    pub events_rejected_max_age: Duration,
+    pub events_rejected_max_count: usize,
+}
+
+impl StateRetentionPolicy {
+    pub fn parse(
+        capture_archive_max_age: &str,
+        events_done_max_age: &str,
+        events_rejected_max_age: &str,
+        events_rejected_max_count: usize,
+    ) -> Result<Self, RetentionError> {
+        Ok(Self {
+            capture_archive_max_age: parse_horizon(capture_archive_max_age)?,
+            events_done_max_age: parse_horizon(events_done_max_age)?,
+            events_rejected_max_age: parse_horizon(events_rejected_max_age)?,
+            events_rejected_max_count,
+        })
+    }
+}
+
+impl Default for StateRetentionPolicy {
+    fn default() -> Self {
+        Self::parse(
+            DEFAULT_CAPTURE_ARCHIVE_MAX_AGE,
+            DEFAULT_EVENTS_DONE_MAX_AGE,
+            DEFAULT_EVENTS_REJECTED_MAX_AGE,
+            DEFAULT_EVENTS_REJECTED_MAX_COUNT,
+        )
+        .expect("ratified default retention horizons are valid systemd timespans")
+    }
+}
+
+/// Everything one sweep needs. There is exactly one sweep entry point
+/// (`run_gc`) and exactly one timer driving it; the state-directory pruners run
+/// under the same GC-roots lock as the Nix GC-root reconciliation.
+#[derive(Debug, Clone)]
+pub struct GcRequest<'a> {
+    pub data_dir: &'a Path,
+    /// Daemon state directory. `None` skips the state-directory pruners
+    /// entirely, which is what a data-dir-only invocation wants.
+    pub state_dir: Option<&'a Path>,
+    pub horizon_text: &'a str,
+    pub state_retention: StateRetentionPolicy,
+    pub now: DateTime<Utc>,
+    pub dry_run: bool,
+    pub collect: bool,
+}
 
 pub struct GcRootsLock {
     _file: File,
@@ -69,6 +138,14 @@ pub struct GcReport {
     pub roots_examined: usize,
     pub roots_pruned: usize,
     pub root_directories_pruned: usize,
+    pub state_dir_swept: bool,
+    pub capture_archives_examined: usize,
+    pub capture_archives_pruned: usize,
+    pub capture_archive_directories_pruned: usize,
+    pub events_done_examined: usize,
+    pub events_done_pruned: usize,
+    pub events_rejected_examined: usize,
+    pub events_rejected_pruned: usize,
     pub collected: bool,
 }
 
@@ -246,15 +323,19 @@ pub fn reconcile_recent_roots(
     Ok(reports)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn run_gc(
-    data_dir: &Path,
-    horizon_text: &str,
-    now: DateTime<Utc>,
-    dry_run: bool,
-    collect: bool,
+    request: GcRequest<'_>,
     backend: &impl GcRootBackend,
 ) -> Result<GcReport, RetentionError> {
+    let GcRequest {
+        data_dir,
+        state_dir,
+        horizon_text,
+        state_retention,
+        now,
+        dry_run,
+        collect,
+    } = request;
     let horizon = parse_horizon(horizon_text)?;
     let gcroots_dir = data_dir.join("gcroots");
     let lock_path = gcroots_lock_path(&gcroots_dir);
@@ -367,6 +448,11 @@ pub fn run_gc(
         }
     }
 
+    let state = match state_dir {
+        Some(state_dir) => sweep_state_directory(state_dir, &state_retention, now, dry_run)?,
+        None => StateSweep::default(),
+    };
+
     let collected = collect && !dry_run;
     if collected {
         backend.collect_garbage().map_err(RetentionError::Collect)?;
@@ -379,8 +465,219 @@ pub fn run_gc(
         roots_examined,
         roots_pruned,
         root_directories_pruned: directories_pruned,
+        state_dir_swept: state_dir.is_some(),
+        capture_archives_examined: state.capture_archives_examined,
+        capture_archives_pruned: state.capture_archives_pruned,
+        capture_archive_directories_pruned: state.capture_archive_directories_pruned,
+        events_done_examined: state.events_done_examined,
+        events_done_pruned: state.events_done_pruned,
+        events_rejected_examined: state.events_rejected_examined,
+        events_rejected_pruned: state.events_rejected_pruned,
         collected,
     })
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct StateSweep {
+    capture_archives_examined: usize,
+    capture_archives_pruned: usize,
+    capture_archive_directories_pruned: usize,
+    events_done_examined: usize,
+    events_done_pruned: usize,
+    events_rejected_examined: usize,
+    events_rejected_pruned: usize,
+}
+
+/// Prunes the two unbounded on-disk sets under the daemon state directory.
+///
+/// Runs inside `run_gc`, under the GC-roots lock it already holds, so there is
+/// no second sweep entry point and no second timer. The ingress directories are
+/// additionally guarded by the producer ingress lock, because the daemon renames
+/// consumed event files into `done`/`rejected` while holding it.
+fn sweep_state_directory(
+    state_dir: &Path,
+    policy: &StateRetentionPolicy,
+    now: DateTime<Utc>,
+    dry_run: bool,
+) -> Result<StateSweep, RetentionError> {
+    let mut sweep = StateSweep::default();
+    let archive_root = state_dir.join(CAPTURE_ARCHIVE_DIRECTORY);
+    let capture_cutoff = mtime_cutoff(now, policy.capture_archive_max_age)?;
+    prune_capture_archives(&archive_root, capture_cutoff, dry_run, &mut sweep)?;
+
+    let events_dir = state_dir.join(EVENTS_DIRECTORY);
+    if !events_dir.is_dir() {
+        return Ok(sweep);
+    }
+    let _ingress_lock = lock_ingress_for_sweep(&events_dir)?;
+
+    let done_cutoff = mtime_cutoff(now, policy.events_done_max_age)?;
+    let done = prune_directory(
+        &events_dir.join("done"),
+        done_cutoff,
+        // The audit trail has no count bound; the ruling deliberately gives the
+        // two event sets separate envelopes.
+        usize::MAX,
+        dry_run,
+    )?;
+    sweep.events_done_examined = done.examined;
+    sweep.events_done_pruned = done.pruned;
+
+    let rejected_cutoff = mtime_cutoff(now, policy.events_rejected_max_age)?;
+    let rejected = prune_directory(
+        &events_dir.join("rejected"),
+        rejected_cutoff,
+        policy.events_rejected_max_count,
+        dry_run,
+    )?;
+    sweep.events_rejected_examined = rejected.examined;
+    sweep.events_rejected_pruned = rejected.pruned;
+    Ok(sweep)
+}
+
+fn lock_ingress_for_sweep(events_dir: &Path) -> Result<File, RetentionError> {
+    let path = events_dir.join(INGRESS_LOCK_FILE_NAME);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|source| io_error(&path, source))?;
+    FileExt::lock_exclusive(&file).map_err(|source| io_error(&path, source))?;
+    Ok(file)
+}
+
+fn prune_capture_archives(
+    archive_root: &Path,
+    cutoff: SystemTime,
+    dry_run: bool,
+    sweep: &mut StateSweep,
+) -> Result<(), RetentionError> {
+    if !archive_root.is_dir() {
+        return Ok(());
+    }
+    let mut units = std::fs::read_dir(archive_root)
+        .map_err(|source| io_error(archive_root, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| io_error(archive_root, source))?;
+    units.sort_by_key(std::fs::DirEntry::file_name);
+    for unit in units {
+        let unit_dir = unit.path();
+        let metadata = match std::fs::symlink_metadata(&unit_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error(&unit_dir, source)),
+        };
+        // Anything that is not a plain per-unit directory was not written by
+        // the archiver; leave it for an operator rather than deleting it.
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        // Sampled before pruning: removing entries bumps the directory mtime,
+        // which would otherwise make an emptied directory look freshly touched.
+        let directory_expired = metadata
+            .modified()
+            .map(|modified| modified < cutoff)
+            .unwrap_or(false);
+        let outcome = prune_directory(&unit_dir, cutoff, usize::MAX, dry_run)?;
+        sweep.capture_archives_examined += outcome.examined;
+        sweep.capture_archives_pruned += outcome.pruned;
+        if !(directory_expired && outcome.skipped == 0 && outcome.examined == outcome.pruned) {
+            continue;
+        }
+        if dry_run {
+            sweep.capture_archive_directories_pruned += 1;
+            continue;
+        }
+        match std::fs::remove_dir(&unit_dir) {
+            Ok(()) => sweep.capture_archive_directories_pruned += 1,
+            // A concurrent archive write can repopulate the directory between
+            // the file prune and this rmdir. Leaving it to the next sweep is
+            // correct; failing the whole sweep is not.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ENOTEMPTY) => {}
+            Err(source) => return Err(io_error(&unit_dir, source)),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PruneOutcome {
+    examined: usize,
+    pruned: usize,
+    skipped: usize,
+}
+
+/// Prunes regular files in `directory` whose mtime predates `cutoff`, then
+/// prunes the oldest survivors until at most `max_count` remain.
+fn prune_directory(
+    directory: &Path,
+    cutoff: SystemTime,
+    max_count: usize,
+    dry_run: bool,
+) -> Result<PruneOutcome, RetentionError> {
+    let mut outcome = PruneOutcome::default();
+    if !directory.is_dir() {
+        return Ok(outcome);
+    }
+    let entries = std::fs::read_dir(directory)
+        .map_err(|source| io_error(directory, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| io_error(directory, source))?;
+
+    let mut expired = Vec::new();
+    let mut retained: Vec<(SystemTime, PathBuf)> = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error(&path, source)),
+        };
+        // Directories, symlinks and device nodes are not archiver or ingress
+        // output; count them as skipped and never unlink them.
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            outcome.skipped += 1;
+            continue;
+        }
+        outcome.examined += 1;
+        let modified = metadata
+            .modified()
+            .map_err(|source| io_error(&path, source))?;
+        if modified < cutoff {
+            expired.push(path);
+        } else {
+            retained.push((modified, path));
+        }
+    }
+
+    if retained.len() > max_count {
+        retained.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        let overflow = retained.len() - max_count;
+        expired.extend(retained.drain(..overflow).map(|(_, path)| path));
+    }
+
+    expired.sort();
+    for path in expired {
+        outcome.pruned += 1;
+        if dry_run {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&path, source)),
+        }
+    }
+    Ok(outcome)
+}
+
+fn mtime_cutoff(now: DateTime<Utc>, max_age: Duration) -> Result<SystemTime, RetentionError> {
+    Ok(SystemTime::from(cutoff(now, max_age)?))
 }
 
 fn cutoff(now: DateTime<Utc>, horizon: Duration) -> Result<DateTime<Utc>, RetentionError> {
@@ -578,7 +875,7 @@ mod tests {
         .unwrap();
 
         let backend = FakeBackend::default();
-        let dry_report = run_gc(data, "30d", now, true, true, &backend).unwrap();
+        let dry_report = run_gc(gc_request(data, now, true), &backend).unwrap();
         assert_eq!(dry_report.roots_pruned, 1);
         assert!(!dry_report.collected);
         assert!(
@@ -586,7 +883,7 @@ mod tests {
         );
         assert_eq!(*backend.collections.borrow(), 0);
 
-        let report = run_gc(data, "30d", now, false, true, &backend).unwrap();
+        let report = run_gc(gc_request(data, now, false), &backend).unwrap();
         assert_eq!(report.live_paths, 1);
         assert_eq!(report.roots_examined, 2);
         assert_eq!(report.roots_pruned, 1);
@@ -633,11 +930,256 @@ mod tests {
         };
 
         assert!(matches!(
-            run_gc(data, "30d", now, false, true, &backend),
+            run_gc(gc_request(data, now, false), &backend),
             Err(RetentionError::LiveRootRegistration { sequence: 2, .. })
         ));
         assert!(fs::symlink_metadata(old_link).is_ok());
         assert_eq!(*backend.collections.borrow(), 0);
+    }
+
+    fn gc_request(data: &Path, now: DateTime<Utc>, dry_run: bool) -> GcRequest<'_> {
+        GcRequest {
+            data_dir: data,
+            state_dir: None,
+            horizon_text: "30d",
+            state_retention: StateRetentionPolicy::default(),
+            now,
+            dry_run,
+            collect: true,
+        }
+    }
+
+    fn write_aged(path: &Path, age: chrono::TimeDelta, now: DateTime<Utc>) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"payload").unwrap();
+        set_mtime(path, now - age);
+    }
+
+    fn set_mtime(path: &Path, at: DateTime<Utc>) {
+        // Age is injected through mtimes rather than slept for, so the sweep is
+        // exercised against real files without a wall-clock dependency.
+        let times = fs::FileTimes::new()
+            .set_accessed(SystemTime::from(at))
+            .set_modified(SystemTime::from(at));
+        fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(times)
+            .unwrap();
+    }
+
+    fn ledger_only_state(data: &Path, now: DateTime<Utc>) {
+        let mut ledger = WitnessLedger::open(data.join("witness.jsonl")).unwrap();
+        append(
+            &mut ledger,
+            now - chrono::TimeDelta::days(1),
+            vec![SHARED.to_owned()],
+            None,
+        );
+    }
+
+    #[test]
+    fn ratified_defaults_match_the_retention_envelope() {
+        let policy = StateRetentionPolicy::default();
+        assert_eq!(
+            policy.capture_archive_max_age,
+            Duration::from_secs(30 * 86_400)
+        );
+        assert_eq!(
+            policy.events_done_max_age,
+            Duration::from_secs(180 * 86_400)
+        );
+        assert_eq!(
+            policy.events_rejected_max_age,
+            Duration::from_secs(30 * 86_400)
+        );
+        assert_eq!(policy.events_rejected_max_count, 10_000);
+    }
+
+    #[test]
+    fn state_sweep_expires_by_age_without_pinning_archives_to_the_ledger() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&data).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
+        ledger_only_state(&data, now);
+
+        // The archive belongs to the attempt the live witness record describes,
+        // and still expires: witness records do not pin archives.
+        let unit = state.join(CAPTURE_ARCHIVE_DIRECTORY).join("unit-a");
+        let stale_out = unit.join("attempt-0000000001-epoch-1.out");
+        let fresh_out = unit.join("attempt-0000000002-epoch-1.err");
+        write_aged(&stale_out, chrono::TimeDelta::days(31), now);
+        write_aged(&fresh_out, chrono::TimeDelta::days(29), now);
+
+        let done_old = state.join("events/done/old.json");
+        let done_fresh = state.join("events/done/fresh.json");
+        write_aged(&done_old, chrono::TimeDelta::days(181), now);
+        write_aged(&done_fresh, chrono::TimeDelta::days(179), now);
+
+        let rejected_old = state.join("events/rejected/old.json");
+        let rejected_fresh = state.join("events/rejected/fresh.json");
+        write_aged(&rejected_old, chrono::TimeDelta::days(31), now);
+        write_aged(&rejected_fresh, chrono::TimeDelta::days(29), now);
+
+        let processing = state.join("events/processing/inflight.json");
+        write_aged(&processing, chrono::TimeDelta::days(400), now);
+
+        let backend = FakeBackend::default();
+        let request = GcRequest {
+            data_dir: &data,
+            state_dir: Some(&state),
+            horizon_text: "30d",
+            state_retention: StateRetentionPolicy::default(),
+            now,
+            dry_run: true,
+            collect: false,
+        };
+        let dry = run_gc(request.clone(), &backend).unwrap();
+        assert!(dry.state_dir_swept);
+        assert_eq!(dry.capture_archives_pruned, 1);
+        assert_eq!(dry.events_done_pruned, 1);
+        assert_eq!(dry.events_rejected_pruned, 1);
+        assert!(stale_out.exists());
+
+        let report = run_gc(
+            GcRequest {
+                dry_run: false,
+                ..request
+            },
+            &backend,
+        )
+        .unwrap();
+        assert_eq!(report.capture_archives_examined, 2);
+        assert_eq!(report.capture_archives_pruned, 1);
+        assert_eq!(report.capture_archive_directories_pruned, 0);
+        assert_eq!(report.events_done_examined, 2);
+        assert_eq!(report.events_done_pruned, 1);
+        assert_eq!(report.events_rejected_examined, 2);
+        assert_eq!(report.events_rejected_pruned, 1);
+        assert!(!stale_out.exists());
+        assert!(fresh_out.exists());
+        assert!(!done_old.exists());
+        assert!(done_fresh.exists());
+        assert!(!rejected_old.exists());
+        assert!(rejected_fresh.exists());
+        // In-flight claims are never retention material.
+        assert!(processing.exists());
+    }
+
+    #[test]
+    fn rejected_count_bound_prunes_oldest_first_and_done_has_no_count_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&data).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
+        ledger_only_state(&data, now);
+
+        for index in 0..6_i64 {
+            write_aged(
+                &state.join(format!("events/rejected/hostile-{index}.json")),
+                chrono::TimeDelta::hours(index),
+                now,
+            );
+            write_aged(
+                &state.join(format!("events/done/audit-{index}.json")),
+                chrono::TimeDelta::hours(index),
+                now,
+            );
+        }
+
+        let report = run_gc(
+            GcRequest {
+                data_dir: &data,
+                state_dir: Some(&state),
+                horizon_text: "30d",
+                state_retention: StateRetentionPolicy {
+                    events_rejected_max_count: 2,
+                    ..StateRetentionPolicy::default()
+                },
+                now,
+                dry_run: false,
+                collect: false,
+            },
+            &FakeBackend::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.events_rejected_examined, 6);
+        assert_eq!(report.events_rejected_pruned, 4);
+        assert_eq!(report.events_done_examined, 6);
+        assert_eq!(report.events_done_pruned, 0);
+        // Newest two survive: index 0 is the youngest.
+        for index in 0..2_i64 {
+            assert!(state
+                .join(format!("events/rejected/hostile-{index}.json"))
+                .exists());
+        }
+        for index in 2..6_i64 {
+            assert!(!state
+                .join(format!("events/rejected/hostile-{index}.json"))
+                .exists());
+        }
+    }
+
+    #[test]
+    fn fully_expired_archive_directory_is_removed_and_foreign_entries_are_left_alone() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&data).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
+        ledger_only_state(&data, now);
+
+        let archive_root = state.join(CAPTURE_ARCHIVE_DIRECTORY);
+        let expired_unit = archive_root.join("unit-expired");
+        write_aged(
+            &expired_unit.join("attempt-0000000001-epoch-1.out"),
+            chrono::TimeDelta::days(45),
+            now,
+        );
+        write_aged(
+            &expired_unit.join("attempt-0000000001-epoch-1.err"),
+            chrono::TimeDelta::days(45),
+            now,
+        );
+        let expired_times = fs::FileTimes::new()
+            .set_accessed(SystemTime::from(now - chrono::TimeDelta::days(45)))
+            .set_modified(SystemTime::from(now - chrono::TimeDelta::days(45)));
+        File::open(&expired_unit)
+            .unwrap()
+            .set_times(expired_times)
+            .unwrap();
+
+        let guarded_unit = archive_root.join("unit-guarded");
+        fs::create_dir_all(&guarded_unit).unwrap();
+        let dangling = guarded_unit.join("dangling.out");
+        symlink("/nonexistent-capture", &dangling).unwrap();
+
+        let report = run_gc(
+            GcRequest {
+                data_dir: &data,
+                state_dir: Some(&state),
+                horizon_text: "30d",
+                state_retention: StateRetentionPolicy::default(),
+                now,
+                dry_run: false,
+                collect: false,
+            },
+            &FakeBackend::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.capture_archives_pruned, 2);
+        assert_eq!(report.capture_archive_directories_pruned, 1);
+        assert!(!expired_unit.exists());
+        // A symlink in an archive directory was never written by the archiver;
+        // it is neither unlinked nor allowed to drag its directory away.
+        assert!(fs::symlink_metadata(&dangling).is_ok());
+        assert!(guarded_unit.exists());
     }
 
     fn append_record_template() -> WitnessRecord {

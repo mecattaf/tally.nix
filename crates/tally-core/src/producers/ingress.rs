@@ -219,9 +219,13 @@ pub(super) fn create_ingress_dirs(events_dir: &Path) -> Result<(), ProducerError
     Ok(())
 }
 
+/// Guards every rename into and out of the ingress directories, including the
+/// retention sweep that prunes `done`/`rejected`.
+pub const INGRESS_LOCK_FILE_NAME: &str = ".producer-ingress.lock";
+
 pub(super) fn lock_ingress(events_dir: &Path) -> Result<File, ProducerError> {
     create_dir_durable(events_dir)?;
-    let path = events_dir.join(".producer-ingress.lock");
+    let path = events_dir.join(INGRESS_LOCK_FILE_NAME);
     let lock = open_private_rw(&path)?;
     lock.lock_exclusive()
         .map_err(|source| ProducerError::Io { path, source })?;

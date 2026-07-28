@@ -860,12 +860,30 @@ fn run_gc(args: GcArgs) -> Result<()> {
     if !data_dir.is_absolute() {
         return Err(invalid("--data-dir must be absolute"));
     }
+    let state_dir = if args.skip_state_dir {
+        None
+    } else {
+        Some(args.state_dir.map_or_else(default_state_dir, Ok)?)
+    };
+    if state_dir.as_deref().is_some_and(|dir| !dir.is_absolute()) {
+        return Err(invalid("--state-dir must be absolute"));
+    }
+    let state_retention = tally_core::retention::StateRetentionPolicy::parse(
+        &args.capture_archive_horizon,
+        &args.events_done_horizon,
+        &args.events_rejected_horizon,
+        args.events_rejected_max_count,
+    )?;
     let report = tally_core::retention::run_gc(
-        &data_dir,
-        &args.horizon,
-        Utc::now(),
-        args.dry_run,
-        args.collect,
+        tally_core::retention::GcRequest {
+            data_dir: &data_dir,
+            state_dir: state_dir.as_deref(),
+            horizon_text: &args.horizon,
+            state_retention,
+            now: Utc::now(),
+            dry_run: args.dry_run,
+            collect: args.collect,
+        },
         &tally_core::nix_store::NixStore::default(),
     )?;
     println!("{}", serde_json::to_string(&report)?);
