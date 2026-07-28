@@ -23,8 +23,8 @@ pub use dialect::{check_script, validate_flow_pool_predicates, CheckOptions, Che
 pub use engine::{run_script, LifecycleSink, RunOptions, VecLifecycleSink};
 pub use error::{FlowError, SourceLocation};
 pub use model::{
-    flow_canonical_payload_fields, node_spec_fields, Admission, ClientError, Derivation,
-    DerivationOutput, Disposition, FlowEnqueueFieldDisposition, FlowEnqueueFieldParity,
+    flow_canonical_payload_fields, node_spec_fields, sugar_reserved_fields, Admission, ClientError,
+    Derivation, DerivationOutput, Disposition, FlowEnqueueFieldDisposition, FlowEnqueueFieldParity,
     FlowSubmission, NodeCanonicalProjection, NodeFailure, NodeResult, NodeSpec,
     NodeSpecFieldContract, NodeSpecSurface, NodeWireProjection, Orchestration, RunInspection,
     RunReport, SelectionProvenance, Verdict, FLOW_ENQUEUE_FIELD_PARITY, NODE_SPEC_FIELD_CONTRACT,

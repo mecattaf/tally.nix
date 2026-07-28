@@ -20,8 +20,8 @@ use crate::catalog::sha256;
 use crate::dialect::validate_instance;
 use crate::executor::FlowJobExecutor;
 use crate::model::{
-    flow_canonical_payload_fields, is_nix_store_path, node_spec_fields, NodeSpecSurface,
-    SubmissionPlan,
+    flow_canonical_payload_fields, is_nix_store_path, node_spec_fields, sugar_reserved_fields,
+    NodeSpecSurface, SubmissionPlan,
 };
 use crate::{
     check_script, resolve_members, Catalog, CheckOptions, Derivation, Disposition, FlowClient,

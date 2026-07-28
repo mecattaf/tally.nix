@@ -772,6 +772,30 @@ pub fn node_spec_fields(surface: NodeSpecSurface) -> impl Iterator<Item = &'stat
         .map(|field| field.json_name)
 }
 
+/// The spec fields each sugar helper fixes for itself.
+///
+/// Setting one of these is `FlowSpecError`/`sugar-option-conflict`. The dialect
+/// lint and the evaluation-time guard read the same list so a script cannot pass
+/// `tally flow check` and then die on the first node, and `None` marks a name
+/// that is not a sugar helper at all.
+#[must_use]
+pub fn sugar_reserved_fields(helper: &str) -> Option<&'static [&'static str]> {
+    match helper {
+        "claude" | "codex" => Some(&["adapter", "pools", "argv", "prompt", "brief"]),
+        "local" => Some(&[
+            "adapter",
+            "pools",
+            "argv",
+            "prompt",
+            "brief",
+            "adapterOptions",
+            "selection",
+        ]),
+        "sh" => Some(&["adapter", "argv", "prompt"]),
+        _ => None,
+    }
+}
+
 #[must_use]
 pub fn flow_canonical_payload_fields() -> Vec<&'static str> {
     let mut fields = NODE_SPEC_FIELD_CONTRACT

@@ -83,7 +83,7 @@ pub(super) fn native_claude(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    native_agent_sugar("claude-code", "claude-window", args, context)
+    native_agent_sugar("claude", "claude-code", "claude-window", args, context)
 }
 
 pub(super) fn native_codex(
@@ -91,10 +91,11 @@ pub(super) fn native_codex(
     args: &[JsValue],
     context: &mut Context,
 ) -> JsResult<JsValue> {
-    native_agent_sugar("codex", "codex-window", args, context)
+    native_agent_sugar("codex", "codex", "codex-window", args, context)
 }
 
 pub(super) fn native_agent_sugar(
+    helper: &str,
     adapter: &str,
     pool: &str,
     args: &[JsValue],
@@ -103,12 +104,7 @@ pub(super) fn native_agent_sugar(
     let location = call_site(context);
     let prompt = required_string(args.first(), "prompt", location, context)?;
     let (mut options, settle) = sugar_options(args.get(1), location, context)?;
-    reject_sugar_conflicts(
-        &options,
-        &["adapter", "pools", "argv", "prompt", "brief"],
-        location,
-        context,
-    )?;
+    reject_sugar_conflicts(&options, reserved_fields(helper), location, context)?;
     let revisions = host(context)?.agent_revisions(adapter, &prompt);
     options.insert("adapter".to_owned(), Value::String(adapter.to_owned()));
     options.insert("pools".to_owned(), json!([pool]));
@@ -130,7 +126,7 @@ pub(super) fn native_sh(
         context,
     )?;
     let (mut options, settle) = sugar_options(args.get(1), location, context)?;
-    reject_sugar_conflicts(&options, &["adapter", "argv", "prompt"], location, context)?;
+    reject_sugar_conflicts(&options, reserved_fields("sh"), location, context)?;
     options.insert("argv".to_owned(), argv);
     options.insert("adapter".to_owned(), Value::String("shell".to_owned()));
     let spec = decode_sugar_spec(options, location, context)?;
@@ -149,20 +145,7 @@ pub(super) fn native_local(
     allowed.push("member");
     reject_unknown_keys(&Value::Object(options.clone()), &allowed, location)
         .map_err(|error| flow_to_js_error(error, context))?;
-    reject_sugar_conflicts(
-        &options,
-        &[
-            "adapter",
-            "pools",
-            "argv",
-            "prompt",
-            "brief",
-            "adapterOptions",
-            "selection",
-        ],
-        location,
-        context,
-    )?;
+    reject_sugar_conflicts(&options, reserved_fields("local"), location, context)?;
     let member_value = options.remove("member").ok_or_else(|| {
         flow_to_js_error(
             FlowError::new(
@@ -579,6 +562,10 @@ pub(super) fn decode_sugar_spec(
             context,
         )
     })
+}
+
+fn reserved_fields(helper: &str) -> &'static [&'static str] {
+    sugar_reserved_fields(helper).expect("every sugar native names a known helper")
 }
 
 pub(super) fn reject_sugar_conflicts(

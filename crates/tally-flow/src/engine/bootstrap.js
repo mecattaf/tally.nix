@@ -5,6 +5,33 @@ const __flowOutcome = promise => Promise.resolve(promise).then(
   error => ({ ok: false, error })
 );
 
+const __flowThenable = value =>
+  value !== null &&
+  (typeof value === "object" || typeof value === "function") &&
+  typeof value.then === "function";
+
+const __flowDescribe = value => {
+  if (value === undefined) {
+    return "undefined";
+  }
+  if (value === null) {
+    return "null";
+  }
+  return `a ${typeof value}`;
+};
+
+const __flowNotThenable = (code, what, index, value, hint, location) => {
+  const error = __flowError(
+    "FlowCombinatorError",
+    code,
+    `${what} returned ${__flowDescribe(value)} instead of a promise; ${hint}`,
+    { index },
+    location
+  );
+  error.index = index;
+  return error;
+};
+
 const __flowAggregate = (outcomes, location) => {
   const error = __flowError(
     "FlowAggregateError",
@@ -38,14 +65,33 @@ globalThis.parallel = function parallel(thunks, options = {}) {
       "parallel() options may contain only a boolean settle field"
     );
   }
-  const promises = thunks.map(thunk => {
+  const invalid = [];
+  const promises = thunks.map((thunk, index) => {
+    let value;
     try {
-      return __flowOutcome(thunk());
+      value = thunk();
     } catch (error) {
       return Promise.resolve({ ok: false, error });
     }
+    if (!__flowThenable(value)) {
+      const error = __flowNotThenable(
+        "parallel-invalid",
+        `parallel() thunk ${index}`,
+        index,
+        value,
+        "a brace-bodied thunk such as () => { sh(...) } discards its node — " +
+          "remove the braces or add an explicit return",
+        callLocation
+      );
+      invalid.push(error);
+      return Promise.resolve({ ok: false, error });
+    }
+    return __flowOutcome(value);
   });
   return Promise.all(promises).then(outcomes => {
+    if (invalid.length) {
+      throw invalid[0];
+    }
     if (options && options.settle === true) {
       return outcomes;
     }
@@ -93,14 +139,35 @@ globalThis.pipeline = function pipeline(items, ...rest) {
       "pipeline() options may contain only a boolean settle field"
     );
   }
+  const invalid = [];
   const chains = items.map((item, index) => {
     let chain = Promise.resolve(item);
-    for (const stage of rest) {
-      chain = chain.then(previous => stage(previous, item, index));
-    }
+    rest.forEach((stage, stageIndex) => {
+      chain = chain.then(previous => {
+        const value = stage(previous, item, index);
+        if (!__flowThenable(value)) {
+          const error = __flowNotThenable(
+            "pipeline-invalid",
+            `pipeline() stage ${stageIndex} for item ${index}`,
+            index,
+            value,
+            "a brace-bodied stage such as (previous, item) => { sh(...) } discards its node — " +
+              "remove the braces, add an explicit return, or declare the stage async",
+            callLocation
+          );
+          error.stage = stageIndex;
+          invalid.push(error);
+          throw error;
+        }
+        return value;
+      });
+    });
     return __flowOutcome(chain);
   });
   return Promise.all(chains).then(outcomes => {
+    if (invalid.length) {
+      throw invalid[0];
+    }
     if (options && options.settle === true) {
       return outcomes;
     }
