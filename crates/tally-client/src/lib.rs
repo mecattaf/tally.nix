@@ -146,11 +146,11 @@ const MAX_REARM_DELAY: Duration = Duration::from_secs(2);
 pub async fn await_job_with_rearm(
     initial_client: RpcClient,
     path: &Path,
-    max_frame_bytes: u64,
     task_uuid: &str,
     rearm_window: Duration,
 ) -> Result<Value, WireIoError> {
     let params = Some(serde_json::json!({"task_uuid": task_uuid}));
+    let max_frame_bytes = initial_client.max_frame_bytes;
     let mut client = initial_client;
     let mut rearm_deadline = None;
     let mut retry_delay = Duration::ZERO;
@@ -864,15 +864,9 @@ mod tests {
         });
 
         let client = RpcClient::connect(&socket).await.unwrap();
-        let result = await_job_with_rearm(
-            client,
-            &socket,
-            DEFAULT_MAX_FRAME_BYTES,
-            "task-7",
-            Duration::from_secs(1),
-        )
-        .await
-        .unwrap();
+        let result = await_job_with_rearm(client, &socket, "task-7", Duration::from_secs(1))
+            .await
+            .unwrap();
         assert_eq!(result["verdict"], "pass");
         server.await.unwrap();
     }
@@ -898,10 +892,9 @@ mod tests {
         let client = RpcClient::connect(&socket).await.unwrap();
         let window = Duration::from_millis(120);
         let started = Instant::now();
-        let error =
-            await_job_with_rearm(client, &socket, DEFAULT_MAX_FRAME_BYTES, "task-8", window)
-                .await
-                .unwrap_err();
+        let error = await_job_with_rearm(client, &socket, "task-8", window)
+            .await
+            .unwrap_err();
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(
             error,
