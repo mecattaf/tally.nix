@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 use tally_core::config::{
-    Config, PoolConfig, PoolPredicate, ResourceKind, WindowedConsumptionPredicate,
+    Config, FlowRegistration, PoolConfig, PoolPredicate, ResourceKind, WindowedConsumptionPredicate,
 };
 
 fn fixture(name: &str) -> PathBuf {
@@ -175,6 +175,111 @@ fn flow_check_cli_rejects_configured_windowed_consumption_pools() {
     assert!(stderr.contains("windowed-consumption-excluded"), "{stderr}");
     assert!(stderr.contains("worker-gpu"), "{stderr}");
     assert!(stderr.contains("priorities"), "{stderr}");
+}
+
+#[test]
+fn flow_run_rejects_a_registered_workload_mutex_without_an_admitted_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.json");
+    let script = fixture("valid.js");
+    let mut config = Config::default();
+    config.pools.insert(
+        "monthly-review".to_owned(),
+        PoolConfig {
+            resource: ResourceKind::Mutex,
+            capacity: 1,
+            ..PoolConfig::default()
+        },
+    );
+    config.flows.insert(
+        "monthly-review".to_owned(),
+        FlowRegistration {
+            script: script.canonicalize().unwrap(),
+            workload_mutex: Some("monthly-review".to_owned()),
+        },
+    );
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--socket")
+        .arg(temp.path().join("absent.sock"))
+        .args(["flow", "run"])
+        .arg(&script)
+        .args([
+            "--args",
+            r#"{"task":"ship"}"#,
+            "--max-nodes",
+            "12",
+            "--flow-run-id",
+            "00000000-0000-4000-8000-000000000051",
+            "--catalog",
+        ])
+        .arg(fixture("catalog.json"))
+        .env_remove("TALLY_TASK_UUID")
+        .env_remove("TALLY_JOB_ID")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("FlowStartupError"), "{stderr}");
+    assert!(
+        stderr.contains("workload-mutex-parent-required"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("monthly-review"), "{stderr}");
+    assert!(stderr.contains("admitted parent"), "{stderr}");
+    assert!(!stderr.contains("daemon socket"), "{stderr}");
+}
+
+#[test]
+fn flow_run_allows_a_registered_flow_without_a_workload_mutex() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_path = temp.path().join("config.json");
+    let socket = temp.path().join("tally.sock");
+    let script = fixture("valid.js");
+    let mut config = Config::default();
+    config.flows.insert(
+        "manual-review".to_owned(),
+        FlowRegistration {
+            script: script.canonicalize().unwrap(),
+            workload_mutex: None,
+        },
+    );
+    fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+    let server = serve_empty_flow_history(&socket, None);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .arg("--config")
+        .arg(&config_path)
+        .arg("--socket")
+        .arg(&socket)
+        .args(["flow", "run"])
+        .arg(&script)
+        .args([
+            "--args",
+            r#"{"task":"manual"}"#,
+            "--max-nodes",
+            "12",
+            "--flow-run-id",
+            "00000000-0000-4000-8000-000000000052",
+            "--catalog",
+        ])
+        .arg(fixture("catalog.json"))
+        .env_remove("TALLY_TASK_UUID")
+        .env_remove("TALLY_JOB_ID")
+        .output()
+        .unwrap();
+    server.join().unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

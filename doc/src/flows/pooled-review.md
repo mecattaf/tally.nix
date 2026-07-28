@@ -34,7 +34,8 @@ export const meta = {
 ```
 
 `worker-gpu` is the workload pool used by every selected member. It is not the
-runner's own pool: generated flow runners always acquire only `flow`. The catalog
+runner's own pool: this flow declares no `workloadMutex`, so its generated
+runner acquires only `flow`. The catalog
 class is declared in `selectors`, so a literal call to
 `members("pooled-strongest", ...)` can be checked during activation.
 

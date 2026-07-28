@@ -47,14 +47,17 @@ Older Nix prose left it unstated.
 
 ## What flows hold today
 
-The current flow runner is admitted to exactly the reserved `flow` pool. A
-flow's `budgetPool` field is checked only to ensure the named pool exists; it
-is not added to the runner's pool set, exported through another channel, or
-held for the duration of the run.
+Every generated flow runner is admitted to the reserved `flow` pool. A flow
+may additionally name one typed `workloadMutex`: a capacity-1 co-residency
+mutex held for the runner process lifetime. It is not an arbitrary extra-pool
+list, and runner death releases it before replay. A replay blocks behind the
+next holder while already-created children remain durable. Direct manual flow
+runs hold no lease, so a mutex flow must enter through an admitted parent job.
 
-There is likewise no current flow surface that makes the runner hold an
-arbitrary mutex or lease for its full run. Nodes acquire their own declared
-pools as ordinary jobs. The shipped flow `NodeSpec` deliberately has no
+A flow's `budgetPool` field is checked only to ensure the named pool exists; it
+is not added to the runner's pool set, exported through another channel, or
+held for the duration of the run. Nodes acquire their own declared pools as
+ordinary jobs. The shipped flow `NodeSpec` deliberately has no
 `consumptionEstimate`; configured flow checking excludes
 windowed-consumption pools by design. Priorities control contention between
 flow workloads. The kernel mechanism remains unchanged for direct and
@@ -71,9 +74,10 @@ recovery path when launch state is uncertain.
 Pool parsing and the `budgetGb` validation are in
 `crates/tally-core/src/config.rs`. Atomic admission, durable budget debits,
 capacity counting, and restart reconstruction are in
-`crates/tally-core/src/lease.rs`. The flow runner rendering and existence-only
-`budgetPool` assertion are in `nix/modules/common.nix`; the fixed pool is pinned
-by `crates/tally/tests/flow_live.rs`. Tests
+`crates/tally-core/src/lease.rs`. Flow runner pool rendering, the typed
+`workloadMutex` assertions, and the existence-only `budgetPool` assertion are
+in `nix/modules/common.nix`. Tests
+`workload_mutex_replay_waits_behind_the_next_process_holder`,
 `rolling_window_rebuild_reads_events_and_verified_witness`,
 `restarted_admission_debits_a_stable_attempt_only_once`, and
 `built_in_usage_feeder_routes_tokens_and_can_only_clamp_headroom_downward`

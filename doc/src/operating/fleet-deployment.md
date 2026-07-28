@@ -283,7 +283,11 @@ kernel-backed resource isolation. The conformance scenario that required
 those surfaces is recorded as `BLOCKED`, not as a software-enforced capacity
 proof.
 
-Flow runner jobs themselves request exactly the generated `flow` pool.
+Flow runner jobs always request the generated `flow` pool and may co-lease one
+typed capacity-1 `workloadMutex` for the runner process lifetime. Runner death
+releases that mutex; replay waits behind the next holder while durable children
+may complete. A direct manual flow run has no lease, so a mutex-declaring flow
+must be enqueued as an admitted parent holding both pools.
 `budgetPool` currently validates that the named pool exists; it does not add
 that pool to runner admission. Separately, flow nodes deliberately have no
 `consumptionEstimate` field and configured flow checking excludes

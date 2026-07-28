@@ -1,6 +1,6 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use tally_core::config::PoolPredicate;
+use tally_core::config::{FlowRegistration, PoolPredicate};
 use tally_flow::validate_flow_pool_predicates;
 
 use super::*;
@@ -168,6 +168,24 @@ pub(super) async fn run_flow(
                 options.catalog_hash = Some(hash);
             }
             let client_config = load_client_config(config_path)?;
+            if runner.task_uuid.is_none() {
+                if let Some((flow, workload_mutex)) =
+                    matching_workload_mutex(&client_config.flows, &args.script)
+                {
+                    return Err(flow_error(
+                        FlowError::new(
+                            "FlowStartupError",
+                            "workload-mutex-parent-required",
+                            format!(
+                                "flow {flow:?} declares workloadMutex {workload_mutex:?}; run it through an admitted parent job holding pools \"flow\" and {workload_mutex:?}"
+                            ),
+                        )
+                        .at(SourceLocation::new(1, 1))
+                        .detail("flow", flow)
+                        .detail("workloadMutex", workload_mutex),
+                    ));
+                }
+            }
             let max_frame_bytes = client_config.max_frame_bytes;
             let final_message_adapters = client_config
                 .adapters
@@ -226,6 +244,24 @@ pub(super) async fn run_flow(
             }
         }
     }
+}
+
+fn matching_workload_mutex<'a>(
+    flows: &'a BTreeMap<String, FlowRegistration>,
+    script: &Path,
+) -> Option<(&'a str, &'a str)> {
+    flows.iter().find_map(|(name, registration)| {
+        let workload_mutex = registration.workload_mutex.as_deref()?;
+        same_script(script, &registration.script).then_some((name.as_str(), workload_mutex))
+    })
+}
+
+fn same_script(left: &Path, right: &Path) -> bool {
+    left == right
+        || matches!(
+            (std::fs::canonicalize(left), std::fs::canonicalize(right)),
+            (Ok(left), Ok(right)) if left == right
+        )
 }
 
 pub(super) fn captured_runner_identity(
@@ -294,7 +330,8 @@ pub(super) fn flow_error(error: FlowError) -> anyhow::Error {
         "flow-run-id-missing"
         | "flow-run-id-invalid"
         | "runner-identity-invalid"
-        | "runner-identity-incomplete" => 2,
+        | "runner-identity-incomplete"
+        | "workload-mutex-parent-required" => 2,
         "script-syntax"
         | "script-encoding"
         | "script-evaluation"

@@ -334,6 +334,14 @@ pub struct JournaldConfig {
     pub native: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FlowRegistration {
+    pub script: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_mutex: Option<String>,
+}
+
 const fn default_capacity() -> u32 {
     1
 }
@@ -394,6 +402,8 @@ pub struct Config {
     #[serde(default)]
     pub pools: BTreeMap<String, PoolConfig>,
     #[serde(default)]
+    pub flows: BTreeMap<String, FlowRegistration>,
+    #[serde(default)]
     pub adapters: BTreeMap<String, AdapterConfig>,
     #[serde(default)]
     pub producers: BTreeMap<String, ProducerConfig>,
@@ -414,6 +424,7 @@ impl Default for Config {
             git_ai: GitAiConfig::default(),
             attestations: AttestationsConfig::default(),
             pools: BTreeMap::new(),
+            flows: BTreeMap::new(),
             adapters: BTreeMap::new(),
             producers: BTreeMap::new(),
             executors: BTreeMap::new(),
@@ -451,6 +462,8 @@ pub enum ConfigError {
     InvalidUsageMeter { pool: String },
     #[error("pool {pool:?} has an invalid credential: {detail}")]
     InvalidCredential { pool: String, detail: String },
+    #[error("flow {flow:?} is invalid: {detail}")]
+    InvalidFlow { flow: String, detail: String },
     #[error("enqueue depthCap and fanoutCap must both be positive")]
     InvalidEnqueueGuardrail,
     #[error("lease graceSec, yieldPollSec, and yieldGraceSec must all be positive")]
@@ -552,6 +565,44 @@ impl Config {
                         detail,
                     }
                 })?;
+            }
+        }
+        for (name, flow) in &self.flows {
+            validate_executor_name(name).map_err(|detail| ConfigError::InvalidFlow {
+                flow: name.clone(),
+                detail,
+            })?;
+            if !flow.script.is_absolute() {
+                return Err(ConfigError::InvalidFlow {
+                    flow: name.clone(),
+                    detail: "script must be an absolute path".to_owned(),
+                });
+            }
+            let Some(mutex_name) = flow.workload_mutex.as_deref() else {
+                continue;
+            };
+            if mutex_name.is_empty() || matches!(mutex_name, "flow" | "build") {
+                return Err(ConfigError::InvalidFlow {
+                    flow: name.clone(),
+                    detail: "workloadMutex must be a non-reserved pool name".to_owned(),
+                });
+            }
+            let Some(pool) = self.pools.get(mutex_name) else {
+                return Err(ConfigError::InvalidFlow {
+                    flow: name.clone(),
+                    detail: format!("workloadMutex references unknown pool {mutex_name:?}"),
+                });
+            };
+            if pool.resource != ResourceKind::Mutex
+                || pool.capacity != 1
+                || !matches!(pool.predicate, PoolPredicate::CoResidency(_))
+            {
+                return Err(ConfigError::InvalidFlow {
+                    flow: name.clone(),
+                    detail: format!(
+                        "workloadMutex pool {mutex_name:?} must be a capacity-1 co-residency mutex"
+                    ),
+                });
             }
         }
         for (name, target) in &self.executors {
@@ -867,6 +918,53 @@ mod tests {
         assert!(matches!(
             invalid.validate(),
             Err(ConfigError::InvalidMutex { .. })
+        ));
+    }
+
+    #[test]
+    fn flow_registrations_bind_only_typed_workload_mutexes() {
+        let valid: Config = serde_json::from_str(
+            r#"{
+                "pools": {
+                    "flow": {"resource": "cpu-slot", "capacity": 8},
+                    "review": {"resource": "mutex", "capacity": 1}
+                },
+                "flows": {
+                    "monthly-review": {
+                        "script": "/nix/store/00000000000000000000000000000000-monthly-review.js",
+                        "workloadMutex": "review"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        valid.validate().unwrap();
+
+        for mutex in ["missing", "flow"] {
+            let mut invalid = valid.clone();
+            invalid
+                .flows
+                .get_mut("monthly-review")
+                .unwrap()
+                .workload_mutex = Some(mutex.to_owned());
+            assert!(matches!(
+                invalid.validate(),
+                Err(ConfigError::InvalidFlow { .. })
+            ));
+        }
+
+        let mut wrong_shape = valid;
+        wrong_shape
+            .flows
+            .get_mut("monthly-review")
+            .unwrap()
+            .workload_mutex = Some("flow-slot".to_owned());
+        wrong_shape
+            .pools
+            .insert("flow-slot".to_owned(), PoolConfig::default());
+        assert!(matches!(
+            wrong_shape.validate(),
+            Err(ConfigError::InvalidFlow { .. })
         ));
     }
 

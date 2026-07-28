@@ -136,15 +136,16 @@ does not replace it with measured usage. This is a capability of the shipped
 `windowed-consumption` predicate, not a predeclared five-hour pool. The module
 defaults to a seven-day window.
 
-There are two current flow limits worth stating without designing their answers.
-Declaratively generated flow runners are always submitted to exactly `["flow"]`.
+There are two explicit flow boundaries. Declaratively generated flow runners
+always request `flow` and may co-lease one typed capacity-1 `workloadMutex` for
+the runner process lifetime.
 The [producer renderer](https://github.com/mecattaf/tally.nix/blob/4c85563a3899369f1aa4905f44e9806e424593f1/nix/modules/common.nix#L2169-L2212)
 and [separate assertion](https://github.com/mecattaf/tally.nix/blob/4c85563a3899369f1aa4905f44e9806e424593f1/nix/modules/common.nix#L2302-L2312)
-make the boundary visible: `budgetPool` is checked only for existence; despite
-the option's stale description, it adds no runner pool and creates no lease.
-There is consequently no sanctioned mechanism today for a flow to hold a
-workload mutex or budget lease for its whole run
-([open question #107](https://github.com/mecattaf/tally.nix/issues/107)).
+make the boundary visible: `budgetPool` is checked only for existence and adds
+no runner pool. The mutex is process-scoped because runner death releases its
+lease; interrupted replay waits behind the next holder while durable children
+may complete. A mutex-declaring flow must use an admitted parent rather than
+direct manual invocation.
 Separately, a generic job can supply `consumptionEstimate`, while flow nodes
 deliberately cannot. Configured flow checking excludes
 `windowed-consumption` pools and points to priorities as the contention

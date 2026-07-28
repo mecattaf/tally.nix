@@ -5,11 +5,11 @@ configuration. Each entry is checked while the system or Home Manager
 generation is built. Home Manager can additionally turn an entry into a
 scheduled user service; NixOS cannot.
 
-This chapter explains how the twelve leaf options compose. The generated
+This chapter explains how the thirteen leaf options compose. The generated
 [shared-core flow options](core-options.md#servicestallyflows) remain the
 authority for types, defaults, examples, and declaration locations.
 
-## The twelve options
+## The thirteen options
 
 | Option | Contract |
 |---|---|
@@ -22,11 +22,12 @@ authority for types, defaults, examples, and declaration locations.
 | [`evidence`](core-options.md#servicestallyflowsnameevidence) | Canonical evidence required of the runner job. It defaults to `[ "exit:0" ]`; node evidence remains part of each node specification. |
 | [`maxNodes`](core-options.md#servicestallyflowsnamemaxnodes) | Per-run admission backstop, default 1,000. It must be at least a literal `meta.maxNodes`; at runtime the smaller applicable bound governs. |
 | [`catalog`](core-options.md#servicestallyflowsnamecatalog) | Optional Nix path to a selector catalog. It is passed through `--catalog`, pinned per run by the exact-byte `catalogHash`, and required when `meta.selectors` is non-empty. |
+| [`workloadMutex`](core-options.md#servicestallyflowsnameworkloadmutex) | Optional capacity-1 mutex pool co-leased with `flow` for the lifetime of the runner process. |
 | [`budgetPool`](core-options.md#servicestallyflowsnamebudgetpool) | Optional pool name with existence-only validation. It does not alter the runner or node pool sets. |
 | [`extraEnv`](core-options.md#servicestallyflowsnameextraenv) | String environment added to the runner invocation. It defaults to `{}` and may not use `TALLY_*` or `CREDENTIALS_DIRECTORY` names. |
 | [`credentials`](core-options.md#servicestallyflowsnamecredentials) | Credential name-to-source-path map passed to the runner through systemd `LoadCredential`. It defaults to `{}`; the JSON never contains secret contents. |
 
-There are exactly twelve leaves in the generated reference. The documentation
+There are exactly thirteen leaves in the generated reference. The documentation
 flake check counts them, so adding or removing a flow option requires an
 intentional contract update rather than silently drifting this table.
 
@@ -58,8 +59,9 @@ equivalent of:
 tally flow run <script> --args <json> --max-nodes <maxNodes> [--catalog <path>]
 ```
 
-The producer uses the `shell` adapter, requests only the reserved `flow` pool,
-and copies `priority`, `dedupKey`, `runtimeMaxSec`, `evidence`, `extraEnv`, and
+The producer uses the `shell` adapter and always requests the reserved `flow`
+pool. When `workloadMutex` is non-null, it requests that one pool as well. It
+copies `priority`, `dedupKey`, `runtimeMaxSec`, `evidence`, `extraEnv`, and
 `credentials` from the flow entry. There is no extra catalog environment
 variable: a non-null `catalog` becomes the explicit `--catalog` flag.
 
@@ -69,9 +71,11 @@ Choose a different bounded template when the intended cadence or idempotence
 window is different. An empty key or an unsupported conversion fails the
 checked configuration instead of waiting for the timer.
 
-An `onCalendar = null` entry still goes through every build-time check. It can
-be run manually with `tally flow run`, but no `flow-<name>` producer unit is
-created for it.
+An `onCalendar = null` entry still goes through every build-time check, but no
+`flow-<name>` producer unit is created for it. A flow without `workloadMutex`
+may be run directly with `tally flow run`; that manual path holds no runner
+lease and bypasses the normal depth and fanout parent caps. A flow with
+`workloadMutex` must use the admitted-parent invocation described below.
 
 ### Runner evidence and bounds
 
@@ -111,6 +115,50 @@ in `meta.pools`. The checker rejects either spelling because the runner and
 Child nodes otherwise request the pools in their node specifications. The flow
 runner does not acquire all child pools up front and does not retain a child's
 lease across an `await`.
+
+## `workloadMutex`
+
+`workloadMutex` is one typed pool name, not an arbitrary list of extra runner
+pools. When non-null, the named pool must exist, must not be `flow` or `build`,
+and must use `resource = "mutex"`, `capacity = 1`, and `co-residency`. A
+windowed-consumption pool is rejected. The generated runner is admitted with:
+
+```json
+{"pool":["flow","<workloadMutex>"]}
+```
+
+The workload mutex is held for the lifetime of the runner *process*, not the flow *run*. If the runner is killed, preempted, or exceeds runtimeMaxSec, the mutex is released and another run may take it. A replay of the interrupted run must re-acquire the mutex and will block until it is free, while its already-created children remain durable and may complete in the meantime. This is weaker than the exclusion a single long-lived bash parent provides; the difference is inherent to the replay model.
+
+That weaker guarantee is intentional. For example, if run A's process dies,
+run B may acquire the mutex before run A replays. Run A's replay then queues
+behind B; once B releases, the same durable run resumes and can reuse or attach
+to its existing children.
+
+Direct `tally flow run` has no parent lease, so it is not a sanctioned
+invocation for a flow that declares `workloadMutex`. Enqueue the runner as a
+job holding both pools instead; the child-capable runner must not use
+`--no-enqueue`:
+
+```console
+$ tally enqueue \
+    --pool flow \
+    --pool monthly-review \
+    --dedup-key manual-monthly-review-2026-07 \
+    -- tally flow run /nix/store/...-monthly-review.js \
+      --args '{"period":"2026-07"}' --max-nodes 200
+```
+
+The admitted job supplies `TALLY_TASK_UUID` and `TALLY_JOB_ID`, so
+`tally flow run` derives the durable flow-run identity and applies ordinary
+parent depth and fanout accounting. With a configured registry, the CLI matches
+the invoked script path to `services.tally.flows`, canonicalizing existing
+paths. A matching `workloadMutex` registration without that inherited parent
+identity fails before daemon connection with
+`workload-mutex-parent-required`. A matching registration without a mutex is
+allowed to run directly and keeps the documented depth/fanout bypass.
+
+Tally runs on one machine for one trusted user, using local AI plus
+authenticated Claude Code and Codex subscriptions.
 
 ## `budgetPool` is existence-check-only
 
@@ -177,7 +225,7 @@ objects. It:
 - renders the associated systemd user services and timers; and
 - passes runner credentials and environment through the generated unit.
 
-The NixOS wrapper exposes the same twelve options and evaluates the same checked
+The NixOS wrapper exposes the same thirteen options and evaluates the same checked
 derivation, so it can reject an invalid flow declaration. It does not add the
 reserved pools or render flow producer services and timers. A NixOS flow entry
 that evaluates successfully is therefore validation, not deployment.

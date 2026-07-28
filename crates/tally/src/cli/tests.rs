@@ -147,6 +147,7 @@ fn flow_failure_taxonomy_has_distinguished_exit_codes() {
     assert_eq!(exit_code("catalog-changed-mid-run"), 20);
     assert_eq!(exit_code("flow-run-id-missing"), 2);
     assert_eq!(exit_code("runner-identity-incomplete"), 2);
+    assert_eq!(exit_code("workload-mutex-parent-required"), 2);
     assert_eq!(exit_code("flow-cancelled"), 4);
     assert_eq!(exit_code("terminal-failure"), 1);
 }

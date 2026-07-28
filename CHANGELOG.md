@@ -8,6 +8,8 @@ authorized.
 
 ### Added
 
+- Added a typed per-flow `workloadMutex`, co-leased with `flow` for the runner process lifetime,
+  with replay-behind-the-next-holder semantics and an admitted-parent manual invocation contract.
 - Added operator chapters for configured mechanisms and declarative flows, including exact module
   contracts and deployment asymmetries.
 - Added a hermetic, offline dependency-policy gate with a flake-pinned RustSec advisory database,

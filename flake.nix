@@ -488,7 +488,7 @@
                   keys[]
                   | select(startswith("services.tally.flows.<name>."))
                 ]
-                | length == 12
+                | length == 13
               )
             ' "$core_json" >/dev/null
 
@@ -801,6 +801,11 @@
                     ];
                     credentials.METER_TOKEN = "/run/credentials/tally-meter";
                   };
+                  flow-run-mutex = {
+                    resource = "mutex";
+                    capacity = 1;
+                    predicate.co-residency = { };
+                  };
                   build.resource = "build-slot";
                   worker-gpu.resource = "vram";
                 };
@@ -950,6 +955,7 @@
                     args.task = "ship";
                     catalog = catalogFixture;
                     budgetPool = "programmatic";
+                    workloadMutex = "flow-run-mutex";
                     extraEnv.FLOW_MODE = "fixture";
                     credentials.FLOW_TOKEN = "/run/credentials/tally-flow";
                   };
@@ -1036,12 +1042,54 @@
                   build.resource = "build-slot";
                   flow.resource = "cpu-slot";
                   worker-gpu.resource = "vram";
+                  wide-mutex = {
+                    resource = "vram";
+                    capacity = 2;
+                    predicate.co-residency = { };
+                  };
+                  programmatic = {
+                    resource = "budget";
+                    predicate.windowed-consumption = {
+                      windowSec = 18000;
+                      consumptionCap = 100;
+                    };
+                  };
                 };
                 flows.bad-budget = {
                   script = ./test/fixtures/flows/valid.js;
                   args.task = "ship";
                   catalog = catalogFixture;
                   budgetPool = "missing-budget";
+                };
+                flows.missing-mutex = {
+                  script = ./test/fixtures/flows/valid.js;
+                  args.task = "ship";
+                  catalog = catalogFixture;
+                  workloadMutex = "absent";
+                };
+                flows.reserved-mutex = {
+                  script = ./test/fixtures/flows/valid.js;
+                  args.task = "ship";
+                  catalog = catalogFixture;
+                  workloadMutex = "flow";
+                };
+                flows.wrong-mutex = {
+                  script = ./test/fixtures/flows/valid.js;
+                  args.task = "ship";
+                  catalog = catalogFixture;
+                  workloadMutex = "worker-gpu";
+                };
+                flows.windowed-mutex = {
+                  script = ./test/fixtures/flows/valid.js;
+                  args.task = "ship";
+                  catalog = catalogFixture;
+                  workloadMutex = "programmatic";
+                };
+                flows.wide-mutex = {
+                  script = ./test/fixtures/flows/valid.js;
+                  args.task = "ship";
+                  catalog = catalogFixture;
+                  workloadMutex = "wide-mutex";
                 };
               };
             }
@@ -2572,6 +2620,19 @@
           assert !(homeServices ? tally-producer-flow-manual);
           assert builtins.elem "tally flow bad-budget references unknown budgetPool missing-budget"
             invalidFlowMessages;
+          assert builtins.elem "tally flow missing-mutex references unknown workloadMutex absent"
+            invalidFlowMessages;
+          assert builtins.elem "tally flow reserved-mutex workloadMutex must not be flow or build"
+            invalidFlowMessages;
+          assert builtins.elem "tally flow wrong-mutex workloadMutex must reference a resource = mutex pool"
+            invalidFlowMessages;
+          assert builtins.elem
+            "tally flow windowed-mutex workloadMutex must not reference a windowed-consumption pool"
+            invalidFlowMessages;
+          assert builtins.elem "tally flow windowed-mutex workloadMutex must reference a co-residency pool"
+            invalidFlowMessages;
+          assert builtins.elem "tally flow wide-mutex workloadMutex must reference a capacity-1 pool"
+            invalidFlowMessages;
           assert homeServices.tally-producer-health.Service.Restart == "always";
           assert homeServices.tally-producer-health.Unit.StartLimitIntervalSec == 0;
           assert homeServices.tally-producer-effects.Service.Restart == "always";
@@ -2676,6 +2737,8 @@
               .pools.stock.enforce == "cooperative" and
               .pools.programmatic.usageMeter.budgetClass == "programmatic" and
               .pools.programmatic.credentials.METER_TOKEN == "/run/credentials/tally-meter" and
+              .pools["flow-run-mutex"].resource == "mutex" and
+              .pools["flow-run-mutex"].capacity == 1 and
               .producers["flow-fixture"].kind == "calendar" and
               .producers["flow-fixture"].onCalendar == "daily" and
               .producers["flow-fixture"].enqueue.argv[0:3] == ["tally", "flow", "run"] and
@@ -2684,7 +2747,7 @@
               .producers["flow-fixture"].enqueue.argv[6:8] == ["--max-nodes", "1000"] and
               .producers["flow-fixture"].enqueue.argv[8] == "--catalog" and
               .producers["flow-fixture"].enqueue.adapter == "shell" and
-              .producers["flow-fixture"].enqueue.pool == "flow" and
+              .producers["flow-fixture"].enqueue.pool == ["flow","flow-run-mutex"] and
               .producers["flow-fixture"].enqueue.priority == "low" and
               .producers["flow-fixture"].enqueue.dedupKey == "flow-fixture-%Y-%m-%d" and
               .producers["flow-fixture"].enqueue.runtimeMaxSec == 43200 and
@@ -2695,7 +2758,9 @@
               .producers["flow-monthly-dedup"].enqueue.dedupKey == "monthly-local-ai-review-%Y-%m" and
               .producers["flow-monthly-dedup"].enqueue.evidence == ["exit:0","artifact:/tmp/monthly-review-receipt.json","hash:sha256"] and
               (.producers | has("flow-manual") | not) and
-              (has("flows") | not) and
+              .flows.fixture.workloadMutex == "flow-run-mutex" and
+              (.flows.fixture.script | startswith("/nix/store/")) and
+              .flows.manual.workloadMutex == null and
               .producers.daily.enqueue.pool == ["programmatic", "stock"] and
               .producers.daily.enqueue.executor == "worker" and
               .producers.daily.enqueue.credentials.JOB_TOKEN == "/run/credentials/tally-job" and

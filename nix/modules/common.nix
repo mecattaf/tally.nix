@@ -1658,6 +1658,17 @@ let
             null.
           '';
         };
+        workloadMutex = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "monthly-review";
+          description = ''
+            Optional capacity-1 mutex pool co-leased with the mandatory
+            "flow" pool for the lifetime of the runner process. Manual runs
+            of a flow that declares this option must enter through an admitted
+            parent job carrying the same pool set.
+          '';
+        };
         budgetPool = mkOption {
           type = types.nullOr types.str;
           default = null;
@@ -1692,6 +1703,10 @@ let
         {
           assertion = config.budgetPool == null || config.budgetPool != "";
           message = "tally flow ${name} budgetPool must be null or non-empty";
+        }
+        {
+          assertion = config.workloadMutex == null || config.workloadMutex != "";
+          message = "tally flow ${name} workloadMutex must be null or non-empty";
         }
         {
           assertion = config.dedupKey != "";
@@ -2219,6 +2234,11 @@ let
         };
   };
 
+  renderFlow = _: flow: {
+    script = storePathWithContext flow.script;
+    inherit (flow) workloadMutex;
+  };
+
   renderExecutor = _: executor: {
     inherit (executor)
       kind
@@ -2261,6 +2281,7 @@ let
         ;
     };
     pools = mapAttrs renderPool cfg.pools;
+    flows = mapAttrs renderFlow cfg.flows;
     executors = mapAttrs renderExecutor cfg.executors;
     producers = mapAttrs renderProducer cfg.producers;
     adapters = mapAttrs renderAdapter cfg.adapters;
@@ -2288,7 +2309,7 @@ let
       ];
       adapter = "shell";
       adapterOptions.environment = flow.extraEnv;
-      pool = [ "flow" ];
+      pool = [ "flow" ] ++ lib.optional (flow.workloadMutex != null) flow.workloadMutex;
       inherit (flow)
         priority
         dedupKey
@@ -2400,17 +2421,56 @@ let
           ]
         ) (producerEnqueues producer))
       ]) cfg.producers)
-      (mapAttrsToList (name: flow: [
-        {
-          assertion = validComponent name;
-          message = "tally flow name ${name} is not a safe unit/file component";
-        }
-        flow._tallyAssertions
-        {
-          assertion = flow.budgetPool == null || builtins.hasAttr flow.budgetPool cfg.pools;
-          message = "tally flow ${name} references unknown budgetPool ${toString flow.budgetPool}";
-        }
-      ]) cfg.flows)
+      (mapAttrsToList (
+        name: flow:
+        let
+          mutexPool =
+            if flow.workloadMutex != null && builtins.hasAttr flow.workloadMutex cfg.pools then
+              cfg.pools.${flow.workloadMutex}
+            else
+              null;
+        in
+        [
+          {
+            assertion = validComponent name;
+            message = "tally flow name ${name} is not a safe unit/file component";
+          }
+          flow._tallyAssertions
+          {
+            assertion = flow.budgetPool == null || builtins.hasAttr flow.budgetPool cfg.pools;
+            message = "tally flow ${name} references unknown budgetPool ${toString flow.budgetPool}";
+          }
+          {
+            assertion = flow.workloadMutex == null || builtins.hasAttr flow.workloadMutex cfg.pools;
+            message = "tally flow ${name} references unknown workloadMutex ${toString flow.workloadMutex}";
+          }
+          {
+            assertion =
+              flow.workloadMutex == null
+              || !(builtins.elem flow.workloadMutex [
+                "flow"
+                "build"
+              ]);
+            message = "tally flow ${name} workloadMutex must not be flow or build";
+          }
+          {
+            assertion = mutexPool == null || mutexPool.resource == "mutex";
+            message = "tally flow ${name} workloadMutex must reference a resource = mutex pool";
+          }
+          {
+            assertion = mutexPool == null || mutexPool.capacity == 1;
+            message = "tally flow ${name} workloadMutex must reference a capacity-1 pool";
+          }
+          {
+            assertion = mutexPool == null || mutexPool.predicate ? co-residency;
+            message = "tally flow ${name} workloadMutex must reference a co-residency pool";
+          }
+          {
+            assertion = mutexPool == null || !(mutexPool.predicate ? windowed-consumption);
+            message = "tally flow ${name} workloadMutex must not reference a windowed-consumption pool";
+          }
+        ]
+      ) cfg.flows)
       (
         let
           owners = mapAttrsToList (
