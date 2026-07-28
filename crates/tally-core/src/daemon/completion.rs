@@ -9,6 +9,10 @@ pub(super) struct TerminalWork {
     pub(super) scrape_capture: bool,
 }
 
+pub(super) struct PreparedExecution {
+    pub(super) job_token: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct GhTerminalWork {
     pub(super) row: RowSeed,
@@ -339,8 +343,8 @@ impl DaemonHandler {
         let mut cancellation = self.execution_cancel.subscribe();
         tokio::task::spawn_local(async move {
             let mut job = job;
-            let job_token = match handler.prepare_execution(&mut job).await {
-                Ok(Some(job_token)) => job_token,
+            let prepared = match handler.prepare_execution(&mut job).await {
+                Ok(Some(prepared)) => prepared,
                 Ok(None) => return,
                 Err(error) => {
                     eprintln!("tally: execution preparation failed: {error}");
@@ -352,7 +356,7 @@ impl DaemonHandler {
                 &executor,
                 &job,
                 limits,
-                (&tally_socket, job_token.as_deref()),
+                (&tally_socket, prepared.job_token.as_deref()),
                 &brief_root,
                 &git_ai,
                 exec_attestations,
@@ -401,7 +405,7 @@ impl DaemonHandler {
     pub(super) async fn prepare_execution(
         &self,
         job: &mut Job,
-    ) -> Result<Option<Option<String>>, DaemonError> {
+    ) -> Result<Option<PreparedExecution>, DaemonError> {
         let mut context = self.context.write().await;
         let Some(stored) = context.jobs.get(&job.job_id) else {
             return Ok(None);
@@ -418,7 +422,7 @@ impl DaemonHandler {
         // carry the token in their fixed systemd environment, so relaunching it
         // here would break identity across a daemon restart.
         if job.row.executor.is_some() || job.adopted {
-            return Ok(Some(None));
+            return Ok(Some(PreparedExecution { job_token: None }));
         }
 
         if let Some(existing_hash) = &job.row.job_token_hash {
@@ -475,7 +479,9 @@ impl DaemonHandler {
         self.job_tokens
             .borrow_mut()
             .insert(job_token_hash, job.job_id);
-        Ok(Some(Some(job_token)))
+        Ok(Some(PreparedExecution {
+            job_token: Some(job_token),
+        }))
     }
 
     pub(super) fn emit_post_ack(&self, event: EmitEvent) {

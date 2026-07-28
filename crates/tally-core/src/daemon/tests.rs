@@ -604,6 +604,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap()
+                    .job_token
                     .unwrap();
                 assert_eq!(token.len(), 64);
                 assert!(token
@@ -5645,6 +5646,7 @@ mod tests {
                     .await
                     .unwrap()
                     .unwrap()
+                    .job_token
                     .is_none());
                 assert_eq!(adopted.row.job_token_hash, Some(token_hash.clone()));
                 assert_eq!(

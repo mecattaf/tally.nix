@@ -181,6 +181,7 @@ canonicalized into ascending order and duplicates are rejected.
 | `credentials` | object of name to absolute path; default `{}` | Explicit credential sources. Pool credentials are merged and conflicts fail admission. |
 | `origin` | object, optional | Versioned admission provenance: `{schemaVersion:1, source, producer?, github?}`. |
 | `callerJobId` | string, optional | Live caller identity used by depth/fanout guardrails. |
+| `callerJobToken` | 64-character lowercase hex string, optional | Daemon-minted capability token a local job receives as `TALLY_JOB_TOKEN`. |
 | `ghTriggerActor`, `ghSelfActor`, `ghOrigin` | optional | Compatibility fields for the GitHub producer. New clients should prefer `origin`. |
 | `taskUuid` | UUID string, optional | Preassigned identity, used by derivation flow nodes. Mutually exclusive with `resumeFrom`. |
 | `relatedTrigger` | object, optional | Fallback trigger provenance `{producer,eventId,outcome,receiptId?}`. |
