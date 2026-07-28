@@ -15760,6 +15760,24 @@ mod tests {
                 assert_eq!(reused["task_uuid"], created["task_uuid"]);
                 assert_eq!(reused["payloadHash"], created["payloadHash"]);
 
+                let mut changed_key = payload.clone();
+                changed_key["dedupKey"] = json!("flow:brief-round-trip:changed-key");
+                changed_key["argv"] = json!(["false"]);
+                let changed_key_error = client
+                    .call("queue.enqueue", Some(changed_key))
+                    .await
+                    .unwrap_err();
+                match changed_key_error {
+                    WireIoError::Rpc(WireErrorCode::DedupKeyConflict, _, Some(data)) => {
+                        assert_eq!(data["existingTaskUuid"], created["task_uuid"]);
+                        assert_eq!(
+                            data["existingOrchestration"]["nodeOrdinal"],
+                            payload["orchestration"]["nodeOrdinal"]
+                        );
+                    }
+                    other => panic!("expected same-ordinal dedup conflict, got {other:?}"),
+                }
+
                 let mut overflow = payload;
                 overflow["dedupKey"] = json!("flow:brief-round-trip:1");
                 overflow["orchestration"]["nodeOrdinal"] = json!(1);

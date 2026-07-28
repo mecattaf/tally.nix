@@ -186,24 +186,27 @@ The default flow pool has capacity eight, not infinite or literally free.
 
 For a declaratively configured scheduled flow—one with `onCalendar` set—the Nix
 module turns the script and optional catalog into store paths in the producer's
-literal argv. The runner hashes the script bytes before execution; the daemon
-records that `scriptHash` for the run, and a later invocation with different
-bytes fails as `script-changed-mid-run`. Together these mechanisms give
-orchestration a generation:
+literal argv. The runner records hashes of the exact script bytes, serialized
+arguments, and exact optional catalog bytes on every node. A later invocation of
+the same run with different identity fails as `script-changed-mid-run`,
+`args-changed-mid-run`, or `catalog-changed-mid-run`. Together these mechanisms
+give orchestration a generation:
 
 - the active NixOS or Home Manager generation selects the flow script;
 - rollback selects the previous store-pinned script along with the rest of the
   system configuration;
-- the witness binds each run to the script content that derived its submissions;
+- the witness binds each run to the script, arguments, and catalog content that
+  derived its submissions;
 - behavior can be bisected by switching known generations rather than reconstructing
   a mutable CI configuration from a service database.
 
-The guarantee is narrower than “every invocation is pinned.” `tally flow run
-./local-script.js` remains a valid manual command and accepts an ordinary path.
+The store-path guarantee is narrower than “every invocation is immutable.”
+`tally flow run ./local-script.js` remains a valid manual command and accepts an
+ordinary path.
 Store pinning and system rollback govern scheduled producers rendered from
 `services.tally.flows`; the CLI does not silently copy arbitrary scripts into
-the store. Hash pinning still prevents one existing run from changing scripts
-midway.
+the store. Hash pinning still prevents one existing run from changing its
+script, arguments, or catalog midway.
 
 ## Isolation by composition
 

@@ -17,6 +17,8 @@ the shipped implementation; placeholders vary with the job.
 | A key names different work | `dedup-key-conflict for key "KEY"` | The same full-mode key was presented with a different payload, or legacy history contains multiple live owners. |
 | Flow history no longer matches | code `replay-divergence`; `ordinal N re-derived payload NEW but the ledger recorded OLD` | Replay derived different work at an existing ordinal. |
 | Flow script changes during one run | code `script-changed-mid-run`; `flow run ID is pinned to RECORDED, not CURRENT` | One flow run observed two script hashes. |
+| Flow arguments change during one run | code `args-changed-mid-run`; `flow run ID is pinned to RECORDED, not CURRENT` | One flow run observed two serialized argument hashes. |
+| Flow catalog changes during one run | code `catalog-changed-mid-run`; `flow run ID is pinned to RECORDED, not CURRENT` | One flow run observed different exact catalog bytes, or changed between a catalog and none. |
 | CLI loses the socket on a large request or response | `wire frame exceeds N bytes` or `daemon closed the socket before replying` | One side exceeded its configured frame bound. |
 | Declared culmination is absent | `cannot read gate manifest PATH: ...` in `completion.gates.manifestError` | The job did not write the declared file on its execution host. |
 | Remote work appears hung | `tally: remote executor "NAME" transport is unavailable; retaining leases and retrying: ...` | SSH or the fixed worker helper is unavailable after dispatch. |
@@ -182,6 +184,20 @@ Resume the old run with the exact recorded script bytes. Start changed code as
 a new run. Declarative `services.tally.flows` reduces this risk because each
 generation refers to an immutable Nix store path, but the identity is the
 SHA-256 of the bytes, not a generation number.
+
+## `args-changed-mid-run` and `catalog-changed-mid-run`
+
+The same run also pins `orchestration.argsHash` and
+`orchestration.catalogHash`. The arguments hash covers the compact serialization
+of parsed JSON; the catalog hash covers exact file bytes and is `null` when no
+catalog was supplied. A mismatch emits the corresponding code and exits 20
+before another node is admitted.
+
+Query the run as above and restore the original invocation. For arguments, use
+values with the same serialized identity. For a catalog, use the exact original
+bytes, including insignificant-looking whitespace; adding or removing the
+catalog is also an identity change. Use a new flow run ID when either change is
+intentional.
 
 ## Oversized wire frame
 

@@ -133,13 +133,13 @@ Exit classification uses the stable `code` field, not `name`:
 | 2 | `flow-run-id-missing`, `flow-run-id-invalid`, `runner-identity-invalid`, `runner-identity-incomplete` |
 | 4 | `flow-cancelled` |
 | 10 | `script-syntax`, `script-encoding`, `script-evaluation`, `script-exception`, `unhandled-rejection`, `determinism-violation`, `iteration-cap`, `runtime-limit`, `microtask-budget`, `wall-clock-budget` |
-| 20 | `replay-divergence`, `script-changed-mid-run` |
+| 20 | `replay-divergence`, `script-changed-mid-run`, `args-changed-mid-run`, `catalog-changed-mid-run` |
 | 1 | Every other flow error code, including admission, catalog, schema, node, capture, and client failures |
 
 Exit 10 groups bugs or bounded failures in the script/evaluator. Exit 20 means continuing the
 same run would contradict already recorded identity: the same ordinal resolved to different
-canonical work, or the script bytes changed after the run began. Automation should stop and
-investigate rather than retry either class in place.
+canonical work, or the script, arguments, or catalog identity changed after the run began.
+Automation should stop and investigate rather than retry either class in place.
 
 The flow client translates notable RPC codes to flow codes before this exit mapping:
 
@@ -155,7 +155,7 @@ The flow client translates notable RPC codes to flow codes before this exit mapp
 | `epoch_changed` | `daemon-epoch-changed` |
 | `invalid_frame`, `internal` | `daemon-protocol-error` |
 
-These translated codes are exit 1 unless they become one of the two exit-20 replay codes.
+These translated codes are exit 1 unless they become an exit-20 replay code.
 
 ## Witness verification problems
 

@@ -125,25 +125,28 @@ A node admitted by the shipped flow runner carries this capsule through the dura
 the canonical witness:
 
 ```text
-flowName, flowRunId, scriptHash, nodeOrdinal, nodeLabel?, maxNodes,
+flowName, flowRunId, scriptHash, argsHash, catalogHash, nodeOrdinal, nodeLabel?, maxNodes,
 promptRevision?, skillRevision?, selection?
 ```
 
-`scriptHash` is SHA-256 over the exact flow source bytes. Before evaluating a run, the runner
-queries existing nodes for that `flowRunId`. If any recorded hash differs from the current
-script, it stops with `script-changed-mid-run` (CLI exit 20) before admitting more work. The
-witness capsule therefore ties a proved node to the generation-pinned script that produced its
-ordinal. Prompt and skill revisions perform the same role for resolved agent inputs when those
-revisions are known.
+`scriptHash` is SHA-256 over the exact flow source bytes. `argsHash` covers the runner's compact
+JSON serialization of parsed arguments. `catalogHash` covers the exact catalog bytes and is
+`null` when no catalog was supplied. Before evaluating a run, the runner queries existing nodes
+for that `flowRunId`. If any recorded identity differs from the current script, arguments, or
+catalog, it stops with the corresponding `*-changed-mid-run` code (CLI exit 20) before admitting
+more work. The witness capsule therefore ties a proved node to all three generation-pinned
+inputs that produced its ordinal. Prompt and skill revisions perform the same role for resolved
+agent inputs when those revisions are known.
 
 This guarantee belongs to the flow-runner path, not to a strong kernel schema for the opaque
 capsule. The kernel requires a UUID `flowRunId`, validates a positive optional `maxNodes`, and
 validates a non-negative optional `nodeOrdinal` and the optional prompt/skill revision shapes;
 it otherwise preserves object members verbatim. A generic RPC client can submit a thinner
-capsule, so consumers should not assume `scriptHash` exists on non-flow records.
+capsule, so consumers should not assume these runner identity hashes exist on non-flow records.
 
 `query.proof` returns the selected canonical record verbatim as `witnessRecord`. No separate
-“proof copy” drops the capsule; its hash, including `scriptHash`, is the record hash input.
+“proof copy” drops the capsule; its hash, including the runner identity hashes, is the record
+hash input.
 
 ## Hash construction
 

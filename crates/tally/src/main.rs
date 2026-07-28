@@ -979,7 +979,10 @@ fn sanitize_inherited_tally_environment() {
 
 fn flow_error(error: FlowError) -> anyhow::Error {
     let code = match error.code.as_str() {
-        "replay-divergence" | "script-changed-mid-run" => 20,
+        "replay-divergence"
+        | "script-changed-mid-run"
+        | "args-changed-mid-run"
+        | "catalog-changed-mid-run" => 20,
         "flow-cancelled" => 4,
         "flow-run-id-missing"
         | "flow-run-id-invalid"
@@ -2564,6 +2567,8 @@ mod tests {
         assert_eq!(exit_code("determinism-violation"), 10);
         assert_eq!(exit_code("replay-divergence"), 20);
         assert_eq!(exit_code("script-changed-mid-run"), 20);
+        assert_eq!(exit_code("args-changed-mid-run"), 20);
+        assert_eq!(exit_code("catalog-changed-mid-run"), 20);
         assert_eq!(exit_code("flow-run-id-missing"), 2);
         assert_eq!(exit_code("runner-identity-incomplete"), 2);
         assert_eq!(exit_code("flow-cancelled"), 4);

@@ -15,13 +15,13 @@ authority for types, defaults, examples, and declaration locations.
 |---|---|
 | [`script`](core-options.md#servicestallyflowsnamescript) | Required Nix path to the JavaScript source. Nix places it in the store, and its content hash participates in the runtime `scriptHash` identity. |
 | [`onCalendar`](core-options.md#servicestallyflowsnameoncalendar) | Optional systemd calendar expression. Its default is `null`, which keeps the flow registered and checked without creating a scheduled producer. |
-| [`args`](core-options.md#servicestallyflowsnameargs) | JSON-serializable attributes exposed to the script as `args` and validated against `meta.argsSchema`. The default is `{}`. |
+| [`args`](core-options.md#servicestallyflowsnameargs) | JSON-serializable attributes exposed to the script as `args`, validated against `meta.argsSchema`, and pinned per run by `argsHash`. The default is `{}`. |
 | [`priority`](core-options.md#servicestallyflowsnamepriority) | Priority of the runner job. The default is `low`; child nodes carry the priorities declared in the script instead. |
 | [`dedupKey`](core-options.md#servicestallyflowsnamededupkey) | Scheduled-run existence key with bounded `strftime` expansion. The default template is `flow-<name>-%Y-%m-%d`, where `<name>` is the registry key. |
 | [`runtimeMaxSec`](core-options.md#servicestallyflowsnameruntimemaxsec) | Optional `RuntimeMaxSec` watchdog for the runner. Its configured default is 43,200 seconds; `null` explicitly removes the watchdog. |
 | [`evidence`](core-options.md#servicestallyflowsnameevidence) | Canonical evidence required of the runner job. It defaults to `[ "exit:0" ]`; node evidence remains part of each node specification. |
 | [`maxNodes`](core-options.md#servicestallyflowsnamemaxnodes) | Per-run admission backstop, default 1,000. It must be at least a literal `meta.maxNodes`; at runtime the smaller applicable bound governs. |
-| [`catalog`](core-options.md#servicestallyflowsnamecatalog) | Optional Nix path to a selector catalog. It is passed through `--catalog` and is required when `meta.selectors` is non-empty. |
+| [`catalog`](core-options.md#servicestallyflowsnamecatalog) | Optional Nix path to a selector catalog. It is passed through `--catalog`, pinned per run by the exact-byte `catalogHash`, and required when `meta.selectors` is non-empty. |
 | [`budgetPool`](core-options.md#servicestallyflowsnamebudgetpool) | Optional pool name with existence-only validation. It does not alter the runner or node pool sets. |
 | [`extraEnv`](core-options.md#servicestallyflowsnameextraenv) | String environment added to the runner invocation. It defaults to `{}` and may not use `TALLY_*` or `CREDENTIALS_DIRECTORY` names. |
 | [`credentials`](core-options.md#servicestallyflowsnamecredentials) | Credential name-to-source-path map passed to the runner through systemd `LoadCredential`. It defaults to `{}`; the JSON never contains secret contents. |

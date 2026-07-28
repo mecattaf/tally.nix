@@ -50,6 +50,7 @@ const CANCELLED_RUN: &str = "00000000-0000-4000-8000-000000000511";
 const CAP_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000512";
 const PARTIAL_FAILURE_RUN: &str = "00000000-0000-4000-8000-000000000513";
 const REORDERED_RUN: &str = "00000000-0000-4000-8000-000000000514";
+const CATALOG_PIN_RUN: &str = "00000000-0000-4000-8000-000000000515";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -570,6 +571,23 @@ const right = () => sh(["/bin/sh", "-c", "printf right"], {
 "#
 }
 
+fn catalog_pin_source() -> &'static str {
+    r#"
+export const meta = {
+  name: "catalog-pin",
+  description: "catalog bytes are run identity even without selection",
+  pools: ["alpha"],
+  argsSchema: { type: "object", additionalProperties: false },
+  selectors: [],
+  maxNodes: 1
+};
+
+(async () => sh(["/bin/sh", "-c", "exit 0"], {
+  pools: ["alpha"], evidence: ["exit:0"], label: "fixed-work"
+}))()
+"#
+}
+
 fn drv_source() -> String {
     format!(
         r#"
@@ -932,6 +950,10 @@ async fn fs5_live_acceptance_matrix() {
                 assert_eq!(child["source"], "orchestrator");
                 assert_eq!(child["parentTaskUuid"], parent_uuid);
                 assert_eq!(child["orchestration"]["flowRunId"], child["parentTaskUuid"]);
+                assert!(child["orchestration"]["argsHash"]
+                    .as_str()
+                    .is_some_and(|hash| hash.starts_with("sha256:")));
+                assert!(child["orchestration"]["catalogHash"].is_null());
                 assert_eq!(child["noEnqueue"], true);
                 assert!(child.get("relatedTrigger").is_none());
             }
@@ -1211,8 +1233,8 @@ async fn fs5_live_acceptance_matrix() {
             assert_eq!(flow_items(&client, RESTARTED_RUN).await.len(), 6);
             assert_six_unique_rows(&paths, RESTARTED_RUN);
 
-            // The same ordinal with changed args reaches the live row's kernel
-            // conflict and is surfaced as replay-divergence with both identities.
+            // Changed arguments are rejected by the run-level identity scan before
+            // a re-derived node can reach admission.
             pause(&client, "alpha").await;
             let mut original = runner(
                 &config_path,
@@ -1244,9 +1266,8 @@ async fn fs5_live_acceptance_matrix() {
                 .map(|line| serde_json::from_str::<Value>(line).unwrap())
                 .find(|event| event["type"] == "flow-failed")
                 .unwrap();
-            assert_eq!(event["error"]["code"], "replay-divergence");
-            assert_eq!(event["error"]["ordinal"], 0);
-            assert!(event["error"]["details"]["expectedHash"]
+            assert_eq!(event["error"]["code"], "args-changed-mid-run");
+            assert!(event["error"]["details"]["currentHash"]
                 .as_str()
                 .unwrap()
                 .starts_with("sha256:"));
@@ -1254,14 +1275,6 @@ async fn fs5_live_acceptance_matrix() {
                 .as_str()
                 .unwrap()
                 .starts_with("sha256:"));
-            assert_eq!(
-                event["error"]["details"]["expectedLabel"],
-                "variant-expected"
-            );
-            assert_eq!(
-                event["error"]["details"]["recordedLabel"],
-                "variant-recorded"
-            );
             assert_eq!(flow_items(&client, DIVERGENT_RUN).await.len(), 1);
             resume_all(&client).await;
             await_items(&client, &original_items).await;
@@ -1698,6 +1711,10 @@ async fn retry_cancellation_cap_and_partial_failure_are_live_end_to_end() {
             fs::write(&partial_script, partial_parallel_failure_source()).unwrap();
             let reordered_script = temp.path().join("reordered-parallel.js");
             fs::write(&reordered_script, reordered_parallel_source()).unwrap();
+            let catalog_script = temp.path().join("catalog-pin.js");
+            fs::write(&catalog_script, catalog_pin_source()).unwrap();
+            let catalog_path = temp.path().join("catalog.json");
+            fs::write(&catalog_path, r#"{"version":1,"members":[]}"#).unwrap();
 
             let daemon_paths = paths(&temp.path().join("daemon"));
             let mut retry_settings = settings();
@@ -1909,9 +1926,47 @@ async fn retry_cancellation_cap_and_partial_failure_are_live_end_to_end() {
             assert_eq!(reordered.status.code(), Some(20));
             assert_eq!(
                 flow_failure(&reordered)["error"]["code"],
-                "replay-divergence"
+                "args-changed-mid-run"
             );
             assert_eq!(flow_items(&client, REORDERED_RUN).await.len(), 2);
+
+            let mut catalog_first = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &catalog_script,
+                CATALOG_PIN_RUN,
+                "{}",
+                1,
+            );
+            catalog_first.arg("--catalog").arg(&catalog_path);
+            let catalog_first = runner_output(catalog_first.spawn().unwrap()).await;
+            assert!(
+                catalog_first.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&catalog_first.stdout),
+                String::from_utf8_lossy(&catalog_first.stderr)
+            );
+            fs::write(
+                &catalog_path,
+                "{\n  \"version\": 1,\n  \"members\": []\n}\n",
+            )
+            .unwrap();
+            let mut catalog_changed = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &catalog_script,
+                CATALOG_PIN_RUN,
+                "{}",
+                1,
+            );
+            catalog_changed.arg("--catalog").arg(&catalog_path);
+            let catalog_changed = runner_output(catalog_changed.spawn().unwrap()).await;
+            assert_eq!(catalog_changed.status.code(), Some(20));
+            assert_eq!(
+                flow_failure(&catalog_changed)["error"]["code"],
+                "catalog-changed-mid-run"
+            );
+            assert_eq!(flow_items(&client, CATALOG_PIN_RUN).await.len(), 1);
 
             daemon.stop().await;
         })

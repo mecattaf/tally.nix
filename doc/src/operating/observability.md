@@ -45,10 +45,11 @@ nodes without matching descriptions or argv:
 $ tally query jobs --flow-run <flow-run-uuid>
 ```
 
-Each item exposes `orchestration.flowRunId`, node ordinal and key,
-`scriptHash`, pool, executor, parent task, disposition-derived state, and
-terminal facts. The runner itself is the parent row and is not one of the
-orchestrated child items unless it also carries that capsule.
+Each item exposes `orchestration.flowRunId`, node ordinal and key, the
+orchestration `scriptHash`, `argsHash`, and `catalogHash`, pool, executor, parent
+task, disposition-derived state, and terminal facts. The runner itself is the
+parent row and is not one of the orchestrated child items unless it also carries
+that capsule.
 
 For one node, inspect all attempt lanes:
 
