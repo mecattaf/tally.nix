@@ -326,11 +326,15 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunInspection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub script_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub args_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -348,6 +352,9 @@ pub struct Orchestration {
     pub flow_name: String,
     pub flow_run_id: String,
     pub script_hash: String,
+    pub args_hash: String,
+    #[serde(default)]
+    pub catalog_hash: Option<String>,
     pub node_ordinal: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_label: Option<String>,
@@ -620,9 +627,13 @@ impl ClientError {
             "dedup-key-conflict" => "FlowDedupKeyConflict",
             "admission-denied" => "FlowAdmissionDenied",
             "flow-node-cap" => "FlowNodeCapError",
-            "replay-divergence" | "script-history-conflict" | "script-changed-mid-run" => {
-                "FlowReplayError"
-            }
+            "replay-divergence"
+            | "script-history-conflict"
+            | "args-history-conflict"
+            | "catalog-history-conflict"
+            | "script-changed-mid-run"
+            | "args-changed-mid-run"
+            | "catalog-changed-mid-run" => "FlowReplayError",
             _ => "FlowClientError",
         };
         let mut error = FlowError::new(name, self.code, self.message)
@@ -631,7 +642,10 @@ impl ClientError {
         if let Some(details) = self.details {
             if matches!(
                 error.code.as_str(),
-                "replay-divergence" | "script-changed-mid-run"
+                "replay-divergence"
+                    | "script-changed-mid-run"
+                    | "args-changed-mid-run"
+                    | "catalog-changed-mid-run"
             ) {
                 if let Value::Object(details) = details {
                     error.details.extend(details);

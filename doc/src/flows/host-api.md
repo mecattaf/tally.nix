@@ -346,9 +346,10 @@ through its orchestration `selection` object.
 
 That selection object is provenance, not work identity: the daemon deliberately
 excludes orchestration metadata from `payloadHash`. Changing member adapter,
-pools, or launch options normally changes the work payload, but changing only a
-member ID, order, or catalog hash does not necessarily do so. Reuse an existing
-`flowRunId` only with the exact same catalog bytes.
+pools, or launch options normally changes the work payload, while changing only
+a member ID, order, or catalog hash does not necessarily do so. Independently,
+the runner pins the exact catalog bytes for the entire `flowRunId`; any catalog
+byte change fails as `catalog-changed-mid-run` before node reuse or admission.
 
 Missing or undeclared classes, zero or excessive counts, unsupported diversity,
 and insufficient members are typed `FlowSelectorError`s. No catalog or an invalid

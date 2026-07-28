@@ -58,7 +58,8 @@ can be re-executed if completed effects collapse onto durable results.
 - [Azure Durable Functions' determinism constraints](https://learn.microsoft.com/azure/azure-functions/durable/durable-functions-code-constraints)
   reinforced the clock/random/ambient-I/O bans. Its whole-orchestration version
   branches were not adopted; declarative tally flows instead use a store-pinned
-  script plus `scriptHash`, and an in-progress run rejects changed bytes.
+  script and optional catalog plus run-level script, argument, and catalog
+  hashes. An in-progress run rejects changes to any of those inputs.
 - [Inngest](https://www.inngest.com/docs/learn/how-functions-are-executed) supplied
   concrete step-result memoization and the useful separation between a duplicate
   call-site identity and a racing invocation. Tally did not copy automatic ID

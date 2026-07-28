@@ -60,7 +60,7 @@ impl FlowClient for TestClient {
         &'a self,
         _flow_run_id: &'a str,
     ) -> FlowFuture<'a, Result<RunInspection, ClientError>> {
-        Box::pin(std::future::ready(Ok(RunInspection { script_hash: None })))
+        Box::pin(std::future::ready(Ok(RunInspection::default())))
     }
 
     fn submit<'a>(

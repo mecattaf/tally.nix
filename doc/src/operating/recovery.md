@@ -115,9 +115,9 @@ $ tally query jobs \
     --flow-run 4f8608e1-608f-4e04-bf47-0e49fd9801f1
 ```
 
-Do not change the script, arguments, or node payload while retaining the run
-ID. `script-changed-mid-run` and `replay-divergence` are deliberate stop
-conditions, not recovery modes. See
+Do not change the script, arguments, catalog, or node payload while retaining the
+run ID. The dedicated `*-changed-mid-run` identity errors and
+`replay-divergence` are deliberate stop conditions, not recovery modes. See
 [Submission identity and replay](../flows/submission-and-replay.md) and
 [Troubleshooting](troubleshooting.md).
 

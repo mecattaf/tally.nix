@@ -127,6 +127,7 @@ pub(crate) struct HostShared {
     meta: Meta,
     flow_run_id: String,
     script_hash: String,
+    args_hash: String,
     effective_max_nodes: u32,
     host_call_sites: Vec<SourceLocation>,
     catalog: Option<Catalog>,
@@ -415,6 +416,8 @@ impl HostShared {
             flow_name: self.meta.name.clone(),
             flow_run_id: self.flow_run_id.clone(),
             script_hash: self.script_hash.clone(),
+            args_hash: self.args_hash.clone(),
+            catalog_hash: self.catalog_hash.clone(),
             node_ordinal: ordinal,
             node_label: spec.label.clone(),
             max_nodes: self.effective_max_nodes,
@@ -461,7 +464,10 @@ impl HostShared {
             Err(error) => {
                 let fatal_replay = matches!(
                     error.code.as_str(),
-                    "replay-divergence" | "script-changed-mid-run"
+                    "replay-divergence"
+                        | "script-changed-mid-run"
+                        | "args-changed-mid-run"
+                        | "catalog-changed-mid-run"
                 );
                 let flow_error = error.into_flow(plan.location, plan.ordinal);
                 if fatal_replay {
@@ -778,22 +784,39 @@ pub fn run_script(
     }
 
     let script_hash = sha256(source.as_bytes());
+    let args_hash = sha256(&serde_json::to_vec(&options.args).map_err(|error| {
+        FlowError::new(
+            "FlowStartupError",
+            "args-hash-failed",
+            format!("cannot hash flow arguments: {error}"),
+        )
+        .at(RUNTIME_ERROR_LOCATION)
+    })?);
     let inspection = futures_lite::future::block_on(client.inspect_run(&options.flow_run_id))
         .map_err(|error| error.into_flow(RUNTIME_ERROR_LOCATION, 0))?;
-    if let Some(recorded_hash) = inspection.script_hash {
-        if recorded_hash != script_hash {
-            return Err(FlowError::new(
-                "FlowReplayError",
-                "script-changed-mid-run",
-                format!(
-                    "flow run {} is pinned to {recorded_hash}, not {script_hash}",
-                    options.flow_run_id
-                ),
-            )
-            .at(RUNTIME_ERROR_LOCATION)
-            .detail("recordedHash", recorded_hash)
-            .detail("currentHash", script_hash));
-        }
+    let recorded_run = inspection.script_hash.is_some();
+    if let Some(recorded_hash) = inspection.script_hash.as_deref() {
+        validate_startup_hash(
+            "script-changed-mid-run",
+            &options.flow_run_id,
+            recorded_hash,
+            &script_hash,
+        )?;
+    }
+    if let Some(recorded_hash) = inspection.args_hash.as_deref() {
+        validate_startup_hash(
+            "args-changed-mid-run",
+            &options.flow_run_id,
+            recorded_hash,
+            &args_hash,
+        )?;
+    }
+    if recorded_run && inspection.catalog_hash != options.catalog_hash {
+        return Err(changed_catalog_error(
+            &options.flow_run_id,
+            inspection.catalog_hash.as_deref(),
+            options.catalog_hash.as_deref(),
+        ));
     }
     let checked = check_script(
         source,
@@ -816,6 +839,7 @@ pub fn run_script(
         meta: checked.meta.clone(),
         flow_run_id: options.flow_run_id,
         script_hash,
+        args_hash,
         effective_max_nodes,
         host_call_sites: checked.host_call_sites,
         catalog: options.catalog,
@@ -954,6 +978,42 @@ pub fn run_script(
         "ordinals": report.ordinal_keys.len(),
     }))?;
     Ok(report)
+}
+
+fn validate_startup_hash(
+    code: &str,
+    flow_run_id: &str,
+    recorded_hash: &str,
+    current_hash: &str,
+) -> Result<(), FlowError> {
+    if recorded_hash == current_hash {
+        return Ok(());
+    }
+    Err(FlowError::new(
+        "FlowReplayError",
+        code,
+        format!("flow run {flow_run_id} is pinned to {recorded_hash}, not {current_hash}"),
+    )
+    .at(RUNTIME_ERROR_LOCATION)
+    .detail("recordedHash", recorded_hash)
+    .detail("currentHash", current_hash))
+}
+
+fn changed_catalog_error(
+    flow_run_id: &str,
+    recorded_hash: Option<&str>,
+    current_hash: Option<&str>,
+) -> FlowError {
+    let rendered_recorded = recorded_hash.unwrap_or("<none>");
+    let rendered_current = current_hash.unwrap_or("<none>");
+    FlowError::new(
+        "FlowReplayError",
+        "catalog-changed-mid-run",
+        format!("flow run {flow_run_id} is pinned to {rendered_recorded}, not {rendered_current}"),
+    )
+    .at(RUNTIME_ERROR_LOCATION)
+    .detail("recordedHash", recorded_hash)
+    .detail("currentHash", current_hash)
 }
 
 fn evaluate_script(source: &str, path: Option<&Path>, context: &mut Context) -> JsResult<JsValue> {
@@ -2656,7 +2716,7 @@ mod tests {
     impl MockClient {
         fn new(replies: Vec<Reply>) -> Rc<Self> {
             Rc::new(Self {
-                inspection: RunInspection { script_hash: None },
+                inspection: RunInspection::default(),
                 replies: RefCell::new(replies.into()),
                 submissions: RefCell::default(),
                 terminals: RefCell::default(),
@@ -2669,7 +2729,19 @@ mod tests {
             Rc::new(Self {
                 inspection: RunInspection {
                     script_hash: Some(hash.to_owned()),
+                    ..RunInspection::default()
                 },
+                replies: RefCell::default(),
+                submissions: RefCell::default(),
+                terminals: RefCell::default(),
+                delayed_submissions: RefCell::default(),
+                hang_submissions: false,
+            })
+        }
+
+        fn with_inspection(inspection: RunInspection) -> Rc<Self> {
+            Rc::new(Self {
+                inspection,
                 replies: RefCell::default(),
                 submissions: RefCell::default(),
                 terminals: RefCell::default(),
@@ -2680,7 +2752,7 @@ mod tests {
 
         fn hanging() -> Rc<Self> {
             Rc::new(Self {
-                inspection: RunInspection { script_hash: None },
+                inspection: RunInspection::default(),
                 replies: RefCell::default(),
                 submissions: RefCell::default(),
                 terminals: RefCell::default(),
@@ -3000,6 +3072,128 @@ mod tests {
         let error = run(invalid_edit, client.clone()).unwrap_err();
         assert_eq!(error.code, "script-changed-mid-run");
         assert!(client.submissions.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_flow_run_pins_args_then_catalog_before_submission() {
+        let source = format!("{}\n42;", meta(&["cpu"], &[]));
+        let script_hash = sha256(source.as_bytes());
+        let args = json!({"subject": "current"});
+        let args_hash = sha256(&serde_json::to_vec(&args).unwrap());
+
+        let args_client = MockClient::with_inspection(RunInspection {
+            script_hash: Some(script_hash.clone()),
+            args_hash: Some("sha256:previous-args".to_owned()),
+            catalog_hash: None,
+        });
+        let error = run_script(
+            &source,
+            Some(Path::new("test-flow.js")),
+            args_client.clone(),
+            Rc::new(VecLifecycleSink::default()),
+            RunOptions::new("run-1", args.clone()),
+        )
+        .unwrap_err();
+        assert_eq!(error.name, "FlowReplayError");
+        assert_eq!(error.code, "args-changed-mid-run");
+        assert!(args_client.submissions.borrow().is_empty());
+
+        let catalog_client = MockClient::with_inspection(RunInspection {
+            script_hash: Some(script_hash),
+            args_hash: Some(args_hash),
+            catalog_hash: Some("sha256:previous-catalog".to_owned()),
+        });
+        let mut options = RunOptions::new("run-1", args);
+        options.catalog = Some(catalog());
+        options.catalog_hash = Some("sha256:current-catalog".to_owned());
+        let error = run_script(
+            &source,
+            Some(Path::new("test-flow.js")),
+            catalog_client.clone(),
+            Rc::new(VecLifecycleSink::default()),
+            options,
+        )
+        .unwrap_err();
+        assert_eq!(error.name, "FlowReplayError");
+        assert_eq!(error.code, "catalog-changed-mid-run");
+        assert!(catalog_client.submissions.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_concurrent_identity_change_stops_the_admission_frontier() {
+        let source = format!(
+            "{}\n(async () => parallel([\n\
+             () => sh(['one'], {{pools: ['cpu'], settle: true}}),\n\
+             () => sh(['two'], {{pools: ['cpu'], settle: true}})\n\
+             ]))()",
+            meta(&["cpu"], &[])
+        );
+        for code in [
+            "script-changed-mid-run",
+            "args-changed-mid-run",
+            "catalog-changed-mid-run",
+        ] {
+            let client = MockClient::new(vec![Reply::client_error(code)]);
+            let error = run(&source, client.clone()).unwrap_err();
+            assert_eq!(error.name, "FlowReplayError");
+            assert_eq!(error.code, code);
+            assert_eq!(client.submissions.borrow().len(), 1);
+        }
+    }
+
+    #[test]
+    fn args_and_catalog_pins_do_not_enter_the_canonical_payload_hash() {
+        let source = format!(
+            "{}\n(async () => sh(['fixed'], {{pools: ['cpu']}}))()",
+            meta(&["cpu"], &[])
+        );
+        let cases = [
+            (json!({"alpha": 1, "beta": 2}), None),
+            (json!({"alpha": 9, "beta": 2}), None),
+            (
+                json!({"alpha": 1, "beta": 2}),
+                Some("sha256:catalog-generation"),
+            ),
+        ];
+        let mut identities = Vec::new();
+        for (args, catalog_hash) in cases {
+            let client = MockClient::new(Vec::new());
+            let mut options = RunOptions::new("run-1", args);
+            if let Some(catalog_hash) = catalog_hash {
+                options.catalog = Some(catalog());
+                options.catalog_hash = Some(catalog_hash.to_owned());
+            }
+            run_script(
+                &source,
+                Some(Path::new("identity-pins.js")),
+                client.clone(),
+                Rc::new(VecLifecycleSink::default()),
+                options,
+            )
+            .unwrap();
+            let submission = client.submissions.borrow()[0].clone();
+            let orchestration = serde_json::to_value(&submission.orchestration).unwrap();
+            identities.push((
+                submission.payload_hash,
+                submission.orchestration.args_hash,
+                submission.orchestration.catalog_hash,
+                orchestration,
+            ));
+        }
+        assert_eq!(identities[0].0, identities[1].0);
+        assert_eq!(identities[0].0, identities[2].0);
+        assert_ne!(identities[0].1, identities[1].1);
+        assert_eq!(identities[0].1, identities[2].1);
+        assert_eq!(identities[0].2, None);
+        assert_eq!(
+            identities[2].2.as_deref(),
+            Some("sha256:catalog-generation")
+        );
+        assert!(identities[0].3["catalogHash"].is_null());
+        assert_eq!(
+            identities[0].1,
+            "sha256:955c071f4fbee40a01b9bc6e8fb3627e81bda84811ae9c29fcc5812ba3a45162"
+        );
     }
 
     #[test]
@@ -3485,6 +3679,94 @@ mod tests {
         assert_eq!(error.name, "FlowUnhandledRejection");
         assert_eq!(error.code, "unhandled-rejection");
         assert!(error.location.is_some());
+    }
+
+    #[test]
+    fn hardened_global_own_property_surface_is_pinned() {
+        let source = format!(
+            "{}\nObject.getOwnPropertyNames(globalThis).sort();",
+            meta(&[], &[])
+        );
+        let (report, _) = run(&source, MockClient::new(Vec::new())).unwrap();
+        assert_eq!(
+            report.final_value,
+            Some(json!([
+                "AggregateError",
+                "Array",
+                "ArrayBuffer",
+                "Atomics",
+                "BigInt",
+                "BigInt64Array",
+                "BigUint64Array",
+                "Boolean",
+                "DataView",
+                "Error",
+                "EvalError",
+                "Float16Array",
+                "Float32Array",
+                "Float64Array",
+                "Function",
+                "Infinity",
+                "Int16Array",
+                "Int32Array",
+                "Int8Array",
+                "JSON",
+                "Map",
+                "Math",
+                "NaN",
+                "Number",
+                "Object",
+                "Promise",
+                "Proxy",
+                "RangeError",
+                "ReferenceError",
+                "Reflect",
+                "RegExp",
+                "Set",
+                "SharedArrayBuffer",
+                "String",
+                "Symbol",
+                "SyntaxError",
+                "TypeError",
+                "TypedArray",
+                "URIError",
+                "Uint16Array",
+                "Uint32Array",
+                "Uint8Array",
+                "Uint8ClampedArray",
+                "WeakMap",
+                "WeakSet",
+                "__flowError",
+                "__flowLocation",
+                "args",
+                "attributed",
+                "claude",
+                "codex",
+                "decodeURI",
+                "decodeURIComponent",
+                "dissent",
+                "drv",
+                "encodeURI",
+                "encodeURIComponent",
+                "eval",
+                "flowMeta",
+                "globalThis",
+                "isFinite",
+                "isNaN",
+                "job",
+                "local",
+                "log",
+                "members",
+                "parallel",
+                "parseFloat",
+                "parseInt",
+                "pipeline",
+                "quorum",
+                "repairKey",
+                "sh",
+                "undefined"
+            ]))
+        );
     }
 
     #[test]

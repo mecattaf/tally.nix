@@ -287,8 +287,8 @@ conclusions plus every roster member excluded from the accepted evidence.
 | Too few candidates are valid after repair | The final `quorum()` throws `quorum-not-met`; no reducer node is admitted. |
 | The first reducer fails its schema | One reducer repair is admitted; a bad repair rejects the flow. |
 | The runner dies during the batch | Replay reselects the same roster, reuses completed nodes, attaches to live ones, and follows the same repair decisions. |
-| Catalog launch data, adapter, pools, or arguments change under the same run ID | If canonical work changes, the affected node diverges and the runner stops. |
-| Only catalog member identity, order, or provenance changes while execution data stays identical | Selection is outside `payloadHash`, so an old node can reuse and be attributed under the newly selected row. Do not replay with changed catalog bytes. |
+| Arguments change under the same run ID | `args-changed-mid-run`, exit 20, before selection or admission. |
+| Any catalog bytes change under the same run ID | `catalog-changed-mid-run`, exit 20, before an old node can reuse, even if selected execution data would stay identical. |
 | The GPU pool has capacity 1 | Jobs wait and drain sequentially; this is not a quorum failure. |
 
 This pattern is useful when the disagreement is part of the evidence. If the

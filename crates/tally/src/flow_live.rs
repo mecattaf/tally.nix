@@ -258,7 +258,9 @@ impl FlowClient for LiveFlowClient {
             self.resolve_runner_related_trigger().await?;
             'snapshot: loop {
                 let mut cursor: Option<String> = None;
-                let mut hashes = BTreeSet::new();
+                let mut script_hashes = BTreeSet::new();
+                let mut args_hashes = BTreeSet::new();
+                let mut catalog_hashes = BTreeSet::new();
                 loop {
                     let mut params = json!({"flowRun": flow_run_id, "limit": 1000});
                     if let Some(cursor) = cursor.as_deref() {
@@ -292,15 +294,34 @@ impl FlowClient for LiveFlowClient {
                                     "a query.jobs --flow-run item omitted orchestration provenance",
                                 )
                             })?;
-                        let hash = orchestration
+                        let script_hash = orchestration
                             .get("scriptHash")
                             .and_then(Value::as_str)
                             .ok_or_else(|| {
+                            protocol_error(
+                                "a query.jobs --flow-run item omitted orchestration.scriptHash",
+                            )
+                        })?;
+                        let args_hash = orchestration
+                            .get("argsHash")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
                                 protocol_error(
-                                    "a query.jobs --flow-run item omitted orchestration.scriptHash",
+                                    "a query.jobs --flow-run item omitted orchestration.argsHash",
                                 )
                             })?;
-                        hashes.insert(hash.to_owned());
+                        let catalog_hash = match orchestration.get("catalogHash") {
+                            Some(Value::String(hash)) => Some(hash.clone()),
+                            Some(Value::Null) => None,
+                            _ => {
+                                return Err(protocol_error(
+                                    "a query.jobs --flow-run item omitted orchestration.catalogHash or supplied an invalid value",
+                                ));
+                            }
+                        };
+                        script_hashes.insert(script_hash.to_owned());
+                        args_hashes.insert(args_hash.to_owned());
+                        catalog_hashes.insert(catalog_hash);
                     }
                     cursor = response
                         .get("nextCursor")
@@ -310,17 +331,44 @@ impl FlowClient for LiveFlowClient {
                         break;
                     }
                 }
-                if hashes.len() > 1 {
+                if script_hashes.len() > 1 {
                     return Err(ClientError::new(
                         "script-history-conflict",
                         format!(
                             "flow run {flow_run_id} contains more than one recorded scriptHash"
                         ),
                     )
-                    .with_details(json!({"flowRunId": flow_run_id, "scriptHashes": hashes})));
+                    .with_details(json!({
+                        "flowRunId": flow_run_id,
+                        "scriptHashes": script_hashes,
+                    })));
+                }
+                if args_hashes.len() > 1 {
+                    return Err(ClientError::new(
+                        "args-history-conflict",
+                        format!("flow run {flow_run_id} contains more than one recorded argsHash"),
+                    )
+                    .with_details(json!({
+                        "flowRunId": flow_run_id,
+                        "argsHashes": args_hashes,
+                    })));
+                }
+                if catalog_hashes.len() > 1 {
+                    return Err(ClientError::new(
+                        "catalog-history-conflict",
+                        format!(
+                            "flow run {flow_run_id} contains more than one recorded catalogHash"
+                        ),
+                    )
+                    .with_details(json!({
+                        "flowRunId": flow_run_id,
+                        "catalogHashes": catalog_hashes,
+                    })));
                 }
                 return Ok(RunInspection {
-                    script_hash: hashes.into_iter().next(),
+                    script_hash: script_hashes.into_iter().next(),
+                    args_hash: args_hashes.into_iter().next(),
+                    catalog_hash: catalog_hashes.into_iter().next().flatten(),
                 });
             }
         })
@@ -344,7 +392,7 @@ impl FlowClient for LiveFlowClient {
             let payload = enqueue_payload(&submission, &runner)?;
             match self.call("queue.enqueue", payload).await {
                 Ok(response) => {
-                    validate_recorded_script_identity(&response, &submission)?;
+                    validate_recorded_run_identity(&response, &submission)?;
                     let mut admission = parse_admission(&response)?;
                     if let Some(expectation) = result_expected {
                         self.result_expected.lock().await.insert(
@@ -540,7 +588,7 @@ fn parse_admission(value: &Value) -> Result<Admission, ClientError> {
     })
 }
 
-fn validate_recorded_script_identity(
+fn validate_recorded_run_identity(
     value: &Value,
     submission: &FlowSubmission,
 ) -> Result<(), ClientError> {
@@ -566,27 +614,93 @@ fn validate_recorded_script_identity(
         // Explicit author dedup keys may intentionally reuse work across runs.
         return Ok(());
     }
-    let recorded_hash = recorded
+    validate_identity_capsule(recorded, submission)
+}
+
+fn validate_identity_capsule(
+    recorded: &Map<String, Value>,
+    submission: &FlowSubmission,
+) -> Result<(), ClientError> {
+    let recorded_script_hash = recorded
         .get("scriptHash")
         .and_then(Value::as_str)
         .ok_or_else(|| {
             protocol_error("same-run replay admission omitted recordedOrchestration.scriptHash")
         })?;
-    if recorded_hash == submission.orchestration.script_hash {
-        return Ok(());
+    if recorded_script_hash != submission.orchestration.script_hash {
+        return Err(changed_hash_error(
+            "script-changed-mid-run",
+            &submission.orchestration.flow_run_id,
+            recorded_script_hash,
+            &submission.orchestration.script_hash,
+        ));
     }
-    Err(ClientError::new(
-        "script-changed-mid-run",
-        format!(
-            "flow run {} is pinned to {recorded_hash}, not {}",
-            submission.orchestration.flow_run_id, submission.orchestration.script_hash
-        ),
+    let recorded_args_hash = recorded
+        .get("argsHash")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            protocol_error("same-run replay admission omitted recordedOrchestration.argsHash")
+        })?;
+    if recorded_args_hash != submission.orchestration.args_hash {
+        return Err(changed_hash_error(
+            "args-changed-mid-run",
+            &submission.orchestration.flow_run_id,
+            recorded_args_hash,
+            &submission.orchestration.args_hash,
+        ));
+    }
+    let recorded_catalog_hash = match recorded.get("catalogHash") {
+        Some(Value::String(hash)) => Some(hash.as_str()),
+        Some(Value::Null) => None,
+        _ => {
+            return Err(protocol_error(
+                "same-run replay admission omitted recordedOrchestration.catalogHash or supplied an invalid value",
+            ));
+        }
+    };
+    if recorded_catalog_hash != submission.orchestration.catalog_hash.as_deref() {
+        return Err(changed_catalog_identity_error(
+            &submission.orchestration.flow_run_id,
+            recorded_catalog_hash,
+            submission.orchestration.catalog_hash.as_deref(),
+        ));
+    }
+    Ok(())
+}
+
+fn changed_hash_error(
+    code: &str,
+    flow_run_id: &str,
+    recorded_hash: &str,
+    current_hash: &str,
+) -> ClientError {
+    ClientError::new(
+        code,
+        format!("flow run {flow_run_id} is pinned to {recorded_hash}, not {current_hash}"),
     )
     .with_details(json!({
-        "flowRunId": submission.orchestration.flow_run_id,
+        "flowRunId": flow_run_id,
         "recordedHash": recorded_hash,
-        "currentHash": submission.orchestration.script_hash,
-    })))
+        "currentHash": current_hash,
+    }))
+}
+
+fn changed_catalog_identity_error(
+    flow_run_id: &str,
+    recorded_hash: Option<&str>,
+    current_hash: Option<&str>,
+) -> ClientError {
+    let rendered_recorded = recorded_hash.unwrap_or("<none>");
+    let rendered_current = current_hash.unwrap_or("<none>");
+    ClientError::new(
+        "catalog-changed-mid-run",
+        format!("flow run {flow_run_id} is pinned to {rendered_recorded}, not {rendered_current}"),
+    )
+    .with_details(json!({
+        "flowRunId": flow_run_id,
+        "recordedHash": recorded_hash,
+        "currentHash": current_hash,
+    }))
 }
 
 fn parse_node_result(value: &Value, disposition: Disposition) -> Result<NodeResult, ClientError> {
@@ -670,25 +784,12 @@ fn parse_verdict(value: &str) -> Result<Verdict, ClientError> {
 fn submission_error(submission: &FlowSubmission, error: WireIoError) -> ClientError {
     if let WireIoError::Rpc(WireErrorCode::DedupKeyConflict, message, Some(data)) = &error {
         if let Some(recorded) = matching_replay_candidate(data, submission) {
-            if let Some(recorded_hash) = recorded
+            let recorded_orchestration = recorded
                 .get("orchestration")
                 .and_then(Value::as_object)
-                .and_then(|orchestration| orchestration.get("scriptHash"))
-                .and_then(Value::as_str)
-                .filter(|hash| *hash != submission.orchestration.script_hash)
-            {
-                return ClientError::new(
-                    "script-changed-mid-run",
-                    format!(
-                        "flow run {} is pinned to {recorded_hash}, not {}",
-                        submission.orchestration.flow_run_id, submission.orchestration.script_hash
-                    ),
-                )
-                .with_details(json!({
-                    "flowRunId": submission.orchestration.flow_run_id,
-                    "recordedHash": recorded_hash,
-                    "currentHash": submission.orchestration.script_hash,
-                }));
+                .expect("matching replay candidates carry an orchestration object");
+            if let Err(error) = validate_identity_capsule(recorded_orchestration, submission) {
+                return error;
             }
             let recorded_hash = recorded
                 .get("payloadHash")
@@ -929,6 +1030,8 @@ mod tests {
                 flow_name: "fixture".to_owned(),
                 flow_run_id: "00000000-0000-4000-8000-000000000047".to_owned(),
                 script_hash: "sha256:script".to_owned(),
+                args_hash: "sha256:args".to_owned(),
+                catalog_hash: None,
                 node_ordinal: 0,
                 node_label: Some("first".to_owned()),
                 max_nodes: 10,
@@ -958,7 +1061,7 @@ mod tests {
             &'a self,
             _flow_run_id: &'a str,
         ) -> FlowFuture<'a, Result<RunInspection, ClientError>> {
-            Box::pin(std::future::ready(Ok(RunInspection { script_hash: None })))
+            Box::pin(std::future::ready(Ok(RunInspection::default())))
         }
 
         fn submit<'a>(
@@ -1026,6 +1129,8 @@ mod tests {
             "00000000-0000-4000-8000-000000000048"
         );
         assert_eq!(payload["orchestration"]["nodeOrdinal"], 0);
+        assert_eq!(payload["orchestration"]["argsHash"], "sha256:args");
+        assert!(payload["orchestration"]["catalogHash"].is_null());
         assert_eq!(
             payload["orchestration"]["promptRevision"],
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -1482,6 +1587,8 @@ export const meta = {
                     "orchestration": {
                         "flowRunId": "00000000-0000-4000-8000-000000000047",
                         "scriptHash": "sha256:script",
+                        "argsHash": "sha256:args",
+                        "catalogHash": null,
                         "nodeOrdinal": 0
                     }
                 }]
@@ -1533,6 +1640,38 @@ export const meta = {
     }
 
     #[test]
+    fn conflict_identity_checks_args_and_catalog_before_payload_divergence() {
+        let conflict = |args_hash: &str, catalog_hash: Value| {
+            WireIoError::Rpc(
+                WireErrorCode::DedupKeyConflict,
+                "dedup-key-conflict".to_owned(),
+                Some(json!({
+                    "existing": [{
+                        "taskUuid": "00000000-0000-4000-8000-000000000049",
+                        "payloadHash": "sha256:other-payload",
+                        "orchestration": {
+                            "flowRunId": "00000000-0000-4000-8000-000000000047",
+                            "scriptHash": "sha256:script",
+                            "argsHash": args_hash,
+                            "catalogHash": catalog_hash,
+                            "nodeOrdinal": 0
+                        }
+                    }]
+                })),
+            )
+        };
+
+        let args = submission_error(&submission(), conflict("sha256:other-args", Value::Null));
+        assert_eq!(args.code, "args-changed-mid-run");
+
+        let catalog = submission_error(
+            &submission(),
+            conflict("sha256:args", json!("sha256:other-catalog")),
+        );
+        assert_eq!(catalog.code, "catalog-changed-mid-run");
+    }
+
+    #[test]
     fn ambiguous_live_candidates_remain_a_kernel_dedup_conflict() {
         let candidate = json!({
             "taskUuid": "00000000-0000-4000-8000-000000000049",
@@ -1569,7 +1708,7 @@ export const meta = {
                 "maxNodes": 10
             }
         });
-        let error = validate_recorded_script_identity(&response, &submission()).unwrap_err();
+        let error = validate_recorded_run_identity(&response, &submission()).unwrap_err();
         assert_eq!(error.code, "script-changed-mid-run");
         assert_eq!(
             error.details.as_ref().unwrap()["recordedHash"],
@@ -1579,7 +1718,45 @@ export const meta = {
         let mut cross_run = response;
         cross_run["recordedOrchestration"]["flowRunId"] =
             json!("00000000-0000-4000-8000-000000000099");
-        validate_recorded_script_identity(&cross_run, &submission()).unwrap();
+        validate_recorded_run_identity(&cross_run, &submission()).unwrap();
+    }
+
+    #[test]
+    fn same_run_admission_pins_args_before_catalog() {
+        let mut response = json!({
+            "schemaVersion": 1,
+            "disposition": "attached",
+            "task_uuid": "00000000-0000-4000-8000-000000000049",
+            "payloadHash": "sha256:expected",
+            "attempt": 1,
+            "recordedOrchestration": {
+                "flowName": "fixture",
+                "flowRunId": "00000000-0000-4000-8000-000000000047",
+                "scriptHash": "sha256:script",
+                "argsHash": "sha256:other-args",
+                "catalogHash": "sha256:other-catalog",
+                "nodeOrdinal": 0,
+                "maxNodes": 10
+            }
+        });
+        let error = validate_recorded_run_identity(&response, &submission()).unwrap_err();
+        assert_eq!(error.code, "args-changed-mid-run");
+        assert_eq!(
+            error.details.as_ref().unwrap()["recordedHash"],
+            "sha256:other-args"
+        );
+
+        response["recordedOrchestration"]["argsHash"] = json!("sha256:args");
+        let error = validate_recorded_run_identity(&response, &submission()).unwrap_err();
+        assert_eq!(error.code, "catalog-changed-mid-run");
+        assert_eq!(
+            error.details.as_ref().unwrap()["recordedHash"],
+            "sha256:other-catalog"
+        );
+        assert!(error.details.as_ref().unwrap()["currentHash"].is_null());
+
+        response["recordedOrchestration"]["catalogHash"] = Value::Null;
+        validate_recorded_run_identity(&response, &submission()).unwrap();
     }
 
     #[test]
