@@ -33,13 +33,30 @@ let
     "--yield-grace-sec"
     (toString cfg.lease.yieldGraceSec)
   ];
+  daemonWrapper = pkgs.writeShellScript "tally-daemon" ''
+    export XDG_RUNTIME_DIR="/run/user/$(${pkgs.coreutils}/bin/id -u)"
+    exec ${lib.escapeShellArgs daemonArgv}
+  '';
 in
 {
-  options.services.tally = common.mkOptions {
-    defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.tally;
-    defaultDataDir = "/var/lib/tally/data";
-    defaultStateDir = "/var/lib/tally/state";
-  };
+  options.services.tally =
+    common.mkOptions {
+      defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.tally;
+      defaultDataDir = "/var/lib/tally/data";
+      defaultStateDir = "/var/lib/tally/state";
+    }
+    // {
+      user = lib.mkOption {
+        type = lib.types.str;
+        default = "tally";
+        description = "Dedicated unprivileged account that runs the tally system service and jobs.";
+      };
+      group = lib.mkOption {
+        type = lib.types.str;
+        default = "tally";
+        description = "Primary group for the dedicated tally system service account.";
+      };
+    };
 
   config = lib.mkMerge [
     { services.tally.adapters = common.adapterDefaults; }
@@ -52,6 +69,40 @@ in
       ];
       environment.etc."tally/config.json".source = checkedConfig;
 
+      users.groups.${cfg.group} = { };
+      users.users.${cfg.user} = {
+        isSystemUser = true;
+        group = cfg.group;
+        linger = true;
+      };
+
+      system.activationScripts.tallyRuntimeDirectories = {
+        deps = [ "users" ];
+        text = ''
+          ${lib.escapeShellArgs [
+            "${pkgs.coreutils}/bin/install"
+            "-d"
+            "-m"
+            "0700"
+            "-o"
+            cfg.user
+            "-g"
+            cfg.group
+            "/var/lib/tally"
+            (toString cfg.dataDir)
+            (toString cfg.stateDir)
+          ]}
+          ${lib.escapeShellArgs [
+            "${pkgs.coreutils}/bin/chown"
+            "--recursive"
+            "--no-dereference"
+            "${cfg.user}:${cfg.group}"
+            (toString cfg.dataDir)
+            (toString cfg.stateDir)
+          ]}
+        '';
+      };
+
       systemd.services.tally-daemon = {
         description = "tally contention and proof system daemon";
         after = [ "network.target" ];
@@ -60,6 +111,8 @@ in
         unitConfig.ConditionPathExists = configPath;
         serviceConfig = {
           Type = "notify";
+          User = cfg.user;
+          Group = cfg.group;
           NotifyAccess = "main";
           WatchdogSec = "30s";
           Restart = "always";
@@ -83,13 +136,17 @@ in
             (toString cfg.dataDir)
             (toString cfg.stateDir)
           ];
-          ExecStart = lib.escapeShellArgs daemonArgv;
+          ExecStart = daemonWrapper;
           CPUWeight = 100;
           MemoryMax = "8G";
           UMask = "0077";
           NoNewPrivileges = true;
           PrivateTmp = true;
           ProtectSystem = "strict";
+          ReadWritePaths = [
+            (toString cfg.dataDir)
+            (toString cfg.stateDir)
+          ];
           RestrictAddressFamilies = [
             "AF_UNIX"
           ]
@@ -105,12 +162,17 @@ in
         description = "append an advisory tally attestation for %i";
         serviceConfig = {
           Type = "oneshot";
+          User = cfg.user;
+          Group = cfg.group;
           ExecStart = lib.escapeShellArgs [
             "${witnessEmitter}/bin/tally-witness-emit"
             "%i"
           ];
           Environment = [ "TALLY_ATTESTATION_LEDGER=${toString cfg.dataDir}/attestations.jsonl" ];
           UMask = "0077";
+          NoNewPrivileges = true;
+          ProtectSystem = "strict";
+          ReadWritePaths = [ (toString cfg.dataDir) ];
         };
       };
     })
