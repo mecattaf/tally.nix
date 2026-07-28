@@ -220,6 +220,7 @@ impl RpcHandler for ContinueGuardrailHandler {
                 "queue.enqueue" => {
                     assert_eq!(params["noEnqueue"], true);
                     assert!(params["callerJobId"].is_null());
+                    assert!(params["callerJobToken"].is_null());
                     *self.admitted_no_enqueue.lock().unwrap() = Some(NO_ENQUEUE_JOB.to_owned());
                     Ok(serde_json::json!({
                         "task_uuid": NO_ENQUEUE_JOB,
@@ -282,14 +283,27 @@ async fn run_tally_with_job_id(
     args: &[&str],
     job_id: Option<&str>,
 ) -> std::process::Output {
+    run_tally_with_identity(socket, args, job_id, None).await
+}
+
+async fn run_tally_with_identity(
+    socket: &Path,
+    args: &[&str],
+    job_id: Option<&str>,
+    job_token: Option<&str>,
+) -> std::process::Output {
     let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
     command
         .arg("--socket")
         .arg(socket)
         .args(args)
-        .env_remove("TALLY_JOB_ID");
+        .env_remove("TALLY_JOB_ID")
+        .env_remove("TALLY_JOB_TOKEN");
     if let Some(job_id) = job_id {
         command.env("TALLY_JOB_ID", job_id);
+    }
+    if let Some(job_token) = job_token {
+        command.env("TALLY_JOB_TOKEN", job_token);
     }
     command.output().await.unwrap()
 }
@@ -369,6 +383,38 @@ async fn no_enqueue_job_cannot_continue_and_empty_job_id_is_unset() {
             .await;
             assert_eq!(cooperative.status.code(), Some(0));
             server.await.unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cli_forwards_the_inherited_job_token_with_the_caller_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let handler = SubmissionCaptureHandler::default();
+    let requests = handler.requests.clone();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_connection(stream, handler).await.unwrap();
+            });
+            let token = "ab".repeat(32);
+            let output = run_tally_with_identity(
+                &socket,
+                &["enqueue", "--pool", "slot", "--", "true"],
+                Some(NO_ENQUEUE_JOB),
+                Some(&token),
+            )
+            .await;
+            assert_eq!(output.status.code(), Some(0));
+            server.await.unwrap();
+
+            let requests = requests.lock().unwrap();
+            assert_eq!(requests[0]["callerJobId"], NO_ENQUEUE_JOB);
+            assert_eq!(requests[0]["callerJobToken"], token);
         })
         .await;
 }

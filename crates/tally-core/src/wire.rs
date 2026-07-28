@@ -505,6 +505,8 @@ define_enqueue_payload! {
     origin: Option<AdmissionOrigin> => "origin",
     #[serde(default)]
     caller_job_id: Option<String> => "callerJobId",
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    caller_job_token: Option<String> => "callerJobToken",
     #[serde(default, rename = "ghTriggerActor", alias = "ghActor")]
     gh_trigger_actor: Option<String> => "ghTriggerActor",
     #[serde(default)]
@@ -2153,6 +2155,7 @@ mod tests {
             credentials: BTreeMap::new(),
             origin: None,
             caller_job_id: Some("job-parent".to_owned()),
+            caller_job_token: None,
             gh_trigger_actor: None,
             gh_self_actor: None,
             gh_origin: None,
@@ -2160,6 +2163,23 @@ mod tests {
             related_trigger: None,
             wait: false,
         }
+    }
+
+    #[test]
+    fn caller_job_token_is_additive_and_uses_the_camel_case_wire_key() {
+        let mut payload = child_payload();
+        let legacy = serde_json::to_value(&payload).unwrap();
+        assert!(legacy.get("callerJobToken").is_none());
+
+        payload.caller_job_token = Some("ab".repeat(32));
+        let encoded = serde_json::to_value(&payload).unwrap();
+        assert_eq!(encoded["callerJobToken"], "ab".repeat(32));
+        assert_eq!(
+            serde_json::from_value::<EnqueuePayload>(encoded)
+                .unwrap()
+                .caller_job_token,
+            payload.caller_job_token
+        );
     }
 
     #[test]

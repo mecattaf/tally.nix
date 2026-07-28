@@ -694,6 +694,7 @@ fn runner(
         .arg(flow_run_id)
         .env_remove("TALLY_TASK_UUID")
         .env_remove("TALLY_JOB_ID")
+        .env_remove("TALLY_JOB_TOKEN")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);

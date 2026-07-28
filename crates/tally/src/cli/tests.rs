@@ -100,12 +100,13 @@ fn explicit_client_config_controls_the_transport_limit() {
 #[test]
 fn runner_identity_is_all_or_nothing_and_uuid_typed() {
     assert_eq!(
-        captured_runner_identity(None, None).unwrap(),
+        captured_runner_identity(None, None, None).unwrap(),
         RunnerIdentity::default()
     );
     let identity = captured_runner_identity(
         Some("00000000-0000-4000-8000-000000000071".to_owned()),
         Some("00000000-0000-4000-8000-000000000072".to_owned()),
+        Some("ab".repeat(32)),
     )
     .unwrap();
     assert_eq!(
@@ -113,8 +114,13 @@ fn runner_identity_is_all_or_nothing_and_uuid_typed() {
         Some("00000000-0000-4000-8000-000000000071")
     );
     assert_eq!(
+        identity.job_token.as_deref(),
+        Some("ab".repeat(32).as_str())
+    );
+    assert_eq!(
         captured_runner_identity(
             Some("00000000-0000-4000-8000-000000000071".to_owned()),
+            None,
             None
         )
         .unwrap_err()
@@ -122,9 +128,13 @@ fn runner_identity_is_all_or_nothing_and_uuid_typed() {
         "runner-identity-incomplete"
     );
     assert_eq!(
-        captured_runner_identity(Some("not-a-uuid".to_owned()), Some("also-bad".to_owned()))
-            .unwrap_err()
-            .code,
+        captured_runner_identity(
+            Some("not-a-uuid".to_owned()),
+            Some("also-bad".to_owned()),
+            None
+        )
+        .unwrap_err()
+        .code,
         "runner-identity-invalid"
     );
 }

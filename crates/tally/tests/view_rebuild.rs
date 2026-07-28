@@ -118,6 +118,7 @@ fn row(uuid: Uuid) -> RowSeed {
         orchestration: None,
         session_ref: None,
         final_message: None,
+        job_token_hash: None,
         lease_epoch: 1,
         attempt: 1,
         argv: vec!["true".to_owned()],

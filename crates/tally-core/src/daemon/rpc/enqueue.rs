@@ -83,6 +83,7 @@ impl DaemonHandler {
             .ok_or_else(|| WireError::invalid(format!("job {task_uuid} attempt overflow")))?;
         row.attempt = next_attempt;
         row.lease_epoch = context.epoch;
+        row.job_token_hash = None;
 
         let engine = AdapterEngine::new(&context.config.adapters);
         let invocation = if row.resumed_from.is_some() {
@@ -165,6 +166,7 @@ impl DaemonHandler {
         let mut event = matching_events
             .pop()
             .expect("exactly one matching event was checked");
+        event.row.job_token_hash = None;
         event.retries.push(DurableRetry {
             attempt: next_attempt,
             previous_witness_seq: terminal.seq,
@@ -561,6 +563,7 @@ impl DaemonHandler {
                 .as_ref()
                 .and_then(|job| job.row.session_ref.clone()),
             final_message: None,
+            job_token_hash: None,
             lease_epoch: epoch,
             attempt: 1,
             argv: resolved.argv,

@@ -558,6 +558,12 @@ pub const FLOW_ENQUEUE_FIELD_PARITY: &[FlowEnqueueFieldParity] = &[
         ),
     },
     FlowEnqueueFieldParity {
+        kernel_field: "callerJobToken",
+        disposition: FlowEnqueueFieldDisposition::Excluded(
+            "the live client derives callerJobToken from the admitted runner capability",
+        ),
+    },
+    FlowEnqueueFieldParity {
         kernel_field: "ghTriggerActor",
         disposition: FlowEnqueueFieldDisposition::Excluded(
             "GitHub trigger identity belongs to producer ingress, not flow nodes",

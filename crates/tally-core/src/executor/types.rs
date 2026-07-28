@@ -4,13 +4,14 @@ pub const CAPTURE_DIRECTORY: &str = "capture";
 pub const CAPTURE_ARCHIVE_DIRECTORY: &str = "capture/archive";
 pub const UNIT_EXIT_DIRECTORY: &str = "unit-exit";
 pub const UNIT_EXIT_SCHEMA_VERSION: u32 = 2;
-pub(super) const OPTIONAL_TALLY_ENVIRONMENT: [&str; 12] = [
+pub(super) const OPTIONAL_TALLY_ENVIRONMENT: [&str; 13] = [
     "TALLY_TASK_UUID",
     "TALLY_PARENT",
     "TALLY_NO_ENQUEUE",
     "TALLY_CREDENTIALS",
     "TALLY_YIELD_HOOK",
     "TALLY_SOCKET",
+    "TALLY_JOB_TOKEN",
     "TALLY_WORKSPACE_REPO",
     "TALLY_WORKSPACE_BASE_REV",
     "TALLY_WORKSPACE_BRANCH",
@@ -73,6 +74,10 @@ pub struct ExecutionRequest {
     /// Daemon RPC endpoint used by checkpoint hooks. This is kept separate
     /// from adapter-controlled environment so it cannot be redirected there.
     pub tally_socket: Option<String>,
+    /// Capability token minted by the coordinator for a local job generation.
+    /// Remote executors never receive the coordinator's token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_token: Option<String>,
     pub environment: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gh_origin: Option<GhOrigin>,

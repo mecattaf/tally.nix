@@ -300,6 +300,9 @@ pub(super) fn execution_environment(
     if let Some(socket) = &request.tally_socket {
         environment.push(("TALLY_SOCKET".to_owned(), socket.clone()));
     }
+    if let Some(token) = &request.job_token {
+        environment.push(("TALLY_JOB_TOKEN".to_owned(), token.clone()));
+    }
     if let Some(path) = &request.brief_path {
         environment.push(("TALLY_BRIEF".to_owned(), display_path(path)?.to_owned()));
     }
@@ -407,14 +410,17 @@ pub(super) fn environment_to_unset(request: &ExecutionRequest) -> Vec<&'static s
     if request.tally_socket.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[5]);
     }
+    if request.job_token.is_none() {
+        names.push(OPTIONAL_TALLY_ENVIRONMENT[6]);
+    }
     if request.workspace.is_none() {
-        names.extend(OPTIONAL_TALLY_ENVIRONMENT[6..10].iter().copied());
+        names.extend(OPTIONAL_TALLY_ENVIRONMENT[7..11].iter().copied());
     }
     if request.brief_path.is_none() {
-        names.push(OPTIONAL_TALLY_ENVIRONMENT[10]);
+        names.push(OPTIONAL_TALLY_ENVIRONMENT[11]);
     }
     if request.gate_manifest.is_none() {
-        names.push(OPTIONAL_TALLY_ENVIRONMENT[11]);
+        names.push(OPTIONAL_TALLY_ENVIRONMENT[12]);
     }
     if request.git_ai.is_none() {
         names.push("GIT_AI_CUSTOM_ATTRIBUTES");

@@ -698,6 +698,16 @@ impl Executor {
                 "tally socket must be non-empty and contain no NUL bytes".to_owned(),
             ));
         }
+        if request.job_token.as_ref().is_some_and(|token| {
+            token.len() != 64
+                || !token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err(ExecutorError::InvalidRequest(
+                "job token must be exactly 256 bits of lowercase hex".to_owned(),
+            ));
+        }
         match (
             request.brief_hash.as_deref(),
             request.brief_path.as_deref(),

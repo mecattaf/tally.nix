@@ -36,6 +36,7 @@ fn request() -> ExecutionRequest {
             "status".to_owned(),
         ]),
         tally_socket: Some("/run/user/1000/tally.sock".to_owned()),
+        job_token: Some("ab".repeat(32)),
         environment: BTreeMap::from([("ADAPTER_COLOR".to_owned(), "never".to_owned())]),
         gh_origin: None,
         brief_hash: None,
@@ -583,6 +584,7 @@ fn systemd_argv_is_direct_stable_and_complete() {
         "TALLY_CREDENTIALS=[\"alpha\",\"zeta\"]",
         "TALLY_YIELD_HOOK=[\"tally\",\"lease\",\"status\"]",
         "TALLY_SOCKET=/run/user/1000/tally.sock",
+        "TALLY_JOB_TOKEN=abababababababababababababababababababababababababababababababab",
     ] {
         assert!(args
             .windows(2)
@@ -1075,6 +1077,7 @@ fn rowless_identity_uses_job_uuid_and_optional_env_stays_absent() {
     request.credentials.clear();
     request.yield_hook = None;
     request.tally_socket = None;
+    request.job_token = None;
     request.runtime_max_sec = None;
     request.cwd = None;
     let args = strings(
@@ -1091,6 +1094,7 @@ fn rowless_identity_uses_job_uuid_and_optional_env_stays_absent() {
         "TALLY_CREDENTIALS=",
         "TALLY_YIELD_HOOK=",
         "TALLY_SOCKET=",
+        "TALLY_JOB_TOKEN=",
         "RuntimeMaxSec=",
         "LoadCredential=",
     ] {
@@ -1151,6 +1155,11 @@ fn invalid_limits_runtime_paths_and_credentials_are_rejected() {
     invalid = request();
     invalid.cwd = Some(PathBuf::from("/work/%n"));
     assert!(executor.build_systemd_argv(&invalid).is_err());
+    for token in ["a".repeat(63), "A".repeat(64), "g".repeat(64)] {
+        invalid = request();
+        invalid.job_token = Some(token);
+        assert!(executor.build_systemd_argv(&invalid).is_err());
+    }
     invalid = request();
     invalid.credentials = BTreeMap::from([("secret".to_owned(), PathBuf::from("/run/keys/%n"))]);
     assert!(executor.build_systemd_argv(&invalid).is_err());
@@ -2277,6 +2286,7 @@ fn fixture_request(pool: &str) -> ExecutionRequest {
         ],
         yield_hook: None,
         tally_socket: None,
+        job_token: None,
         environment: BTreeMap::new(),
         gh_origin: None,
         brief_hash: None,

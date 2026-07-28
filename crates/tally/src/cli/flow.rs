@@ -9,6 +9,7 @@ use super::*;
 pub(super) struct InheritedFlowEnvironment {
     pub(super) task_uuid: Option<String>,
     pub(super) job_id: Option<String>,
+    pub(super) job_token: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -28,6 +29,7 @@ impl InvocationEnvironment {
         .then(|| InheritedFlowEnvironment {
             task_uuid: std::env::var("TALLY_TASK_UUID").ok(),
             job_id: std::env::var("TALLY_JOB_ID").ok(),
+            job_token: std::env::var("TALLY_JOB_TOKEN").ok(),
         });
         Self {
             rpc_timeout: std::env::var_os(RPC_TIMEOUT_ENV),
@@ -133,6 +135,7 @@ pub(super) async fn run_flow(
                 .with_context(|| format!("cannot read flow script {}", args.script.display()))?;
             let inherited_task_uuid = inherited.task_uuid;
             let inherited_job_id = inherited.job_id;
+            let inherited_job_token = inherited.job_token;
             let flow_run_id = args
                 .flow_run_id
                 .or_else(|| inherited_task_uuid.clone())
@@ -153,8 +156,12 @@ pub(super) async fn run_flow(
                     format!("flow run ID {flow_run_id:?} is not a UUID"),
                 ))
             })?;
-            let runner = captured_runner_identity(inherited_task_uuid, inherited_job_id)
-                .map_err(|error| flow_error(*error))?;
+            let runner = captured_runner_identity(
+                inherited_task_uuid,
+                inherited_job_id,
+                inherited_job_token,
+            )
+            .map_err(|error| flow_error(*error))?;
             let catalog = args
                 .catalog
                 .as_deref()
@@ -267,9 +274,13 @@ fn same_script(left: &Path, right: &Path) -> bool {
 pub(super) fn captured_runner_identity(
     task_uuid: Option<String>,
     job_id: Option<String>,
+    job_token: Option<String>,
 ) -> std::result::Result<RunnerIdentity, Box<FlowError>> {
     match (task_uuid, job_id) {
-        (None, None) => Ok(RunnerIdentity::default()),
+        (None, None) => Ok(RunnerIdentity {
+            job_token,
+            ..RunnerIdentity::default()
+        }),
         (Some(task_uuid), Some(job_id)) => {
             for (name, value) in [("TALLY_TASK_UUID", &task_uuid), ("TALLY_JOB_ID", &job_id)] {
                 uuid::Uuid::parse_str(value).map_err(|_| {
@@ -283,6 +294,7 @@ pub(super) fn captured_runner_identity(
             Ok(RunnerIdentity {
                 task_uuid: Some(task_uuid),
                 job_id: Some(job_id),
+                job_token,
                 related_trigger: None,
             })
         }

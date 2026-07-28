@@ -8,6 +8,10 @@ authorized.
 
 ### Added
 
+- Added a daemon-minted per-job capability token, delivered to local jobs as `TALLY_JOB_TOKEN`,
+  persisted by hash in the durable row so a running job keeps one identity across daemon restarts,
+  and forwarded by the CLI as the `callerJobToken` enqueue field. Remote and SSH-executed jobs
+  never receive it.
 - Added a typed per-flow `workloadMutex`, co-leased with `flow` for the runner process lifetime,
   with replay-behind-the-next-holder semantics and an admitted-parent manual invocation contract.
 - Added operator chapters for configured mechanisms and declarative flows, including exact module

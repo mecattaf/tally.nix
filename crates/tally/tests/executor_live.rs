@@ -70,6 +70,7 @@ fn request(argv: Vec<String>) -> ExecutionRequest {
         argv,
         yield_hook: None,
         tally_socket: None,
+        job_token: None,
         environment: BTreeMap::new(),
         gh_origin: None,
         brief_hash: None,
@@ -183,6 +184,7 @@ async fn real_user_manager_executor_smoke() {
     let mut cleanup = UnitCleanup::new();
     let script = r#"
 set -eu
+test "$TALLY_JOB_TOKEN" = 'abababababababababababababababababababababababababababababababab'
 printf 'pool=%s class=%s epoch=%s no_enqueue=%s credentials=%s\n' \
   "$TALLY_POOL" "$TALLY_CLASS" "$TALLY_LEASE_EPOCH" "$TALLY_NO_ENQUEUE" "$TALLY_CREDENTIALS"
 printf 'stderr-line\n' >&2
@@ -199,6 +201,7 @@ sleep 3
         "tally-live-credential".to_owned(),
         credential_copy.to_string_lossy().into_owned(),
     ]);
+    success.job_token = Some("ab".repeat(32));
     success
         .credentials
         .insert("token".to_owned(), credential.clone());
@@ -231,6 +234,7 @@ sleep 3
         "TALLY_CLASS",
         "TALLY_NO_ENQUEUE",
         "TALLY_CREDENTIALS",
+        "TALLY_JOB_TOKEN",
     ] {
         assert!(properties.contains(name), "missing {name} in {properties}");
     }

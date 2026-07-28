@@ -78,6 +78,12 @@ pub(super) fn inherited_caller_job_id() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+pub(super) fn inherited_caller_job_token() -> Option<String> {
+    std::env::var("TALLY_JOB_TOKEN")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
 pub(super) fn resolve_rpc_timeout(
     flag: Option<u64>,
     environment: Option<&OsStr>,
