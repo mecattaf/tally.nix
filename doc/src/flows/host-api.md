@@ -96,7 +96,7 @@ The first argument must be a JSON-serializable object. Its public fields are:
 | `executor` | Optional configured executor name. Absence means the daemon's local executor. |
 | `priority` | Optional `interrupt`, `high`, `medium`, or `low`. |
 | `runtimeMaxSec` | Optional positive process deadline. |
-| `evidence` | Optional canonical evidence list: `exit:<0..255>`, `artifact:<absolute-path>`, `store:<nix-store-path>`, and at most one `hash:sha256[:<digest>]`. |
+| `evidence` | Optional canonical evidence list: at most one `exit:<0..255>`, any number of `artifact:<path>` with a non-empty path, `store:<nix-store-path>` with no duplicate path, and at most one `hash:sha256[:<digest>]`. |
 | `evidenceClass`, `manifestHash` | Optional evidence-policy values passed to the daemon. |
 | `workspace` | Optional object with exactly `repo`, `baseRev`, `branch`, and absolute `worktreePath` strings. |
 | `brief` | Optional structured JSON object delivered out of band through `TALLY_BRIEF`. |
@@ -112,6 +112,10 @@ declared `windowed-consumption` pool with
 `FlowPoolError`/`windowed-consumption-excluded`. Priorities, rather than
 estimates, control contention between flow workloads.
 
+The dialect does not require an evidence path to be absolute; a declaratively
+configured flow's evidence is checked for absoluteness by the Nix module, not by
+the script surface.
+
 The optional second argument may contain only boolean `settle`. Shape and value
 errors are `FlowSpecError`/`invalid-options`. Other important classes are
 `FlowPoolError` for pool declarations, `FlowEvidenceError` for evidence,
@@ -120,6 +124,11 @@ errors are `FlowSpecError`/`invalid-options`. Other important classes are
 `FlowNodeCapError` from admission, `FlowDedupKeyConflict` for a raw key collision,
 `FlowReplayError` for fatal same-run divergence, and `FlowTerminalError` or
 `FlowResultError` after completion.
+
+`FlowPoolError` covers what the script *said* about pools — `empty-pools`,
+`invalid-pool`, `duplicate-pool`, `undeclared-pool`. Omitting `pools` entirely is
+not one of them: `pools` has no default, so the spec fails to deserialize and the
+error is `FlowSpecError`/`invalid-spec` naming a missing field.
 
 ## `drv(spec, options?)`
 
@@ -154,9 +163,11 @@ disposition `substituted`. Otherwise the promise follows ordinary job admission.
 The task UUID is deterministically seeded from the flow run and ordinal so replay
 uses the same identity.
 
-Malformed paths, duplicate output names, unknown fields, or a shape inconsistent
-with the fixed mapping raise `FlowSpecError`/`invalid-derivation`. After mapping,
-the ordinary admission, replay, terminal, and settle rules apply.
+Malformed paths, duplicate output names, or a shape inconsistent with the fixed
+mapping raise `FlowSpecError`/`invalid-derivation`. A field other than `drvPath`
+and `outputs` is the ordinary `FlowSpecError`/`unknown-spec-field` instead, since
+it is rejected before the derivation shape is read. After mapping, the ordinary
+admission, replay, terminal, and settle rules apply.
 
 ## `claude()`, `codex()`, `local()`, and `sh()`
 
@@ -360,7 +371,11 @@ optional and is exactly `family` or `maker`. It round-robins the matching catalo
 groups before taking `count`; it is a preference order, not a promise that all
 returned diversity values are distinct.
 
-The result is an array of catalog member objects in deterministic catalog order.
+The result is an array of catalog member objects. Without `diversity` they are in
+catalog order. With `diversity` the order **is** the round-robin interleave —
+first-seen group order, one member per group per pass — and `count` takes a prefix
+of that interleave, not of catalog order. Either way the order is deterministic
+for a given catalog, which is what replay needs.
 Each object includes `id`, `family`, `maker`, `classes`, `adapter`, `pools`,
 `launch`, optional catalog metadata, and a host-added `selection` object containing
 the selector, catalog hash, selected member ID, and the complete selected ID list.

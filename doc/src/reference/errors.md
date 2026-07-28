@@ -145,6 +145,19 @@ same run would contradict already recorded identity: the same ordinal resolved t
 canonical work, or the script, arguments, or catalog identity changed after the run began.
 Automation should stop and investigate rather than retry either class in place.
 
+Two edges of that mapping are worth knowing before you build automation on it.
+
+`script-history-conflict`, `args-history-conflict`, and `catalog-history-conflict` are raised when
+a run's own recorded history already contains more than one hash. They carry the `FlowReplayError`
+name, so they read like the exit-20 family, but they are not in the exit-20 list and **exit 1**.
+Branch on the `code`, not on the `name` and not on the exit code alone.
+
+`runtime-limit` is assigned to every `RangeError`, including one the script threw itself. A
+deliberate `throw new RangeError("page out of range")` is therefore reported as a runtime-limit
+breach and exits 10, indistinguishable from an engine backstop. Express a domain outcome as a
+validated result envelope rather than a thrown error; see
+[Two more cookbook recipes](../flows/cookbook.md#expressing-domain-failure).
+
 The flow client translates notable RPC codes to flow codes before this exit mapping:
 
 | RPC | Flow code |
