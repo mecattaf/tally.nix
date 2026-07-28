@@ -616,6 +616,7 @@ pub(crate) async fn reconcile_pool_loss_intents(
                 argv: Vec::new(),
                 env: BTreeMap::new(),
                 hardening: Default::default(),
+                extra_writable_paths: Vec::new(),
                 yield_hook: None,
             },
             labor_class: intent.labor_class,

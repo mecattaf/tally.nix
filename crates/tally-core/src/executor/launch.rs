@@ -140,11 +140,15 @@ impl Executor {
         if request.hardening == AdapterHardening::None {
             return Ok(());
         }
-        if request.hardening == AdapterHardening::Strict {
+        let strict = matches!(
+            request.hardening,
+            AdapterHardening::Strict | AdapterHardening::Production
+        );
+        if strict {
             push_pair(args, "--property", "ProtectHome=read-only");
         }
         push_pair(args, "--property", "PrivateTmp=yes");
-        if request.hardening == AdapterHardening::Strict {
+        if strict {
             push_pair(args, "--property", "ProtectSystem=strict");
             push_pair(args, "--property", "NoNewPrivileges=yes");
             push_pair(
@@ -153,6 +157,24 @@ impl Executor {
                 "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
             );
         }
+        if request.hardening == AdapterHardening::Production {
+            for property in [
+                "PrivateDevices=yes",
+                "ProtectKernelTunables=yes",
+                "ProtectKernelModules=yes",
+                "ProtectKernelLogs=yes",
+                "ProtectControlGroups=yes",
+                "ProtectClock=yes",
+                "RestrictSUIDSGID=yes",
+                "LockPersonality=yes",
+                "RestrictRealtime=yes",
+                "SystemCallFilter=@system-service",
+                "CapabilityBoundingSet=",
+                "ProtectProc=invisible",
+            ] {
+                push_pair(args, "--property", property);
+            }
+        }
         let mut writable = Vec::new();
         if let Some(workspace) = &request.workspace {
             writable.push(workspace.worktree_path.clone());
@@ -160,7 +182,40 @@ impl Executor {
                 writable.extend(git_repository_write_paths(&workspace.worktree_path));
             }
         }
-        writable.push(self.state_dir.clone());
+        if strict {
+            // Keep the transient unit's state writers explicit. systemd opens
+            // the two capture files, ExecStopPost atomically replaces a record
+            // in unit-exit, the optional exec wrapper appends its ledger, and a
+            // job may write its declared gate manifest. GitHub context is
+            // scoped to this identity. The yield hook only calls the daemon
+            // socket and receives no state-directory-wide write exception.
+            let paths = self.paths(&request.identity);
+            writable.push(
+                paths
+                    .exit_record
+                    .parent()
+                    .expect("exit record always has a parent")
+                    .to_owned(),
+            );
+            writable.push(paths.stdout);
+            writable.push(paths.stderr);
+            if request.exec_attestation.is_some() {
+                writable.push(self.state_dir.join(EXEC_ATTESTATION_LEDGER));
+            }
+            if request
+                .gh_origin
+                .as_ref()
+                .is_some_and(|origin| origin.is_current())
+            {
+                writable.push(self.gh_context_path(&request.identity));
+            }
+            if let Some(manifest) = &request.gate_manifest {
+                writable.push(manifest.path.clone());
+            }
+        } else {
+            writable.push(self.state_dir.clone());
+        }
+        writable.extend(request.extra_writable_paths.iter().cloned());
         let mut unique_writable = Vec::new();
         for path in writable {
             if !unique_writable.contains(&path) {

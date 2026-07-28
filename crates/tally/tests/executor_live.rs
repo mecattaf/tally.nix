@@ -5,7 +5,9 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
+use tally_core::adapters::AdapterHardening;
 use tally_core::config::Priority;
+use tally_core::exec_attestation::ExecAttestationContext;
 use tally_core::executor::{
     ExecutionBackend, ExecutionIdentity, ExecutionRequest, ExecutionTermination, Executor,
     UnitLimits, Uuid,
@@ -79,6 +81,7 @@ fn request(argv: Vec<String>) -> ExecutionRequest {
         git_ai: None,
         exec_attestation: None,
         hardening: Default::default(),
+        extra_writable_paths: Vec::new(),
         credentials: BTreeMap::new(),
         limits: UnitLimits {
             cpu_weight: 250,
@@ -351,4 +354,165 @@ sleep 30
     assert_eq!(exit_127.termination, ExecutionTermination::Exited(127));
     assert_eq!(std::fs::read_to_string(marker).unwrap(), "x");
     assert_collected(&exit_127_unit).await;
+}
+
+#[tokio::test]
+#[ignore = "requires an explicitly selected NixOS host with a user manager"]
+async fn real_user_manager_hardening_presets_scope_writes() {
+    let Some(_remote_host) =
+        live_support::require_remote_host("real_user_manager_hardening_presets_scope_writes")
+    else {
+        return;
+    };
+    let home = std::env::var_os("HOME").expect("the selected live user must have HOME");
+    let temp = tempfile::Builder::new()
+        .prefix("tally-hardening-live-")
+        .tempdir_in(home)
+        .unwrap();
+
+    for hardening in [AdapterHardening::Strict, AdapterHardening::Production] {
+        let label = match hardening {
+            AdapterHardening::Strict => "strict",
+            AdapterHardening::Production => "production",
+            _ => unreachable!(),
+        };
+        let root = temp.path().join(label);
+        let state_dir = root.join("state");
+        let allowed_dir = root.join("adapter-state");
+        let allowed = allowed_dir.join("written");
+        let forbidden = state_dir.join("forbidden");
+        let other_capture = state_dir.join("capture/other-job.out");
+        std::fs::create_dir_all(&allowed_dir).unwrap();
+        std::fs::create_dir_all(other_capture.parent().unwrap()).unwrap();
+        std::fs::write(&other_capture, b"untouched").unwrap();
+
+        let executor = live_executor(&state_dir);
+        let mut cleanup = UnitCleanup::new();
+        let script = r#"
+set -eu
+printf allowed > "$1"
+if printf forbidden > "$2" 2>/dev/null; then exit 70; fi
+if printf replaced > "$3" 2>/dev/null; then exit 71; fi
+printf 'hardening-ready\n'
+sleep 3
+"#;
+        let mut hardened = request(vec![
+            BASH.to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            format!("tally-live-{label}"),
+            allowed.to_string_lossy().into_owned(),
+            forbidden.to_string_lossy().into_owned(),
+            other_capture.to_string_lossy().into_owned(),
+        ]);
+        hardened.hardening = hardening;
+        hardened.extra_writable_paths = vec![allowed_dir.clone()];
+        hardened.exec_attestation = Some(ExecAttestationContext {
+            adapter: "shell".to_owned(),
+            executor: None,
+            payload_hash: None,
+            brief_hash: None,
+            evidence: vec!["exit:0".to_owned()],
+        });
+        let unit = executor.unit_name(&hardened.identity);
+        cleanup.track(unit.clone());
+        let running_executor = executor.clone();
+        let running = tokio::spawn(async move { running_executor.execute(hardened).await });
+        wait_for_active(&unit).await;
+
+        let properties = systemctl(&[
+            OsStr::new("show"),
+            OsStr::new("--property=ProtectHome"),
+            OsStr::new("--property=ProtectSystem"),
+            OsStr::new("--property=PrivateTmp"),
+            OsStr::new("--property=NoNewPrivileges"),
+            OsStr::new("--property=RestrictAddressFamilies"),
+            OsStr::new("--property=PrivateDevices"),
+            OsStr::new("--property=ProtectKernelTunables"),
+            OsStr::new("--property=ProtectKernelModules"),
+            OsStr::new("--property=ProtectKernelLogs"),
+            OsStr::new("--property=ProtectControlGroups"),
+            OsStr::new("--property=ProtectClock"),
+            OsStr::new("--property=RestrictSUIDSGID"),
+            OsStr::new("--property=LockPersonality"),
+            OsStr::new("--property=RestrictRealtime"),
+            OsStr::new("--property=SystemCallFilter"),
+            OsStr::new("--property=CapabilityBoundingSet"),
+            OsStr::new("--property=ProtectProc"),
+            OsStr::new("--property=ReadWritePaths"),
+            OsStr::new("--"),
+            OsStr::new(&unit),
+        ])
+        .await;
+        assert!(properties.status.success());
+        let properties = String::from_utf8_lossy(&properties.stdout);
+        for expected in [
+            "ProtectHome=read-only",
+            "ProtectSystem=strict",
+            "PrivateTmp=yes",
+            "NoNewPrivileges=yes",
+        ] {
+            assert!(
+                properties.lines().any(|line| line == expected),
+                "{properties}"
+            );
+        }
+        assert!(properties.contains("AF_UNIX"), "{properties}");
+        assert!(properties.contains("AF_INET"), "{properties}");
+        assert!(properties.contains("AF_INET6"), "{properties}");
+        let writable = properties
+            .lines()
+            .find_map(|line| line.strip_prefix("ReadWritePaths="))
+            .expect("ReadWritePaths must be reported");
+        assert!(!writable
+            .split_whitespace()
+            .any(|path| path == state_dir.to_str().unwrap()));
+        assert!(
+            writable.contains(allowed_dir.to_str().unwrap()),
+            "{writable}"
+        );
+        assert!(
+            !writable.contains(other_capture.to_str().unwrap()),
+            "{writable}"
+        );
+
+        if hardening == AdapterHardening::Production {
+            for expected in [
+                "PrivateDevices=yes",
+                "ProtectKernelTunables=yes",
+                "ProtectKernelModules=yes",
+                "ProtectKernelLogs=yes",
+                "ProtectControlGroups=yes",
+                "ProtectClock=yes",
+                "RestrictSUIDSGID=yes",
+                "LockPersonality=yes",
+                "RestrictRealtime=yes",
+                "CapabilityBoundingSet=",
+                "ProtectProc=invisible",
+            ] {
+                assert!(
+                    properties.lines().any(|line| line == expected),
+                    "{properties}"
+                );
+            }
+            assert!(
+                properties
+                    .lines()
+                    .any(|line| line.starts_with("SystemCallFilter=") && line.len() > 17),
+                "{properties}"
+            );
+        }
+
+        let outcome = running.await.unwrap().unwrap();
+        assert_eq!(outcome.backend, ExecutionBackend::Systemd);
+        assert_eq!(outcome.termination, ExecutionTermination::Exited(0));
+        assert_eq!(std::fs::read_to_string(&allowed).unwrap(), "allowed");
+        assert!(!forbidden.exists());
+        assert_eq!(
+            std::fs::read_to_string(&other_capture).unwrap(),
+            "untouched"
+        );
+        assert!(state_dir.join("exec-attestations.jsonl").exists());
+        assert_collected(&unit).await;
+    }
 }

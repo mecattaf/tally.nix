@@ -47,6 +47,7 @@ fn request() -> ExecutionRequest {
         git_ai: None,
         exec_attestation: None,
         hardening: AdapterHardening::None,
+        extra_writable_paths: Vec::new(),
         credentials: BTreeMap::from([
             ("alpha".to_owned(), PathBuf::from("/run/keys/alpha")),
             ("zeta".to_owned(), PathBuf::from("/run/keys/zeta")),
@@ -648,6 +649,20 @@ fn exec_attestation_wrapper_is_argv_safe_and_preserves_the_exact_child() {
 #[test]
 fn hardening_preset_names_stamp_only_the_normative_property_bundles() {
     let executor = executor(Path::new("/state tree"));
+    let properties = |request: &ExecutionRequest| {
+        let mut args = Vec::new();
+        executor
+            .push_hardening_properties(&mut args, request)
+            .unwrap();
+        strings(&args)
+            .chunks_exact(2)
+            .map(|pair| {
+                assert_eq!(pair[0], "--property");
+                pair[1].clone()
+            })
+            .collect::<Vec<_>>()
+    };
+
     let mut strict = request();
     strict.hardening = AdapterHardening::Strict;
     strict.workspace = Some(WorkspaceMetadata {
@@ -656,53 +671,92 @@ fn hardening_preset_names_stamp_only_the_normative_property_bundles() {
         branch: "tally/work".to_owned(),
         worktree_path: PathBuf::from("/work tree"),
     });
-    let strict = strings(&executor.build_systemd_argv(&strict).unwrap());
-    for property in [
-        "ProtectHome=read-only",
-        "PrivateTmp=yes",
-        "ProtectSystem=strict",
-        "NoNewPrivileges=yes",
-        "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
-        "ReadWritePaths=\"/work tree\" \"/state tree\"",
-    ] {
-        assert!(
-            strict
-                .windows(2)
-                .any(|pair| pair == ["--property", property]),
-            "strict bundle omitted {property}"
-        );
-    }
+    assert_eq!(
+        properties(&strict),
+        [
+            "ProtectHome=read-only",
+            "PrivateTmp=yes",
+            "ProtectSystem=strict",
+            "NoNewPrivileges=yes",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "ReadWritePaths=\"/work tree\" \"/state tree/unit-exit\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.out\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.err\"",
+        ]
+    );
+
+    let mut production = strict.clone();
+    production.hardening = AdapterHardening::Production;
+    assert_eq!(
+        properties(&production),
+        [
+            "ProtectHome=read-only",
+            "PrivateTmp=yes",
+            "ProtectSystem=strict",
+            "NoNewPrivileges=yes",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "PrivateDevices=yes",
+            "ProtectKernelTunables=yes",
+            "ProtectKernelModules=yes",
+            "ProtectKernelLogs=yes",
+            "ProtectControlGroups=yes",
+            "ProtectClock=yes",
+            "RestrictSUIDSGID=yes",
+            "LockPersonality=yes",
+            "RestrictRealtime=yes",
+            "SystemCallFilter=@system-service",
+            "CapabilityBoundingSet=",
+            "ProtectProc=invisible",
+            "ReadWritePaths=\"/work tree\" \"/state tree/unit-exit\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.out\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.err\"",
+        ]
+    );
 
     let mut workspace = request();
     workspace.hardening = AdapterHardening::Workspace;
-    let workspace = strings(&executor.build_systemd_argv(&workspace).unwrap());
-    for property in ["PrivateTmp=yes", "ReadWritePaths=\"/state tree\""] {
-        assert!(workspace
-            .windows(2)
-            .any(|pair| pair == ["--property", property]));
-    }
-    for forbidden in [
-        "ProtectHome=",
-        "ProtectSystem=",
-        "NoNewPrivileges=",
-        "RestrictAddressFamilies=",
-    ] {
-        assert!(!workspace
-            .iter()
-            .any(|argument| argument.starts_with(forbidden)));
-    }
+    assert_eq!(
+        properties(&workspace),
+        ["PrivateTmp=yes", "ReadWritePaths=\"/state tree\""]
+    );
+    assert!(properties(&request()).is_empty());
+}
 
-    let none = strings(&executor.build_systemd_argv(&request()).unwrap());
-    for forbidden in [
-        "ProtectHome=",
-        "PrivateTmp=",
-        "ProtectSystem=",
-        "NoNewPrivileges=",
-        "RestrictAddressFamilies=",
-        "ReadWritePaths=",
-    ] {
-        assert!(!none.iter().any(|argument| argument.starts_with(forbidden)));
-    }
+#[test]
+fn strict_writes_are_scoped_to_declared_execution_paths() {
+    let executor = executor(Path::new("/state tree"));
+    let mut strict = request();
+    strict.hardening = AdapterHardening::Strict;
+    strict.exec_attestation = Some(ExecAttestationContext {
+        adapter: "codex".to_owned(),
+        executor: None,
+        payload_hash: None,
+        brief_hash: None,
+        evidence: vec!["exit:0".to_owned()],
+    });
+    strict.gh_origin = Some(gh_origin(GhItemType::Issue));
+    strict.gate_manifest = Some(GateManifestSpec {
+        path: PathBuf::from("/state tree/capture/gates.json"),
+        required_gate_ids: vec!["tests".to_owned()],
+        acceptance_policy: AcceptancePolicy::ExecutionAndGates,
+    });
+    strict.extra_writable_paths = vec![
+        PathBuf::from("/home/agent/.codex"),
+        PathBuf::from("/home/agent/.codex"),
+    ];
+    let args = strings(&executor.build_systemd_argv(&strict).unwrap());
+    let writable = args
+        .windows(2)
+        .find(|pair| pair[0] == "--property" && pair[1].starts_with("ReadWritePaths="))
+        .unwrap()[1]
+        .clone();
+    assert_eq!(
+        writable,
+        "ReadWritePaths=\"/state tree/unit-exit\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.out\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.err\" \"/state tree/exec-attestations.jsonl\" \"/state tree/github-context/00000000-0000-4000-8000-000000000002.json\" \"/state tree/capture/gates.json\" \"/home/agent/.codex\""
+    );
+
+    strict.extra_writable_paths = vec![PathBuf::from("relative/path")];
+    assert!(matches!(
+        executor.build_systemd_argv(&strict),
+        Err(ExecutorError::InvalidRequest(detail))
+            if detail == "extra writable path relative/path must be absolute"
+    ));
 }
 
 #[test]
@@ -2234,6 +2288,7 @@ fn fixture_request(pool: &str) -> ExecutionRequest {
         git_ai: None,
         exec_attestation: None,
         hardening: AdapterHardening::None,
+        extra_writable_paths: Vec::new(),
         credentials: BTreeMap::new(),
         limits: UnitLimits {
             cpu_weight: 100,

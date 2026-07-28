@@ -52,6 +52,9 @@ authorized.
 
 ### Security
 
+- Added the opt-in `production` adapter hardening bundle and narrowed `strict` and `production`
+  transient jobs to execution-scoped state writes, with explicit per-adapter writable-path
+  extensions for required agent state.
 - Documented the single-trusted-Unix-user boundary, cooperative versus token-bound job identity,
   unsigned witness-chain limits, and why hardening presets are not a hostile-code sandbox.
 - Acknowledged `RUSTSEC-2024-0436` as the sole advisory suppression: unmaintained `paste` arrives
