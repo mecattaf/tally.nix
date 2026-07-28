@@ -64,6 +64,10 @@ The singular compatibility fields appear only when exactly one candidate exists.
 
 These are semantic failures. Blindly retrying the same request will reproduce them.
 
+Public `tally enqueue --dedup-key KEY` requests use full submission mode by default, so a live
+same-key/different-payload collision reports `dedup-key-conflict` on stderr and exits 1.
+`--submission legacy` retains the compatibility behavior without live conflict detection.
+
 ## CLI process exits
 
 The general CLI contract is:

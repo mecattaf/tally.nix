@@ -271,6 +271,55 @@ fn enqueue_accepts_direct_argv_or_invocation() {
 }
 
 #[test]
+fn enqueue_submission_mode_defaults_to_full_and_accepts_legacy() {
+    let default = Opts::try_parse_from([
+        "tally",
+        "enqueue",
+        "--pool",
+        "gpu",
+        "--dedup-key",
+        "review:42",
+        "--",
+        "true",
+    ])
+    .unwrap();
+    let Some(Command::Enqueue(default)) = default.command else {
+        panic!("expected enqueue command");
+    };
+    assert_eq!(default.submission, CliSubmissionMode::Full);
+
+    let legacy = Opts::try_parse_from([
+        "tally",
+        "enqueue",
+        "--pool",
+        "gpu",
+        "--dedup-key",
+        "review:42",
+        "--submission",
+        "legacy",
+        "--",
+        "true",
+    ])
+    .unwrap();
+    let Some(Command::Enqueue(legacy)) = legacy.command else {
+        panic!("expected enqueue command");
+    };
+    assert_eq!(legacy.submission, CliSubmissionMode::Legacy);
+
+    let invalid = Opts::try_parse_from([
+        "tally",
+        "enqueue",
+        "--pool",
+        "gpu",
+        "--submission",
+        "other",
+        "--",
+        "true",
+    ]);
+    assert!(invalid.is_err());
+}
+
+#[test]
 fn flow_run_and_check_cli_shapes_match_the_declarative_contract() {
     let check = Opts::try_parse_from([
         "tally",

@@ -43,7 +43,7 @@ use tally_core::producers::{
 use tally_core::provenance::Orchestration;
 use tally_core::recovery::RecoveryPolicy;
 use tally_core::taskdb::{EnqueueSource, RelatedTrigger, WorkspaceMetadata, TASKDATA_DIRECTORY};
-use tally_core::wire::EnqueuePayload;
+use tally_core::wire::{EnqueuePayload, SubmissionMode, SubmissionOptions};
 use tally_core::witness::{
     append_attestation, read_verified_attestations, read_verified_records, GENESIS_PREV_HASH,
 };

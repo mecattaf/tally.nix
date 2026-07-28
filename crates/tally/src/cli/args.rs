@@ -231,6 +231,12 @@ impl From<CliSource> for EnqueueSource {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(super) enum CliSubmissionMode {
+    Full,
+    Legacy,
+}
+
 #[derive(Debug, Args)]
 pub(super) struct EnqueueArgs {
     #[arg(long = "pool", required = true, action = clap::ArgAction::Append)]
@@ -282,6 +288,8 @@ pub(super) struct EnqueueArgs {
     pub(super) source: CliSource,
     #[arg(long)]
     pub(super) dedup_key: Option<String>,
+    #[arg(long, value_enum, default_value = "full")]
+    pub(super) submission: CliSubmissionMode,
     #[arg(long, value_parser = parse_orchestration, allow_hyphen_values = true)]
     pub(super) orchestration: Option<Orchestration>,
     #[arg(long)]
