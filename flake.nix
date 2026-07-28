@@ -60,6 +60,22 @@
               commit --quiet --message="Pinned RustSec advisory database ${advisory-db.rev}"
         '';
         isLinux = pkgs.stdenv.hostPlatform.isLinux;
+        tallySource = pkgs.lib.fileset.toSource {
+          root = ./.;
+          fileset = pkgs.lib.fileset.unions [
+            ./Cargo.lock
+            ./Cargo.toml
+            ./crates
+            ./doc/src/reference/rpc-protocol.md
+            ./examples/flows/academic-ocr.js
+            ./examples/flows/monthly-review.js
+            ./test/fixtures/flows
+            ./test/fixtures/git-ai
+            ./test/fixtures/ledger
+            ./test/fixtures/shell-command-provider
+            ./test/fixtures/traces
+          ];
+        };
         adapterConfig = pkgs.writeText "tally-adapter-config.json" (
           builtins.toJSON {
             pools = { };
@@ -191,7 +207,7 @@
         tally = pkgs.rustPlatform.buildRustPackage {
           pname = "tally";
           version = "0.1.0";
-          src = self;
+          src = tallySource;
           cargoLock.lockFile = ./Cargo.lock;
           doCheck = true;
           preCheck = ''
