@@ -3062,7 +3062,7 @@
               .enqueue.depthCap == 3 and
               .enqueue.fanoutCap == 64 and
               .lease.yieldGraceSec == 20 and
-              .retention == {"enable":true,"horizon":"30d","onCalendar":"daily"} and
+              .retention == {"enable":true,"horizon":"30d","onCalendar":"daily","captureArchiveHorizon":"30d","eventsDoneHorizon":"180d","eventsRejectedHorizon":"30d","eventsRejectedMaxCount":10000} and
               .attestations == {"exec":{"enable":true}} and
               .gitAi == {"enable":false,"mode":"advisory","awaitTimeoutSec":60,"globalAwaitOk":false} and
               .pools.build.resource == "build-slot" and
