@@ -1496,6 +1496,81 @@ mod tests {
         assert_eq!(first[0].job_id, "child-00");
     }
 
+    #[test]
+    fn workload_mutex_replay_waits_behind_the_next_process_holder() {
+        let mutex = PoolConfig {
+            resource: ResourceKind::Mutex,
+            capacity: 1,
+            predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+            ..PoolConfig::default()
+        };
+        let mut engine = LeaseEngine::new(
+            1,
+            Duration::from_secs(20),
+            BTreeMap::from([
+                ("flow".to_owned(), pool(8)),
+                ("monthly-review".to_owned(), mutex),
+            ]),
+            None,
+        )
+        .unwrap();
+
+        let first_process = grant(
+            engine
+                .admit_at(
+                    request(
+                        "run-a-attempt-1",
+                        &["flow", "monthly-review"],
+                        Priority::Low,
+                    ),
+                    now(),
+                )
+                .unwrap(),
+        );
+        assert!(matches!(
+            engine
+                .admit_at(
+                    request(
+                        "run-b-attempt-1",
+                        &["flow", "monthly-review"],
+                        Priority::Low,
+                    ),
+                    now(),
+                )
+                .unwrap(),
+            AdmitOutcome::Queued { .. }
+        ));
+
+        // Releasing the first runner process models death or preemption: the next run takes the
+        // mutex even though the interrupted flow's durable children may still be completing.
+        let second_process = engine
+            .release_at(&first_process.lease_id, first_process.epoch, now())
+            .unwrap()
+            .promoted
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(second_process.job_id, "run-b-attempt-1");
+
+        assert!(matches!(
+            engine
+                .admit_at(
+                    request("run-a-replay", &["flow", "monthly-review"], Priority::Low,),
+                    now(),
+                )
+                .unwrap(),
+            AdmitOutcome::Queued { .. }
+        ));
+        let replay = engine
+            .release_at(&second_process.lease_id, second_process.epoch, now())
+            .unwrap()
+            .promoted
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(replay.job_id, "run-a-replay");
+    }
+
     fn grouped_request(job: &str, group: LeaseSchedulingGroup, priority: Priority) -> LeaseRequest {
         let mut request = request(job, &["cpu"], priority);
         request.scheduling_group = group;
