@@ -79,27 +79,31 @@ The expected result is no output and grep exit 1.
 
 ## Merge verification
 
-This repository has no GitHub Actions workflows or GitHub-hosted checks. Verification runs on the
-KVM-capable fleet host, which posts the required external commit status `fleet/gate-ladder` for the
-exact pull-request head SHA. Branch protection is strict: GitHub refuses a stale, missing, red, or
-pending status. The implementing worker may reproduce the authoritative runner with:
+This repository has no GitHub Actions workflows or GitHub-hosted checks. The implementing worker
+runs the one canonical local ladder in its worktree for the exact pull-request head:
 
 ```console
 $ test/fleet-gate.sh "$(git rev-parse HEAD)"
 ```
 
-The runner starts from a pristine clone and disposable detached worktree. In order it runs
+The runner uses the operator's existing `gh` authentication to read pull-request metadata, then
+starts from a pristine clone and disposable detached worktree. In order it runs
 `cargo fmt --all --check`, `env -u TALLY_TEST_REMOTE_HOST cargo test --workspace`, Clippy for all
 workspace targets and features with warnings denied, the pinned offline dependency-policy stage,
 `nix flake check -L`, an evaluated-check assertion for the `flow-multi-host` VM, the no-stubs grep,
 the no-workflows assertion, and the changelog stage. The changelog stage says **NOT RUN** until
 `CHANGELOG.md` exists; after that, a pull request must touch it or carry the `no-changelog` label.
 
-Each run commits `<sha>.log` to the dedicated `gate-evidence` branch. The green status links to
-that transcript; paste its tail into the pull request as human-readable evidence. The machine
-status is the blocking merge evidence. The repository's sole administrator retains a direct-push
-break-glass because `enforce_admins` is intentionally false, but ordinary pull-request merges must
-never use that bypass.
+The runner writes a local transcript below
+`${XDG_STATE_HOME:-$HOME/.local/state}/tally-fleet-gate/transcripts/` and prints its path. Paste the
+transcript tail into the pull request. That worker-run transcript is the merge evidence; the runner
+does not publish evidence or write any merge-control state to GitHub.
+
+For the single-operator phase, #128 item 5's “independently enforced merge control” is
+**consciously rejected**. Trusted agents act under the operator's existing `gh`, Claude Code, and
+Codex authentication; a GitHub-side control those agents could bypass would add ceremony and
+credential cost without creating an independent boundary. Revisit this decision only at the first
+outside contributor or the first release tag, and only through a new ruling from Tom.
 
 ## Live-system tests
 
