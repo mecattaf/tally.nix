@@ -98,8 +98,37 @@ pub enum WireIoError {
     RequestTask(String),
     #[error("RPC method {method} exceeded its {deadline:?} deadline")]
     DeadlineExceeded { method: String, deadline: Duration },
+    #[error(
+        "daemon socket {path} did not return within {window:?} while re-arming RPC method {method}"
+    )]
+    RearmDeadlineExceeded {
+        method: String,
+        path: PathBuf,
+        window: Duration,
+    },
     #[error("RPC error {0:?}: {1}")]
     Rpc(WireErrorCode, String, Option<Value>),
+}
+
+/// Whether an idempotent RPC may be reissued after replacing its connection.
+///
+/// Callers still decide which operations are idempotent and how long to retry. This
+/// classifier only captures the transport and daemon-restart failures shared by the
+/// flow runner and the CLI's `queue.await_job` path.
+pub fn is_rearmable_rpc_error(method: &str, error: &WireIoError) -> bool {
+    match error {
+        WireIoError::Unreachable { .. }
+        | WireIoError::Io(_)
+        | WireIoError::Closed
+        | WireIoError::RequestTask(_) => true,
+        WireIoError::Rpc(WireErrorCode::EpochChanged | WireErrorCode::Timeout, _, _) => true,
+        WireIoError::Rpc(WireErrorCode::Internal, message, _)
+            if method == "queue.await_job" && message.contains("daemon stopped while waiting") =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Errors resolving a client's frame limit from tally's rendered configuration.
@@ -616,6 +645,50 @@ mod tests {
             serde_json::to_string(&request).unwrap(),
             r#"{"id":"cli-1","method":"query.status","params":{"pool":"gpu"}}"#
         );
+    }
+
+    #[test]
+    fn rearmable_errors_match_the_flow_runner_restart_contract() {
+        assert!(is_rearmable_rpc_error(
+            "queue.await_job",
+            &WireIoError::Closed
+        ));
+        assert!(is_rearmable_rpc_error(
+            "query.job",
+            &WireIoError::Io(io::Error::new(io::ErrorKind::BrokenPipe, "closed"))
+        ));
+        assert!(is_rearmable_rpc_error(
+            "query.job",
+            &WireIoError::Rpc(WireErrorCode::EpochChanged, "new epoch".to_owned(), None)
+        ));
+        assert!(is_rearmable_rpc_error(
+            "queue.await_job",
+            &WireIoError::Rpc(
+                WireErrorCode::Internal,
+                "daemon stopped while waiting for terminal state".to_owned(),
+                None,
+            )
+        ));
+        assert!(!is_rearmable_rpc_error(
+            "query.job",
+            &WireIoError::Rpc(
+                WireErrorCode::Internal,
+                "daemon stopped while waiting for terminal state".to_owned(),
+                None,
+            )
+        ));
+        assert!(!is_rearmable_rpc_error(
+            "queue.await_job",
+            &WireIoError::InvalidResponse("bad response id".to_owned())
+        ));
+        assert!(!is_rearmable_rpc_error(
+            "queue.await_job",
+            &WireIoError::RearmDeadlineExceeded {
+                method: "queue.await_job".to_owned(),
+                path: PathBuf::from("/run/tally.sock"),
+                window: Duration::from_secs(60),
+            }
+        ));
     }
 
     #[tokio::test]
