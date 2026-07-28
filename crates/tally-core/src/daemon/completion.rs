@@ -1,0 +1,911 @@
+use super::*;
+
+pub(super) struct TerminalWork {
+    pub(super) job: Job,
+    pub(super) result: JobResult,
+    pub(super) evidence: String,
+    pub(super) evidence_checks: Vec<CheckOutcome>,
+    pub(super) launches: Vec<Job>,
+    pub(super) scrape_capture: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct GhTerminalWork {
+    pub(super) row: RowSeed,
+    pub(super) result: JobResult,
+}
+
+impl DaemonHandler {
+    pub(super) fn complete_terminal_post_ack(&self, work: TerminalWork) {
+        if self.commits.send(CommitCommand::Rebuild).is_err() {
+            eprintln!("tally: post-ack replica worker stopped before terminal projection");
+        }
+        let status = if work.result.verdict == Verdict::Cancelled {
+            Status::Deleted
+        } else {
+            Status::Completed
+        };
+        if work.job.task_uuid.is_some()
+            && self
+                .commits
+                .send(CommitCommand::Upsert {
+                    row: Box::new(work.job.row.clone()),
+                    status,
+                    labor_class: work.job.labor_class,
+                })
+                .is_err()
+        {
+            eprintln!("tally: post-ack replica worker stopped before terminal row projection");
+        }
+        self.complete_gh_post_ack(work.job.row.clone(), work.result.clone());
+        for check in &work.evidence_checks {
+            self.emit_post_ack(evidence_event(&work.job, check));
+        }
+        self.emit_scraped_completion(work.job, work.result, work.evidence, work.scrape_capture);
+        for job in work.launches {
+            self.spawn_execution(job);
+        }
+    }
+
+    pub(super) fn complete_gh_post_ack(&self, row: RowSeed, result: JobResult) {
+        let Some(origin) = row.gh_origin.clone() else {
+            return;
+        };
+        let handler = self.clone();
+        let task = tokio::task::spawn_local(async move {
+            let (registry, events_dir, state_dir, gh_program, mut shutdown) = {
+                let context = handler.context.read().await;
+                (
+                    context.config.producers.clone(),
+                    context.paths.events_dir(),
+                    context.paths.state_dir.clone(),
+                    handler.gh_program.clone(),
+                    handler.execution_shutdown.clone(),
+                )
+            };
+            let completion_id = format!("{}:{}:{}", row.uuid, result.attempt, result.witness_seq);
+            let mut evidence = json!({
+                "taskUuid": row.uuid.to_string(),
+                "witnessSeq": result.witness_seq,
+                "verdict": result.verdict,
+                "exitCode": result.exit_code,
+                "artifactContentHash": result.artifact_content_hash,
+                "adapter": row.adapter,
+                "model": result.model,
+            });
+            if let Some(completion) = &result.completion {
+                evidence["completion"] = serde_json::to_value(completion)
+                    .expect("semantic completion always serializes");
+            }
+            let mut retry_delay = Duration::from_secs(1);
+            loop {
+                let registry = registry.clone();
+                let events_dir = events_dir.clone();
+                let state_dir = state_dir.clone();
+                let gh_program = gh_program.clone();
+                let origin = origin.clone();
+                let completion_id = completion_id.clone();
+                let evidence = evidence.clone();
+                let semantic_completion = result.completion.clone();
+                let verdict = result.verdict;
+                let completed = tokio::task::spawn_blocking(move || {
+                    let engine = ProducerEngine::new(&registry, events_dir, state_dir);
+                    let mut sink = GhCliMutationSink::with_program(gh_program);
+                    engine.complete_gh_once_with_completion(
+                        &origin,
+                        &completion_id,
+                        verdict,
+                        Some(evidence),
+                        semantic_completion,
+                        &mut sink,
+                    )
+                })
+                .await;
+                match completed {
+                    Ok(Ok(_)) => break,
+                    Ok(Err(error)) => eprintln!(
+                        "tally: post-ack GitHub COMPLETED mutation failed for {} and will retry: {error}",
+                        row.uuid
+                    ),
+                    Err(error) => eprintln!(
+                        "tally: post-ack GitHub mutation worker failed for {} and will retry: {error}",
+                        row.uuid
+                    ),
+                }
+                if *shutdown.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay) => {}
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                }
+                retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(60));
+            }
+        });
+        let mut tasks = self.post_ack_tasks.borrow_mut();
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+
+    pub(super) fn emit_scraped_completion(
+        &self,
+        job: Job,
+        result: JobResult,
+        evidence: String,
+        scrape_capture: bool,
+    ) {
+        if !scrape_capture {
+            self.emit_post_ack(completed_event(&job, &result, evidence));
+            return;
+        }
+        let handler = self.clone();
+        let task = tokio::task::spawn_local(async move {
+            let (adapters, attestation_path, state_dir, pools) = {
+                let context = handler.context.read().await;
+                (
+                    context.config.adapters.clone(),
+                    context.paths.attestations_path(),
+                    context.paths.state_dir.clone(),
+                    context.config.pools.clone(),
+                )
+            };
+            let scrape_configured = adapters
+                .get(&job.row.adapter)
+                .is_some_and(|adapter| !adapter.scrape.is_empty());
+            if !scrape_configured {
+                handler.emit_post_ack(completed_event(&job, &result, evidence));
+                return;
+            }
+
+            let paths = handler.executor.paths(&job.identity());
+            let adapter = job.row.adapter.clone();
+            let stable_key = job.stable_key();
+            let job_id = job.job_id.to_string();
+            let attempt = job.row.attempt;
+            let lease_epoch = job.row.lease_epoch;
+            let leased_pools = job.row.pools.clone();
+            let scraped = tokio::task::spawn_blocking(move || {
+                let captures = AdapterEngine::new(&adapters)
+                    .scrape_paths(&adapter, &paths)
+                    .map_err(|error| error.to_string())?;
+                let attestation_error = if captures.captures.is_empty() {
+                    None
+                } else {
+                    append_attestation(
+                        &attestation_path,
+                        json!({
+                            "kind": "adapter-scrape",
+                            "taskUuid": stable_key,
+                            "jobId": job_id,
+                            "adapter": adapter,
+                            "attempt": attempt,
+                            "leaseEpoch": lease_epoch,
+                            "captures": captures.captures.clone(),
+                            "usageAuthority": "advisory-only",
+                        }),
+                    )
+                    .err()
+                    .map(|error| error.to_string())
+                };
+                let meter_errors = feed_scraped_usage(&state_dir, &pools, &leased_pools, &captures);
+                Ok::<_, String>((captures, attestation_error, meter_errors))
+            })
+            .await;
+
+            let (captures, attestation_error, meter_errors) = match scraped {
+                Ok(Ok(scraped)) => scraped,
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "tally: post-ack adapter scrape failed for {}: {error}",
+                        job.stable_key()
+                    );
+                    handler.emit_post_ack(completed_event(&job, &result, evidence));
+                    return;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "tally: post-ack adapter scrape worker failed for {}: {error}",
+                        job.stable_key()
+                    );
+                    handler.emit_post_ack(completed_event(&job, &result, evidence));
+                    return;
+                }
+            };
+            for error in meter_errors {
+                eprintln!(
+                    "tally: built-in usage meter feeder failed for {}: {error}",
+                    job.stable_key()
+                );
+            }
+            if let Some(error) = attestation_error {
+                eprintln!(
+                    "tally: post-ack adapter attestation failed for {}: {error}",
+                    job.stable_key()
+                );
+                handler.emit_post_ack(completed_event(&job, &result, evidence));
+                return;
+            }
+
+            let mut enriched = job;
+            if let Ok(Some(session_ref)) = captures.session_ref() {
+                enriched.row.session_ref = Some(session_ref.to_owned());
+            }
+            if let Ok(Some(model)) = captures.model() {
+                enriched.row.model = Some(model.to_owned());
+            }
+            if let Ok(Some(final_message)) = captures.final_message() {
+                enriched.row.final_message = Some(final_message.to_owned());
+            }
+            {
+                let mut context = handler.context.write().await;
+                if let Some(stored) = context.jobs.get_mut(&enriched.job_id) {
+                    stored.row.session_ref.clone_from(&enriched.row.session_ref);
+                    stored.row.model.clone_from(&enriched.row.model);
+                    stored
+                        .row
+                        .final_message
+                        .clone_from(&enriched.row.final_message);
+                }
+                if let Some(task_uuid) = enriched.task_uuid {
+                    if let Some(row) = context.query_rows.get_mut(&task_uuid) {
+                        row.session_ref.clone_from(&enriched.row.session_ref);
+                        row.model.clone_from(&enriched.row.model);
+                        row.final_message.clone_from(&enriched.row.final_message);
+                    }
+                    if let Some(detail) = context.query_details.get_mut(&task_uuid) {
+                        detail.session_ref.clone_from(&enriched.row.session_ref);
+                        detail.observed_model.clone_from(&enriched.row.model);
+                        detail.final_message.clone_from(&enriched.row.final_message);
+                    }
+                }
+            }
+            if enriched.task_uuid.is_some()
+                && handler
+                    .commits
+                    .send(CommitCommand::Upsert {
+                        row: Box::new(enriched.row.clone()),
+                        status: if result.verdict == Verdict::Cancelled {
+                            Status::Deleted
+                        } else {
+                            Status::Completed
+                        },
+                        labor_class: enriched.labor_class,
+                    })
+                    .is_err()
+            {
+                eprintln!("tally: post-ack replica worker stopped before scrape projection");
+            }
+            handler.emit_post_ack(completed_event(&enriched, &result, evidence));
+        });
+        let mut tasks = self.post_ack_tasks.borrow_mut();
+        tasks.retain(|task| !task.is_finished());
+        tasks.push(task);
+    }
+
+    pub(super) async fn drain_post_ack_tasks(&self) {
+        loop {
+            let tasks = std::mem::take(&mut *self.post_ack_tasks.borrow_mut());
+            if tasks.is_empty() {
+                break;
+            }
+            for task in tasks {
+                if let Err(error) = task.await {
+                    eprintln!("tally: post-ack task failed during shutdown: {error}");
+                }
+            }
+        }
+    }
+
+    pub(super) fn spawn_execution(&self, job: Job) {
+        if job.labor_class == LaborClass::Recovered {
+            self.emit_post_ack(execution_event(&job, TallyEvent::Resumed));
+        }
+        self.emit_post_ack(execution_event(&job, TallyEvent::Dispatched));
+        self.emit_post_ack(execution_event(&job, TallyEvent::Started));
+        let executor = self.executor.clone();
+        let completion = self.completion.clone();
+        let request = execution_request(
+            &executor,
+            &job,
+            self.settings.unit_limits,
+            &self.tally_socket,
+            &self.brief_root,
+            &self.git_ai,
+            self.exec_attestations,
+        );
+        let execution_target = job.row.executor.clone();
+        let evidence = job.row.evidence.clone();
+        let mut shutdown = self.execution_shutdown.clone();
+        let mut cancellation = self.execution_cancel.subscribe();
+        tokio::task::spawn_local(async move {
+            let started = Instant::now();
+            let execution = async {
+                let request = request?;
+                if job.adopted {
+                    executor
+                        .adopt_on(
+                            execution_target.as_deref(),
+                            request,
+                            job.adopted_invocation_id
+                                .as_deref()
+                                .expect("adopted recovery jobs retain their invocation ID"),
+                            evidence,
+                        )
+                        .await
+                } else {
+                    executor
+                        .execute_on(execution_target.as_deref(), request, evidence)
+                        .await
+                }
+            };
+            tokio::pin!(execution);
+            let outcome = tokio::select! {
+                outcome = &mut execution => Some(outcome),
+                () = wait_for_cancellation(&mut cancellation, job.job_id) => None,
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        return;
+                    }
+                    Some(execution.await)
+                }
+            };
+            let _ = completion.send(ExecutionFinished {
+                job_id: job.job_id,
+                attempt: job.row.attempt,
+                lease_epoch: job.row.lease_epoch,
+                elapsed: started.elapsed(),
+                outcome,
+            });
+        });
+    }
+
+    pub(super) fn emit_post_ack(&self, event: EmitEvent) {
+        let fields = match event.into_fields() {
+            Ok(fields) => fields,
+            Err(error) => {
+                let error =
+                    DaemonError::Invalid(format!("invalid lifecycle event after ack: {error}"));
+                eprintln!("tally: {error}");
+                let _ = self.fatal.send(error);
+                return;
+            }
+        };
+        let lifecycle = match self.history.borrow_mut().append_now(fields.clone()) {
+            Ok(record) => record,
+            Err(error) => {
+                eprintln!("tally: lifecycle history append failed after ack: {error}");
+                let _ = self.fatal.send(error.into());
+                return;
+            }
+        };
+        let change_payload = json!({
+            "taskUuid": fields.task_uuid,
+            "attempt": fields.attempt,
+            "leaseEpoch": fields.lease_epoch,
+            "event": fields.event,
+            "lifecycleCursor": lifecycle.cursor,
+        });
+        let mut changes = self.changes.borrow_mut();
+        let mut append_change = |kind, payload| changes.append_now(kind, payload);
+        let changed = append_change(ChangeKind::Lifecycle, change_payload.clone())
+            .and_then(|_| {
+                append_change(
+                    ChangeKind::Job,
+                    json!({
+                        "taskUuid": fields.task_uuid,
+                        "attempt": fields.attempt,
+                        "leaseEpoch": fields.lease_epoch,
+                        "reason": fields.event,
+                    }),
+                )
+            })
+            .and_then(|_| {
+                if matches!(
+                    fields.event,
+                    TallyEvent::Completed
+                        | TallyEvent::Failed
+                        | TallyEvent::Preempted
+                        | TallyEvent::WitnessEmitted
+                ) {
+                    append_change(ChangeKind::Proof, change_payload.clone())?;
+                }
+                Ok(())
+            })
+            .and_then(|_| {
+                if fields
+                    .agent
+                    .as_ref()
+                    .is_some_and(|adapter| self.trace_adapters.contains(adapter))
+                    && matches!(
+                        fields.event,
+                        TallyEvent::Started
+                            | TallyEvent::Completed
+                            | TallyEvent::Failed
+                            | TallyEvent::Preempted
+                    )
+                {
+                    append_change(ChangeKind::Trace, change_payload)?;
+                }
+                Ok(())
+            });
+        drop(changes);
+        if let Err(error) = changed {
+            eprintln!("tally: change log append failed after ack: {error}");
+            let _ = self.fatal.send(error.into());
+            return;
+        }
+        let journal = self.journal.clone();
+        tokio::task::spawn_local(async move {
+            tokio::task::yield_now().await;
+            if let Err(error) = journal.emit_fields(&fields) {
+                eprintln!("tally: journald emission failed outside ack barrier: {error}");
+            }
+        });
+    }
+}
+
+async fn wait_for_cancellation(receiver: &mut broadcast::Receiver<Uuid>, job_id: Uuid) {
+    loop {
+        match receiver.recv().await {
+            Ok(cancelled) if cancelled == job_id => return,
+            Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+            Err(broadcast::error::RecvError::Closed) => {
+                std::future::pending::<()>().await;
+            }
+        }
+    }
+}
+
+pub(super) fn execution_request(
+    executor: &Executor,
+    job: &Job,
+    limits: UnitLimits,
+    tally_socket: &str,
+    brief_root: &Path,
+    git_ai_config: &GitAiConfig,
+    exec_attestations: bool,
+) -> Result<ExecutionRequest, ExecutorError> {
+    let brief_path = job.row.brief_hash.as_deref().map(|hash| {
+        brief::content_path(brief_root, hash)
+            .expect("validated durable briefHash always derives a content path")
+    });
+    let gate_manifest = effective_gate_manifest(executor, job)?;
+    let git_ai = git_ai_config.enable.then(|| {
+        let mut attributes = BTreeMap::from([
+            ("taskUuid".to_owned(), job.stable_key()),
+            ("attempt".to_owned(), job.row.attempt.to_string()),
+            ("leaseEpoch".to_owned(), job.row.lease_epoch.to_string()),
+            ("adapter".to_owned(), job.row.adapter.clone()),
+        ]);
+        if let Some(orchestration) = &job.row.orchestration {
+            attributes.insert(
+                "flowRunId".to_owned(),
+                orchestration.flow_run_id().to_owned(),
+            );
+            if let Some(node_ordinal) = orchestration
+                .as_value()
+                .get("nodeOrdinal")
+                .and_then(Value::as_u64)
+            {
+                attributes.insert("nodeOrdinal".to_owned(), node_ordinal.to_string());
+            }
+        }
+        GitAiExecution {
+            config: git_ai_config.clone(),
+            attributes,
+            expected_session: job.row.session_ref.clone(),
+            expected_model: canonical_job_model(job),
+        }
+    });
+    Ok(ExecutionRequest {
+        identity: job.identity(),
+        parent: job.row.parent_uuid,
+        pools: job.row.pools.clone(),
+        lease_epoch: job.row.lease_epoch,
+        attempt: job.row.attempt,
+        priority: job.row.priority,
+        no_enqueue: job.row.no_enqueue,
+        argv: job.invocation.argv.clone(),
+        yield_hook: job.invocation.yield_hook.clone(),
+        // A remote worker has no tally daemon and cannot use the coordinator's
+        // Unix socket. The SSH transport itself never forwards ambient sockets.
+        tally_socket: job.row.executor.is_none().then(|| tally_socket.to_owned()),
+        environment: job.invocation.env.clone(),
+        gh_origin: job.row.gh_origin.clone(),
+        brief_hash: job.row.brief_hash.clone(),
+        brief_path,
+        brief_document: None,
+        cwd: job.row.cwd.clone(),
+        workspace: job.row.workspace.clone(),
+        gate_manifest,
+        git_ai,
+        exec_attestation: exec_attestations.then(|| ExecAttestationContext {
+            adapter: job.row.adapter.clone(),
+            executor: job.row.executor.clone(),
+            payload_hash: job.row.payload_hash.clone(),
+            brief_hash: job.row.brief_hash.clone(),
+            evidence: job.row.evidence.clone(),
+        }),
+        hardening: job.invocation.hardening,
+        credentials: job.row.credentials.clone(),
+        limits,
+        runtime_max_sec: job.row.runtime_max_sec,
+    })
+}
+
+pub(super) fn effective_gate_manifest(
+    executor: &Executor,
+    job: &Job,
+) -> Result<Option<GateManifestSpec>, ExecutorError> {
+    if let Some(spec) = &job.row.gate_manifest {
+        return Ok(Some(spec.clone()));
+    }
+    provisions_gate_manifest(&job.row.adapter)
+        .then(|| {
+            executor.default_gate_manifest_on(
+                job.row.executor.as_deref(),
+                &job.identity(),
+                job.row.attempt,
+            )
+        })
+        .transpose()
+}
+
+pub(super) fn execution_fact_for_termination(termination: &ExecutionTermination) -> ExecutionFact {
+    match termination {
+        ExecutionTermination::Exited(exit_code) => ExecutionFact::exited(*exit_code),
+        ExecutionTermination::RuntimeExceeded => {
+            ExecutionFact::failed("process exceeded RuntimeMaxSec")
+        }
+        ExecutionTermination::Signaled { code, status } => {
+            ExecutionFact::failed(format!("process ended by {code} {status}"))
+        }
+        ExecutionTermination::ServiceFailed { service_result, .. } => {
+            ExecutionFact::failed(format!("systemd service failed with {service_result}"))
+        }
+    }
+}
+
+pub(super) fn enqueued_event(job: &Job) -> EmitEvent {
+    let mut event = EmitEvent::enqueued(job.stable_key(), job.row.priority, job.row.source);
+    event.agent = Some(job.row.adapter.clone());
+    event.session_ref.clone_from(&job.row.session_ref);
+    event.unit = Some(format!("tally-job-{}.service", job.stable_key()));
+    event.attempt = Some(job.row.attempt);
+    event.lease_epoch = Some(job.row.lease_epoch);
+    event.labor_class = Some(job.labor_class);
+    event.job_id = Some(job.job_id.to_string());
+    event.parent = job.row.parent_uuid.map(|uuid| uuid.to_string());
+    event.pools = Some(job.row.pools.clone());
+    event.executor = job.row.executor.clone();
+    event
+}
+
+fn execution_event(job: &Job, event: TallyEvent) -> EmitEvent {
+    EmitEvent {
+        event,
+        task_uuid: job.stable_key(),
+        class: job.row.priority,
+        source: job.row.source,
+        message: None,
+        agent: Some(job.row.adapter.clone()),
+        session_ref: job.row.session_ref.clone(),
+        unit: Some(format!("tally-job-{}.service", job.stable_key())),
+        exit_code: None,
+        gpu_seconds: None,
+        artifact_hash: None,
+        evidence: None,
+        attempt: Some(job.row.attempt),
+        lease_epoch: Some(job.row.lease_epoch),
+        labor_class: Some(job.labor_class),
+        job_id: Some(job.job_id.to_string()),
+        parent: job.row.parent_uuid.map(|uuid| uuid.to_string()),
+        pools: Some(job.row.pools.clone()),
+        executor: job.row.executor.clone(),
+    }
+}
+
+pub(super) fn canonical_job_model(job: &Job) -> Option<String> {
+    job.row.adapter_options.model.clone().or_else(|| {
+        if job.model_is_advisory {
+            None
+        } else {
+            job.row.model.clone()
+        }
+    })
+}
+
+fn log_gcroot_registration_failures(record: &WitnessRecord, paths: &DaemonPaths) {
+    let report = register_record_roots(&paths.gcroots_dir(), record, &NixStore::default());
+    for failure in report.failures {
+        eprintln!(
+            "tally: gcroot registration failed for witness {} path {} link {}: {}",
+            record.seq,
+            failure.target.display(),
+            failure.link.display(),
+            failure.reason
+        );
+    }
+}
+
+pub(super) fn lock_gcroot_registration(paths: &DaemonPaths) -> Result<GcRootsLock, WitnessError> {
+    acquire_registration_lock(&paths.gcroots_dir()).map_err(|source| WitnessError::Io {
+        path: gcroots_lock_path(&paths.gcroots_dir()),
+        source,
+    })
+}
+
+pub(super) fn append_daemon_witness(
+    ledger: &mut WitnessLedger,
+    paths: &DaemonPaths,
+    body: WitnessBody,
+) -> Result<WitnessRecord, WitnessError> {
+    let _lock = lock_gcroot_registration(paths)?;
+    let record = ledger.append(body)?;
+    log_gcroot_registration_failures(&record, paths);
+    Ok(record)
+}
+
+pub(super) fn append_context_witness(
+    context: &mut Context,
+    body: WitnessBody,
+) -> Result<WitnessRecord, WitnessError> {
+    let _lock = lock_gcroot_registration(&context.paths)?;
+    let record = context.witness.append(body)?;
+    log_gcroot_registration_failures(&record, &context.paths);
+    Ok(record)
+}
+
+pub(super) fn forced_witness(job: &Job, verdict: Verdict, host_id: Option<String>) -> WitnessBody {
+    WitnessBody {
+        task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
+        transition_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        verdict,
+        exit_code: if verdict == Verdict::Cancelled { 0 } else { 1 },
+        artifact_content_hash: None,
+        store_paths: None,
+        drv: job.row.drv.clone(),
+        gpu_seconds: None,
+        wall_clock: 0.0,
+        attempt: job.row.attempt,
+        lease_epoch: job.row.lease_epoch,
+        dedup_key: job.row.dedup_key.clone(),
+        payload_hash: job.row.payload_hash.clone(),
+        brief_hash: job.row.brief_hash.clone(),
+        origin: job
+            .row
+            .origin
+            .clone()
+            .expect("canonical row carries admission origin"),
+        orchestration: job.row.orchestration.clone(),
+        labor_class: job.labor_class,
+        trace_ref: None,
+        pools: job.row.pools.clone(),
+        executor: job.row.executor.clone(),
+        host_id,
+        charge: None,
+        model: canonical_job_model(job),
+        evidence_class: job.row.evidence_class.clone(),
+        manifest_hash: job.row.manifest_hash.clone(),
+        completion: None,
+        result_revision: None,
+        authorship: None,
+        authorship_sessions: None,
+    }
+}
+
+pub(super) fn substituted_witness(row: &RowSeed, drv: Derivation) -> WitnessBody {
+    WitnessBody {
+        task_uuid: Some(row.uuid.to_string()),
+        transition_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        verdict: Verdict::Substituted,
+        exit_code: 0,
+        artifact_content_hash: None,
+        store_paths: Some(drv.output_paths()),
+        drv: Some(drv),
+        gpu_seconds: None,
+        wall_clock: 0.0,
+        attempt: 1,
+        lease_epoch: 1,
+        dedup_key: row.dedup_key.clone(),
+        payload_hash: row.payload_hash.clone(),
+        brief_hash: row.brief_hash.clone(),
+        origin: row
+            .origin
+            .clone()
+            .expect("canonical row carries admission origin"),
+        orchestration: row.orchestration.clone(),
+        labor_class: LaborClass::Substituted,
+        trace_ref: None,
+        pools: row.pools.clone(),
+        executor: row.executor.clone(),
+        host_id: None,
+        charge: None,
+        model: row.model.clone(),
+        evidence_class: row.evidence_class.clone(),
+        manifest_hash: row.manifest_hash.clone(),
+        completion: None,
+        result_revision: None,
+        authorship: None,
+        authorship_sessions: None,
+    }
+}
+
+pub(super) fn release_child_charge(context: &mut Context, job: &Job) -> Result<(), DaemonError> {
+    if context
+        .guardrail_depths
+        .get(&job.row.uuid)
+        .is_some_and(|depth| *depth > 0)
+    {
+        if let Some(parent_uuid) = job.row.parent_uuid {
+            context
+                .guardrails
+                .rollback_child_charge(&parent_uuid.to_string())
+                .map_err(|error| DaemonError::Invalid(error.message))?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn finalize_forced_locked(
+    context: &mut Context,
+    job_id: Uuid,
+    verdict: Verdict,
+    release_lease: bool,
+    scrape_capture: bool,
+) -> Result<Option<TerminalWork>, DaemonError> {
+    let job = context
+        .jobs
+        .get(&job_id)
+        .cloned()
+        .ok_or_else(|| DaemonError::Invalid(format!("unknown forced-terminal job {job_id}")))?;
+    if job.state == JobState::Completed {
+        return Ok(None);
+    }
+    let host_id = (job.state == JobState::Running && job.row.executor.is_none())
+        .then(|| context.host_id.clone());
+    let record = append_context_witness(context, forced_witness(&job, verdict, host_id))?;
+    let result = JobResult {
+        task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
+        job_id: job.job_id.to_string(),
+        verdict,
+        exit_code: if verdict == Verdict::Cancelled { 0 } else { 1 },
+        artifact_content_hash: None,
+        attempt: job.row.attempt,
+        lease_epoch: job.row.lease_epoch,
+        witness_seq: record.seq,
+        model: record.model.clone(),
+        completion: None,
+    };
+    context
+        .barriers
+        .complete_job(&job.stable_key(), result.value());
+    let stored = context.jobs.get_mut(&job_id).expect("job exists");
+    stored.state = JobState::Completed;
+    if release_lease {
+        stored.lease_id = None;
+    }
+    release_child_charge(context, &job)?;
+    context.guardrails.retire_parent(&job.stable_key());
+    if let Some(task_uuid) = job.task_uuid {
+        if let Some(row) = context.query_rows.get_mut(&task_uuid) {
+            row.status = if verdict == Verdict::Cancelled {
+                RowStatus::Deleted
+            } else {
+                RowStatus::Completed
+            };
+        }
+        if let Some(detail) = context.query_details.get_mut(&task_uuid) {
+            detail.row_status = if verdict == Verdict::Cancelled {
+                RowStatus::Deleted
+            } else {
+                RowStatus::Completed
+            };
+        }
+    }
+
+    let mut launches = Vec::new();
+    if release_lease {
+        if let Some(lease_id) = &job.lease_id {
+            let epoch = context.epoch;
+            let status = context.lease.engine().status(lease_id, epoch)?;
+            if status.held {
+                let released = context.lease.release(lease_id, epoch, Utc::now())?;
+                launches.extend(promoted_jobs(context, released.promoted));
+            } else {
+                context
+                    .lease
+                    .engine_mut()
+                    .cancel_pending_at(lease_id, epoch, Utc::now())?;
+            }
+            context.lease_jobs.remove(lease_id);
+        }
+    }
+    let evidence = serde_json::to_string(&job.row.evidence)
+        .map_err(|error| DaemonError::Invalid(error.to_string()))?;
+    Ok(Some(TerminalWork {
+        job,
+        result,
+        evidence,
+        evidence_checks: Vec::new(),
+        launches,
+        scrape_capture,
+    }))
+}
+
+fn evidence_event(job: &Job, check: &CheckOutcome) -> EmitEvent {
+    EmitEvent {
+        event: if check.passed {
+            TallyEvent::EvidencePass
+        } else {
+            TallyEvent::EvidenceFail
+        },
+        task_uuid: job.stable_key(),
+        class: job.row.priority,
+        source: job.row.source,
+        message: Some(check.reason.clone()),
+        agent: Some(job.row.adapter.clone()),
+        session_ref: job.row.session_ref.clone(),
+        unit: Some(format!("tally-job-{}.service", job.stable_key())),
+        exit_code: None,
+        gpu_seconds: None,
+        artifact_hash: None,
+        evidence: Some(check.spec.clone()),
+        attempt: Some(job.row.attempt),
+        lease_epoch: Some(job.row.lease_epoch),
+        labor_class: Some(job.labor_class),
+        job_id: Some(job.job_id.to_string()),
+        parent: job.row.parent_uuid.map(|uuid| uuid.to_string()),
+        pools: Some(job.row.pools.clone()),
+        executor: job.row.executor.clone(),
+    }
+}
+
+pub(super) fn completed_event(job: &Job, result: &JobResult, evidence: String) -> EmitEvent {
+    EmitEvent {
+        event: match (result.verdict, result.artifact_content_hash.is_some()) {
+            (Verdict::Preempted, _) => TallyEvent::Preempted,
+            (Verdict::Pass | Verdict::Reused, true) => TallyEvent::Completed,
+            (Verdict::Pass | Verdict::Reused, false) => TallyEvent::WitnessEmitted,
+            _ => TallyEvent::Failed,
+        },
+        task_uuid: job.stable_key(),
+        class: job.row.priority,
+        source: job.row.source,
+        message: None,
+        agent: Some(job.row.adapter.clone()),
+        session_ref: job.row.session_ref.clone(),
+        unit: Some(format!("tally-job-{}.service", job.stable_key())),
+        exit_code: Some(result.exit_code),
+        gpu_seconds: Some(0.0),
+        artifact_hash: result.artifact_content_hash.clone(),
+        evidence: Some(evidence),
+        attempt: Some(result.attempt),
+        lease_epoch: Some(result.lease_epoch),
+        labor_class: Some(job.labor_class),
+        job_id: Some(job.job_id.to_string()),
+        parent: job.row.parent_uuid.map(|uuid| uuid.to_string()),
+        pools: Some(job.row.pools.clone()),
+        executor: job.row.executor.clone(),
+    }
+}
+
+pub(super) fn canonical_verdict(
+    evidence_verdict: Verdict,
+    completion: Option<&SemanticCompletion>,
+) -> Verdict {
+    if evidence_verdict == Verdict::Pass
+        && completion.is_some_and(|completion| {
+            completion.execution.status == ExecutionStatus::Failure
+                || completion.gates.status == GateSummaryStatus::Fail
+        })
+    {
+        Verdict::Failed
+    } else {
+        evidence_verdict
+    }
+}
