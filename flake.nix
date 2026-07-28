@@ -1339,6 +1339,41 @@
             }
           ];
         };
+        unsupportedSystemNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            {
+              services.tally = {
+                producers.daily = {
+                  kind = "calendar";
+                  onCalendar = "daily";
+                  enqueue = {
+                    argv = [ "daily-job" ];
+                    pool = "metered";
+                  };
+                };
+                flows.fixture.script = ./test/fixtures/flows/valid.js;
+                pools.metered = {
+                  resource = "budget";
+                  predicate.windowed-consumption = {
+                    windowSec = 3600;
+                    consumptionCap = 1000;
+                  };
+                  usageMeter = {
+                    argv = [ "usage-meter" ];
+                    pollIntervalSec = 60;
+                    budgetClass = "metered";
+                  };
+                };
+              };
+            }
+          ];
+        };
+        unsupportedSystemMessages = builtins.map (entry: entry.message) (
+          builtins.filter (entry: !entry.assertion) unsupportedSystemNixos.config.assertions
+        );
         stockHostTest = pkgs.testers.runNixOSTest {
           name = "tally-stock-host-activation";
           nodes.machine =
@@ -1359,6 +1394,7 @@
 
               services.tally = {
                 enable = true;
+                retention.onCalendar = "2099-01-01 00:00:00";
                 pools.stock = {
                   resource = "build-slot";
                   enforce = "cooperative";
@@ -1392,7 +1428,11 @@
             machine.succeed("systemctl start linger-users.service")
             machine.succeed("test -e /var/lib/systemd/linger/tally")
             machine.wait_for_unit("tally-daemon.service")
+            machine.wait_for_unit("tally-drain.timer")
+            machine.wait_for_unit("tally-retention.timer")
             machine.succeed("systemctl is-active tally-daemon.service")
+            machine.succeed("systemctl is-active tally-drain.timer")
+            machine.succeed("systemctl is-active tally-retention.timer")
             machine.succeed("test \"$(systemctl show tally-daemon.service --property=User --value)\" = tally")
             machine.succeed("test \"$(stat -c '%U:%G:%a' /run/tally)\" = tally:tally:700")
             machine.succeed("test -d /var/lib/tally")
@@ -2455,8 +2495,11 @@
           in
           if builtins.isList value then builtins.head value else value;
         checkedHomeConfig = stockHome.config.xdg.configFile."tally/config.json".source;
-        systemDaemon = stockNixos.config.systemd.services.tally-daemon;
-        systemWitnessEmitter = stockNixos.config.systemd.services."tally-witness-emit@";
+        systemServices = stockNixos.config.systemd.services;
+        systemTimers = stockNixos.config.systemd.timers;
+        systemServiceExec = name: systemServices.${name}.serviceConfig.ExecStart;
+        systemDaemon = systemServices.tally-daemon;
+        systemWitnessEmitter = systemServices."tally-witness-emit@";
         moduleContract =
           assert
             stockHome.config.services.tally.retention == {
@@ -2476,6 +2519,30 @@
           assert homeTimers ? tally-retention;
           assert homeTimers.tally-retention.Timer.OnCalendar == "daily";
           assert pkgs.lib.hasInfix "gc --horizon 30d --collect" (homeServiceExec "tally-retention");
+          assert systemServices ? tally-drain;
+          assert systemTimers ? tally-drain;
+          assert systemTimers.tally-drain.timerConfig.OnActiveSec == "1s";
+          assert systemTimers.tally-drain.timerConfig.OnUnitActiveSec == "5s";
+          assert pkgs.lib.hasInfix "--socket /run/tally/tally.sock daemon drain" (
+            systemServiceExec "tally-drain"
+          );
+          assert systemServices.tally-drain.serviceConfig.User == "tally";
+          assert systemServices ? tally-retention;
+          assert systemTimers ? tally-retention;
+          assert systemTimers.tally-retention.timerConfig.OnCalendar == "daily";
+          assert pkgs.lib.hasInfix "gc --horizon 30d --collect --data-dir /var/lib/tally/data" (
+            systemServiceExec "tally-retention"
+          );
+          assert systemServices.tally-retention.serviceConfig.User == "tally";
+          assert builtins.elem
+            "services.tally.producers must be empty in the NixOS module; configure producers with the Home Manager module (tally.homeManagerModules.tally)"
+            unsupportedSystemMessages;
+          assert builtins.elem
+            "services.tally.flows must be empty in the NixOS module; configure flows with the Home Manager module (tally.homeManagerModules.tally)"
+            unsupportedSystemMessages;
+          assert builtins.elem
+            "services.tally.pools.<name>.usageMeter must be null in the NixOS module; configure usage meters with the Home Manager module (tally.homeManagerModules.tally)"
+            unsupportedSystemMessages;
           assert homeTimers ? tally-producer-daily;
           assert homeTimers.tally-producer-daily.Timer.OnCalendar == "daily";
           assert homeTimers ? tally-producer-flow-fixture;
