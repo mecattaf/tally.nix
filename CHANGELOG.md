@@ -15,6 +15,9 @@ authorized.
   persisted by hash in the durable row so a running job keeps one identity across daemon restarts,
   and forwarded by the CLI as the `callerJobToken` enqueue field. Remote and SSH-executed jobs
   never receive it.
+- Added an evaluation-time flow width check: a script whose explicit `meta.maxNodes` exceeds
+  `services.tally.enqueue.fanoutCap` now fails the generation build instead of hitting the cap at
+  run time.
 - Added `dedupKey` and `disposition` to the job projection, `--flow-run` filters to `tally query
   log` and `tally query proof`, and per-node `node-submitted` and `node-terminal` lifecycle events
   to the flow runner's stream, so a claimed replay is verifiable rather than asserted.

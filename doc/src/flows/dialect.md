@@ -52,6 +52,40 @@ The accepted fields are exact; unknown fields produce `meta-invalid`:
 | `iterationCap` | Optional positive per-host-call-site cap; default `64`. It is distinct from the whole-run node cap. |
 | `selectors` | Optional unique array, default empty. Every `members()` class must be declared here. |
 
+### Width: the three caps and the host's fanout cap
+
+Three different numbers bound how much a flow can materialize, and they are not
+interchangeable:
+
+| Bound | Kind | Scope |
+|---|---|---|
+| `meta.maxNodes` (intersected with `--max-nodes`) | Total | Nodes materialized over the whole run |
+| `meta.iterationCap` | Total | Executions of one node-producing call site |
+| `services.tally.enqueue.fanoutCap` | Width | Children of one parent job outstanding *at the same time* |
+
+The effective width of a flow is therefore `min(maxNodes, iterationCap,
+fanoutCap)`. Only `fanoutCap` is a width: the daemon charges a parent when a
+child is created and returns the charge when that child reaches a terminal, so a
+strictly sequential flow of 500 nodes never exceeds a `fanoutCap` of 64, while
+65 concurrent nodes do. Full-mode admission defers the charge until `created` is
+known, so a replayed prefix that answers `reused` or `terminal` costs no fanout.
+
+The two ways of starting a flow are asymmetric. A declaratively registered flow
+runs as a tally job, so its nodes are that job's children and `fanoutCap`
+applies. A manual `tally flow run` invoked from a shell has no parent job, so
+nothing charges fanout and the cap does not apply — the same script can succeed
+by hand and be refused under its own timer.
+
+Because a declared budget is checkable and a script's concurrency is not, the
+generation build fails when a script's explicit `meta.maxNodes` exceeds the
+host's `services.tally.enqueue.fanoutCap`. That is deliberately conservative: a
+wave-based flow that declares a large total but only ever opens a few nodes at a
+time would have run. The build still stops, because the declaration is the only
+statement of width the host can read. Raise
+`services.tally.enqueue.fanoutCap` to the declared budget, or lower
+`meta.maxNodes` to what the flow really needs. A script that declares no
+`meta.maxNodes` is not checked this way.
+
 `flow` and `build` are reserved pools in declarative registrations. The Nix
 checker rejects them in `meta.pools`: the runner owns `flow`, while `drv()` adds
 `build` without requiring it in metadata.
@@ -92,8 +126,10 @@ one evaluation gets a 24-hour total wall-clock budget, including awaited host
 work, reported as `FlowRuntimeBudgetError`/`wall-clock-budget`.
 
 Separately, each node-producing call site may execute only `meta.iterationCap`
-times; the next call throws `FlowLoopError`/`iteration-cap`. Set a deliberate
-higher cap for a bounded fan-out rather than relying on an engine backstop.
+times; the next call throws `FlowLoopError`/`iteration-cap`. The cap counts
+node-producing calls only — `job()`, `drv()`, and the four sugars — so ordinary
+loops, `members()`, and `log()` do not consume it. Set a deliberate higher cap
+for a bounded fan-out rather than relying on an engine backstop.
 
 ```javascript
 // Deterministic: the bound and order come from checked args.

@@ -1105,6 +1105,7 @@
             args ? { },
             catalog ? null,
             maxNodes ? 1000,
+            enqueue ? { },
             flowOptions ? { },
             pools ? {
               build.resource = "build-slot";
@@ -1120,6 +1121,7 @@
                   defaultStateDir = "/tmp/tally-state";
                 };
                 config.services.tally = {
+                  inherit enqueue;
                   pools = pools // {
                     flow = {
                       resource = "cpu-slot";
@@ -1316,6 +1318,19 @@
           expectedBuilderExitCode = 1;
           expectedBuilderLogEntries = [
             "tally flow fixture maxNodes 4 is less than script meta.maxNodes 5"
+          ];
+        };
+        flowFanoutWidthFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-fanout-width-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/valid.js;
+            args.task = "ship";
+            catalog = catalogFixture;
+            enqueue.fanoutCap = 4;
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            "tally flow fixture script meta.maxNodes 5 exceeds enqueue.fanoutCap 4; raise services.tally.enqueue.fanoutCap or lower meta.maxNodes"
           ];
         };
         flowCatalogFailure = pkgs.testers.testBuildFailure' {
@@ -2904,6 +2919,7 @@
                 reservedFailure = flowReservedPoolFailure;
                 reservedBuildFailure = flowReservedBuildPoolFailure;
                 maxNodesFailure = flowMaxNodesFailure;
+                fanoutWidthFailure = flowFanoutWidthFailure;
               }
               ''
                 test -e "$lintFailure"
@@ -2913,6 +2929,7 @@
                 test -e "$reservedFailure"
                 test -e "$reservedBuildFailure"
                 test -e "$maxNodesFailure"
+                test -e "$fanoutWidthFailure"
                 touch "$out"
               '';
           flow-catalog-renderer =
