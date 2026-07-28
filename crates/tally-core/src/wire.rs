@@ -842,8 +842,11 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use proptest::collection::vec;
+    use proptest::prelude::*;
+    use proptest::test_runner::{FileFailurePersistence, TestRunner};
     use tally_client::RpcClient;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::UnixListener;
     use tokio::sync::{mpsc, Semaphore};
 
@@ -867,6 +870,46 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[test]
+    fn arbitrary_byte_streams_never_panic_the_server() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        let mut runner = TestRunner::new(ProptestConfig {
+            failure_persistence: Some(Box::new(FileFailurePersistence::Direct(
+                "crates/tally-core/proptest-regressions/wire.txt",
+            ))),
+            ..ProptestConfig::default()
+        });
+        runner
+            .run(
+                &(vec(any::<u8>(), 0..512), 1_u64..=128),
+                |(input, max_frame_bytes)| {
+                    runtime.block_on(local.run_until(async {
+                        let (mut client, server) = UnixStream::pair().unwrap();
+                        let task = tokio::task::spawn_local(async move {
+                            serve_connection_with_max_frame_bytes(
+                                server,
+                                EchoHandler,
+                                max_frame_bytes,
+                            )
+                            .await
+                        });
+
+                        let _ = client.write_all(&input).await;
+                        let _ = client.shutdown().await;
+                        let mut responses = Vec::new();
+                        let (_, joined) = tokio::join!(client.read_to_end(&mut responses), task);
+                        prop_assert!(joined.is_ok(), "server task panicked");
+                        Ok(())
+                    }))
+                },
+            )
+            .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
