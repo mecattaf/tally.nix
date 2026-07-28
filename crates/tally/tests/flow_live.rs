@@ -42,6 +42,7 @@ const DRV_BUILD_RUN: &str = "00000000-0000-4000-8000-000000000505";
 const DRV_SUBSTITUTE_RUN: &str = "00000000-0000-4000-8000-000000000506";
 const STRUCTURED_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000507";
 const UNTYPED_RESULT_RUN: &str = "00000000-0000-4000-8000-000000000508";
+const CREDENTIAL_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000509";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -227,6 +228,43 @@ fn install_fake_nix(root: &Path) -> (std::path::PathBuf, std::path::PathBuf, Pat
     (marker, builds, path_guard)
 }
 
+fn install_fake_systemd_run(root: &Path, state_dir: &Path) -> std::path::PathBuf {
+    let program = root.join("fake-systemd-run");
+    shell_program::install(
+        &program,
+        format!(
+            concat!(
+                "#!/bin/sh\n",
+                "unit=\n",
+                "attempt=\n",
+                "lease_epoch=\n",
+                "while [ \"$#\" -gt 0 ]; do\n",
+                "  case \"$1\" in\n",
+                "    --unit) unit=\"$2\"; shift 2 ;;\n",
+                "    --setenv)\n",
+                "      case \"$2\" in\n",
+                "        TALLY_ATTEMPT=*) attempt=\"${{2#TALLY_ATTEMPT=}}\" ;;\n",
+                "        TALLY_LEASE_EPOCH=*) lease_epoch=\"${{2#TALLY_LEASE_EPOCH=}}\" ;;\n",
+                "      esac\n",
+                "      shift 2\n",
+                "      ;;\n",
+                "    --) break ;;\n",
+                "    *) shift ;;\n",
+                "  esac\n",
+                "done\n",
+                "test -n \"$unit\" -a -n \"$attempt\" -a -n \"$lease_epoch\" || exit 90\n",
+                "uuid=\"${{unit#tally-job-}}\"\n",
+                "record='{}/unit-exit/'\"$uuid\"'.json'\n",
+                "mkdir -p '{}/unit-exit'\n",
+                "printf '{{\"schemaVersion\":2,\"unit\":\"%s.service\",\"invocationId\":\"fake-systemd-run\",\"attempt\":%s,\"leaseEpoch\":%s,\"serviceResult\":\"success\",\"exitCode\":\"exited\",\"exitStatus\":\"0\"}}' \"$unit\" \"$attempt\" \"$lease_epoch\" > \"$record\"\n",
+            ),
+            state_dir.display(),
+            state_dir.display(),
+        ),
+    );
+    program
+}
+
 fn github_flow_observation() -> GhObservation {
     GhObservation {
         source: "search".to_owned(),
@@ -289,8 +327,16 @@ fn paths(root: &Path) -> DaemonPaths {
 }
 
 async fn start_daemon(paths: &DaemonPaths, config: Config) -> RunningDaemon {
+    start_daemon_with_systemd_run(paths, config, paths.state_dir.join("absent-systemd-run")).await
+}
+
+async fn start_daemon_with_systemd_run(
+    paths: &DaemonPaths,
+    config: Config,
+    systemd_run: std::path::PathBuf,
+) -> RunningDaemon {
     let executor = Executor::new(&paths.state_dir, env!("CARGO_BIN_EXE_tally"))
-        .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+        .with_systemd_run(systemd_run)
         .with_unit_probe(ExitFileProbe);
     let daemon = Daemon::open_with_executor(config, paths.clone(), settings(), executor)
         .await
@@ -1084,6 +1130,84 @@ async fn fs5_live_acceptance_matrix() {
                 .iter()
                 .all(|event| event.row.source == EnqueueSource::Orchestrator));
 
+            daemon.stop().await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn credentialed_pool_replays_the_same_flow_as_reused() {
+    let _environment = ENVIRONMENT_LOCK.lock().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let daemon_paths = paths(&temp.path().join("daemon"));
+            let credential = temp.path().join("alpha-token");
+            fs::write(&credential, "test-only-token").unwrap();
+
+            let mut config = config();
+            config.attestations.exec.enable = false;
+            config
+                .pools
+                .get_mut("alpha")
+                .unwrap()
+                .credentials
+                .insert("api-token".to_owned(), credential.clone());
+            config.validate().unwrap();
+            let config_path = temp.path().join("config.json");
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let script = temp.path().join("credential-replay.js");
+            fs::write(&script, one_node_source()).unwrap();
+            let systemd_run = install_fake_systemd_run(temp.path(), &daemon_paths.state_dir);
+            let daemon = start_daemon_with_systemd_run(&daemon_paths, config, systemd_run).await;
+
+            let first = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                CREDENTIAL_REPLAY_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let first = runner_output(first).await;
+            assert!(
+                first.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&first.stdout),
+                String::from_utf8_lossy(&first.stderr)
+            );
+            assert_eq!(
+                flow_report(&first)["report"]["finalValue"]["disposition"],
+                "created"
+            );
+
+            let second = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                CREDENTIAL_REPLAY_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let second = runner_output(second).await;
+            assert!(
+                second.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&second.stdout),
+                String::from_utf8_lossy(&second.stderr)
+            );
+            assert_eq!(
+                flow_report(&second)["report"]["finalValue"]["disposition"],
+                "reused"
+            );
+
+            let events = read_acknowledged_events(&daemon_paths.events_dir()).unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].row.credentials["api-token"], credential);
             daemon.stop().await;
         })
         .await;

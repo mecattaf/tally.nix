@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -6,11 +7,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use tally_core::config::Config;
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../test/fixtures/flows")
         .join(name)
+}
+
+fn write_config(root: &Path) -> PathBuf {
+    let path = root.join("config.json");
+    fs::write(&path, serde_json::to_vec(&Config::default()).unwrap()).unwrap();
+    path
 }
 
 fn serve_empty_flow_history(
@@ -137,9 +145,12 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
 #[test]
 fn flow_run_cli_derives_the_run_id_and_emits_jsonl_for_a_zero_node_script() {
     let temp = tempfile::tempdir().unwrap();
+    let config = write_config(temp.path());
     let socket = temp.path().join("tally.sock");
     let server = serve_empty_flow_history(&socket, Some("00000000-0000-4000-8000-000000000048"));
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .arg("--config")
+        .arg(&config)
         .arg("--socket")
         .arg(&socket)
         .args(["flow", "run"])
@@ -180,9 +191,12 @@ fn flow_run_cli_derives_the_run_id_and_emits_jsonl_for_a_zero_node_script() {
 #[test]
 fn flow_run_script_failure_has_a_distinguished_exit_and_structured_capture_event() {
     let temp = tempfile::tempdir().unwrap();
+    let config = write_config(temp.path());
     let socket = temp.path().join("tally.sock");
     let server = serve_empty_flow_history(&socket, None);
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .arg("--config")
+        .arg(&config)
         .arg("--socket")
         .arg(&socket)
         .args(["flow", "run"])
@@ -211,4 +225,41 @@ fn flow_run_script_failure_has_a_distinguished_exit_and_structured_capture_event
     assert_eq!(events[0]["error"]["code"], "determinism-violation");
     assert_eq!(events[0]["error"]["ordinal"], 0);
     assert!(events[0]["error"]["location"]["line"].as_u64().unwrap() > 1);
+}
+
+#[test]
+fn flow_run_without_config_names_the_missing_default_before_connecting() {
+    let temp = tempfile::tempdir().unwrap();
+    let config_home = temp.path().join("empty-config-home");
+    fs::create_dir_all(&config_home).unwrap();
+    let expected = config_home.join("tally/config.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .arg("--socket")
+        .arg(temp.path().join("absent.sock"))
+        .args(["flow", "run"])
+        .arg(fixture("valid.js"))
+        .args([
+            "--args",
+            r#"{"task":"ship"}"#,
+            "--max-nodes",
+            "12",
+            "--flow-run-id",
+            "00000000-0000-4000-8000-000000000050",
+            "--catalog",
+        ])
+        .arg(fixture("catalog.json"))
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env_remove("HOME")
+        .env_remove("TALLY_TASK_UUID")
+        .env_remove("TALLY_JOB_ID")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("cannot read config"), "{stderr}");
+    assert!(stderr.contains(&expected.display().to_string()), "{stderr}");
+    assert!(!stderr.contains("daemon socket"), "{stderr}");
 }

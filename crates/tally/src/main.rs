@@ -13,7 +13,6 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use tally_client::{
     default_config_path, resolve_max_frame_bytes, RpcClient, WireErrorCode, WireIoError,
-    DEFAULT_MAX_FRAME_BYTES,
 };
 use tally_core::authorship::verify_authorship;
 use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
@@ -857,36 +856,27 @@ async fn run_flow(socket: &Path, config_path: Option<&Path>, command: FlowComman
                 options.catalog_hash = Some(hash);
             }
             let client_config = load_client_config(config_path)?;
-            let max_frame_bytes = client_config
-                .as_ref()
-                .map_or(DEFAULT_MAX_FRAME_BYTES, |config| config.max_frame_bytes);
+            let max_frame_bytes = client_config.max_frame_bytes;
             let final_message_adapters = client_config
-                .as_ref()
-                .map(|config| {
-                    config
-                        .adapters
-                        .iter()
-                        .filter(|(_, adapter)| adapter.scrape.contains_key("finalMessage"))
-                        .map(|(name, _)| name.clone())
-                        .collect()
+                .adapters
+                .iter()
+                .filter(|(_, adapter)| adapter.scrape.contains_key("finalMessage"))
+                .map(|(name, _)| name.clone())
+                .collect();
+            options.adapter_skill_revisions = client_config
+                .adapters
+                .iter()
+                .filter_map(|(name, adapter)| {
+                    adapter
+                        .resolved_skill_revision()
+                        .map(|revision| (name.clone(), revision))
                 })
-                .unwrap_or_default();
-            if let Some(config) = client_config {
-                options.adapter_skill_revisions = config
-                    .adapters
-                    .iter()
-                    .filter_map(|(name, adapter)| {
-                        adapter
-                            .resolved_skill_revision()
-                            .map(|revision| (name.clone(), revision))
-                    })
-                    .collect();
-                options.pool_credentials = config
-                    .pools
-                    .into_iter()
-                    .map(|(name, pool)| (name, pool.credentials))
-                    .collect();
-            }
+                .collect();
+            options.pool_credentials = client_config
+                .pools
+                .into_iter()
+                .map(|(name, pool)| (name, pool.credentials))
+                .collect();
             sanitize_inherited_tally_environment();
             let socket = socket.to_owned();
             let script = args.script;
@@ -2030,24 +2020,9 @@ fn client_max_frame_bytes(config_path: Option<&Path>) -> Result<u64> {
     resolve_max_frame_bytes(config_path).map_err(Into::into)
 }
 
-fn load_client_config(config_path: Option<&Path>) -> Result<Option<Config>> {
-    let (path, explicit) = if let Some(path) = config_path {
-        (path.to_owned(), true)
-    } else {
-        let Ok(path) = default_config_path() else {
-            return Ok(None);
-        };
-        (path, false)
-    };
-    match Config::from_path(&path) {
-        Ok(config) => Ok(Some(config)),
-        Err(tally_core::ConfigError::Read { source, .. })
-            if !explicit && source.kind() == std::io::ErrorKind::NotFound =>
-        {
-            Ok(None)
-        }
-        Err(error) => Err(error.into()),
-    }
+fn load_client_config(config_path: Option<&Path>) -> Result<Config> {
+    let path = config_path.map_or_else(default_config_path, |path| Ok(path.to_owned()))?;
+    Config::from_path(&path).map_err(Into::into)
 }
 
 async fn run_query_watch(
@@ -2501,7 +2476,7 @@ mod tests {
             20 * 1024 * 1024
         );
         assert_eq!(
-            load_client_config(Some(&config)).unwrap().unwrap().pools["slot"].credentials["token"],
+            load_client_config(Some(&config)).unwrap().pools["slot"].credentials["token"],
             PathBuf::from("/run/credentials/slot-token")
         );
         assert!(client_max_frame_bytes(Some(&temp.path().join("missing.json"))).is_err());

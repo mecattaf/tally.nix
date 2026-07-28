@@ -1146,7 +1146,15 @@ impl DaemonHandler {
                         "credential {name:?} has conflicting pool and enqueue sources"
                     )));
                 }
-                resolved.credentials.entry(name).or_insert(source);
+                if full_mode && !resolved.credentials.contains_key(&name) {
+                    rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;
+                    return Err(WireError::invalid(format!(
+                        "full-mode enqueue omitted credential {name:?} required by pool {pool:?}"
+                    )));
+                }
+                if !full_mode {
+                    resolved.credentials.entry(name).or_insert(source);
+                }
             }
         }
         let engine = AdapterEngine::new(&context.config.adapters);
@@ -9658,6 +9666,21 @@ mod tests {
                     "manifestHash": "deliberately-not-validated://events manifest",
                     "credentials": {"token": "/run/credentials/token"}
                 });
+                let missing = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": ["must-not-run"],
+                        "pool": "slot",
+                        "source": "orchestrator",
+                        "dedupKey": "missing-full-mode-credential",
+                        "submission": {"mode": "full"},
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap_err();
+                assert_eq!(missing.code, WireErrorCode::InvalidParams);
+                assert!(missing.message.contains("pool-token"));
+                assert!(missing.message.contains("slot"));
                 let conflicting = daemon
                     .handler
                     .enqueue(Some(json!({
@@ -15543,6 +15566,7 @@ mod tests {
                         "dedupKey": key,
                         "submission": {"mode": "full"},
                         "callerJobId": parent_uuid,
+                        "credentials": {"token": "/run/credentials/slot-token"},
                         "evidence": ["exit:0"]
                     })
                 };

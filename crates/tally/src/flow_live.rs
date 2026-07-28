@@ -804,16 +804,21 @@ fn json_client_error(error: serde_json::Error) -> ClientError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
     use std::path::Path;
+    use std::rc::Rc;
     use tally_core::adapters::AdapterJobOptions;
+    use tally_core::brief::PreparedBrief;
     use tally_core::config::Priority;
     use tally_core::taskdb::{EnqueueSource, RelatedTriggerOutcome};
     use tally_core::wire::{
         canonical_payload, canonical_payload_hash, EnqueuePayload, GuardrailConfig, GuardrailState,
         ProducerDefaults,
     };
-    use tally_flow::{Derivation, NodeSpec, Orchestration};
+    use tally_flow::{
+        run_script, Derivation, NodeSpec, Orchestration, RunOptions, VecLifecycleSink,
+    };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
 
@@ -869,6 +874,59 @@ mod tests {
             event_id: "comment-61".to_owned(),
             outcome: RelatedTriggerOutcome::NotObserved,
             receipt_id: Some("receipt-61".to_owned()),
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturingClient {
+        submission: RefCell<Option<FlowSubmission>>,
+    }
+
+    impl FlowClient for CapturingClient {
+        fn inspect_run<'a>(
+            &'a self,
+            _flow_run_id: &'a str,
+        ) -> FlowFuture<'a, Result<RunInspection, ClientError>> {
+            Box::pin(std::future::ready(Ok(RunInspection { script_hash: None })))
+        }
+
+        fn submit<'a>(
+            &'a self,
+            submission: FlowSubmission,
+        ) -> FlowFuture<'a, Result<Admission, ClientError>> {
+            let payload_hash = submission.payload_hash.clone();
+            let label = submission.spec.label.clone();
+            self.submission.replace(Some(submission));
+            Box::pin(std::future::ready(Ok(Admission {
+                schema_version: 1,
+                disposition: Disposition::Created,
+                task_uuid: "00000000-0000-4000-8000-000000000073".to_owned(),
+                payload_hash,
+                attempt: 1,
+                terminal: Some(NodeResult {
+                    task_uuid: "00000000-0000-4000-8000-000000000073".to_owned(),
+                    verdict: Verdict::Pass,
+                    exit_code: Some(0),
+                    witness_seq: 1,
+                    disposition: Disposition::Created,
+                    result: Some(json!({"ok": true})),
+                    gates: None,
+                    error: None,
+                }),
+                recorded_label: label,
+                reused_rejected: None,
+            })))
+        }
+
+        fn await_terminal<'a>(
+            &'a self,
+            _task_uuid: &'a str,
+            _attempt: u32,
+        ) -> FlowFuture<'a, Result<NodeResult, ClientError>> {
+            Box::pin(std::future::ready(Err(ClientError::new(
+                "unexpected-await",
+                "capturing client admissions are terminal inline",
+            ))))
         }
     }
 
@@ -1009,6 +1067,123 @@ mod tests {
         assert_eq!(
             canonical_payload_hash(&resolved).unwrap(),
             "sha256:aa09bfa03f0d0a01e824d28d383c029490bc6adbc6917dee5140355e166acada"
+        );
+    }
+
+    #[test]
+    fn fully_populated_engine_and_wire_payload_hashes_match() {
+        let source = r#"
+export const meta = {
+  name: "hash-contract",
+  description: "engine and daemon canonical payload parity",
+  pools: ["alpha"],
+  argsSchema: {type: "object", additionalProperties: false},
+  selectors: ["hash-member"],
+  maxNodes: 1
+};
+
+(async () => {
+  const [member] = members("hash-member", {count: 1});
+  return local("compare both canonical payload implementations", {
+    member,
+    executor: "remote-a",
+    priority: "high",
+    runtimeMaxSec: 37,
+    evidence: ["exit:0"],
+    evidenceClass: {kind: "contract", revision: 2},
+    manifestHash: "sha256:manifest-contract",
+    workspace: {
+      repo: "mecattaf/tally.nix",
+      baseRev: "0123456789abcdef",
+      branch: "t-145-u2",
+      worktreePath: "/work/tally-t145"
+    },
+    key: "fully-populated",
+    label: "fully-populated-node",
+    env: {FROM_SPEC: "yes"},
+    resultSchema: {type: "object", required: ["ok"]}
+  });
+})()
+"#;
+        let client = Rc::new(CapturingClient::default());
+        let mut options = RunOptions::new("00000000-0000-4000-8000-000000000074", json!({}));
+        options.pool_credentials.insert(
+            "alpha".to_owned(),
+            BTreeMap::from([
+                (
+                    "api-token".to_owned(),
+                    PathBuf::from("/run/credentials/alpha-api-token"),
+                ),
+                (
+                    "signing-key".to_owned(),
+                    PathBuf::from("/run/credentials/alpha-signing-key"),
+                ),
+            ]),
+        );
+        options.catalog = Some(
+            serde_json::from_value(json!({
+                "version": 1,
+                "members": [{
+                    "id": "hash-member-a",
+                    "family": "contract-family",
+                    "maker": "contract-maker",
+                    "classes": ["hash-member"],
+                    "adapter": "codex",
+                    "pools": ["alpha"],
+                    "launch": {
+                        "prePromptArgv": ["--contract"],
+                        "environment": {"FROM_OPTIONS": "yes"},
+                        "approvalPolicy": "never",
+                        "sandboxPolicy": "workspace-write",
+                        "model": "provider/model-v2",
+                        "effort": "high"
+                    }
+                }]
+            }))
+            .unwrap(),
+        );
+        options.catalog_hash = Some("sha256:catalog-contract".to_owned());
+        run_script(
+            source,
+            Some(Path::new("hash-contract.js")),
+            client.clone(),
+            Rc::new(VecLifecycleSink::default()),
+            options,
+        )
+        .unwrap();
+        let submission = client.submission.borrow().clone().unwrap();
+        assert_eq!(submission.credentials.len(), 2);
+        assert!(submission.spec.brief.is_some());
+        assert!(submission.spec.workspace.is_some());
+        assert_eq!(
+            submission.spec.adapter_options.as_ref().unwrap()["model"],
+            "provider/model-v2"
+        );
+
+        let mut payload: EnqueuePayload = serde_json::from_value(
+            enqueue_payload(&submission, &RunnerIdentity::default()).unwrap(),
+        )
+        .unwrap();
+        let brief = PreparedBrief::from_value(payload.brief.take().unwrap()).unwrap();
+        let defaults = ProducerDefaults {
+            pools: vec!["alpha".to_owned()],
+            executor: Some("remote-a".to_owned()),
+            priority: Priority::High,
+            adapter: "codex".to_owned(),
+            source: EnqueueSource::Orchestrator,
+            cwd: None,
+            workspace: None,
+            adapter_options: AdapterJobOptions::default(),
+        };
+        let mut resolved = GuardrailState::new(GuardrailConfig::default())
+            .unwrap()
+            .validate_enqueue(payload, &defaults)
+            .unwrap();
+        resolved.brief_hash = Some(brief.hash().to_owned());
+
+        assert_eq!(
+            canonical_payload_hash(&resolved).unwrap(),
+            submission.payload_hash
         );
     }
 
