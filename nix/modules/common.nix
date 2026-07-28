@@ -2234,6 +2234,11 @@ let
         };
   };
 
+  renderFlow = _: flow: {
+    script = storePathWithContext flow.script;
+    inherit (flow) workloadMutex;
+  };
+
   renderExecutor = _: executor: {
     inherit (executor)
       kind
@@ -2276,6 +2281,7 @@ let
         ;
     };
     pools = mapAttrs renderPool cfg.pools;
+    flows = mapAttrs renderFlow cfg.flows;
     executors = mapAttrs renderExecutor cfg.executors;
     producers = mapAttrs renderProducer cfg.producers;
     adapters = mapAttrs renderAdapter cfg.adapters;

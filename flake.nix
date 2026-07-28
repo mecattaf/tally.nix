@@ -2758,7 +2758,9 @@
               .producers["flow-monthly-dedup"].enqueue.dedupKey == "monthly-local-ai-review-%Y-%m" and
               .producers["flow-monthly-dedup"].enqueue.evidence == ["exit:0","artifact:/tmp/monthly-review-receipt.json","hash:sha256"] and
               (.producers | has("flow-manual") | not) and
-              (has("flows") | not) and
+              .flows.fixture.workloadMutex == "flow-run-mutex" and
+              (.flows.fixture.script | startswith("/nix/store/")) and
+              .flows.manual.workloadMutex == null and
               .producers.daily.enqueue.pool == ["programmatic", "stock"] and
               .producers.daily.enqueue.executor == "worker" and
               .producers.daily.enqueue.credentials.JOB_TOKEN == "/run/credentials/tally-job" and
