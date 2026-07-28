@@ -657,7 +657,12 @@ fn local_unknown_options_use_the_shared_node_field_error_shape() {
     .unwrap_err();
     assert_eq!(error.name, "FlowSpecError");
     assert_eq!(error.code, "unknown-spec-field");
-    assert_eq!(error.message, "unknown job spec field \"resultShema\"");
+    assert_eq!(
+        error.message,
+        "unknown local() option \"resultShema\", expected one of argv, adapter, pools, executor, \
+         priority, runtimeMaxSec, evidence, evidenceClass, manifestHash, workspace, brief, key, \
+         dedupKey, label, env, resultSchema, member"
+    );
     assert_eq!(error.details["field"], "resultShema");
 }
 
@@ -1451,4 +1456,155 @@ fn a_sugar_helper_rejects_a_fixed_field_at_evaluation_time_too() {
     let error = run(&source, MockClient::new(Vec::new())).unwrap_err();
     assert_eq!(error.name, "FlowSpecError");
     assert_eq!(error.code, "sugar-option-conflict");
+}
+
+#[test]
+fn unknown_field_messages_name_their_surface_and_list_what_is_accepted() {
+    let job = format!(
+        "{}\n(async () => job({{argv: ['x'], pools: ['cpu'], resultShema: {{}}}}))()",
+        meta(&["cpu"], &[])
+    );
+    let error = run(&job, MockClient::new(Vec::new())).unwrap_err();
+    assert_eq!(error.code, "unknown-spec-field");
+    assert!(
+        error
+            .message
+            .starts_with("unknown job spec field \"resultShema\", expected one of argv, adapter,"),
+        "unexpected message: {}",
+        error.message
+    );
+    assert!(error.message.contains("resultSchema"));
+
+    let sugar = format!(
+        "{}\n(async () => sh(['x'], {{pools: ['cpu'], resultShema: {{}}}}))()",
+        meta(&["cpu"], &[])
+    );
+    let error = run(&sugar, MockClient::new(Vec::new())).unwrap_err();
+    assert_eq!(error.code, "unknown-spec-field");
+    assert!(
+        error
+            .message
+            .starts_with("unknown sh() option \"resultShema\", expected one of argv, adapter,"),
+        "unexpected message: {}",
+        error.message
+    );
+    assert_eq!(error.details["expected"][0], "argv");
+}
+
+#[test]
+fn duplicate_key_names_the_first_claim_by_ordinal_and_position() {
+    let source = format!(
+        "{}\n(async () => {{\n\
+         for (const item of ['a', 'b']) {{\n\
+         sh([item], {{pools: ['cpu'], key: 'constant'}});\n\
+         }}\n\
+         }})()",
+        meta(&["cpu"], &[])
+    );
+    let client = MockClient::new(vec![Reply::pass(Disposition::Created, 1)]);
+    let error = run(&source, client).unwrap_err();
+    assert_eq!(error.code, "duplicate-key");
+    assert!(
+        error.message.starts_with(
+            "flow-local key \"constant\" was already claimed by node 0 at line 11, column 1;"
+        ),
+        "unexpected message: {}",
+        error.message
+    );
+    assert!(error.message.contains("derive the key from what varies"));
+    assert_eq!(error.details["firstOrdinal"], 0);
+    assert_eq!(error.details["firstLocation"]["line"], 11);
+    // The second use is the same source line, which is exactly why the ordinal
+    // is the part that tells the two apart.
+    assert_eq!(error.location.unwrap().line, 11);
+    assert_eq!(error.ordinal, Some(1));
+}
+
+#[test]
+fn environment_name_errors_separate_invalid_from_reserved() {
+    let invalid = format!(
+        "{}\n(async () => sh(['x'], {{pools: ['cpu'], env: {{'9lives': 'x'}}}}))()",
+        meta(&["cpu"], &[])
+    );
+    let error = run(&invalid, MockClient::new(Vec::new())).unwrap_err();
+    assert_eq!(error.code, "reserved-env");
+    assert!(
+        error
+            .message
+            .starts_with("environment name \"9lives\" is not a valid name:"),
+        "unexpected message: {}",
+        error.message
+    );
+    assert_eq!(error.details["reason"], "invalid");
+
+    let reserved = format!(
+        "{}\n(async () => sh(['x'], {{pools: ['cpu'], env: {{TALLY_JOB_ID: 'x'}}}}))()",
+        meta(&["cpu"], &[])
+    );
+    let error = run(&reserved, MockClient::new(Vec::new())).unwrap_err();
+    assert_eq!(error.code, "reserved-env");
+    assert!(
+        error
+            .message
+            .starts_with("environment name \"TALLY_JOB_ID\" is reserved by the host:"),
+        "unexpected message: {}",
+        error.message
+    );
+    assert_eq!(error.details["reason"], "reserved");
+}
+
+#[test]
+fn a_banned_global_says_what_to_do_instead() {
+    let source = format!("{}\nconst now = Date.now();\nnow;", meta(&["cpu"], &[]));
+    let error = run(&source, MockClient::new(Vec::new())).unwrap_err();
+    assert_eq!(error.code, "determinism-violation");
+    assert_eq!(
+        error.message,
+        "banned global Date is unavailable in flow scripts because it would break replay; \
+         witness a clock reading in a node instead"
+    );
+
+    let random = format!(
+        "{}\n(async () => sh([String(Math.random())], {{pools: ['cpu']}}))()",
+        meta(&["cpu"], &[])
+    );
+    let error = run(&random, MockClient::new(Vec::new())).unwrap_err();
+    assert_eq!(error.code, "determinism-violation");
+    assert!(
+        error
+            .message
+            .ends_with("derive the choice from witnessed input, or let members() pick, instead"),
+        "unexpected message: {}",
+        error.message
+    );
+}
+
+#[test]
+fn a_float_in_an_integer_field_says_so_instead_of_naming_a_rust_type() {
+    let source = format!(
+        "{}\n(async () => sh(['x'], {{pools: ['cpu'], runtimeMaxSec: Math.floor(600.5)}}))()",
+        meta(&["cpu"], &[])
+    );
+    let error = run(&source, MockClient::new(Vec::new())).unwrap_err();
+    assert_eq!(error.name, "FlowSpecError");
+    assert_eq!(error.code, "invalid-spec");
+    assert_eq!(
+        error.message,
+        "sh() options runtimeMaxSec must be a whole number, but arrived as the floating-point \
+         value 600.0; JavaScript arithmetic such as Math.floor() stays floating point even when \
+         its result is integral — coerce it with (x | 0)"
+    );
+    assert_eq!(error.details["field"], "runtimeMaxSec");
+
+    // The coercion the message recommends actually works.
+    let fixed = format!(
+        "{}\n(async () => sh(['x'], {{pools: ['cpu'], runtimeMaxSec: Math.floor(600.5) | 0}}))()",
+        meta(&["cpu"], &[])
+    );
+    let client = MockClient::new(vec![Reply::pass(Disposition::Created, 1)]);
+    run(&fixed, client.clone()).unwrap();
+    assert_eq!(
+        client.submissions.borrow()[0].spec.runtime_max_sec,
+        Some(600)
+    );
 }

@@ -58,6 +58,10 @@ authorized.
 - Removed the inert declarative-flow `budgetPool` option; its tombstone points to priorities and
   the typed process-scoped `workloadMutex` instead.
 - Restricted system-indexed flake outputs to `x86_64-linux` and documented that supported platform.
+- Made the five worst flow authoring errors actionable: `unknown-spec-field` names its surface and
+  lists the accepted fields, `duplicate-key` reports the first claim's ordinal and position,
+  environment names separate invalid from reserved, every banned global names what to do instead,
+  and a float in a whole-number field says so rather than naming a Rust type.
 
 ### Fixed
 

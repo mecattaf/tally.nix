@@ -194,14 +194,33 @@ pub(super) fn validate_environment_entry(
         .next()
         .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
         && bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_');
-    if !valid_name || name.starts_with("TALLY_") || name == "CREDENTIALS_DIRECTORY" {
+    // Invalid and reserved are different author mistakes: one is a typo in the
+    // name, the other is a name the host owns. The code stays `reserved-env`.
+    if !valid_name {
         return Err(FlowError::new(
             "FlowEnvironmentError",
             "reserved-env",
-            format!("environment name {name:?} is invalid or reserved"),
+            format!(
+                "environment name {name:?} is not a valid name: it must start with a letter or \
+                 underscore and contain only letters, digits, and underscores"
+            ),
         )
         .at(location)
-        .detail("name", name.to_owned()));
+        .detail("name", name.to_owned())
+        .detail("reason", "invalid"));
+    }
+    if name.starts_with("TALLY_") || name == "CREDENTIALS_DIRECTORY" {
+        return Err(FlowError::new(
+            "FlowEnvironmentError",
+            "reserved-env",
+            format!(
+                "environment name {name:?} is reserved by the host: names beginning TALLY_ and \
+                 CREDENTIALS_DIRECTORY are set for the job, not by it"
+            ),
+        )
+        .at(location)
+        .detail("name", name.to_owned())
+        .detail("reason", "reserved"));
     }
     if value.contains('\0') {
         return Err(FlowError::new(
@@ -680,8 +699,78 @@ pub(super) fn validate_terminal_result(
     Ok(())
 }
 
+/// Which object a rejected field came from.
+///
+/// The call sites take different field sets, and an author calls a sugar's second
+/// argument options rather than a spec, so `unknown-spec-field` names the surface
+/// it means instead of calling every one of them a job spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SpecSurface<'a> {
+    JobSpec,
+    DerivationSpec,
+    SugarOptions(&'a str),
+}
+
+impl SpecSurface<'_> {
+    /// The object as a whole, for "… must be an object".
+    fn subject(self) -> String {
+        match self {
+            Self::JobSpec => "job spec".to_owned(),
+            Self::DerivationSpec => "drv spec".to_owned(),
+            Self::SugarOptions(helper) => format!("{helper}() options"),
+        }
+    }
+
+    /// One member of the object, for "unknown …".
+    fn member(self) -> String {
+        match self {
+            Self::JobSpec => "job spec field".to_owned(),
+            Self::DerivationSpec => "drv spec field".to_owned(),
+            Self::SugarOptions(helper) => format!("{helper}() option"),
+        }
+    }
+}
+
+/// Reject a float in a field that must be a whole number.
+///
+/// Without this, serde reports `invalid type: floating point 600.0, expected u64`
+/// — which names neither the field nor anything the author can act on.
+pub(super) fn reject_nonintegral_numbers(
+    value: &Value,
+    surface: SpecSurface<'_>,
+    location: SourceLocation,
+) -> Result<(), FlowError> {
+    let Some(object) = value.as_object() else {
+        return Ok(());
+    };
+    for field in NODE_SPEC_INTEGER_FIELDS {
+        let Some(number) = object.get(*field) else {
+            continue;
+        };
+        if !number.is_f64() {
+            continue;
+        }
+        let seen = number.as_f64().unwrap_or_default();
+        return Err(FlowError::new(
+            "FlowSpecError",
+            "invalid-spec",
+            format!(
+                "{} {field} must be a whole number, but arrived as the floating-point value \
+                 {seen:?}; JavaScript arithmetic such as Math.floor() stays floating point even \
+                 when its result is integral — coerce it with (x | 0)",
+                surface.subject()
+            ),
+        )
+        .at(location)
+        .detail("field", (*field).to_owned())
+        .detail("value", seen));
+    }
+    Ok(())
+}
+
 pub(super) fn reject_unknown_keys(
     value: &Value,
+    surface: SpecSurface<'_>,
     allowed: &[&str],
     location: SourceLocation,
 ) -> Result<(), FlowError> {
@@ -689,7 +778,7 @@ pub(super) fn reject_unknown_keys(
         FlowError::new(
             "FlowSpecError",
             "invalid-spec",
-            "job spec must be an object",
+            format!("{} must be an object", surface.subject()),
         )
         .at(location)
     })?;
@@ -698,10 +787,15 @@ pub(super) fn reject_unknown_keys(
             return Err(FlowError::new(
                 "FlowSpecError",
                 "unknown-spec-field",
-                format!("unknown job spec field {key:?}"),
+                format!(
+                    "unknown {} {key:?}, expected one of {}",
+                    surface.member(),
+                    allowed.join(", ")
+                ),
             )
             .at(location)
-            .detail("field", key.clone()));
+            .detail("field", key.clone())
+            .detail("expected", json!(allowed)));
         }
     }
     Ok(())

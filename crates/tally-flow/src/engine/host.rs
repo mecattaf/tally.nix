@@ -73,7 +73,10 @@ pub(super) struct HostState {
     next_ordinal: u64,
     admission_frontier: u64,
     admission_wakers: BTreeMap<u64, Waker>,
-    explicit_keys: BTreeSet<String>,
+    /// Each flow-local key with the ordinal and call site that first claimed it.
+    /// The dominant real duplicate is a constant key inside a `.map()`, where the
+    /// second use is the same source line, so the ordinal is what separates them.
+    explicit_keys: BTreeMap<String, (u64, SourceLocation)>,
     resolved_selections: BTreeSet<(String, String, Vec<String>)>,
     ordinal_keys: Vec<String>,
     iteration_counts: BTreeMap<SourceLocation, u32>,
@@ -353,16 +356,27 @@ impl HostShared {
             .with_ordinal(ordinal));
         }
         let dedup_key = if let Some(key) = &spec.key {
-            if !state.explicit_keys.insert(key.clone()) {
+            if let Some((first_ordinal, first_location)) = state.explicit_keys.get(key) {
+                let (first_ordinal, first_location) = (*first_ordinal, *first_location);
                 return Err(FlowError::new(
                     "FlowKeyError",
                     "duplicate-key",
-                    format!("flow-local key {key:?} is used more than once"),
+                    format!(
+                        "flow-local key {key:?} was already claimed by node {first_ordinal} at \
+                         line {}, column {}; derive the key from what varies per node",
+                        first_location.line, first_location.column
+                    ),
                 )
                 .at(location)
                 .with_ordinal(ordinal)
-                .detail("key", key.clone()));
+                .detail("key", key.clone())
+                .detail("firstOrdinal", first_ordinal)
+                .detail(
+                    "firstLocation",
+                    json!({"line": first_location.line, "column": first_location.column}),
+                ));
             }
+            state.explicit_keys.insert(key.clone(), (ordinal, location));
             format!("flow:{}:k:{key}", self.flow_run_id)
         } else if let Some(key) = &spec.dedup_key {
             key.clone()

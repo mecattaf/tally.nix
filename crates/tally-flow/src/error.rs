@@ -99,6 +99,38 @@ impl FlowError {
             .at(location)
             .detail("global", global)
     }
+
+    /// The standard message for a banned global, ending in what to do instead.
+    ///
+    /// Knowing a global is banned does not tell an author how to express the
+    /// intent behind reaching for it, so every banned global names its
+    /// replacement. The static lint and the hardened runtime share this text.
+    #[must_use]
+    pub fn banned_global(global: &str, location: SourceLocation) -> Self {
+        Self::determinism(
+            global,
+            format!(
+                "banned global {global} is unavailable in flow scripts because it would break \
+                 replay; {}",
+                banned_global_remedy(global)
+            ),
+            location,
+        )
+    }
+}
+
+fn banned_global_remedy(global: &str) -> &'static str {
+    match global {
+        "Date" => "witness a clock reading in a node instead",
+        "Math.random" => "derive the choice from witnessed input, or let members() pick, instead",
+        "WeakRef" | "FinalizationRegistry" => {
+            "collection timing is not reproducible — hold the value directly instead"
+        }
+        "eval" | "Function" => {
+            "code built at run time is outside the script hash — write the branch out instead"
+        }
+        _ => "express the intent through a node result instead",
+    }
 }
 
 impl fmt::Display for FlowError {
