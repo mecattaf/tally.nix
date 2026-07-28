@@ -45,6 +45,32 @@ impl Meta {
     }
 }
 
+/// Reject flow pool declarations that target windowed-consumption admission.
+///
+/// Pool predicates live in the kernel configuration rather than the JavaScript dialect, so the
+/// configured CLI supplies the names after ordinary syntax and metadata checking.
+pub fn validate_flow_pool_predicates(
+    meta: &Meta,
+    windowed_consumption_pools: &BTreeSet<String>,
+) -> Result<(), FlowError> {
+    let Some(pool) = meta
+        .pools
+        .iter()
+        .find(|pool| windowed_consumption_pools.contains(*pool))
+    else {
+        return Ok(());
+    };
+    Err(FlowError::new(
+        "FlowPoolError",
+        "windowed-consumption-excluded",
+        format!(
+            "flows are excluded from windowed-consumption admission by design; use priorities to control contention between workloads (pool {pool:?})"
+        ),
+    )
+    .detail("pool", pool.clone())
+    .detail("control", "priorities"))
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CheckOptions<'a> {
     pub args: Option<&'a Value>,
@@ -871,6 +897,22 @@ const x = args.task;
                 .code,
             "undeclared-pool"
         );
+    }
+
+    #[test]
+    fn configured_check_excludes_windowed_consumption_by_design() {
+        let checked = check_script(VALID, None, CheckOptions::default()).unwrap();
+        let error = validate_flow_pool_predicates(
+            &checked.meta,
+            &BTreeSet::from(["codex-window".to_owned()]),
+        )
+        .unwrap_err();
+        assert_eq!(error.name, "FlowPoolError");
+        assert_eq!(error.code, "windowed-consumption-excluded");
+        assert!(error.message.contains("excluded"));
+        assert!(error.message.contains("priorities"));
+        assert_eq!(error.details["pool"], "codex-window");
+        assert_eq!(error.details["control"], "priorities");
     }
 
     #[test]
