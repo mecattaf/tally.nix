@@ -8,6 +8,16 @@ authorized.
 
 ### Added
 
+- Added offline `tally history compact --keep-days N`: drops lifecycle records older than the
+  window, records the cut in the durable retention metadata (complete=false, truncation boundary,
+  reason), refuses to run while a daemon owns the state directory, and never touches durable
+  enqueue events, which remain recovery inputs. The lifecycle retention policy string is now
+  `unbounded-until-compacted`, sequences survive compaction unrenumbered, and a history whose
+  prefix is missing without a recorded boundary fails closed.
+- Added an ignored-by-default capacity envelope soak (50k witness records, 50k lifecycle events,
+  20k durable rows) asserting bounded startup verification passes, no per-query ledger
+  re-verification, near-zero continuation-page IO, bounded steady-state RSS growth, and amortized
+  O(record) change-log bytes per event.
 - Added characterization tests pinning the durable change-log window across reopen and crash
   artifacts, pagination cursor stability and deterministic page boundaries under the response
   byte cap, and client wire framing at and over the protocol frame limit.
@@ -54,6 +64,8 @@ authorized.
 
 ### Changed
 
+- Served the daemon's per-query row projections from Arc-shared snapshots rebuilt only after a
+  mutation instead of deep-cloning every projection per query.
 - Collapsed daemon startup to at most two full witness verifications and gave the daemon a
   verified in-memory witness view with per-task and per-dedup-key indexes. Queries, retry
   admission, dedup probes, and completed-job waits now verify only newly appended ledger bytes

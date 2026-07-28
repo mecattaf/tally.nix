@@ -177,6 +177,50 @@ impl SharedAttestations {
     }
 }
 
+/// A map that serves cheap Arc-shared value snapshots per mutation epoch.
+///
+/// Fresh query envelopes previously deep-cloned every row projection per
+/// query; this rebuilds the Vec only after a mutation and hands queries a
+/// clone of the Arc. Read-only access passes through Deref; the mutating
+/// methods invalidate the cached snapshot.
+pub(crate) struct SnapshotMap<V> {
+    map: BTreeMap<Uuid, V>,
+    cached: Option<Arc<Vec<V>>>,
+}
+
+impl<V> std::ops::Deref for SnapshotMap<V> {
+    type Target = BTreeMap<Uuid, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl<V> From<BTreeMap<Uuid, V>> for SnapshotMap<V> {
+    fn from(map: BTreeMap<Uuid, V>) -> Self {
+        Self { map, cached: None }
+    }
+}
+
+impl<V: Clone> SnapshotMap<V> {
+    pub(crate) fn insert(&mut self, key: Uuid, value: V) -> Option<V> {
+        self.cached = None;
+        self.map.insert(key, value)
+    }
+
+    pub(crate) fn get_mut(&mut self, key: &Uuid) -> Option<&mut V> {
+        self.cached = None;
+        self.map.get_mut(key)
+    }
+
+    pub(crate) fn snapshot(&mut self) -> Arc<Vec<V>> {
+        Arc::clone(
+            self.cached
+                .get_or_insert_with(|| Arc::new(self.map.values().cloned().collect())),
+        )
+    }
+}
+
 const LEASE_TICK: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
@@ -411,8 +455,8 @@ pub struct Context {
     barriers: BarrierTracker,
     rows: BTreeMap<Uuid, RowSeed>,
     guardrail_depths: BTreeMap<Uuid, u32>,
-    query_rows: BTreeMap<Uuid, RowFact>,
-    query_details: BTreeMap<Uuid, RowDetailFact>,
+    query_rows: SnapshotMap<RowFact>,
+    query_details: SnapshotMap<RowDetailFact>,
 }
 
 type SharedContext = Rc<RwLock<Context>>;

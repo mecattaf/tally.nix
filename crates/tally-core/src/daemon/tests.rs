@@ -8305,6 +8305,232 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    #[ignore = "capacity envelope soak; run explicitly with --ignored"]
+    async fn capacity_envelope_soak_bounds_startup_queries_and_change_log() {
+        const ROWS: usize = 20_000;
+        const LIFECYCLE_EVENTS: usize = 50_000;
+        const CHANGE_APPENDS: usize = 12_288;
+
+        fn rss_kib() -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("VmRSS:"))
+                .unwrap()
+                .trim()
+                .trim_end_matches(" kB")
+                .trim()
+                .parse()
+                .unwrap()
+        }
+
+        fn thread_rchar() -> u64 {
+            std::fs::read_to_string("/proc/thread-self/io")
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("rchar: "))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        }
+
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                prepare_paths(&paths).unwrap();
+                for _ in 0..3 {
+                    bump_epoch(&paths.state_dir).unwrap();
+                }
+
+                // 20k durable rows; 10k with three witness attempts and 10k
+                // with two: 50k witness records total, all terminal.
+                let mut ledger = WitnessLedger::open(paths.witness_path()).unwrap();
+                let mut history = LifecycleStore::open(&paths.data_dir).unwrap();
+                let mut timestamp_us = 1_786_000_000_000_000_u64;
+                let mut lifecycle_events = 0_usize;
+                for index in 0..ROWS {
+                    let row = durable_row(Uuid::new_v4(), &format!("soak-{index}"), 1);
+                    write_enqueue_event_atomic(
+                        &paths.events_dir(),
+                        &DurableEnqueueEvent::new(row.clone()).unwrap(),
+                    )
+                    .unwrap();
+                    let attempts: &[(Verdict, i32)] = if index < ROWS / 2 {
+                        &[
+                            (Verdict::Preempted, 1),
+                            (Verdict::Preempted, 1),
+                            (Verdict::Pass, 0),
+                        ]
+                    } else {
+                        &[(Verdict::Preempted, 1), (Verdict::Pass, 0)]
+                    };
+                    for (attempt_index, (verdict, exit_code)) in attempts.iter().enumerate() {
+                        let attempt = attempt_index as u32 + 1;
+                        append_fixture_witness(
+                            &mut ledger,
+                            &row,
+                            "2026-07-28T10:00:00.000Z",
+                            *verdict,
+                            *exit_code,
+                            attempt,
+                            u64::from(attempt),
+                        );
+                    }
+                    if lifecycle_events < LIFECYCLE_EVENTS {
+                        for event in [TallyEvent::Enqueued, TallyEvent::Started] {
+                            append_history_event(&mut history, &row, event, 1, 1, timestamp_us);
+                            timestamp_us += 1;
+                            lifecycle_events += 1;
+                        }
+                        if index % 2 == 0 {
+                            append_history_event(
+                                &mut history,
+                                &row,
+                                TallyEvent::Completed,
+                                1,
+                                1,
+                                timestamp_us,
+                            );
+                            timestamp_us += 1;
+                            lifecycle_events += 1;
+                        }
+                    }
+                }
+                drop(ledger);
+                drop(history);
+
+                // Startup over the populated state performs at most two full
+                // witness verifications.
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let before_open =
+                    crate::witness::FULL_VERIFICATION_PASSES.with(std::cell::Cell::get);
+                let opened_at = Instant::now();
+                let daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let open_elapsed = opened_at.elapsed();
+                let full_passes = crate::witness::FULL_VERIFICATION_PASSES
+                    .with(std::cell::Cell::get)
+                    - before_open;
+                assert!(
+                    full_passes <= 2,
+                    "startup performed {full_passes} full witness verifications"
+                );
+
+                // First page: no additional full verification, bounded item
+                // count, and its latency is reported for the record.
+                let before_query =
+                    crate::witness::FULL_VERIFICATION_PASSES.with(std::cell::Cell::get);
+                let first_page_at = Instant::now();
+                let first = daemon
+                    .handler
+                    .query("query.jobs", Some(json!({"limit": 100})))
+                    .await
+                    .unwrap();
+                let first_page_elapsed = first_page_at.elapsed();
+                assert_eq!(
+                    crate::witness::FULL_VERIFICATION_PASSES.with(std::cell::Cell::get)
+                        - before_query,
+                    0,
+                    "first page re-verified the whole ledger"
+                );
+                assert!(first["items"].as_array().unwrap().len() <= 100);
+                let cursor = first["nextCursor"].as_str().unwrap().to_owned();
+
+                // Continuation: zero witness verification passes and near-zero
+                // read IO on this thread.
+                let before_continuation =
+                    crate::witness::FULL_VERIFICATION_PASSES.with(std::cell::Cell::get);
+                let rchar_before = thread_rchar();
+                let second = daemon
+                    .handler
+                    .query("query.jobs", Some(json!({"limit": 100, "cursor": cursor})))
+                    .await
+                    .unwrap();
+                let continuation_rchar = thread_rchar() - rchar_before;
+                assert_eq!(
+                    crate::witness::FULL_VERIFICATION_PASSES.with(std::cell::Cell::get)
+                        - before_continuation,
+                    0,
+                    "continuation verified the ledger"
+                );
+                assert!(!second["items"].as_array().unwrap().is_empty());
+                assert!(
+                    continuation_rchar < 256 * 1024,
+                    "continuation read {continuation_rchar} bytes"
+                );
+
+                // Steady-state queries hold RSS within a bounded envelope.
+                let rss_before = rss_kib();
+                for _ in 0..25 {
+                    daemon
+                        .handler
+                        .query("query.jobs", Some(json!({"limit": 100})))
+                        .await
+                        .unwrap();
+                }
+                let rss_delta_kib = rss_kib().saturating_sub(rss_before);
+                assert!(
+                    rss_delta_kib < 512 * 1024,
+                    "25 queries grew RSS by {rss_delta_kib} KiB"
+                );
+
+                eprintln!(
+                    "soak: open={open_elapsed:?} first-page={first_page_elapsed:?} \
+                     continuation-rchar={continuation_rchar} rss-delta={rss_delta_kib}KiB"
+                );
+                drop(daemon);
+
+                // Change log: per-event durable cost is O(record), observable
+                // as at most appends/capacity + 1 whole-file rewrites and a
+                // durable file bounded by twice the retention window.
+                use std::os::unix::fs::MetadataExt;
+                let change_dir = temp.path().join("changes-soak");
+                let mut store = ChangeStore::open(&change_dir).unwrap();
+                let change_path = change_dir.join(crate::watch::CHANGE_FILE);
+                let mut inode = std::fs::metadata(&change_path).unwrap().ino();
+                let mut rewrites = 0_usize;
+                let mut max_line = 0_u64;
+                for index in 0..CHANGE_APPENDS {
+                    store
+                        .append_now(
+                            ChangeKind::Lifecycle,
+                            json!({"index": index, "payload": "x".repeat(160)}),
+                        )
+                        .unwrap();
+                    let metadata = std::fs::metadata(&change_path).unwrap();
+                    if metadata.ino() != inode {
+                        rewrites += 1;
+                        inode = metadata.ino();
+                    }
+                    max_line = max_line.max(metadata.len());
+                }
+                assert!(
+                    rewrites <= CHANGE_APPENDS / crate::watch::CHANGE_RETENTION_RECORDS + 1,
+                    "{rewrites} whole-file rewrites for {CHANGE_APPENDS} appends"
+                );
+                let final_len = std::fs::metadata(&change_path).unwrap().len();
+                assert!(
+                    final_len
+                        <= 2 * (crate::watch::CHANGE_RETENTION_RECORDS as u64) * 512,
+                    "durable change log holds {final_len} bytes"
+                );
+                eprintln!("soak: change rewrites={rewrites} final-bytes={final_len}");
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn startup_performs_at_most_two_full_witness_verifications() {
         let local = LocalSet::new();
         local

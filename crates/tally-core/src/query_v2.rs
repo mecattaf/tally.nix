@@ -1675,7 +1675,7 @@ mod tests {
             records: Vec::new(),
             retention: RetentionMetadata {
                 complete: true,
-                policy: "unbounded".to_owned(),
+                policy: crate::history::LIFECYCLE_RETENTION_POLICY.to_owned(),
                 earliest_cursor: None,
                 latest_cursor: None,
                 truncation_boundary: None,

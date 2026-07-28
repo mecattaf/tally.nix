@@ -326,8 +326,8 @@ impl DaemonHandler {
 struct QueryProjection {
     history: crate::history::LifecycleSnapshot,
     journal: Vec<JournalEntry>,
-    rows: Vec<RowFact>,
-    details: Vec<RowDetailFact>,
+    rows: std::sync::Arc<Vec<RowFact>>,
+    details: std::sync::Arc<Vec<RowDetailFact>>,
     attestations_path: PathBuf,
     live_states: HashMap<String, String>,
     live: Vec<LiveJobFact>,
@@ -353,8 +353,8 @@ impl DaemonHandler {
             let witness = context.witness_view.records().map_err(internal_wire)?;
             let report = context.witness_view.report();
             (
-                context.query_rows.values().cloned().collect::<Vec<_>>(),
-                context.query_details.values().cloned().collect::<Vec<_>>(),
+                context.query_rows.snapshot(),
+                context.query_details.snapshot(),
                 context.paths.attestations_path(),
                 context
                     .jobs

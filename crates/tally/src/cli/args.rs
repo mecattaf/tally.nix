@@ -73,6 +73,29 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: FlowCommand,
     },
+    History {
+        #[command(subcommand)]
+        command: HistoryCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum HistoryCommand {
+    /// Offline lifecycle-history compaction: drop records older than the
+    /// retention window and record the cut in the durable retention metadata.
+    /// Durable enqueue events are recovery inputs and are never touched.
+    Compact(HistoryCompactArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct HistoryCompactArgs {
+    /// Keep lifecycle records from the newest KEEP_DAYS days.
+    #[arg(long, value_name = "DAYS")]
+    pub(super) keep_days: u32,
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    pub(super) data_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
