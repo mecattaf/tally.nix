@@ -78,6 +78,11 @@ Book source and local build instructions live in [`doc/`](doc/README.md).
 The older design and campaign records in [`legacy-docs/`](legacy-docs/README.md)
 remain provenance, not the current user manual.
 
+## Platform support
+
+tally supports `x86_64-linux` only. That is the platform exercised by the full
+fleet gate and matches tally's systemd-based execution model.
+
 ## Development
 
 ```console
