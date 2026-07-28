@@ -6,6 +6,7 @@ use std::ffi::OsStr;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -48,6 +49,9 @@ use tally_flow::{
 
 use crate::flow_live::{LiveFlowClient, RunnerIdentity};
 
+const DEFAULT_RPC_TIMEOUT_SEC: u64 = 60;
+const RPC_TIMEOUT_ENV: &str = "TALLY_RPC_TIMEOUT_SEC";
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum Mode {
     Daemon,
@@ -67,6 +71,8 @@ struct Opts {
     config: Option<PathBuf>,
     #[arg(long, global = true, value_name = "PATH")]
     socket: Option<PathBuf>,
+    #[arg(long, global = true, value_name = "SECONDS")]
+    rpc_timeout_sec: Option<u64>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -799,12 +805,18 @@ impl LifecycleSink for JsonlLifecycleSink {
     }
 }
 
-async fn run_flow(socket: &Path, config_path: Option<&Path>, command: FlowCommand) -> Result<()> {
+async fn run_flow(
+    socket: &Path,
+    config_path: Option<&Path>,
+    rpc_timeout: Duration,
+    command: FlowCommand,
+) -> Result<()> {
     match command {
         FlowCommand::Cancel(args) => {
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "queue.cancel",
                 Some(json!({"flowRunId": args.flow_run_id})),
             )
@@ -1014,6 +1026,9 @@ async fn execute(opts: Opts) -> Result<()> {
         return Ok(());
     }
 
+    let rpc_timeout_environment = std::env::var_os(RPC_TIMEOUT_ENV);
+    let rpc_timeout =
+        resolve_rpc_timeout(opts.rpc_timeout_sec, rpc_timeout_environment.as_deref())?;
     let socket = opts.socket.unwrap_or_else(default_socket_path);
     match opts.command {
         Some(Command::RecordUnitExit(args)) => {
@@ -1128,6 +1143,7 @@ async fn execute(opts: Opts) -> Result<()> {
             print_rpc(
                 &socket,
                 opts.config.as_deref(),
+                rpc_timeout,
                 "queue.drain",
                 Some(json!({})),
             )
@@ -1139,19 +1155,21 @@ async fn execute(opts: Opts) -> Result<()> {
             command: QueueCommand::Enqueue(args),
         }) => run_enqueue(&socket, opts.config.as_deref(), *args).await,
         Some(Command::Queue { command }) => {
-            run_queue(&socket, opts.config.as_deref(), command).await
+            run_queue(&socket, opts.config.as_deref(), rpc_timeout, command).await
         }
         Some(Command::Producer { command }) => run_producer(opts.config, command),
         Some(Command::Witness { command }) => run_witness(command),
         Some(Command::View { command }) => run_view(command).await,
         Some(Command::Attest { command }) => run_attest(command),
         Some(Command::Lease { command }) => {
-            run_lease(&socket, opts.config.as_deref(), command).await
+            run_lease(&socket, opts.config.as_deref(), rpc_timeout, command).await
         }
         Some(Command::Query { command }) => {
-            run_query(&socket, opts.config.as_deref(), command).await
+            run_query(&socket, opts.config.as_deref(), rpc_timeout, command).await
         }
-        Some(Command::Flow { command }) => run_flow(&socket, opts.config.as_deref(), command).await,
+        Some(Command::Flow { command }) => {
+            run_flow(&socket, opts.config.as_deref(), rpc_timeout, command).await
+        }
         None => {
             Opts::command().print_help()?;
             println!();
@@ -1718,13 +1736,19 @@ async fn submit_payload(
     }
 }
 
-async fn run_queue(socket: &Path, config_path: Option<&Path>, command: QueueCommand) -> Result<()> {
+async fn run_queue(
+    socket: &Path,
+    config_path: Option<&Path>,
+    rpc_timeout: Duration,
+    command: QueueCommand,
+) -> Result<()> {
     match command {
         QueueCommand::Enqueue(_) => unreachable!("enqueue is routed before run_queue"),
         QueueCommand::Cancel { job, force } => {
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "queue.cancel",
                 Some(json!({"task_uuid": job, "force": force})),
             )
@@ -1734,6 +1758,7 @@ async fn run_queue(socket: &Path, config_path: Option<&Path>, command: QueueComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "queue.pause",
                 Some(json!({"pool": pool, "all": all})),
             )
@@ -1743,6 +1768,7 @@ async fn run_queue(socket: &Path, config_path: Option<&Path>, command: QueueComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "queue.resume",
                 Some(json!({"pool": pool, "all": all})),
             )
@@ -1791,16 +1817,27 @@ async fn run_queue(socket: &Path, config_path: Option<&Path>, command: QueueComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "queue.retry",
                 Some(json!({"task_uuid": job})),
             )
             .await
         }
-        QueueCommand::Drain => print_rpc(socket, config_path, "queue.drain", Some(json!({}))).await,
+        QueueCommand::Drain => {
+            print_rpc(
+                socket,
+                config_path,
+                rpc_timeout,
+                "queue.drain",
+                Some(json!({})),
+            )
+            .await
+        }
         QueueCommand::AwaitJob { job } => {
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "queue.await_job",
                 Some(json!({"task_uuid": job})),
             )
@@ -1810,6 +1847,7 @@ async fn run_queue(socket: &Path, config_path: Option<&Path>, command: QueueComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "queue.await_barrier",
                 Some(json!({"barrier": barrier})),
             )
@@ -1818,7 +1856,12 @@ async fn run_queue(socket: &Path, config_path: Option<&Path>, command: QueueComm
     }
 }
 
-async fn run_lease(socket: &Path, config_path: Option<&Path>, command: LeaseCommand) -> Result<()> {
+async fn run_lease(
+    socket: &Path,
+    config_path: Option<&Path>,
+    rpc_timeout: Duration,
+    command: LeaseCommand,
+) -> Result<()> {
     match command {
         LeaseCommand::Acquire { mut pools } => {
             tally_core::poolset::canonicalize(&mut pools)
@@ -1830,6 +1873,7 @@ async fn run_lease(socket: &Path, config_path: Option<&Path>, command: LeaseComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "lease.acquire",
                 Some(json!({"pool": pool})),
             )
@@ -1839,6 +1883,7 @@ async fn run_lease(socket: &Path, config_path: Option<&Path>, command: LeaseComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "lease.release",
                 Some(json!({"lease": lease})),
             )
@@ -1853,12 +1898,24 @@ async fn run_lease(socket: &Path, config_path: Option<&Path>, command: LeaseComm
                 })?;
                 json!({"jobId": job_id})
             };
-            print_rpc(socket, config_path, "lease.status", Some(params)).await
+            print_rpc(
+                socket,
+                config_path,
+                rpc_timeout,
+                "lease.status",
+                Some(params),
+            )
+            .await
         }
     }
 }
 
-async fn run_query(socket: &Path, config_path: Option<&Path>, command: QueryCommand) -> Result<()> {
+async fn run_query(
+    socket: &Path,
+    config_path: Option<&Path>,
+    rpc_timeout: Duration,
+    command: QueryCommand,
+) -> Result<()> {
     match command {
         QueryCommand::Jobs {
             state,
@@ -1879,6 +1936,7 @@ async fn run_query(socket: &Path, config_path: Option<&Path>, command: QueryComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "query.jobs",
                 Some(json!({
                     "liveState": state,
@@ -1900,12 +1958,20 @@ async fn run_query(socket: &Path, config_path: Option<&Path>, command: QueryComm
             .await
         }
         QueryCommand::Job { id } => {
-            print_rpc(socket, config_path, "query.job", Some(json!({"id": id}))).await
+            print_rpc(
+                socket,
+                config_path,
+                rpc_timeout,
+                "query.job",
+                Some(json!({"id": id})),
+            )
+            .await
         }
         QueryCommand::Status { pool } => {
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "query.status",
                 Some(json!({"pool": pool})),
             )
@@ -1925,6 +1991,7 @@ async fn run_query(socket: &Path, config_path: Option<&Path>, command: QueryComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "query.log",
                 Some(json!({
                     "task": task,
@@ -1944,6 +2011,7 @@ async fn run_query(socket: &Path, config_path: Option<&Path>, command: QueryComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "query.proof",
                 Some(json!({"task": task, "attempt": attempt})),
             )
@@ -1958,6 +2026,7 @@ async fn run_query(socket: &Path, config_path: Option<&Path>, command: QueryComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "query.trace",
                 Some(json!({
                     "task": task,
@@ -1972,6 +2041,7 @@ async fn run_query(socket: &Path, config_path: Option<&Path>, command: QueryComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "query.producers",
                 Some(json!({"name": name, "kind": kind})),
             )
@@ -2001,23 +2071,40 @@ async fn run_query(socket: &Path, config_path: Option<&Path>, command: QueryComm
             print_rpc(
                 socket,
                 config_path,
+                rpc_timeout,
                 "query.standup",
                 Some(json!({"since": since})),
             )
             .await
         }
-        QueryCommand::Pools => print_rpc(socket, config_path, "query.pools", Some(json!({}))).await,
+        QueryCommand::Pools => {
+            print_rpc(
+                socket,
+                config_path,
+                rpc_timeout,
+                "query.pools",
+                Some(json!({})),
+            )
+            .await
+        }
     }
 }
 
 async fn print_rpc(
     socket: &Path,
     config_path: Option<&Path>,
+    rpc_timeout: Duration,
     method: &str,
     params: Option<Value>,
 ) -> Result<()> {
     let client = connect_rpc(socket, config_path).await?;
-    let result = client.call(method, params).await?;
+    let result = if matches!(method, "queue.await_job" | "query.watch") {
+        client.call(method, params).await?
+    } else {
+        client
+            .call_with_deadline(method, params, rpc_timeout)
+            .await?
+    };
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
@@ -2424,6 +2511,30 @@ fn inherited_caller_job_id() -> Option<String> {
         .filter(|value| !value.trim().is_empty())
 }
 
+fn resolve_rpc_timeout(flag: Option<u64>, environment: Option<&OsStr>) -> Result<Duration> {
+    let seconds = match flag {
+        Some(seconds) => seconds,
+        None => match environment {
+            Some(value) => value
+                .to_str()
+                .ok_or_else(|| invalid(format!("{RPC_TIMEOUT_ENV} must be valid UTF-8")))?
+                .parse::<u64>()
+                .map_err(|_| {
+                    invalid(format!(
+                        "{RPC_TIMEOUT_ENV} must be a positive whole number of seconds"
+                    ))
+                })?,
+            None => DEFAULT_RPC_TIMEOUT_SEC,
+        },
+    };
+    if seconds == 0 {
+        return Err(invalid(
+            "--rpc-timeout-sec and TALLY_RPC_TIMEOUT_SEC must be greater than zero",
+        ));
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
 fn default_socket_path() -> PathBuf {
     if let Some(socket) = std::env::var_os("TALLY_SOCKET") {
         return PathBuf::from(socket);
@@ -2459,6 +2570,36 @@ mod tests {
     #[test]
     fn clap_tree_is_consistent() {
         Opts::command().debug_assert();
+    }
+
+    #[test]
+    fn rpc_timeout_flag_is_global() {
+        let options =
+            Opts::try_parse_from(["tally", "query", "pools", "--rpc-timeout-sec", "7"]).unwrap();
+        assert_eq!(options.rpc_timeout_sec, Some(7));
+    }
+
+    #[test]
+    fn rpc_timeout_selection_prefers_flag_then_environment_then_default() {
+        assert_eq!(
+            resolve_rpc_timeout(Some(7), Some(OsStr::new("invalid"))).unwrap(),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            resolve_rpc_timeout(None, Some(OsStr::new("9"))).unwrap(),
+            Duration::from_secs(9)
+        );
+        assert_eq!(
+            resolve_rpc_timeout(None, None).unwrap(),
+            Duration::from_secs(DEFAULT_RPC_TIMEOUT_SEC)
+        );
+    }
+
+    #[test]
+    fn rpc_timeout_selection_rejects_zero_and_invalid_environment_values() {
+        assert!(resolve_rpc_timeout(Some(0), None).is_err());
+        assert!(resolve_rpc_timeout(None, Some(OsStr::new("0"))).is_err());
+        assert!(resolve_rpc_timeout(None, Some(OsStr::new("not-a-number"))).is_err());
     }
 
     #[test]
