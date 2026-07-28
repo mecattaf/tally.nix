@@ -720,6 +720,100 @@ mod tests {
         params
     }
 
+    /// Close the loop between the mint and the enforcement.
+    ///
+    /// The other capability tests register a synthetic token so they can focus
+    /// on what admission does with it. This one takes the token that
+    /// `prepare_execution` actually minted, hands it back exactly as the job's
+    /// `TALLY_JOB_TOKEN` would carry it, and checks the daemon resolves the same
+    /// job — the daemon → job → CLI → enqueue round trip, minus the two links
+    /// that need a real unit (`executor_live` proves the unit receives the
+    /// variable; `cli_rpc` proves the CLI forwards it as `callerJobToken`).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_minted_token_round_trips_back_to_the_job_that_owns_it() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let job_id = Uuid::parse_str(admitted["job_id"].as_str().unwrap()).unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+
+                let mut job = {
+                    let mut context = daemon.handler.context.write().await;
+                    let stored = context.jobs.get_mut(&job_id).unwrap();
+                    stored.state = JobState::Running;
+                    stored.clone()
+                };
+                let minted = daemon
+                    .handler
+                    .prepare_execution(&mut job)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .job_token
+                    .unwrap();
+
+                // The token as the job would read it out of its own environment.
+                let request = execution_request(
+                    &daemon.handler.executor,
+                    &job,
+                    settings().unit_limits,
+                    ("/run/tally/tally.sock", Some(&minted)),
+                    &paths.data_dir,
+                    &GitAiConfig::default(),
+                    false,
+                )
+                .unwrap();
+                let carried = request.job_token.clone().unwrap();
+                assert_eq!(carried, minted);
+
+                let child = rpc(
+                    &daemon.handler,
+                    "queue.enqueue",
+                    child_request(&carried, json!({"dedupKey": "round-trip"})),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    admitted_parent(&daemon.handler, &child).await.as_deref(),
+                    Some(task_uuid.as_str())
+                );
+
+                // Revoking at terminal ends the round trip for that generation.
+                daemon.handler.revoke_job_token(&job);
+                let after_revoke = rpc(
+                    &daemon.handler,
+                    "queue.enqueue",
+                    child_request(&carried, json!({"dedupKey": "round-trip-revoked"})),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    after_revoke.message,
+                    "callerJobToken is not a live job capability; it was never minted or has been revoked"
+                );
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn job_token_fixes_caller_identity_and_rejects_sibling_impersonation() {
         let local = LocalSet::new();
