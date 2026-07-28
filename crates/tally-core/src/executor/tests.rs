@@ -2354,6 +2354,20 @@ async fn executor_default_refuses_direct_fallback() {
 }
 
 #[tokio::test]
+async fn require_systemd_revokes_an_earlier_direct_fallback_opt_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let request = fixture_request("fixture-exit127");
+    let result = Executor::new(temp.path(), "/nix/store/example/bin/tally")
+        .with_unit_probe(AbsentProbe)
+        .with_systemd_run(temp.path().join("missing-systemd-run"))
+        .with_direct_fallback()
+        .require_systemd()
+        .execute(request)
+        .await;
+    assert!(matches!(result, Err(ExecutorError::Spawn { .. })));
+}
+
+#[tokio::test]
 async fn direct_fallback_times_out_and_refuses_credentials() {
     let temp = tempfile::tempdir().unwrap();
     let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally")
