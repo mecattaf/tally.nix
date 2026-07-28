@@ -1229,6 +1229,14 @@ async fn fs5_live_acceptance_matrix() {
                 String::from_utf8_lossy(&restarted.stdout),
                 String::from_utf8_lossy(&restarted.stderr)
             );
+            assert!(
+                String::from_utf8_lossy(&restarted.stdout)
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .any(|event| event["type"] == "flow-rpc-reconnect"),
+                "restart emitted no reconnect lifecycle event:\n{}",
+                String::from_utf8_lossy(&restarted.stdout)
+            );
             client = rpc(&paths.socket).await;
             assert_eq!(flow_items(&client, RESTARTED_RUN).await.len(), 6);
             assert_six_unique_rows(&paths, RESTARTED_RUN);

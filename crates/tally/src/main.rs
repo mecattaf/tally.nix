@@ -2,7 +2,7 @@ mod flow_live;
 
 use std::collections::BTreeMap;
 use std::error::Error as StdError;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -153,6 +153,8 @@ struct FlowRunArgs {
     flow_run_id: Option<String>,
     #[arg(long, default_value_t = tally_flow::DEFAULT_MAX_NODES)]
     max_nodes: u32,
+    #[arg(long, value_name = "SECONDS")]
+    rpc_call_deadline_sec: Option<u64>,
 }
 
 #[derive(Debug, Args)]
@@ -742,15 +744,29 @@ fn exit_failure(code: i32, message: impl Into<String>) -> anyhow::Error {
     })
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
-    let helper_mode = std::env::args_os().nth(1).is_some_and(|argument| {
+fn main() {
+    let mut args = std::env::args_os().collect::<Vec<_>>();
+    let invoked_as_tallyd =
+        args.first().and_then(|arg| Path::new(arg).file_name()) == Some(OsStr::new("tallyd"));
+    if invoked_as_tallyd && args.len() == 1 {
+        args.extend(["daemon".into(), "run".into()]);
+    }
+    let helper_mode = args.get(1).is_some_and(|argument| {
         matches!(
             argument.to_str(),
             Some("__record-unit-exit" | "__remote-executor")
         )
     });
-    match run().await {
+    let opts = Opts::parse_from(args);
+    let environment = InvocationEnvironment::capture(&opts);
+    if environment.flow_runner.is_some() {
+        sanitize_inherited_tally_environment();
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tally tokio runtime must build");
+    match runtime.block_on(execute(opts, environment)) {
         Ok(()) => {}
         Err(error) => {
             if !helper_mode && !error.to_string().is_empty() {
@@ -761,14 +777,35 @@ async fn main() {
     }
 }
 
-async fn run() -> Result<()> {
-    let mut args = std::env::args_os().collect::<Vec<_>>();
-    let invoked_as_tallyd =
-        args.first().and_then(|arg| Path::new(arg).file_name()) == Some(OsStr::new("tallyd"));
-    if invoked_as_tallyd && args.len() == 1 {
-        args.extend(["daemon".into(), "run".into()]);
+#[derive(Debug, Default)]
+struct InheritedFlowEnvironment {
+    task_uuid: Option<String>,
+    job_id: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct InvocationEnvironment {
+    rpc_timeout: Option<OsString>,
+    flow_runner: Option<InheritedFlowEnvironment>,
+}
+
+impl InvocationEnvironment {
+    fn capture(opts: &Opts) -> Self {
+        let flow_runner = matches!(
+            &opts.command,
+            Some(Command::Flow {
+                command: FlowCommand::Run(_)
+            })
+        )
+        .then(|| InheritedFlowEnvironment {
+            task_uuid: std::env::var("TALLY_TASK_UUID").ok(),
+            job_id: std::env::var("TALLY_JOB_ID").ok(),
+        });
+        Self {
+            rpc_timeout: std::env::var_os(RPC_TIMEOUT_ENV),
+            flow_runner,
+        }
     }
-    execute(Opts::parse_from(args)).await
 }
 
 fn configuration_contract() -> Value {
@@ -811,6 +848,7 @@ async fn run_flow(
     config_path: Option<&Path>,
     rpc_timeout: Duration,
     command: FlowCommand,
+    inherited: InheritedFlowEnvironment,
 ) -> Result<()> {
     match command {
         FlowCommand::Cancel(args) => {
@@ -846,10 +884,14 @@ async fn run_flow(
             Ok(())
         }
         FlowCommand::Run(args) => {
+            if args.rpc_call_deadline_sec == Some(0) {
+                return Err(invalid("--rpc-call-deadline-sec must be greater than zero"));
+            }
+            let rpc_call_timeout = args.rpc_call_deadline_sec.map(Duration::from_secs);
             let source = std::fs::read_to_string(&args.script)
                 .with_context(|| format!("cannot read flow script {}", args.script.display()))?;
-            let inherited_task_uuid = std::env::var("TALLY_TASK_UUID").ok();
-            let inherited_job_id = std::env::var("TALLY_JOB_ID").ok();
+            let inherited_task_uuid = inherited.task_uuid;
+            let inherited_job_id = inherited.job_id;
             let flow_run_id = args
                 .flow_run_id
                 .or_else(|| inherited_task_uuid.clone())
@@ -906,23 +948,21 @@ async fn run_flow(
                 .into_iter()
                 .map(|(name, pool)| (name, pool.credentials))
                 .collect();
-            sanitize_inherited_tally_environment();
+            ensure_sanitized_flow_environment()?;
             let socket = socket.to_owned();
             let script = args.script;
             let runtime = tokio::runtime::Handle::current();
             let outcome = tokio::task::spawn_blocking(move || {
                 let _runtime = runtime.enter();
-                run_script(
-                    &source,
-                    Some(&script),
-                    Rc::new(
-                        LiveFlowClient::new(socket, max_frame_bytes, runner)
-                            .with_final_message_adapters(final_message_adapters),
-                    ),
-                    Rc::new(JsonlLifecycleSink),
-                    options,
-                )
-                .map_err(Box::new)
+                let lifecycle: Rc<dyn LifecycleSink> = Rc::new(JsonlLifecycleSink);
+                let mut client = LiveFlowClient::new(socket, max_frame_bytes, runner)
+                    .with_final_message_adapters(final_message_adapters);
+                if let Some(timeout) = rpc_call_timeout {
+                    client = client.with_call_timeout(timeout);
+                }
+                let client = client.with_lifecycle_sink(Rc::clone(&lifecycle));
+                run_script(&source, Some(&script), Rc::new(client), lifecycle, options)
+                    .map_err(Box::new)
             })
             .await
             .context("flow runner worker failed")?;
@@ -990,6 +1030,19 @@ fn sanitize_inherited_tally_environment() {
     }
 }
 
+fn ensure_sanitized_flow_environment() -> Result<()> {
+    if let Some(name) = std::env::vars_os().find_map(|(name, _)| {
+        name.to_str()
+            .filter(|name| name.starts_with("TALLY_") && *name != "TALLY_SOCKET")
+            .map(ToOwned::to_owned)
+    }) {
+        return Err(anyhow::anyhow!(
+            "flow worker inherited reserved environment variable {name}"
+        ));
+    }
+    Ok(())
+}
+
 fn flow_error(error: FlowError) -> anyhow::Error {
     let code = match error.code.as_str() {
         "replay-divergence"
@@ -1017,7 +1070,7 @@ fn flow_error(error: FlowError) -> anyhow::Error {
     anyhow::Error::new(ExitFailure { code, message })
 }
 
-async fn execute(opts: Opts) -> Result<()> {
+async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
     if matches!(opts.mode, Some(Mode::CheckConfig)) {
         let path = opts
             .config
@@ -1027,9 +1080,8 @@ async fn execute(opts: Opts) -> Result<()> {
         return Ok(());
     }
 
-    let rpc_timeout_environment = std::env::var_os(RPC_TIMEOUT_ENV);
     let rpc_timeout =
-        resolve_rpc_timeout(opts.rpc_timeout_sec, rpc_timeout_environment.as_deref())?;
+        resolve_rpc_timeout(opts.rpc_timeout_sec, environment.rpc_timeout.as_deref())?;
     let socket = opts.socket.unwrap_or_else(default_socket_path);
     match opts.command {
         Some(Command::RecordUnitExit(args)) => {
@@ -1171,7 +1223,14 @@ async fn execute(opts: Opts) -> Result<()> {
             run_query(&socket, opts.config.as_deref(), rpc_timeout, command).await
         }
         Some(Command::Flow { command }) => {
-            run_flow(&socket, opts.config.as_deref(), rpc_timeout, command).await
+            run_flow(
+                &socket,
+                opts.config.as_deref(),
+                rpc_timeout,
+                command,
+                environment.flow_runner.unwrap_or_default(),
+            )
+            .await
         }
         None => {
             Opts::command().print_help()?;
@@ -2885,6 +2944,8 @@ mod tests {
             "200",
             "--flow-run-id",
             "run-47",
+            "--rpc-call-deadline-sec",
+            "7200",
         ])
         .unwrap();
         assert!(matches!(
@@ -2893,6 +2954,7 @@ mod tests {
                 command: FlowCommand::Run(FlowRunArgs {
                     flow_run_id: Some(flow_run_id),
                     max_nodes: 200,
+                    rpc_call_deadline_sec: Some(7200),
                     ..
                 })
             }) if flow_run_id == "run-47"

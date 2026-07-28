@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
@@ -8,16 +9,16 @@ use tally_client::{is_rearmable_rpc_error, RpcClient, WireErrorCode, WireIoError
 use tally_core::query::QUERY_PROTOCOL_VERSION;
 use tally_core::taskdb::RelatedTrigger;
 use tally_flow::{
-    Admission, ClientError, Disposition, FlowClient, FlowFuture, FlowSubmission, NodeFailure,
-    NodeResult, RunInspection, Verdict,
+    Admission, ClientError, Disposition, FlowClient, FlowFuture, FlowSubmission, LifecycleSink,
+    NodeFailure, NodeResult, RunInspection, Verdict,
 };
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 const LIVE_CALL_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 const LIVE_RETRY_LIMIT: u32 = 64;
-const LIVE_RETRY_BASE_DELAY: Duration = Duration::from_millis(25);
-const LIVE_RETRY_MAX_DELAY: Duration = Duration::from_secs(1);
+const LIVE_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
+const LIVE_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const RESULT_PROJECTION_RETRY: Duration = Duration::from_millis(10);
 const RESULT_PROJECTION_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -56,6 +57,7 @@ pub(crate) struct LiveFlowClient {
     call_timeout: Duration,
     retry_limit: u32,
     retry_base_delay: Duration,
+    lifecycle: Option<Rc<dyn LifecycleSink>>,
 }
 
 impl LiveFlowClient {
@@ -75,6 +77,7 @@ impl LiveFlowClient {
             call_timeout: LIVE_CALL_TIMEOUT,
             retry_limit: LIVE_RETRY_LIMIT,
             retry_base_delay: LIVE_RETRY_BASE_DELAY,
+            lifecycle: None,
         }
     }
 
@@ -84,6 +87,18 @@ impl LiveFlowClient {
         final_message_adapters: BTreeSet<String>,
     ) -> Self {
         self.final_message_adapters = final_message_adapters;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_call_timeout(mut self, call_timeout: Duration) -> Self {
+        self.call_timeout = call_timeout;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_lifecycle_sink(mut self, lifecycle: Rc<dyn LifecycleSink>) -> Self {
+        self.lifecycle = Some(lifecycle);
         self
     }
 
@@ -169,12 +184,23 @@ impl LiveFlowClient {
         if *retries >= self.retry_limit {
             return Err(retry_limit_error(method, self.retry_limit, last_error));
         }
+        if *retries == 0 {
+            if let Some(lifecycle) = &self.lifecycle {
+                lifecycle
+                    .emit(json!({
+                        "type": "flow-rpc-reconnect",
+                        "method": method,
+                        "attempt": 1,
+                        "error": last_error.to_string(),
+                    }))
+                    .map_err(|error| WireIoError::ClientCallback(error.to_string()))?;
+            }
+        }
         *retries += 1;
-        let multiplier = 1_u32 << (*retries).saturating_sub(1).min(16);
-        let delay = self
-            .retry_base_delay
-            .saturating_mul(multiplier)
-            .min(LIVE_RETRY_MAX_DELAY);
+        if *retries == 1 {
+            return Ok(());
+        }
+        let delay = live_retry_delay(*retries, self.retry_base_delay);
         let now = Instant::now();
         if now >= deadline {
             return Err(call_timeout_error(method, *retries));
@@ -247,6 +273,11 @@ impl LiveFlowClient {
         }
         Ok(())
     }
+}
+
+fn live_retry_delay(retry: u32, base: Duration) -> Duration {
+    let multiplier = 1_u32 << retry.saturating_sub(2).min(16);
+    base.saturating_mul(multiplier).min(LIVE_RETRY_MAX_DELAY)
 }
 
 impl FlowClient for LiveFlowClient {
@@ -1800,6 +1831,26 @@ export const meta = {
         ));
     }
 
+    #[test]
+    fn live_reconnect_backoff_starts_at_fifty_milliseconds_and_caps_at_two_seconds() {
+        assert_eq!(
+            live_retry_delay(2, LIVE_RETRY_BASE_DELAY),
+            Duration::from_millis(50)
+        );
+        assert_eq!(
+            live_retry_delay(3, LIVE_RETRY_BASE_DELAY),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            live_retry_delay(8, LIVE_RETRY_BASE_DELAY),
+            LIVE_RETRY_MAX_DELAY
+        );
+        assert_eq!(
+            live_retry_delay(64, LIVE_RETRY_BASE_DELAY),
+            LIVE_RETRY_MAX_DELAY
+        );
+    }
+
     #[tokio::test]
     async fn persistent_retryable_errors_obey_backoff_and_retry_ceiling() {
         const RETRY_LIMIT: u32 = 2;
@@ -1826,7 +1877,9 @@ export const meta = {
             requests
         });
 
-        let mut client = LiveFlowClient::new(&socket, 16 * 1024 * 1024, RunnerIdentity::default());
+        let lifecycle = Rc::new(VecLifecycleSink::default());
+        let mut client = LiveFlowClient::new(&socket, 16 * 1024 * 1024, RunnerIdentity::default())
+            .with_lifecycle_sink(lifecycle.clone());
         client.call_timeout = Duration::from_secs(1);
         client.retry_limit = RETRY_LIMIT;
         client.retry_base_delay = Duration::from_millis(15);
@@ -1840,9 +1893,18 @@ export const meta = {
             }
             other => panic!("expected bounded retry timeout, got {other:?}"),
         }
-        assert!(elapsed >= Duration::from_millis(40));
+        assert!(elapsed >= Duration::from_millis(10));
         assert!(elapsed < Duration::from_millis(500));
         assert_eq!(server.await.unwrap(), RETRY_LIMIT + 1);
+        assert_eq!(
+            lifecycle.events(),
+            [json!({
+                "type": "flow-rpc-reconnect",
+                "method": "query.status",
+                "attempt": 1,
+                "error": "RPC error Timeout: retry later",
+            })]
+        );
     }
 
     #[tokio::test]

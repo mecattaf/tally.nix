@@ -121,6 +121,12 @@ attempt number. When a daemon-side automatic requeue has advanced the same task
 UUID, a stale requested attempt follows the durable row's current attempt; a
 future attempt remains an error rather than being silently rewritten.
 
+The first reconnect attempt is immediate. Continued failures back off exponentially from
+50 milliseconds to a 2-second cap, and the runner emits one `flow-rpc-reconnect` lifecycle
+line when each call first enters reconnect mode. A live RPC call has a generous 24-hour total
+deadline by default; `flow run --rpc-call-deadline-sec SECONDS` selects a shorter or longer
+positive bound when an operator needs one.
+
 The daemon recovers durable rows and reconciles live executor work. The shipped
 multi-host VM check kills the coordinator daemon while a remote child is running,
 adopts that child into the new lease epoch, and lets a replaying runner attach
