@@ -1220,14 +1220,14 @@ fn old_format_error(path: &Path) -> WitnessError {
     }
 }
 
-fn scan_head(file: &mut File, path: &Path) -> Result<ChainHead, WitnessError> {
+fn scan_head(file: &mut File, path: &Path) -> Result<(ChainHead, u64), WitnessError> {
     file.seek(SeekFrom::Start(0))
         .map_err(|source| io_error(path, source))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|source| io_error(path, source))?;
     if bytes.is_empty() {
-        return Ok(ChainHead::default());
+        return Ok((ChainHead::default(), 0));
     }
     if looks_like_old_format(&bytes) {
         return Err(old_format_error(path));
@@ -1249,7 +1249,7 @@ fn scan_head(file: &mut File, path: &Path) -> Result<ChainHead, WitnessError> {
         ));
     }
     if report.records == 0 {
-        return Ok(ChainHead::default());
+        return Ok((ChainHead::default(), complete_len as u64));
     }
     let text = String::from_utf8(bytes)
         .map_err(|error| WitnessError::Corrupt(format!("ledger is not UTF-8: {error}")))?;
@@ -1260,16 +1260,91 @@ fn scan_head(file: &mut File, path: &Path) -> Result<ChainHead, WitnessError> {
         .ok_or_else(|| WitnessError::Corrupt("ledger has no complete record".to_owned()))?;
     let raw: Value = serde_json::from_str(last)?;
     let record = validate_record(&raw).map_err(|failure| WitnessError::Corrupt(failure.reason))?;
-    Ok(ChainHead {
-        seq: record.seq,
-        hash: record.hash,
-    })
+    Ok((
+        ChainHead {
+            seq: record.seq,
+            hash: record.hash,
+        },
+        complete_len as u64,
+    ))
+}
+
+// Verify only the bytes another writer appended after our verified prefix,
+// chaining from the cached head. The prefix was fully verified when this
+// handle cached (head, offset); re-verifying it on every append made appends
+// O(ledger). Prefix tampering after open is instead caught at startup, view
+// rebuilds, and explicit `tally witness verify` runs.
+fn verify_suffix(
+    file: &mut File,
+    path: &Path,
+    head: &ChainHead,
+    offset: u64,
+) -> Result<(ChainHead, u64), WitnessError> {
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|source| io_error(path, source))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| io_error(path, source))?;
+    if bytes.is_empty() {
+        return Ok((head.clone(), offset));
+    }
+    let complete_len = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    if complete_len != bytes.len() {
+        file.set_len(offset + complete_len as u64)
+            .map_err(|source| io_error(path, source))?;
+        bytes.truncate(complete_len);
+    }
+    let text = std::str::from_utf8(&bytes)
+        .map_err(|error| WitnessError::Corrupt(format!("ledger suffix is not UTF-8: {error}")))?;
+    let mut head = head.clone();
+    for line in text.split_terminator('\n') {
+        if line.trim().is_empty() {
+            return Err(WitnessError::Corrupt(
+                "blank lines are not canonical witness records".to_owned(),
+            ));
+        }
+        let raw: Value = serde_json::from_str(line)
+            .map_err(|_| WitnessError::Corrupt("suffix line is not valid JSON".to_owned()))?;
+        if serde_json::to_string(&raw)? != line {
+            return Err(WitnessError::Corrupt(
+                "suffix record bytes are not compact canonical JSON".to_owned(),
+            ));
+        }
+        let record =
+            validate_record(&raw).map_err(|failure| WitnessError::Corrupt(failure.reason))?;
+        if compute_hash_value(&raw)? != record.hash {
+            return Err(WitnessError::Corrupt(format!(
+                "suffix record {} hash does not match its bytes",
+                record.seq
+            )));
+        }
+        if record.prev_hash != head.hash || record.seq != head.seq + 1 {
+            return Err(WitnessError::Corrupt(format!(
+                "suffix record {} does not chain from the verified head {}",
+                record.seq, head.seq
+            )));
+        }
+        head = ChainHead {
+            seq: record.seq,
+            hash: record.hash,
+        };
+    }
+    Ok((head, offset + complete_len as u64))
 }
 
 pub struct WitnessLedger {
     path: PathBuf,
     file: File,
     head: ChainHead,
+    // Byte length of the verified prefix ending at `head`. Appends compare it
+    // with the current file length: equal means the cached head is current,
+    // longer means another writer appended a suffix to verify incrementally,
+    // shorter means the ledger shrank and the append fails closed after a
+    // full rescan.
+    verified_offset: u64,
 }
 
 impl WitnessLedger {
@@ -1289,7 +1364,7 @@ impl WitnessLedger {
             .map_err(|source| io_error(&path, source))?;
         let head = scan_head(&mut file, &path);
         let unlock = FileExt::unlock(&file).map_err(|source| io_error(&path, source));
-        let head = head?;
+        let (head, verified_offset) = head?;
         unlock?;
         if created {
             if let Some(parent) = path.parent() {
@@ -1298,7 +1373,12 @@ impl WitnessLedger {
                     .map_err(|source| io_error(parent, source))?;
             }
         }
-        Ok(Self { path, file, head })
+        Ok(Self {
+            path,
+            file,
+            head,
+            verified_offset,
+        })
     }
 
     pub fn head(&self) -> &ChainHead {
@@ -1310,10 +1390,26 @@ impl WitnessLedger {
             .lock_exclusive()
             .map_err(|source| io_error(&self.path, source))?;
         let result = (|| {
-            self.head = scan_head(&mut self.file, &self.path)?;
+            let length = self
+                .file
+                .metadata()
+                .map_err(|source| io_error(&self.path, source))?
+                .len();
+            if length < self.verified_offset {
+                // The ledger shrank behind us: the cached head no longer
+                // describes this file. Re-verify everything and fail closed on
+                // any problem.
+                (self.head, self.verified_offset) = scan_head(&mut self.file, &self.path)?;
+            } else if length > self.verified_offset {
+                (self.head, self.verified_offset) =
+                    verify_suffix(&mut self.file, &self.path, &self.head, self.verified_offset)?;
+            }
             let (record, raw) = build_record_with_raw(body, &self.head)?;
             let mut line = canonical_record_bytes(&raw)?;
             line.push(b'\n');
+            self.file
+                .seek(SeekFrom::End(0))
+                .map_err(|source| io_error(&self.path, source))?;
             self.file
                 .write_all(&line)
                 .map_err(|source| io_error(&self.path, source))?;
@@ -1324,6 +1420,7 @@ impl WitnessLedger {
                 seq: record.seq,
                 hash: record.hash.clone(),
             };
+            self.verified_offset += line.len() as u64;
             Ok(record)
         })();
         let unlock = FileExt::unlock(&self.file).map_err(|source| io_error(&self.path, source));
@@ -1380,6 +1477,237 @@ fn durable_parent(path: &Path) -> &Path {
     path.parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."))
+}
+
+/// A long-lived attestation-chain handle with a verified-head cache.
+///
+/// `open` repairs the tail and fully verifies the chain once. Afterwards each
+/// operation verifies only the bytes other writers appended past the cached
+/// verified prefix, so steady-state appends and reads are O(new records)
+/// instead of O(chain). The one-shot [`append_attestation`] stays for CLI use.
+pub struct AttestationLedger {
+    path: PathBuf,
+    file: File,
+    records: Vec<AttestationRecord>,
+    verified_offset: u64,
+}
+
+impl AttestationLedger {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, WitnessError> {
+        let path = path.as_ref().to_owned();
+        let parent = durable_parent(&path);
+        std::fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+        let created = !path.exists();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(&path)
+            .map_err(|source| io_error(&path, source))?;
+        file.lock_exclusive()
+            .map_err(|source| io_error(&path, source))?;
+        let scan = (|| -> Result<_, WitnessError> {
+            truncate_incomplete_attestation_tail(&mut file, &path)?;
+            let records = read_attestation_chain(&mut file, &path)?;
+            let verified_offset = file
+                .metadata()
+                .map_err(|source| io_error(&path, source))?
+                .len();
+            Ok((records, verified_offset))
+        })();
+        let unlock = FileExt::unlock(&file).map_err(|source| io_error(&path, source));
+        let (records, verified_offset) = scan?;
+        unlock?;
+        if created {
+            File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|source| io_error(parent, source))?;
+        }
+        Ok(Self {
+            path,
+            file,
+            records,
+            verified_offset,
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn head(&self) -> (u64, String) {
+        self.records.last().map_or_else(
+            || (0, GENESIS_PREV_HASH.to_owned()),
+            |record| (record.seq, record.hash.clone()),
+        )
+    }
+
+    // Absorb bytes other writers appended past our verified prefix. Must run
+    // under the file lock.
+    fn refresh_locked(&mut self) -> Result<(), WitnessError> {
+        let length = self
+            .file
+            .metadata()
+            .map_err(|source| io_error(&self.path, source))?
+            .len();
+        if length == self.verified_offset {
+            return Ok(());
+        }
+        if length < self.verified_offset {
+            // The chain shrank behind us: abandon the cache and re-verify the
+            // whole file, failing closed on any problem.
+            truncate_incomplete_attestation_tail(&mut self.file, &self.path)?;
+            self.records = read_attestation_chain(&mut self.file, &self.path)?;
+            self.verified_offset = self
+                .file
+                .metadata()
+                .map_err(|source| io_error(&self.path, source))?
+                .len();
+            return Ok(());
+        }
+        self.file
+            .seek(SeekFrom::Start(self.verified_offset))
+            .map_err(|source| io_error(&self.path, source))?;
+        let mut bytes = Vec::new();
+        self.file
+            .read_to_end(&mut bytes)
+            .map_err(|source| io_error(&self.path, source))?;
+        if bytes.last() != Some(&b'\n') {
+            // Mirror truncate_incomplete_attestation_tail on the suffix: a
+            // parseable unterminated record gains its newline, torn bytes are
+            // truncated away.
+            let complete_len = bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |position| position + 1);
+            if serde_json::from_slice::<Value>(&bytes[complete_len..]).is_ok() {
+                self.file
+                    .seek(SeekFrom::End(0))
+                    .map_err(|source| io_error(&self.path, source))?;
+                self.file
+                    .write_all(b"\n")
+                    .map_err(|source| io_error(&self.path, source))?;
+                bytes.push(b'\n');
+            } else {
+                self.file
+                    .set_len(self.verified_offset + complete_len as u64)
+                    .map_err(|source| io_error(&self.path, source))?;
+                bytes.truncate(complete_len);
+            }
+        }
+        let (mut expected_seq, mut previous_hash) = self.head();
+        expected_seq += 1;
+        let text = std::str::from_utf8(&bytes).map_err(|error| {
+            WitnessError::Corrupt(format!("attestation suffix is not UTF-8: {error}"))
+        })?;
+        let mut appended = Vec::new();
+        for line in text.split_terminator('\n') {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let raw: Value = serde_json::from_str(line)?;
+            let record: AttestationRecord = serde_json::from_value(raw.clone())?;
+            if record.seq != expected_seq
+                || record.prev_hash != previous_hash
+                || compute_hash_value(&raw)? != record.hash
+            {
+                return Err(WitnessError::Corrupt(format!(
+                    "attestation chain breaks at seq {}",
+                    record.seq
+                )));
+            }
+            expected_seq += 1;
+            previous_hash = record.hash.clone();
+            appended.push(record);
+        }
+        self.records.extend(appended);
+        self.verified_offset += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// The verified records, refreshed with any suffix other writers appended.
+    pub fn records(&mut self) -> Result<&[AttestationRecord], WitnessError> {
+        self.file
+            .lock_exclusive()
+            .map_err(|source| io_error(&self.path, source))?;
+        let refresh = self.refresh_locked();
+        let unlock = FileExt::unlock(&self.file).map_err(|source| io_error(&self.path, source));
+        refresh?;
+        unlock?;
+        Ok(&self.records)
+    }
+
+    pub fn append(&mut self, payload: Value) -> Result<AttestationRecord, WitnessError> {
+        self.file
+            .lock_exclusive()
+            .map_err(|source| io_error(&self.path, source))?;
+        let result = (|| {
+            self.refresh_locked()?;
+            let (seq, previous_hash) = self.head();
+            let mut record = AttestationRecord {
+                observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                payload,
+                seq: seq + 1,
+                prev_hash: previous_hash,
+                hash: String::new(),
+            };
+            record.hash = compute_hash_value(&serde_json::to_value(&record)?)?;
+            let mut line = serde_json::to_vec(&record)?;
+            line.push(b'\n');
+            self.file
+                .seek(SeekFrom::End(0))
+                .map_err(|source| io_error(&self.path, source))?;
+            self.file
+                .write_all(&line)
+                .map_err(|source| io_error(&self.path, source))?;
+            self.file
+                .sync_all()
+                .map_err(|source| io_error(&self.path, source))?;
+            self.verified_offset += line.len() as u64;
+            self.records.push(record.clone());
+            Ok(record)
+        })();
+        let unlock = FileExt::unlock(&self.file).map_err(|source| io_error(&self.path, source));
+        match (result, unlock) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(record), Ok(())) => Ok(record),
+        }
+    }
+}
+
+// Read and verify the full attestation chain, returning the parsed records.
+fn read_attestation_chain(
+    file: &mut File,
+    path: &Path,
+) -> Result<Vec<AttestationRecord>, WitnessError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| io_error(path, source))?;
+    let reader = BufReader::new(file.try_clone().map_err(|source| io_error(path, source))?);
+    let mut expected_seq = 1;
+    let mut previous_hash = GENESIS_PREV_HASH.to_owned();
+    let mut records = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|source| io_error(path, source))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let raw: Value = serde_json::from_str(&line)?;
+        let record: AttestationRecord = serde_json::from_value(raw.clone())?;
+        if record.seq != expected_seq
+            || record.prev_hash != previous_hash
+            || compute_hash_value(&raw)? != record.hash
+        {
+            return Err(WitnessError::Corrupt(format!(
+                "attestation chain breaks at seq {}",
+                record.seq
+            )));
+        }
+        expected_seq += 1;
+        previous_hash = record.hash.clone();
+        records.push(record);
+    }
+    Ok(records)
 }
 
 pub fn repair_attestation_tail(path: &Path) -> Result<(), WitnessError> {
@@ -2271,6 +2599,146 @@ mod tests {
     }
 
     #[test]
+    fn interleaved_appends_from_two_handles_are_absorbed_by_suffix_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("witness.jsonl");
+        let mut first = WitnessLedger::open(&path).unwrap();
+        let mut second = WitnessLedger::open(&path).unwrap();
+        for round in 0..4 {
+            assert_eq!(first.append(body()).unwrap().seq, round * 2 + 1);
+            assert_eq!(second.append(body()).unwrap().seq, round * 2 + 2);
+        }
+        let (report, records) = read_verified_records(&path).unwrap();
+        assert!(report.ok, "{:?}", report.problems);
+        assert_eq!(
+            records.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            (1..=8).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn prefix_tamper_is_rejected_at_open_and_suffix_tamper_at_next_append() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("witness.jsonl");
+        {
+            let mut ledger = WitnessLedger::open(&path).unwrap();
+            for _ in 0..3 {
+                ledger.append(body()).unwrap();
+            }
+        }
+        // Prefix tamper: flip a payload byte in the first record.
+        let pristine = std::fs::read(&path).unwrap();
+        let mut tampered = pristine.clone();
+        let target = tampered
+            .windows(9)
+            .position(|window| window == b"verdict\":")
+            .unwrap()
+            + 10;
+        tampered[target] ^= 0x01;
+        std::fs::write(&path, &tampered).unwrap();
+        assert!(matches!(
+            WitnessLedger::open(&path),
+            Err(WitnessError::Corrupt(_))
+        ));
+        std::fs::write(&path, &pristine).unwrap();
+
+        // Suffix tamper: a record appended after this handle cached its head
+        // is verified (and rejected) on the handle's next append.
+        let mut ledger = WitnessLedger::open(&path).unwrap();
+        let mut other = WitnessLedger::open(&path).unwrap();
+        other.append(body()).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let suffix_target = bytes.len() - 40;
+        bytes[suffix_target] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            ledger.append(body()),
+            Err(WitnessError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn shrunken_ledger_triggers_a_full_rescan_and_fails_closed_on_corruption() {
+        // A file shorter than the verified offset abandons the cached head.
+        // If the shorter file still verifies (a torn tail truncated back to a
+        // record boundary), the append chains from the rescanned head exactly
+        // as the pre-cache implementation did.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("witness.jsonl");
+        let mut ledger = WitnessLedger::open(&path).unwrap();
+        for _ in 0..3 {
+            ledger.append(body()).unwrap();
+        }
+        let length = std::fs::metadata(&path).unwrap().len();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(length - 30)
+            .unwrap();
+        let recovered = ledger.append(body()).unwrap();
+        assert_eq!(recovered.seq, 3);
+        let report = verify_file(&path).unwrap();
+        assert!(report.ok, "{:?}", report.problems);
+
+        // If the shrunken bytes are not a valid chain, the append fails
+        // closed instead of writing after garbage.
+        let mut corrupt = std::fs::read(&path).unwrap();
+        corrupt.truncate(corrupt.len() - 40);
+        let flip = corrupt.len() / 2;
+        corrupt[flip] ^= 0x01;
+        std::fs::write(&path, &corrupt).unwrap();
+        assert!(ledger.append(body()).is_err());
+    }
+
+    #[test]
+    #[ignore = "capacity perf probe; run explicitly with --ignored"]
+    fn append_io_is_independent_of_ledger_size() {
+        fn thread_read_bytes() -> u64 {
+            let stats = std::fs::read_to_string("/proc/thread-self/io").unwrap();
+            stats
+                .lines()
+                .find_map(|line| line.strip_prefix("rchar: "))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("witness.jsonl");
+        // Build a 50k-record chain directly; opening it once (full verify) is
+        // expected to read everything.
+        let mut head = ChainHead::default();
+        let mut bytes = Vec::new();
+        for ordinal in 0..50_000_u64 {
+            let mut next = body();
+            next.task_uuid = Some(format!("b2c40001-0000-4000-8000-{ordinal:012x}"));
+            next.dedup_key = Some(format!("soak:{ordinal}"));
+            let record = build_record(next, &head).unwrap();
+            bytes.extend(serde_json::to_vec(&record).unwrap());
+            bytes.push(b'\n');
+            head = ChainHead {
+                seq: record.seq,
+                hash: record.hash,
+            };
+        }
+        std::fs::write(&path, &bytes).unwrap();
+        let ledger_bytes = bytes.len() as u64;
+
+        let mut ledger = WitnessLedger::open(&path).unwrap();
+        // First append settles any lazily cached state.
+        ledger.append(body()).unwrap();
+        let before = thread_read_bytes();
+        ledger.append(body()).unwrap();
+        let read_during_append = thread_read_bytes() - before;
+        assert!(
+            read_during_append < ledger_bytes / 100,
+            "append read {read_during_append} bytes of a {ledger_bytes}-byte ledger"
+        );
+    }
+
+    #[test]
     fn attestation_chain_is_independent_and_advisory() {
         assert_eq!(
             durable_parent(Path::new("attestations.jsonl")),
@@ -2317,6 +2785,54 @@ mod tests {
         std::fs::write(&malformed, b"{\"payload\":{}}").unwrap();
         assert!(repair_attestation_tail(&malformed).is_err());
         assert_eq!(std::fs::read(&malformed).unwrap(), b"{\"payload\":{}}");
+    }
+
+    #[test]
+    fn attestation_ledger_caches_the_head_and_absorbs_external_appends() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("attestations.jsonl");
+        let mut ledger = AttestationLedger::open(&path).unwrap();
+        assert_eq!(ledger.append(serde_json::json!({"n": 1})).unwrap().seq, 1);
+        // A one-shot CLI append lands between two cached appends.
+        append_attestation(&path, serde_json::json!({"n": 2})).unwrap();
+        assert_eq!(ledger.append(serde_json::json!({"n": 3})).unwrap().seq, 3);
+        let records = ledger.records().unwrap();
+        assert_eq!(
+            records.iter().map(|record| record.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        let report = verify_attestations(&path).unwrap();
+        assert!(report.ok);
+        assert_eq!(report.records, 3);
+    }
+
+    #[test]
+    fn attestation_ledger_repairs_torn_suffix_and_rejects_tampered_suffix() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("attestations.jsonl");
+        let mut ledger = AttestationLedger::open(&path).unwrap();
+        ledger.append(serde_json::json!({"n": 1})).unwrap();
+
+        // Torn external append: repaired, not fatal.
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"observed_at\":")
+            .unwrap();
+        assert_eq!(ledger.append(serde_json::json!({"n": 2})).unwrap().seq, 2);
+        assert_eq!(verify_attestations(&path).unwrap().records, 2);
+
+        // Tampered external append: the cached handle refuses to extend it.
+        append_attestation(&path, serde_json::json!({"n": 3})).unwrap();
+        let mut bytes = std::fs::read(&path).unwrap();
+        let target = bytes.len() - 40;
+        bytes[target] ^= 0x01;
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(matches!(
+            ledger.append(serde_json::json!({"n": 4})),
+            Err(WitnessError::Corrupt(_))
+        ));
     }
 
     #[test]

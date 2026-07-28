@@ -806,7 +806,7 @@ pub(super) fn renderable_pool_return_rows(
     plan: &crate::recovery::RecoveryPlan,
     config: &Config,
     executor: &Executor,
-    attestation_path: &Path,
+    attestations: &mut SharedAttestations,
 ) -> BTreeSet<Uuid> {
     let mut selected = BTreeSet::new();
     for action in &plan.actions {
@@ -829,7 +829,7 @@ pub(super) fn renderable_pool_return_rows(
             );
             continue;
         }
-        match recovery_adapter_invocation(config, action, row, executor, attestation_path) {
+        match recovery_adapter_invocation(config, action, row, executor, attestations) {
             Ok(_) => {
                 selected.insert(row.uuid);
             }

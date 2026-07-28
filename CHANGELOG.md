@@ -54,6 +54,16 @@ authorized.
 
 ### Changed
 
+- Made witness, attestation, and change-log appends O(1) in steady state. The witness and
+  attestation ledgers cache their verified head and byte offset, verifying only bytes other
+  writers appended since instead of rescanning the whole chain on every append; prefix tampering
+  is now detected at startup, view rebuilds, and explicit verification rather than on every
+  operation, while post-open suffix tampering is still caught at the next append or read. The
+  change log keeps its in-memory window at exactly the retention limit but lets the durable file
+  grow to at most twice that before one amortized rewrite drops it back, so at least the newest
+  4096 changes remain durably available. Daemon startup now opens one shared attestation handle
+  instead of re-verifying the chain for every hydration helper and recovery row.
+
 - Derived job-originated enqueue identity from the daemon-minted capability token rather than from
   the client-supplied `callerJobId`, which is now accepted only when it names the same identity.
   The depth, fan-out, `noEnqueue`, and ancestry guardrails are consequently enforced rather than

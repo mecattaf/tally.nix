@@ -167,15 +167,15 @@ impl DaemonHandler {
         }
         let handler = self.clone();
         let task = tokio::task::spawn_local(async move {
-            let (adapters, attestation_path, state_dir, pools) = {
+            let (adapters, state_dir, pools) = {
                 let context = handler.context.read().await;
                 (
                     context.config.adapters.clone(),
-                    context.paths.attestations_path(),
                     context.paths.state_dir.clone(),
                     context.config.pools.clone(),
                 )
             };
+            let attestations = Arc::clone(&handler.attestations);
             let scrape_configured = adapters
                 .get(&job.row.adapter)
                 .is_some_and(|adapter| !adapter.scrape.is_empty());
@@ -198,21 +198,24 @@ impl DaemonHandler {
                 let attestation_error = if captures.captures.is_empty() {
                     None
                 } else {
-                    append_attestation(
-                        &attestation_path,
-                        json!({
-                            "kind": "adapter-scrape",
-                            "taskUuid": stable_key,
-                            "jobId": job_id,
-                            "adapter": adapter,
-                            "attempt": attempt,
-                            "leaseEpoch": lease_epoch,
-                            "captures": captures.captures.clone(),
-                            "usageAuthority": "advisory-only",
-                        }),
-                    )
-                    .err()
-                    .map(|error| error.to_string())
+                    attestations
+                        .lock()
+                        .expect("attestation ledger lock poisoned")
+                        .ledger()
+                        .and_then(|ledger| {
+                            ledger.append(json!({
+                                "kind": "adapter-scrape",
+                                "taskUuid": stable_key,
+                                "jobId": job_id,
+                                "adapter": adapter,
+                                "attempt": attempt,
+                                "leaseEpoch": lease_epoch,
+                                "captures": captures.captures.clone(),
+                                "usageAuthority": "advisory-only",
+                            }))
+                        })
+                        .err()
+                        .map(|error| error.to_string())
                 };
                 let meter_errors = feed_scraped_usage(&state_dir, &pools, &leased_pools, &captures);
                 Ok::<_, String>((captures, attestation_error, meter_errors))

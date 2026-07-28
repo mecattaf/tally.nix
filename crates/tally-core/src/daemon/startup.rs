@@ -126,16 +126,13 @@ impl Daemon {
         };
         let mut startup_policy = settings.recovery_policy;
         startup_policy.retry.auto_pool_return = true;
-        if let Err(error) = repair_attestation_tail(&paths.attestations_path()) {
-            eprintln!("tally: advisory attestation tail could not be repaired: {error}");
+        let mut attestations = SharedAttestations::new(paths.attestations_path());
+        if let Err(error) = attestations.ledger() {
+            eprintln!("tally: advisory attestation ledger could not be opened: {error}");
         }
         let triggered_plan = recover(&facts, startup_policy)?;
-        let selected = renderable_pool_return_rows(
-            &triggered_plan,
-            &config,
-            &executor,
-            &paths.attestations_path(),
-        );
+        let selected =
+            renderable_pool_return_rows(&triggered_plan, &config, &executor, &mut attestations);
         let mut facts_without_pool_returns = facts.clone();
         facts_without_pool_returns
             .triggers
@@ -148,21 +145,11 @@ impl Daemon {
             facts.durable.witness(),
             &config,
             &executor,
-            &paths.attestations_path(),
+            &mut attestations,
         );
-        hydrate_completed_adapter_metadata(
-            &mut plan,
-            &config,
-            &executor,
-            &paths.attestations_path(),
-        );
-        hydrate_adopted_adapter_metadata(&mut plan, &paths.attestations_path())?;
-        hydrate_represent_adapter_metadata(
-            &mut plan,
-            &config,
-            &executor,
-            &paths.attestations_path(),
-        )?;
+        hydrate_completed_adapter_metadata(&mut plan, &config, &executor, &mut attestations);
+        hydrate_adopted_adapter_metadata(&mut plan, &mut attestations)?;
+        hydrate_represent_adapter_metadata(&mut plan, &config, &executor, &mut attestations)?;
 
         let mut db = TaskDb::open(&paths.data_dir).await?;
         db.rebuild_from_recovery_plan(&plan).await?;
@@ -195,7 +182,16 @@ impl Daemon {
             adapter_metadata,
         });
         Self::build_locked(
-            config, paths, settings, executor, host_id, epoch, plan, committer, state_lock,
+            config,
+            paths,
+            settings,
+            executor,
+            host_id,
+            epoch,
+            plan,
+            committer,
+            state_lock,
+            attestations,
         )
     }
 
@@ -212,8 +208,18 @@ impl Daemon {
     ) -> Result<Self, DaemonError> {
         let state_lock = DaemonLockGuard::acquire(&paths.state_dir)?;
         let host_id = current_host_id()?;
+        let attestations = SharedAttestations::new(paths.attestations_path());
         Self::build_locked(
-            config, paths, settings, executor, host_id, epoch, plan, committer, state_lock,
+            config,
+            paths,
+            settings,
+            executor,
+            host_id,
+            epoch,
+            plan,
+            committer,
+            state_lock,
+            attestations,
         )
     }
 
@@ -228,6 +234,7 @@ impl Daemon {
         plan: crate::recovery::RecoveryPlan,
         committer: Box<dyn ReplicaCommitter>,
         state_lock: DaemonLockGuard,
+        mut attestations: SharedAttestations,
     ) -> Result<Self, DaemonError> {
         validate_recovery_briefs(&plan, &paths.data_dir)?;
         let event_log = LeaseEventLog::in_state_dir(&paths.state_dir);
@@ -288,7 +295,8 @@ impl Daemon {
             query_details,
         };
         restore_completed_aliases(&mut context, &completed_witness)?;
-        let initial_jobs = install_recovery_jobs(&mut context, &plan, &executor)?;
+        let initial_jobs =
+            install_recovery_jobs(&mut context, &plan, &executor, &mut attestations)?;
         restore_guardrail_parents(&mut context, &plan)?;
         let job_tokens = restore_job_tokens(&context)?;
 
@@ -358,6 +366,7 @@ impl Daemon {
             brief_root: paths.data_dir.clone(),
             git_ai: config.git_ai.clone(),
             exec_attestations: config.attestations.exec.enable,
+            attestations: Arc::new(std::sync::Mutex::new(attestations)),
         };
         Ok(Self {
             _state_lock: state_lock,
@@ -677,7 +686,7 @@ pub(super) fn hydrate_completed_adapter_metadata(
     plan: &mut crate::recovery::RecoveryPlan,
     config: &Config,
     executor: &Executor,
-    attestation_path: &Path,
+    attestations: &mut SharedAttestations,
 ) {
     let engine = AdapterEngine::new(&config.adapters);
     for recovery in &mut plan.rows {
@@ -688,7 +697,7 @@ pub(super) fn hydrate_completed_adapter_metadata(
             continue;
         }
         match verified_adapter_attestation_captures(
-            attestation_path,
+            attestations,
             recovery.row.uuid,
             &recovery.row.adapter,
             recovery.row.attempt,
@@ -757,7 +766,7 @@ pub(super) fn hydrate_represent_adapter_metadata(
     plan: &mut crate::recovery::RecoveryPlan,
     config: &Config,
     executor: &Executor,
-    attestation_path: &Path,
+    attestations: &mut SharedAttestations,
 ) -> Result<(), DaemonError> {
     let updates = plan
         .actions
@@ -768,7 +777,7 @@ pub(super) fn hydrate_represent_adapter_metadata(
         })
         .map(|(action, row)| {
             let (_, captures) =
-                recovery_adapter_invocation(config, action, row, executor, attestation_path)?;
+                recovery_adapter_invocation(config, action, row, executor, attestations)?;
             let captures = captures.expect("RePresent always returns its resume captures");
             Ok::<_, DaemonError>((
                 row.uuid,
@@ -799,7 +808,7 @@ pub(super) fn hydrate_represent_adapter_metadata(
 
 pub(super) fn hydrate_adopted_adapter_metadata(
     plan: &mut crate::recovery::RecoveryPlan,
-    attestation_path: &Path,
+    attestations: &mut SharedAttestations,
 ) -> Result<(), DaemonError> {
     let targets = plan
         .actions
@@ -825,7 +834,7 @@ pub(super) fn hydrate_adopted_adapter_metadata(
             .find(|recovery| recovery.row.uuid == uuid)
             .ok_or_else(|| DaemonError::Invalid(format!("recovery row {uuid} is absent")))?;
         let captures = match verified_latest_adapter_attestation_before(
-            attestation_path,
+            attestations,
             uuid,
             &recovery.row.adapter,
             current_attempt,
@@ -857,9 +866,9 @@ pub(super) fn reconcile_retained_adapter_attestations(
     witness: &[WitnessRecord],
     config: &Config,
     executor: &Executor,
-    attestation_path: &Path,
+    attestations: &mut SharedAttestations,
 ) {
-    let existing = match adapter_attestation_keys(attestation_path) {
+    let existing = match adapter_attestation_keys(attestations) {
         Ok(existing) => existing,
         Err(error) => {
             eprintln!("tally: retained adapter attestations cannot be reconciled: {error}");
@@ -918,9 +927,8 @@ pub(super) fn reconcile_retained_adapter_attestations(
                 continue;
             }
         };
-        if let Err(error) = append_attestation(
-            attestation_path,
-            json!({
+        if let Err(error) = attestations.ledger().and_then(|ledger| {
+            ledger.append(json!({
                 "kind": "adapter-scrape",
                 "taskUuid": task_uuid.to_string(),
                 "jobId": task_uuid.to_string(),
@@ -930,8 +938,8 @@ pub(super) fn reconcile_retained_adapter_attestations(
                 "captures": captures.captures,
                 "usageAuthority": "advisory-only",
                 "reconciledAfterRestart": true,
-            }),
-        ) {
+            }))
+        }) {
             eprintln!(
                 "tally: retained adapter attestation for {task_uuid} could not be appended: {error}"
             );
@@ -940,34 +948,10 @@ pub(super) fn reconcile_retained_adapter_attestations(
 }
 
 pub(super) fn adapter_attestation_keys(
-    path: &Path,
+    attestations: &mut SharedAttestations,
 ) -> Result<BTreeSet<(String, u32, u64)>, DaemonError> {
-    let report = verify_attestations(path)?;
-    if !report.ok {
-        return Err(DaemonError::Invalid(format!(
-            "attestation chain is invalid: {}",
-            report
-                .problem
-                .as_deref()
-                .unwrap_or("unknown verification failure")
-        )));
-    }
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
-        Err(source) => return Err(io_error(path, source)),
-    };
     let mut keys = BTreeSet::new();
-    for (index, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record: AttestationRecord = serde_json::from_str(line).map_err(|error| {
-            DaemonError::Invalid(format!(
-                "attestation line {} cannot be decoded: {error}",
-                index + 1
-            ))
-        })?;
+    for record in attestations.ledger()?.records()? {
         if record.payload.get("kind").and_then(Value::as_str) != Some("adapter-scrape") {
             continue;
         }
@@ -987,39 +971,15 @@ pub(super) fn adapter_attestation_keys(
 }
 
 pub(super) fn verified_adapter_attestation_captures(
-    path: &Path,
+    attestations: &mut SharedAttestations,
     task_uuid: Uuid,
     adapter: &str,
     attempt: u32,
     lease_epoch: u64,
 ) -> Result<Option<ScrapeResult>, DaemonError> {
-    let report = verify_attestations(path)?;
-    if !report.ok {
-        return Err(DaemonError::Invalid(format!(
-            "attestation chain is invalid: {}",
-            report
-                .problem
-                .as_deref()
-                .unwrap_or("unknown verification failure")
-        )));
-    }
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(io_error(path, source)),
-    };
     let task_uuid = task_uuid.to_string();
     let mut selected = None;
-    for (index, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record: AttestationRecord = serde_json::from_str(line).map_err(|error| {
-            DaemonError::Invalid(format!(
-                "attestation line {} cannot be decoded: {error}",
-                index + 1
-            ))
-        })?;
+    for record in attestations.ledger()?.records()? {
         let payload = &record.payload;
         if payload.get("kind").and_then(Value::as_str) != Some("adapter-scrape")
             || payload.get("taskUuid").and_then(Value::as_str) != Some(task_uuid.as_str())
@@ -1050,38 +1010,14 @@ pub(super) fn verified_adapter_attestation_captures(
 }
 
 pub(super) fn verified_latest_adapter_attestation_before(
-    path: &Path,
+    attestations: &mut SharedAttestations,
     task_uuid: Uuid,
     adapter: &str,
     before_attempt: u32,
 ) -> Result<Option<ScrapeResult>, DaemonError> {
-    let report = verify_attestations(path)?;
-    if !report.ok {
-        return Err(DaemonError::Invalid(format!(
-            "attestation chain is invalid: {}",
-            report
-                .problem
-                .as_deref()
-                .unwrap_or("unknown verification failure")
-        )));
-    }
-    let contents = match std::fs::read_to_string(path) {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => return Err(io_error(path, source)),
-    };
     let task_uuid = task_uuid.to_string();
     let mut selected = None;
-    for (index, line) in contents.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record: AttestationRecord = serde_json::from_str(line).map_err(|error| {
-            DaemonError::Invalid(format!(
-                "attestation line {} cannot be decoded: {error}",
-                index + 1
-            ))
-        })?;
+    for record in attestations.ledger()?.records()? {
         let payload = &record.payload;
         let Some(attempt) = payload
             .get("attempt")
@@ -1138,15 +1074,19 @@ pub(super) fn recovered_model_is_advisory(
 }
 
 pub(super) fn ensure_verified_resume_attestation(
-    path: &Path,
+    attestations: &mut SharedAttestations,
     row: &RowSeed,
     attempt: u32,
     lease_epoch: u64,
     captures: &ScrapeResult,
 ) -> Result<(), DaemonError> {
-    if let Some(stored) =
-        verified_adapter_attestation_captures(path, row.uuid, &row.adapter, attempt, lease_epoch)?
-    {
+    if let Some(stored) = verified_adapter_attestation_captures(
+        attestations,
+        row.uuid,
+        &row.adapter,
+        attempt,
+        lease_epoch,
+    )? {
         if stored != *captures {
             return Err(DaemonError::Invalid(format!(
                 "verified adapter scrape attestation for {} attempt {} disagrees with retained capture",
@@ -1155,28 +1095,30 @@ pub(super) fn ensure_verified_resume_attestation(
         }
         return Ok(());
     }
-    append_attestation(
-        path,
-        json!({
-            "kind": "adapter-scrape",
-            "taskUuid": row.uuid.to_string(),
-            "jobId": row.uuid.to_string(),
-            "adapter": row.adapter,
-            "attempt": attempt,
-            "leaseEpoch": lease_epoch,
-            "captures": captures.captures,
-            "usageAuthority": "advisory-only",
-            "recoveryCheckpoint": true,
-        }),
-    )?;
-    let stored =
-        verified_adapter_attestation_captures(path, row.uuid, &row.adapter, attempt, lease_epoch)?
-            .ok_or_else(|| {
-                DaemonError::Invalid(format!(
-                    "adapter scrape attestation for {} attempt {} was not durable after append",
-                    row.uuid, attempt
-                ))
-            })?;
+    attestations.ledger()?.append(json!({
+        "kind": "adapter-scrape",
+        "taskUuid": row.uuid.to_string(),
+        "jobId": row.uuid.to_string(),
+        "adapter": row.adapter,
+        "attempt": attempt,
+        "leaseEpoch": lease_epoch,
+        "captures": captures.captures,
+        "usageAuthority": "advisory-only",
+        "recoveryCheckpoint": true,
+    }))?;
+    let stored = verified_adapter_attestation_captures(
+        attestations,
+        row.uuid,
+        &row.adapter,
+        attempt,
+        lease_epoch,
+    )?
+    .ok_or_else(|| {
+        DaemonError::Invalid(format!(
+            "adapter scrape attestation for {} attempt {} was not durable after append",
+            row.uuid, attempt
+        ))
+    })?;
     if stored != *captures {
         return Err(DaemonError::Invalid(format!(
             "durable adapter scrape attestation for {} attempt {} changed during append",
@@ -1267,6 +1209,7 @@ pub(super) fn install_recovery_jobs(
     context: &mut Context,
     plan: &crate::recovery::RecoveryPlan,
     executor: &Executor,
+    attestations: &mut SharedAttestations,
 ) -> Result<Vec<Job>, DaemonError> {
     let rows = plan
         .rows
@@ -1315,7 +1258,7 @@ pub(super) fn install_recovery_jobs(
             action,
             &recovery_row.row,
             executor,
-            &context.paths.attestations_path(),
+            attestations,
         )?;
         if adapter_invocations.insert(task_uuid, rendered).is_some() {
             return Err(DaemonError::Invalid(format!(
@@ -1538,7 +1481,7 @@ pub(super) fn recovery_adapter_invocation(
     action: &RecoveryAction,
     row: &RowSeed,
     executor: &Executor,
-    attestation_path: &Path,
+    attestations: &mut SharedAttestations,
 ) -> Result<(AdapterInvocation, Option<ScrapeResult>), DaemonError> {
     let engine = AdapterEngine::new(&config.adapters);
     match action {
@@ -1547,13 +1490,12 @@ pub(super) fn recovery_adapter_invocation(
             previous_lease_epoch,
             ..
         } => {
-            repair_attestation_tail(attestation_path)?;
             let identity = ExecutionIdentity {
                 job_id: row.uuid,
                 task_uuid: Some(row.uuid),
             };
             let checkpoint = verified_adapter_attestation_captures(
-                attestation_path,
+                attestations,
                 row.uuid,
                 &row.adapter,
                 *previous_attempt,
@@ -1571,7 +1513,7 @@ pub(super) fn recovery_adapter_invocation(
                         let captures =
                             engine.scrape_paths(&row.adapter, &executor.paths(&identity))?;
                         ensure_verified_resume_attestation(
-                            attestation_path,
+                            attestations,
                             row,
                             *previous_attempt,
                             *previous_lease_epoch,
