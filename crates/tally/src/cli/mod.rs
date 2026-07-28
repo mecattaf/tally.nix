@@ -244,6 +244,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
         }
         Some(Command::Producer { command }) => run_producer(opts.config, command),
         Some(Command::Witness { command }) => run_witness(command),
+        Some(Command::History { command }) => run_history(command),
         Some(Command::View { command }) => run_view(command).await,
         Some(Command::Attest { command }) => run_attest(command),
         Some(Command::Lease { command }) => {
@@ -591,6 +592,23 @@ async fn run_producer_dispatch(
     let result = dispatched?;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
+}
+
+fn run_history(command: HistoryCommand) -> Result<()> {
+    match command {
+        HistoryCommand::Compact(args) => {
+            let state_dir = args.state_dir.map_or_else(default_state_dir, Ok)?;
+            let data_dir = args.data_dir.map_or_else(default_data_dir, Ok)?;
+            let outcome = tally_core::history::compact_lifecycle(
+                &state_dir,
+                &data_dir,
+                args.keep_days,
+                chrono::Utc::now(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
+            Ok(())
+        }
+    }
 }
 
 fn run_witness(command: WitnessCommand) -> Result<()> {

@@ -14,7 +14,7 @@ pub const LIFECYCLE_FILE: &str = "lifecycle.jsonl";
 pub const LIFECYCLE_RETENTION_FILE: &str = "lifecycle-retention.json";
 pub const LIFECYCLE_SCHEMA_VERSION: u32 = 1;
 pub const LIFECYCLE_RETENTION_SCHEMA_VERSION: u32 = 1;
-pub const LIFECYCLE_RETENTION_POLICY: &str = "unbounded";
+pub const LIFECYCLE_RETENTION_POLICY: &str = "unbounded-until-compacted";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -183,9 +183,25 @@ impl LifecycleStore {
         let (records, repaired_boundary) = scan?;
         unlock?;
 
+        if records.first().is_some_and(|record| record.sequence > 1)
+            && retention.truncation_boundary.is_none()
+        {
+            return Err(HistoryError::Invalid(
+                "lifecycle history starts past sequence 1 without a recorded truncation boundary"
+                    .to_owned(),
+            ));
+        }
         if let Some(boundary) = repaired_boundary {
             retention.complete = false;
-            retention.truncation_boundary = Some(boundary);
+            // Cursors are fixed-width, so string max never regresses a
+            // compaction boundary when a torn tail is repaired on an
+            // otherwise-empty suffix.
+            retention.truncation_boundary = Some(
+                retention
+                    .truncation_boundary
+                    .take()
+                    .map_or(boundary.clone(), |existing| existing.max(boundary)),
+            );
             retention.reason = Some("incomplete-tail-repaired-after-interrupted-append".to_owned());
             write_retention_state(&retention_path, &retention)?;
         } else if !retention_path.exists() {
@@ -218,7 +234,7 @@ impl LifecycleStore {
         realtime_us: u64,
     ) -> Result<LifecycleRecord, HistoryError> {
         validate_fields(&fields).map_err(|error| HistoryError::Invalid(error.to_string()))?;
-        let sequence = self.records.len() as u64 + 1;
+        let sequence = self.next_sequence()?;
         let record = LifecycleRecord::new(sequence, realtime_us, fields);
         record.validate(sequence)?;
         let mut line = serde_json::to_vec(&record)?;
@@ -245,6 +261,16 @@ impl LifecycleStore {
         }
     }
 
+    fn next_sequence(&self) -> Result<u64, HistoryError> {
+        if let Some(last) = self.records.last() {
+            return Ok(last.sequence + 1);
+        }
+        match &self.retention.truncation_boundary {
+            Some(boundary) => parse_lifecycle_cursor(boundary).map(|sequence| sequence + 1),
+            None => Ok(1),
+        }
+    }
+
     pub fn snapshot(&self) -> LifecycleSnapshot {
         LifecycleSnapshot {
             records: self.records.clone(),
@@ -266,6 +292,130 @@ impl LifecycleStore {
     pub fn retention_path(&self) -> &Path {
         &self.retention_path
     }
+}
+
+fn parse_lifecycle_cursor(cursor: &str) -> Result<u64, HistoryError> {
+    cursor
+        .strip_prefix("lifecycle:")
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| {
+            HistoryError::Invalid(format!("invalid lifecycle truncation boundary {cursor:?}"))
+        })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleCompaction {
+    pub examined: usize,
+    pub dropped: usize,
+    pub kept: usize,
+    pub truncation_boundary: Option<String>,
+}
+
+/// Offline lifecycle compaction sanctioned by the retention rulings: drop the
+/// contiguous prefix older than `keep_days`, recording the cut in the durable
+/// retention metadata (complete=false, truncation boundary, reason). Durable
+/// enqueue events are recovery inputs and are never touched. Refuses to run
+/// while a daemon owns the state directory.
+pub fn compact_lifecycle(
+    state_dir: &Path,
+    data_dir: &Path,
+    keep_days: u32,
+    now: DateTime<Utc>,
+) -> Result<LifecycleCompaction, HistoryError> {
+    std::fs::create_dir_all(state_dir).map_err(|source| io_error(state_dir, source))?;
+    let lock_path = state_dir.join("daemon.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|source| io_error(&lock_path, source))?;
+    lock.try_lock_exclusive().map_err(|source| {
+        if source.kind() == std::io::ErrorKind::WouldBlock {
+            HistoryError::Invalid(format!(
+                "a running daemon owns {}; stop it before compacting",
+                lock_path.display()
+            ))
+        } else {
+            io_error(&lock_path, source)
+        }
+    })?;
+
+    let mut store = LifecycleStore::open(data_dir)?;
+    let cutoff = now - chrono::Duration::days(i64::from(keep_days));
+    let cutoff_us = u64::try_from(cutoff.timestamp_micros()).unwrap_or(0);
+    let examined = store.records.len();
+    // Keep a contiguous suffix: cut before the first record inside the window
+    // so sequences stay gap-free even if timestamps are not monotonic.
+    let keep_from = store
+        .records
+        .iter()
+        .position(|record| record.realtime_us >= cutoff_us)
+        .unwrap_or(examined);
+    if keep_from == 0 {
+        let unlock = FileExt::unlock(&lock);
+        unlock.map_err(|source| io_error(&lock_path, source))?;
+        return Ok(LifecycleCompaction {
+            examined,
+            dropped: 0,
+            kept: examined,
+            truncation_boundary: store.retention.truncation_boundary.clone(),
+        });
+    }
+    let kept_records = store.records.split_off(keep_from);
+    let boundary = lifecycle_cursor(kept_records.first().map_or_else(
+        || {
+            store
+                .records
+                .last()
+                .expect("dropped prefix is nonempty")
+                .sequence
+        },
+        |record| record.sequence - 1,
+    ));
+
+    let temporary = store
+        .path
+        .with_extension(format!("jsonl.tmp-{}", std::process::id()));
+    let result = (|| -> Result<(), HistoryError> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temporary)
+            .map_err(|source| io_error(&temporary, source))?;
+        for record in &kept_records {
+            serde_json::to_writer(&mut file, record)?;
+            file.write_all(b"\n")
+                .map_err(|source| io_error(&temporary, source))?;
+        }
+        file.sync_all()
+            .map_err(|source| io_error(&temporary, source))?;
+        std::fs::rename(&temporary, &store.path).map_err(|source| io_error(&store.path, source))?;
+        File::open(data_dir)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| io_error(data_dir, source))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result?;
+
+    store.retention.complete = false;
+    store.retention.truncation_boundary = Some(boundary.clone());
+    store.retention.reason = Some(format!("compacted-keep-days-{keep_days}"));
+    write_retention_state(&store.retention_path, &store.retention)?;
+    FileExt::unlock(&lock).map_err(|source| io_error(&lock_path, source))?;
+    Ok(LifecycleCompaction {
+        examined,
+        dropped: keep_from,
+        kept: kept_records.len(),
+        truncation_boundary: Some(boundary),
+    })
 }
 
 fn ensure_private(path: &Path) -> Result<(), HistoryError> {
@@ -305,7 +455,8 @@ fn scan_and_repair(
         bytes.truncate(complete_len);
     }
 
-    let mut records = Vec::new();
+    let mut records: Vec<LifecycleRecord> = Vec::new();
+    let mut base = 1_u64;
     for (index, line) in BufReader::new(bytes.as_slice()).lines().enumerate() {
         let line = line.map_err(|source| io_error(path, source))?;
         if line.trim().is_empty() {
@@ -315,7 +466,13 @@ fn scan_and_repair(
             )));
         }
         let record: LifecycleRecord = serde_json::from_str(&line)?;
-        record.validate(index as u64 + 1)?;
+        if index == 0 {
+            // A compacted history legitimately starts past sequence 1; the
+            // caller checks that a truncation boundary vouches for the
+            // missing prefix.
+            base = record.sequence;
+        }
+        record.validate(base + index as u64)?;
         records.push(record);
     }
     file.seek(SeekFrom::End(0))
@@ -497,6 +654,149 @@ mod tests {
             );
             prop_assert_eq!(std::fs::read(&path).unwrap(), valid_prefix);
         }
+    }
+
+    #[test]
+    fn compaction_drops_the_old_prefix_and_records_an_explicit_boundary() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let data_dir = temp.path().join("data");
+        let base_us = 1_700_000_000_000_000_u64;
+        let day_us = 86_400_000_000_u64;
+        {
+            let mut store = LifecycleStore::open(&data_dir).unwrap();
+            for index in 0..10_u64 {
+                store
+                    .append_at(fields(&format!("task-{index}")), base_us + index * day_us)
+                    .unwrap();
+            }
+        }
+        // Keep the newest 3 days relative to just after the last record.
+        let now =
+            DateTime::<Utc>::from_timestamp_micros((base_us + 9 * day_us + 1) as i64).unwrap();
+        let outcome = compact_lifecycle(&state_dir, &data_dir, 3, now).unwrap();
+        assert_eq!(outcome.examined, 10);
+        assert_eq!(outcome.dropped, 7);
+        assert_eq!(outcome.kept, 3);
+        assert_eq!(
+            outcome.truncation_boundary.as_deref(),
+            Some("lifecycle:00000000000000000007")
+        );
+
+        let reopened = LifecycleStore::open(&data_dir).unwrap();
+        let snapshot = reopened.snapshot();
+        assert_eq!(
+            snapshot
+                .records
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            vec![8, 9, 10]
+        );
+        assert!(!snapshot.retention.complete);
+        assert_eq!(snapshot.retention.policy, LIFECYCLE_RETENTION_POLICY);
+        assert_eq!(
+            snapshot.retention.truncation_boundary.as_deref(),
+            Some("lifecycle:00000000000000000007")
+        );
+        assert_eq!(
+            snapshot.retention.reason.as_deref(),
+            Some("compacted-keep-days-3")
+        );
+
+        // Appends continue the original sequence.
+        let mut appending = LifecycleStore::open(&data_dir).unwrap();
+        let appended = appending
+            .append_at(fields("after-compaction"), base_us + 10 * day_us)
+            .unwrap();
+        assert_eq!(appended.sequence, 11);
+    }
+
+    #[test]
+    fn compaction_to_empty_history_preserves_the_sequence_high_water() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let data_dir = temp.path().join("data");
+        let base_us = 1_700_000_000_000_000_u64;
+        {
+            let mut store = LifecycleStore::open(&data_dir).unwrap();
+            for index in 0..4_u64 {
+                store
+                    .append_at(fields(&format!("task-{index}")), base_us + index)
+                    .unwrap();
+            }
+        }
+        let now = DateTime::<Utc>::from_timestamp_micros((base_us + 100) as i64).unwrap()
+            + chrono::Duration::days(30);
+        let outcome = compact_lifecycle(&state_dir, &data_dir, 1, now).unwrap();
+        assert_eq!(outcome.dropped, 4);
+        assert_eq!(outcome.kept, 0);
+        let mut reopened = LifecycleStore::open(&data_dir).unwrap();
+        assert!(reopened.snapshot().records.is_empty());
+        let appended = reopened
+            .append_at(fields("resumes"), base_us + 200)
+            .unwrap();
+        assert_eq!(appended.sequence, 5);
+    }
+
+    #[test]
+    fn compaction_is_a_no_op_inside_the_window_and_refuses_a_running_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let data_dir = temp.path().join("data");
+        let now_us = u64::try_from(Utc::now().timestamp_micros()).unwrap();
+        {
+            let mut store = LifecycleStore::open(&data_dir).unwrap();
+            store.append_at(fields("fresh"), now_us).unwrap();
+        }
+        let outcome = compact_lifecycle(&state_dir, &data_dir, 7, Utc::now()).unwrap();
+        assert_eq!(outcome.dropped, 0);
+        assert_eq!(outcome.kept, 1);
+        assert!(
+            LifecycleStore::open(&data_dir)
+                .unwrap()
+                .snapshot()
+                .retention
+                .complete
+        );
+
+        // A held daemon lock refuses compaction.
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(state_dir.join("daemon.lock"))
+            .unwrap();
+        fs2::FileExt::lock_exclusive(&lock).unwrap();
+        let refused = compact_lifecycle(&state_dir, &data_dir, 7, Utc::now());
+        assert!(matches!(refused, Err(HistoryError::Invalid(_))));
+    }
+
+    #[test]
+    fn missing_prefix_without_boundary_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().to_owned();
+        let path;
+        {
+            let mut store = LifecycleStore::open(&data_dir).unwrap();
+            for index in 0..3_u64 {
+                store
+                    .append_at(
+                        fields(&format!("task-{index}")),
+                        1_700_000_000_000_000 + index,
+                    )
+                    .unwrap();
+            }
+            path = store.path().to_owned();
+        }
+        // Strip the first line without recording a truncation boundary.
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let remainder = contents.split_once('\n').unwrap().1.to_owned();
+        std::fs::write(&path, remainder).unwrap();
+        std::fs::remove_file(temp.path().join(LIFECYCLE_RETENTION_FILE)).unwrap();
+        assert!(LifecycleStore::open(&data_dir).is_err());
     }
 
     #[test]

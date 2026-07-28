@@ -296,8 +296,8 @@ impl Daemon {
             barriers: BarrierTracker::with_namespace(epoch),
             rows,
             guardrail_depths,
-            query_rows,
-            query_details,
+            query_rows: query_rows.into(),
+            query_details: query_details.into(),
         };
         restore_completed_aliases(&mut context, &completed_witness)?;
         let initial_jobs =
