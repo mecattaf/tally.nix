@@ -214,8 +214,9 @@ pass whose artifact or store-path evidence drifted creates fresh work and report
 
 Legacy mode is selected by omitting `submission`. It performs only pass-witness reuse, disables
 live attachment and conflict detection, and skips dedup reuse entirely when a gate manifest is
-present. The public `tally enqueue` CLI currently always uses this legacy mode; only the flow
-runner and direct RPC clients select full mode.
+present. The public `tally enqueue` CLI selects full mode by default when `--dedup-key` is
+present; `--submission legacy` preserves the omission. Keyless CLI enqueues omit `submission`
+regardless of the flag, while the flow runner always selects full mode.
 
 ### Enqueue results
 

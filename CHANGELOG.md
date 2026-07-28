@@ -21,6 +21,8 @@ authorized.
 
 ### Changed
 
+- Made `tally enqueue --dedup-key` use full submission semantics by default, with
+  `--submission legacy` as the compatibility escape hatch.
 - Standardized pull-request merge evidence on the canonical worker-run local ladder transcript in
   the single-operator phase.
 - Required each behavior-affecting pull request to update `[Unreleased]` unless it carries the

@@ -251,6 +251,28 @@ impl RpcHandler for ContinueGuardrailHandler {
     }
 }
 
+#[derive(Clone, Default)]
+struct SubmissionCaptureHandler {
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+impl RpcHandler for SubmissionCaptureHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        Box::pin(async move {
+            assert_eq!(request.method, "queue.enqueue");
+            self.requests.lock().unwrap().push(request.params.unwrap());
+            Ok(serde_json::json!({
+                "task_uuid": "00000000-0000-4000-8000-000000000141",
+                "job_id": "00000000-0000-4000-8000-000000000141",
+                "state": "queued"
+            }))
+        })
+    }
+}
+
 async fn run_tally(socket: &Path, args: &[&str]) -> std::process::Output {
     run_tally_with_job_id(socket, args, None).await
 }
@@ -382,6 +404,110 @@ async fn cli_forwards_opaque_evidence_metadata() {
             server.await.unwrap();
         })
         .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn cli_submission_flag_preserves_legacy_wire_bytes_and_omits_keyless_mode() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let handler = SubmissionCaptureHandler::default();
+    let requests = handler.requests.clone();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                for _ in 0..4 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(stream, handler.clone()).await.unwrap();
+                }
+            });
+
+            let default_full = run_tally(
+                &socket,
+                &[
+                    "enqueue",
+                    "--pool",
+                    "slot",
+                    "--dedup-key",
+                    "review:42",
+                    "--",
+                    "true",
+                ],
+            )
+            .await;
+            assert_eq!(default_full.status.code(), Some(0));
+
+            let explicit_full = run_tally(
+                &socket,
+                &[
+                    "enqueue",
+                    "--pool",
+                    "slot",
+                    "--dedup-key",
+                    "review:42",
+                    "--submission",
+                    "full",
+                    "--",
+                    "true",
+                ],
+            )
+            .await;
+            assert_eq!(explicit_full.status.code(), Some(0));
+
+            let legacy = run_tally(
+                &socket,
+                &[
+                    "enqueue",
+                    "--pool",
+                    "slot",
+                    "--dedup-key",
+                    "review:42",
+                    "--submission",
+                    "legacy",
+                    "--",
+                    "true",
+                ],
+            )
+            .await;
+            assert_eq!(legacy.status.code(), Some(0));
+
+            let keyless = run_tally(
+                &socket,
+                &[
+                    "enqueue",
+                    "--pool",
+                    "slot",
+                    "--submission",
+                    "full",
+                    "--",
+                    "true",
+                ],
+            )
+            .await;
+            assert_eq!(keyless.status.code(), Some(0));
+            server.await.unwrap();
+        })
+        .await;
+
+    let requests = requests.lock().unwrap();
+    assert_eq!(
+        requests[0]["submission"],
+        serde_json::json!({"mode": "full"})
+    );
+    assert_eq!(requests[0], requests[1]);
+
+    let mut full_without_submission = requests[0].clone();
+    full_without_submission
+        .as_object_mut()
+        .unwrap()
+        .shift_remove("submission");
+    assert_eq!(
+        serde_json::to_vec(&full_without_submission).unwrap(),
+        serde_json::to_vec(&requests[2]).unwrap(),
+        "legacy mode must reproduce the pre-flag enqueue params byte-for-byte"
+    );
+    assert!(!requests[3].as_object().unwrap().contains_key("submission"));
 }
 
 #[tokio::test(flavor = "current_thread")]

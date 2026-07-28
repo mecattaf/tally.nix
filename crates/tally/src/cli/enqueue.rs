@@ -79,6 +79,12 @@ pub(super) async fn run_enqueue(
         model: args.model,
         effort: args.effort,
     };
+    let submission = match (args.dedup_key.as_ref(), args.submission) {
+        (Some(_), CliSubmissionMode::Full) => Some(SubmissionOptions {
+            mode: SubmissionMode::Full,
+        }),
+        _ => None,
+    };
     let payload = EnqueuePayload {
         invocation: args.invocation,
         argv: has_argv.then_some(args.argv),
@@ -95,7 +101,7 @@ pub(super) async fn run_enqueue(
         resume_from: None,
         source: Some(args.source.into()),
         dedup_key: args.dedup_key,
-        submission: None,
+        submission,
         orchestration: args.orchestration,
         parent: args.parent,
         evidence: args.evidence,

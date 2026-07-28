@@ -104,6 +104,7 @@ does not invoke a shell.
 | `--brief JSON` / `--brief-path PATH` | Mutually exclusive structured brief sources. |
 | `--source SOURCE` | `manual` by default; also `orchestrator`, `calendar`, `events-dir`, `gh`, `build-effect`, `pool-reachability`. |
 | `--dedup-key KEY` | Deduplication key. |
+| `--submission MODE` | `full` or `legacy`; defaults to `full` when a dedup key is present. |
 | `--orchestration JSON` | Opaque flow provenance capsule. |
 | `--parent UUID` | Durable parent task identity. |
 | `--evidence SPEC` | Repeatable canonical evidence specification. |
@@ -128,21 +129,22 @@ gate list.
 The exact RPC request fields, canonical payload hash, and result shapes are in
 [the enqueue protocol](../reference/rpc-protocol.md#enqueueparams).
 
-### Legacy submission warning
+### Submission mode
 
-The public enqueue command has no submission-mode flag. It always omits the RPC `submission`
-object and therefore selects **legacy mode**, even when `--dedup-key` is present. Legacy mode
-does pass-witness reuse only; it does not attach identical live submissions or reject a live
-same-key/different-payload collision.
+With `--dedup-key`, the public enqueue command defaults to **full mode**. Identical live
+submissions attach to the existing task, while the same key with a different canonical payload
+fails with `dedup-key-conflict`. Pass-witness reuse and the other full-mode dispositions follow
+the enqueue protocol.
 
-The flow runner uses full mode. A foreign client that needs the full disposition table sends
-`"submission":{"mode":"full"}` directly over RPC. The CLI's absence of that switch is a real,
-current limitation, not an implied default.
+`--submission legacy` is the compatibility escape hatch. It omits the RPC `submission` object
+and retains pass-witness reuse without live attachment or live conflict detection. Without
+`--dedup-key`, the CLI omits `submission` regardless of the selected mode, so keyless enqueue
+requests are unchanged.
 
 `--wait` does not make enqueue one blocking RPC. The CLI first admits, then calls
 `queue.await_job` using the returned `task_uuid`. If a daemon restart interrupts that await, the
 CLI reconnects with backoff and reissues only the idempotent await for up to 60 seconds by
-default (or the selected RPC timeout). The legacy enqueue RPC is never retried.
+default (or the selected RPC timeout). The enqueue RPC itself is never retried.
 
 ## Queue control
 
