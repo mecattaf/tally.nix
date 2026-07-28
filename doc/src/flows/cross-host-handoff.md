@@ -97,8 +97,8 @@ services.tally = {
 
 This registration stanza is provided by the Home Manager module. With the
 default `onCalendar = null` it is checked but not scheduled. The NixOS module
-checks a flow declaration but does not currently render its calendar producer or
-automatic pools.
+rejects flow declarations because it does not render their calendar producers
+or automatic pools.
 
 The coordinator always invokes a fixed `tally __remote-executor` command through
 OpenSSH with an empty SSH config, pinned known-hosts file, explicit key, and no

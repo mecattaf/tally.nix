@@ -3,8 +3,8 @@
 tally has artifact garbage collection now, but only for Nix store evidence. It
 does not have a general retention engine.
 
-`store:<path>` evidence and `drv()` records receive Nix GC roots. The
-Home Manager timer drops expired roots and invokes Nix garbage collection.
+`store:<path>` evidence and `drv()` records receive Nix GC roots. The Home
+Manager and NixOS timers drop expired roots and invoke Nix garbage collection.
 Ordinary `artifact:<path>` files, captures, lifecycle observations, enqueue
 events, and the ledgers are outside that mechanism.
 
@@ -42,7 +42,7 @@ root, an unrelated host-wide Nix GC can collect the path.
 
 ## Configure the horizon
 
-The Home Manager module renders the retention service and timer:
+Both the Home Manager and NixOS modules render the retention service and timer:
 
 ```nix
 services.tally.retention = {
@@ -58,11 +58,10 @@ The timer runs this command:
 $ tally gc --horizon 30d --collect
 ```
 
-The three options above exist in the shared module tree, but the shipped NixOS
-system module does **not** render a system retention timer. A system-daemon
-deployment must schedule the same command explicitly, with
-`--data-dir /var/lib/tally/data`, or run it by hand. This is a current module
-asymmetry, not an implied future feature.
+The NixOS service runs the same command with its configured `--data-dir`
+(default `/var/lib/tally/data`) under the dedicated service account. The Home
+Manager service uses its configured XDG data directory. Both timers are enabled
+by default.
 
 The GC command:
 
@@ -101,9 +100,9 @@ the full command would do.
 
 `nix store gc` is host-wide. It can collect any unrooted store object, not just
 objects previously rooted by tally. In particular, the default-on Home Manager
-timer invokes it even when tally has no store-evidence roots. That run may still
-collect unrelated unrooted Nix objects, so “no tally roots” does not mean a
-literal no-op in the shipped implementation.
+and NixOS timers invoke it even when tally has no store-evidence roots. That run
+may still collect unrelated unrooted Nix objects, so “no tally roots” does not
+mean a literal no-op in the shipped implementation.
 
 Account for the host's other roots, run the dry form before shortening the
 horizon, and disable the timer if host-wide daily GC is not acceptable.

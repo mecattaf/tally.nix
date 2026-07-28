@@ -25,6 +25,8 @@ authorized.
   `--submission legacy` as the compatibility escape hatch.
 - Run NixOS system-mode daemon, transient jobs, and witness emission as a dedicated configurable
   unprivileged user and group, migrating existing root-owned state during activation.
+- Run NixOS system-mode drain and retention schedules as system timers, and reject Home
+  Manager-only producers, flows, and usage meters during NixOS evaluation.
 - Standardized pull-request merge evidence on the canonical worker-run local ladder transcript in
   the single-operator phase.
 - Required each behavior-affecting pull request to update `[Unreleased]` unless it carries the

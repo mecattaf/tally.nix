@@ -144,10 +144,10 @@ witness the receiving-side result. See
 
 ## Can the NixOS module schedule flows and producers?
 
-Not in the shipped implementation. The NixOS module renders the system daemon
-and witness emitter. Home Manager additionally renders producers, meters,
-flow calendar units, drain, and retention. Use Home Manager—standalone or
-integrated into NixOS—for those scheduled surfaces.
+Not in the shipped implementation. The NixOS module renders the system daemon,
+witness emitter, drain timer, and retention timer, but rejects producer,
+usage-meter, and flow declarations. Use Home Manager—standalone or integrated
+into NixOS—for those workload-scheduling surfaces.
 
 ## Is a passing witness a permanent artifact archive?
 

@@ -37,6 +37,20 @@ let
     export XDG_RUNTIME_DIR="/run/user/$(${pkgs.coreutils}/bin/id -u)"
     exec ${lib.escapeShellArgs daemonArgv}
   '';
+  unsupportedConfigAssertions = [
+    {
+      assertion = cfg.producers == { };
+      message = "services.tally.producers must be empty in the NixOS module; configure producers with the Home Manager module (tally.homeManagerModules.tally)";
+    }
+    {
+      assertion = cfg.flows == { };
+      message = "services.tally.flows must be empty in the NixOS module; configure flows with the Home Manager module (tally.homeManagerModules.tally)";
+    }
+    {
+      assertion = lib.all (pool: pool.usageMeter == null) (builtins.attrValues cfg.pools);
+      message = "services.tally.pools.<name>.usageMeter must be null in the NixOS module; configure usage meters with the Home Manager module (tally.homeManagerModules.tally)";
+    }
+  ];
 in
 {
   options.services.tally =
@@ -59,7 +73,10 @@ in
     };
 
   config = lib.mkMerge [
-    { services.tally.adapters = common.adapterDefaults; }
+    {
+      services.tally.adapters = common.adapterDefaults;
+      assertions = unsupportedConfigAssertions;
+    }
     (lib.mkIf cfg.enable {
       assertions = common.mkAssertions cfg;
 
@@ -173,6 +190,72 @@ in
           NoNewPrivileges = true;
           ProtectSystem = "strict";
           ReadWritePaths = [ (toString cfg.dataDir) ];
+        };
+      };
+
+      systemd.services.tally-drain = {
+        description = "drain tally producer event files";
+        after = [ "tally-daemon.service" ];
+        unitConfig.ConditionPathExists = configPath;
+        serviceConfig = {
+          Type = "oneshot";
+          User = cfg.user;
+          Group = cfg.group;
+          ExecStart = lib.escapeShellArgs [
+            "${cfg.package}/bin/tally"
+            "--socket"
+            socketPath
+            "daemon"
+            "drain"
+          ];
+          UMask = "0077";
+        };
+      };
+
+      systemd.timers.tally-drain = {
+        description = "periodically drain tally producer event files";
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnActiveSec = "1s";
+          OnUnitActiveSec = "5s";
+          Unit = "tally-drain.service";
+        };
+      };
+
+      systemd.services.tally-retention = lib.mkIf cfg.retention.enable {
+        description = "prune expired tally Nix GC roots and collect the store";
+        after = [ "tally-daemon.service" ];
+        requires = [ "tally-daemon.service" ];
+        serviceConfig = {
+          Type = "oneshot";
+          User = cfg.user;
+          Group = cfg.group;
+          TimeoutStartSec = "infinity";
+          ExecStart = lib.escapeShellArgs [
+            "${cfg.package}/bin/tally"
+            "gc"
+            "--horizon"
+            cfg.retention.horizon
+            "--collect"
+            "--data-dir"
+            (toString cfg.dataDir)
+          ];
+          Environment = [ "PATH=${lib.makeBinPath [ pkgs.nix ]}" ];
+          UMask = "0077";
+          NoNewPrivileges = true;
+          PrivateTmp = true;
+          ProtectSystem = "strict";
+          ReadWritePaths = [ (toString cfg.dataDir) ];
+        };
+      };
+
+      systemd.timers.tally-retention = lib.mkIf cfg.retention.enable {
+        description = "schedule tally store-evidence retention";
+        wantedBy = [ "timers.target" ];
+        timerConfig = {
+          OnCalendar = cfg.retention.onCalendar;
+          Persistent = true;
+          Unit = "tally-retention.service";
         };
       };
     })

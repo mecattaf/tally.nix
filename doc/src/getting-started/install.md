@@ -5,6 +5,26 @@ deployed surface: it creates the user daemon, producer units, usage meters, and
 declarative flows. tally also exports a NixOS module for a system daemon, but
 that module deliberately does not generate producers, meters, or flows.
 
+## NixOS module upgrade note
+
+The NixOS module now creates a dedicated unprivileged service account through
+`services.tally.user` and `services.tally.group` (both default to `tally`). Its
+activation migrates existing root-owned tally data and state files to that
+account, and its lingering user manager owns every transient job.
+
+Two previously inert settings now have visible upgrade effects:
+
+- `retention.enable = true`, the default, now installs and starts the system
+  retention timer. Set it to `false` before upgrading if host-wide Nix store
+  collection is not yet part of the machine's operating policy.
+- `producers`, `flows`, and pool `usageMeter` settings now fail NixOS
+  evaluation instead of being silently ignored. Move those settings to the
+  Home Manager module, `tally.homeManagerModules.tally`.
+
+The NixOS module also installs the event-drain timer. It remains the right
+surface for a machine-wide coordinator daemon; Home Manager remains the
+complete surface for producer, flow, and usage-meter units.
+
 You need Linux with systemd, Nix with flakes enabled, and Home Manager. The
 examples use `jq` only to make JSON output readable.
 
