@@ -219,7 +219,11 @@ impl DaemonHandler {
                 }
             }
             match self
-                .enqueue_payload(payload, Some(claim.ingress_id.clone()))
+                .enqueue_payload(
+                    payload,
+                    Some(claim.ingress_id.clone()),
+                    CallerIdentity::Client,
+                )
                 .await
             {
                 Ok(_) => {

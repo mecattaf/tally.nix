@@ -18,6 +18,7 @@ mod tests {
         PoolPredicate, ResourceKind, SshExecutorConfig, UsageMeterConfig,
     };
     use crate::evidence::{hash_artifact_file, RetryPolicy};
+    use crate::wire::RequestId;
     use crate::executor::{
         read_exit_record, write_exit_record, ExecutionPaths, LocalUnitFact, LocalUnitProbe,
         LocalUnitState, RemoteCapture, RemoteCompletion, RemoteExecutorReply,
@@ -579,7 +580,7 @@ mod tests {
                     .unwrap();
                 let admitted = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["true"],
                         "pool": "slot",
                         "priority": "high",
@@ -664,6 +665,402 @@ mod tests {
 
                 daemon.handler.revoke_job_token(&job);
                 assert!(!daemon.handler.job_tokens.borrow().contains_key(&digest));
+            })
+            .await;
+    }
+
+    /// Drive a request through the real dispatcher so that caller-class
+    /// resolution runs. Calling `DaemonHandler::enqueue` directly would skip it.
+    async fn rpc(
+        handler: &DaemonHandler,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, WireError> {
+        handler
+            .handle(RequestFrame {
+                id: RequestId::Number(1),
+                method: method.to_owned(),
+                params: Some(params),
+            })
+            .await
+    }
+
+    /// Register a capability token for an already-admitted job, standing in for
+    /// the mint that `prepare_execution` performs when the job starts running.
+    fn issue_job_token(handler: &DaemonHandler, job_id: Uuid, seed: &str) -> String {
+        let token = seed.repeat(64 / seed.len());
+        handler
+            .job_tokens
+            .borrow_mut()
+            .insert(hash_job_token(&token), job_id);
+        token
+    }
+
+    async fn admitted_parent(handler: &DaemonHandler, admitted: &Value) -> Option<String> {
+        let job_id = Uuid::parse_str(admitted["job_id"].as_str().unwrap()).unwrap();
+        handler.context.read().await.jobs[&job_id]
+            .row
+            .parent_uuid
+            .map(|uuid| uuid.to_string())
+    }
+
+    fn child_request(token: &str, extra: Value) -> Value {
+        let mut params = json!({
+            "argv": ["true"],
+            "pool": "slot",
+            "adapter": "shell",
+            "source": "orchestrator",
+            "evidence": ["exit:0"],
+            "callerJobToken": token,
+        });
+        let object = params.as_object_mut().unwrap();
+        for (key, value) in extra.as_object().unwrap() {
+            object.insert(key.clone(), value.clone());
+        }
+        params
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn job_token_fixes_caller_identity_and_rejects_sibling_impersonation() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+
+                let mine = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let sibling = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let my_job_id = Uuid::parse_str(mine["job_id"].as_str().unwrap()).unwrap();
+                let my_task_uuid = mine["task_uuid"].as_str().unwrap().to_owned();
+                let sibling_task_uuid = sibling["task_uuid"].as_str().unwrap().to_owned();
+                let token = issue_job_token(&daemon.handler, my_job_id, "ab");
+
+                // A token with no callerJobId is parented to the token's job, so
+                // dropping the field cannot turn a child into a root submission.
+                let implicit = rpc(
+                    &daemon.handler,
+                    "queue.enqueue",
+                    child_request(&token, json!({"dedupKey": "token-implicit"})),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    admitted_parent(&daemon.handler, &implicit).await.as_deref(),
+                    Some(my_task_uuid.as_str())
+                );
+
+                // Naming your own identity alongside the token is still accepted.
+                let explicit = rpc(
+                    &daemon.handler,
+                    "queue.enqueue",
+                    child_request(
+                        &token,
+                        json!({"dedupKey": "token-explicit", "callerJobId": my_task_uuid}),
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    admitted_parent(&daemon.handler, &explicit).await.as_deref(),
+                    Some(my_task_uuid.as_str())
+                );
+
+                // Naming a sibling is the forgery the token exists to stop.
+                let forged = rpc(
+                    &daemon.handler,
+                    "queue.enqueue",
+                    child_request(
+                        &token,
+                        json!({"dedupKey": "token-forged", "callerJobId": sibling_task_uuid}),
+                    ),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(forged.code, WireErrorCode::InvalidParams);
+                assert_eq!(
+                    forged.message,
+                    "callerJobId is not accepted as authorization; identity derives from TALLY_JOB_TOKEN"
+                );
+                // The rejected attempt left no fan-out charge on the sibling.
+                assert_eq!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .guardrails
+                        .parent(&sibling_task_uuid)
+                        .map_or(0, |info| info.outstanding),
+                    0
+                );
+
+                // A token that was never minted is a hard error, not a demotion
+                // to operator class.
+                let unknown = rpc(
+                    &daemon.handler,
+                    "queue.enqueue",
+                    child_request(&"cd".repeat(32), json!({"dedupKey": "token-unknown"})),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(unknown.code, WireErrorCode::InvalidParams);
+                assert_eq!(
+                    unknown.message,
+                    "callerJobToken is not a live job capability; it was never minted or has been revoked"
+                );
+
+                // So is a token revoked when its job reached a terminal state.
+                daemon
+                    .handler
+                    .job_tokens
+                    .borrow_mut()
+                    .remove(&hash_job_token(&token));
+                let revoked = rpc(
+                    &daemon.handler,
+                    "queue.enqueue",
+                    child_request(&token, json!({"dedupKey": "token-revoked"})),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    revoked.message,
+                    "callerJobToken is not a live job capability; it was never minted or has been revoked"
+                );
+
+                // An operator presenting no token keeps the pre-token behaviour.
+                let root = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"],
+                        "dedupKey": "operator-root"
+                    })))
+                    .await
+                    .unwrap();
+                assert!(admitted_parent(&daemon.handler, &root).await.is_none());
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn job_token_cannot_shed_no_enqueue_depth_or_fanout_by_dropping_caller_job_id() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut config = one_pool_config();
+                config.enqueue.fanout_cap = 1;
+                config.enqueue.depth_cap = 1;
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(config, paths, settings(), executor)
+                    .await
+                    .unwrap();
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+
+                let sealed = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"],
+                        "noEnqueue": true
+                    })))
+                    .await
+                    .unwrap();
+                let sealed_token = issue_job_token(
+                    &daemon.handler,
+                    Uuid::parse_str(sealed["job_id"].as_str().unwrap()).unwrap(),
+                    "ab",
+                );
+                let denied = rpc(
+                    &daemon.handler,
+                    "queue.enqueue",
+                    child_request(&sealed_token, json!({"dedupKey": "sealed-child"})),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    denied.message.contains("carries the noEnqueue capability"),
+                    "unexpected message {}",
+                    denied.message
+                );
+
+                let open = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let open_token = issue_job_token(
+                    &daemon.handler,
+                    Uuid::parse_str(open["job_id"].as_str().unwrap()).unwrap(),
+                    "cd",
+                );
+                let child = rpc(
+                    &daemon.handler,
+                    "queue.enqueue",
+                    child_request(&open_token, json!({"dedupKey": "fanout-first"})),
+                )
+                .await
+                .unwrap();
+                let capped = rpc(
+                    &daemon.handler,
+                    "queue.enqueue",
+                    child_request(&open_token, json!({"dedupKey": "fanout-second"})),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    capped.message.contains("fanoutCap"),
+                    "unexpected message {}",
+                    capped.message
+                );
+
+                // depthCap is 1, so the admitted child may not enqueue at all.
+                let grandchild_token = issue_job_token(
+                    &daemon.handler,
+                    Uuid::parse_str(child["job_id"].as_str().unwrap()).unwrap(),
+                    "ef",
+                );
+                let too_deep = rpc(
+                    &daemon.handler,
+                    "queue.enqueue",
+                    child_request(&grandchild_token, json!({"dedupKey": "too-deep"})),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    too_deep.message.contains("depthCap"),
+                    "unexpected message {}",
+                    too_deep.message
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn job_capability_is_denied_admin_and_producer_methods() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let token = issue_job_token(
+                    &daemon.handler,
+                    Uuid::parse_str(admitted["job_id"].as_str().unwrap()).unwrap(),
+                    "ab",
+                );
+
+                for (method, params) in [
+                    ("queue.pause", json!({"all": true, "callerJobToken": token})),
+                    ("queue.resume", json!({"all": true, "callerJobToken": token})),
+                    ("queue.drain", json!({"callerJobToken": token})),
+                    (
+                        "queue.cancel",
+                        json!({"task_uuid": admitted["task_uuid"], "callerJobToken": token}),
+                    ),
+                    (
+                        "queue.retry",
+                        json!({"task_uuid": admitted["task_uuid"], "callerJobToken": token}),
+                    ),
+                    (
+                        "__producer.pool-transition",
+                        json!({"producer": "health", "transition": "lost", "generation": 1,
+                               "callerJobToken": token}),
+                    ),
+                    (
+                        "__producer.runtime-observed",
+                        json!({"callerJobToken": token}),
+                    ),
+                ] {
+                    let error = rpc(&daemon.handler, method, params).await.unwrap_err();
+                    assert_eq!(error.code, WireErrorCode::InvalidParams);
+                    assert_eq!(
+                        error.message,
+                        format!("method {method} is not available to a job capability")
+                    );
+                }
+
+                // The producer runtime presents no job token, so it still reaches
+                // the method body — this fixture has no `health` producer, so it
+                // fails there rather than at the capability boundary.
+                let runtime = rpc(
+                    &daemon.handler,
+                    "__producer.pool-transition",
+                    json!({"producer": "health", "transition": "lost", "generation": 1}),
+                )
+                .await
+                .unwrap_err();
+                assert!(
+                    !runtime.message.contains("not available to a job capability"),
+                    "producer runtime was denied its own method: {}",
+                    runtime.message
+                );
+
+                // A malformed token is a request error, not a silent demotion.
+                let malformed = rpc(
+                    &daemon.handler,
+                    "query.status",
+                    json!({"callerJobToken": 17}),
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(malformed.message, "callerJobToken must be a string");
             })
             .await;
     }
@@ -1074,7 +1471,7 @@ mod tests {
         let task_uuid = "00000000-0000-4000-8000-000000000084";
         let response = daemon
             .handler
-            .enqueue(Some(json!({
+            .enqueue_as_client(Some(json!({
                 "argv": ["nix", "build", "--no-link", format!("{DRV}^*")],
                 "pool": ["build"],
                 "adapter": "shell",
@@ -1132,7 +1529,7 @@ mod tests {
         }
         let fresh_uuid = "00000000-0000-4000-8000-000000000085";
         let fresh = tokio::task::LocalSet::new()
-            .run_until(daemon.handler.enqueue(Some(json!({
+            .run_until(daemon.handler.enqueue_as_client(Some(json!({
                 "argv": ["nix", "build", "--no-link", format!("{DRV}^*")],
                 "pool": ["build"],
                 "adapter": "shell",
@@ -1723,7 +2120,7 @@ mod tests {
                 });
                 let missing = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["must-not-run"],
                         "pool": "slot",
                         "source": "orchestrator",
@@ -1738,7 +2135,7 @@ mod tests {
                 assert!(missing.message.contains("slot"));
                 let conflicting = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["must-not-run"],
                         "pool": "slot",
                         "credentials": {"pool-token": "/run/credentials/wrong"}
@@ -1751,7 +2148,7 @@ mod tests {
                     .contains("conflicting pool and enqueue sources"));
                 let direct = daemon
                     .handler
-                    .enqueue(Some(direct_payload.clone()))
+                    .enqueue_as_client(Some(direct_payload.clone()))
                     .await
                     .unwrap();
 
@@ -1788,7 +2185,7 @@ mod tests {
                     durable_oversize_bytes,
                 )
                 .unwrap();
-                let direct_error = daemon.handler.enqueue(Some(malformed)).await.unwrap_err();
+                let direct_error = daemon.handler.enqueue_as_client(Some(malformed)).await.unwrap_err();
 
                 let drained = daemon.handler.drain(None).await.unwrap();
                 assert_eq!(drained["enqueued"], 1);
@@ -1878,7 +2275,11 @@ mod tests {
                 let payload = read_ingress_payload(&claims[0]).unwrap();
                 daemon
                     .handler
-                    .enqueue_payload(payload, Some(claims[0].ingress_id.clone()))
+                    .enqueue_payload(
+                        payload,
+                        Some(claims[0].ingress_id.clone()),
+                        CallerIdentity::Client,
+                    )
                     .await
                     .unwrap();
                 assert!(claims[0].path.exists());
@@ -2198,7 +2599,7 @@ mod tests {
                         .unwrap();
                 let admitted = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["initial"],
                         "pool": "slot",
                         "adapter": "resumable",
@@ -2217,7 +2618,7 @@ mod tests {
                 let parent_task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
                 let child = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["true"],
                         "pool": "zeta",
                         "adapter": "shell",
@@ -3344,7 +3745,7 @@ mod tests {
                     .unwrap();
                 let admitted = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["author wave 3"],
                         "pool": "slot",
                         "adapter": "codex",
@@ -3494,7 +3895,7 @@ mod tests {
                     .unwrap();
                 let first = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["initial request"],
                         "pool": "slot",
                         "adapter": "resumable"
@@ -3526,7 +3927,7 @@ mod tests {
 
                 let continued = daemon
                     .handler
-                    .continue_job(Some(json!({
+                    .continue_job_as_client(Some(json!({
                         "resumeFrom": first_id,
                         "argv": ["address review"]
                     })))
@@ -3603,7 +4004,7 @@ mod tests {
                 .unwrap();
                 let admitted = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": [program],
                         "pool": "slot",
                         "gateManifest": {
@@ -3731,7 +4132,7 @@ mod tests {
 
                 let absent = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": [program, "absent"],
                         "pool": "slot",
                         "adapter": "codex",
@@ -3775,7 +4176,7 @@ mod tests {
 
                 let passed = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": [program, "write"],
                         "pool": "slot",
                         "adapter": "codex",
@@ -3848,7 +4249,7 @@ mod tests {
                         .unwrap();
                 let unknown = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["must-not-run"],
                         "pool": "slot",
                         "adapter": "not-declared"
@@ -3861,7 +4262,7 @@ mod tests {
                 assert!(!paths.events_dir().exists());
                 let admitted = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["literal;$(not-a-shell)", "", "--option-looking"],
                         "pool": "slot",
                         "priority": "high",
@@ -4170,7 +4571,7 @@ mod tests {
                     }));
                 let admitted = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["/bin/true"],
                         "pool": "slot",
                         "priority": "high",
@@ -4320,7 +4721,7 @@ mod tests {
                 let (shutdown, shutdown_rx) = watch::channel(false);
                 let mut daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
                 let admitted = handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["work"],
                         "pool": "slot",
                         "adapter": "blocked",
@@ -4920,7 +5321,7 @@ mod tests {
                 .unwrap();
                 let low = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["sleep", "30"],
                         "pool": "slot",
                         "priority": "low",
@@ -4932,7 +5333,7 @@ mod tests {
                     .unwrap();
                 let urgent = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["true"],
                         "pool": "slot",
                         "priority": "interrupt",
@@ -5153,7 +5554,7 @@ mod tests {
                 .unwrap();
                 let admitted = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["opaque-worker-command", "two words", "$HOME"],
                         "pool": "slot",
                         "executor": "worker",
@@ -6093,7 +6494,7 @@ mod tests {
                     .to_owned();
                 let admitted = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["true"],
                         "pool": ["zeta", "slot"],
                         "priority": "low",
@@ -6220,7 +6621,7 @@ mod tests {
                     .to_owned();
                 let admitted = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["true"],
                         "pool": "slot",
                         "priority": "low",
@@ -7657,7 +8058,7 @@ mod tests {
 
                 let parent = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["true"],
                         "pool": "flow",
                         "adapter": "shell",
@@ -7684,7 +8085,7 @@ mod tests {
                 };
                 let first = daemon
                     .handler
-                    .enqueue(Some(child_payload("fs2-child-1")))
+                    .enqueue_as_client(Some(child_payload("fs2-child-1")))
                     .await
                     .unwrap();
                 {
@@ -7696,7 +8097,7 @@ mod tests {
                 }
                 let capped = daemon
                     .handler
-                    .enqueue(Some(child_payload("fs2-child-at-cap")))
+                    .enqueue_as_client(Some(child_payload("fs2-child-at-cap")))
                     .await
                     .unwrap_err();
                 assert_eq!(capped.code, WireErrorCode::InvalidParams);
@@ -7732,7 +8133,7 @@ mod tests {
 
                 let rollback = daemon
                     .handler
-                    .enqueue(Some(json!({
+                    .enqueue_as_client(Some(json!({
                         "argv": ["true"],
                         "pool": "slot",
                         "adapter": "shell",
@@ -7760,7 +8161,7 @@ mod tests {
 
                 let second = daemon
                     .handler
-                    .enqueue(Some(child_payload("fs2-child-2")))
+                    .enqueue_as_client(Some(child_payload("fs2-child-2")))
                     .await
                     .unwrap();
                 assert_eq!(second["disposition"], "created");

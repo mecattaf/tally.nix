@@ -33,6 +33,11 @@ authorized.
 
 ### Changed
 
+- Derived job-originated enqueue identity from the daemon-minted capability token rather than from
+  the client-supplied `callerJobId`, which is now accepted only when it names the same identity.
+  The depth, fan-out, `noEnqueue`, and ancestry guardrails are consequently enforced rather than
+  cooperative, and a request presenting a job token is refused the administrative and
+  `__producer.*` method classes.
 - Made `tally enqueue --dedup-key` use full submission semantics by default, with
   `--submission legacy` as the compatibility escape hatch.
 - Run NixOS system-mode daemon, transient jobs, and witness emission as a dedicated configurable

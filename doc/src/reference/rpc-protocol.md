@@ -180,8 +180,8 @@ canonicalized into ascending order and duplicates are rejected.
 | `noEnqueue` | boolean; default `false` | Prevents the admitted job from spawning children. |
 | `credentials` | object of name to absolute path; default `{}` | Explicit credential sources. Pool credentials are merged and conflicts fail admission. |
 | `origin` | object, optional | Versioned admission provenance: `{schemaVersion:1, source, producer?, github?}`. |
-| `callerJobId` | string, optional | Live caller identity used by depth/fanout guardrails. |
-| `callerJobToken` | 64-character lowercase hex string, optional | Daemon-minted capability token a local job receives as `TALLY_JOB_TOKEN`. |
+| `callerJobId` | string, optional | Caller identity. When `callerJobToken` is also present it must name the identity that token resolves to; otherwise the request is rejected. |
+| `callerJobToken` | 64-character lowercase hex string, optional | Daemon-minted capability token a local job receives as `TALLY_JOB_TOKEN`. Presenting it makes the request Job class: the daemon resolves the caller from the token, and the administrative and `__producer.*` method classes are refused. |
 | `ghTriggerActor`, `ghSelfActor`, `ghOrigin` | optional | Compatibility fields for the GitHub producer. New clients should prefer `origin`. |
 | `taskUuid` | UUID string, optional | Preassigned identity, used by derivation flow nodes. Mutually exclusive with `resumeFrom`. |
 | `relatedTrigger` | object, optional | Fallback trigger provenance `{producer,eventId,outcome,receiptId?}`. |
