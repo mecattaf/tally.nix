@@ -2543,6 +2543,17 @@ let
               exit 1
             fi
 
+            # A declaratively deployed runner is itself a job, so its nodes are
+            # children bounded by enqueue.fanoutCap. A script that declares a
+            # wider budget than this host will admit is a switch-time question,
+            # not a 2am one. Only an explicit meta.maxNodes is checked: the
+            # module's own backstop defaults far above any host cap.
+            if [ -n "$script_max_nodes" ] && [ "$script_max_nodes" -gt ${toString cfg.enqueue.fanoutCap} ]; then
+              printf 'tally flow %s script meta.maxNodes %s exceeds enqueue.fanoutCap %s; raise services.tally.enqueue.fanoutCap or lower meta.maxNodes\n' \
+                ${flowName} "$script_max_nodes" ${lib.escapeShellArg (toString cfg.enqueue.fanoutCap)} >&2
+              exit 1
+            fi
+
             ${lib.getExe cfg.package} --config ${rendered} flow check ${script} \
               --args "$(cat ${args})" >/dev/null
 
