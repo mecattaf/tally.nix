@@ -115,10 +115,17 @@ operator control over pools; it is not a durable approval primitive.
 
 ## Can a flow hold a mutex or budget lease for its whole run?
 
-There is no sanctioned run-wide flow lease. The generated runner requests
-exactly the `flow` pool, and a flow's `budgetPool` currently checks only that
-the named pool exists. Individual nodes request their own pools while they
-run.
+A flow may declare one typed `workloadMutex`. The generated parent runner then
+co-leases that capacity-1 mutex with `flow` for its process lifetime. This is
+not a run-lifetime guarantee: runner death releases the mutex, another run may
+take it, and replay of the interrupted run queues behind that holder while its
+already-created children remain durable. A direct manual `tally flow run`
+bypasses runner admission, so a mutex flow must instead be enqueued as a parent
+job holding both pools.
+
+There is no corresponding run-wide budget lease. A flow's `budgetPool`
+currently checks only that the named pool exists. Individual nodes request
+their own pools while they run.
 
 Likewise, flow nodes deliberately do not supply `consumptionEstimate`, and
 configured flow checking excludes `windowed-consumption` pools. Flow

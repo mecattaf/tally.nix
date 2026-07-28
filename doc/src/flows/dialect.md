@@ -58,7 +58,11 @@ checker rejects them in `meta.pools`: the runner owns `flow`, while `drv()` adds
 
 There is no `meta.budgetPool` field in the shipped dialect. `budgetPool` is a Nix
 flow option, and today it performs an existence check only. It neither changes
-the generated runner pool (always `[ "flow" ]`) nor adds a pool to child nodes.
+the generated runner pool nor adds a pool to child nodes. The runner always
+requests `flow` as its base pool.
+Likewise, `workloadMutex` is a Nix registration option rather than flow
+metadata. It adds one validated capacity-1 mutex to the generated runner's
+`flow` lease for the process lifetime; it does not change node pool sets.
 
 During execution the host also exposes the checked metadata as read-only
 `flowMeta`, and exposes the checked invocation data as read-only `args`. Treat the

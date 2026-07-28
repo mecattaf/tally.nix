@@ -325,7 +325,7 @@ adds the flag only when `services.tally.flows.<name>.catalog` is non-null. The o
 optional; a script whose literal meta declares selector use fails checking unless a catalog is
 provided.
 
-### Declarative runner pool and `budgetPool`
+### Declarative runner pool, `workloadMutex`, and `budgetPool`
 
 The generated calendar producer renders the runner with:
 
@@ -333,14 +333,27 @@ The generated calendar producer renders the runner with:
 {"pool":["flow"]}
 ```
 
-It does this unconditionally. `services.tally.flows.<name>.budgetPool` is validated only to be
-null or the name of an existing configured pool. Its value is not added to the runner pool,
-passed as an argument, exported in the environment, or used as a child-admission estimate.
+It always requests `flow`. If `services.tally.flows.<name>.workloadMutex` is
+non-null, the generated pool value is instead `["flow","<mutex>"]`. The extra
+pool must be a named capacity-1 co-residency mutex; arbitrary extra runner
+pools, reserved `flow`/`build`, and windowed-consumption pools are rejected.
+The mutex lasts for the runner process. Death or preemption releases it, and a
+replay waits behind whichever run acquired it next.
+
+Direct `tally flow run` holds no runner lease. For a mutex-declaring flow,
+enqueue the runner as a parent job with both `--pool flow` and
+`--pool <mutex>`; direct invocation is not sanctioned. Flows without a mutex
+may still run directly, with the documented depth/fanout bypass.
+
+`services.tally.flows.<name>.budgetPool` is validated only to be null or the
+name of an existing configured pool. Its value is not added to the runner
+pool, passed as an argument, exported in the environment, or used as a
+child-admission estimate.
 
 The live option description at `4c85563` calls `budgetPool` a pool “leased with the flow
 runner.” That sentence is stale and contradicts both the renderer and the final ruling. The
-existence-only behavior above is the contract. As shipped, the CLI has no flag that adds another
-run-lifetime pool to a declaratively rendered flow runner.
+existence-only behavior above is the contract. `workloadMutex` is the sole
+typed extra runner pool; it is not a general run-lifetime pool list.
 
 ## Witness
 
