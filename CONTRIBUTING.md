@@ -3,9 +3,10 @@
 Thank you for helping improve tally. Keep changes inside its defining boundary: tally arbitrates
 contention and emits proof. A driver decides what work should run and interprets domain output.
 
-Read the project [security policy](SECURITY.md) before handling vulnerability reports or
-credentials. Release preparation follows the [release runbook](RELEASING.md); documenting its tag
-commands is not authorization to execute them.
+Project policy lives in the [security policy](SECURITY.md), [release runbook](RELEASING.md),
+[changelog](CHANGELOG.md), and [dependency policy](deny.toml). Read the security policy before
+handling vulnerability reports or credentials. Documenting the runbook's tag commands is not
+authorization to execute them.
 
 ## Development environment
 
@@ -91,8 +92,9 @@ starts from a pristine clone and disposable detached worktree. In order it runs
 `cargo fmt --all --check`, `env -u TALLY_TEST_REMOTE_HOST cargo test --workspace`, Clippy for all
 workspace targets and features with warnings denied, the pinned offline dependency-policy stage,
 `nix flake check -L`, an evaluated-check assertion for the `flow-multi-host` VM, the no-stubs grep,
-the no-workflows assertion, and the changelog stage. The changelog stage says **NOT RUN** until
-`CHANGELOG.md` exists; after that, a pull request must touch it or carry the `no-changelog` label.
+the no-workflows assertion, and the changelog stage. A pull request must touch `CHANGELOG.md` or
+carry the `no-changelog` label. A main-branch audit records that this rule was enforced on the pull
+request head rather than inventing a second diff.
 
 The runner writes a local transcript below
 `${XDG_STATE_HOME:-$HOME/.local/state}/tally-fleet-gate/transcripts/` and prints its path. Paste the
@@ -133,6 +135,18 @@ for features that are not implemented.
 
 New producer behavior must not silently expand the closed kind set. New agent integrations should
 normally be data-only adapters built with `lib.adapters.mkAdapter`.
+
+## Changelog discipline
+
+Every behavior-affecting pull request must add a concise entry under the appropriate heading in
+`CHANGELOG.md`'s `[Unreleased]` section. Behavior includes user-visible CLI/RPC changes, execution or
+admission semantics, configuration defaults and options, durable formats, security posture, and
+operator-facing deployment behavior.
+
+A pull request with no release-note-worthy effect may carry the `no-changelog` label instead. State
+the reason in its description; the label is an explicit reviewable decision, not a way to skip an
+entry for behavior that changed. The local runner enforces the mechanical rule against the exact
+pull-request base and head.
 
 ## Change hygiene
 

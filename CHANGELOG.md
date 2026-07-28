@@ -1,0 +1,59 @@
+# Changelog
+
+All notable changes to tally.nix are recorded here. The format is based on
+[Keep a Changelog], and the project intends to follow [Semantic Versioning] once version tags are
+authorized.
+
+## [Unreleased]
+
+### Added
+
+- Added operator chapters for configured mechanisms and declarative flows, including exact module
+  contracts and deployment asymmetries.
+- Added a hermetic, offline dependency-policy gate with a flake-pinned RustSec advisory database,
+  a tree-derived license allowlist, crates.io-only sources, and duplicate-version warnings.
+- Added private vulnerability-reporting policy, a supported threat model, and an end-to-end release
+  and rollback runbook.
+- Added this changelog and the contribution rule that keeps `[Unreleased]` current.
+- Added randomized checks for bounded NDJSON framing, byte-exact request round trips, witness
+  mutation detection, durable JSONL tail repair, and canonical pool-set and migration behavior.
+- Added flake-native rustfmt, Clippy, and repository-wide Nix formatting checks.
+
+### Changed
+
+- Standardized pull-request merge evidence on the canonical worker-run local ladder transcript in
+  the single-operator phase.
+- Required each behavior-affecting pull request to update `[Unreleased]` unless it carries the
+  `no-changelog` label.
+- Single-sourced the declarative-flow node field contract across JavaScript validation, live-wire
+  rendering, and canonical hashing.
+- Restricted system-indexed flake outputs to `x86_64-linux` and documented that supported platform.
+
+### Fixed
+
+- Detect canonical payload-hash drift on a flow's first admission instead of storing a mismatch
+  that becomes an unrecoverable replay divergence on the next run.
+- Made full-mode flow credential resolution symmetric between the client and daemon, including a
+  hard error when `tally flow run` has no client configuration.
+- Preserved inherited job identity and `noEnqueue` guardrails through CLI continuation, and made
+  negative or signalled waited process outcomes return a nonzero CLI status.
+- Preserved the original launcher-failure status and stderr when transient-unit reclamation cannot
+  find or clean up the failed launch.
+
+### Security
+
+- Documented the single-trusted-Unix-user boundary, cooperative versus token-bound job identity,
+  unsigned witness-chain limits, and why hardening presets are not a hostile-code sandbox.
+- Acknowledged `RUSTSEC-2024-0436` as the sole advisory suppression: unmaintained `paste` arrives
+  through Boa 0.21.1 and must be revisited by 2026-12-31 or when a later Boa removes it.
+
+## [Pre-release history]
+
+Development through baseline commit [`c6c304e`] was pre-release; see `git log c6c304e` for that
+earlier history. No version tag is implied by this retroactive section.
+
+[Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
+[Semantic Versioning]: https://semver.org/spec/v2.0.0.html
+[Unreleased]: https://github.com/mecattaf/tally.nix/compare/c6c304e...HEAD
+[Pre-release history]: https://github.com/mecattaf/tally.nix/commits/c6c304e
+[`c6c304e`]: https://github.com/mecattaf/tally.nix/commit/c6c304e
