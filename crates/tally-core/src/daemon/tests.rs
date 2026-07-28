@@ -37,6 +37,10 @@ mod tests {
     use crate::witness::{Authorship, AuthorshipSession, AuthorshipStatus};
     use tally_client::RpcClient;
 
+    fn direct_executor(state_dir: &Path) -> Executor {
+        Executor::new(state_dir, std::env::current_exe().unwrap()).with_direct_fallback()
+    }
+
     #[test]
     fn dispatcher_methods_match_wire_inventory() {
         use crate::wire::{method_class, INTERNAL_RPC_METHODS, RPC_METHODS};
@@ -557,7 +561,7 @@ mod tests {
     }
 
     async fn fs1_daemon(paths: &DaemonPaths) -> Daemon {
-        let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+        let executor = direct_executor(&paths.state_dir)
             .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
             .with_unit_probe(ExitFileProbe);
         Daemon::open_with_executor(one_pool_config(), paths.clone(), settings(), executor)
@@ -1280,7 +1284,7 @@ mod tests {
             paths.witness_path(),
         )
         .unwrap();
-        let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+        let executor = direct_executor(&paths.state_dir)
             .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
             .with_unit_probe(ExitFileProbe);
 
@@ -1320,7 +1324,7 @@ mod tests {
         let legacy_event = paths.events_dir().join("legacy.enqueue.json");
         let legacy_bytes = b"not even parseable legacy event bytes\n";
         fs::write(&legacy_event, legacy_bytes).unwrap();
-        let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+        let executor = direct_executor(&paths.state_dir)
             .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
             .with_unit_probe(ExitFileProbe);
 
@@ -1475,7 +1479,7 @@ mod tests {
             })
             .unwrap();
 
-        let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+        let executor = direct_executor(&paths.state_dir)
             .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
             .with_unit_probe(ExitFileProbe);
         let first = Daemon::open_with_executor(
@@ -1554,7 +1558,7 @@ mod tests {
                 ..PoolConfig::default()
             },
         );
-        let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+        let executor = direct_executor(&paths.state_dir)
             .with_systemd_run(temp.path().join("absent-systemd-run"))
             .with_unit_probe(ExitFileProbe);
         let daemon = Daemon::open_with_executor(config, paths.clone(), settings(), executor)
@@ -2180,7 +2184,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let mut config = one_pool_config();
@@ -2432,7 +2436,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(
@@ -2680,7 +2684,7 @@ mod tests {
                 }))
                 .unwrap();
                 let registry = config.producers.clone();
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let restart_config = config.clone();
@@ -3012,7 +3016,7 @@ mod tests {
                     }
                 }))
                 .unwrap();
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let identity = ExecutionIdentity {
@@ -3145,7 +3149,7 @@ mod tests {
                     .unwrap();
                 assert_eq!(returned.transition, Some(ReachabilityTransition::Returned));
 
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(config, paths, settings(), executor)
@@ -3187,7 +3191,7 @@ mod tests {
                     }
                 }))
                 .unwrap();
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let mut daemon =
@@ -3387,7 +3391,7 @@ mod tests {
                 )
                 .unwrap();
 
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(
@@ -3632,7 +3636,7 @@ mod tests {
                     "maintainer"
                 );
 
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(
@@ -3825,7 +3829,7 @@ mod tests {
                     },
                 );
                 config.validate().unwrap();
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon =
@@ -3981,7 +3985,7 @@ mod tests {
                     },
                 );
                 config.validate().unwrap();
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let mut daemon = Daemon::open_with_executor(config, paths, settings(), executor)
@@ -4085,7 +4089,7 @@ mod tests {
                 .unwrap();
                 let program = temp.path().join("successful-job");
                 crate::test_support::install_shell_program(&program, "#!/bin/sh\nexit 0\n");
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let mut daemon = Daemon::open_with_executor(
@@ -4216,7 +4220,7 @@ mod tests {
                     .adapters
                     .insert("codex".to_owned(), AdapterConfig::default());
                 let executor =
-                    Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    direct_executor(&paths.state_dir)
                         .with_systemd_run(temp.path().join("absent-systemd-run"))
                         .with_unit_probe(ExitFileProbe);
                 let mut daemon =
@@ -4329,7 +4333,7 @@ mod tests {
                     framing: TraceFraming::JsonLines,
                 });
                 config.adapters.insert("from-nix".to_owned(), adapter);
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let mut daemon =
@@ -4628,7 +4632,7 @@ mod tests {
                     framing: TraceFraming::JsonLines,
                 });
                 config.validate().unwrap();
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon =
@@ -4796,7 +4800,7 @@ mod tests {
                 config
                     .adapters
                     .insert("blocked".to_owned(), structured_adapter(&program));
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(config, paths.clone(), settings(), executor)
@@ -5177,7 +5181,7 @@ mod tests {
             state_dir: temp.path().join("state"),
             data_dir: temp.path().join("data"),
         };
-        let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+        let executor = direct_executor(&paths.state_dir)
             .with_systemd_run(temp.path().join("absent-systemd-run"))
             .with_unit_probe(ExitFileProbe);
         let mut config = window_pool_config();
@@ -5399,7 +5403,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let mut fast_settings = settings();
@@ -5539,7 +5543,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(
@@ -5832,7 +5836,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let mut daemon = Daemon::open_with_executor(
@@ -5910,7 +5914,7 @@ mod tests {
                 prepare_paths(&paths).unwrap();
                 drop(WitnessLedger::open(paths.witness_path()).unwrap());
                 let epoch = bump_epoch(&paths.state_dir).unwrap();
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let (commit_started_tx, commit_started_rx) = oneshot::channel();
@@ -6027,7 +6031,7 @@ mod tests {
                 prepare_paths(&paths).unwrap();
                 drop(WitnessLedger::open(paths.witness_path()).unwrap());
                 let epoch = bump_epoch(&paths.state_dir).unwrap();
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let (commit_started_tx, commit_started_rx) = oneshot::channel();
@@ -6102,7 +6106,7 @@ mod tests {
                     &DurableEnqueueEvent::new(row.clone()).unwrap(),
                 )
                 .unwrap();
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(RunningProbe {
                         attempt: 1,
@@ -6169,7 +6173,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let first = Daemon::open_with_executor(
@@ -6405,7 +6409,7 @@ mod tests {
                 };
                 let artifact = temp.path().join("already-built.txt");
                 fs::write(&artifact, b"stable artifact\n").unwrap();
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(
@@ -6565,7 +6569,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(
@@ -6693,7 +6697,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(
@@ -6809,7 +6813,7 @@ mod tests {
                     state_dir: temp.path().join("state"),
                     data_dir: temp.path().join("data"),
                 };
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(
@@ -6993,7 +6997,7 @@ mod tests {
                 let temp = tempdir().unwrap();
                 let (paths, parent_uuid, child_uuid, parent_pass, _) =
                     seed_durable_query_fixture(temp.path());
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
 
@@ -7108,7 +7112,7 @@ mod tests {
                 let temp = tempdir().unwrap();
                 let (paths, parent_uuid, _, expected, expected_head) =
                     seed_durable_query_fixture(temp.path());
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon = Daemon::open_with_executor(
@@ -8097,7 +8101,7 @@ mod tests {
                 tokio::task::yield_now().await;
 
                 fs::write(&stored_path, b"{}").unwrap();
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let error = match Daemon::open_with_executor(
@@ -8137,7 +8141,7 @@ mod tests {
                         ..PoolConfig::default()
                     },
                 );
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let daemon =
@@ -8274,7 +8278,7 @@ mod tests {
                 drop(daemon);
                 tokio::task::yield_now().await;
 
-                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
                 let restarted = Daemon::open_with_executor(config, paths, settings(), executor)

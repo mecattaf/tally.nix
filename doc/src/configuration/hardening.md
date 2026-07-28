@@ -10,6 +10,21 @@ explicitly. There is no scheduled default change.
 The presets are defense in depth for trusted operator-selected programs. They
 are not a hostile-code sandbox or an authorization boundary between jobs.
 
+## Presets require a transient unit
+
+Every property below is carried by the transient unit that `systemd-run`
+creates for the job. The executor also has a direct-process backend used when
+`systemd-run` is absent, and that path applies no preset, no `ReadWritePaths=`,
+and none of the transient unit's resource limits.
+
+The direct backend is off by default and must be requested explicitly with
+`Executor::with_direct_fallback`. The packaged daemon and the remote-execution
+helper both call `Executor::require_systemd`, so a NixOS deployment never
+silently degrades to an unhardened launch: a missing `systemd-run` fails the
+job with a spawn error instead of running it unconstrained. Library consumers
+that opt into the direct backend give up hardening for every job that takes it,
+whatever `hardening` the adapter declares.
+
 ## Property contract
 
 The table is a checked fixture. A flake check extracts every systemd property

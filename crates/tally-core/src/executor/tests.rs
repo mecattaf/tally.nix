@@ -1829,6 +1829,7 @@ async fn hard_reclaim_kills_and_awaits_a_direct_process_group() {
     let unit = format!("tally-job-{}.service", request.identity.unit_uuid());
     let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally")
         .with_systemd_run(temp.path().join("missing-systemd-run"))
+        .with_direct_fallback()
         .with_unit_probe(FactProbe(LocalUnitFact::absent(&unit)));
     let running_executor = executor.clone();
     let running_request = request.clone();
@@ -2315,6 +2316,7 @@ async fn missing_systemd_run_falls_back_once_and_leaf_127_is_not_retried() {
     let outcome = Executor::new(temp.path(), "/nix/store/example/bin/tally")
         .with_unit_probe(AbsentProbe)
         .with_systemd_run(temp.path().join("missing-systemd-run"))
+        .with_direct_fallback()
         .execute(request)
         .await
         .unwrap();
@@ -2335,13 +2337,12 @@ async fn missing_systemd_run_falls_back_once_and_leaf_127_is_not_retried() {
 }
 
 #[tokio::test]
-async fn durable_daemon_policy_refuses_direct_fallback() {
+async fn executor_default_refuses_direct_fallback() {
     let temp = tempfile::tempdir().unwrap();
     let request = fixture_request("fixture-exit127");
     let result = Executor::new(temp.path(), "/nix/store/example/bin/tally")
         .with_unit_probe(AbsentProbe)
         .with_systemd_run(temp.path().join("missing-systemd-run"))
-        .require_systemd()
         .execute(request)
         .await;
     assert!(matches!(result, Err(ExecutorError::Spawn { .. })));
@@ -2353,11 +2354,26 @@ async fn durable_daemon_policy_refuses_direct_fallback() {
 }
 
 #[tokio::test]
+async fn require_systemd_revokes_an_earlier_direct_fallback_opt_in() {
+    let temp = tempfile::tempdir().unwrap();
+    let request = fixture_request("fixture-exit127");
+    let result = Executor::new(temp.path(), "/nix/store/example/bin/tally")
+        .with_unit_probe(AbsentProbe)
+        .with_systemd_run(temp.path().join("missing-systemd-run"))
+        .with_direct_fallback()
+        .require_systemd()
+        .execute(request)
+        .await;
+    assert!(matches!(result, Err(ExecutorError::Spawn { .. })));
+}
+
+#[tokio::test]
 async fn direct_fallback_times_out_and_refuses_credentials() {
     let temp = tempfile::tempdir().unwrap();
     let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally")
         .with_unit_probe(AbsentProbe)
-        .with_systemd_run(temp.path().join("missing-systemd-run"));
+        .with_systemd_run(temp.path().join("missing-systemd-run"))
+        .with_direct_fallback();
     let mut timeout = fixture_request("fixture-timeout");
     timeout.runtime_max_sec = Some(1);
     timeout.cwd = Some(temp.path().to_owned());

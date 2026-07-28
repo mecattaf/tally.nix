@@ -369,6 +369,7 @@ async fn start_daemon_with_systemd_run_and_settings(
 ) -> RunningDaemon {
     let executor = Executor::new(&paths.state_dir, env!("CARGO_BIN_EXE_tally"))
         .with_systemd_run(systemd_run)
+        .with_direct_fallback()
         .with_unit_probe(ExitFileProbe);
     let daemon = Daemon::open_with_executor(config, paths.clone(), settings, executor)
         .await

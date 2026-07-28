@@ -101,6 +101,8 @@ authorized.
 
 ### Security
 
+- Disabled the executor's unhardened direct-process fallback by default; library consumers must
+  opt into that compatibility path explicitly.
 - Exposed opt-in hardening and scoped writable-path declarations through the Nix adapter library
   without changing the intentionally un-hardened default.
 - Added the opt-in `production` adapter hardening bundle and narrowed `strict` and `production`

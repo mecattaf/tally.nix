@@ -180,6 +180,7 @@ fn seed_durable_facts(paths: &DaemonPaths, uuid: Uuid) {
 async fn start_daemon(paths: &DaemonPaths) -> RunningDaemon {
     let executor = Executor::new(&paths.state_dir, env!("CARGO_BIN_EXE_tally"))
         .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+        .with_direct_fallback()
         .with_unit_probe(AbsentUnitProbe);
     let daemon = Daemon::open_with_executor(config(), paths.clone(), settings(), executor)
         .await
