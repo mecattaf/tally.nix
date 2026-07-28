@@ -12,7 +12,9 @@ use tally_core::adapters::{AdapterConfig, ScrapeCapture, ScrapeMode, ScrapeStrea
 use tally_core::config::{
     CoResidencyPredicate, Config, JournaldConfig, PoolConfig, PoolPredicate, ResourceKind,
 };
-use tally_core::daemon::{Daemon, DaemonError, DaemonPaths, DaemonSettings};
+use tally_core::daemon::{
+    Daemon, DaemonError, DaemonPaths, DaemonSettings, DEFAULT_MAX_CONNECTIONS,
+};
 use tally_core::evidence::RetryPolicy;
 use tally_core::executor::{
     read_exit_record, ExecutionPaths, Executor, ExecutorError, LocalUnitFact, LocalUnitProbe,
@@ -315,6 +317,7 @@ fn settings() -> DaemonSettings {
             },
             max_attempts: 2,
         },
+        max_connections: DEFAULT_MAX_CONNECTIONS,
     }
 }
 

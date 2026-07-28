@@ -95,8 +95,10 @@ use crate::witness::{
 };
 
 const LEASE_TICK: Duration = Duration::from_millis(100);
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_METER_EVENT_BYTES: u64 = 64 * 1024;
 const UNCLAIMED_DRAIN_BARRIER_LIMIT: usize = 64;
+pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 #[derive(Debug, Clone)]
 pub struct DaemonPaths {
@@ -136,6 +138,7 @@ pub struct DaemonSettings {
     pub unit_limits: UnitLimits,
     pub yield_grace: Duration,
     pub recovery_policy: RecoveryPolicy,
+    pub max_connections: usize,
 }
 
 impl DaemonSettings {
@@ -158,6 +161,11 @@ impl DaemonSettings {
         if self.recovery_policy.max_attempts == 0 {
             return Err(DaemonError::Invalid(
                 "recovery maxAttempts must be positive".to_owned(),
+            ));
+        }
+        if self.max_connections == 0 {
+            return Err(DaemonError::Invalid(
+                "max connections must be positive".to_owned(),
             ));
         }
         Ok(self)
@@ -205,6 +213,13 @@ fn io_error(path: &Path, source: io::Error) -> DaemonError {
         path: path.to_owned(),
         source,
     }
+}
+
+fn retryable_accept_error(error: &io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE | libc::ENFILE | libc::ECONNABORTED | libc::EINTR)
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5136,6 +5151,8 @@ pub struct Daemon {
     max_frame_bytes: u64,
     #[cfg(test)]
     lease_tick_hook: Option<LeaseTickHook>,
+    #[cfg(test)]
+    connection_count_hook: Option<mpsc::UnboundedSender<usize>>,
 }
 
 impl Daemon {
@@ -5480,6 +5497,8 @@ impl Daemon {
             max_frame_bytes: config.max_frame_bytes,
             #[cfg(test)]
             lease_tick_hook: None,
+            #[cfg(test)]
+            connection_count_hook: None,
         })
     }
 
@@ -5561,7 +5580,10 @@ impl Daemon {
         lease_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut watchdog = self.notifier.watchdog_interval();
         let mut lease_ticks = JoinSet::new();
-        let mut connections = Vec::new();
+        let mut connections = JoinSet::new();
+        let max_connections = self.handler.settings.max_connections;
+        #[cfg(test)]
+        let connection_count_hook = self.connection_count_hook.clone();
         let mut result = if let Some(error) = startup_error {
             Err(error)
         } else {
@@ -5569,12 +5591,12 @@ impl Daemon {
                 Err(error) => Err(error),
                 Ok(()) => loop {
                     tokio::select! {
-                        accepted = self.listener.accept() => {
+                        accepted = self.listener.accept(), if connections.len() < max_connections => {
                             match accepted {
                                 Ok((stream, _)) => {
                                     let handler = self.handler.clone();
                                     let max_frame_bytes = self.max_frame_bytes;
-                                    connections.push(tokio::task::spawn_local(async move {
+                                    connections.spawn_local(async move {
                                         if let Err(error) = serve_connection_with_max_frame_bytes(
                                             stream,
                                             handler,
@@ -5584,9 +5606,29 @@ impl Daemon {
                                         {
                                             eprintln!("tally: RPC connection failed: {error}");
                                         }
-                                    }));
+                                    });
+                                    #[cfg(test)]
+                                    if let Some(hook) = &connection_count_hook {
+                                        let _ = hook.send(connections.len());
+                                    }
+                                }
+                                Err(source) if retryable_accept_error(&source) => {
+                                    eprintln!(
+                                        "tally: RPC accept failed, retrying after {} ms: {source}",
+                                        ACCEPT_ERROR_BACKOFF.as_millis()
+                                    );
+                                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                                 }
                                 Err(source) => break Err(io_error(&socket_path, source)),
+                            }
+                        }
+                        Some(joined) = connections.join_next(), if !connections.is_empty() => {
+                            if let Err(error) = joined {
+                                eprintln!("tally: RPC connection task failed: {error}");
+                            }
+                            #[cfg(test)]
+                            if let Some(hook) = &connection_count_hook {
+                                let _ = hook.send(connections.len());
                             }
                         }
                         Some(finished) = self.completion_rx.recv() => {
@@ -5666,10 +5708,7 @@ impl Daemon {
                 }
             }
         }
-        for connection in connections {
-            connection.abort();
-            let _ = connection.await;
-        }
+        connections.shutdown().await;
         // Pool-loss application crosses physical reclaim and canonical witness
         // writes. RPC connection cancellation must not detach or abort that
         // transaction; join it under the daemon's exclusive state lock.
@@ -8202,6 +8241,7 @@ mod tests {
     use std::sync::Arc;
 
     use tempfile::tempdir;
+    use tokio::net::UnixStream;
 
     use super::*;
     use crate::adapters::{
@@ -8711,6 +8751,7 @@ mod tests {
                 },
                 max_attempts: 1,
             },
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 
@@ -8734,6 +8775,116 @@ mod tests {
         Daemon::open_with_executor(one_pool_config(), paths.clone(), settings(), executor)
             .await
             .unwrap()
+    }
+
+    async fn wait_for_connection_count(
+        counts: &mut mpsc::UnboundedReceiver<usize>,
+        expected: usize,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let count = counts
+                    .recv()
+                    .await
+                    .expect("connection count hook must remain open");
+                if count == expected {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("connection count did not reach {expected}"));
+    }
+
+    #[test]
+    fn retryable_accept_errors_are_explicit() {
+        for errno in [libc::EMFILE, libc::ENFILE, libc::ECONNABORTED, libc::EINTR] {
+            assert!(retryable_accept_error(&io::Error::from_raw_os_error(errno)));
+        }
+        assert!(!retryable_accept_error(&io::Error::from_raw_os_error(
+            libc::EINVAL
+        )));
+    }
+
+    #[test]
+    fn daemon_settings_reject_zero_max_connections() {
+        let mut invalid = settings();
+        invalid.max_connections = 0;
+        assert!(matches!(
+            invalid.validate(),
+            Err(DaemonError::Invalid(message)) if message == "max connections must be positive"
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn completed_connections_are_reaped() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut daemon = fs1_daemon(&paths).await;
+                let (count_tx, mut count_rx) = mpsc::unbounded_channel();
+                daemon.connection_count_hook = Some(count_tx);
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+
+                let mut clients = Vec::new();
+                for _ in 0..10 {
+                    clients.push(UnixStream::connect(&paths.socket).await.unwrap());
+                }
+                wait_for_connection_count(&mut count_rx, 10).await;
+
+                drop(clients);
+                wait_for_connection_count(&mut count_rx, 0).await;
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn max_connections_defers_serving_until_a_slot_opens() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut daemon = fs1_daemon(&paths).await;
+                daemon.handler.settings.max_connections = 2;
+                let (count_tx, mut count_rx) = mpsc::unbounded_channel();
+                daemon.connection_count_hook = Some(count_tx);
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+
+                let first = UnixStream::connect(&paths.socket).await.unwrap();
+                let second = UnixStream::connect(&paths.socket).await.unwrap();
+                wait_for_connection_count(&mut count_rx, 2).await;
+
+                let third = RpcClient::connect(&paths.socket).await.unwrap();
+                let mut third_call = tokio::task::spawn_local(async move {
+                    third.call("query.status", Some(json!({}))).await
+                });
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(50), &mut third_call)
+                        .await
+                        .is_err(),
+                    "a connection beyond the cap was served before a slot opened"
+                );
+
+                drop(first);
+                tokio::time::timeout(Duration::from_secs(1), &mut third_call)
+                    .await
+                    .expect("the deferred connection must be served after a slot opens")
+                    .unwrap()
+                    .unwrap();
+
+                drop(second);
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]

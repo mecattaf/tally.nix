@@ -17,7 +17,7 @@ use tally_client::{
 use tally_core::authorship::verify_authorship;
 use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
 use tally_core::config::Priority;
-use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings};
+use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings, DEFAULT_MAX_CONNECTIONS};
 use tally_core::evidence::RetryPolicy;
 use tally_core::exec_attestation::{
     compare as compare_witness_attestations, read_verified_exec_attestations, run_exec,
@@ -1503,6 +1503,7 @@ async fn run_daemon_runtime(
                 },
                 max_attempts: 2,
             },
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         },
         recorder_program,
     )
