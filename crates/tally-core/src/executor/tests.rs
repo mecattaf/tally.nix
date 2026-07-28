@@ -1155,6 +1155,11 @@ fn invalid_limits_runtime_paths_and_credentials_are_rejected() {
     invalid = request();
     invalid.cwd = Some(PathBuf::from("/work/%n"));
     assert!(executor.build_systemd_argv(&invalid).is_err());
+    for token in ["a".repeat(63), "A".repeat(64), "g".repeat(64)] {
+        invalid = request();
+        invalid.job_token = Some(token);
+        assert!(executor.build_systemd_argv(&invalid).is_err());
+    }
     invalid = request();
     invalid.credentials = BTreeMap::from([("secret".to_owned(), PathBuf::from("/run/keys/%n"))]);
     assert!(executor.build_systemd_argv(&invalid).is_err());

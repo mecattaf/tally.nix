@@ -17,21 +17,7 @@ pub(super) struct GhTerminalWork {
 
 impl DaemonHandler {
     pub(super) fn complete_terminal_post_ack(&self, work: TerminalWork) {
-        if let Some(job_token_hash) = &work.job.row.job_token_hash {
-            if self
-                .job_tokens
-                .borrow_mut()
-                .remove(job_token_hash)
-                .is_some_and(|job_id| job_id != work.job.job_id)
-            {
-                let error = DaemonError::Invalid(format!(
-                    "job token hash for {} was registered to another job",
-                    work.job.stable_key()
-                ));
-                eprintln!("tally: {error}");
-                let _ = self.fatal.send(error);
-            }
-        }
+        self.revoke_job_token(&work.job);
         if self.commits.send(CommitCommand::Rebuild).is_err() {
             eprintln!("tally: post-ack replica worker stopped before terminal projection");
         }
@@ -59,6 +45,24 @@ impl DaemonHandler {
         self.emit_scraped_completion(work.job, work.result, work.evidence, work.scrape_capture);
         for job in work.launches {
             self.spawn_execution(job);
+        }
+    }
+
+    pub(super) fn revoke_job_token(&self, job: &Job) {
+        if let Some(job_token_hash) = &job.row.job_token_hash {
+            if self
+                .job_tokens
+                .borrow_mut()
+                .remove(job_token_hash)
+                .is_some_and(|job_id| job_id != job.job_id)
+            {
+                let error = DaemonError::Invalid(format!(
+                    "job token hash for {} was registered to another job",
+                    job.stable_key()
+                ));
+                eprintln!("tally: {error}");
+                let _ = self.fatal.send(error);
+            }
         }
     }
 
@@ -348,8 +352,7 @@ impl DaemonHandler {
                 &executor,
                 &job,
                 limits,
-                &tally_socket,
-                job_token.as_deref(),
+                (&tally_socket, job_token.as_deref()),
                 &brief_root,
                 &git_ai,
                 exec_attestations,
@@ -395,7 +398,7 @@ impl DaemonHandler {
         });
     }
 
-    async fn prepare_execution(
+    pub(super) async fn prepare_execution(
         &self,
         job: &mut Job,
     ) -> Result<Option<Option<String>>, DaemonError> {
@@ -576,12 +579,12 @@ pub(super) fn execution_request(
     executor: &Executor,
     job: &Job,
     limits: UnitLimits,
-    tally_socket: &str,
-    job_token: Option<&str>,
+    local_environment: (&str, Option<&str>),
     brief_root: &Path,
     git_ai_config: &GitAiConfig,
     exec_attestations: bool,
 ) -> Result<ExecutionRequest, ExecutorError> {
+    let (tally_socket, job_token) = local_environment;
     let brief_path = job.row.brief_hash.as_deref().map(|hash| {
         brief::content_path(brief_root, hash)
             .expect("validated durable briefHash always derives a content path")
@@ -665,7 +668,7 @@ fn mint_job_token() -> Result<String, DaemonError> {
     Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-fn hash_job_token(job_token: &str) -> String {
+pub(super) fn hash_job_token(job_token: &str) -> String {
     format!("sha256:{:x}", Sha256::digest(job_token.as_bytes()))
 }
 

@@ -107,6 +107,7 @@ async fn enqueue(socket: &Path, args: &[&str]) -> std::process::Output {
         .arg("enqueue")
         .args(args)
         .env_remove("TALLY_JOB_ID")
+        .env_remove("TALLY_JOB_TOKEN")
         .output()
         .await
         .unwrap()

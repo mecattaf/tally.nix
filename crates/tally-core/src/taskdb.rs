@@ -2499,6 +2499,22 @@ mod tests {
     }
 
     #[test]
+    fn durable_job_token_hash_accepts_only_lowercase_sha256() {
+        let mut row = seed(Uuid::new_v4());
+        row.job_token_hash = Some(format!("sha256:{}", "a".repeat(64)));
+        row.validate().unwrap();
+
+        for invalid in [
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}", "A".repeat(64)),
+            "sha512:not-a-token-hash".to_owned(),
+        ] {
+            row.job_token_hash = Some(invalid);
+            assert!(row.validate().is_err());
+        }
+    }
+
+    #[test]
     fn durable_pool_emission_is_always_array_and_legacy_scalars_still_load() {
         let singleton = seed(Uuid::new_v4());
         let encoded = serde_json::to_value(&singleton).unwrap();

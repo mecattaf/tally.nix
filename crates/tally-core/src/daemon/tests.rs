@@ -564,6 +564,109 @@ mod tests {
             .unwrap()
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn local_execution_token_is_durable_resolvable_remote_safe_and_revocable() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "priority": "high",
+                        "adapter": "shell",
+                        "source": "orchestrator",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let job_id = Uuid::parse_str(admitted["job_id"].as_str().unwrap()).unwrap();
+                let mut job = {
+                    let mut context = daemon.handler.context.write().await;
+                    let stored = context.jobs.get_mut(&job_id).unwrap();
+                    assert_eq!(stored.state, JobState::Paused);
+                    stored.state = JobState::Running;
+                    stored.clone()
+                };
+
+                let token = daemon
+                    .handler
+                    .prepare_execution(&mut job)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(token.len(), 64);
+                assert!(token
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)));
+                let digest = hash_job_token(&token);
+                assert_eq!(
+                    daemon.handler.job_tokens.borrow().get(&digest),
+                    Some(&job_id)
+                );
+                assert_eq!(job.row.job_token_hash.as_deref(), Some(digest.as_str()));
+                assert_eq!(
+                    daemon.handler.context.read().await.rows[&job_id]
+                        .job_token_hash
+                        .as_deref(),
+                    Some(digest.as_str())
+                );
+
+                let events = read_acknowledged_events(&paths.events_dir()).unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(
+                    events[0].row.job_token_hash.as_deref(),
+                    Some(digest.as_str())
+                );
+                assert!(!serde_json::to_string(&events[0]).unwrap().contains(&token));
+
+                let request = execution_request(
+                    &daemon.handler.executor,
+                    &job,
+                    settings().unit_limits,
+                    ("/run/tally/tally.sock", Some(&token)),
+                    &paths.data_dir,
+                    &GitAiConfig::default(),
+                    false,
+                )
+                .unwrap();
+                assert_eq!(
+                    request.tally_socket.as_deref(),
+                    Some("/run/tally/tally.sock")
+                );
+                assert_eq!(request.job_token.as_deref(), Some(token.as_str()));
+
+                let mut remote = job.clone();
+                remote.row.executor = Some("remote-worker".to_owned());
+                let remote_request = execution_request(
+                    &daemon.handler.executor,
+                    &remote,
+                    settings().unit_limits,
+                    ("/run/tally/tally.sock", Some(&token)),
+                    &paths.data_dir,
+                    &GitAiConfig::default(),
+                    false,
+                )
+                .unwrap();
+                assert!(remote_request.tally_socket.is_none());
+                assert!(remote_request.job_token.is_none());
+
+                daemon.handler.revoke_job_token(&job);
+                assert!(!daemon.handler.job_tokens.borrow().contains_key(&digest));
+            })
+            .await;
+    }
+
     async fn wait_for_connection_count(
         counts: &mut mpsc::UnboundedReceiver<usize>,
         expected: usize,
@@ -3067,8 +3170,7 @@ mod tests {
                     &executor,
                     &job,
                     settings().unit_limits,
-                    "/run/tally/tally.sock",
-                    None,
+                    ("/run/tally/tally.sock", None),
                     &paths.data_dir,
                     &GitAiConfig::default(),
                     false,
@@ -3294,8 +3396,7 @@ mod tests {
                     &executor,
                     &job,
                     settings().unit_limits,
-                    "/run/tally/tally.sock",
-                    None,
+                    ("/run/tally/tally.sock", None),
                     &paths.data_dir,
                     &GitAiConfig::default(),
                     false,
@@ -5498,6 +5599,8 @@ mod tests {
                 assert_eq!(bump_epoch(&paths.state_dir).unwrap(), 1);
                 let mut row = durable_row(Uuid::new_v4(), "restart-multi-pool", 1);
                 row.pools = vec!["slot".to_owned(), "zeta".to_owned()];
+                let token_hash = hash_job_token(&"ab".repeat(32));
+                row.job_token_hash = Some(token_hash.clone());
                 write_enqueue_event_atomic(
                     &paths.events_dir(),
                     &DurableEnqueueEvent::new(row.clone()).unwrap(),
@@ -5531,6 +5634,10 @@ mod tests {
                 assert_eq!(context.lease.engine().held_in_pool("zeta").unwrap(), 1);
                 assert_eq!(context.lease.engine().queue_len(), 0);
                 drop(context);
+                assert_eq!(
+                    daemon.handler.job_tokens.borrow().get(&token_hash),
+                    Some(&row.uuid)
+                );
 
                 let lease_log =
                     fs::read_to_string(paths.state_dir.join(crate::lease::LEASE_EVENTS_FILE))

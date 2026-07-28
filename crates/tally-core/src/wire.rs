@@ -2166,6 +2166,23 @@ mod tests {
     }
 
     #[test]
+    fn caller_job_token_is_additive_and_uses_the_camel_case_wire_key() {
+        let mut payload = child_payload();
+        let legacy = serde_json::to_value(&payload).unwrap();
+        assert!(legacy.get("callerJobToken").is_none());
+
+        payload.caller_job_token = Some("ab".repeat(32));
+        let encoded = serde_json::to_value(&payload).unwrap();
+        assert_eq!(encoded["callerJobToken"], "ab".repeat(32));
+        assert_eq!(
+            serde_json::from_value::<EnqueuePayload>(encoded)
+                .unwrap()
+                .caller_job_token,
+            payload.caller_job_token
+        );
+    }
+
+    #[test]
     fn full_mode_flow_rejects_kernel_only_hashed_fields() {
         let mut payload = child_payload();
         payload.caller_job_id = None;

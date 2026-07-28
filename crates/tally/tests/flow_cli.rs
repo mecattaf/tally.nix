@@ -305,6 +305,10 @@ fn flow_run_captures_identity_then_starts_worker_with_task_uuid_absent() {
         .arg(fixture("catalog.json"))
         .env("TALLY_TASK_UUID", "00000000-0000-4000-8000-000000000048")
         .env("TALLY_JOB_ID", "00000000-0000-4000-8000-000000000048")
+        .env(
+            "TALLY_JOB_TOKEN",
+            "abababababababababababababababababababababababababababababababab",
+        )
         .output()
         .unwrap();
     server.join().unwrap();
@@ -351,6 +355,7 @@ fn flow_run_script_failure_has_a_distinguished_exit_and_structured_capture_event
         ])
         .env_remove("TALLY_TASK_UUID")
         .env_remove("TALLY_JOB_ID")
+        .env_remove("TALLY_JOB_TOKEN")
         .output()
         .unwrap();
     server.join().unwrap();
@@ -393,6 +398,7 @@ fn flow_run_without_config_names_the_missing_default_before_connecting() {
         .env_remove("HOME")
         .env_remove("TALLY_TASK_UUID")
         .env_remove("TALLY_JOB_ID")
+        .env_remove("TALLY_JOB_TOKEN")
         .output()
         .unwrap();
 

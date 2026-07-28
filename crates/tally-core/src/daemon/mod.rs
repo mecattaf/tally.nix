@@ -16,14 +16,14 @@ pub use supervise::{
 #[cfg(test)]
 pub(crate) use barriers::WaitRegistration;
 pub(crate) use barriers::{await_registration, parse_job_barrier, single_job_barrier_value};
-#[cfg(test)]
-use completion::execution_request;
 use completion::{
     append_context_witness, append_daemon_witness, canonical_job_model, canonical_verdict,
     completed_event, effective_gate_manifest, enqueued_event, execution_fact_for_termination,
     finalize_forced_locked, forced_witness, lock_gcroot_registration, release_child_charge,
     substituted_witness, GhTerminalWork, TerminalWork,
 };
+#[cfg(test)]
+use completion::{execution_request, hash_job_token};
 pub(crate) use notify::watchdog_tick;
 pub(crate) use replica::{spawn_commit_worker, CommitCommand, ReplicaCommitter, TaskDbCommitter};
 use rpc::control::{find_job, lease_request, lease_wire, state_name};

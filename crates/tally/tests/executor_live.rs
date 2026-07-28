@@ -200,6 +200,7 @@ sleep 3
         "tally-live-credential".to_owned(),
         credential_copy.to_string_lossy().into_owned(),
     ]);
+    success.job_token = Some("ab".repeat(32));
     success
         .credentials
         .insert("token".to_owned(), credential.clone());
@@ -232,6 +233,7 @@ sleep 3
         "TALLY_CLASS",
         "TALLY_NO_ENQUEUE",
         "TALLY_CREDENTIALS",
+        "TALLY_JOB_TOKEN",
     ] {
         assert!(properties.contains(name), "missing {name} in {properties}");
     }
