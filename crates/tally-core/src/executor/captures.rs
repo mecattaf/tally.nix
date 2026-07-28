@@ -213,6 +213,44 @@ pub(super) fn replace_private_file(path: &Path, contents: &[u8]) -> Result<(), E
     result
 }
 
+pub(super) fn ensure_private_file(path: &Path) -> Result<(), ExecutorError> {
+    let parent = path.parent().ok_or_else(|| {
+        ExecutorError::InvalidRequest("private file path has no parent".to_owned())
+    })?;
+    let (file, created) = match OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (
+            OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(path)
+                .map_err(|source| io_error(path, source))?,
+            false,
+        ),
+        Err(source) => return Err(io_error(path, source)),
+    };
+    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "private file {} must be a regular file with one link",
+            path.display()
+        )));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|source| io_error(path, source))?;
+    if created {
+        file.sync_all().map_err(|source| io_error(path, source))?;
+        sync_directory(parent)?;
+    }
+    Ok(())
+}
+
 pub(super) fn copy_private_file_exclusive(
     source: &Path,
     destination: &Path,

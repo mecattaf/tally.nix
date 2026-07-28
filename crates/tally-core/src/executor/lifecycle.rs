@@ -387,6 +387,7 @@ impl Executor {
             },
         )?;
         self.materialize_gh_context(&request)?;
+        self.prepare_hardening_files(&request)?;
         let args = self.build_systemd_argv_with_git_ai(&request, git_ai_runtime)?;
         let output = match Command::new(&self.systemd_run).args(&args).output().await {
             Ok(output) => {
@@ -793,6 +794,15 @@ impl Executor {
                 .validate()
                 .map_err(|error| ExecutorError::InvalidRequest(error.to_string()))?;
         }
+        for path in &request.extra_writable_paths {
+            if !path.is_absolute() {
+                return Err(ExecutorError::InvalidRequest(format!(
+                    "extra writable path {} must be absolute",
+                    path.display()
+                )));
+            }
+            validate_systemd_path(path, "extra writable path")?;
+        }
         Ok(())
     }
 
@@ -816,6 +826,22 @@ impl Executor {
         let path = self.gh_context_path(&request.identity);
         replace_private_file(&path, &serde_json::to_vec(context)?)?;
         Ok(Some(path))
+    }
+
+    fn prepare_hardening_files(&self, request: &ExecutionRequest) -> Result<(), ExecutorError> {
+        if !matches!(
+            request.hardening,
+            AdapterHardening::Strict | AdapterHardening::Production
+        ) {
+            return Ok(());
+        }
+        if request.exec_attestation.is_some() {
+            ensure_private_file(&self.state_dir.join(EXEC_ATTESTATION_LEDGER))?;
+        }
+        if let Some(manifest) = &request.gate_manifest {
+            ensure_private_file(&manifest.path)?;
+        }
+        Ok(())
     }
 
     pub(super) fn exec_stop_post(

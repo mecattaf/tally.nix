@@ -531,6 +531,7 @@ pub(super) fn execution_request(
             evidence: job.row.evidence.clone(),
         }),
         hardening: job.invocation.hardening,
+        extra_writable_paths: job.invocation.extra_writable_paths.clone(),
         credentials: job.row.credentials.clone(),
         limits,
         runtime_max_sec: job.row.runtime_max_sec,

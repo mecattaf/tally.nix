@@ -552,6 +552,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                     ]),
                     launch: tally_core::adapters::AdapterLaunchConfig::default(),
                     hardening: Default::default(),
+                    extra_writable_paths: Vec::new(),
                     skill_bundle: None,
                     skill_revision: None,
                     extra_config: BTreeMap::from([(

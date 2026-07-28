@@ -1613,6 +1613,7 @@ pub(super) fn recovery_adapter_invocation(
                 argv: row.argv.clone(),
                 env: BTreeMap::new(),
                 hardening: engine.adapter(&row.adapter)?.hardening,
+                extra_writable_paths: engine.adapter(&row.adapter)?.extra_writable_paths.clone(),
                 yield_hook: None,
             },
             None,

@@ -513,6 +513,7 @@ mod tests {
             env: BTreeMap::from([("CUSTOM_AGENT_MODE".to_owned(), "batch".to_owned())]),
             launch: crate::adapters::AdapterLaunchConfig::default(),
             hardening: Default::default(),
+            extra_writable_paths: Vec::new(),
             skill_bundle: None,
             skill_revision: None,
             extra_config: BTreeMap::from([(
@@ -2064,6 +2065,7 @@ mod tests {
                         env: BTreeMap::new(),
                         launch: crate::adapters::AdapterLaunchConfig::default(),
                         hardening: Default::default(),
+                        extra_writable_paths: Vec::new(),
                         skill_bundle: None,
                         skill_revision: None,
                         extra_config: BTreeMap::new(),
@@ -2326,6 +2328,7 @@ mod tests {
                 argv: vec!["true".to_owned()],
                 env: BTreeMap::new(),
                 hardening: Default::default(),
+                extra_writable_paths: Vec::new(),
                 yield_hook: None,
             },
             labor_class: LaborClass::Fresh,

@@ -95,6 +95,8 @@ pub struct ExecutionRequest {
     pub exec_attestation: Option<ExecAttestationContext>,
     #[serde(default, skip_serializing_if = "AdapterHardening::is_none")]
     pub hardening: AdapterHardening,
+    #[serde(default)]
+    pub extra_writable_paths: Vec<PathBuf>,
     pub credentials: BTreeMap<String, PathBuf>,
     pub limits: UnitLimits,
     pub runtime_max_sec: Option<u64>,

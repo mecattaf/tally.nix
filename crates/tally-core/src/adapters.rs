@@ -5,7 +5,7 @@ use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,7 @@ pub enum ScrapeMode {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum AdapterHardening {
+    Production,
     Strict,
     Workspace,
     #[default]
@@ -151,6 +152,8 @@ pub struct AdapterConfig {
     pub launch: AdapterLaunchConfig,
     #[serde(default, skip_serializing_if = "AdapterHardening::is_none")]
     pub hardening: AdapterHardening,
+    #[serde(default)]
+    pub extra_writable_paths: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_bundle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -176,6 +179,7 @@ pub struct AdapterInvocation {
     pub argv: Vec<String>,
     pub env: BTreeMap<String, String>,
     pub hardening: AdapterHardening,
+    pub extra_writable_paths: Vec<PathBuf>,
     /// Direct checkpoint probe installed by the harness integration. Tally
     /// deliberately does not run it on a timer: the harness owns its safe
     /// checkpoints, and the no-argument preset probe resolves TALLY_JOB_ID.
@@ -457,6 +461,7 @@ fn invocation(
         argv,
         env,
         hardening: adapter.hardening,
+        extra_writable_paths: adapter.extra_writable_paths.clone(),
         yield_hook: adapter.yield_hook.clone(),
     })
 }
@@ -645,6 +650,31 @@ fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterEr
     }
     if let Some(hook) = &adapter.yield_hook {
         validate_argv(name, "yieldHook", hook, false)?;
+    }
+    for path in &adapter.extra_writable_paths {
+        if !path.is_absolute() {
+            return invalid_config(
+                name,
+                format!(
+                    "extraWritablePaths entry {} must be absolute",
+                    path.display()
+                ),
+            );
+        }
+        let Some(path) = path.to_str() else {
+            return invalid_config(
+                name,
+                "extraWritablePaths entries must be valid UTF-8".to_owned(),
+            );
+        };
+        if path.chars().any(char::is_control) || path.contains('%') {
+            return invalid_config(
+                name,
+                format!(
+                    "extraWritablePaths entry {path:?} must contain no control or systemd specifier characters"
+                ),
+            );
+        }
     }
     for (env_name, value) in &adapter.env {
         if !valid_environment_name(env_name)
@@ -1098,6 +1128,7 @@ mod tests {
             env: BTreeMap::from([("AGENT_COLOR".to_owned(), "never".to_owned())]),
             launch: AdapterLaunchConfig::default(),
             hardening: AdapterHardening::None,
+            extra_writable_paths: Vec::new(),
             skill_bundle: None,
             skill_revision: None,
             extra_config: BTreeMap::from([(
@@ -1189,6 +1220,34 @@ mod tests {
                 .hardening,
             AdapterHardening::Strict
         );
+
+        let production: AdapterConfig = serde_json::from_value(serde_json::json!({
+            "argv": ["agent"],
+            "hardening": "production",
+            "extraWritablePaths": ["/home/agent/.config/agent"]
+        }))
+        .unwrap();
+        let adapters = BTreeMap::from([("production-agent".to_owned(), production)]);
+        engine(&adapters).validate_all().unwrap();
+        let invocation = engine(&adapters).launch("production-agent", &[]).unwrap();
+        assert_eq!(invocation.hardening, AdapterHardening::Production);
+        assert_eq!(
+            invocation.extra_writable_paths,
+            [PathBuf::from("/home/agent/.config/agent")]
+        );
+
+        let relative: AdapterConfig = serde_json::from_value(serde_json::json!({
+            "argv": ["agent"],
+            "hardening": "production",
+            "extraWritablePaths": [".config/agent"]
+        }))
+        .unwrap();
+        let adapters = BTreeMap::from([("relative-agent".to_owned(), relative)]);
+        assert!(matches!(
+            engine(&adapters).validate_all(),
+            Err(AdapterError::InvalidConfig { detail, .. })
+                if detail.contains("extraWritablePaths entry .config/agent must be absolute")
+        ));
         assert!(serde_json::from_value::<AdapterConfig>(serde_json::json!({
             "argv": ["agent"],
             "hardening": "almost-strict"
