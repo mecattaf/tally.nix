@@ -549,10 +549,13 @@ fn open_capture(path: &Path) -> Result<(std::fs::File, std::fs::Metadata), Trace
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Seek, SeekFrom, Write};
+
     use super::*;
     use crate::adapters::{AdapterTrace, TraceFraming};
     use crate::history::RetentionMetadata;
     use crate::query_v2::{QueryChainHead, QuerySnapshotMetadata};
+    use proptest::prelude::*;
 
     fn snapshot() -> QuerySnapshotMetadata {
         QuerySnapshotMetadata {
@@ -806,6 +809,42 @@ mod tests {
                 TraceCapability::Unavailable
             );
             assert_eq!(trace.generations[0].reason, expected_reason);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn oversized_capture_discards_every_arbitrary_incomplete_suffix(
+            incomplete_suffix in prop::collection::vec(
+                prop_oneof![0_u8..=9, 11_u8..=u8::MAX],
+                0..4097,
+            ),
+            overflow_bytes in 1_u64..=4096,
+        ) {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("capture.jsonl");
+            let mut file = std::fs::File::create(&path).unwrap();
+            file.set_len(MAX_TRACE_CAPTURE_BYTES + overflow_bytes).unwrap();
+            let last_newline = MAX_TRACE_CAPTURE_BYTES
+                - incomplete_suffix.len() as u64
+                - 1;
+            file.seek(SeekFrom::Start(last_newline)).unwrap();
+            file.write_all(b"\n").unwrap();
+            file.write_all(&incomplete_suffix).unwrap();
+            file.sync_all().unwrap();
+            drop(file);
+
+            let capture = read_capture(&path).unwrap();
+            prop_assert_eq!(
+                capture.byte_count,
+                MAX_TRACE_CAPTURE_BYTES + overflow_bytes,
+            );
+            prop_assert_eq!(
+                capture.truncation.as_deref(),
+                Some(TRACE_READ_TRUNCATION),
+            );
+            prop_assert_eq!(capture.bytes.len() as u64, last_newline + 1);
+            prop_assert_eq!(capture.bytes.last(), Some(&b'\n'));
         }
     }
 }
