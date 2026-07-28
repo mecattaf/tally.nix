@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -94,8 +95,14 @@ fn io_error(path: &Path, source: std::io::Error) -> ChangeError {
 pub struct ChangeStore {
     path: PathBuf,
     file: File,
-    records: Vec<ChangeRecord>,
+    records: VecDeque<ChangeRecord>,
     capacity: usize,
+    // Records currently on disk. The durable file is allowed to hold up to
+    // 2*capacity records so that steady-state appends are O(1); the whole-file
+    // rewrite runs only when this counter reaches that threshold, dropping the
+    // file back to the newest `capacity` records. The in-memory window served
+    // by watch() is always trimmed to exactly `capacity`.
+    disk_records: usize,
 }
 
 impl ChangeStore {
@@ -148,24 +155,33 @@ impl ChangeStore {
             records.push(serde_json::from_slice::<ChangeRecord>(line)?);
         }
         validate_records(&records)?;
-        if records.len() > capacity {
+        let disk_records = if records.len() >= capacity.saturating_mul(2) {
+            // A crash may have interrupted the previous owner between the
+            // threshold append and its rewrite; finish the drop to the newest
+            // `capacity` records now.
             records = records.split_off(records.len() - capacity);
-            rewrite(&path, &records)?;
+            rewrite(&path, records.iter())?;
             file = OpenOptions::new()
                 .read(true)
                 .append(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(&path)
                 .map_err(|source| io_error(&path, source))?;
+            capacity
         } else {
             file.seek(SeekFrom::End(0))
                 .map_err(|source| io_error(&path, source))?;
+            records.len()
+        };
+        if records.len() > capacity {
+            records = records.split_off(records.len() - capacity);
         }
         Ok(Self {
             path,
             file,
-            records,
+            records: records.into(),
             capacity,
+            disk_records,
         })
     }
 
@@ -176,7 +192,7 @@ impl ChangeStore {
     ) -> Result<ChangeRecord, ChangeError> {
         let sequence = self
             .records
-            .last()
+            .back()
             .map_or(1, |record| record.sequence.saturating_add(1));
         let record = ChangeRecord {
             schema_version: CHANGE_SCHEMA_VERSION,
@@ -193,16 +209,20 @@ impl ChangeStore {
             .write_all(&encoded)
             .and_then(|_| self.file.sync_all())
             .map_err(|source| io_error(&self.path, source))?;
-        self.records.push(record.clone());
+        self.records.push_back(record.clone());
         if self.records.len() > self.capacity {
-            self.records.remove(0);
-            rewrite(&self.path, &self.records)?;
+            self.records.pop_front();
+        }
+        self.disk_records += 1;
+        if self.disk_records >= self.capacity.saturating_mul(2) {
+            rewrite(&self.path, self.records.iter())?;
             self.file = OpenOptions::new()
                 .read(true)
                 .append(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(&self.path)
                 .map_err(|source| io_error(&self.path, source))?;
+            self.disk_records = self.records.len();
         }
         Ok(record)
     }
@@ -218,8 +238,8 @@ impl ChangeStore {
                 "watch limit must be between 1 and {MAX_WATCH_PAGE_ITEMS}"
             )));
         }
-        let earliest = self.records.first().map(|record| record.sequence);
-        let latest = self.records.last().map(|record| record.sequence);
+        let earliest = self.records.front().map(|record| record.sequence);
+        let latest = self.records.back().map(|record| record.sequence);
         if after.is_none() {
             return Ok(self.envelope(
                 WatchStatus::Ok,
@@ -287,15 +307,15 @@ impl ChangeStore {
             status,
             items,
             next_cursor,
-            earliest_available_cursor: self.records.first().map(|record| record.cursor.clone()),
+            earliest_available_cursor: self.records.front().map(|record| record.cursor.clone()),
             resume_after_cursor: (status == WatchStatus::CursorExpired).then(|| {
                 change_cursor(
                     self.records
-                        .first()
+                        .front()
                         .map_or(0, |record| record.sequence.saturating_sub(1)),
                 )
             }),
-            latest_cursor: self.records.last().map(|record| record.cursor.clone()),
+            latest_cursor: self.records.back().map(|record| record.cursor.clone()),
             retention_limit: self.capacity,
             termination,
         }
@@ -345,7 +365,10 @@ fn ensure_private(path: &Path) -> Result<(), ChangeError> {
     Ok(())
 }
 
-fn rewrite(path: &Path, records: &[ChangeRecord]) -> Result<(), ChangeError> {
+fn rewrite<'a>(
+    path: &Path,
+    records: impl Iterator<Item = &'a ChangeRecord> + Clone,
+) -> Result<(), ChangeError> {
     let parent = path
         .parent()
         .ok_or_else(|| ChangeError::Invalid("change path has no parent".to_owned()))?;
@@ -358,7 +381,7 @@ fn rewrite(path: &Path, records: &[ChangeRecord]) -> Result<(), ChangeError> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&temporary)
             .map_err(|source| io_error(&temporary, source))?;
-        for record in records {
+        for record in records.clone() {
             serde_json::to_writer(&mut file, record)?;
             file.write_all(b"\n")
                 .map_err(|source| io_error(&temporary, source))?;
@@ -409,6 +432,88 @@ mod tests {
             }
         }
         assert_eq!(observed, (0..10).collect::<Vec<_>>());
+    }
+
+    fn inode(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).unwrap().ino()
+    }
+
+    #[test]
+    fn three_capacities_of_appends_cause_at_most_two_rewrites() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(CHANGE_FILE);
+        let mut store = ChangeStore::open_with_capacity(temp.path(), 8).unwrap();
+        // The whole-file rewrite is observable as an inode change: it writes a
+        // temp file and renames it over the log.
+        let mut current = inode(&path);
+        let mut rewrites = 0;
+        for index in 0..24 {
+            store
+                .append_now(ChangeKind::Job, serde_json::json!({"index": index}))
+                .unwrap();
+            let now = inode(&path);
+            if now != current {
+                rewrites += 1;
+                current = now;
+            }
+        }
+        assert!(rewrites <= 2, "expected at most 2 rewrites, saw {rewrites}");
+        // The in-memory watch window still serves exactly the newest capacity.
+        let expired = store.watch(Some(&change_cursor(0)), None).unwrap();
+        assert_eq!(expired.status, WatchStatus::CursorExpired);
+        let resumed = store
+            .watch(expired.resume_after_cursor.as_deref(), Some(1_000))
+            .unwrap();
+        assert_eq!(
+            resumed
+                .items
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            (17..=24).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn crash_between_threshold_append_and_rewrite_reopens_gap_free() {
+        let temp = tempfile::tempdir().unwrap();
+        // Produce a durable file holding exactly 2*8 records without a rewrite
+        // by writing under a larger capacity: this is byte-identical to a
+        // crash after the threshold append but before the amortized rewrite.
+        {
+            let mut store = ChangeStore::open_with_capacity(temp.path(), 100).unwrap();
+            for index in 0..16 {
+                store
+                    .append_now(ChangeKind::Lifecycle, serde_json::json!({"index": index}))
+                    .unwrap();
+            }
+        }
+        let store = ChangeStore::open_with_capacity(temp.path(), 8).unwrap();
+        let bytes = std::fs::read(temp.path().join(CHANGE_FILE)).unwrap();
+        let sequences = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| {
+                serde_json::from_slice::<ChangeRecord>(line)
+                    .unwrap()
+                    .sequence
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(sequences, (9..=16).collect::<Vec<_>>());
+        let page = store.watch(Some(&change_cursor(8)), Some(1_000)).unwrap();
+        assert_eq!(page.status, WatchStatus::Ok);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|record| record.sequence)
+                .collect::<Vec<_>>(),
+            (9..=16).collect::<Vec<_>>()
+        );
+        let done = store
+            .watch(Some(page.next_cursor.as_deref().unwrap()), Some(1_000))
+            .unwrap();
+        assert!(done.items.is_empty(), "resume produced duplicates");
     }
 
     // Characterization: observable durable behavior only. These tests assert

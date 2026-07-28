@@ -34,7 +34,9 @@ mod tests {
         GhContextSnapshot, GhItemState, GhItemType, GhOrigin, WorkspaceMetadata,
         GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
     };
-    use crate::witness::{Authorship, AuthorshipSession, AuthorshipStatus};
+    use crate::witness::{
+        append_attestation, verify_attestations, Authorship, AuthorshipSession, AuthorshipStatus,
+    };
     use tally_client::RpcClient;
 
     fn direct_executor(state_dir: &Path) -> Executor {
@@ -4891,13 +4893,14 @@ mod tests {
             previous_lease_epoch: 1,
         };
         let attestation_path = temp.path().join("attestations.jsonl");
+        let mut attestations = SharedAttestations::new(attestation_path.clone());
         fs::write(
             &capture_paths.capture_generation,
             r#"{"attempt":0,"leaseEpoch":1}"#,
         )
         .unwrap();
         assert!(
-            recovery_adapter_invocation(&config, &action, &row, &executor, &attestation_path)
+            recovery_adapter_invocation(&config, &action, &row, &executor, &mut attestations)
                 .unwrap_err()
                 .to_string()
                 .contains("does not match prior attempt")
@@ -4915,13 +4918,13 @@ mod tests {
             &action,
             &row,
             &executor,
-            &blocked_attestation,
+            &mut SharedAttestations::new(blocked_attestation),
         )
         .is_err());
         assert_eq!(fs::read(&capture_paths.stdout).unwrap(), original);
 
         let (invocation, captures) =
-            recovery_adapter_invocation(&config, &action, &row, &executor, &attestation_path)
+            recovery_adapter_invocation(&config, &action, &row, &executor, &mut attestations)
                 .unwrap();
         assert_eq!(
             invocation.argv,
@@ -4940,7 +4943,7 @@ mod tests {
         );
         assert_eq!(fs::read(&capture_paths.stdout).unwrap(), original);
         assert!(verified_adapter_attestation_captures(
-            &attestation_path,
+            &mut attestations,
             row.uuid,
             &row.adapter,
             1,
@@ -4956,7 +4959,13 @@ mod tests {
         .unwrap();
         let missing_attestation = temp.path().join("missing-attestation.jsonl");
         assert!(matches!(
-            recovery_adapter_invocation(&config, &action, &row, &executor, &missing_attestation),
+            recovery_adapter_invocation(
+                &config,
+                &action,
+                &row,
+                &executor,
+                &mut SharedAttestations::new(missing_attestation),
+            ),
             Err(DaemonError::Adapter(AdapterError::MissingCapture { .. }))
         ));
         assert_eq!(
@@ -4970,7 +4979,7 @@ mod tests {
         .unwrap();
         fs::write(&capture_paths.stdout, b"").unwrap();
         let (fallback, captures) =
-            recovery_adapter_invocation(&config, &action, &row, &executor, &attestation_path)
+            recovery_adapter_invocation(&config, &action, &row, &executor, &mut attestations)
                 .unwrap();
         assert_eq!(fallback.argv[2], "resume-me");
         assert_eq!(fallback.argv[4], "Exact/Model");
@@ -4987,7 +4996,7 @@ mod tests {
         plan.actions.push(action);
         plan.rows[0].row.session_ref = None;
         plan.rows[0].row.model = None;
-        hydrate_represent_adapter_metadata(&mut plan, &config, &executor, &attestation_path)
+        hydrate_represent_adapter_metadata(&mut plan, &config, &executor, &mut attestations)
             .unwrap();
         assert_eq!(plan.rows[0].row.session_ref.as_deref(), Some("resume-me"));
         assert_eq!(plan.rows[0].row.model.as_deref(), Some("Exact/Model"));
@@ -5007,12 +5016,7 @@ mod tests {
         )
         .unwrap();
         fs::write(&capture_paths.stdout, original).unwrap();
-        hydrate_completed_adapter_metadata(
-            &mut deleted_plan,
-            &config,
-            &executor,
-            &attestation_path,
-        );
+        hydrate_completed_adapter_metadata(&mut deleted_plan, &config, &executor, &mut attestations);
         assert_eq!(
             deleted_plan.rows[0].row.session_ref.as_deref(),
             Some("resume-me")
@@ -5042,7 +5046,7 @@ mod tests {
             lease_epoch: 2,
             labor_class: Some(LaborClass::Fresh),
         });
-        hydrate_adopted_adapter_metadata(&mut adopted_plan, &attestation_path).unwrap();
+        hydrate_adopted_adapter_metadata(&mut adopted_plan, &mut attestations).unwrap();
         assert_eq!(
             adopted_plan.rows[0].row.session_ref.as_deref(),
             Some("resume-me")

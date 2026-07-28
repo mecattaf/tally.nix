@@ -287,7 +287,10 @@ impl DaemonHandler {
                 &plan,
                 &config,
                 &self.executor,
-                &paths.attestations_path(),
+                &mut self
+                    .attestations
+                    .lock()
+                    .expect("attestation ledger lock poisoned"),
             );
             pool_representations(plan, pool, &selected)
         } else {
@@ -303,7 +306,10 @@ impl DaemonHandler {
             &mut plan,
             &config,
             &self.executor,
-            &paths.attestations_path(),
+            &mut self
+                .attestations
+                .lock()
+                .expect("attestation ledger lock poisoned"),
         )
         .map_err(|error| self.fail_stop(error))?;
         let represented_rows = plan
@@ -328,8 +334,16 @@ impl DaemonHandler {
                 RowDetailFact::from_seed(row, RowStatus::Pending, recovery.labor_class),
             );
         }
-        let mut launches = install_recovery_jobs(&mut context, &plan, &self.executor)
-            .map_err(|error| self.fail_stop(error))?;
+        let mut launches = install_recovery_jobs(
+            &mut context,
+            &plan,
+            &self.executor,
+            &mut self
+                .attestations
+                .lock()
+                .expect("attestation ledger lock poisoned"),
+        )
+        .map_err(|error| self.fail_stop(error))?;
         let paused = context
             .unreachable_paused_jobs
             .iter()

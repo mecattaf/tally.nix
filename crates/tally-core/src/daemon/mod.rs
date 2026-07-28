@@ -146,10 +146,34 @@ use crate::wire::{
     WireError, WireErrorCode, WireIoError,
 };
 use crate::witness::{
-    append_attestation, current_host_id, read_verified_attestations, read_verified_records,
-    repair_attestation_tail, verify_attestations, AttestationRecord, Derivation, LaborClass,
-    Verdict, WitnessBody, WitnessError, WitnessLedger, WitnessRecord,
+    current_host_id, read_verified_attestations, read_verified_records, AttestationLedger,
+    Derivation, LaborClass, Verdict, WitnessBody, WitnessError, WitnessLedger, WitnessRecord,
 };
+
+/// The daemon's one cached handle per advisory attestation chain.
+///
+/// The ledger opens lazily so that a corrupt or unopenable chain keeps its
+/// pre-existing advisory semantics: each caller sees the error and decides
+/// whether to log, skip, or fail its own operation, and startup never
+/// fail-stops on it. Once open, appends and reads reuse the verified head
+/// instead of rescanning the whole chain.
+pub(crate) struct SharedAttestations {
+    path: PathBuf,
+    ledger: Option<AttestationLedger>,
+}
+
+impl SharedAttestations {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path, ledger: None }
+    }
+
+    pub(crate) fn ledger(&mut self) -> Result<&mut AttestationLedger, WitnessError> {
+        if self.ledger.is_none() {
+            self.ledger = Some(AttestationLedger::open(&self.path)?);
+        }
+        Ok(self.ledger.as_mut().expect("ledger opened above"))
+    }
+}
 
 const LEASE_TICK: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
@@ -424,6 +448,7 @@ struct DaemonHandler {
     brief_root: PathBuf,
     git_ai: GitAiConfig,
     exec_attestations: bool,
+    attestations: Arc<std::sync::Mutex<SharedAttestations>>,
 }
 
 #[derive(Clone, Copy)]
