@@ -4,8 +4,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -1329,6 +1331,7 @@ const GH_COMPLETION_PULL_REQUEST_GRAPHQL: &str = r#"mutation TallyCompletionPull
   closePullRequest(input: {pullRequestId: $itemId}) { pullRequest { id state } }
 }"#;
 const GH_PROCESS_TIMEOUT: Duration = Duration::from_secs(20);
+const GH_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_GH_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_GH_COMMENT_PAGES: usize = 100;
 
@@ -2651,7 +2654,17 @@ fn run_gh_bounded(
     args: &[&str],
     input: Option<Vec<u8>>,
 ) -> Result<Vec<u8>, String> {
-    let mut child = Command::new(program)
+    run_gh_bounded_with_timeout(program, args, input, GH_PROCESS_TIMEOUT)
+}
+
+fn run_gh_bounded_with_timeout(
+    program: &Path,
+    args: &[&str],
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<Vec<u8>, String> {
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(if input.is_some() {
             Stdio::piped()
@@ -2660,8 +2673,34 @@ fn run_gh_bounded(
         })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .process_group(0);
+    #[cfg(target_os = "linux")]
+    // SAFETY: this pre-exec hook performs only async-signal-safe libc calls.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                return Err(std::io::Error::from_raw_os_error(libc::ECHILD));
+            }
+            Ok(())
+        });
+    }
+    let mut child = command
         .spawn()
         .map_err(|error| format!("cannot execute {}: {error}", program.display()))?;
+    let process_group = match i32::try_from(child.id()) {
+        Ok(process_group) => process_group,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(format!(
+                "{} returned an unrepresentable process-group id",
+                program.display()
+            ));
+        }
+    };
     let stdin_task = input.map(|input| {
         let mut stdin = child.stdin.take().expect("requested piped gh stdin");
         thread::spawn(move || -> std::io::Result<()> {
@@ -2678,44 +2717,59 @@ fn run_gh_bounded(
         child.stderr.take().expect("requested piped gh stderr"),
         MAX_GH_PROCESS_OUTPUT_BYTES,
     );
-    let deadline = Instant::now() + GH_PROCESS_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     let mut timed_out = false;
+    let mut group_kill_error = None;
     let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .map_err(|error| format!("cannot poll {}: {error}", program.display()))?
-        {
-            break status;
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = kill_gh_process_group(process_group);
+                let _ = child.kill();
+                break match child.wait() {
+                    Ok(_) => Err(format!("cannot poll {}: {error}", program.display())),
+                    Err(wait_error) => Err(format!(
+                        "cannot poll {} ({error}) or reap it after cleanup: {wait_error}",
+                        program.display()
+                    )),
+                };
+            }
         }
         if Instant::now() >= deadline {
             timed_out = true;
+            group_kill_error = kill_gh_process_group(process_group).err();
             let _ = child.kill();
-            break child.wait().map_err(|error| {
-                format!("cannot reap timed-out {}: {error}", program.display())
-            })?;
+            break child
+                .wait()
+                .map_err(|error| format!("cannot reap timed-out {}: {error}", program.display()));
         }
         thread::sleep(Duration::from_millis(10));
     };
-    if let Some(task) = stdin_task {
-        task.join()
-            .map_err(|_| "gh stdin writer panicked".to_owned())?
-            .map_err(|error| format!("cannot write gh stdin: {error}"))?;
-    }
-    let (stdout, stdout_overflow) = stdout_task
-        .join()
-        .map_err(|_| "gh stdout reader panicked".to_owned())?
-        .map_err(|error| format!("cannot read gh stdout: {error}"))?;
-    let (stderr, stderr_overflow) = stderr_task
-        .join()
-        .map_err(|_| "gh stderr reader panicked".to_owned())?
-        .map_err(|error| format!("cannot read gh stderr: {error}"))?;
+    let stdin_result = if let Some(task) = stdin_task {
+        match task.join() {
+            Ok(result) => result.map_err(|error| format!("cannot write gh stdin: {error}")),
+            Err(_) => Err("gh stdin writer panicked".to_owned()),
+        }
+    } else {
+        Ok(())
+    };
+    let stdout = stdout_task.drain("stdout");
+    let stderr = stderr_task.drain("stderr");
     if timed_out {
+        let cleanup = group_kill_error
+            .map(|error| format!("; process-group cleanup failed: {error}"))
+            .unwrap_or_default();
         return Err(format!(
-            "{} exceeded the {} second timeout",
+            "{} exceeded the {} second timeout{cleanup}",
             program.display(),
-            GH_PROCESS_TIMEOUT.as_secs()
+            timeout.as_secs_f64()
         ));
     }
+    stdin_result?;
+    let status = status?;
+    let (stdout, stdout_overflow) = stdout?;
+    let (stderr, stderr_overflow) = stderr?;
     if stdout_overflow || stderr_overflow {
         return Err(format!(
             "{} output exceeded the {} byte cap",
@@ -2733,25 +2787,75 @@ fn run_gh_bounded(
     Ok(stdout)
 }
 
-fn bounded_reader(
-    mut reader: impl Read + Send + 'static,
-    limit: usize,
-) -> thread::JoinHandle<std::io::Result<(Vec<u8>, bool)>> {
-    thread::spawn(move || {
+fn kill_gh_process_group(process_group: i32) -> Result<(), String> {
+    // SAFETY: process_group is the positive, representable pid returned by the
+    // child, and negating it targets only that child's process group.
+    let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot kill gh process group {process_group}: {error}"
+        ))
+    }
+}
+
+struct BoundedReaderTask {
+    result: mpsc::Receiver<std::io::Result<(Vec<u8>, bool)>>,
+    thread: thread::JoinHandle<()>,
+}
+
+impl BoundedReaderTask {
+    fn drain(self, stream: &str) -> Result<(Vec<u8>, bool), String> {
+        let Self { result, thread } = self;
+        match result.recv_timeout(GH_READER_DRAIN_TIMEOUT) {
+            Ok(result) => {
+                thread
+                    .join()
+                    .map_err(|_| format!("gh {stream} reader panicked"))?;
+                result.map_err(|error| format!("cannot read gh {stream}: {error}"))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                drop(thread);
+                Err(format!(
+                    "gh {stream} reader exceeded the {} second drain timeout",
+                    GH_READER_DRAIN_TIMEOUT.as_secs()
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                thread
+                    .join()
+                    .map_err(|_| format!("gh {stream} reader panicked"))?;
+                Err(format!("gh {stream} reader ended without a result"))
+            }
+        }
+    }
+}
+
+fn bounded_reader(mut reader: impl Read + Send + 'static, limit: usize) -> BoundedReaderTask {
+    let (sender, result) = mpsc::sync_channel(1);
+    let thread = thread::spawn(move || {
         let mut kept = Vec::new();
         let mut overflow = false;
         let mut buffer = [0_u8; 8192];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
+        let read_result = loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break Ok((kept, overflow)),
+                Ok(read) => {
+                    let remaining = limit.saturating_sub(kept.len());
+                    kept.extend_from_slice(&buffer[..read.min(remaining)]);
+                    overflow |= read > remaining;
+                }
+                Err(error) => break Err(error),
             }
-            let remaining = limit.saturating_sub(kept.len());
-            kept.extend_from_slice(&buffer[..read.min(remaining)]);
-            overflow |= read > remaining;
-        }
-        Ok((kept, overflow))
-    })
+        };
+        let _ = sender.send(read_result);
+    });
+    BoundedReaderTask { result, thread }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -5245,6 +5349,8 @@ pub enum ProducerError {
 mod tests {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::FileTypeExt;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::process::ExitStatusExt;
     use std::sync::{Arc, Barrier};
 
     use chrono::TimeZone;
@@ -5361,6 +5467,132 @@ mod tests {
         Utc.with_ymd_and_hms(2026, 7, 20, 12, 30, 0)
             .single()
             .unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn process_is_alive(pid: i32) -> bool {
+        // SAFETY: signal zero performs existence/permission checking only.
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        while process_is_alive(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        !process_is_alive(pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gh_timeout_kills_the_process_group_and_drains_readers() {
+        let temp = tempdir().unwrap();
+        let descendant_pid = temp.path().join("descendant-pid");
+        let gh = temp.path().join("fake-gh");
+        crate::test_support::install_shell_program(
+            &gh,
+            format!(
+                "#!/bin/sh\n\
+                 trap '' HUP INT TERM\n\
+                 sleep 300 >&2 &\n\
+                 printf '%s' \"$!\" > '{}'\n\
+                 while :; do sleep 300; done\n",
+                descendant_pid.display()
+            ),
+        );
+
+        let started = Instant::now();
+        let error =
+            run_gh_bounded_with_timeout(&gh, &[], None, Duration::from_millis(500)).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(error.contains("exceeded the 0.5 second timeout"), "{error}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "gh timeout cleanup took {elapsed:?}"
+        );
+        let descendant_pid = std::fs::read_to_string(descendant_pid)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        assert!(
+            wait_for_process_exit(descendant_pid, Duration::from_secs(2)),
+            "gh descendant {descendant_pid} survived process-group cleanup"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn gh_parent_death_helper() {
+        let Some(program) = std::env::var_os("TALLY_TEST_GH_PARENT_DEATH_PROGRAM") else {
+            return;
+        };
+        let _ =
+            run_gh_bounded_with_timeout(Path::new(&program), &[], None, Duration::from_secs(30));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn interactive_cancellation_still_terminates_gh() {
+        let temp = tempdir().unwrap();
+        let gh_pid_path = temp.path().join("gh-pid");
+        let gh = temp.path().join("fake-gh");
+        crate::test_support::install_shell_program(
+            &gh,
+            format!(
+                "#!/bin/sh\n\
+                 printf '%s' \"$$\" > '{}'\n\
+                 exec sleep 300\n",
+                gh_pid_path.display()
+            ),
+        );
+        let mut helper = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "producers::tests::gh_parent_death_helper",
+                "--nocapture",
+            ])
+            .env("TALLY_TEST_GH_PARENT_DEATH_PROGRAM", &gh)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let startup_deadline = Instant::now() + Duration::from_secs(2);
+        while !gh_pid_path.exists() && Instant::now() < startup_deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !gh_pid_path.exists() {
+            let _ = helper.kill();
+            let _ = helper.wait();
+            panic!("gh cancellation helper did not start");
+        }
+        let gh_pid = std::fs::read_to_string(&gh_pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let helper_pid = i32::try_from(helper.id()).unwrap();
+        // SAFETY: helper_pid belongs to the child process spawned above.
+        assert_eq!(unsafe { libc::kill(helper_pid, libc::SIGINT) }, 0);
+        let exit_deadline = Instant::now() + Duration::from_secs(2);
+        let helper_status = loop {
+            if let Some(status) = helper.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= exit_deadline {
+                let _ = helper.kill();
+                let _ = helper.wait();
+                panic!("SIGINT did not cancel the gh helper");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(helper_status.signal(), Some(libc::SIGINT));
+        if !wait_for_process_exit(gh_pid, Duration::from_secs(2)) {
+            // SAFETY: gh_pid is the process-group leader written by the helper.
+            let _ = unsafe { libc::kill(-gh_pid, libc::SIGKILL) };
+            panic!("gh process {gh_pid} survived interactive cancellation");
+        }
     }
 
     fn gh_observation(node_id: &str, item_author: &str, trigger_actor: &str) -> GhObservation {
