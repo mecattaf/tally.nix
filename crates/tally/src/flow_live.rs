@@ -298,10 +298,10 @@ impl FlowClient for LiveFlowClient {
                             .get("scriptHash")
                             .and_then(Value::as_str)
                             .ok_or_else(|| {
-                                protocol_error(
-                                    "a query.jobs --flow-run item omitted orchestration.scriptHash",
-                                )
-                            })?;
+                            protocol_error(
+                                "a query.jobs --flow-run item omitted orchestration.scriptHash",
+                            )
+                        })?;
                         let args_hash = orchestration
                             .get("argsHash")
                             .and_then(Value::as_str)
