@@ -36,6 +36,10 @@ authorized.
 
 ### Fixed
 
+- Pinned the fleet gate's changelog decision to the audited SHA's status at script start instead of
+  re-deciding it when the stage runs. A merge landing while the run waited for the runner lock or
+  worked through the ladder moved the tip of main away from the audited commit, and an otherwise
+  green audit of main then exited 1 claiming no open pull request contained the head SHA.
 - Excluded the trailing record-framing newline from the single-byte mutation properties for the
   witness and attestation chains. Replacing that byte leaves every record identical and the chain
   legitimately valid, so the properties reported a false tamper miss on the seeds that selected it.

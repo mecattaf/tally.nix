@@ -130,24 +130,38 @@ run_cargo_deny_stage() {
     nix develop --command test/cargo-deny.sh
 }
 
+# Resolved exactly once, before the runner lock is taken and before any stage
+# runs. The main-audit decision is time-of-check dependent: a merge landing
+# while this run waits for the lock or works through the ladder would move the
+# tip of main away from the audited SHA, and the changelog stage would then see
+# a commit that is neither the tip nor an open pull-request head and fail a run
+# whose substantive stages all passed. Pinning the decision to the SHA's status
+# at script start keeps the verdict a property of the audited commit rather
+# than of when the last stage happened to execute.
 resolve_pull_request_metadata() {
   local pull_json main_sha
   pull_json="$(
     gh api "repos/$gate_repo/commits/$gate_sha/pulls?per_page=100" \
       --jq "[.[] | select(.state == \"open\" and .head.sha == \"$gate_sha\")][0] // {}"
-  )"
+  )" || fail "cannot list pull requests for $gate_sha in $gate_repo (is the commit pushed?)"
   gate_pr_number="$(jq -r '.number // empty' <<<"$pull_json")"
   gate_base_sha="$(jq -r '.base.sha // empty' <<<"$pull_json")"
   gate_no_changelog_label="$(
     jq -r 'any(.labels[]?; .name == "no-changelog")' <<<"$pull_json"
   )"
   gate_is_main_audit=false
+  gate_changelog_subject="neither an open pull-request head nor the tip of main"
 
-  if [[ -z "$gate_pr_number" ]]; then
-    main_sha="$(gh api "repos/$gate_repo/commits/main" --jq .sha)"
-    if [[ "$main_sha" == "$gate_sha" ]]; then
-      gate_is_main_audit=true
-    fi
+  if [[ -n "$gate_pr_number" ]]; then
+    gate_changelog_subject="head of open pull request #$gate_pr_number"
+    return
+  fi
+
+  main_sha="$(gh api "repos/$gate_repo/commits/main" --jq .sha)" \
+    || fail "cannot resolve the tip of main in $gate_repo"
+  if [[ "$main_sha" == "$gate_sha" ]]; then
+    gate_is_main_audit=true
+    gate_changelog_subject="tip of main"
   fi
 }
 
@@ -195,6 +209,7 @@ run_ladder() {
   printf 'host: %s\n' "$(hostname -f)"
   printf 'started-at: %s\n' "$(date --utc '+%Y-%m-%dT%H:%M:%SZ')"
   printf 'worktree-head: %s\n' "$(git rev-parse HEAD)"
+  printf 'changelog-subject: %s (pinned at script start)\n' "$gate_changelog_subject"
 
   run_step "cargo fmt" nix develop --command cargo fmt --all --check
   run_step "cargo test" nix develop --command env -u TALLY_TEST_REMOTE_HOST cargo test --workspace
@@ -249,6 +264,10 @@ chmod 0700 "$gate_root"
 worktree="$gate_root/worktree"
 trap remove_gate_root EXIT INT TERM
 
+# Pin the changelog decision before waiting on the runner lock, so that neither
+# the wait nor the ladder itself can move it.
+resolve_pull_request_metadata
+
 mkdir -p "$cache_dir"
 exec 8>"$cache_dir/runner.lock"
 flock 8
@@ -258,7 +277,6 @@ set +e
   set -e
   prepare_pristine_clone
   create_disposable_worktree
-  resolve_pull_request_metadata
   run_ladder
 ) 2>&1 | tee "$transcript"
 ladder_status="${PIPESTATUS[0]}"
