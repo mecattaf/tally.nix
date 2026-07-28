@@ -1340,7 +1340,7 @@
               ];
 
               system.stateVersion = "26.11";
-              users.users."tally-home" = {
+              users.users.tallyhome = {
                 isNormalUser = true;
                 uid = 1000;
                 createHome = true;
@@ -1358,10 +1358,10 @@
               home-manager = {
                 useGlobalPkgs = true;
                 useUserPackages = true;
-                users."tally-home" = {
+                users.tallyhome = {
                   imports = [ self.homeManagerModules.tally ];
                   home = {
-                    username = "tally-home";
+                    username = "tallyhome";
                     homeDirectory = "/var/lib/tally-test-user";
                     stateVersion = "26.11";
                   };
@@ -1399,15 +1399,15 @@
             machine.succeed("test \"$(stat -c '%U:%G:%a' /var/lib/tally/data/attestations.jsonl)\" = tally:tally:600")
             machine.succeed("${pkgs.jq}/bin/jq -e 'select(.payload.outcome == \"success\" and .payload.unit == \"upgrade-check\")' /var/lib/tally/data/attestations.jsonl")
 
-            machine.wait_for_unit("home-manager-tally-home.service")
-            machine.succeed("loginctl enable-linger tally-home")
+            machine.wait_for_unit("home-manager-tallyhome.service")
+            machine.succeed("loginctl enable-linger tallyhome")
             machine.succeed("systemctl start user@1000.service")
             machine.wait_until_succeeds(
-              "runuser -u tally-home -- env HOME=/var/lib/tally-test-user XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active tally-daemon.service"
+              "runuser -u tallyhome -- env HOME=/var/lib/tally-test-user XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active tally-daemon.service"
             )
             machine.succeed("test -S /run/user/1000/tally/tally.sock")
 
-            user = "runuser -u tally-home -- env HOME=/var/lib/tally-test-user XDG_RUNTIME_DIR=/run/user/1000"
+            user = "runuser -u tallyhome -- env HOME=/var/lib/tally-test-user XDG_RUNTIME_DIR=/run/user/1000"
             machine.wait_until_succeeds(
               user + " systemctl --user show tally-clean-removed-producers.service --property=ExecMainStartTimestampMonotonic --value | grep -E '^[1-9][0-9]*$'"
             )
