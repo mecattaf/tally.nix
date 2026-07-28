@@ -2358,7 +2358,7 @@ impl Executor {
                 });
             }
         };
-        let _reservation = self.reserve(&request.identity)?;
+        let reservation = self.reserve(&request.identity)?;
         // This marker is fsynced before systemd-run can create the unit. If a
         // retry finds the same generation with neither a unit nor an exit
         // record, the previous helper may have launched work that was lost
@@ -2408,7 +2408,10 @@ impl Executor {
             Err(error) if is_not_found(&error) => {
                 // Losing the systemd-run client must never release the caller's
                 // lease while the exact transient unit may still be executing.
-                self.reclaim_identity(&request.identity).await?;
+                drop(reservation);
+                if let Err(error) = self.reclaim_identity(&request.identity).await {
+                    eprintln!("tally: cannot reclaim {unit} after launcher failure: {error}");
+                }
                 return Err(ExecutorError::LauncherFailed {
                     status: output.status.code(),
                     stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
@@ -5945,6 +5948,30 @@ mod tests {
             "unexpected launcher result: {result:?}"
         );
         assert_eq!(std::fs::read_to_string(marker).unwrap(), unit);
+    }
+
+    #[tokio::test]
+    async fn launcher_failure_without_visible_unit_preserves_error_promptly() {
+        let temp = tempfile::tempdir().unwrap();
+        let systemd_run = temp.path().join("fake-systemd-run");
+        crate::test_support::install_shell_program(&systemd_run, "#!/bin/sh\nexit 23\n");
+        let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally")
+            .with_systemd_run(systemd_run)
+            .with_unit_probe(AbsentProbe);
+
+        let result = tokio::time::timeout(Duration::from_millis(100), executor.execute(request()))
+            .await
+            .expect("launcher failure was masked by reservation reclaim");
+        assert!(
+            matches!(
+                result,
+                Err(ExecutorError::LauncherFailed {
+                    status: Some(23),
+                    ..
+                })
+            ),
+            "unexpected launcher result: {result:?}"
+        );
     }
 
     #[test]
