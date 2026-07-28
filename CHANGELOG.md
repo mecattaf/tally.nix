@@ -8,6 +8,14 @@ authorized.
 
 ### Added
 
+- Replaced the `agency-nightly` example flow with the real overnight wave: a deterministic
+  worklist node that witnesses the wave declared in the flow's own arguments (the worklist is the
+  script plus its args — no external worklist source), per-task parallel `codex()` implementation
+  in per-task git worktrees, cross-harness `claude()` review that finds but never certifies, and a
+  settled deterministic culmination that opens pull requests and writes a morning report even on a
+  partially failed wave. Ships a packaged deterministic driver (`agency-nightly-driver`), a
+  documented example argument file, hermetic driver tests, and flow tests covering settle-mode
+  failure routing and mid-wave restart reuse/attach under a pinned flow-run identity.
 - Added offline `tally history compact --keep-days N`: drops lifecycle records older than the
   window, records the cut in the durable retention metadata (complete=false, truncation boundary,
   reason), refuses to run while a daemon owns the state directory, and never touches durable
@@ -21,7 +29,6 @@ authorized.
 - Added characterization tests pinning the durable change-log window across reopen and crash
   artifacts, pagination cursor stability and deterministic page boundaries under the response
   byte cap, and client wire framing at and over the protocol frame limit.
-
 - Documented the ratified trust boundary: what the per-job capability token enforces, that
   demotion to operator class and same-UID environment access are by design rather than gaps, and
   that hardening presets rather than the token are the containment story.

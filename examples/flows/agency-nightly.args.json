@@ -1,0 +1,49 @@
+{
+  "repository": "mecattaf/example",
+  "checkout": "/srv/agency/example",
+  "baseRev": "origin/main",
+  "baseBranch": "main",
+  "worktreeRoot": "/srv/agency/worktrees",
+  "branchPrefix": "agency/nightly",
+  "reportPath": "/srv/agency/reports/morning.md",
+  "driver": {
+    "adapter": "agency-driver",
+    "program": "/run/current-system/sw/bin/agency-nightly-driver",
+    "runtimeMaxSec": 900
+  },
+  "implementationRuntimeMaxSec": 14400,
+  "reviewRuntimeMaxSec": 7200,
+  "wave": [
+    {
+      "taskId": "retry-backoff",
+      "title": "Bound the reconnect loop with backoff",
+      "mission": "The client reconnects in a hot loop when the daemon answers Timeout. Give it bounded exponential backoff with a total deadline, and a distinct error when the deadline is reached.",
+      "acceptanceCriteria": [
+        "reconnect attempts back off and stop at a total deadline",
+        "the deadline failure is a named error, not a generic timeout",
+        "a test drives the loop to its deadline without sleeping in real time"
+      ],
+      "issue": "212"
+    },
+    {
+      "taskId": "gc-horizon-docs",
+      "title": "Document what the retention horizon does and does not collect",
+      "mission": "The retention chapter states a horizon but never says which records survive it. Write the actual rule, with the code as the source of truth.",
+      "acceptanceCriteria": [
+        "the chapter states which record kinds the horizon collects",
+        "every claim is traceable to a named function",
+        "the documentation flake check still passes"
+      ]
+    },
+    {
+      "taskId": "queue-list-paging",
+      "title": "Page the queue listing instead of truncating it",
+      "mission": "tally queue list silently stops at its internal limit. Page it, and say so when there is more.",
+      "acceptanceCriteria": [
+        "the listing pages rather than truncating",
+        "a truncated result says how many rows were not shown",
+        "the existing output shape is unchanged for short listings"
+      ]
+    }
+  ]
+}

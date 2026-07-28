@@ -68,6 +68,7 @@
             ./crates
             ./doc/src/reference/rpc-protocol.md
             ./examples/flows/academic-ocr.js
+            ./examples/flows/agency-nightly.js
             ./examples/flows/monthly-review.js
             ./test/fixtures/flows
             ./test/fixtures/git-ai
@@ -570,6 +571,17 @@
             exec ${pkgs.bash}/bin/bash ${./doc/publish.sh} ${documentation} "$@"
           '';
         };
+        agencyNightlyDriver = pkgs.writeShellApplication {
+          name = "agency-nightly-driver";
+          runtimeInputs = [
+            pkgs.gh
+            pkgs.git
+            pkgs.python3
+          ];
+          text = ''
+            exec ${pkgs.python3}/bin/python3 ${./examples/flows/agency_nightly_driver.py} "$@"
+          '';
+        };
         catalogFixtureInput = import ./test/fixtures/catalog/valid.nix;
         catalogFixtureUnchecked = catalogLibrary.renderCatalog (
           catalogFixtureInput
@@ -584,8 +596,10 @@
             package = tally;
           }
         );
-        # Representative arguments for every checked-in example, so the flake
-        # exercises each argsSchema instead of only its meta block.
+        # Representative arguments for the checked-in examples, so the flake
+        # exercises each argsSchema instead of only its meta block. The agency
+        # wave is the exception: it ships its own documented argument file,
+        # because for that flow the arguments are the worklist.
         exampleArgs =
           builtins.mapAttrs
             (name: value: pkgs.writeText "tally-example-args-${name}.json" (builtins.toJSON value))
@@ -617,13 +631,6 @@
                 rasterDpi = 600;
                 maxMutationIterations = 2;
                 maxDisagreementPermille = 20;
-              };
-              agency-nightly = {
-                mission = "Close the open review comments on the parser";
-                repository = "mecattaf/tally.nix";
-                baseRev = "main";
-                branch = "agency/nightly";
-                worktree = "/var/lib/agency/worktree";
               };
               domain-failure = {
                 invoice = "INV-2026-0042";
@@ -3055,6 +3062,7 @@
         packages = {
           inherit tally;
           doc = documentation;
+          agency-nightly-driver = agencyNightlyDriver;
           tally-witness-emit = tallyWitnessEmit;
           default = tally;
         };
@@ -3112,8 +3120,6 @@
                 done
                 ${tally}/bin/tally flow check ${./examples/flows/academic-ocr.js} \
                   --args "$(cat ${exampleArgs.academic-ocr})" >/dev/null
-                ${tally}/bin/tally flow check ${./examples/flows/agency-nightly.js} \
-                  --args "$(cat ${exampleArgs.agency-nightly})" >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/domain-failure.js} \
                   --args "$(cat ${exampleArgs.domain-failure})" >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/fleet-deploy.js} \
@@ -3124,6 +3130,32 @@
                   --args "$(cat ${exampleArgs.pooled-review})" --catalog ${catalogFixture} >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/worklist-fanout.js} \
                   --args "$(cat ${exampleArgs.worklist-fanout})" >/dev/null
+                # The agency wave's worklist IS its arguments, so its
+                # representative arguments are the checked-in documented wave
+                # rather than an inline attrset, and that file has to satisfy
+                # the flow's own argsSchema.
+                agency_meta="$(${tally}/bin/tally flow check ${./examples/flows/agency-nightly.js} \
+                  --args "$(cat ${./examples/flows/agency-nightly.args.json})")"
+                test "$(printf '%s' "$agency_meta" | jq -r '.name')" = agency-nightly
+                test "$(printf '%s' "$agency_meta" | jq -r '.maxNodes')" = 20
+                test "$(printf '%s' "$agency_meta" | jq -r '.iterationCap')" = 8
+                test "$(printf '%s' "$agency_meta" | jq -c '.pools')" = \
+                  '["agency-control","codex-window","claude-window"]'
+                touch "$out"
+              '';
+          agency-nightly-driver =
+            pkgs.runCommand "tally-agency-nightly-driver"
+              {
+                nativeBuildInputs = [
+                  pkgs.git
+                  pkgs.python3
+                ];
+                AGENCY_NIGHTLY_DRIVER = ./examples/flows/agency_nightly_driver.py;
+              }
+              ''
+                export HOME="$TMPDIR/home"
+                mkdir -p "$HOME"
+                ${pkgs.python3}/bin/python3 ${./test/agency_nightly_driver_test.py}
                 touch "$out"
               '';
           flow-dialect-reject-nonliteral-meta = flowNonliteralFailure;
