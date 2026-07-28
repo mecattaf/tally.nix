@@ -488,7 +488,7 @@
                   keys[]
                   | select(startswith("services.tally.flows.<name>."))
                 ]
-                | length == 13
+                | length == 12
               )
             ' "$core_json" >/dev/null
 
@@ -954,7 +954,6 @@
                     onCalendar = "daily";
                     args.task = "ship";
                     catalog = catalogFixture;
-                    budgetPool = "programmatic";
                     workloadMutex = "flow-run-mutex";
                     extraEnv.FLOW_MODE = "fixture";
                     credentials.FLOW_TOKEN = "/run/credentials/tally-flow";
@@ -2618,7 +2617,8 @@
           assert homeServices ? tally-producer-flow-monthly-dedup;
           assert !(homeTimers ? tally-producer-flow-manual);
           assert !(homeServices ? tally-producer-flow-manual);
-          assert builtins.elem "tally flow bad-budget references unknown budgetPool missing-budget"
+          assert builtins.elem
+            "services.tally.flows.bad-budget.budgetPool has been removed: flows are excluded from windowed-consumption admission by design; use node priorities for contention, or workloadMutex for a process-scoped capacity-1 runner mutex"
             invalidFlowMessages;
           assert builtins.elem "tally flow missing-mutex references unknown workloadMutex absent"
             invalidFlowMessages;

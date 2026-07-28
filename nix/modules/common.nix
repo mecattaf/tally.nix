@@ -1590,7 +1590,13 @@ let
   );
 
   mkFlowType = types.submodule (
-    { config, name, ... }: {
+    {
+      config,
+      name,
+      options,
+      ...
+    }:
+    {
       options = {
         script = mkOption {
           type = types.path;
@@ -1670,15 +1676,8 @@ let
           '';
         };
         budgetPool = mkOption {
-          type = types.nullOr types.str;
-          default = null;
-          example = "programmatic";
-          description = ''
-            Optional pool name checked for existence only. It is not added to
-            the runner or node pool set and creates no render channel; the
-            declarative runner remains admitted solely through the reserved
-            "flow" pool.
-          '';
+          visible = false;
+          type = types.unspecified;
         };
         extraEnv = mkOption {
           type = types.attrsOf types.str;
@@ -1701,8 +1700,8 @@ let
           message = "tally flow ${name} onCalendar must be null or non-empty";
         }
         {
-          assertion = config.budgetPool == null || config.budgetPool != "";
-          message = "tally flow ${name} budgetPool must be null or non-empty";
+          assertion = !options.budgetPool.isDefined;
+          message = "services.tally.flows.${name}.budgetPool has been removed: flows are excluded from windowed-consumption admission by design; use node priorities for contention, or workloadMutex for a process-scoped capacity-1 runner mutex";
         }
         {
           assertion = config.workloadMutex == null || config.workloadMutex != "";
@@ -2436,10 +2435,6 @@ let
             message = "tally flow name ${name} is not a safe unit/file component";
           }
           flow._tallyAssertions
-          {
-            assertion = flow.budgetPool == null || builtins.hasAttr flow.budgetPool cfg.pools;
-            message = "tally flow ${name} references unknown budgetPool ${toString flow.budgetPool}";
-          }
           {
             assertion = flow.workloadMutex == null || builtins.hasAttr flow.workloadMutex cfg.pools;
             message = "tally flow ${name} references unknown workloadMutex ${toString flow.workloadMutex}";
