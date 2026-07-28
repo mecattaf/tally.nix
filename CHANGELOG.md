@@ -15,13 +15,24 @@ authorized.
 - Added private vulnerability-reporting policy, a supported threat model, and an end-to-end release
   and rollback runbook.
 - Added this changelog and the contribution rule that keeps `[Unreleased]` current.
+- Added randomized checks for bounded NDJSON framing, byte-exact request round trips, and
+  panic-free handling of arbitrary connection input.
 
 ### Changed
 
-- Protected pull-request merges with an exact-head `fleet/gate-ladder` status produced from a
-  pristine fleet checkout, with durable transcripts and explicit no-workflow/no-stub checks.
+- Standardized pull-request merge evidence on the canonical worker-run local ladder transcript,
+  with no independently enforced GitHub status or branch protection in the single-operator phase.
 - Required each behavior-affecting pull request to update `[Unreleased]` unless it carries the
   `no-changelog` label.
+- Single-sourced the declarative-flow node field contract across JavaScript validation, live-wire
+  rendering, and canonical hashing.
+
+### Fixed
+
+- Detect canonical payload-hash drift on a flow's first admission instead of storing a mismatch
+  that becomes an unrecoverable replay divergence on the next run.
+- Made full-mode flow credential resolution symmetric between the client and daemon, including a
+  hard error when `tally flow run` has no client configuration.
 
 ### Security
 
