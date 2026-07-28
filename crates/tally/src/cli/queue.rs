@@ -248,6 +248,7 @@ pub(super) async fn run_query(
         }
         QueryCommand::Log {
             task,
+            flow_run,
             attempt,
             session,
             event,
@@ -264,6 +265,7 @@ pub(super) async fn run_query(
                 "query.log",
                 Some(json!({
                     "task": task,
+                    "flowRun": flow_run,
                     "attempt": attempt,
                     "session": session,
                     "event": event,
@@ -276,13 +278,21 @@ pub(super) async fn run_query(
             )
             .await
         }
-        QueryCommand::Proof { task, attempt } => {
+        QueryCommand::Proof {
+            task,
+            flow_run,
+            attempt,
+        } => {
             print_rpc(
                 socket,
                 config_path,
                 rpc_timeout,
                 "query.proof",
-                Some(json!({"task": task, "attempt": attempt})),
+                Some(json!({
+                    "task": task,
+                    "flowRun": flow_run,
+                    "attempt": attempt,
+                })),
             )
             .await
         }

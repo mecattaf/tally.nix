@@ -132,7 +132,7 @@ The table between the markers is checked against the daemon's `RPC_METHODS` cons
 | `query.job` | `{id: string}` | Job detail |
 | `query.status` | `{pool?: string}` | Status view |
 | `query.log` | Lifecycle filters plus `limit` and `cursor` | Paginated lifecycle collection |
-| `query.proof` | `{task: string, attempt?: integer}` | Proof view |
+| `query.proof` | `{task: string, attempt?: integer}` or `{flowRun: string}` | Proof view, or a proof collection for a flow run |
 | `query.trace` | `{task: string, attempt?: integer, limit?: integer, cursor?: string}` | Paginated trace view |
 | `query.producers` | `{name?: string, kind?: string}` | Producer inventory |
 | `query.watch` | `{after?: string, limit?: integer}` | Watch envelope |
@@ -327,16 +327,24 @@ adapter, source, origin, parent, flowRun, session, since, until, limit, cursor
 `flowRun` matches `orchestration.flowRunId`, which is how `tally query jobs --flow-run ID` groups
 a run's nodes. Each job summary includes its durable identity and admission fields, live and
 terminal state, parent/children, provenance with authority labels, evidence, timestamps,
-resource use, artifact/witness facts, authorship when present, and trace availability.
+resource use, artifact/witness facts, authorship when present, and trace availability. Two of the
+admission fields are `dedupKey`, the node's submission identity, and `disposition`, which is
+`created`, `reused`, or `substituted` for the admission that wrote the row. Admissions that write
+no row — `attached`, and full-mode `reused` and `terminal` — are reported by the flow runner's
+`node-submitted` and `node-terminal` lifecycle events instead.
 
-`query.log` filters by `task`, `attempt`, `session`, lifecycle `event`, `source`, `since`, and
-`until`. `query.trace` requires `task` and optionally selects `attempt`. Both return collection
+`query.log` filters by `task`, `flowRun`, `attempt`, `session`, lifecycle `event`, `source`,
+`since`, and `until`. A lifecycle event carries no orchestration capsule, so `flowRun` is resolved
+to the run's task UUIDs through the durable rows and the witness chain. `query.trace` requires `task` and optionally selects `attempt`. Both return collection
 envelopes; trace also includes a `generations` array describing capture capability, completeness,
 retained range, byte count, truncation, and redaction provenance.
 
-`query.proof` selects a task and optional attempt. Its `status` is `verified`,
+`query.proof` selects either a task with an optional attempt, or a `flowRun`; supplying both, or
+neither, is an invalid request, and `attempt` applies only to a task. Its `status` is `verified`,
 `no-witness-expected-yet`, or `proof-missing`. The selected canonical witness is returned
-verbatim as `witnessRecord`; advisory attestations and their authority are separate.
+verbatim as `witnessRecord`; advisory attestations and their authority are separate. A `flowRun`
+request returns a collection envelope whose `items` hold one proof per node in node-ordinal
+order, and an unknown run is `unknown job`.
 
 `query.status` combines pool headroom and the legacy job projection. `query.pools` returns only
 headroom. A pool item includes capacity/held/queued counts, remaining capacity, optional

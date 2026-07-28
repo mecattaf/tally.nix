@@ -336,6 +336,13 @@ JavaScript error and becomes a script failure. A later serialization or write
 failure in the lifecycle output itself is
 `FlowCaptureError`/`lifecycle-serialization` or `lifecycle-write`.
 
+Node lifecycle events are separate from `log()` and are never suppressed. Each
+node emits `node-submitted` when the daemon answers its enqueue and
+`node-terminal` when its result is observed; both carry the node `ordinal`,
+`dedupKey`, and `disposition`, so a replayed prefix reporting `reused` is visible
+in the stream. See [Follow a flow run's
+nodes](../operating/observability.md#follow-a-flow-runs-nodes).
+
 ## `members(selector, options?)`
 
 `members()` synchronously resolves a declared class from the active catalog:

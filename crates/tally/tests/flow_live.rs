@@ -798,6 +798,14 @@ fn flow_report(output: &std::process::Output) -> Value {
         })
 }
 
+fn runner_events(output: &std::process::Output, kind: &str) -> Vec<Value> {
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["type"] == kind)
+        .collect()
+}
+
 fn flow_failure(output: &std::process::Output) -> Value {
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -1406,9 +1414,61 @@ async fn credentialed_pool_replays_the_same_flow_as_reused() {
                 "reused"
             );
 
+            // The runner's own stream reports each node's disposition, so a
+            // replayed prefix is visible without inspecting the daemon.
+            let submitted = runner_events(&second, "node-submitted");
+            assert_eq!(submitted.len(), 1);
+            assert_eq!(submitted[0]["disposition"], "reused");
+            assert_eq!(submitted[0]["ordinal"], 0);
+            assert_eq!(
+                submitted[0]["dedupKey"],
+                format!("flow:{CREDENTIAL_REPLAY_RUN}:0")
+            );
+            let terminal = runner_events(&second, "node-terminal");
+            assert_eq!(terminal.len(), 1);
+            assert_eq!(terminal[0]["disposition"], "reused");
+            assert_eq!(terminal[0]["verdict"], "pass");
+            assert_eq!(terminal[0]["taskUuid"], submitted[0]["taskUuid"]);
+
             let events = read_acknowledged_events(&daemon_paths.events_dir()).unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(events[0].row.credentials["api-token"], credential);
+
+            // Replay wrote no second row, and the one row carries the node's
+            // dedup key and the disposition that created it.
+            let client = rpc(&daemon_paths.socket).await;
+            let items = flow_items(&client, CREDENTIAL_REPLAY_RUN).await;
+            assert_eq!(items.len(), 1);
+            assert_eq!(
+                items[0]["dedupKey"],
+                format!("flow:{CREDENTIAL_REPLAY_RUN}:0")
+            );
+            assert_eq!(items[0]["disposition"], "created");
+
+            let log = client
+                .call(
+                    "query.log",
+                    Some(json!({"flowRun": CREDENTIAL_REPLAY_RUN, "limit": 1000})),
+                )
+                .await
+                .unwrap();
+            let logged = log["items"].as_array().unwrap();
+            assert!(!logged.is_empty());
+            assert!(logged
+                .iter()
+                .all(|event| event["taskUuid"] == items[0]["taskUuid"]));
+
+            let proofs = client
+                .call(
+                    "query.proof",
+                    Some(json!({"flowRun": CREDENTIAL_REPLAY_RUN})),
+                )
+                .await
+                .unwrap();
+            let proofs = proofs["items"].as_array().unwrap();
+            assert_eq!(proofs.len(), 1);
+            assert_eq!(proofs[0]["taskUuid"], items[0]["taskUuid"]);
+
             daemon.stop().await;
         })
         .await;
