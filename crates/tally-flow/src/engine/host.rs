@@ -232,6 +232,60 @@ impl HostShared {
         }));
     }
 
+    /// Announce one node's admission on the runner's lifecycle stream.
+    ///
+    /// Unlike `log()`, node lifecycle events are never suppressed on replay:
+    /// a replayed prefix reporting `reused` is exactly the fact an operator
+    /// needs to see. They are emitted in admission order and, for terminals,
+    /// in the replay-stable observation order.
+    pub(super) fn emit_node_submitted(
+        &self,
+        ordinal: u64,
+        dedup_key: &str,
+        label: Option<&str>,
+        admission: &Admission,
+    ) -> Result<(), FlowError> {
+        let mut event = json!({
+            "type": "node-submitted",
+            "flowRunId": self.flow_run_id,
+            "ordinal": ordinal,
+            "dedupKey": dedup_key,
+            "disposition": admission.disposition,
+            "taskUuid": admission.task_uuid,
+            "payloadHash": admission.payload_hash,
+            "attempt": admission.attempt,
+        });
+        if let Some(label) = label {
+            event["label"] = Value::String(label.to_owned());
+        }
+        self.sink.emit(event)
+    }
+
+    pub(super) fn emit_node_terminal(
+        &self,
+        ordinal: u64,
+        dedup_key: &str,
+        result: &NodeResult,
+    ) -> Result<(), FlowError> {
+        let mut event = json!({
+            "type": "node-terminal",
+            "flowRunId": self.flow_run_id,
+            "ordinal": ordinal,
+            "dedupKey": dedup_key,
+            "disposition": result.disposition,
+            "taskUuid": result.task_uuid,
+            "verdict": result.verdict,
+            "witnessSeq": result.witness_seq,
+        });
+        if let Some(exit_code) = result.exit_code {
+            event["exitCode"] = Value::from(exit_code);
+        }
+        if let Some(error) = &result.error {
+            event["errorCode"] = Value::String(error.code.clone());
+        }
+        self.sink.emit(event)
+    }
+
     pub(super) fn record_selection(&self, selector: &str, catalog_hash: &str, members: &[String]) {
         self.state.borrow_mut().resolved_selections.insert((
             selector.to_owned(),
@@ -441,6 +495,7 @@ impl HostShared {
         self.wait_for_admission(plan.ordinal).await?;
         let expected_hash = plan.submission.payload_hash.clone();
         let expected_label = plan.submission.spec.label.clone();
+        let dedup_key = plan.submission.dedup_key.clone();
         let admission = match self.client.submit(plan.submission).await {
             Ok(admission) => admission,
             Err(error) => {
@@ -494,7 +549,7 @@ impl HostShared {
                 .with_ordinal(plan.ordinal)
                 .detail("expectedHash", expected_hash)
                 .detail("recordedHash", admission.payload_hash.clone())
-                .detail("label", expected_label.unwrap_or_default())
+                .detail("label", expected_label.clone().unwrap_or_default())
             } else {
                 FlowError::new(
                     "FlowReplayError",
@@ -508,7 +563,7 @@ impl HostShared {
                 .with_ordinal(plan.ordinal)
                 .detail("expectedHash", expected_hash)
                 .detail("recordedHash", admission.payload_hash.clone())
-                .detail("expectedLabel", expected_label.unwrap_or_default())
+                .detail("expectedLabel", expected_label.clone().unwrap_or_default())
                 .detail(
                     "recordedLabel",
                     admission.recorded_label.clone().unwrap_or_default(),
@@ -519,6 +574,12 @@ impl HostShared {
         }
 
         self.finish_admission(plan.ordinal, Some(admission.disposition))?;
+        self.emit_node_submitted(
+            plan.ordinal,
+            &dedup_key,
+            expected_label.as_deref(),
+            &admission,
+        )?;
         let mut result = match admission.disposition {
             Disposition::Reused | Disposition::Substituted | Disposition::Terminal => {
                 admission.terminal.clone().ok_or_else(|| {
@@ -600,6 +661,7 @@ impl HostShared {
                     details: Some(Value::Object(error.details.clone())),
                 });
                 self.observe(result.witness_seq, plan.ordinal).await?;
+                self.emit_node_terminal(plan.ordinal, &dedup_key, &result)?;
                 if plan.settle {
                     return Ok(result);
                 }
@@ -608,6 +670,7 @@ impl HostShared {
         }
 
         self.observe(result.witness_seq, plan.ordinal).await?;
+        self.emit_node_terminal(plan.ordinal, &dedup_key, &result)?;
         if result.verdict == Verdict::Cancelled && !plan.settle {
             return Err(FlowError::new(
                 "FlowCancelledError",

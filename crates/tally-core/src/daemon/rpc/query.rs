@@ -1,5 +1,11 @@
 use super::super::*;
 
+/// What one `query.proof` call is asking about.
+enum ProofTarget {
+    Task(String),
+    FlowRun(String),
+}
+
 impl DaemonHandler {
     pub(crate) async fn query(
         &self,
@@ -266,6 +272,8 @@ impl DaemonHandler {
                     #[serde(default)]
                     task: Option<String>,
                     #[serde(default)]
+                    flow_run: Option<String>,
+                    #[serde(default)]
                     attempt: Option<u32>,
                     #[serde(default)]
                     session: Option<String>,
@@ -285,6 +293,7 @@ impl DaemonHandler {
                 let params: Params = decode_params(params)?;
                 let fingerprint = serde_json::to_string(&json!({
                     "task": params.task.clone(),
+                    "flowRun": params.flow_run.clone(),
                     "attempt": params.attempt,
                     "session": params.session.clone(),
                     "event": params.event,
@@ -297,10 +306,12 @@ impl DaemonHandler {
                     Some(
                         serde_json::to_value(
                             query_lifecycle_log(
+                                &details,
                                 &history,
                                 &witness,
                                 &LifecycleLogFilter {
                                     task: params.task,
+                                    flow_run: params.flow_run,
                                     attempt: params.attempt,
                                     session: params.session,
                                     event: params.event,
@@ -329,16 +340,48 @@ impl DaemonHandler {
             }
             "query.proof" => {
                 #[derive(Deserialize)]
-                #[serde(deny_unknown_fields)]
+                #[serde(deny_unknown_fields, rename_all = "camelCase")]
                 struct Params {
-                    task: String,
+                    #[serde(default)]
+                    task: Option<String>,
+                    #[serde(default)]
+                    flow_run: Option<String>,
                     #[serde(default)]
                     attempt: Option<u32>,
                 }
                 let params: Params = decode_params(params)?;
-                if params.task.trim().is_empty() {
-                    return Err(WireError::invalid("query proof task must not be empty"));
-                }
+                let target = match (
+                    params
+                        .task
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty()),
+                    params
+                        .flow_run
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty()),
+                ) {
+                    (Some(_), Some(_)) => {
+                        return Err(WireError::invalid(
+                            "query proof takes either a task or a flow run, not both",
+                        ));
+                    }
+                    (Some(task), None) => ProofTarget::Task(task.to_owned()),
+                    (None, Some(flow_run)) => {
+                        if params.attempt.is_some() {
+                            return Err(WireError::invalid(
+                                "query proof --attempt applies to a single task, not a flow run",
+                            ));
+                        }
+                        ProofTarget::FlowRun(flow_run.to_owned())
+                    }
+                    (None, None) => {
+                        return Err(WireError::invalid(
+                            "query proof requires a task or a flow run",
+                        ));
+                    }
+                };
                 let (attestation_report, attestations) = tokio::task::spawn_blocking(move || {
                     read_verified_attestations(&attestations_path)
                 })
@@ -352,19 +395,33 @@ impl DaemonHandler {
                         "attestation verification failed during proof query",
                     ));
                 }
-                serde_json::to_value(
-                    query_proof(
-                        &params.task,
-                        params.attempt,
-                        &details,
-                        &history,
-                        &report,
-                        &witness,
-                        &attestations,
+                match target {
+                    ProofTarget::Task(task) => serde_json::to_value(
+                        query_proof(
+                            &task,
+                            params.attempt,
+                            &details,
+                            &history,
+                            &report,
+                            &witness,
+                            &attestations,
+                        )
+                        .map_err(observability_wire)?,
                     )
-                    .map_err(observability_wire)?,
-                )
-                .map_err(internal_wire)
+                    .map_err(internal_wire),
+                    ProofTarget::FlowRun(flow_run) => serde_json::to_value(
+                        query_flow_proofs(
+                            &flow_run,
+                            &details,
+                            &history,
+                            &report,
+                            &witness,
+                            &attestations,
+                        )
+                        .map_err(observability_wire)?,
+                    )
+                    .map_err(internal_wire),
+                }
             }
             "query.trace" => {
                 #[derive(Deserialize)]

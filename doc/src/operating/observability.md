@@ -45,11 +45,60 @@ nodes without matching descriptions or argv:
 $ tally query jobs --flow-run <flow-run-uuid>
 ```
 
-Each item exposes `orchestration.flowRunId`, node ordinal and key, the
-orchestration `scriptHash`, `argsHash`, and `catalogHash`, pool, executor, parent
-task, disposition-derived state, and terminal facts. The runner itself is the
-parent row and is not one of the orchestrated child items unless it also carries
-that capsule.
+Each item exposes `orchestration.flowRunId`, the node ordinal, the orchestration
+`scriptHash`, `argsHash`, and `catalogHash`, pool, executor, parent task, live
+state, and terminal facts. The runner itself is the parent row and is not one of
+the orchestrated child items unless it also carries that capsule.
+
+Two fields make a replay auditable rather than merely asserted:
+
+| Field | Meaning |
+|---|---|
+| `dedupKey` | The node's submission identity. A flow-local `key` is rendered `flow:<run-id>:k:<key>`; a node without one is `flow:<run-id>:<ordinal>`; a `dedupKey` set by the script is used verbatim. |
+| `disposition` | How this row came to exist: `created`, `reused`, or `substituted`. |
+
+`disposition` covers only admissions that write a row. An `attached` answer joins
+a job already in flight, and a full-mode `reused` or `terminal` answer returns a
+governing witness — none of the three writes a second row, which is exactly what
+a correct replay looks like from here. Those answers appear in the runner's own
+lifecycle stream instead; see [Follow a flow run's
+nodes](#follow-a-flow-runs-nodes) below.
+
+To verify that a re-run replayed rather than re-executed: the node count and the
+`dedupKey` set must be unchanged, and every `disposition` must still read
+`created` from the first run.
+
+## Follow a flow run's nodes
+
+The flow runner writes one JSON object per line. Alongside `log`,
+`selector-resolved`, and `flow-completed`, it emits a pair of events per node:
+
+| Event | Emitted | Carries |
+|---|---|---|
+| `node-submitted` | When the daemon answers the node's enqueue | `ordinal`, `dedupKey`, `label`, `disposition`, `taskUuid`, `payloadHash`, `attempt` |
+| `node-terminal` | When the node's terminal result is observed | `ordinal`, `dedupKey`, `disposition`, `taskUuid`, `verdict`, `witnessSeq`, `exitCode`, `errorCode` |
+
+Unlike `log`, these are never suppressed on replay: a replayed prefix reporting
+`reused` is the fact an operator needs to see. `node-submitted` follows admission
+order and `node-terminal` follows the replay-stable observation order.
+
+The same run ID filters the two ledgers:
+
+```console
+$ tally query log --flow-run <flow-run-uuid>
+$ tally query proof --flow-run <flow-run-uuid>
+```
+
+`query log` restricts the lifecycle stream to the run's nodes, resolved from the
+orchestration capsule on the durable rows and the witness chain, because a
+lifecycle event carries no capsule of its own. `query proof` returns one proof
+per node in node-ordinal order under an `items` array, rather than requiring the
+task UUIDs the operator is trying to discover; it is mutually exclusive with
+`--task`, and `--attempt` applies only to `--task`.
+
+Both spellings of the run ID work everywhere: `--flow-run` and `--flow-run-id`
+are aliases on `tally query jobs`, `tally query log`, `tally query proof`, and
+`tally flow run`.
 
 For one node, inspect all attempt lanes:
 

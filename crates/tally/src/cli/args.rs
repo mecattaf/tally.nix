@@ -96,7 +96,9 @@ pub(super) struct FlowRunArgs {
     pub(super) args: Value,
     #[arg(long, value_name = "PATH")]
     pub(super) catalog: Option<PathBuf>,
-    #[arg(long)]
+    // `tally flow run` named this `--flow-run-id` while `tally query` named the
+    // same value `--flow-run`. Both spellings now work on both sides.
+    #[arg(long, alias = "flow-run")]
     pub(super) flow_run_id: Option<String>,
     #[arg(long, default_value_t = tally_flow::DEFAULT_MAX_NODES)]
     pub(super) max_nodes: u32,
@@ -595,7 +597,7 @@ pub(super) enum QueryCommand {
         origin: Option<String>,
         #[arg(long)]
         parent: Option<String>,
-        #[arg(long)]
+        #[arg(long, alias = "flow-run-id")]
         flow_run: Option<String>,
         #[arg(long)]
         session: Option<String>,
@@ -618,6 +620,8 @@ pub(super) enum QueryCommand {
     Log {
         #[arg(long)]
         task: Option<String>,
+        #[arg(long, alias = "flow-run-id")]
+        flow_run: Option<String>,
         #[arg(long)]
         attempt: Option<u32>,
         #[arg(long)]
@@ -637,7 +641,9 @@ pub(super) enum QueryCommand {
     },
     Proof {
         #[arg(long)]
-        task: String,
+        task: Option<String>,
+        #[arg(long, alias = "flow-run-id")]
+        flow_run: Option<String>,
         #[arg(long)]
         attempt: Option<u32>,
     },

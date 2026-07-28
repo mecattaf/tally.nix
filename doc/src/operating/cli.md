@@ -239,8 +239,10 @@ $ tally query job TASK-UUID
 ```
 
 `--flow-run` matches the witnessed/durable `orchestration.flowRunId` and is the supported way to
-group a runner's nodes. Pagination cursors are daemon-memory snapshots: repeat the same filters,
-and restart from the beginning if the daemon or cursor snapshot is gone.
+group a runner's nodes; `--flow-run-id` is an accepted alias, so the spelling `tally flow run`
+uses works here too. Each item carries the node's `dedupKey` and the `disposition` that wrote its
+row. Pagination cursors are daemon-memory snapshots: repeat the same filters, and restart from the
+beginning if the daemon or cursor snapshot is gone.
 
 ### Status, proof, log, and trace
 
@@ -248,7 +250,9 @@ and restart from the beginning if the daemon or cursor snapshot is gone.
 $ tally query status
 $ tally query status --pool build
 $ tally query proof --task TASK-UUID --attempt 2
+$ tally query proof --flow-run RUN-UUID
 $ tally query log --task TASK-UUID --attempt 2 --event completed
+$ tally query log --flow-run RUN-UUID
 $ tally query trace --task TASK-UUID --attempt 2 --limit 100
 ```
 
@@ -256,6 +260,14 @@ $ tally query trace --task TASK-UUID --attempt 2 --limit 100
 supports `--cursor`. `query trace` also supports page cursors. Proof is not just a witness
 lookup: it reports whether a witness is expected, returns the canonical record when present,
 separates advisory attestations, and includes ledger verification state.
+
+`query log --flow-run` restricts the lifecycle stream to one run's nodes. A lifecycle event
+carries no orchestration capsule, so the run's task UUIDs are resolved from the durable rows and
+the witness chain, which do.
+
+`query proof --flow-run` returns one proof per node in node-ordinal order under `items`, instead
+of requiring the task UUIDs the operator is trying to discover. It is mutually exclusive with
+`--task`, and `--attempt` applies only to `--task`.
 
 ### Producers, pools, render, and stand-up
 
@@ -308,12 +320,15 @@ $ tally flow run ./review.js \
 ```
 
 `--args` defaults to `{}`. `--max-nodes` defaults to 1,000 and is intersected with a smaller
-literal `meta.maxNodes`. A run ID is required from `--flow-run-id` or inherited
-`TALLY_TASK_UUID`; it must be a UUID. When the runner itself is a tally job,
+literal `meta.maxNodes`. `--flow-run` is an accepted alias for `--flow-run-id`, so one spelling
+carries across `tally flow run` and `tally query`. A run ID is required from `--flow-run-id` or
+inherited `TALLY_TASK_UUID`; it must be a UUID. When the runner itself is a tally job,
 `TALLY_TASK_UUID` and `TALLY_JOB_ID` must be present together and valid.
 
 The runner emits lifecycle objects as JSONL and ends with either `flow-report` or
-`flow-failed`. Script/determinism errors exit 10; replay divergence or a changed script in the
+`flow-failed`. Each node contributes a `node-submitted` object when the daemon answers its enqueue
+and a `node-terminal` object when its result is observed; both carry the node's `ordinal`,
+`dedupKey`, and `disposition`, and neither is suppressed on replay. Script/determinism errors exit 10; replay divergence or a changed script in the
 same run exits 20; flow-scoped cancellation exits 4 unless the cancelled node used
 `settle: true`. See the [full mapping](../reference/errors.md#structured-flow-errors).
 

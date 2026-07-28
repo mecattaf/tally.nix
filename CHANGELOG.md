@@ -15,6 +15,9 @@ authorized.
   persisted by hash in the durable row so a running job keeps one identity across daemon restarts,
   and forwarded by the CLI as the `callerJobToken` enqueue field. Remote and SSH-executed jobs
   never receive it.
+- Added `dedupKey` and `disposition` to the job projection, `--flow-run` filters to `tally query
+  log` and `tally query proof`, and per-node `node-submitted` and `node-terminal` lifecycle events
+  to the flow runner's stream, so a claimed replay is verifiable rather than asserted.
 - Added a typed per-flow `workloadMutex`, co-leased with `flow` for the runner process lifetime,
   with replay-behind-the-next-holder semantics and an admitted-parent manual invocation contract.
 - Added operator chapters for configured mechanisms and declarative flows, including exact module
@@ -58,6 +61,8 @@ authorized.
 - Removed the inert declarative-flow `budgetPool` option; its tombstone points to priorities and
   the typed process-scoped `workloadMutex` instead.
 - Restricted system-indexed flake outputs to `x86_64-linux` and documented that supported platform.
+- Accepted `--flow-run` and `--flow-run-id` interchangeably across `tally query` and
+  `tally flow run`.
 - Made the five worst flow authoring errors actionable: `unknown-spec-field` names its surface and
   lists the accepted fields, `duplicate-key` reports the first claim's ordinal and position,
   environment names separate invalid from reserved, every banned global names what to do instead,

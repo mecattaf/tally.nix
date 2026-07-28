@@ -53,6 +53,7 @@ pub struct RowDetailFact {
     pub task_uuid: String,
     pub description: String,
     pub argv: Vec<String>,
+    pub dedup_key: Option<String>,
     pub brief_hash: Option<String>,
     pub orchestration: Option<Orchestration>,
     pub row_status: RowStatus,
@@ -97,6 +98,7 @@ impl RowDetailFact {
             task_uuid: row.uuid.to_string(),
             description: row.description.clone(),
             argv: row.argv.clone(),
+            dedup_key: row.dedup_key.clone(),
             brief_hash: row.brief_hash.clone(),
             orchestration: row.orchestration.clone(),
             row_status,
@@ -242,6 +244,34 @@ pub struct AuthorshipProjection {
     pub git_ai_sessions: Vec<SourcedValue<AuthorshipSession>>,
 }
 
+/// How a durable row came to exist, in the daemon's own enqueue vocabulary.
+///
+/// A flow node's replay is only verifiable if the operator can read the answer
+/// the daemon gave, so the projection reports it rather than making the reader
+/// translate `laborClass`. Only admissions that write a row appear here:
+/// `attached` and full-mode `reused` and `terminal` answers reuse an existing
+/// row or a governing witness and write none, so those show up in the flow
+/// runner's `node-submitted` and `node-terminal` lifecycle events instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RowDisposition {
+    Created,
+    Reused,
+    Substituted,
+}
+
+impl RowDisposition {
+    const fn from_labor_class(labor_class: LaborClass) -> Self {
+        match labor_class {
+            // A recovered row was still created by its original admission;
+            // recovery is a property of the attempt, not of the admission.
+            LaborClass::Fresh | LaborClass::Recovered => Self::Created,
+            LaborClass::Reused => Self::Reused,
+            LaborClass::Substituted => Self::Substituted,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct JobSummary {
@@ -250,6 +280,8 @@ pub struct JobSummary {
     pub live_job_id: Option<String>,
     pub description: Option<String>,
     pub argv: Vec<String>,
+    pub dedup_key: Option<String>,
+    pub disposition: Option<RowDisposition>,
     pub brief_hash: Option<String>,
     pub orchestration: Option<Orchestration>,
     pub row_status: Option<RowStatus>,
@@ -568,6 +600,7 @@ pub struct LifecycleEventProjection {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LifecycleLogFilter {
     pub task: Option<String>,
+    pub flow_run: Option<String>,
     pub attempt: Option<u32>,
     pub session: Option<String>,
     pub event: Option<TallyEvent>,
@@ -577,16 +610,21 @@ pub struct LifecycleLogFilter {
 }
 
 pub fn query_lifecycle_log(
+    details: &[RowDetailFact],
     history: &LifecycleSnapshot,
     witness: &[WitnessRecord],
     filter: &LifecycleLogFilter,
 ) -> Result<CollectionEnvelope<LifecycleEventProjection>, ObservabilityError> {
     let since = filter.since.as_deref().map(parse_timestamp).transpose()?;
     let until = filter.until.as_deref().map(parse_timestamp).transpose()?;
+    let flow_tasks = filter
+        .flow_run
+        .as_deref()
+        .map(|flow_run| flow_run_tasks(flow_run, details, witness));
     let mut ordered = Vec::<(DateTime<Utc>, u8, u64, LifecycleEventProjection)>::new();
     for record in &history.records {
         let projection = lifecycle_projection(record);
-        if lifecycle_matches(&projection, filter, since, until) {
+        if lifecycle_matches(&projection, filter, flow_tasks.as_ref(), since, until) {
             ordered.push((
                 parse_timestamp(&projection.timestamp)?,
                 0,
@@ -597,7 +635,7 @@ pub fn query_lifecycle_log(
     }
     for record in witness {
         let projection = witness_lifecycle_projection(record);
-        if lifecycle_matches(&projection, filter, since, until) {
+        if lifecycle_matches(&projection, filter, flow_tasks.as_ref(), since, until) {
             ordered.push((
                 parse_timestamp(&projection.timestamp)?,
                 1,
@@ -812,6 +850,56 @@ pub fn query_proof(
     })
 }
 
+/// Every node proof for one flow run, in node-ordinal order.
+///
+/// Verifying a flow means verifying its nodes, and asking for them one task
+/// UUID at a time requires already knowing the UUIDs — which is the thing the
+/// operator is trying to find out.
+#[allow(clippy::too_many_arguments)]
+pub fn query_flow_proofs(
+    flow_run: &str,
+    details: &[RowDetailFact],
+    history: &LifecycleSnapshot,
+    witness_report: &VerifyReport,
+    witness: &[WitnessRecord],
+    attestations: &[AttestationRecord],
+) -> Result<CollectionEnvelope<ProofView>, ObservabilityError> {
+    let mut nodes = details
+        .iter()
+        .filter_map(|detail| {
+            let orchestration = detail.orchestration.as_ref()?;
+            (orchestration.flow_run_id() == flow_run)
+                .then(|| (orchestration.node_ordinal(), detail.task_uuid.clone()))
+        })
+        .collect::<Vec<_>>();
+    nodes.sort();
+    nodes.dedup();
+    if nodes.is_empty() {
+        return Err(ObservabilityError::UnknownJob(flow_run.to_owned()));
+    }
+    let items = nodes
+        .into_iter()
+        .map(|(_, task_uuid)| {
+            query_proof(
+                &task_uuid,
+                None,
+                details,
+                history,
+                witness_report,
+                witness,
+                attestations,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(CollectionEnvelope {
+        schema_version: QUERY_SCHEMA_VERSION,
+        protocol_version: QUERY_PROTOCOL_VERSION,
+        items,
+        next_cursor: None,
+        snapshot: snapshot_metadata(history, witness),
+    })
+}
+
 fn build_summary(
     anchor: &str,
     detail: Option<&RowDetailFact>,
@@ -878,6 +966,20 @@ fn build_summary(
         .filter(|record| current_attempt == Some(record.attempt))
         .filter(|record| current_lease_epoch.is_none_or(|lease| record.lease_epoch == lease))
         .max_by_key(|record| record.seq);
+    let labor_class = current_witness
+        .map(|record| record.labor_class)
+        .or_else(|| {
+            live.filter(|live| current_attempt == Some(live.attempt))
+                .map(|live| live.labor_class)
+        })
+        .or_else(|| current_event.and_then(|event| event.fields.labor_class))
+        .or_else(|| {
+            detail
+                .filter(|detail| current_attempt == Some(detail.attempt))
+                .map(|detail| detail.labor_class)
+        })
+        .or_else(|| live.map(|live| live.labor_class))
+        .or_else(|| latest_witness.map(|record| record.labor_class));
     let latest_evidence = aggregate_evidence(&current_events);
     let pools = detail
         .map(|detail| detail.pools.clone())
@@ -933,6 +1035,10 @@ fn build_summary(
             .or_else(|| latest_event.and_then(|event| event.fields.job_id.clone())),
         description: detail.map(|detail| detail.description.clone()),
         argv: detail.map_or_else(Vec::new, |detail| detail.argv.clone()),
+        dedup_key: detail
+            .and_then(|detail| detail.dedup_key.clone())
+            .or_else(|| latest_witness.and_then(|record| record.dedup_key.clone())),
+        disposition: labor_class.map(RowDisposition::from_labor_class),
         brief_hash: latest_witness
             .and_then(|record| record.brief_hash.clone())
             .or_else(|| detail.and_then(|detail| detail.brief_hash.clone())),
@@ -990,20 +1096,7 @@ fn build_summary(
         unit: live
             .map(|live| live.unit.clone())
             .or_else(|| current_event.and_then(|event| event.fields.unit.clone())),
-        labor_class: current_witness
-            .map(|record| record.labor_class)
-            .or_else(|| {
-                live.filter(|live| current_attempt == Some(live.attempt))
-                    .map(|live| live.labor_class)
-            })
-            .or_else(|| current_event.and_then(|event| event.fields.labor_class))
-            .or_else(|| {
-                detail
-                    .filter(|detail| current_attempt == Some(detail.attempt))
-                    .map(|detail| detail.labor_class)
-            })
-            .or_else(|| live.map(|live| live.labor_class))
-            .or_else(|| latest_witness.map(|record| record.labor_class)),
+        labor_class,
         parent_task_uuid: detail
             .and_then(|detail| detail.parent_task_uuid.clone())
             .or_else(|| current_event.and_then(|event| event.fields.parent.clone())),
@@ -1339,12 +1432,47 @@ fn witness_lifecycle_projection(record: &WitnessRecord) -> LifecycleEventProject
     }
 }
 
+/// Every task UUID a flow run admitted, from durable rows and the witness chain.
+///
+/// A lifecycle event carries no orchestration capsule, so a `--flow-run` filter
+/// has to resolve the run's nodes from the two records that do carry one.
+fn flow_run_tasks(
+    flow_run: &str,
+    details: &[RowDetailFact],
+    witness: &[WitnessRecord],
+) -> BTreeSet<String> {
+    let mut tasks = BTreeSet::new();
+    for detail in details {
+        if detail
+            .orchestration
+            .as_ref()
+            .is_some_and(|orchestration| orchestration.flow_run_id() == flow_run)
+        {
+            tasks.insert(detail.task_uuid.clone());
+        }
+    }
+    for record in witness {
+        if let (Some(task_uuid), Some(orchestration)) =
+            (record.task_uuid.as_ref(), record.orchestration.as_ref())
+        {
+            if orchestration.flow_run_id() == flow_run {
+                tasks.insert(task_uuid.clone());
+            }
+        }
+    }
+    tasks
+}
+
 fn lifecycle_matches(
     record: &LifecycleEventProjection,
     filter: &LifecycleLogFilter,
+    flow_tasks: Option<&BTreeSet<String>>,
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
 ) -> bool {
+    if flow_tasks.is_some_and(|tasks| !tasks.contains(&record.task_uuid)) {
+        return false;
+    }
     if filter
         .task
         .as_deref()
@@ -1609,6 +1737,7 @@ mod tests {
             task_uuid: "00000000-0000-4000-8000-000000000024".to_owned(),
             description: "proof state fixture".to_owned(),
             argv: vec!["run-proof".to_owned()],
+            dedup_key: Some("proof-fixture".to_owned()),
             brief_hash: None,
             orchestration: None,
             row_status: status,

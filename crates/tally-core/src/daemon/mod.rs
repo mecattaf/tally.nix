@@ -120,9 +120,9 @@ use crate::query::{
     RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
 };
 use crate::query_v2::{
-    query_job as query_job_v2, query_jobs as query_jobs_v2, query_lifecycle_log, query_proof,
-    snapshot_metadata, JobsFilter, LifecycleLogFilter, LiveJobFact, ObservabilityError,
-    RowDetailFact,
+    query_flow_proofs, query_job as query_job_v2, query_jobs as query_jobs_v2, query_lifecycle_log,
+    query_proof, snapshot_metadata, JobsFilter, LifecycleLogFilter, LiveJobFact,
+    ObservabilityError, RowDetailFact,
 };
 use crate::recovery::{
     collect_durable_recovery_facts, collect_local_unit_facts, recover, DurableRecoveryFacts,

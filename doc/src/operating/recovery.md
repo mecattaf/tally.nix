@@ -107,13 +107,22 @@ $ tally flow run /nix/store/…-review.js \
     --args '{"repository":"mecattaf/tally.nix"}'
 ```
 
-The report identifies each node as `created`, `attached`, `reused`,
-`substituted`, or `terminal`. A replayed prefix must not create duplicate rows:
+The runner's own JSONL stream identifies each node as `created`, `attached`,
+`reused`, `substituted`, or `terminal`, in the `disposition` field of its
+`node-submitted` and `node-terminal` events. `RunReport` itself carries no
+dispositions; read them from the stream, or from the node results the script
+observed.
+
+A replayed prefix must not create duplicate rows:
 
 ```console
 $ tally query jobs \
     --flow-run 4f8608e1-608f-4e04-bf47-0e49fd9801f1
 ```
+
+The node count and the set of `dedupKey` values must be unchanged, and each row's
+`disposition` must still read `created` from the original run — a replay that
+re-executed would have written new rows.
 
 Do not change the script, arguments, catalog, or node payload while retaining the
 run ID. The dedicated `*-changed-mid-run` identity errors and
