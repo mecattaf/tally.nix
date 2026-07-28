@@ -36,6 +36,26 @@ mod tests {
     use crate::witness::{Authorship, AuthorshipSession, AuthorshipStatus};
     use tally_client::RpcClient;
 
+    #[test]
+    fn dispatcher_methods_match_wire_inventory() {
+        use crate::wire::{method_class, INTERNAL_RPC_METHODS, RPC_METHODS};
+
+        let dispatched = DISPATCHER_METHODS
+            .iter()
+            .map(|(method, _)| *method)
+            .collect::<BTreeSet<_>>();
+        let inventoried = RPC_METHODS
+            .iter()
+            .chain(INTERNAL_RPC_METHODS)
+            .copied()
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(dispatched.len(), DISPATCHER_METHODS.len());
+        assert_eq!(inventoried.len(), RPC_METHODS.len() + INTERNAL_RPC_METHODS.len());
+        assert_eq!(dispatched, inventoried);
+        assert!(inventoried.iter().all(|method| method_class(method).is_some()));
+    }
+
     struct ExitFileProbe;
 
     impl LocalUnitProbe for ExitFileProbe {
