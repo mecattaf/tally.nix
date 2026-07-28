@@ -1,3 +1,8 @@
+use std::collections::BTreeSet;
+
+use tally_core::config::PoolPredicate;
+use tally_flow::validate_flow_pool_predicates;
+
 use super::*;
 
 #[derive(Debug, Default)]
@@ -103,6 +108,19 @@ pub(super) async fn run_flow(
                 },
             )
             .map_err(flow_error)?;
+            if let Some(config_path) = config_path {
+                let config = load_client_config(Some(config_path))?;
+                let windowed_consumption_pools = config
+                    .pools
+                    .iter()
+                    .filter_map(|(name, pool)| {
+                        matches!(pool.predicate, PoolPredicate::WindowedConsumption(_))
+                            .then(|| name.clone())
+                    })
+                    .collect::<BTreeSet<_>>();
+                validate_flow_pool_predicates(&checked.meta, &windowed_consumption_pools)
+                    .map_err(flow_error)?;
+            }
             println!("{}", serde_json::to_string(&checked.meta_json)?);
             Ok(())
         }
