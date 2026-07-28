@@ -1340,7 +1340,7 @@
               ];
 
               system.stateVersion = "26.11";
-              users.users.tally = {
+              users.users."tally-home" = {
                 isNormalUser = true;
                 uid = 1000;
                 createHome = true;
@@ -1358,10 +1358,10 @@
               home-manager = {
                 useGlobalPkgs = true;
                 useUserPackages = true;
-                users.tally = {
+                users."tally-home" = {
                   imports = [ self.homeManagerModules.tally ];
                   home = {
-                    username = "tally";
+                    username = "tally-home";
                     homeDirectory = "/var/lib/tally-test-user";
                     stateVersion = "26.11";
                   };
@@ -1379,21 +1379,35 @@
           testScript = ''
             machine.start()
             machine.wait_for_unit("multi-user.target")
+            machine.wait_for_unit("linger-users.service")
             machine.wait_for_unit("tally-daemon.service")
             machine.succeed("systemctl is-active tally-daemon.service")
+            machine.succeed("test \"$(systemctl show tally-daemon.service --property=User --value)\" = tally")
+            machine.succeed("test \"$(stat -c '%U:%G:%a' /run/tally)\" = tally:tally:700")
             machine.succeed("test -d /var/lib/tally")
             machine.succeed("test -d /var/log/tally")
             machine.succeed("grep -F '\"enforce\":\"cooperative\"' /etc/tally/config.json")
 
-            machine.wait_for_unit("home-manager-tally.service")
-            machine.succeed("loginctl enable-linger tally")
+            machine.succeed("systemctl stop tally-daemon.service")
+            machine.succeed("install -o root -g root -m 0600 /dev/null /var/lib/tally/data/attestations.jsonl")
+            machine.succeed("chown -R root:root /var/lib/tally")
+            machine.succeed("/run/current-system/activate")
+            machine.succeed("test \"$(stat -c '%U:%G:%a' /var/lib/tally/data/attestations.jsonl)\" = tally:tally:600")
+            machine.succeed("systemctl start tally-daemon.service")
+            machine.wait_for_unit("tally-daemon.service")
+            machine.succeed("systemctl start 'tally-witness-emit@success:upgrade-check.service'")
+            machine.succeed("test \"$(stat -c '%U:%G:%a' /var/lib/tally/data/attestations.jsonl)\" = tally:tally:600")
+            machine.succeed("${pkgs.jq}/bin/jq -e 'select(.payload.outcome == \"success\" and .payload.unit == \"upgrade-check\")' /var/lib/tally/data/attestations.jsonl")
+
+            machine.wait_for_unit("home-manager-tally-home.service")
+            machine.succeed("loginctl enable-linger tally-home")
             machine.succeed("systemctl start user@1000.service")
             machine.wait_until_succeeds(
-              "runuser -u tally -- env HOME=/var/lib/tally-test-user XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active tally-daemon.service"
+              "runuser -u tally-home -- env HOME=/var/lib/tally-test-user XDG_RUNTIME_DIR=/run/user/1000 systemctl --user is-active tally-daemon.service"
             )
             machine.succeed("test -S /run/user/1000/tally/tally.sock")
 
-            user = "runuser -u tally -- env HOME=/var/lib/tally-test-user XDG_RUNTIME_DIR=/run/user/1000"
+            user = "runuser -u tally-home -- env HOME=/var/lib/tally-test-user XDG_RUNTIME_DIR=/run/user/1000"
             machine.wait_until_succeeds(
               user + " systemctl --user show tally-clean-removed-producers.service --property=ExecMainStartTimestampMonotonic --value | grep -E '^[1-9][0-9]*$'"
             )
@@ -1409,6 +1423,57 @@
             machine.wait_until_succeeds(
               user + " journalctl --user --unit=tally-drain.service --output=cat --no-pager | grep -F '\"barrier\":\"barrier:drain:' | grep -F '\"rejected\":0'"
             )
+          '';
+        };
+        systemSocketExecutionTest = pkgs.testers.runNixOSTest {
+          name = "tally-system-socket-execution";
+          nodes.machine =
+            { ... }:
+            {
+              imports = [ self.nixosModules.tally ];
+              system.stateVersion = "26.11";
+
+              services.tally = {
+                enable = true;
+                dataDir = "/srv/tally/data";
+                stateDir = "/srv/tally/state";
+                retention.enable = false;
+                pools.stock = {
+                  resource = "build-slot";
+                  capacity = 1;
+                  enforce = "cooperative";
+                };
+              };
+            };
+          testScript = ''
+            import json
+
+            machine.start()
+            machine.wait_for_unit("multi-user.target")
+            machine.wait_for_unit("linger-users.service")
+            machine.wait_for_unit("tally-daemon.service")
+            uid = machine.succeed("id -u tally").strip()
+            machine.wait_for_unit(f"user@{uid}.service")
+
+            machine.succeed("test -S /run/tally/tally.sock")
+            machine.succeed("test \"$(stat -c '%U:%G:%a' /run/tally)\" = tally:tally:700")
+            machine.succeed("test \"$(stat -c '%U:%G:%a' /srv/tally/data)\" = tally:tally:700")
+            machine.succeed("test \"$(stat -c '%U:%G:%a' /srv/tally/state)\" = tally:tally:700")
+
+            result = json.loads(machine.succeed(
+              "${tally}/bin/tally --socket /run/tally/tally.sock enqueue --pool stock --wait -- ${pkgs.coreutils}/bin/true"
+            ))
+            assert result["verdict"] == "pass", result
+            assert result["exit_code"] == 0, result
+            task = result["task_uuid"]
+
+            queried = json.loads(machine.succeed(
+              "${tally}/bin/tally --socket /run/tally/tally.sock query job " + task
+            ))
+            assert queried["job"]["terminalVerdict"] == "pass", queried
+            exit_record = f"/srv/tally/state/unit-exit/{task}.json"
+            machine.succeed(f"test \"$(stat -c '%U:%G' {exit_record})\" = tally:tally")
+            machine.succeed(f"test \"$(stat -c '%u' {exit_record})\" != 0")
           '';
         };
         retentionTest = pkgs.testers.runNixOSTest {
@@ -2448,6 +2513,22 @@
           assert builtins.elem tallyWitnessEmit stockNixos.config.environment.systemPackages;
           assert builtins.elem "TALLY_ATTESTATION_LEDGER=/var/lib/tally/data/attestations.jsonl"
             systemWitnessEmitter.serviceConfig.Environment;
+          assert stockNixos.config.services.tally.user == "tally";
+          assert stockNixos.config.services.tally.group == "tally";
+          assert stockNixos.config.users.users.tally.isSystemUser;
+          assert stockNixos.config.users.users.tally.linger;
+          assert systemDaemon.serviceConfig.User == "tally";
+          assert systemDaemon.serviceConfig.Group == "tally";
+          assert
+            systemDaemon.serviceConfig.ReadWritePaths == [
+              "/var/lib/tally/data"
+              "/var/lib/tally/state"
+            ];
+          assert systemWitnessEmitter.serviceConfig.User == "tally";
+          assert systemWitnessEmitter.serviceConfig.Group == "tally";
+          assert systemWitnessEmitter.serviceConfig.NoNewPrivileges;
+          assert systemWitnessEmitter.serviceConfig.ProtectSystem == "strict";
+          assert systemWitnessEmitter.serviceConfig.ReadWritePaths == [ "/var/lib/tally/data" ];
           assert systemDaemon.serviceConfig.StateDirectory == "tally";
           assert systemDaemon.serviceConfig.LogsDirectory == "tally";
           assert systemDaemon.serviceConfig.RestrictAddressFamilies == [ "AF_UNIX" ];
@@ -2940,6 +3021,7 @@
         // pkgs.lib.optionalAttrs isLinux {
           stock-nixos-activation = stockNixos.config.system.build.toplevel;
           stock-host-activation = stockHostTest;
+          system-socket-execution = systemSocketExecutionTest;
           retention-liveness-floor = retentionTest;
           flow-multi-host = flowMultiHostTest;
         };
