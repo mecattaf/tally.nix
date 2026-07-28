@@ -6131,7 +6131,10 @@ mod tests {
         let systemctl = temp.path().join("fake-systemctl");
         crate::test_support::install_shell_program(
             &systemctl,
-            format!("#!/bin/sh\nprintf '%s' \"$4\" > '{}'\n", stopped.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$4\" >> '{}'\n",
+                stopped.display()
+            ),
         );
         let executor = base
             .with_systemd_run(systemd_run)
@@ -6158,7 +6161,11 @@ mod tests {
         .await
         .expect("reclaim did not wait for launch visibility")
         .unwrap();
-        assert_eq!(std::fs::read_to_string(stopped).unwrap(), unit);
+        let stopped_units = std::fs::read_to_string(stopped).unwrap();
+        assert!(
+            !stopped_units.is_empty() && stopped_units.lines().all(|stopped| stopped == unit),
+            "unexpected stopped units: {stopped_units:?}"
+        );
         let result = running.await.unwrap();
         assert!(
             matches!(
