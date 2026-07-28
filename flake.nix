@@ -186,6 +186,53 @@
           '';
           meta.mainProgram = "tally";
         };
+        mkCargoCheck =
+          {
+            pname,
+            tool,
+            command,
+          }:
+          tally.overrideAttrs (previous: {
+            inherit pname;
+            nativeBuildInputs = (previous.nativeBuildInputs or [ ]) ++ [ tool ];
+            doCheck = false;
+            buildPhase = ''
+              runHook preBuild
+              ${command}
+              runHook postBuild
+            '';
+            installPhase = ''
+              runHook preInstall
+              touch "$out"
+              runHook postInstall
+            '';
+            postInstall = "";
+          });
+        rustfmtCheck = mkCargoCheck {
+          pname = "tally-rustfmt-check";
+          tool = pkgs.rustfmt;
+          command = "cargo fmt --all --check";
+        };
+        clippyCheck = mkCargoCheck {
+          pname = "tally-clippy-check";
+          tool = pkgs.clippy;
+          command = "cargo clippy --workspace --all-targets --all-features -- -D warnings";
+        };
+        nixfmtCheck =
+          pkgs.runCommand "tally-nixfmt-check"
+            {
+              src = self;
+              nativeBuildInputs = [
+                pkgs.findutils
+                pkgs.nixfmt-rfc-style
+              ];
+            }
+            ''
+              find "$src" -type f -name '*.nix' -print0 \
+                | sort -z \
+                | xargs -0 nixfmt --check
+              touch "$out"
+            '';
         optionsJson = optionsDoc: "${optionsDoc.optionsJSON}/share/doc/nixos/options.json";
         transformTallyOption =
           option:
@@ -2292,23 +2339,24 @@
         systemDaemon = stockNixos.config.systemd.services.tally-daemon;
         systemWitnessEmitter = stockNixos.config.systemd.services."tally-witness-emit@";
         moduleContract =
-          assert stockHome.config.services.tally.retention == {
-            enable = true;
-            horizon = "30d";
-            onCalendar = "daily";
-          };
+          assert
+            stockHome.config.services.tally.retention == {
+              enable = true;
+              horizon = "30d";
+              onCalendar = "daily";
+            };
           assert stockHome.config.services.tally.attestations.exec.enable;
-          assert stockHome.config.services.tally.gitAi == {
-            enable = false;
-            mode = "advisory";
-            awaitTimeoutSec = 60;
-            globalAwaitOk = false;
-          };
+          assert
+            stockHome.config.services.tally.gitAi == {
+              enable = false;
+              mode = "advisory";
+              awaitTimeoutSec = 60;
+              globalAwaitOk = false;
+            };
           assert homeServices ? tally-retention;
           assert homeTimers ? tally-retention;
           assert homeTimers.tally-retention.Timer.OnCalendar == "daily";
-          assert pkgs.lib.hasInfix "gc --horizon 30d --collect"
-            (homeServiceExec "tally-retention");
+          assert pkgs.lib.hasInfix "gc --horizon 30d --collect" (homeServiceExec "tally-retention");
           assert homeTimers ? tally-producer-daily;
           assert homeTimers.tally-producer-daily.Timer.OnCalendar == "daily";
           assert homeTimers ? tally-producer-flow-fixture;
@@ -2496,6 +2544,9 @@
         };
         checks = {
           inherit tally;
+          rustfmt = rustfmtCheck;
+          clippy = clippyCheck;
+          nixfmt-check = nixfmtCheck;
           doc = documentation;
           stock-home-activation = stockHome.activationPackage;
           stock-nixos-activation = stockNixos.config.system.build.toplevel;
