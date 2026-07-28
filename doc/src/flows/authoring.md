@@ -58,9 +58,10 @@ Two current limits matter when choosing pools:
   runner lifetime. The generated runner requests only `flow`; putting a mutex on
   individual children protects only those children. The run-wide question remains
   open in [#107](https://github.com/mecattaf/tally.nix/issues/107).
-- A flow node has no `consumptionEstimate` field. It therefore cannot satisfy the
-  admission contract of a `windowed-consumption` pool. The missing input remains
-  open in [#116](https://github.com/mecattaf/tally.nix/issues/116).
+- A flow node deliberately has no `consumptionEstimate` field. Checked flows
+  are excluded from `windowed-consumption` pools by design. Use low node
+  priorities for wave work so a more important ask can intercede during the
+  run without estimates preventing completion.
 
 Those are descriptions of the shipped interface, not invitations to emulate a
 missing run-wide lease in JavaScript.

@@ -54,10 +54,11 @@ held for the duration of the run.
 
 There is likewise no current flow surface that makes the runner hold an
 arbitrary mutex or lease for its full run. Nodes acquire their own declared
-pools as ordinary jobs. Finally, the shipped flow `NodeSpec` has no
-`consumptionEstimate`, while the lease engine requires that field for every
-windowed-consumption pool. A flow node therefore cannot currently be admitted
-to such a pool. These are present limits, not promises about a future surface.
+pools as ordinary jobs. The shipped flow `NodeSpec` deliberately has no
+`consumptionEstimate`; configured flow checking excludes
+windowed-consumption pools by design. Priorities control contention between
+flow workloads. The kernel mechanism remains unchanged for direct and
+producer enqueues.
 
 ## Lease lifetime
 

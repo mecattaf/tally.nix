@@ -144,15 +144,18 @@ The pipeline is:
 
 1. Render the complete runtime JSON and run
    `tally --mode check-config --config <rendered-json>`.
-2. For each entry, run `tally flow check <script>` and capture its normalized
-   metadata.
+2. For each entry, run
+   `tally --config <rendered-json> flow check <script>` and capture its
+   normalized metadata.
 3. Reject any `meta.pools` name absent from `services.tally.pools`.
-4. Reject reserved `flow` or `build` in `meta.pools`.
-5. Compare a literal `meta.maxNodes` with the configured `maxNodes`.
-6. Run `tally flow check <script> --args <configured-json>`.
-7. If `catalog` is non-null, run
-   `tally flow check <script> --catalog <store-path>`; otherwise reject any
-   declared selector.
+4. Reject any `meta.pools` entry configured with a
+   `windowed-consumption` predicate.
+5. Reject reserved `flow` or `build` in `meta.pools`.
+6. Compare a literal `meta.maxNodes` with the configured `maxNodes`.
+7. Run `tally --config <rendered-json> flow check <script> --args <configured-json>`.
+8. If `catalog` is non-null, run
+   `tally --config <rendered-json> flow check <script> --catalog <store-path>`;
+   otherwise reject any declared selector.
 
 The first `flow check` parses the module, validates the literal `meta` object,
 applies the deterministic-global lint, checks literal pool declarations, and
@@ -179,20 +182,20 @@ derivation, so it can reject an invalid flow declaration. It does not add the
 reserved pools or render flow producer services and timers. A NixOS flow entry
 that evaluates successfully is therefore validation, not deployment.
 
-## Current windowed-consumption limitation
+## Flows are excluded from windowed consumption
 
-Manual and producer enqueues can supply `consumptionEstimate`, which every
-`windowed-consumption` pool requires before admission. The shipped flow
-`NodeSpec` has no `consumptionEstimate` field. A flow node assigned to such a
-pool is therefore rejected with:
+Flow nodes deliberately have no `consumptionEstimate` field. A checked flow
+may not declare a pool whose configured predicate is `windowed-consumption`.
+The configured `tally flow check` fails before activation with the named error
+`FlowPoolError`/`windowed-consumption-excluded`, identifying the pool and
+stating that priorities are the control for contention between workloads.
 
-```text
-windowed-consumption pool "<name>" requires consumptionEstimate
-```
+This is a design position, not a temporary dialect limitation. Estimates do
+not block flow work from completing. Give ordinary wave nodes a low priority;
+a more important ask can then intercede midway through the run by design.
+Setting `budgetPool` does not change the rule because that option creates no
+node admission channel.
 
-Setting the Nix `budgetPool` option does not work around this limitation: as
-described above, that field only checks that a pool name exists. Use a
-co-residency pool for flow nodes today, or submit budgeted work through a
-surface that can carry an authoritative estimate. Do not infer consumption
-from adapter argv or scraped usage; the estimate is an admission input, while
-meter observations can only clamp headroom after the fact.
+The exclusion is flow-specific. Direct and producer enqueues retain the
+kernel's existing windowed-consumption mechanism and may supply
+`consumptionEstimate` when that admission policy is appropriate.

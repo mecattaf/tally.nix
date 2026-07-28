@@ -145,10 +145,12 @@ the option's stale description, it adds no runner pool and creates no lease.
 There is consequently no sanctioned mechanism today for a flow to hold a
 workload mutex or budget lease for its whole run
 ([open question #107](https://github.com/mecattaf/tally.nix/issues/107)).
-Separately, a generic job can supply `consumptionEstimate`, but a flow node cannot;
-that means a node cannot currently enter a `windowed-consumption` pool
-([open question #116](https://github.com/mecattaf/tally.nix/issues/116)). Neither
-gap is papered over here with a prospective API.
+Separately, a generic job can supply `consumptionEstimate`, while flow nodes
+deliberately cannot. Configured flow checking excludes
+`windowed-consumption` pools and points to priorities as the contention
+control: important work may intercede midway through a low-priority wave
+without estimates preventing its eventual completion. The kernel-side budget
+mechanism remains available to direct and producer enqueues.
 
 ## Pure evaluation in JavaScript clothes
 

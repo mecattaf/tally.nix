@@ -283,11 +283,11 @@ proof.
 
 Flow runner jobs themselves request exactly the generated `flow` pool.
 `budgetPool` currently validates that the named pool exists; it does not add
-that pool to runner admission. Separately, a flow node has no
-`consumptionEstimate` field, so it cannot enter a
-`windowed-consumption` pool that requires one. These are current boundaries,
-not configuration recipes. Manual enqueue can supply
-`--consumption-estimate` where that pool type is needed.
+that pool to runner admission. Separately, flow nodes deliberately have no
+`consumptionEstimate` field and configured flow checking excludes
+`windowed-consumption` pools by design. Use priorities for contention between
+flow workloads. Manual and producer enqueue retain
+`--consumption-estimate` where that pool type is appropriate.
 
 ## Move artifacts explicitly
 

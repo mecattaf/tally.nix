@@ -1178,6 +1178,28 @@
             "tally flow fixture references unknown pool worker-gpu"
           ];
         };
+        flowWindowedConsumptionFailure = pkgs.testers.testBuildFailure' {
+          name = "tally-flow-windowed-consumption-failure";
+          drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
+            script = ./test/fixtures/flows/valid.js;
+            args.task = "ship";
+            catalog = catalogFixture;
+            pools = {
+              build.resource = "build-slot";
+              worker-gpu = {
+                resource = "budget";
+                predicate.windowed-consumption = {
+                  windowSec = 18000;
+                  consumptionCap = 100;
+                };
+              };
+            };
+          });
+          expectedBuilderExitCode = 1;
+          expectedBuilderLogEntries = [
+            ''tally: {"name":"FlowPoolError","code":"windowed-consumption-excluded","message":"flows are excluded from windowed-consumption admission by design; use priorities to control contention between workloads (pool \"worker-gpu\")","details":{"pool":"worker-gpu","control":"priorities"}}''
+          ];
+        };
         flowReservedPoolFailure = pkgs.testers.testBuildFailure' {
           name = "tally-flow-reserved-pool-failure";
           drv = moduleCommon.mkCheckedConfig (mkFlowConfig {
@@ -2625,6 +2647,7 @@
               {
                 lintFailure = flowUndeclaredPoolFailure;
                 closureFailure = flowPoolClosureFailure;
+                windowedFailure = flowWindowedConsumptionFailure;
                 reservedFailure = flowReservedPoolFailure;
                 reservedBuildFailure = flowReservedBuildPoolFailure;
                 maxNodesFailure = flowMaxNodesFailure;
@@ -2632,6 +2655,7 @@
               ''
                 test -e "$lintFailure"
                 test -e "$closureFailure"
+                test -e "$windowedFailure"
                 test -e "$reservedFailure"
                 test -e "$reservedBuildFailure"
                 test -e "$maxNodesFailure"

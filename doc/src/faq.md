@@ -120,9 +120,11 @@ exactly the `flow` pool, and a flow's `budgetPool` currently checks only that
 the named pool exists. Individual nodes request their own pools while they
 run.
 
-Likewise, flow nodes cannot supply the `consumptionEstimate` required by a
-`windowed-consumption` pool. Manual enqueue has
-`--consumption-estimate`; the flow dialect does not. Do not infer either
+Likewise, flow nodes deliberately do not supply `consumptionEstimate`, and
+configured flow checking excludes `windowed-consumption` pools. Flow
+contention uses priorities so more important work can intercede without an
+estimate preventing the wave from completing. Manual and producer enqueue
+retain the kernel's windowed-consumption mechanism. Do not infer either
 capability from the option names.
 
 ## Are pools hard resource isolation?

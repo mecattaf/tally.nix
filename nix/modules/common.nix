@@ -2455,13 +2455,13 @@ let
                 ''
               else
                 ''
-                  ${lib.getExe cfg.package} flow check ${script} \
+                  ${lib.getExe cfg.package} --config ${rendered} flow check ${script} \
                     --catalog ${lib.escapeShellArg (storePathWithContext flow.catalog)} >/dev/null
                 '';
           in
           ''
             meta="$TMPDIR/flow-${id}-meta.json"
-            ${lib.getExe cfg.package} flow check ${script} > "$meta"
+            ${lib.getExe cfg.package} --config ${rendered} flow check ${script} > "$meta"
 
             unknown_pool="$(
               jq -r --slurpfile config ${rendered} \
@@ -2488,7 +2488,8 @@ let
               exit 1
             fi
 
-            ${lib.getExe cfg.package} flow check ${script} --args "$(cat ${args})" >/dev/null
+            ${lib.getExe cfg.package} --config ${rendered} flow check ${script} \
+              --args "$(cat ${args})" >/dev/null
 
             selector_count="$(jq -r '(.selectors // []) | length' "$meta")"
             ${catalogCheck}

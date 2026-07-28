@@ -13,6 +13,7 @@ the shipped implementation; placeholders vary with the job.
 | Job remains queued or paused | state `queued` or `paused`; pool signal `STOP` | Capacity is held, a consumption window is spent, or the pool is paused/unreachable. |
 | Child is rejected before admission | `parent fanout would exceed fanoutCap N`, `enqueue depth D exceeds depthCap N`, or `flow run ID already has N nodes; maxNodes is M` | A configured guardrail, not pool contention. |
 | Budget submission is rejected | `windowed-consumption pool "NAME" requires consumptionEstimate` | The request omitted the authoritative debit estimate. |
+| Flow configuration is rejected | code `windowed-consumption-excluded` | A pool in `meta.pools` uses windowed consumption, from which flows are excluded by design. |
 | Child points at the wrong daemon | `unknown parent job ID` | An inherited `TALLY_JOB_ID` was sent to a daemon that does not own that parent. |
 | A key names different work | `dedup-key-conflict for key "KEY"` | The same full-mode key was presented with a different payload, or legacy history contains multiple live owners. |
 | Flow history no longer matches | code `replay-divergence`; `ordinal N re-derived payload NEW but the ledger recorded OLD` | Replay derived different work at an existing ordinal. |
@@ -80,8 +81,20 @@ Without it the daemon emits:
 windowed-consumption pool "programmatic" requires consumptionEstimate
 ```
 
-Flow node submissions have no `consumptionEstimate` surface in the shipped
-dialect, so assigning such a pool to a flow node is not an operable workaround.
+Flow node submissions deliberately have no `consumptionEstimate` surface.
+Checking a registered flow against its rendered configuration rejects a
+windowed pool before activation:
+
+```text
+FlowPoolError [windowed-consumption-excluded]: flows are excluded from
+windowed-consumption admission by design; use priorities to control contention
+between workloads
+```
+
+Use node priorities for flow contention: low-priority wave work remains
+eligible to complete, while a more important ask can intercede midway through
+the run. The kernel-side mechanism above remains available to direct and
+producer enqueues.
 
 ## `unknown parent job`
 
