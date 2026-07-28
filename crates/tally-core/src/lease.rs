@@ -13,7 +13,7 @@ use thiserror::Error;
 use crate::config::{
     PoolConfig, PoolPredicate, Priority, ResourceKind, DEFAULT_AGING_THRESHOLD_SEC,
 };
-use crate::witness::{read_verified_records, Verdict, WitnessError};
+use crate::witness::{Verdict, WitnessError, WitnessRecord};
 
 pub const LEASE_EPOCH_FILE: &str = "lease_epoch";
 pub const LEASE_EVENTS_FILE: &str = "lease-events.jsonl";
@@ -445,7 +445,7 @@ impl LeaseEngine {
         yield_grace: Duration,
         pools: BTreeMap<String, PoolConfig>,
         events: LeaseEventLog,
-        witness_path: &Path,
+        witness: &[WitnessRecord],
         now: DateTime<Utc>,
     ) -> Result<Self, LeaseError> {
         Self::from_durable_with_aging_threshold(
@@ -454,7 +454,7 @@ impl LeaseEngine {
             Duration::from_secs(DEFAULT_AGING_THRESHOLD_SEC),
             pools,
             events,
-            witness_path,
+            witness,
             now,
         )
     }
@@ -465,10 +465,10 @@ impl LeaseEngine {
         aging_threshold: Duration,
         pools: BTreeMap<String, PoolConfig>,
         events: LeaseEventLog,
-        witness_path: &Path,
+        witness: &[WitnessRecord],
         now: DateTime<Utc>,
     ) -> Result<Self, LeaseError> {
-        let rebuilt = rebuild_window_usage(&pools, &events, witness_path, now)?;
+        let rebuilt = rebuild_window_usage(&pools, &events, witness, now)?;
         let mut engine = Self::new_with_aging_threshold(
             epoch,
             yield_grace,
@@ -1189,13 +1189,9 @@ fn prune_debits(state: &mut RuntimePool, now: DateTime<Utc>) -> Result<(), Lease
 pub fn rebuild_window_usage(
     pools: &BTreeMap<String, PoolConfig>,
     event_log: &LeaseEventLog,
-    witness_path: &Path,
+    witness: &[WitnessRecord],
     now: DateTime<Utc>,
 ) -> Result<WindowUsageSnapshot, LeaseError> {
-    let (report, witness) = read_verified_records(witness_path)?;
-    if !report.ok {
-        return Err(LeaseError::InvalidWitness);
-    }
     let witness_records = witness.len();
     let mut unique_grants = HashSet::new();
     let mut usage = BTreeMap::new();
@@ -1416,7 +1412,7 @@ mod tests {
 
     use crate::config::{CoResidencyPredicate, WindowedConsumptionPredicate};
     use crate::taskdb::{AdmissionOrigin, EnqueueSource};
-    use crate::witness::{LaborClass, WitnessBody, WitnessLedger};
+    use crate::witness::{read_verified_records, LaborClass, WitnessBody, WitnessLedger};
 
     use super::*;
 
@@ -2607,12 +2603,14 @@ mod tests {
             Some(timestamp(now() + chrono::Duration::seconds(60)))
         );
 
-        let rebuilt = rebuild_window_usage(&pools, &log, &witness, now()).unwrap();
+        let (report, records) = read_verified_records(&witness).unwrap();
+        assert!(report.ok);
+        let rebuilt = rebuild_window_usage(&pools, &log, &records, now()).unwrap();
         assert_eq!(rebuilt.usage["api"], 40);
         assert_eq!(rebuilt.witness_records, 1);
 
         let mut restarted =
-            LeaseEngine::from_durable(4, Duration::from_secs(20), pools, log, &witness, now())
+            LeaseEngine::from_durable(4, Duration::from_secs(20), pools, log, &records, now())
                 .unwrap();
         let mut after_restart = request("after-restart", &["api"], Priority::High);
         after_restart.consumption_estimate = Some(61);
@@ -2643,18 +2641,20 @@ mod tests {
         grant(first.admit_at(request.clone(), now()).unwrap());
         assert_eq!(first.budget_used_at("api", now()).unwrap(), 60);
 
+        let (report, records) = read_verified_records(&witness).unwrap();
+        assert!(report.ok);
         let mut restarted = LeaseEngine::from_durable(
             4,
             Duration::from_secs(20),
             pools.clone(),
             log.clone(),
-            &witness,
+            &records,
             now(),
         )
         .unwrap();
         grant(restarted.admit_at(request, now()).unwrap());
         assert_eq!(restarted.budget_used_at("api", now()).unwrap(), 60);
-        let rebuilt = rebuild_window_usage(&pools, &log, &witness, now()).unwrap();
+        let rebuilt = rebuild_window_usage(&pools, &log, &records, now()).unwrap();
         assert_eq!(rebuilt.usage["api"], 60);
     }
 
@@ -2691,7 +2691,9 @@ mod tests {
             .unwrap();
         }
         let pools = BTreeMap::from([("api".to_owned(), window_pool(100))]);
-        let rebuilt = rebuild_window_usage(&pools, &log, &witness, now()).unwrap();
+        let (report, records) = read_verified_records(&witness).unwrap();
+        assert!(report.ok);
+        let rebuilt = rebuild_window_usage(&pools, &log, &records, now()).unwrap();
         assert_eq!(rebuilt.usage["api"], 60);
         assert!(rebuilt.debited_admissions.contains("stable:1"));
     }

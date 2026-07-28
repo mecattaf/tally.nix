@@ -8305,6 +8305,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn startup_performs_at_most_two_full_witness_verifications() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let (paths, _, _, _, _) = seed_durable_query_fixture(temp.path());
+                let executor = Executor::new(&paths.state_dir, std::env::current_exe().unwrap())
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let before = crate::witness::FULL_VERIFICATION_PASSES.with(std::cell::Cell::get);
+                let daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let after = crate::witness::FULL_VERIFICATION_PASSES.with(std::cell::Cell::get);
+                assert!(
+                    after - before <= 2,
+                    "startup performed {} full witness verifications",
+                    after - before
+                );
+
+                // Queries reuse the startup-verified view: a fresh envelope
+                // performs no additional full pass.
+                let before_query =
+                    crate::witness::FULL_VERIFICATION_PASSES.with(std::cell::Cell::get);
+                daemon
+                    .handler
+                    .query("query.jobs", Some(json!({"limit": 10})))
+                    .await
+                    .unwrap();
+                let after_query =
+                    crate::witness::FULL_VERIFICATION_PASSES.with(std::cell::Cell::get);
+                assert_eq!(
+                    after_query - before_query,
+                    0,
+                    "query re-verified the whole ledger"
+                );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn continuation_pages_skip_witness_reads_and_stay_frozen() {
         let local = LocalSet::new();
         local

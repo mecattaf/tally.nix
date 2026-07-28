@@ -920,7 +920,16 @@ struct ParsedRecord {
     line: usize,
 }
 
+thread_local! {
+    /// Count of whole-ledger verification passes performed by this thread,
+    /// exposed so capacity tests can assert how many full verifications an
+    /// operation performs. Suffix-only verification does not count.
+    pub static FULL_VERIFICATION_PASSES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 pub fn verify_reader(mut reader: impl BufRead) -> VerifyReport {
+    FULL_VERIFICATION_PASSES.with(|passes| passes.set(passes.get() + 1));
     let mut problems = Vec::new();
     let mut valid = Vec::new();
     let mut line_number = 0;
@@ -1297,9 +1306,28 @@ fn verify_suffix(
             .map_err(|source| io_error(path, source))?;
         bytes.truncate(complete_len);
     }
-    let text = std::str::from_utf8(&bytes)
+    let records = verify_suffix_bytes(&bytes, head)?;
+    let head = records.last().map_or_else(
+        || head.clone(),
+        |record| ChainHead {
+            seq: record.seq,
+            hash: record.hash.clone(),
+        },
+    );
+    Ok((head, offset + complete_len as u64))
+}
+
+/// Verify complete LF-terminated ledger bytes as a suffix chaining from
+/// `head`, returning the parsed records. Every record is fully validated and
+/// hash-checked exactly as full verification would.
+pub fn verify_suffix_bytes(
+    bytes: &[u8],
+    head: &ChainHead,
+) -> Result<Vec<WitnessRecord>, WitnessError> {
+    let text = std::str::from_utf8(bytes)
         .map_err(|error| WitnessError::Corrupt(format!("ledger suffix is not UTF-8: {error}")))?;
     let mut head = head.clone();
+    let mut records = Vec::new();
     for line in text.split_terminator('\n') {
         if line.trim().is_empty() {
             return Err(WitnessError::Corrupt(
@@ -1329,10 +1357,11 @@ fn verify_suffix(
         }
         head = ChainHead {
             seq: record.seq,
-            hash: record.hash,
+            hash: record.hash.clone(),
         };
+        records.push(record);
     }
-    Ok((head, offset + complete_len as u64))
+    Ok(records)
 }
 
 pub struct WitnessLedger {

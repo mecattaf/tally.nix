@@ -332,7 +332,7 @@ struct QueryProjection {
     live_states: HashMap<String, String>,
     live: Vec<LiveJobFact>,
     report: crate::witness::VerifyReport,
-    witness: Vec<WitnessRecord>,
+    witness: std::sync::Arc<Vec<WitnessRecord>>,
 }
 
 impl DaemonHandler {
@@ -346,12 +346,15 @@ impl DaemonHandler {
                 realtime_us: Some(record.realtime_us),
             })
             .collect::<Vec<_>>();
-        let (rows, details, witness_path, attestations_path, live_states, live) = {
-            let context = self.context.read().await;
+        let (rows, details, attestations_path, live_states, live, report, witness) = {
+            let mut context = self.context.write().await;
+            // The cached view verifies only bytes appended since the last
+            // read; a broken suffix or shrunken ledger fails the query.
+            let witness = context.witness_view.records().map_err(internal_wire)?;
+            let report = context.witness_view.report();
             (
                 context.query_rows.values().cloned().collect::<Vec<_>>(),
                 context.query_details.values().cloned().collect::<Vec<_>>(),
-                context.paths.witness_path(),
                 context.paths.attestations_path(),
                 context
                     .jobs
@@ -373,17 +376,10 @@ impl DaemonHandler {
                         labor_class: job.labor_class,
                     })
                     .collect::<Vec<_>>(),
+                report,
+                witness,
             )
         };
-        let (report, witness) = tokio::task::spawn_blocking(move || {
-            crate::witness::read_verified_records(&witness_path)
-        })
-        .await
-        .map_err(|error| internal_wire(format!("witness query worker failed: {error}")))?
-        .map_err(internal_wire)?;
-        if !report.ok {
-            return Err(internal_wire("witness verification failed during query"));
-        }
         Ok(QueryProjection {
             history,
             journal,

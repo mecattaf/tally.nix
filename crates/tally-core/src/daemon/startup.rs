@@ -74,15 +74,9 @@ impl Daemon {
         {
             let _lock = lock_gcroot_registration(&paths)?;
             let horizon = parse_horizon(&config.retention.horizon)?;
-            let (verification, records) = read_verified_records(&witness_path)?;
-            if !verification.ok {
-                return Err(DaemonError::Invalid(
-                    "witness verification failed during GC-root reconciliation".to_owned(),
-                ));
-            }
             for (sequence, report) in reconcile_recent_roots(
                 &paths.gcroots_dir(),
-                &records,
+                durable.witness(),
                 Utc::now(),
                 horizon,
                 &NixStore::default(),
@@ -97,7 +91,6 @@ impl Daemon {
                 }
             }
         }
-        drop(witness_ledger);
         let units = collect_local_unit_facts(&executor, &durable).await?;
         let producer_engine =
             ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir);
@@ -192,6 +185,8 @@ impl Daemon {
             committer,
             state_lock,
             attestations,
+            witness_ledger,
+            facts.durable.witness().to_vec(),
         )
     }
 
@@ -209,6 +204,8 @@ impl Daemon {
         let state_lock = DaemonLockGuard::acquire(&paths.state_dir)?;
         let host_id = current_host_id()?;
         let attestations = SharedAttestations::new(paths.attestations_path());
+        let witness_ledger = WitnessLedger::open(paths.witness_path())?;
+        let witness_records = facts_witness(&plan, &paths)?;
         Self::build_locked(
             config,
             paths,
@@ -220,6 +217,8 @@ impl Daemon {
             committer,
             state_lock,
             attestations,
+            witness_ledger,
+            witness_records,
         )
     }
 
@@ -235,19 +234,21 @@ impl Daemon {
         committer: Box<dyn ReplicaCommitter>,
         state_lock: DaemonLockGuard,
         mut attestations: SharedAttestations,
+        witness_ledger: WitnessLedger,
+        witness_records: Vec<crate::witness::WitnessRecord>,
     ) -> Result<Self, DaemonError> {
         validate_recovery_briefs(&plan, &paths.data_dir)?;
         let event_log = LeaseEventLog::in_state_dir(&paths.state_dir);
+        let completed_witness = witness_records;
         let lease_engine = LeaseEngine::from_durable_with_aging_threshold(
             epoch,
             settings.yield_grace,
             Duration::from_secs(config.aging_threshold_sec),
             config.pools.clone(),
             event_log,
-            &paths.witness_path(),
+            &completed_witness,
             Utc::now(),
         )?;
-        let completed_witness = facts_witness(&plan, &paths)?;
         let initial_gh_completions = recovery_gh_completions(&plan, &completed_witness)?;
         let initial_lost_pools =
             ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir)
@@ -279,7 +280,11 @@ impl Daemon {
                 require_dedup_key: config.enqueue.require_dedup_key,
             })
             .map_err(|error| DaemonError::Invalid(error.message))?,
-            witness: WitnessLedger::open(paths.witness_path())?,
+            witness: witness_ledger,
+            witness_view: WitnessView::from_records(
+                paths.witness_path(),
+                completed_witness.clone(),
+            ),
             derivation_store: Arc::new(NixStore::default()),
             jobs: HashMap::new(),
             aliases: HashMap::new(),
@@ -461,6 +466,7 @@ pub(super) fn acquire_daemon_lock(state_dir: &Path) -> Result<File, DaemonError>
     Ok(file)
 }
 
+#[cfg(test)]
 pub(super) fn facts_witness(
     _plan: &crate::recovery::RecoveryPlan,
     paths: &DaemonPaths,

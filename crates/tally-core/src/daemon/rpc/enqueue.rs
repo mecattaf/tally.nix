@@ -70,19 +70,11 @@ impl DaemonHandler {
             .get(&task_uuid)
             .cloned()
             .ok_or_else(|| WireError::invalid(format!("job {task_uuid} was not found")))?;
-        let (report, records) =
-            read_verified_records(&context.paths.witness_path()).map_err(internal_wire)?;
-        if !report.ok {
-            return Err(internal_wire(
-                "witness verification failed while admitting retry",
-            ));
-        }
         let canonical_task_uuid = task_uuid.to_string();
-        let terminal = records
-            .iter()
-            .filter(|record| record.task_uuid.as_deref() == Some(canonical_task_uuid.as_str()))
-            .max_by_key(|record| record.seq)
-            .cloned()
+        let terminal = context
+            .witness_view
+            .latest_for_task(&canonical_task_uuid, None)
+            .map_err(internal_wire)?
             .ok_or_else(|| {
                 WireError::invalid(format!(
                     "job {task_uuid} has no terminal witness and cannot be retried"
@@ -670,8 +662,7 @@ impl DaemonHandler {
         }
 
         if let Some(drv) = row.drv.clone() {
-            if let Some(existing) = latest_witness_for_task(&context.paths.witness_path(), job_id)?
-            {
+            if let Some(existing) = latest_witness_for_task(&mut context, job_id)? {
                 if full_mode
                     && existing.payload_hash == row.payload_hash
                     && existing.drv.as_ref() == Some(&drv)
@@ -722,8 +713,7 @@ impl DaemonHandler {
                     "task UUID {job_id} was admitted while its drv substitution was checked"
                 )));
             }
-            if let Some(existing) = latest_witness_for_task(&context.paths.witness_path(), job_id)?
-            {
+            if let Some(existing) = latest_witness_for_task(&mut context, job_id)? {
                 if full_mode
                     && existing.payload_hash == row.payload_hash
                     && existing.drv.as_ref() == Some(&drv)
@@ -794,26 +784,19 @@ impl DaemonHandler {
                     {
                         return Ok(response);
                     }
-                    let witness_path = context.paths.witness_path();
-                    let probe_dedup_key = dedup_key.to_owned();
                     let probe_payload_hash = payload_hash.to_owned();
                     let evidence_specs = row.evidence.clone();
                     let probe_substituted = row.drv.is_some();
+                    // The indexed view answers the governing-record lookup;
+                    // only the artifact evidence probe stays on the blocking
+                    // pool because it may hash store paths.
+                    let governing = context
+                        .witness_view
+                        .governing_for_dedup(dedup_key)
+                        .map_err(internal_wire)?;
+                    let view_head = context.witness_view.head_seq();
                     drop(context);
                     let probe = tokio::task::spawn_blocking(move || {
-                        let (report, witness) = read_verified_records(&witness_path)?;
-                        if !report.ok {
-                            return Err(WitnessError::Corrupt(
-                                "witness verification failed during full dedup probe".to_owned(),
-                            ));
-                        }
-                        let governing = witness
-                            .iter()
-                            .filter(|record| {
-                                record.dedup_key.as_deref() == Some(probe_dedup_key.as_str())
-                            })
-                            .max_by_key(|record| record.seq)
-                            .cloned();
                         let pass_probe = governing.as_ref().and_then(|record| {
                             (record.payload_hash.as_deref() == Some(probe_payload_hash.as_str())
                                 && (record.verdict == Verdict::Pass
@@ -825,7 +808,7 @@ impl DaemonHandler {
                                     probe_full_pass(&evidence, record)
                                 })
                         });
-                        Ok((report.last_seq.unwrap_or(0), governing, pass_probe))
+                        Ok::<_, WitnessError>((view_head, governing, pass_probe))
                     })
                     .await;
                     context = self.context.write().await;
@@ -921,16 +904,10 @@ impl DaemonHandler {
             {
                 let evidence = parse_evidence_specs(&row.evidence)
                     .expect("guardrail validation canonicalized evidence before charging fanout");
-                let witness_path = context.paths.witness_path();
+                let witness = context.witness_view.records().map_err(internal_wire)?;
                 drop(context);
                 let probe = tokio::task::spawn_blocking(move || {
-                    let (report, witness) = read_verified_records(&witness_path)?;
-                    if !report.ok {
-                        return Err(WitnessError::Corrupt(
-                            "witness verification failed during dedup probe".to_owned(),
-                        ));
-                    }
-                    Ok(probe_dedup(Some(&dedup_key), &evidence, &witness))
+                    Ok::<_, WitnessError>(probe_dedup(Some(&dedup_key), &evidence, &witness))
                 })
                 .await;
                 context = self.context.write().await;
@@ -1629,18 +1606,11 @@ fn full_terminal_response(
 }
 
 fn latest_witness_for_task(
-    witness_path: &Path,
+    context: &mut Context,
     task_uuid: Uuid,
 ) -> Result<Option<WitnessRecord>, WireError> {
-    let (report, records) = read_verified_records(witness_path).map_err(internal_wire)?;
-    if !report.ok {
-        return Err(internal_wire(
-            "witness verification failed while checking drv seed identity",
-        ));
-    }
-    let task_uuid = task_uuid.to_string();
-    Ok(records
-        .into_iter()
-        .filter(|record| record.task_uuid.as_deref() == Some(task_uuid.as_str()))
-        .max_by_key(|record| record.seq))
+    context
+        .witness_view
+        .latest_for_task(&task_uuid.to_string(), None)
+        .map_err(internal_wire)
 }

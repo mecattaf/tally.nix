@@ -60,18 +60,18 @@ impl DaemonHandler {
             } else {
                 (
                     None,
-                    Some((context.paths.witness_path(), stable, resolved_attempt)),
+                    Some(reconstruct_job_result(
+                        &mut context,
+                        &stable,
+                        resolved_attempt,
+                    )),
                 )
             }
         };
         if let Some(registration) = registration {
             return await_registration(registration).await;
         }
-        let (path, stable, attempt) =
-            witness_lookup.expect("terminal witness lookup was selected above");
-        tokio::task::spawn_blocking(move || reconstruct_job_result(&path, &stable, attempt))
-            .await
-            .map_err(|error| internal_wire(format!("witness await worker failed: {error}")))?
+        witness_lookup.expect("terminal witness lookup was selected above")
     }
 
     pub(crate) async fn await_barrier(&self, params: Option<Value>) -> Result<Value, WireError> {
@@ -123,21 +123,15 @@ impl DaemonHandler {
             } else {
                 (
                     None,
-                    Some((context.paths.witness_path(), stable.clone(), attempt)),
-                    stable,
+                    Some(reconstruct_job_result(&mut context, &stable, Some(attempt))),
+                    stable.clone(),
                 )
             }
         };
         let result = if let Some(registration) = registration {
             await_registration(registration).await?
         } else {
-            let (path, stable, attempt) =
-                witness_lookup.expect("terminal barrier lookup was selected above");
-            tokio::task::spawn_blocking(move || {
-                reconstruct_job_result(&path, &stable, Some(attempt))
-            })
-            .await
-            .map_err(|error| internal_wire(format!("witness barrier worker failed: {error}")))??
+            witness_lookup.expect("terminal barrier lookup was selected above")?
         };
         Ok(single_job_barrier_value(&params.barrier, &stable, result))
     }
@@ -619,21 +613,14 @@ pub(crate) fn lease_wire(error: LeaseError) -> WireError {
 }
 
 fn reconstruct_job_result(
-    path: &Path,
+    context: &mut Context,
     stable: &str,
     attempt: Option<u32>,
 ) -> Result<Value, WireError> {
-    let (report, records) = read_verified_records(path).map_err(internal_wire)?;
-    if !report.ok {
-        return Err(internal_wire(
-            "witness verification failed while reconstructing a completed wait",
-        ));
-    }
-    let record = records
-        .into_iter()
-        .filter(|record| record.task_uuid.as_deref() == Some(stable))
-        .filter(|record| attempt.is_none_or(|attempt| record.attempt == attempt))
-        .max_by_key(|record| record.seq)
+    let record = context
+        .witness_view
+        .latest_for_task(stable, attempt)
+        .map_err(internal_wire)?
         .ok_or_else(|| {
             let suffix = attempt.map_or_else(String::new, |attempt| format!(" attempt {attempt}"));
             WireError::not_found(format!("job {stable}{suffix} has no terminal witness"))
