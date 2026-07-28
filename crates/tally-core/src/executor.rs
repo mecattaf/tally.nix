@@ -64,6 +64,7 @@ const GH_TALLY_ENVIRONMENT: [&str; 11] = [
     "TALLY_GH_CONTEXT",
 ];
 const GH_CONTEXT_DIRECTORY: &str = "github-context";
+const LAUNCH_VISIBILITY_TIMEOUT: Duration = Duration::from_secs(60);
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
@@ -1159,6 +1160,38 @@ impl Drop for UnitReservation {
     }
 }
 
+struct LaunchingUnitGuard {
+    key: Uuid,
+    registry: Arc<Mutex<HashMap<Uuid, watch::Receiver<bool>>>>,
+    receiver: watch::Receiver<bool>,
+    completed: watch::Sender<bool>,
+    armed: bool,
+}
+
+impl LaunchingUnitGuard {
+    fn mark_complete(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let _ = self.completed.send(true);
+        if let Ok(mut registry) = self.registry.lock() {
+            if registry
+                .get(&self.key)
+                .is_some_and(|receiver| receiver.same_channel(&self.receiver))
+            {
+                registry.remove(&self.key);
+            }
+        }
+        self.armed = false;
+    }
+}
+
+impl Drop for LaunchingUnitGuard {
+    fn drop(&mut self) {
+        self.mark_complete();
+    }
+}
+
 #[derive(Clone)]
 struct DirectProcess {
     pgid: i32,
@@ -1221,6 +1254,7 @@ pub struct Executor {
     systemctl: PathBuf,
     recorder_program: PathBuf,
     unit_probe: Arc<dyn LocalUnitProbe>,
+    launching_units: Arc<Mutex<HashMap<Uuid, watch::Receiver<bool>>>>,
     direct_processes: Arc<Mutex<HashMap<Uuid, DirectProcess>>>,
     allow_direct_fallback: bool,
     remote_executors: Arc<BTreeMap<String, ExecutionTargetConfig>>,
@@ -1252,6 +1286,7 @@ impl Executor {
             systemctl: PathBuf::from("systemctl"),
             recorder_program: recorder_program.into(),
             unit_probe: Arc::new(SystemdLocalUnitProbe::default()),
+            launching_units: Arc::new(Mutex::new(HashMap::new())),
             direct_processes: Arc::new(Mutex::new(HashMap::new())),
             allow_direct_fallback: true,
             remote_executors: Arc::new(BTreeMap::new()),
@@ -1971,7 +2006,10 @@ impl Executor {
         identity: &ExecutionIdentity,
         expected_invocation_id: Option<&str>,
     ) -> Result<(), ExecutorError> {
-        for attempt in 0..=200 {
+        let mut launching = None;
+        let mut launch_deadline = None;
+        let mut attempt = 0_u16;
+        loop {
             let direct = self
                 .direct_processes
                 .lock()
@@ -2062,7 +2100,31 @@ impl Executor {
             if !reserved {
                 return Ok(());
             }
-            if attempt == 200 {
+            if launch_deadline.is_none() {
+                launching = self
+                    .launching_units
+                    .lock()
+                    .map_err(|_| ExecutorError::UnitControl {
+                        unit: fact.unit.clone(),
+                        detail: "launch registry is poisoned".to_owned(),
+                    })?
+                    .get(identity.unit_uuid())
+                    .cloned();
+                if launching.is_some() {
+                    launch_deadline = Some(tokio::time::Instant::now() + LAUNCH_VISIBILITY_TIMEOUT);
+                }
+            }
+            if let Some(deadline) = launch_deadline {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ExecutorError::UnitControl {
+                        unit: fact.unit,
+                        detail: format!(
+                            "execution launch did not become reclaimable within {} seconds",
+                            LAUNCH_VISIBILITY_TIMEOUT.as_secs()
+                        ),
+                    });
+                }
+            } else if attempt == 200 {
                 return Err(ExecutorError::UnitControl {
                     unit: fact.unit,
                     detail: "execution reservation is still held without a reclaimable unit"
@@ -2072,9 +2134,21 @@ impl Executor {
             // The reservation is acquired before either backend becomes
             // externally visible. Give that bounded transition time to publish
             // a systemd unit or direct-process registry entry, then reclaim it.
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            if let Some(receiver) = launching.as_mut() {
+                let launch_completed = tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => false,
+                    changed = receiver.changed() => {
+                        changed.is_err() || *receiver.borrow_and_update()
+                    }
+                };
+                if launch_completed {
+                    launching = None;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            attempt = attempt.saturating_add(1);
         }
-        unreachable!("bounded reclaim loop always returns")
     }
 
     fn identity_is_reserved(&self, identity: &ExecutionIdentity) -> Result<bool, ExecutorError> {
@@ -2359,6 +2433,7 @@ impl Executor {
             }
         };
         let reservation = self.reserve(&request.identity)?;
+        let mut launching = self.register_launch(&request.identity)?;
         // This marker is fsynced before systemd-run can create the unit. If a
         // retry finds the same generation with neither a unit nor an exit
         // record, the previous helper may have launched work that was lost
@@ -2388,7 +2463,10 @@ impl Executor {
         self.materialize_gh_context(&request)?;
         let args = self.build_systemd_argv_with_git_ai(&request, git_ai_runtime)?;
         let output = match Command::new(&self.systemd_run).args(&args).output().await {
-            Ok(output) => output,
+            Ok(output) => {
+                launching.mark_complete();
+                output
+            }
             Err(source)
                 if source.kind() == std::io::ErrorKind::NotFound && self.allow_direct_fallback =>
             {
@@ -2855,6 +2933,36 @@ impl Executor {
             }
             Err(source) => Err(io_error(&lock_path, source)),
         }
+    }
+
+    fn register_launch(
+        &self,
+        identity: &ExecutionIdentity,
+    ) -> Result<LaunchingUnitGuard, ExecutorError> {
+        let key = *identity.unit_uuid();
+        let (completed, receiver) = watch::channel(false);
+        let mut registry = self
+            .launching_units
+            .lock()
+            .map_err(|_| ExecutorError::UnitControl {
+                unit: self.unit_name(identity),
+                detail: "launch registry is poisoned".to_owned(),
+            })?;
+        if registry.contains_key(&key) {
+            return Err(ExecutorError::UnitControl {
+                unit: self.unit_name(identity),
+                detail: "execution identity is already registered as launching".to_owned(),
+            });
+        }
+        registry.insert(key, receiver.clone());
+        drop(registry);
+        Ok(LaunchingUnitGuard {
+            key,
+            registry: self.launching_units.clone(),
+            receiver,
+            completed,
+            armed: true,
+        })
     }
 
     fn prepare_paths(&self, identity: &ExecutionIdentity) -> Result<ExecutionPaths, ExecutorError> {
@@ -5962,6 +6070,103 @@ mod tests {
         let result = tokio::time::timeout(Duration::from_millis(100), executor.execute(request()))
             .await
             .expect("launcher failure was masked by reservation reclaim");
+        assert!(
+            matches!(
+                result,
+                Err(ExecutorError::LauncherFailed {
+                    status: Some(23),
+                    ..
+                })
+            ),
+            "unexpected launcher result: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reclaim_waits_for_a_registered_launch_to_become_visible() {
+        #[derive(Clone)]
+        struct VisibilityProbe {
+            unit: String,
+            visible: PathBuf,
+        }
+
+        impl LocalUnitProbe for VisibilityProbe {
+            fn inspect(
+                &self,
+                _unit: &str,
+                _paths: &ExecutionPaths,
+            ) -> Result<LocalUnitFact, ExecutorError> {
+                if self.visible.exists() {
+                    Ok(LocalUnitFact {
+                        unit: self.unit.clone(),
+                        loaded: true,
+                        state: LocalUnitState::Running,
+                        invocation_id: Some("delayed-launch".to_owned()),
+                        attempt: Some(1),
+                        lease_epoch: Some(1),
+                        exit_record: None,
+                    })
+                } else {
+                    Ok(LocalUnitFact::absent(&self.unit))
+                }
+            }
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let request = request();
+        let base = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+        let unit = base.unit_name(&request.identity);
+        let started = temp.path().join("launch-started");
+        let visible = temp.path().join("unit-visible");
+        let systemd_run = temp.path().join("slow-systemd-run");
+        crate::test_support::install_shell_program(
+            &systemd_run,
+            format!(
+                "#!/bin/sh\n: > '{}'\nsleep 3\n: > '{}'\nexit 23\n",
+                started.display(),
+                visible.display()
+            ),
+        );
+        let stopped = temp.path().join("unit-stopped");
+        let systemctl = temp.path().join("fake-systemctl");
+        crate::test_support::install_shell_program(
+            &systemctl,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$4\" >> '{}'\n",
+                stopped.display()
+            ),
+        );
+        let executor = base
+            .with_systemd_run(systemd_run)
+            .with_systemctl(systemctl)
+            .with_unit_probe(VisibilityProbe {
+                unit: unit.clone(),
+                visible,
+            });
+        let running_executor = executor.clone();
+        let running_request = request.clone();
+        let running = tokio::spawn(async move { running_executor.execute(running_request).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !started.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fake systemd-run did not start");
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            executor.reclaim_identity(&request.identity),
+        )
+        .await
+        .expect("reclaim did not wait for launch visibility")
+        .unwrap();
+        let stopped_units = std::fs::read_to_string(stopped).unwrap();
+        assert!(
+            !stopped_units.is_empty() && stopped_units.lines().all(|stopped| stopped == unit),
+            "unexpected stopped units: {stopped_units:?}"
+        );
+        let result = running.await.unwrap();
         assert!(
             matches!(
                 result,
