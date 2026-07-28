@@ -143,7 +143,7 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
 }
 
 #[test]
-fn flow_run_cli_derives_the_run_id_and_emits_jsonl_for_a_zero_node_script() {
+fn flow_run_captures_identity_then_starts_worker_with_task_uuid_absent() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_config(temp.path());
     let socket = temp.path().join("tally.sock");

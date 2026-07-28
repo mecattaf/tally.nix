@@ -97,6 +97,8 @@ pub enum WireIoError {
     InvalidResponse(String),
     #[error("RPC request task failed: {0}")]
     RequestTask(String),
+    #[error("client callback failed: {0}")]
+    ClientCallback(String),
     #[error("RPC method {method} exceeded its {deadline:?} deadline")]
     DeadlineExceeded { method: String, deadline: Duration },
     #[error(
