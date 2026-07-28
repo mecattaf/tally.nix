@@ -492,11 +492,12 @@ mod tests {
                 prop_assert!(matches!(result, Ok(None)));
             } else {
                 let mut expected = input[..wire_len].to_vec();
-                if expected.last() == Some(&b'\n') {
+                let terminated = expected.last() == Some(&b'\n');
+                if terminated {
                     expected.pop();
-                }
-                if expected.last() == Some(&b'\r') {
-                    expected.pop();
+                    if expected.last() == Some(&b'\r') {
+                        expected.pop();
+                    }
                 }
                 let line = result.unwrap().unwrap();
                 prop_assert_eq!(&line, &expected);
