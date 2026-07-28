@@ -18,7 +18,10 @@ use serde_json::{json, Map, Value};
 use crate::catalog::sha256;
 use crate::dialect::validate_instance;
 use crate::executor::FlowJobExecutor;
-use crate::model::{is_nix_store_path, SubmissionPlan};
+use crate::model::{
+    flow_canonical_payload_fields, is_nix_store_path, node_spec_fields, NodeSpecSurface,
+    SubmissionPlan,
+};
 use crate::{
     check_script, resolve_members, Catalog, CheckOptions, Derivation, Disposition, FlowClient,
     FlowError, FlowSubmission, Meta, NodeFailure, NodeResult, NodeSpec, Orchestration, RunReport,
@@ -996,30 +999,9 @@ fn native_job(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsRes
         "job spec",
         context,
     )?;
-    reject_unknown_keys(
-        &raw,
-        &[
-            "argv",
-            "adapter",
-            "prompt",
-            "pools",
-            "executor",
-            "priority",
-            "runtimeMaxSec",
-            "evidence",
-            "evidenceClass",
-            "manifestHash",
-            "workspace",
-            "brief",
-            "key",
-            "dedupKey",
-            "label",
-            "env",
-            "resultSchema",
-        ],
-        location,
-    )
-    .map_err(|error| flow_to_js_error(error, context))?;
+    let allowed = node_spec_fields(NodeSpecSurface::Job).collect::<Vec<_>>();
+    reject_unknown_keys(&raw, &allowed, location)
+        .map_err(|error| flow_to_js_error(error, context))?;
     let spec: NodeSpec = serde_json::from_value(raw).map_err(|error| {
         flow_to_js_error(
             FlowError::new(
@@ -1131,6 +1113,10 @@ fn native_local(_this: &JsValue, args: &[JsValue], context: &mut Context) -> JsR
     let location = call_site(context);
     let prompt = required_string(args.first(), "prompt", location, context)?;
     let (mut options, settle) = sugar_options(args.get(1), location, context)?;
+    let mut allowed = node_spec_fields(NodeSpecSurface::Sugar).collect::<Vec<_>>();
+    allowed.push("member");
+    reject_unknown_keys(&Value::Object(options.clone()), &allowed, location)
+        .map_err(|error| flow_to_js_error(error, context))?;
     reject_sugar_conflicts(
         &options,
         &[
@@ -1531,29 +1517,9 @@ fn decode_sugar_spec(
     location: SourceLocation,
     context: &mut Context,
 ) -> JsResult<NodeSpec> {
-    reject_unknown_keys(
-        &Value::Object(options.clone()),
-        &[
-            "argv",
-            "adapter",
-            "pools",
-            "executor",
-            "priority",
-            "runtimeMaxSec",
-            "evidence",
-            "evidenceClass",
-            "manifestHash",
-            "workspace",
-            "brief",
-            "key",
-            "dedupKey",
-            "label",
-            "env",
-            "resultSchema",
-        ],
-        location,
-    )
-    .map_err(|error| flow_to_js_error(error, context))?;
+    let allowed = node_spec_fields(NodeSpecSurface::Sugar).collect::<Vec<_>>();
+    reject_unknown_keys(&Value::Object(options.clone()), &allowed, location)
+        .map_err(|error| flow_to_js_error(error, context))?;
     serde_json::from_value(Value::Object(options)).map_err(|error| {
         flow_to_js_error(
             FlowError::new(
@@ -2164,6 +2130,9 @@ fn canonical_payload_hash(
     spec: &NodeSpec,
     credentials: &BTreeMap<String, PathBuf>,
 ) -> Result<String, FlowError> {
+    // Flow-side counterpart to tally_core::wire::CanonicalPayload. The NodeSpec
+    // contract owns the field names and ordering; the cross-crate structural
+    // guard fails if the kernel hashes a field this builder does not classify.
     let mut payload = Map::new();
     if let Some(argv) = &spec.argv {
         payload.insert("argv".to_owned(), json!(argv));
@@ -2224,7 +2193,20 @@ fn canonical_payload_hash(
         })?;
         payload.insert("briefHash".to_owned(), Value::String(sha256(&bytes)));
     }
-    let bytes = serde_json::to_vec(&Value::Object(payload)).map_err(|error| {
+    let mut ordered = Map::new();
+    for field in flow_canonical_payload_fields() {
+        if let Some(value) = payload.remove(field) {
+            ordered.insert(field.to_owned(), value);
+        }
+    }
+    if let Some(field) = payload.keys().next() {
+        return Err(FlowError::new(
+            "FlowSpecError",
+            "canonical-field-unclassified",
+            format!("canonical payload field {field:?} is absent from the NodeSpec contract"),
+        ));
+    }
+    let bytes = serde_json::to_vec(&Value::Object(ordered)).map_err(|error| {
         FlowError::new(
             "FlowSpecError",
             "payload-serialization",
@@ -3082,6 +3064,32 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    #[test]
+    fn local_unknown_options_use_the_shared_node_field_error_shape() {
+        let source = format!(
+            "{}\n(async () => {{\n\
+             const member = members('pooled', {{count: 1}})[0];\n\
+             return local('mission', {{member, resultShema: {{type: 'object'}}}});\n\
+             }})()",
+            meta(&["gpu"], &["pooled"])
+        );
+        let mut options = RunOptions::new("run-1", json!({}));
+        options.catalog = Some(catalog());
+        options.catalog_hash = Some("sha256:catalog".to_owned());
+        let error = run_script(
+            &source,
+            Some(Path::new("local-unknown.js")),
+            MockClient::new(Vec::new()),
+            Rc::new(VecLifecycleSink::default()),
+            options,
+        )
+        .unwrap_err();
+        assert_eq!(error.name, "FlowSpecError");
+        assert_eq!(error.code, "unknown-spec-field");
+        assert_eq!(error.message, "unknown job spec field \"resultShema\"");
+        assert_eq!(error.details["field"], "resultShema");
     }
 
     #[test]

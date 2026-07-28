@@ -32,6 +32,8 @@ libc = "0.2"
 proptest = "1"
 regex = "1.11"
 serde = { version = "1.0", features = ["derive"] }
+# Load-bearing for every canonical payload, catalog, brief, and script identity
+# hash: both the flow runner and kernel intentionally preserve JSON member order.
 serde_json = { version = "1.0", features = ["preserve_order"] }
 serde_json_path = "0.7.2"
 sha2 = "0.10"

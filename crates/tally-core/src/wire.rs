@@ -370,6 +370,9 @@ pub struct ResolvedEnqueue {
     pub wait: bool,
 }
 
+// Kernel-side counterpart to tally_flow's NodeSpec canonical field contract.
+// Full-mode flow submissions keep cwd and gateManifest absent until NodeSpec
+// exposes them; the tally crate's structural parity test pins this exact split.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CanonicalPayload<'a> {
@@ -550,6 +553,22 @@ impl GuardrailState {
                 ));
             }
         };
+        let full_submission = payload
+            .submission
+            .as_ref()
+            .is_some_and(|submission| submission.mode == SubmissionMode::Full);
+        if full_submission && payload.orchestration.is_some() {
+            if payload.cwd.is_some() {
+                return Err(WireError::invalid(
+                    "full-mode flow submissions require cwd to be absent until NodeSpec exposes it",
+                ));
+            }
+            if payload.gate_manifest.is_some() {
+                return Err(WireError::invalid(
+                    "full-mode flow submissions require gateManifest to be absent until NodeSpec exposes it",
+                ));
+            }
+        }
         if payload.runtime_max_sec == Some(0) {
             return Err(WireError::invalid(
                 "runtimeMaxSec must be positive when set",
@@ -704,10 +723,6 @@ impl GuardrailState {
             return Err(WireError::invalid("adapter must not be empty"));
         }
 
-        let full_submission = payload
-            .submission
-            .as_ref()
-            .is_some_and(|submission| submission.mode == SubmissionMode::Full);
         let mut parent = payload.parent;
         let mut depth = 0;
         if let Some(caller_job_id) = payload.caller_job_id {
@@ -1703,6 +1718,50 @@ mod tests {
             related_trigger: None,
             wait: false,
         }
+    }
+
+    #[test]
+    fn full_mode_flow_rejects_kernel_only_hashed_fields() {
+        let mut payload = child_payload();
+        payload.caller_job_id = None;
+        payload.submission = Some(SubmissionOptions {
+            mode: SubmissionMode::Full,
+        });
+        payload.orchestration = Some(
+            serde_json::from_value(serde_json::json!({
+                "flowRunId": "00000000-0000-4000-8000-000000000145",
+                "maxNodes": 1
+            }))
+            .unwrap(),
+        );
+
+        let mut with_cwd = payload.clone();
+        with_cwd.cwd = Some(PathBuf::from("/work/flow"));
+        assert_eq!(
+            GuardrailState::new(GuardrailConfig::default())
+                .unwrap()
+                .validate_enqueue(with_cwd, &defaults())
+                .unwrap_err()
+                .message,
+            "full-mode flow submissions require cwd to be absent until NodeSpec exposes it"
+        );
+
+        payload.gate_manifest = Some(
+            serde_json::from_value(serde_json::json!({
+                "path": "/work/flow/gates.json",
+                "requiredGateIds": ["tests"],
+                "acceptancePolicy": "manual"
+            }))
+            .unwrap(),
+        );
+        assert_eq!(
+            GuardrailState::new(GuardrailConfig::default())
+                .unwrap()
+                .validate_enqueue(payload, &defaults())
+                .unwrap_err()
+                .message,
+            "full-mode flow submissions require gateManifest to be absent until NodeSpec exposes it"
+        );
     }
 
     #[test]

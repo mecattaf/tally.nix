@@ -2372,6 +2372,26 @@ mod tests {
     }
 
     #[test]
+    fn corrupt_orchestration_in_events_dir_fails_read_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let events = temp.path().join("events");
+        fs::create_dir_all(&events).unwrap();
+        let event = DurableEnqueueEvent::new(seed(Uuid::new_v4())).unwrap();
+        let path = events.join(format!("{}.enqueue.json", event.event_id));
+        let mut encoded = serde_json::to_value(event).unwrap();
+        encoded["row"]["orchestration"] = serde_json::json!({
+            "flowRunId": "corrupt-flow-run-id",
+            "nodeOrdinal": 0
+        });
+        fs::write(path, serde_json::to_vec(&encoded).unwrap()).unwrap();
+
+        let error = read_acknowledged_events(&events).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("orchestration flowRunId must be a UUID string"));
+    }
+
+    #[test]
     fn literal_legacy_origin_migration_rewrites_once_then_is_byte_stable() {
         assert!(!LEGACY_NO_ORIGIN.contains("\"rowVersion\""));
         assert!(!LEGACY_NO_ORIGIN.contains("\"origin\""));

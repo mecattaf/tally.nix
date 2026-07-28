@@ -811,13 +811,20 @@ mod tests {
     use tally_core::adapters::AdapterJobOptions;
     use tally_core::brief::PreparedBrief;
     use tally_core::config::Priority;
-    use tally_core::taskdb::{EnqueueSource, RelatedTriggerOutcome};
+    use tally_core::provenance::Orchestration as KernelOrchestration;
+    use tally_core::taskdb::{
+        AdmissionOrigin, EnqueueSource, GhOrigin, RelatedTriggerOutcome, WorkspaceMetadata,
+    };
     use tally_core::wire::{
         canonical_payload, canonical_payload_hash, EnqueuePayload, GuardrailConfig, GuardrailState,
-        ProducerDefaults,
+        ProducerDefaults, ResolvedEnqueue,
+    };
+    use tally_core::witness::{
+        Derivation as KernelDerivation, DerivationOutput as KernelDrvOutput,
     };
     use tally_flow::{
-        run_script, Derivation, NodeSpec, Orchestration, RunOptions, VecLifecycleSink,
+        flow_canonical_payload_fields, run_script, Derivation, NodeSpec, NodeWireProjection,
+        Orchestration, RunOptions, SelectionProvenance, VecLifecycleSink, NODE_SPEC_FIELD_CONTRACT,
     };
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
@@ -1071,6 +1078,54 @@ mod tests {
     }
 
     #[test]
+    fn every_wire_exposed_node_field_is_rendered_from_the_shared_contract() {
+        let mut submission = submission();
+        submission.spec.prompt = Some("mission".to_owned());
+        submission.spec.executor = Some("worker-a".to_owned());
+        submission.spec.runtime_max_sec = Some(30);
+        submission.spec.drv = Some(
+            serde_json::from_value(json!({
+                "drvPath": "/nix/store/00000000000000000000000000000000-node.drv",
+                "outputs": [{
+                    "name": "out",
+                    "path": "/nix/store/11111111111111111111111111111111-node"
+                }]
+            }))
+            .unwrap(),
+        );
+        submission.spec.evidence_class = Some(json!({"kind": "contract"}));
+        submission.spec.manifest_hash = Some("sha256:manifest".to_owned());
+        submission.spec.workspace = Some(json!({"repo": "mecattaf/tally.nix"}));
+        submission.spec.brief = Some(json!({"mission": "test"}));
+        submission.spec.key = Some("node".to_owned());
+        submission.spec.dedup_key = Some("explicit-dedup".to_owned());
+        submission.spec.label = Some("node-label".to_owned());
+        submission.spec.env = BTreeMap::from([("SAFE".to_owned(), "yes".to_owned())]);
+        submission.spec.result_schema = Some(json!({"type": "object"}));
+        submission.spec.selection = Some(SelectionProvenance {
+            selector: "pooled".to_owned(),
+            catalog_hash: "sha256:catalog".to_owned(),
+            member_id: "worker-a".to_owned(),
+            members: vec!["worker-a".to_owned()],
+        });
+
+        let payload = enqueue_payload(&submission, &RunnerIdentity::default()).unwrap();
+        for field in NODE_SPEC_FIELD_CONTRACT {
+            let wire_field = match field.wire {
+                NodeWireProjection::Field(field) | NodeWireProjection::NormalizedInto(field) => {
+                    field
+                }
+                NodeWireProjection::Excluded(_) => continue,
+            };
+            assert!(
+                payload.get(wire_field).is_some(),
+                "NodeSpec field {} is not rendered to {wire_field}",
+                field.json_name
+            );
+        }
+    }
+
+    #[test]
     fn fully_populated_engine_and_wire_payload_hashes_match() {
         let source = r#"
 export const meta = {
@@ -1185,6 +1240,88 @@ export const meta = {
             canonical_payload_hash(&resolved).unwrap(),
             submission.payload_hash
         );
+    }
+
+    #[test]
+    fn kernel_canonical_fields_match_the_node_contract_in_preserved_order() {
+        let resolved = ResolvedEnqueue {
+            argv: vec!["tool".to_owned(), "--flag".to_owned()],
+            pools: vec!["alpha".to_owned(), "zeta".to_owned()],
+            executor: Some("worker-a".to_owned()),
+            priority: Priority::High,
+            adapter: "codex".to_owned(),
+            // These kernel-only hashed fields are rejected for full-mode flow
+            // submissions until NodeSpec explicitly exposes them.
+            cwd: None,
+            workspace: Some(WorkspaceMetadata {
+                repo: "mecattaf/tally.nix".to_owned(),
+                base_rev: "origin/main".to_owned(),
+                branch: "t-145-u3".to_owned(),
+                worktree_path: PathBuf::from("/work/tally-t145"),
+            }),
+            adapter_options: AdapterJobOptions {
+                pre_prompt_argv: vec!["--json".to_owned()],
+                environment: BTreeMap::from([("NO_COLOR".to_owned(), "1".to_owned())]),
+                approval_policy: Some("never".to_owned()),
+                sandbox_policy: Some("workspace-write".to_owned()),
+                model: Some("provider/model".to_owned()),
+                effort: Some("high".to_owned()),
+            },
+            gate_manifest: None,
+            brief_hash: Some(format!("sha256:{}", "b".repeat(64))),
+            resume_from: Some("00000000-0000-4000-8000-000000000141".to_owned()),
+            source: EnqueueSource::Orchestrator,
+            dedup_key: Some("flow:contract:0".to_owned()),
+            orchestration: Some(
+                serde_json::from_value::<KernelOrchestration>(json!({
+                    "flowRunId": "00000000-0000-4000-8000-000000000142",
+                    "maxNodes": 1
+                }))
+                .unwrap(),
+            ),
+            parent: Some("00000000-0000-4000-8000-000000000143".to_owned()),
+            evidence: vec!["exit:0".to_owned()],
+            drv: Some(KernelDerivation {
+                drv_path: "/nix/store/00000000000000000000000000000000-node.drv".to_owned(),
+                outputs: vec![KernelDrvOutput {
+                    name: "out".to_owned(),
+                    path: "/nix/store/11111111111111111111111111111111-node".to_owned(),
+                }],
+            }),
+            evidence_class: Some(json!({"kind": "contract"})),
+            manifest_hash: Some("sha256:manifest".to_owned()),
+            consumption_estimate: Some(17),
+            runtime_max_sec: Some(300),
+            no_enqueue: true,
+            credentials: BTreeMap::from([(
+                "token".to_owned(),
+                PathBuf::from("/run/credentials/token"),
+            )]),
+            origin: AdmissionOrigin::direct(EnqueueSource::Orchestrator),
+            gh_origin: Some(
+                serde_json::from_value::<GhOrigin>(json!({
+                    "producer": "github",
+                    "source": "notifications",
+                    "actor": "maintainer",
+                    "selfActor": "tally-bot",
+                    "actorExclude": "tally-bot"
+                }))
+                .unwrap(),
+            ),
+            task_uuid: Some("00000000-0000-4000-8000-000000000144".to_owned()),
+            related_trigger: Some(related_trigger()),
+            depth: 4,
+            wait: true,
+        };
+        let canonical: Value =
+            serde_json::from_slice(&canonical_payload(&resolved).unwrap()).unwrap();
+        let kernel_fields = canonical
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(kernel_fields, flow_canonical_payload_fields());
     }
 
     #[test]
