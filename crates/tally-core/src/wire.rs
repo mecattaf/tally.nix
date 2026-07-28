@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -77,13 +78,25 @@ pub async fn serve_connection<H>(stream: UnixStream, handler: H) -> Result<(), W
 where
     H: RpcHandler + Clone + 'static,
 {
-    serve_connection_with_max_frame_bytes(stream, handler, DEFAULT_MAX_FRAME_BYTES).await
+    serve_connection_with_limits(stream, handler, DEFAULT_MAX_FRAME_BYTES, None).await
 }
 
 pub async fn serve_connection_with_max_frame_bytes<H>(
     stream: UnixStream,
     handler: H,
     max_frame_bytes: u64,
+) -> Result<(), WireIoError>
+where
+    H: RpcHandler + Clone + 'static,
+{
+    serve_connection_with_limits(stream, handler, max_frame_bytes, None).await
+}
+
+pub async fn serve_connection_with_limits<H>(
+    stream: UnixStream,
+    handler: H,
+    max_frame_bytes: u64,
+    idle_timeout: Option<Duration>,
 ) -> Result<(), WireIoError>
 where
     H: RpcHandler + Clone + 'static,
@@ -103,8 +116,17 @@ where
             continue;
         }
 
+        let read_idle_timeout = if requests.is_empty() {
+            idle_timeout
+        } else {
+            None
+        };
         tokio::select! {
-            line = read_line_limited(&mut reader, max_frame_bytes) => {
+            line = read_line_with_idle_timeout(
+                &mut reader,
+                max_frame_bytes,
+                read_idle_timeout,
+            ) => {
                 let Some(line) = line? else {
                     reader_open = false;
                     continue;
@@ -145,6 +167,24 @@ where
         }
     }
     Ok(())
+}
+
+async fn read_line_with_idle_timeout<R>(
+    reader: &mut R,
+    max_frame_bytes: u64,
+    idle_timeout: Option<Duration>,
+) -> Result<Option<Vec<u8>>, WireIoError>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let read = read_line_limited(reader, max_frame_bytes);
+    let Some(idle_timeout) = idle_timeout else {
+        return read.await;
+    };
+    match tokio::time::timeout(idle_timeout, read).await {
+        Ok(result) => result,
+        Err(_) => Ok(None),
+    }
 }
 
 async fn write_completed_request(
@@ -1086,6 +1126,96 @@ mod tests {
                 Ok(serde_json::json!({"index": index}))
             })
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn idle_connection_closes_after_the_configured_timeout() {
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut client, server) = UnixStream::pair().unwrap();
+                let server = tokio::task::spawn_local(async move {
+                    serve_connection_with_limits(
+                        server,
+                        EchoHandler,
+                        DEFAULT_MAX_FRAME_BYTES,
+                        Some(Duration::from_millis(25)),
+                    )
+                    .await
+                });
+
+                let mut byte = [0_u8; 1];
+                let read = tokio::time::timeout(Duration::from_secs(1), client.read(&mut byte))
+                    .await
+                    .expect("an idle connection must close")
+                    .unwrap();
+                assert_eq!(read, 0);
+                server.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pending_await_survives_beyond_the_idle_timeout() {
+        const IDLE_TIMEOUT: Duration = Duration::from_millis(25);
+
+        let (started_tx, mut started_rx) = mpsc::unbounded_channel();
+        let permits = Arc::new(Semaphore::new(0));
+        let server_permits = Arc::clone(&permits);
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (mut client, server_stream) = UnixStream::pair().unwrap();
+                let server = tokio::task::spawn_local(async move {
+                    serve_connection_with_limits(
+                        server_stream,
+                        WindowHandler {
+                            started: started_tx,
+                            permits: server_permits,
+                        },
+                        DEFAULT_MAX_FRAME_BYTES,
+                        Some(IDLE_TIMEOUT),
+                    )
+                    .await
+                });
+
+                let request = RequestFrame {
+                    id: RequestId::Number(1),
+                    method: "queue.await_job".to_owned(),
+                    params: Some(serde_json::json!({"index": 7})),
+                };
+                let mut encoded = serde_json::to_vec(&request).unwrap();
+                encoded.push(b'\n');
+                client.write_all(&encoded).await.unwrap();
+                assert_eq!(started_rx.recv().await, Some(7));
+
+                tokio::time::sleep(IDLE_TIMEOUT * 3).await;
+                assert!(
+                    !server.is_finished(),
+                    "an in-flight await must suppress the idle timeout"
+                );
+
+                permits.add_permits(1);
+                let mut reader = BufReader::new(client);
+                let response = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    read_line_limited(&mut reader, DEFAULT_MAX_FRAME_BYTES),
+                )
+                .await
+                .expect("the pending await must complete")
+                .unwrap()
+                .unwrap();
+                let response: Value = serde_json::from_slice(&response).unwrap();
+                assert_eq!(response["id"], 1);
+                assert_eq!(response["result"]["index"], 7);
+
+                tokio::time::timeout(Duration::from_secs(1), server)
+                    .await
+                    .expect("the idle timeout must resume after the await")
+                    .unwrap()
+                    .unwrap();
+            })
+            .await;
     }
 
     #[tokio::test(flavor = "current_thread")]

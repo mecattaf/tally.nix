@@ -84,7 +84,7 @@ use crate::taskdb::{
 use crate::trace::{query_trace, trace_availability, TraceError, TraceLane};
 use crate::watch::{ChangeError, ChangeKind, ChangeStore};
 use crate::wire::{
-    canonical_payload_hash, serve_connection_with_max_frame_bytes, EnqueuePayload, GuardrailConfig,
+    canonical_payload_hash, serve_connection_with_limits, EnqueuePayload, GuardrailConfig,
     GuardrailState, ParentInfo, ProducerDefaults, RequestFrame, RpcHandler, SubmissionMode,
     WireError, WireErrorCode, WireIoError,
 };
@@ -96,6 +96,7 @@ use crate::witness::{
 
 const LEASE_TICK: Duration = Duration::from_millis(100);
 const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+const RPC_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_METER_EVENT_BYTES: u64 = 64 * 1024;
 const UNCLAIMED_DRAIN_BARRIER_LIMIT: usize = 64;
 pub const DEFAULT_MAX_CONNECTIONS: usize = 256;
@@ -5688,10 +5689,11 @@ impl Daemon {
                                     let handler = self.handler.clone();
                                     let max_frame_bytes = self.max_frame_bytes;
                                     connections.spawn_local(async move {
-                                        if let Err(error) = serve_connection_with_max_frame_bytes(
+                                        if let Err(error) = serve_connection_with_limits(
                                             stream,
                                             handler,
                                             max_frame_bytes,
+                                            Some(RPC_IDLE_TIMEOUT),
                                         )
                                         .await
                                         {
