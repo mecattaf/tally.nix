@@ -21,8 +21,8 @@ authorized.
 
 ### Changed
 
-- Standardized pull-request merge evidence on the canonical worker-run local ladder transcript,
-  with no independently enforced GitHub status or branch protection in the single-operator phase.
+- Standardized pull-request merge evidence on the canonical worker-run local ladder transcript in
+  the single-operator phase.
 - Required each behavior-affecting pull request to update `[Unreleased]` unless it carries the
   `no-changelog` label.
 - Single-sourced the declarative-flow node field contract across JavaScript validation, live-wire

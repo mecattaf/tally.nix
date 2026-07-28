@@ -145,8 +145,8 @@ operator-facing deployment behavior.
 
 A pull request with no release-note-worthy effect may carry the `no-changelog` label instead. State
 the reason in its description; the label is an explicit reviewable decision, not a way to skip an
-entry for behavior that changed. The fleet runner enforces the mechanical rule against the exact
-pull-request base and head before it can post a green status.
+entry for behavior that changed. The local runner enforces the mechanical rule against the exact
+pull-request base and head.
 
 ## Change hygiene
 
