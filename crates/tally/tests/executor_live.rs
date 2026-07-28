@@ -184,6 +184,7 @@ async fn real_user_manager_executor_smoke() {
     let mut cleanup = UnitCleanup::new();
     let script = r#"
 set -eu
+test "$TALLY_JOB_TOKEN" = 'abababababababababababababababababababababababababababababababab'
 printf 'pool=%s class=%s epoch=%s no_enqueue=%s credentials=%s\n' \
   "$TALLY_POOL" "$TALLY_CLASS" "$TALLY_LEASE_EPOCH" "$TALLY_NO_ENQUEUE" "$TALLY_CREDENTIALS"
 printf 'stderr-line\n' >&2
