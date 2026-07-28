@@ -231,6 +231,78 @@ Crossing that boundary terminates the runner process, so no `FlowError` can be
 emitted from that process; the durable ledger and same-identity replay are the
 recovery mechanism.
 
+## What silently changes your payload hash
+
+Two payloads are the same work only if their canonical bytes match. Most of the
+normalization the host performs makes *cosmetic* differences invisible — but one
+thing an author reasonably assumes is normalized is not, and it is the one that
+bites.
+
+**Evidence order is not canonicalized.** The host validates and rewrites each
+evidence spec individually, and keeps the array in the order the script wrote it.
+Reordering an evidence array between runs of the same flow run is a different
+payload and therefore `replay-divergence`. Build the array in a fixed order — a
+literal, or a sorted projection of a witnessed result — not by appending in
+whatever order the script happens to discover requirements.
+
+| Input | Normalization before hashing |
+|---|---|
+| `evidence` array order | **None.** Order is preserved exactly as written, so reordering diverges. |
+| Each `evidence` entry | `hash:sha256:<digest>` lowercases the digest; `exit:<code>` is re-rendered from the parsed integer; `artifact:` and `store:` are kept verbatim. |
+| `pools` | Sorted before hashing and submission, so declaration order is free. |
+| `env` | Relocated into `adapterOptions.environment` and key-sorted, so insertion order is free. A name set in both `env` and `adapterOptions.environment` is `duplicate-environment`, not a silent overwrite. |
+| Pool credentials | Resolved by walking the sorted pool list and taking the first path for each credential name, so the resolved set is a function of the pool set alone. |
+| `drv` outputs | Sorted by output name, and the derived `store:` evidence is sorted and de-duplicated. |
+| `prompt` | Normalized into the structured brief and hashed as `briefHash`; the prompt text is not in the payload. |
+
+`args` and the catalog are pinned per run rather than hashed into the node
+payload: they are checked once at startup, and a change is
+`args-changed-mid-run` or `catalog-changed-mid-run` rather than a per-node
+divergence.
+
+## A flow cannot choose a model
+
+There is no surface through which a script sets `model` or `effort` on a
+`claude()` or `codex()` node. `adapterOptions` is not among the fields either the
+`job()` or the sugar surface accepts, so writing it is
+`FlowSpecError`/`unknown-spec-field`. The only path to a launch object is
+`local()`, which copies it verbatim from the selected catalog member — where it
+is operator-declared, hashed into the catalog, and pinned for the run.
+
+This is deliberate. A model choice that lived in the script would be a payload
+input the operator never declared and the catalog hash never covered.
+
+## Redeploying while a run is in flight
+
+A declaratively registered flow's script is a store path, and the durable rows of
+an in-flight run reference the generation that admitted them. Two things follow.
+
+**The old script can be garbage-collected out from under a live run.** While the
+old generation is still a profile generation its closure is rooted, so the script
+path survives an ordinary `nix-collect-garbage`. Deleting the generation itself —
+`nix-collect-garbage -d`, or `--delete-older-than` past it — drops that root. The
+daemon registers GC roots for witnessed store paths and `drv` outputs, not for a
+flow's script, so nothing else holds it. A run re-executed after that deletion
+cannot read its script. Keep the generation until the run is finished, or accept
+that the run ends and start a new run identity against the new script.
+
+**Editing the script does not silently continue the run.** If the run is
+re-executed with the same run ID against a changed script, the first thing the
+runner does is compare hashes and stop with `script-changed-mid-run`, exit 20.
+That is the intended outcome: the alternative is a run whose first half and
+second half came from different programs.
+
+**The next timer firing belongs to the new generation.** A calendar-registered
+flow derives its runner's `dedupKey` from an strftime template, so the identity
+of the *next* firing is a function of the clock and the template, not of the
+deployed script. After a redeploy, the next firing is admitted under the new
+generation and runs the new script; an unfinished run from the old generation
+does not adopt it and is not resumed by it. If the template's resolution is
+coarser than the redeploy interval — a monthly key redeployed twice in a month —
+the second firing deduplicates against the first and does not execute again.
+Change the template, not the script, when you want a redeploy to produce a
+distinct run.
+
 ## The author rule
 
 A node specification may be built only from `args`, literals, `meta`/`flowMeta`,

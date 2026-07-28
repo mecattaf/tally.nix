@@ -113,10 +113,10 @@ escape hatches:
 | Surface | Shipped behavior |
 |---|---|
 | `Date` | A direct use fails `tally flow check` with `determinism-violation`; the global is also deleted at runtime. |
-| `Math.random()` | Direct access fails the static check. Computed access reaches a replacement that throws `FlowDeterminismError`/`determinism-violation`. |
+| `Math.random()` | Direct access, and a computed access whose key is a string literal such as `Math["random"]`, both fail the static check. A computed access through a variable reaches a replacement that throws `FlowDeterminismError`/`determinism-violation`. |
 | `WeakRef`, `FinalizationRegistry` | Rejected statically and deleted from the runtime. |
 | `eval`, `Function` | Direct uses are rejected; Boa's compile-strings hook rejects indirect runtime compilation too. |
-| Timers | No timer API is installed. Any Boa timeout job that is reached aborts with `determinism-violation`. |
+| Timers | No timer API is installed. A Boa timeout job that is nevertheless reached aborts the run, but it is classified `FlowScriptError`/`script-evaluation` — its message reads `FlowDeterminismError [determinism-violation]: timer jobs are forbidden` while its code does not. Both exit 10. |
 
 The engine has distinct non-catchable runtime backstops. A flow gets 1,000,000
 loop iterations and 512 recursive calls; breaching either is

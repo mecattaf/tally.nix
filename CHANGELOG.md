@@ -15,6 +15,8 @@ authorized.
   persisted by hash in the durable row so a running job keeps one identity across daemon restarts,
   and forwarded by the CLI as the `callerJobToken` enqueue field. Remote and SSH-executed jobs
   never receive it.
+- Added a payload-hash normalization table, the flow-cannot-choose-a-model rule, and a
+  redeploy-during-an-in-flight-run section to the submission and replay chapter.
 - Added two cookbook recipes with executable examples — bounded fan-out over a witnessed worklist,
   and expressing domain failure as a validated envelope instead of a thrown error.
 - Added an evaluation-time flow width check: a script whose explicit `meta.maxNodes` exceeds
@@ -72,6 +74,10 @@ authorized.
 - Restricted system-indexed flake outputs to `x86_64-linux` and documented that supported platform.
 - Accepted `--flow-run` and `--flow-run-id` interchangeably across `tally query` and
   `tally flow run`.
+- Corrected the flow documentation where it diverged from the code: evidence absoluteness and the
+  single-`exit` rule, a missing `pools` field's real error class, `drv()` unknown-field handling,
+  the diversity interleave order, the `*-history-conflict` exit code, `RangeError` classification,
+  computed banned-global access, and how a reached timer job is reported.
 - Made the five worst flow authoring errors actionable: `unknown-spec-field` names its surface and
   lists the accepted fields, `duplicate-key` reports the first claim's ordinal and position,
   environment names separate invalid from reserved, every banned global names what to do instead,
