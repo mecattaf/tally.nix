@@ -5,11 +5,11 @@ configuration. Each entry is checked while the system or Home Manager
 generation is built. Home Manager can additionally turn an entry into a
 scheduled user service; NixOS cannot.
 
-This chapter explains how the thirteen leaf options compose. The generated
+This chapter explains how the twelve leaf options compose. The generated
 [shared-core flow options](core-options.md#servicestallyflows) remain the
 authority for types, defaults, examples, and declaration locations.
 
-## The thirteen options
+## The twelve options
 
 | Option | Contract |
 |---|---|
@@ -23,11 +23,10 @@ authority for types, defaults, examples, and declaration locations.
 | [`maxNodes`](core-options.md#servicestallyflowsnamemaxnodes) | Per-run admission backstop, default 1,000. It must be at least a literal `meta.maxNodes`; at runtime the smaller applicable bound governs. |
 | [`catalog`](core-options.md#servicestallyflowsnamecatalog) | Optional Nix path to a selector catalog. It is passed through `--catalog`, pinned per run by the exact-byte `catalogHash`, and required when `meta.selectors` is non-empty. |
 | [`workloadMutex`](core-options.md#servicestallyflowsnameworkloadmutex) | Optional capacity-1 mutex pool co-leased with `flow` for the lifetime of the runner process. |
-| [`budgetPool`](core-options.md#servicestallyflowsnamebudgetpool) | Optional pool name with existence-only validation. It does not alter the runner or node pool sets. |
 | [`extraEnv`](core-options.md#servicestallyflowsnameextraenv) | String environment added to the runner invocation. It defaults to `{}` and may not use `TALLY_*` or `CREDENTIALS_DIRECTORY` names. |
 | [`credentials`](core-options.md#servicestallyflowsnamecredentials) | Credential name-to-source-path map passed to the runner through systemd `LoadCredential`. It defaults to `{}`; the JSON never contains secret contents. |
 
-There are exactly thirteen leaves in the generated reference. The documentation
+There are exactly twelve leaves in the generated reference. The documentation
 flake check counts them, so adding or removing a flow option requires an
 intentional contract update rather than silently drifting this table.
 
@@ -160,26 +159,14 @@ allowed to run directly and keeps the documented depth/fanout bypass.
 Tally runs on one machine for one trusted user, using local AI plus
 authenticated Claude Code and Codex subscriptions.
 
-## `budgetPool` is existence-check-only
+## `budgetPool` has been removed
 
-The generated option description is deliberately explicit:
-
-> Optional pool name checked for existence only. It is not added to the runner
-> or node pool set and creates no render channel; the declarative runner remains
-> admitted solely through the reserved "flow" pool.
-
-When non-null, `budgetPool` must name an entry in `services.tally.pools`. That is
-the complete effect. The value is not added to the runner's pool list, passed to
-`tally flow run`, exported in an environment variable, or attached to child
-submissions. It therefore cannot reserve programmatic budget for the duration
-of a flow.
-
-This option should not be mistaken for a general run-lifetime lease. The actual
-generated runner pool set is always:
-
-```json
-{"pool":["flow"]}
-```
+`services.tally.flows.<name>.budgetPool` never created a lease or render
+channel, so retaining it would advertise behavior tally did not honor. A
+declaration now fails checked configuration with guidance to remove it. Use
+node priorities for contention between flow workloads, or `workloadMutex` for
+one process-scoped capacity-1 runner mutex. Neither mechanism creates a
+run-wide consumption budget.
 
 ## Generation-time validation
 
@@ -225,7 +212,7 @@ objects. It:
 - renders the associated systemd user services and timers; and
 - passes runner credentials and environment through the generated unit.
 
-The NixOS wrapper exposes the same thirteen options and evaluates the same checked
+The NixOS wrapper exposes the same twelve options and evaluates the same checked
 derivation, so it can reject an invalid flow declaration. It does not add the
 reserved pools or render flow producer services and timers. A NixOS flow entry
 that evaluates successfully is therefore validation, not deployment.
@@ -241,8 +228,7 @@ stating that priorities are the control for contention between workloads.
 This is a design position, not a temporary dialect limitation. Estimates do
 not block flow work from completing. Give ordinary wave nodes a low priority;
 a more important ask can then intercede midway through the run by design.
-Setting `budgetPool` does not change the rule because that option creates no
-node admission channel.
+There is no runner-budget option that changes this rule.
 
 The exclusion is flow-specific. Direct and producer enqueues retain the
 kernel's existing windowed-consumption mechanism and may supply

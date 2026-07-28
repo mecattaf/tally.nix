@@ -54,10 +54,10 @@ list, and runner death releases it before replay. A replay blocks behind the
 next holder while already-created children remain durable. Direct manual flow
 runs hold no lease, so a mutex flow must enter through an admitted parent job.
 
-A flow's `budgetPool` field is checked only to ensure the named pool exists; it
-is not added to the runner's pool set, exported through another channel, or
-held for the duration of the run. Nodes acquire their own declared pools as
-ordinary jobs. The shipped flow `NodeSpec` deliberately has no
+The former `budgetPool` field was removed because it was not added to the
+runner's pool set, exported through another channel, or held for the duration
+of the run. Nodes acquire their own declared pools as ordinary jobs. The
+shipped flow `NodeSpec` deliberately has no
 `consumptionEstimate`; configured flow checking excludes
 windowed-consumption pools by design. Priorities control contention between
 flow workloads. The kernel mechanism remains unchanged for direct and
@@ -75,8 +75,8 @@ Pool parsing and the `budgetGb` validation are in
 `crates/tally-core/src/config.rs`. Atomic admission, durable budget debits,
 capacity counting, and restart reconstruction are in
 `crates/tally-core/src/lease.rs`. Flow runner pool rendering, the typed
-`workloadMutex` assertions, and the existence-only `budgetPool` assertion are
-in `nix/modules/common.nix`. Tests
+`workloadMutex` assertions, and the removed-option tombstone are in
+`nix/modules/common.nix`. Tests
 `workload_mutex_replay_waits_behind_the_next_process_holder`,
 `rolling_window_rebuild_reads_events_and_verified_witness`,
 `restarted_admission_debits_a_stable_attempt_only_once`, and

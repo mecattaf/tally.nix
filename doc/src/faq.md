@@ -123,8 +123,8 @@ already-created children remain durable. A direct manual `tally flow run`
 bypasses runner admission, so a mutex flow must instead be enqueued as a parent
 job holding both pools.
 
-There is no corresponding run-wide budget lease. A flow's `budgetPool`
-currently checks only that the named pool exists. Individual nodes request
+There is no corresponding run-wide budget lease. The former `budgetPool`
+option was removed because it never created one. Individual nodes request
 their own pools while they run.
 
 Likewise, flow nodes deliberately do not supply `consumptionEstimate`, and

@@ -37,6 +37,8 @@ authorized.
   rendering, and canonical hashing.
 - Excluded flows from windowed-consumption admission at configured check time; flow contention
   uses priorities while direct and producer enqueue retain consumption estimates.
+- Removed the inert declarative-flow `budgetPool` option; its tombstone points to priorities and
+  the typed process-scoped `workloadMutex` instead.
 - Restricted system-indexed flake outputs to `x86_64-linux` and documented that supported platform.
 
 ### Fixed
