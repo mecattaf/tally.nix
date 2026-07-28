@@ -21,6 +21,12 @@ authorized.
   mutation detection, durable JSONL tail repair, and canonical pool-set and migration behavior.
 - Added flake-native rustfmt, Clippy, and repository-wide Nix formatting checks.
 
+### Fixed
+
+- Excluded the trailing record-framing newline from the single-byte mutation properties for the
+  witness and attestation chains. Replacing that byte leaves every record identical and the chain
+  legitimately valid, so the properties reported a false tamper miss on the seeds that selected it.
+
 ### Changed
 
 - Made `tally enqueue --dedup-key` use full submission semantics by default, with
