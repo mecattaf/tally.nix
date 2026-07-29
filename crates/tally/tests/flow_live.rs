@@ -28,7 +28,7 @@ use tally_core::taskdb::{
 };
 use tally_core::view::rebuild_taskchampion_view;
 use tally_core::wire::EnqueuePayload;
-use tally_core::witness::read_verified_records;
+use tally_core::witness::{read_verified_attestations, read_verified_records};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
@@ -51,6 +51,7 @@ const CAP_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000512";
 const PARTIAL_FAILURE_RUN: &str = "00000000-0000-4000-8000-000000000513";
 const REORDERED_RUN: &str = "00000000-0000-4000-8000-000000000514";
 const CATALOG_PIN_RUN: &str = "00000000-0000-4000-8000-000000000515";
+const REGEX_RESULT_RUN: &str = "00000000-0000-4000-8000-000000000516";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -665,6 +666,43 @@ export const meta = {
     pools: ["alpha"],
     evidence: ["exit:0"],
     label: "untyped-result"
+  });
+  return node.result;
+})()
+"#
+}
+
+fn regex_result_source() -> &'static str {
+    r#"
+export const meta = {
+  name: "regex-result",
+  description: "live regex adapter result is projected before restart",
+  pools: ["alpha"],
+  argsSchema: { type: "object", additionalProperties: false },
+  selectors: [],
+  maxNodes: 1
+};
+
+(async () => {
+  const node = await job({
+    argv: [
+      "/bin/sh",
+      "-c",
+      "printf '%s\\n' 'TALLY_FINAL_MESSAGE={\"ok\":true,\"n\":3}'"
+    ],
+    adapter: "ocr-driver",
+    pools: ["alpha"],
+    evidence: ["exit:0"],
+    resultSchema: {
+      type: "object",
+      required: ["ok", "n"],
+      properties: {
+        ok: { const: true },
+        n: { const: 3 }
+      },
+      additionalProperties: false
+    },
+    label: "regex-result"
   });
   return node.result;
 })()
@@ -1697,6 +1735,74 @@ async fn structured_result_is_observed_after_terminal_ack_and_replayed_after_res
                 "result replay must not materialize a second row"
             );
             restarted.stop().await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn regex_result_is_observed_after_terminal_ack_without_restart() {
+    let _environment = ENVIRONMENT_LOCK.lock().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let mut config = config();
+            config.adapters.insert(
+                "ocr-driver".to_owned(),
+                AdapterConfig {
+                    scrape: BTreeMap::from([(
+                        "finalMessage".to_owned(),
+                        ScrapeCapture {
+                            stream: ScrapeStream::Stdout,
+                            mode: ScrapeMode::Regex,
+                            pattern: "^TALLY_FINAL_MESSAGE=(.*)$".to_owned(),
+                        },
+                    )]),
+                    ..AdapterConfig::default()
+                },
+            );
+            config.validate().unwrap();
+            let config_path = temp.path().join("config.json");
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let script = temp.path().join("regex-result.js");
+            fs::write(&script, regex_result_source()).unwrap();
+            let daemon_paths = paths(&temp.path().join("daemon"));
+
+            let daemon = start_daemon(&daemon_paths, config).await;
+            let output = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                REGEX_RESULT_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let output = runner_output(output).await;
+            assert!(
+                output.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                flow_report(&output)["report"]["finalValue"],
+                json!({"ok": true, "n": 3})
+            );
+            let (report, attestations) =
+                read_verified_attestations(&daemon_paths.attestations_path()).unwrap();
+            assert!(report.ok);
+            assert_eq!(attestations.len(), 1);
+            assert_eq!(attestations[0].payload["kind"], "adapter-scrape");
+            assert_eq!(
+                attestations[0].payload["captures"]["finalMessage"],
+                r#"{"ok":true,"n":3}"#
+            );
+            assert!(attestations[0]
+                .payload
+                .get("reconciledAfterRestart")
+                .is_none());
+            daemon.stop().await;
         })
         .await;
 }

@@ -35,7 +35,9 @@ are rejected.
 After the canonical terminal acknowledgement, tally may read the selected
 private stdout or stderr capture and apply one of three modes:
 
-- `regex` retains the last match, using the first capture group when present;
+- `regex` enables line anchors for `^` and `$` and retains the last match,
+  using the first capture group when present (`\A` and `\z` remain available
+  for whole-capture anchors);
 - `jsonPath` evaluates the expression against each JSON value in the stream
   and retains the last non-null result;
 - `jsonPathLast` parses the complete JSON-lines stream as one array, evaluates

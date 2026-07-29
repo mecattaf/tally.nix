@@ -7,7 +7,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
-use regex::Regex;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use serde_json_path::JsonPath;
@@ -708,7 +708,7 @@ fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterEr
         }
         match capture.mode {
             ScrapeMode::Regex => {
-                Regex::new(&capture.pattern).map_err(|error| AdapterError::InvalidConfig {
+                compile_regex(&capture.pattern).map_err(|error| AdapterError::InvalidConfig {
                     adapter: name.to_owned(),
                     detail: format!("capture {capture_name:?} has invalid regex: {error}"),
                 })?;
@@ -917,7 +917,7 @@ fn render_argument(
 }
 
 fn scrape_regex(pattern: &str, input: &str) -> Result<Option<Value>, String> {
-    let expression = Regex::new(pattern).map_err(|error| error.to_string())?;
+    let expression = compile_regex(pattern).map_err(|error| error.to_string())?;
     let mut selected = None;
     for captures in expression.captures_iter(input) {
         let value = if captures.len() > 1 {
@@ -932,6 +932,10 @@ fn scrape_regex(pattern: &str, input: &str) -> Result<Option<Value>, String> {
         selected = Some(Value::String(value.as_str().to_owned()));
     }
     Ok(selected)
+}
+
+fn compile_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    RegexBuilder::new(pattern).multi_line(true).build()
 }
 
 fn parse_json_path(pattern: &str) -> Result<JsonPath, String> {
@@ -1339,6 +1343,22 @@ mod tests {
             )
             .unwrap(),
             Some(Value::from(4))
+        );
+    }
+
+    #[test]
+    fn regex_scraping_is_line_oriented_by_default() {
+        assert_eq!(
+            scrape_regex(
+                "^TALLY_FINAL_MESSAGE=(.*)$",
+                concat!(
+                    "diagnostic output\n",
+                    "TALLY_FINAL_MESSAGE={\"ok\":false}\n",
+                    "TALLY_FINAL_MESSAGE={\"ok\":true,\"n\":3}\n"
+                ),
+            )
+            .unwrap(),
+            Some(Value::String("{\"ok\":true,\"n\":3}".to_owned()))
         );
     }
 
