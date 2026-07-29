@@ -72,6 +72,10 @@ authorized.
 
 ### Fixed
 
+- Made regex adapter scrapes line-oriented by default, so documented
+  newline-terminated `^TALLY_FINAL_MESSAGE=(.*)$` captures are attested and
+  projected immediately after local completion without requiring a daemon
+  restart.
 - Refused daemon startup when its state directory is a symlink or another
   non-directory, with instructions to replace it with a real directory and
   move the state files, instead of reporting healthy and failing producer

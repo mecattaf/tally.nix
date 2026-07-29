@@ -78,9 +78,10 @@ let
           default = "regex";
           example = "jsonPathLast";
           description = ''
-            How tally extracts this capture. "regex" applies pattern matching,
-            "jsonPath" returns JSONPath matches, and "jsonPathLast" applies the
-            same RFC 9535 expression but keeps the last whole-stream match.
+            How tally extracts this capture. "regex" applies pattern matching
+            with line anchors enabled for ^ and $, "jsonPath" returns JSONPath
+            matches, and "jsonPathLast" applies the same RFC 9535 expression but
+            keeps the last whole-stream match.
           '';
         };
         pattern = mkOption {
