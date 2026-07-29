@@ -91,6 +91,15 @@ fn io_error(path: &Path, source: std::io::Error) -> ChangeError {
     }
 }
 
+fn reopen(path: &Path) -> Result<File, ChangeError> {
+    OpenOptions::new()
+        .read(true)
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|source| io_error(path, source))
+}
+
 #[derive(Debug)]
 pub struct ChangeStore {
     path: PathBuf,
@@ -147,26 +156,26 @@ impl ChangeStore {
                 .map_err(|source| io_error(&path, source))?;
             bytes.truncate(complete);
         }
-        let mut records = Vec::new();
-        for line in bytes
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-        {
-            records.push(serde_json::from_slice::<ChangeRecord>(line)?);
-        }
-        validate_records(&records)?;
+        // The watch feed is bounded convenience state, not evidence or a
+        // recovery input. Discard the whole feed when complete records cannot
+        // be decoded or validated rather than presenting the failure as
+        // corruption of durable state that an operator must preserve.
+        let mut records = match decode_records(&bytes) {
+            Ok(records) => records,
+            Err(ChangeError::Json(_) | ChangeError::Invalid(_)) => {
+                rewrite(&path, std::iter::empty())?;
+                file = reopen(&path)?;
+                Vec::new()
+            }
+            Err(error) => return Err(error),
+        };
         let disk_records = if records.len() >= capacity.saturating_mul(2) {
             // A crash may have interrupted the previous owner between the
             // threshold append and its rewrite; finish the drop to the newest
             // `capacity` records now.
             records = records.split_off(records.len() - capacity);
             rewrite(&path, records.iter())?;
-            file = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&path)
-                .map_err(|source| io_error(&path, source))?;
+            file = reopen(&path)?;
             capacity
         } else {
             file.seek(SeekFrom::End(0))
@@ -216,12 +225,7 @@ impl ChangeStore {
         self.disk_records += 1;
         if self.disk_records >= self.capacity.saturating_mul(2) {
             rewrite(&self.path, self.records.iter())?;
-            self.file = OpenOptions::new()
-                .read(true)
-                .append(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(&self.path)
-                .map_err(|source| io_error(&self.path, source))?;
+            self.file = reopen(&self.path)?;
             self.disk_records = self.records.len();
         }
         Ok(record)
@@ -333,6 +337,16 @@ fn parse_change_cursor(cursor: &str) -> Result<u64, ChangeError> {
         .ok_or_else(|| ChangeError::Invalid("invalid watch cursor".to_owned()))
 }
 
+fn decode_records(bytes: &[u8]) -> Result<Vec<ChangeRecord>, ChangeError> {
+    let records = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(serde_json::from_slice::<ChangeRecord>)
+        .collect::<Result<Vec<_>, _>>()?;
+    validate_records(&records)?;
+    Ok(records)
+}
+
 fn validate_records(records: &[ChangeRecord]) -> Result<(), ChangeError> {
     for (index, record) in records.iter().enumerate() {
         if record.schema_version != CHANGE_SCHEMA_VERSION
@@ -437,6 +451,69 @@ mod tests {
     fn inode(path: &Path) -> u64 {
         use std::os::unix::fs::MetadataExt;
         std::fs::metadata(path).unwrap().ino()
+    }
+
+    fn test_record(sequence: u64) -> ChangeRecord {
+        ChangeRecord {
+            schema_version: CHANGE_SCHEMA_VERSION,
+            protocol_version: QUERY_PROTOCOL_VERSION,
+            sequence,
+            cursor: change_cursor(sequence),
+            observed_at: "2026-07-29T00:00:00Z".to_owned(),
+            kind: ChangeKind::Job,
+            payload: serde_json::json!({"sequence": sequence}),
+        }
+    }
+
+    fn encode_records(records: &[ChangeRecord]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for record in records {
+            serde_json::to_writer(&mut bytes, record).unwrap();
+            bytes.push(b'\n');
+        }
+        bytes
+    }
+
+    #[test]
+    fn invalid_or_foreign_change_log_is_discarded_on_open() {
+        let mut foreign_schema = test_record(1);
+        foreign_schema.schema_version += 1;
+        let cases = [
+            ("foreign schema", encode_records(&[foreign_schema])),
+            ("foreign shape", b"{\"legacy\":true}\n".to_vec()),
+            ("malformed JSON", b"{not-json}\n".to_vec()),
+            (
+                "non-contiguous sequence",
+                encode_records(&[test_record(1), test_record(3)]),
+            ),
+        ];
+
+        for (case, bytes) in cases {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join(CHANGE_FILE);
+            std::fs::write(&path, bytes).unwrap();
+
+            let mut store = ChangeStore::open_with_capacity(temp.path(), 4)
+                .unwrap_or_else(|error| panic!("{case}: open failed: {error}"));
+            assert!(
+                std::fs::read(&path).unwrap().is_empty(),
+                "{case}: unusable feed was not discarded"
+            );
+            let seed = store.watch(None, None).unwrap();
+            assert!(seed.items.is_empty(), "{case}: reset feed served records");
+            assert_eq!(
+                seed.next_cursor.as_deref(),
+                Some(change_cursor(0).as_str()),
+                "{case}: reset feed did not return the genesis cursor"
+            );
+            let appended = store
+                .append_now(ChangeKind::Job, serde_json::json!({"case": case}))
+                .unwrap();
+            assert_eq!(
+                appended.sequence, 1,
+                "{case}: reset feed did not restart at sequence 1"
+            );
+        }
     }
 
     #[test]

@@ -68,6 +68,9 @@ authorized.
 
 ### Fixed
 
+- Reset an invalid or foreign-format `changes.jsonl` to an empty watch feed at
+  daemon startup instead of reporting disposable, non-evidence state like
+  corruption that needs operator intervention.
 - Pinned the fleet gate's changelog decision to the audited SHA's status at script start instead of
   re-deciding it when the stage runs. A merge landing while the run waited for the runner lock or
   worked through the ladder moved the tip of main away from the audited commit, and an otherwise
