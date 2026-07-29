@@ -1361,6 +1361,42 @@ mod tests {
         drop(acquire_daemon_lock(&paths.state_dir).unwrap());
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn foreign_change_log_is_discarded_without_blocking_daemon_boot() {
+        let temp = tempdir().unwrap();
+        let paths = fs1_paths(temp.path());
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        let change_path = paths.data_dir.join(crate::watch::CHANGE_FILE);
+        fs::write(&change_path, b"{\"legacy\":true}\n").unwrap();
+        let executor = direct_executor(&paths.state_dir)
+            .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+            .with_unit_probe(ExitFileProbe);
+
+        let daemon = Daemon::open_with_executor(
+            one_pool_config(),
+            paths.clone(),
+            settings(),
+            executor,
+        )
+        .await
+        .expect("disposable foreign watch state must not block daemon boot");
+
+        let bytes = fs::read(&change_path).unwrap();
+        let records = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice::<crate::watch::ChangeRecord>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(!records.is_empty(), "startup did not seed the fresh feed");
+        assert_eq!(records[0].sequence, 1);
+        assert!(records
+            .iter()
+            .all(|record| record.schema_version == crate::watch::CHANGE_SCHEMA_VERSION));
+
+        drop(daemon);
+        drop(acquire_daemon_lock(&paths.state_dir).unwrap());
+    }
+
     #[test]
     fn rejected_startup_explicitly_unlocks_before_an_inherited_duplicate_closes() {
         let temp = tempdir().unwrap();

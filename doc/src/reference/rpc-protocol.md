@@ -383,6 +383,8 @@ There is no durable recovery for a page cursor. Start the query again.
 
 `query.watch` is different. Changes live in a private durable `changes.jsonl` capped at 4,096
 records. Limits are again 1–1,000 and each result is capped at 48 KiB.
+The file is a non-evidence feed rather than a recovery input: startup replaces
+the whole feed with an empty one if its records cannot be decoded or validated.
 
 A call without `after` is a tail subscription seed: it returns no items and a `nextCursor` at
 the current head. Call again with that cursor to receive later changes. A normal envelope has

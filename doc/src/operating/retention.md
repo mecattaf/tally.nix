@@ -154,7 +154,7 @@ The current storage story is intentionally uneven:
 | `witness.jsonl` | Append-only, unbounded | Never truncate; archive only as a complete, verified ledger during an explicit migration. |
 | `attestations.jsonl` | Append-only, unbounded | Preserve if advisory history matters; it is a separate chain from verdicts. |
 | `lifecycle.jsonl` | Explicit policy string `unbounded` | No supported compaction command exists. Do not hand-edit it. |
-| `changes.jsonl` | Latest 4,096 change records | Automatic; slow readers receive `cursor-expired`. |
+| `changes.jsonl` | Latest 4,096 change records | Automatic; invalid or foreign contents reset to an empty feed at startup, and slow readers receive `cursor-expired`. |
 | Current and archived captures | Files accumulate per execution generation; query reads at most 16 MiB | Do not remove active-generation files. Archiving old captures sacrifices trace and scrape reconstruction. |
 | Worker `stateDir` | Captures, launch markers, exit records, and execution attestations accumulate | Preserve live/ambiguous generations. No worker-side GC is shipped. |
 | Ordinary `artifact:<path>` files | Owned by the workload; no tally GC root | Apply a workload-specific policy only after accepting the reuse and audit consequences below. |

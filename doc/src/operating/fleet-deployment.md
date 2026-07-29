@@ -428,22 +428,23 @@ tally: witness error: old-format witness ledger at ~/.local/share/tally/witness.
 archive it aside before first boot: mv -- …/witness.jsonl …/witness.jsonl.pre-2026-07-29
 ```
 
-The gates fire one at a time — witness ledger, then the events directory — so
-each restart reveals the next one. Two sharp edges observed on first contact:
+The evidence gates fire one at a time — witness ledger, then the events
+directory — so each restart reveals the next one. The watch change log
+(`changes.jsonl`) is deliberately not a migration gate: it is a bounded,
+non-evidence feed. If tally cannot decode or validate it, startup replaces the
+whole file with an empty feed and watch clients must seed a new tail cursor.
+Do not preserve or restore it as evidence.
 
-- The watch change log (`changes.jsonl`) has no archive-aside gate; an
-  old-format file fails as `invalid change log: change record 1 has an invalid
-  schema or cursor` with no printed remedy. The file is a bounded change feed,
-  not evidence; archive it aside like the gated files.
-- The daemon requires the state directory to be a real directory. A legacy
-  symlink (for example `~/.local/state/tally` pointing into `~/.config/tally`)
-  boots the daemon but fails producer drain with `invalid producer observation:
-  … is not a real directory`. Replace the symlink with a real directory and
-  move the state files into it.
+One sharp edge observed on first contact remains: the daemon requires the state
+directory to be a real directory. A legacy symlink (for example
+`~/.local/state/tally` pointing into `~/.config/tally`) boots the daemon but
+fails producer drain with `invalid producer observation: … is not a real
+directory`. Replace the symlink with a real directory and move the state files
+into it.
 
-Keep every `.pre-*` archive. The rollback path below depends on them, and the
-recovery chapter's rule applies: archive exactly what the error names, never
-delete evidence to make startup proceed.
+Keep every `.pre-*` archive named by an evidence gate. The rollback path below
+depends on them, and the recovery chapter's rule applies: archive exactly what
+the error names, never delete evidence to make startup proceed.
 
 ### Verify, in order
 
@@ -489,13 +490,15 @@ Quiesce admission, stop the daemon, and swap the state before activating the
 older generation:
 
 1. `systemctl --user stop tally-daemon.service`;
-2. move each new-format file to a `.flow-era` name and restore its `.pre-*`
-   archive to the live name (`witness.jsonl`, `changes.jsonl`, the events
-   directory);
+2. move each new-format evidence file to a `.flow-era` name and restore its
+   `.pre-*` archive to the live name (`witness.jsonl` and the events
+   directory); move `changes.jsonl` to a `.flow-era` name without restoring a
+   predecessor, so the older daemon creates a fresh disposable feed;
 3. switch to the older generation and confirm the old daemon is `active` and
    `tally witness verify` is GREEN against the restored ledger;
-4. roll forward by switching the profile back, then reverse the swap so the
-   new daemon boots over its own state again.
+4. roll forward by switching the profile back, then reverse the evidence swap
+   so the new daemon boots over its own state again; its disposable watch feed
+   may start empty.
 
 Both directions of this swap were exercised on first contact; each daemon
 verified its own chain GREEN afterwards. The witness property from the rollout
