@@ -406,5 +406,5 @@ $ du -sh /var/lib/tally-remote
 For a system daemon, use `systemctl`, `journalctl -u tally-daemon.service`, and
 pass `--socket /run/tally/tally.sock`. The exact two-host recovery and
 Git/Attic handoff exercised by the release is in the
-[`flow-multi-host`](https://github.com/mecattaf/tally.nix/blob/4c85563/flake.nix#L1221)
+[`flow-multi-host`](https://github.com/mecattaf/tally.nix/blob/284f641bd9b00036d7bd29f094f4b353872c30d0/flake.nix#L2015-L2016)
 VM check.
