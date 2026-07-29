@@ -1437,6 +1437,7 @@ let
             "vram"
             "build-slot"
             "cpu-slot"
+            "slot"
             "budget"
             "mutex"
           ];
@@ -1444,8 +1445,9 @@ let
           example = "build-slot";
           description = ''
             Resource accounted by this pool: memory co-residency ("vram"),
-            counted build or CPU slots, rolling spend ("budget"), or a
-            capacity-one exclusion lock ("mutex").
+            counted build or CPU slots, a neutral counted concurrency lane
+            for external or metered capacity ("slot"), rolling spend
+            ("budget"), or a capacity-one exclusion lock ("mutex").
           '';
         };
         capacity = mkOption {

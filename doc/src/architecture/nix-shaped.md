@@ -127,14 +127,16 @@ not probe advertised features or dynamically score executors by speed. A
 submission names its pools and, when remote placement is wanted, its executor;
 priority orders work rather than ranking hosts.
 
-Pools can model a resource ordinary CI queues usually leave implicit: a renewable
-five-hour subscription window. For example, an operator can declare a budget
-pool whose rolling `windowSec` is `18000` and whose `consumptionCap` is expressed
-in the resource's native unit. A job must supply `consumptionEstimate`; admission
-records that estimate as the window debit. It ages out with the window; completion
-does not replace it with measured usage. This is a capability of the shipped
-`windowed-consumption` predicate, not a predeclared five-hour pool. The module
-defaults to a seven-day window.
+Pools can model resources ordinary CI queues usually leave implicit. A neutral
+`slot` pool counts concurrent holders of an external lane, such as Codex or
+Claude Code subscription sessions, without pretending they consume local CPU.
+A `budget` pool instead models spend over a renewable window: for example, an
+operator can set `windowSec` to `18000` and express `consumptionCap` in the
+resource's native unit. A job must supply `consumptionEstimate`; admission
+records that estimate as the window debit. It ages out with the window;
+completion does not replace it with measured usage. This is a capability of the
+shipped `windowed-consumption` predicate, not a predeclared five-hour pool. The
+module defaults to a seven-day window.
 
 There are two explicit flow boundaries. Declaratively generated flow runners
 always request `flow` and may co-lease one typed capacity-1 `workloadMutex` for

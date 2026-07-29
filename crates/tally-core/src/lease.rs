@@ -1493,6 +1493,39 @@ mod tests {
     }
 
     #[test]
+    fn counted_external_slot_admits_up_to_its_capacity() {
+        let slot = PoolConfig {
+            resource: ResourceKind::Slot,
+            capacity: 3,
+            predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+            ..PoolConfig::default()
+        };
+        let mut engine = LeaseEngine::new(
+            1,
+            Duration::from_secs(20),
+            BTreeMap::from([("codex-window".to_owned(), slot)]),
+            None,
+        )
+        .unwrap();
+
+        for index in 0..3 {
+            let outcome = engine
+                .admit_at(
+                    request(&format!("agent-{index}"), &["codex-window"], Priority::Low),
+                    now(),
+                )
+                .unwrap();
+            assert!(matches!(outcome, AdmitOutcome::Granted(_)));
+        }
+        assert!(matches!(
+            engine
+                .admit_at(request("agent-3", &["codex-window"], Priority::Low), now(),)
+                .unwrap(),
+            AdmitOutcome::Queued { .. }
+        ));
+    }
+
+    #[test]
     fn workload_mutex_replay_waits_behind_the_next_process_holder() {
         let mutex = PoolConfig {
             resource: ResourceKind::Mutex,

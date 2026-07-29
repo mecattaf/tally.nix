@@ -943,6 +943,14 @@
                     capacity = 1;
                     predicate.co-residency = { };
                   };
+                  codex-window = {
+                    resource = "slot";
+                    capacity = 16;
+                  };
+                  claude-window = {
+                    resource = "slot";
+                    capacity = 8;
+                  };
                   build.resource = "build-slot";
                   worker-gpu.resource = "vram";
                 };
@@ -3082,6 +3090,10 @@
               .pools.programmatic.credentials.METER_TOKEN == "/run/credentials/tally-meter" and
               .pools["flow-run-mutex"].resource == "mutex" and
               .pools["flow-run-mutex"].capacity == 1 and
+              .pools["codex-window"].resource == "slot" and
+              .pools["codex-window"].capacity == 16 and
+              .pools["claude-window"].resource == "slot" and
+              .pools["claude-window"].capacity == 8 and
               .producers["flow-fixture"].kind == "calendar" and
               .producers["flow-fixture"].onCalendar == "daily" and
               .producers["flow-fixture"].enqueue.argv[0:3] == ["tally", "flow", "run"] and
