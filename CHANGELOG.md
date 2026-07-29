@@ -8,6 +8,10 @@ authorized.
 
 ### Added
 
+- Added a neutral `slot` pool resource for counted external or metered
+  concurrency, so Codex and Claude Code subscription lanes can admit multiple
+  holders without being mislabeled as local CPU capacity or serialized as a
+  mutex.
 - Replaced the `agency-nightly` example flow with the real overnight wave: a deterministic
   worklist node that witnesses the wave declared in the flow's own arguments (the worklist is the
   script plus its args — no external worklist source), per-task parallel `codex()` implementation

@@ -108,6 +108,28 @@ its own pool, and setting `pools` on a `claude()`, `codex()`, or `local()` call 
 `sugar-option-conflict` at `tally flow check`. It still has to be declared,
 because activation closes `meta.pools` against the configured pool set.
 
+Declare provider-backed agent lanes as counted `slot` pools, not as mutexes or
+local CPU accounting:
+
+```nix
+services.tally.pools = {
+  claude-window = {
+    resource = "slot";
+    capacity = 8;
+  };
+  codex-window = {
+    resource = "slot";
+    capacity = 16;
+  };
+};
+```
+
+Each running sugar node holds one slot. Capacity is the operator's concurrency
+limit for that subscription or remote service; a capacity-1 `mutex` would
+serialize the whole lane. These co-residency slots are usable by flows because
+they require no `consumptionEstimate`. A rolling `budget` pool is a different
+admission shape and remains unavailable to flow nodes.
+
 ## Expressing domain failure
 
 A custom `throw` in a flow script becomes `FlowScriptError`/`script-evaluation`

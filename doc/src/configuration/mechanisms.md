@@ -29,7 +29,7 @@ partial set.
 
 | Option | Operational meaning |
 |---|---|
-| [`resource`](core-options.md#servicestallypoolsnameresource) | Classifies the gate as `vram`, `build-slot`, `cpu-slot`, `budget`, or `mutex`; it does not discover or allocate that resource. |
+| [`resource`](core-options.md#servicestallypoolsnameresource) | Classifies the gate as `vram`, `build-slot`, `cpu-slot`, neutral counted `slot`, `budget`, or `mutex`; it does not discover or allocate that resource. |
 | [`capacity`](core-options.md#servicestallypoolsnamecapacity) | Bounds simultaneous holders for `co-residency`; a `mutex` is the capacity-one special case. |
 | [`budgetGb`](core-options.md#servicestallypoolsnamebudgetgb) | Records a VRAM co-residency budget. Current admission still counts holders and does not sum per-job VRAM, so this is not an enforced memory total. |
 | [`predicate.co-residency`](core-options.md#servicestallypoolsnamepredicateco-residency) | Selects counted-holder admission. |

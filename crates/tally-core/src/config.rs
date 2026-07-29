@@ -170,6 +170,7 @@ pub enum ResourceKind {
     Vram,
     BuildSlot,
     CpuSlot,
+    Slot,
     Budget,
     Mutex,
 }
@@ -972,6 +973,28 @@ mod tests {
             invalid.validate(),
             Err(ConfigError::InvalidMutex { .. })
         ));
+    }
+
+    #[test]
+    fn counted_slot_accepts_multi_holder_external_capacity() {
+        let config: Config = serde_json::from_str(
+            r#"{
+                "pools": {
+                    "codex-window": {"resource": "slot", "capacity": 16}
+                }
+            }"#,
+        )
+        .unwrap();
+        config.validate().unwrap();
+
+        let pool = &config.pools["codex-window"];
+        assert_eq!(pool.resource, ResourceKind::Slot);
+        assert_eq!(pool.capacity, 16);
+        assert!(matches!(pool.predicate, PoolPredicate::CoResidency(_)));
+        assert_eq!(
+            serde_json::to_value(pool.resource).unwrap(),
+            serde_json::json!("slot")
+        );
     }
 
     #[test]

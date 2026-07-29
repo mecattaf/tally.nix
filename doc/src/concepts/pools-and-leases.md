@@ -5,10 +5,10 @@ pool names; tally grants a lease only when every requested pool permits the job.
 The lease, rather than a guessed property of the process, is what accounts for
 contention.
 
-`resource` classifies the policy as VRAM, build slot, CPU slot, budget, or
-mutex. It does not discover hardware or allocate memory. `enforce` currently
-accepts only cooperative enforcement. The operator declares the real resource
-boundary and ensures that workloads honor it.
+`resource` classifies the policy as VRAM, build slot, CPU slot, a neutral
+counted slot, budget, or mutex. It does not discover hardware or allocate
+memory. `enforce` currently accepts only cooperative enforcement. The operator
+declares the real resource boundary and ensures that workloads honor it.
 
 ## One atomic pool set
 
@@ -20,6 +20,30 @@ enqueue rather than acquire them piecemeal.
 For the `co-residency` predicate, `capacity` is the maximum number of live
 holders. A mutex is the strict special case: it must use co-residency with
 capacity one. Other resource labels use the same counted-holder mechanism.
+
+Use `resource = "slot"` when the scarce boundary is external concurrency rather
+than local hardware. Provider-backed agent harnesses are the common case:
+
+```nix
+services.tally.pools = {
+  codex-window = {
+    resource = "slot";
+    capacity = 16;
+  };
+  claude-window = {
+    resource = "slot";
+    capacity = 8;
+  };
+};
+```
+
+These capacities bound simultaneous holders of each provider lane; they do not
+account local CPU or debit token usage. Choose them from the provider and
+operator's tolerated concurrency. The `codex()` and `claude()` flow sugars use
+these exact pool names, so their nodes can share the lanes directly. A `mutex`
+would deliberately serialize the lane and is appropriate only when the account
+must admit exactly one holder. A windowed `budget` remains the spend model for
+requests that can supply a `consumptionEstimate`; flow nodes cannot do so.
 
 There is an uncomfortable shipped edge worth stating plainly. `budgetGb` is
 type-checked and allowed only on a multi-holder co-resident VRAM pool, but the
