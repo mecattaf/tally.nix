@@ -211,7 +211,11 @@
           pname = "tally";
           version = "0.1.0";
           src = tallySource;
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            # All Boa workspace crates share this one fixed-output git source.
+            outputHashes."boa_ast-1.0.0-dev" = "sha256-xdB+SCFjaV+/hJu9n+3Il3vN0TZQXq0V95XmsJ/ihwo=";
+          };
           doCheck = true;
           preCheck = ''
             export TALLY_NIX_CATALOG_FIXTURE=${catalogFixtureUnchecked}

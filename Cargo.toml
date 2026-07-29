@@ -17,11 +17,12 @@ keywords = ["nix", "systemd", "contention", "provenance", "task-runner"]
 
 [workspace.dependencies]
 anyhow = "1.0"
-boa_ast = "=0.21.1"
-boa_engine = { version = "=0.21.1", features = ["native-backtrace"] }
-boa_gc = "=0.21.1"
-boa_interner = "=0.21.1"
-boa_parser = "=0.21.1"
+# Keep every Boa sibling on PR #5223's exact paste-to-pastey tree.
+boa_ast = { git = "https://github.com/boa-dev/boa.git", rev = "c39e6bf105b3360c80effefde506bf4fb62476eb" }
+boa_engine = { git = "https://github.com/boa-dev/boa.git", rev = "c39e6bf105b3360c80effefde506bf4fb62476eb", default-features = false, features = ["float16", "native-backtrace", "xsum"] }
+boa_gc = { git = "https://github.com/boa-dev/boa.git", rev = "c39e6bf105b3360c80effefde506bf4fb62476eb" }
+boa_interner = { git = "https://github.com/boa-dev/boa.git", rev = "c39e6bf105b3360c80effefde506bf4fb62476eb" }
+boa_parser = { git = "https://github.com/boa-dev/boa.git", rev = "c39e6bf105b3360c80effefde506bf4fb62476eb" }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
 fs2 = "0.4"

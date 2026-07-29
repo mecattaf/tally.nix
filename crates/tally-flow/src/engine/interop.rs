@@ -116,7 +116,7 @@ fn stack_location(stack: &str) -> Option<SourceLocation> {
 
 pub(super) fn flow_error_value(error: &FlowError, context: &mut Context) -> JsResult<JsValue> {
     let value = JsError::from_native(JsNativeError::error().with_message(error.message.clone()))
-        .to_opaque(context);
+        .into_opaque(context)?;
     let object = value
         .as_object()
         .ok_or_else(|| JsNativeError::error().with_message("cannot construct flow error"))?;
@@ -173,16 +173,24 @@ pub(crate) fn flow_to_js_error(error: FlowError, context: &mut Context) -> JsErr
 
 pub(super) fn js_error_to_flow(error: JsError, context: &mut Context) -> FlowError {
     let rendered = error.to_string();
-    if error
-        .as_native()
-        .is_some_and(JsNativeError::is_runtime_limit)
-    {
+    if matches!(
+        error.as_engine(),
+        Some(boa_engine::error::EngineError::RuntimeLimit(_))
+    ) {
         let location = stack_location(&rendered).unwrap_or(RUNTIME_ERROR_LOCATION);
         return FlowError::new("FlowRuntimeLimitError", "runtime-limit", rendered.clone())
             .at(location)
             .with_stack(rendered);
     }
-    let value = error.to_opaque(context);
+    let value = match error.into_opaque(context) {
+        Ok(value) => value,
+        Err(_) => {
+            let location = stack_location(&rendered).unwrap_or(RUNTIME_ERROR_LOCATION);
+            return FlowError::new("FlowScriptError", "script-exception", rendered.clone())
+                .at(location)
+                .with_stack(rendered);
+        }
+    };
     if let Some(object) = value.as_object() {
         fn string_property(object: &JsObject, key: &str, context: &mut Context) -> Option<String> {
             object
