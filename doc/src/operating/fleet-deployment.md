@@ -435,12 +435,11 @@ non-evidence feed. If tally cannot decode or validate it, startup replaces the
 whole file with an empty feed and watch clients must seed a new tail cursor.
 Do not preserve or restore it as evidence.
 
-One sharp edge observed on first contact remains: the daemon requires the state
-directory to be a real directory. A legacy symlink (for example
-`~/.local/state/tally` pointing into `~/.config/tally`) boots the daemon but
-fails producer drain with `invalid producer observation: … is not a real
-directory`. Replace the symlink with a real directory and move the state files
-into it.
+The daemon also requires the state directory to be a real directory. A legacy
+symlink (for example `~/.local/state/tally` pointing into `~/.config/tally`) is
+rejected at startup with `state directory … is not a real directory; replace
+it with a real directory and move the state files into it before starting
+tally`. Apply that remedy before restarting the daemon.
 
 Keep every `.pre-*` archive named by an evidence gate. The rollback path below
 depends on them, and the recovery chapter's rule applies: archive exactly what

@@ -304,6 +304,10 @@ impl DaemonSettings {
 pub enum DaemonError {
     #[error("invalid daemon configuration: {0}")]
     Invalid(String),
+    #[error(
+        "state directory {path} is not a real directory; replace it with a real directory and move the state files into it before starting tally"
+    )]
+    InvalidStateDirectory { path: PathBuf },
     #[error("daemon I/O error at {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
     #[error("wire error: {0}")]
