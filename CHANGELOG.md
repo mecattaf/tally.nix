@@ -68,6 +68,10 @@ authorized.
 
 ### Fixed
 
+- Refused daemon startup when its state directory is a symlink or another
+  non-directory, with instructions to replace it with a real directory and
+  move the state files, instead of reporting healthy and failing producer
+  drains later.
 - Reset an invalid or foreign-format `changes.jsonl` to an empty watch feed at
   daemon startup instead of reporting disposable, non-evidence state like
   corruption that needs operator intervention.

@@ -2,7 +2,7 @@
 mod tests {
     use std::cell::Cell;
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -1395,6 +1395,45 @@ mod tests {
 
         drop(daemon);
         drop(acquire_daemon_lock(&paths.state_dir).unwrap());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn symlinked_state_directory_refuses_daemon_boot_with_relocation_instruction() {
+        let temp = tempdir().unwrap();
+        let paths = fs1_paths(temp.path());
+        let legacy_state = temp.path().join("legacy-state");
+        fs::create_dir(&legacy_state).unwrap();
+        let legacy_epoch = legacy_state.join("lease_epoch");
+        fs::write(&legacy_epoch, b"41\n").unwrap();
+        symlink(&legacy_state, &paths.state_dir).unwrap();
+        let executor = direct_executor(&paths.state_dir)
+            .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+            .with_unit_probe(ExitFileProbe);
+
+        let error = match Daemon::open_with_executor(
+            one_pool_config(),
+            paths.clone(),
+            settings(),
+            executor,
+        )
+        .await
+        {
+            Ok(_) => panic!("daemon unexpectedly booted over a symlinked state directory"),
+            Err(error) => error,
+        };
+
+        let message = error.to_string();
+        assert!(message.contains(&paths.state_dir.display().to_string()));
+        assert!(message.contains("replace it with a real directory"));
+        assert!(message.contains("move the state files into it before starting tally"));
+        match error {
+            DaemonError::InvalidStateDirectory { path } => assert_eq!(path, paths.state_dir),
+            other => panic!("expected typed state-directory error, got {other:?}"),
+        }
+        assert_eq!(fs::read(legacy_epoch).unwrap(), b"41\n");
+        assert_eq!(fs::read_dir(&legacy_state).unwrap().count(), 1);
+        assert!(!paths.data_dir.exists());
+        assert!(!paths.socket.parent().unwrap().exists());
     }
 
     #[test]

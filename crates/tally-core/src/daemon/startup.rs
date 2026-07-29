@@ -403,13 +403,43 @@ pub(super) fn prepare_paths(paths: &DaemonPaths) -> Result<(), DaemonError> {
                 path.display()
             )));
         }
-        std::fs::create_dir_all(path).map_err(|source| io_error(path, source))?;
     }
+    prepare_state_directory(&paths.state_dir)?;
+    std::fs::create_dir_all(&paths.data_dir).map_err(|source| io_error(&paths.data_dir, source))?;
     let socket_parent = paths
         .socket
         .parent()
         .ok_or_else(|| DaemonError::Invalid("socket has no parent directory".to_owned()))?;
     std::fs::create_dir_all(socket_parent).map_err(|source| io_error(socket_parent, source))?;
+    Ok(())
+}
+
+fn prepare_state_directory(path: &Path) -> Result<(), DaemonError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(DaemonError::InvalidStateDirectory {
+                path: path.to_owned(),
+            })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(source) => return Err(io_error(path, source)),
+    }
+
+    if let Err(source) = std::fs::create_dir_all(path) {
+        if std::fs::symlink_metadata(path).is_ok_and(|metadata| !metadata.file_type().is_dir()) {
+            return Err(DaemonError::InvalidStateDirectory {
+                path: path.to_owned(),
+            });
+        }
+        return Err(io_error(path, source));
+    }
+    let metadata = std::fs::symlink_metadata(path).map_err(|source| io_error(path, source))?;
+    if !metadata.file_type().is_dir() {
+        return Err(DaemonError::InvalidStateDirectory {
+            path: path.to_owned(),
+        });
+    }
     Ok(())
 }
 
