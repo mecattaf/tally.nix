@@ -5,7 +5,7 @@ use std::rc::Rc;
 use std::task::{Poll, Waker};
 use std::time::Duration;
 
-use boa_engine::builtins::promise::{OperationType, PromiseState};
+use boa_engine::builtins::promise::{OperationType, Promise, PromiseState};
 use boa_engine::context::{ContextBuilder, HostHooks};
 use boa_engine::object::builtins::JsPromise;
 use boa_engine::property::{Attribute, PropertyDescriptor};
@@ -240,12 +240,10 @@ pub fn run_script(
             None => value,
         };
         if let Some(promise) = hooks.unhandled().first() {
-            let reason = JsPromise::from_object(promise.clone())
-                .ok()
-                .and_then(|promise| match promise.state() {
-                    PromiseState::Rejected(reason) => reason.to_json(&mut context).ok().flatten(),
-                    PromiseState::Pending | PromiseState::Fulfilled(_) => None,
-                });
+            let reason = match JsPromise::from(promise.clone()).state() {
+                PromiseState::Rejected(reason) => reason.to_json(&mut context).ok().flatten(),
+                PromiseState::Pending | PromiseState::Fulfilled(_) => None,
+            };
             let mut error = FlowError::new(
                 "FlowUnhandledRejection",
                 "unhandled-rejection",
@@ -329,7 +327,7 @@ fn evaluate_script(source: &str, path: Option<&Path>, context: &mut Context) -> 
 
 fn harden_engine(context: &mut Context) -> JsResult<()> {
     let global = context.global_object().clone();
-    for name in ["Date", "WeakRef", "FinalizationRegistry"] {
+    for name in ["Date", "WeakRef", "FinalizationRegistry", "Iterator"] {
         global.delete_property_or_throw(JsString::from(name), context)?;
     }
     let math = global

@@ -848,6 +848,7 @@ fn parse_error(error: ParseError) -> FlowError {
             position.column_number(),
         )),
         ParseError::AbruptEnd
+        | ParseError::ScopeAnalysis { .. }
         | ParseError::Lex {
             err: LexError::IO(_),
         } => None,

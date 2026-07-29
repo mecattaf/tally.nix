@@ -4,8 +4,6 @@ all-features = true
 [advisories]
 db-path = "$TALLY_ADVISORY_DB_ROOT"
 db-urls = ["https://github.com/RustSec/advisory-db"]
-# unmaintained paste via boa =0.21.1; revisit by 2026-12-31 or when Boa >0.21 drops paste
-ignore = ["RUSTSEC-2024-0436"]
 
 [licenses]
 allow = [
@@ -31,4 +29,5 @@ multiple-versions = "warn"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# Boa is locked to the exact upstream paste-to-pastey migration commit.
+allow-git = ["https://github.com/boa-dev/boa.git"]

@@ -156,8 +156,9 @@ authorized.
   extensions for required agent state.
 - Documented the single-trusted-Unix-user boundary, cooperative versus token-bound job identity,
   unsigned witness-chain limits, and why hardening presets are not a hostile-code sandbox.
-- Acknowledged `RUSTSEC-2024-0436` as the sole advisory suppression: unmaintained `paste` arrives
-  through Boa 0.21.1 and must be revisited by 2026-12-31 or when a later Boa removes it.
+- Replaced Boa 0.21.1 with the exact upstream `c39e6bf` migration commit that removes the
+  unmaintained `paste` proc macro in favor of maintained `pastey`, and removed the
+  `RUSTSEC-2024-0436` advisory suppression.
 
 ## [Pre-release history]
 

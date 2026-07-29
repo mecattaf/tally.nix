@@ -7,9 +7,9 @@ pub(super) struct CapturedTrace {
 }
 
 pub(super) struct FlowHooks {
-    rejected: RefCell<Vec<JsObject>>,
-    root_promises: RefCell<HashSet<JsObject>>,
-    rejection_traces: RefCell<HashMap<JsObject, CapturedTrace>>,
+    rejected: RefCell<Vec<JsObject<Promise>>>,
+    root_promises: RefCell<HashSet<JsObject<Promise>>>,
+    rejection_traces: RefCell<HashMap<JsObject<Promise>, CapturedTrace>>,
 }
 
 impl FlowHooks {
@@ -21,18 +21,18 @@ impl FlowHooks {
         }
     }
 
-    pub(super) fn observe_root(&self, promise: JsObject) {
+    pub(super) fn observe_root(&self, promise: JsObject<Promise>) {
         self.root_promises.borrow_mut().insert(promise.clone());
         self.rejected
             .borrow_mut()
             .retain(|rejected| rejected != &promise);
     }
 
-    pub(super) fn unhandled(&self) -> Vec<JsObject> {
+    pub(super) fn unhandled(&self) -> Vec<JsObject<Promise>> {
         self.rejected.borrow().clone()
     }
 
-    pub(super) fn rejection_trace(&self, promise: &JsObject) -> Option<CapturedTrace> {
+    pub(super) fn rejection_trace(&self, promise: &JsObject<Promise>) -> Option<CapturedTrace> {
         self.rejection_traces.borrow().get(promise).cloned()
     }
 }
@@ -40,7 +40,7 @@ impl FlowHooks {
 impl HostHooks for FlowHooks {
     fn promise_rejection_tracker(
         &self,
-        promise: &JsObject,
+        promise: &JsObject<Promise>,
         operation: OperationType,
         context: &mut Context,
     ) {
