@@ -408,3 +408,97 @@ pass `--socket /run/tally/tally.sock`. The exact two-host recovery and
 Git/Attic handoff exercised by the release is in the
 [`flow-multi-host`](https://github.com/mecattaf/tally.nix/blob/284f641bd9b00036d7bd29f094f4b353872c30d0/flake.nix#L2015-L2016)
 VM check.
+
+## First-contact verification runbook
+
+This is the standing procedure for the first boot of a new daemon generation on
+a real fleet, first exercised against the live coordinator on 2026-07-29. Run
+it in daylight, with the rollback path below ready. The interesting output is
+the delta between what the fleet does and what the VM checks predicted.
+
+### Expect the migration gates
+
+A daemon generation that changes an on-disk format refuses to boot over the old
+files rather than converting them. The unit crash-loops until the operator
+archives each named file exactly as the error instructs:
+
+```console
+$ journalctl --user -u tally-daemon.service -n 3
+tally: witness error: old-format witness ledger at ~/.local/share/tally/witness.jsonl;
+archive it aside before first boot: mv -- …/witness.jsonl …/witness.jsonl.pre-2026-07-29
+```
+
+The gates fire one at a time — witness ledger, then the events directory — so
+each restart reveals the next one. Two sharp edges observed on first contact:
+
+- The watch change log (`changes.jsonl`) has no archive-aside gate; an
+  old-format file fails as `invalid change log: change record 1 has an invalid
+  schema or cursor` with no printed remedy. The file is a bounded change feed,
+  not evidence; archive it aside like the gated files.
+- The daemon requires the state directory to be a real directory. A legacy
+  symlink (for example `~/.local/state/tally` pointing into `~/.config/tally`)
+  boots the daemon but fails producer drain with `invalid producer observation:
+  … is not a real directory`. Replace the symlink with a real directory and
+  move the state files into it.
+
+Keep every `.pre-*` archive. The rollback path below depends on them, and the
+recovery chapter's rule applies: archive exactly what the error names, never
+delete evidence to make startup proceed.
+
+### Verify, in order
+
+1. **Static surface.** `tally flow check examples/flows/pooled-review.js`
+   must print the flow summary and exit 0.
+2. **Single-host liveness.** Run a small multi-node flow with a fixed
+   `--flow-run-id`, SIGKILL the runner while the last node is in flight, and
+   rerun with the same id. The replay must report `disposition":"reused"` for
+   every completed node (same `taskUuid`, same `witnessSeq`, no re-execution)
+   and `"attached"` for the in-flight node, then complete when the surviving
+   job unit finishes. The killed runner leaves the daemon-owned
+   `tally-job-*.service` unit running; that unit surviving the runner is the
+   point.
+3. **Cross-host.** Only when the topology declares an SSH executor: one flow
+   whose child leases the worker pool over the executor, with the handoff
+   through the sanctioned data plane. On a coordinator-only topology
+   (`executors = { }`) this step is vacuous — record that fact rather than
+   skipping silently.
+4. **Daemon restart mid-flow.** `systemctl --user restart tally-daemon.service`
+   while a node is in flight and the runner is alive. The restarted daemon must
+   re-emit `started`/`dispatched` for the in-flight task at the same attempt
+   and lease epoch (re-adoption), and the runner's await must resolve when the
+   node completes — flow ends `flow-completed` with every node executed exactly
+   once.
+5. **Witness.** `tally witness verify` GREEN on the live ledger; then copy the
+   ledger, flip one field in a middle record, and `tally witness verify
+   --ledger <copy>` must go RED naming the tampered line and both hashes.
+
+### Rollback, as actually exercised
+
+On a flake-based system `nixos-rebuild switch --rollback` fails looking for
+`nixos-config` in `NIX_PATH`; the working path is the profile generation
+switch:
+
+```console
+$ sudo nix-env --switch-generation <N-1> -p /nix/var/nix/profiles/system
+$ sudo /nix/var/nix/profiles/system/bin/switch-to-configuration switch
+```
+
+Because the migration gates archived the old files aside, rolling the binary
+back is not enough: the old daemon meets new-format state it never wrote.
+Quiesce admission, stop the daemon, and swap the state before activating the
+older generation:
+
+1. `systemctl --user stop tally-daemon.service`;
+2. move each new-format file to a `.flow-era` name and restore its `.pre-*`
+   archive to the live name (`witness.jsonl`, `changes.jsonl`, the events
+   directory);
+3. switch to the older generation and confirm the old daemon is `active` and
+   `tally witness verify` is GREEN against the restored ledger;
+4. roll forward by switching the profile back, then reverse the swap so the
+   new daemon boots over its own state again.
+
+Both directions of this swap were exercised on first contact; each daemon
+verified its own chain GREEN afterwards. The witness property from the rollout
+section is what makes this safe to reason about: `scriptHash` ties each proved
+node to the exact bytes that produced it, so the ledgers on either side of the
+swap stay internally consistent.
