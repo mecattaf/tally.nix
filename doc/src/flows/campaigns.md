@@ -49,6 +49,10 @@ services.tally = {
     maxTasks = 32;
 
     agent = "codex";
+    # These are the defaults. Keep them explicit here to show that the
+    # implementation node is writable and may request bounded escalation.
+    agentApprovalPolicy = "on-request";
+    agentSandboxPolicy = "workspace-write";
     gates = [
       {
         id = "tests";
@@ -78,6 +82,15 @@ when shell syntax is actually part of project policy. `agentArgv` normally stays
 at its default: a fixed instruction telling the adapter to read the structured
 brief at `TALLY_BRIEF`. It can be overridden for a fixture or a purpose-built
 adapter executable, but the campaign never interpolates task prose into argv.
+
+An implementation node defaults to `agentSandboxPolicy = "workspace-write"`
+because its contract requires a commit, paired with
+`agentApprovalPolicy = "on-request"` so the adapter can surface a request to go
+beyond that boundary. Both names must exist in the selected adapter's launch
+maps; deployment fails early otherwise. Set `agentSandboxPolicy = "read-only"`
+when a deliberately non-writing campaign agent needs that constraint. Set either
+option to `null` only for an adapter such as the shell fixture that declares no
+corresponding policy map.
 
 One enabled attrset expands to all of the following:
 

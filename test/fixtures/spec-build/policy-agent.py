@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""No-network implementation fixture invoked through tally's shell adapter."""
+"""No-network implementation fixture behind a Codex-shaped policy adapter."""
 
 import json
 import os
@@ -12,6 +12,22 @@ brief = json.loads(Path(os.environ["TALLY_BRIEF"]).read_text(encoding="utf-8"))
 task = brief["task"]["id"]
 control = Path(sys.argv[1])
 worktree = Path.cwd()
+launch = sys.argv[2:]
+expected_prefix = [
+    "--ask-for-approval",
+    "on-request",
+    "--sandbox",
+    "workspace-write",
+    "--",
+]
+if launch[:5] != expected_prefix or len(launch) != 6 or "TALLY_BRIEF" not in launch[5]:
+    detail = f"adapter policy launch was not preserved: {launch!r}\n"
+    (control / "policy-error.log").write_text(detail, encoding="utf-8")
+    raise SystemExit(detail)
+
+with (control / "policy-order.log").open("a", encoding="utf-8") as stream:
+    stream.write(f"{task}:{launch[1]}:{launch[3]}\n")
+
 output = worktree / "build"
 output.mkdir(exist_ok=True)
 

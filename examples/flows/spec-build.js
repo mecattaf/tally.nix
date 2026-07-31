@@ -59,7 +59,14 @@ export const meta = {
       driverRuntimeMaxSec: { type: "integer", minimum: 1 },
       agent: {
         type: "object",
-        required: ["adapter", "argv", "priority", "runtimeMaxSec"],
+        required: [
+          "adapter",
+          "argv",
+          "priority",
+          "runtimeMaxSec",
+          "approvalPolicy",
+          "sandboxPolicy"
+        ],
         properties: {
           adapter: { type: "string", minLength: 1 },
           argv: {
@@ -68,7 +75,9 @@ export const meta = {
             items: { type: "string" }
           },
           priority: { enum: ["interrupt", "high", "medium", "low"] },
-          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 }
+          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
+          approvalPolicy: { type: ["string", "null"], minLength: 1 },
+          sandboxPolicy: { type: ["string", "null"], minLength: 1 }
         },
         additionalProperties: false
       },
@@ -334,6 +343,12 @@ function workspaceFor(prepared) {
     };
     if (args.agent.runtimeMaxSec !== null) {
       agentSpec.runtimeMaxSec = args.agent.runtimeMaxSec;
+    }
+    if (args.agent.approvalPolicy !== null) {
+      agentSpec.approvalPolicy = args.agent.approvalPolicy;
+    }
+    if (args.agent.sandboxPolicy !== null) {
+      agentSpec.sandboxPolicy = args.agent.sandboxPolicy;
     }
     await job(agentSpec);
 

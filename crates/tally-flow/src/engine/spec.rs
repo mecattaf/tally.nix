@@ -38,6 +38,8 @@ pub(super) fn validate_node_spec_shape(
     for (name, value) in [
         ("adapter", spec.adapter.as_deref()),
         ("executor", spec.executor.as_deref()),
+        ("approvalPolicy", spec.approval_policy.as_deref()),
+        ("sandboxPolicy", spec.sandbox_policy.as_deref()),
     ] {
         if value.is_some_and(|value| value.is_empty() || value.chars().any(char::is_control)) {
             return Err(FlowError::new(
@@ -428,6 +430,27 @@ pub(super) fn normalize_adapter_options(
         )
         .at(location)
         .detail("field", field.clone()));
+    }
+
+    for (field, policy) in [
+        ("approvalPolicy", spec.approval_policy.take()),
+        ("sandboxPolicy", spec.sandbox_policy.take()),
+    ] {
+        let Some(policy) = policy else {
+            continue;
+        };
+        if options
+            .insert(field.to_owned(), Value::String(policy))
+            .is_some()
+        {
+            return Err(FlowError::new(
+                "FlowSpecError",
+                "duplicate-adapter-option",
+                format!("adapter option {field:?} is set twice"),
+            )
+            .at(location)
+            .detail("field", field));
+        }
     }
 
     let pre_prompt_argv = options

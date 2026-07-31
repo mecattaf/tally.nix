@@ -1178,6 +1178,8 @@
                   ];
                   agent = "shell";
                   agentArgv = [ "/bin/true" ];
+                  agentApprovalPolicy = null;
+                  agentSandboxPolicy = null;
                   agentRuntimeMaxSec = 120;
                   driverRuntimeMaxSec = 30;
                   pool.name = "fixture-campaign";
@@ -1192,7 +1194,6 @@
                       argv = [ "/bin/true" ];
                     }
                   ];
-                  agent = "shell";
                   agentArgv = [ "/bin/true" ];
                   pool.name = "default-campaign";
                 };
@@ -3296,6 +3297,8 @@
                 test -e "$activationPackage"
                 ${tally}/bin/tally --mode check-config --config "$checkedConfig" >/dev/null
                 jq -e '
+                  (.producers["campaign-fixture"].enqueue.argv[5] | fromjson) as $fixtureArgs |
+                  (.producers["campaign-defaulted"].enqueue.argv[5] | fromjson) as $defaultedArgs |
                   .enqueue.fanoutCap == 64 and
                   .pools["fixture-campaign"].resource == "mutex" and
                   .pools["fixture-campaign"].capacity == 1 and
@@ -3307,6 +3310,11 @@
                   .adapters["spec-build-driver"].scrape.finalMessage.pattern == "^TALLY_FINAL_MESSAGE=(.*)$" and
                   .flows.fixture.workloadMutex == "fixture-campaign" and
                   (.flows.fixture.script | endswith("spec-build.js")) and
+                  $fixtureArgs.agent.approvalPolicy == null and
+                  $fixtureArgs.agent.sandboxPolicy == null and
+                  $defaultedArgs.agent.adapter == "codex" and
+                  $defaultedArgs.agent.approvalPolicy == "on-request" and
+                  $defaultedArgs.agent.sandboxPolicy == "workspace-write" and
                   .producers["campaign-fixture"].kind == "gh" and
                   .producers["campaign-fixture"].enable == true and
                   .producers["campaign-fixture"].sources[0].search.repositories == ["acme/spec"] and
@@ -3394,6 +3402,8 @@
                   $args.repositories["acme/spec"].forge == "github" and
                   $args.agent.adapter == "shell" and
                   $args.agent.argv == ["/bin/true"] and
+                  $args.agent.approvalPolicy == null and
+                  $args.agent.sandboxPolicy == null and
                   [$args.gates[].id] == ["content", "clean"]
                 ' "$payload" >/dev/null
                 runtime_args="$(jq -r '.argv[5]' "$payload")"

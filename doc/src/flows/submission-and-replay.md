@@ -328,6 +328,7 @@ whatever order the script happens to discover requirements.
 | Each `evidence` entry | `hash:sha256:<digest>` lowercases the digest; `exit:<code>` is re-rendered from the parsed integer; `artifact:` and `store:` are kept verbatim. |
 | `pools` | Sorted before hashing and submission, so declaration order is free. |
 | `env` | Relocated into `adapterOptions.environment` and key-sorted, so insertion order is free. A name set in both `env` and `adapterOptions.environment` is `duplicate-environment`, not a silent overwrite. |
+| `approvalPolicy`, `sandboxPolicy` | Relocated into the corresponding `adapterOptions` members. Their names remain exact payload inputs because the selected adapter maps them to authorized argv. |
 | Pool credentials | Resolved by walking the sorted pool list and taking the first path for each credential name, so the resolved set is a function of the pool set alone. |
 | `drv` outputs | Sorted by output name, and the derived `store:` evidence is sorted and de-duplicated. |
 | `prompt` | Normalized into the structured brief and hashed as `briefHash`; the prompt text is not in the payload. |
@@ -342,9 +343,12 @@ divergence.
 There is no surface through which a script sets `model` or `effort` on a
 `claude()` or `codex()` node. `adapterOptions` is not among the fields either the
 `job()` or the sugar surface accepts, so writing it is
-`FlowSpecError`/`unknown-spec-field`. The only path to a launch object is
-`local()`, which copies it verbatim from the selected catalog member — where it
-is operator-declared, hashed into the catalog, and pinned for the run.
+`FlowSpecError`/`unknown-spec-field`. A script may set the narrower top-level
+`approvalPolicy` and `sandboxPolicy` fields; the host normalizes them into the
+private envelope and the adapter still rejects names absent from its closed
+policy maps. `local()` instead copies its complete launch object verbatim from
+the selected catalog member — where it is operator-declared, hashed into the
+catalog, and pinned for the run.
 
 This is deliberate. A model choice that lived in the script would be a payload
 input the operator never declared and the catalog hash never covered.

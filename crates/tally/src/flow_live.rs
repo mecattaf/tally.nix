@@ -1046,6 +1046,8 @@ mod tests {
                 dedup_key: None,
                 label: Some("first".to_owned()),
                 env: Default::default(),
+                approval_policy: None,
+                sandbox_policy: None,
                 result_schema: None,
                 adapter_options: Some(json!({
                     "prePromptArgv": [],

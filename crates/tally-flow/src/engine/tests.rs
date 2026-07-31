@@ -815,7 +815,7 @@ fn local_unknown_options_use_the_shared_node_field_error_shape() {
         error.message,
         "unknown local() option \"resultShema\", expected one of argv, adapter, pools, executor, \
          priority, runtimeMaxSec, evidence, evidenceClass, manifestHash, workspace, brief, key, \
-         dedupKey, label, env, resultSchema, member"
+         dedupKey, label, env, approvalPolicy, sandboxPolicy, resultSchema, member"
     );
     assert_eq!(error.details["field"], "resultShema");
 }
@@ -1642,6 +1642,48 @@ fn canonical_payload_includes_resolved_nonoptional_defaults() {
         submission.payload_hash,
         sha256(&serde_json::to_vec(&expected).unwrap())
     );
+}
+
+#[test]
+fn job_and_agent_sugar_normalize_named_launch_policies_into_adapter_options() {
+    let source = format!(
+        "{}\n(async () => {{\n\
+         await job({{\n\
+           argv: ['direct'], adapter: 'codex', pools: ['codex-window'],\n\
+           approvalPolicy: 'on-request', sandboxPolicy: 'workspace-write'\n\
+         }});\n\
+         return codex('implement', {{\n\
+           approvalPolicy: 'on-request', sandboxPolicy: 'workspace-write'\n\
+         }});\n\
+         }})()",
+        meta(&["codex-window"], &[])
+    );
+    let client = MockClient::new(Vec::new());
+    run(&source, client.clone()).unwrap();
+
+    let submissions = client.submissions.borrow();
+    assert_eq!(submissions.len(), 2);
+    for submission in submissions.iter() {
+        assert_eq!(submission.spec.approval_policy, None);
+        assert_eq!(submission.spec.sandbox_policy, None);
+        assert_eq!(
+            submission.spec.adapter_options,
+            Some(json!({
+                "prePromptArgv": [],
+                "environment": {},
+                "approvalPolicy": "on-request",
+                "sandboxPolicy": "workspace-write"
+            }))
+        );
+    }
+
+    let private_envelope = format!(
+        "{}\njob({{argv: ['x'], pools: ['codex-window'], adapterOptions: {{model: 'x'}}}});",
+        meta(&["codex-window"], &[])
+    );
+    let error = run(&private_envelope, MockClient::new(Vec::new())).unwrap_err();
+    assert_eq!(error.code, "unknown-spec-field");
+    assert_eq!(error.details["field"], "adapterOptions");
 }
 
 #[test]

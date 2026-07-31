@@ -212,6 +212,8 @@ mod tests {
             dedup_key: Some("dedup".to_owned()),
             label: Some("label".to_owned()),
             env: BTreeMap::from([("SAFE".to_owned(), "yes".to_owned())]),
+            approval_policy: Some("on-request".to_owned()),
+            sandbox_policy: Some("workspace-write".to_owned()),
             result_schema: Some(json!({"type": "object"})),
             adapter_options: Some(json!({"model": "provider/model"})),
             selection: Some(SelectionProvenance {
@@ -255,6 +257,8 @@ mod tests {
                 "dedupKey",
                 "label",
                 "env",
+                "approvalPolicy",
+                "sandboxPolicy",
                 "resultSchema",
             ]
         );
@@ -276,6 +280,8 @@ mod tests {
                 "dedupKey",
                 "label",
                 "env",
+                "approvalPolicy",
+                "sandboxPolicy",
                 "resultSchema",
             ]
         );
@@ -743,6 +749,18 @@ define_node_spec! {
         canonical: NodeCanonicalProjection::NormalizedInto("adapterOptions")
     },
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    approval_policy: Option<String> => {
+        json: "approvalPolicy", job: true, sugar: true,
+        wire: NodeWireProjection::NormalizedInto("adapterOptions"),
+        canonical: NodeCanonicalProjection::NormalizedInto("adapterOptions")
+    },
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sandbox_policy: Option<String> => {
+        json: "sandboxPolicy", job: true, sugar: true,
+        wire: NodeWireProjection::NormalizedInto("adapterOptions"),
+        canonical: NodeCanonicalProjection::NormalizedInto("adapterOptions")
+    },
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     result_schema: Option<Value> => {
         json: "resultSchema", job: true, sugar: true,
         wire: NodeWireProjection::Excluded("resultSchema stays in the live runner"),
@@ -795,6 +813,8 @@ pub fn sugar_reserved_fields(helper: &str) -> Option<&'static [&'static str]> {
             "argv",
             "prompt",
             "brief",
+            "approvalPolicy",
+            "sandboxPolicy",
             "adapterOptions",
             "selection",
         ]),
