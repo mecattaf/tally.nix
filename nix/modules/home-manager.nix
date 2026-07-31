@@ -353,6 +353,7 @@ in
         ${cleanupProgram}/bin/tally-clean-removed-producers
       '';
     }
+    { services.tally = common.mkCampaignConfig cfg; }
     (lib.mkIf (cfg.flows != { }) {
       services.tally.pools.build = common.buildPoolDefaults;
       services.tally.pools.flow = common.flowPoolDefaults;

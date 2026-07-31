@@ -1,0 +1,1 @@
+fixture outputs are lowercase words followed by one newline
