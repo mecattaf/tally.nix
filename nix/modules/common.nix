@@ -1862,6 +1862,17 @@ let
           example = "@tally build";
           description = "Exact mention comment that starts one campaign run.";
         };
+        allowSelfTriggered = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = ''
+            Explicitly allow a campaign mention whose actor is the
+            authenticated GitHub identity. Leave this disabled when the
+            campaign runs under a bot identity so self-posted output cannot
+            start another run.
+          '';
+        };
         allowedActors = mkOption {
           type = types.listOf types.str;
           default = [ ];
@@ -2774,7 +2785,7 @@ let
         }
       ];
       triggers.mentions = [ campaign.mention ];
-      inherit (campaign) allowedActors pollIntervalSec;
+      inherit (campaign) allowSelfTriggered allowedActors pollIntervalSec;
       postReceipt = true;
       postEvidence = true;
       postGateSummary = false;

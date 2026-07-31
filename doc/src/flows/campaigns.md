@@ -42,6 +42,8 @@ services.tally = {
 
     label = "spec-build";
     mention = "@tally build";
+    # The operator posts the mention using this same account's gh token.
+    allowSelfTriggered = true;
     allowedActors = [ "mecattaf" ];
     worklist = "specs/001-crm/tasks.json";
     maxTasks = 32;
@@ -64,6 +66,12 @@ services.tally = {
   };
 };
 ```
+
+`allowSelfTriggered` defaults to `false`. Keep that loop-breaker when tally's
+authenticated GitHub identity is a bot: comments posted by the bot cannot start
+another campaign run. Set it to `true` only when the trusted person posting the
+campaign mention is also the account authenticated by `gh`, as in the
+single-account example above. `allowedActors` still applies independently.
 
 Gate commands are direct argv, not shell strings. Use `sh -c` explicitly only
 when shell syntax is actually part of project policy. `agentArgv` normally stays
