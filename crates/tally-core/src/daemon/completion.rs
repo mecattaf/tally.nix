@@ -929,6 +929,7 @@ pub(super) fn finalize_forced_locked(
         witness_seq: record.seq,
         model: record.model.clone(),
         completion: None,
+        stderr_excerpt: None,
     };
     context
         .barriers

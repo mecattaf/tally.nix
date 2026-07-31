@@ -62,6 +62,7 @@ impl DaemonHandler {
                     None,
                     Some(reconstruct_job_result(
                         &mut context,
+                        &self.executor,
                         &stable,
                         resolved_attempt,
                     )),
@@ -123,7 +124,12 @@ impl DaemonHandler {
             } else {
                 (
                     None,
-                    Some(reconstruct_job_result(&mut context, &stable, Some(attempt))),
+                    Some(reconstruct_job_result(
+                        &mut context,
+                        &self.executor,
+                        &stable,
+                        Some(attempt),
+                    )),
                     stable.clone(),
                 )
             }
@@ -614,6 +620,7 @@ pub(crate) fn lease_wire(error: LeaseError) -> WireError {
 
 fn reconstruct_job_result(
     context: &mut Context,
+    executor: &Executor,
     stable: &str,
     attempt: Option<u32>,
 ) -> Result<Value, WireError> {
@@ -625,14 +632,33 @@ fn reconstruct_job_result(
             let suffix = attempt.map_or_else(String::new, |attempt| format!(" attempt {attempt}"));
             WireError::not_found(format!("job {stable}{suffix} has no terminal witness"))
         })?;
-    Ok(job_result_from_witness(&record).value())
+    Ok(job_result_from_witness(&record, executor).value())
 }
 
-fn job_result_from_witness(record: &WitnessRecord) -> JobResult {
+fn job_result_from_witness(record: &WitnessRecord, executor: &Executor) -> JobResult {
     let stable = record
         .task_uuid
         .clone()
         .expect("durable wait reconstruction selected a task witness");
+    let stderr_excerpt = if is_adapter_smoke(record.evidence_class.as_ref())
+        && !matches!(
+            record.verdict,
+            Verdict::Pass | Verdict::Reused | Verdict::Substituted
+        ) {
+        Uuid::parse_str(&stable).ok().and_then(|uuid| {
+            let identity = ExecutionIdentity {
+                job_id: uuid,
+                task_uuid: Some(uuid),
+            };
+            executor
+                .retained_capture_paths(&identity, record.attempt, record.lease_epoch)
+                .ok()
+                .flatten()
+                .and_then(|paths| crate::executor::read_capture_excerpt(&paths.stderr).ok())
+        })
+    } else {
+        None
+    };
     JobResult {
         task_uuid: Some(stable.clone()),
         job_id: stable,
@@ -644,6 +670,7 @@ fn job_result_from_witness(record: &WitnessRecord) -> JobResult {
         witness_seq: record.seq,
         model: record.model.clone(),
         completion: record.completion.clone(),
+        stderr_excerpt,
     }
 }
 

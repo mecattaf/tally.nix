@@ -3315,6 +3315,7 @@ mod tests {
                     witness_seq: 9,
                     model: Some("gpt-5.6-codex".to_owned()),
                     completion: None,
+                    stderr_excerpt: None,
                 };
                 daemon
                     .handler

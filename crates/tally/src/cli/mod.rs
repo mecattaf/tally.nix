@@ -1,3 +1,4 @@
+mod adapter;
 mod args;
 mod daemon;
 mod enqueue;
@@ -60,6 +61,7 @@ use crate::flow_live::{LiveFlowClient, RunnerIdentity};
 
 const DEFAULT_RPC_TIMEOUT_SEC: u64 = 60;
 const RPC_TIMEOUT_ENV: &str = "TALLY_RPC_TIMEOUT_SEC";
+use adapter::*;
 use args::*;
 use daemon::*;
 use enqueue::*;
@@ -186,6 +188,10 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             );
             Ok(())
         }
+        Some(Command::AdapterSmokeShell) => {
+            println!("ok");
+            Ok(())
+        }
         Some(Command::ProducerDispatch(args)) => {
             run_producer_dispatch(opts.config, &socket, args).await
         }
@@ -243,6 +249,9 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             run_queue(&socket, opts.config.as_deref(), rpc_timeout, command).await
         }
         Some(Command::Producer { command }) => run_producer(opts.config, command),
+        Some(Command::Adapter { command }) => {
+            run_adapter(&socket, opts.config.as_deref(), rpc_timeout, command).await
+        }
         Some(Command::Witness { command }) => run_witness(command),
         Some(Command::History { command }) => run_history(command),
         Some(Command::View { command }) => run_view(command).await,

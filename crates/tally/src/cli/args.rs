@@ -33,6 +33,8 @@ pub(super) enum Command {
     RemoteExecutor,
     #[command(name = "__adapter-render", hide = true)]
     AdapterRender(AdapterRenderArgs),
+    #[command(name = "__adapter-smoke-shell", hide = true)]
+    AdapterSmokeShell,
     #[command(name = "__producer-dispatch", hide = true)]
     ProducerDispatch(ProducerDispatchArgs),
     Enqueue(Box<EnqueueArgs>),
@@ -44,6 +46,10 @@ pub(super) enum Command {
     Producer {
         #[command(subcommand)]
         command: ProducerCommand,
+    },
+    Adapter {
+        #[command(subcommand)]
+        command: AdapterCommand,
     },
     Witness {
         #[command(subcommand)]
@@ -77,6 +83,31 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: HistoryCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum AdapterCommand {
+    /// Execute one minimal job through the configured adapter and daemon.
+    Smoke(AdapterSmokeArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct AdapterSmokeArgs {
+    /// Configured adapter to execute.
+    pub(super) name: String,
+    /// Execution working directory; defaults to the current directory.
+    #[arg(long, value_name = "PATH")]
+    pub(super) cwd: Option<PathBuf>,
+    /// Minimal workload passed to agent adapters.
+    #[arg(
+        long,
+        default_value = "Reply with the single word ok.",
+        allow_hyphen_values = true
+    )]
+    pub(super) prompt: String,
+    /// Admission pool; inferred only when a conventional lane is configured.
+    #[arg(long)]
+    pub(super) pool: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
