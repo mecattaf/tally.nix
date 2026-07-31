@@ -8,6 +8,10 @@ authorized.
 
 ### Added
 
+- Documented fixed-budget replay as the continuation mechanism for flow
+  campaigns that exceed one 24-hour evaluation, and added a regression test
+  proving that a budget-stopped run reuses its witnessed prefix, attaches to its
+  live frontier, and completes identically to an uninterrupted run.
 - Added a neutral `slot` pool resource for counted external or metered
   concurrency, so Codex and Claude Code subscription lanes can admit multiple
   holders without being mislabeled as local CPU capacity or serialized as a
