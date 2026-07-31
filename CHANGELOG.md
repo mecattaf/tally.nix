@@ -72,6 +72,9 @@ authorized.
 
 ### Fixed
 
+- Made jobs without an explicit working directory execute from
+  `workspace.worktreePath`, so flow-submitted agent nodes start inside their
+  prepared worktrees across systemd and direct-spawn execution.
 - Made regex adapter scrapes line-oriented by default, so documented
   newline-terminated `^TALLY_FINAL_MESSAGE=(.*)$` captures are attested and
   projected immediately after local completion without requiring a daemon
