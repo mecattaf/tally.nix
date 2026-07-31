@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 
 use super::*;
@@ -195,6 +196,159 @@ impl FlowClient for MockClient {
             .cloned()
             .ok_or_else(|| ClientError::new("missing-terminal", task_uuid));
         Box::pin(std::future::ready(result))
+    }
+}
+
+#[derive(Clone)]
+struct DurableNode {
+    ordinal: u64,
+    task_uuid: String,
+    payload_hash: String,
+    label: Option<String>,
+    script_hash: String,
+    args_hash: String,
+    catalog_hash: Option<String>,
+    terminal: Option<NodeResult>,
+}
+
+struct BudgetContinuationClient {
+    pause_first_evaluation_at: Option<u64>,
+    evaluation: Cell<u32>,
+    nodes: RefCell<BTreeMap<String, DurableNode>>,
+    admissions: RefCell<Vec<(u32, u64, Disposition)>>,
+    executions: RefCell<Vec<u64>>,
+}
+
+impl BudgetContinuationClient {
+    fn new(pause_first_evaluation_at: Option<u64>) -> Rc<Self> {
+        Rc::new(Self {
+            pause_first_evaluation_at,
+            evaluation: Cell::new(0),
+            nodes: RefCell::default(),
+            admissions: RefCell::default(),
+            executions: RefCell::default(),
+        })
+    }
+
+    fn terminal(node: &DurableNode, disposition: Disposition) -> NodeResult {
+        NodeResult {
+            task_uuid: node.task_uuid.clone(),
+            verdict: Verdict::Pass,
+            exit_code: Some(0),
+            witness_seq: node.ordinal + 1,
+            disposition,
+            result: Some(json!({"step": node.ordinal + 1})),
+            gates: None,
+            error: None,
+        }
+    }
+}
+
+impl FlowClient for BudgetContinuationClient {
+    fn inspect_run<'a>(
+        &'a self,
+        _flow_run_id: &'a str,
+    ) -> FlowFuture<'a, Result<RunInspection, ClientError>> {
+        self.evaluation.set(self.evaluation.get() + 1);
+        let inspection =
+            self.nodes
+                .borrow()
+                .values()
+                .next()
+                .map_or_else(RunInspection::default, |node| RunInspection {
+                    script_hash: Some(node.script_hash.clone()),
+                    args_hash: Some(node.args_hash.clone()),
+                    catalog_hash: node.catalog_hash.clone(),
+                });
+        Box::pin(std::future::ready(Ok(inspection)))
+    }
+
+    fn submit<'a>(
+        &'a self,
+        submission: FlowSubmission,
+    ) -> FlowFuture<'a, Result<Admission, ClientError>> {
+        let evaluation = self.evaluation.get();
+        let ordinal = submission.orchestration.node_ordinal;
+        let dedup_key = submission.dedup_key.clone();
+        let mut nodes = self.nodes.borrow_mut();
+
+        let admission = if let Some(node) = nodes.get(&dedup_key) {
+            assert_eq!(submission.payload_hash, node.payload_hash);
+            let disposition = if node.terminal.is_some() {
+                Disposition::Reused
+            } else {
+                Disposition::Attached
+            };
+            Admission {
+                schema_version: 1,
+                disposition,
+                task_uuid: node.task_uuid.clone(),
+                payload_hash: node.payload_hash.clone(),
+                attempt: 0,
+                terminal: node
+                    .terminal
+                    .as_ref()
+                    .map(|_| Self::terminal(node, disposition)),
+                recorded_label: node.label.clone(),
+                reused_rejected: None,
+            }
+        } else {
+            let mut node = DurableNode {
+                ordinal,
+                task_uuid: format!("task-{ordinal}"),
+                payload_hash: submission.payload_hash.clone(),
+                label: submission.spec.label.clone(),
+                script_hash: submission.orchestration.script_hash.clone(),
+                args_hash: submission.orchestration.args_hash.clone(),
+                catalog_hash: submission.orchestration.catalog_hash.clone(),
+                terminal: None,
+            };
+            self.executions.borrow_mut().push(ordinal);
+            if !(evaluation == 1 && self.pause_first_evaluation_at == Some(ordinal)) {
+                node.terminal = Some(Self::terminal(&node, Disposition::Created));
+            }
+            let admission = Admission {
+                schema_version: 1,
+                disposition: Disposition::Created,
+                task_uuid: node.task_uuid.clone(),
+                payload_hash: node.payload_hash.clone(),
+                attempt: 0,
+                terminal: None,
+                recorded_label: None,
+                reused_rejected: None,
+            };
+            nodes.insert(dedup_key, node);
+            admission
+        };
+        self.admissions
+            .borrow_mut()
+            .push((evaluation, ordinal, admission.disposition));
+        Box::pin(std::future::ready(Ok(admission)))
+    }
+
+    fn await_terminal<'a>(
+        &'a self,
+        task_uuid: &'a str,
+        _attempt: u32,
+    ) -> FlowFuture<'a, Result<NodeResult, ClientError>> {
+        let evaluation = self.evaluation.get();
+        let mut nodes = self.nodes.borrow_mut();
+        let Some(node) = nodes.values_mut().find(|node| node.task_uuid == task_uuid) else {
+            return Box::pin(std::future::ready(Err(ClientError::new(
+                "missing-terminal",
+                task_uuid,
+            ))));
+        };
+        if evaluation == 1 && self.pause_first_evaluation_at == Some(node.ordinal) {
+            return Box::pin(std::future::pending());
+        }
+        if node.terminal.is_none() {
+            node.terminal = Some(Self::terminal(node, Disposition::Created));
+        }
+        Box::pin(std::future::ready(Ok(node
+            .terminal
+            .clone()
+            .expect("continuation terminal was materialized"))))
     }
 }
 
@@ -1167,6 +1321,117 @@ fn microtask_wall_clock_and_recursion_backstops_are_distinct() {
     let error = run(&recursion, MockClient::new(Vec::new())).unwrap_err();
     assert_eq!(error.name, "FlowRuntimeLimitError");
     assert_eq!(error.code, "runtime-limit");
+}
+
+#[test]
+fn wall_clock_budget_replay_reuses_prefix_and_completes_identically() {
+    let source = format!(
+        "{}\n(async () => {{\n\
+         const steps = [];\n\
+         log('before-first');\n\
+         steps.push((await sh(['first'], {{pools: ['cpu']}})).result.step);\n\
+         log('before-second');\n\
+         steps.push((await sh(['second'], {{pools: ['cpu']}})).result.step);\n\
+         log('before-third');\n\
+         steps.push((await sh(['third'], {{pools: ['cpu']}})).result.step);\n\
+         log('tail');\n\
+         return steps;\n\
+         }})()",
+        meta(&["cpu"], &[])
+    );
+    let client = BudgetContinuationClient::new(Some(1));
+    let first_sink = Rc::new(VecLifecycleSink::default());
+    let mut first_options = RunOptions::new("run-1", json!({}));
+    first_options.wall_clock_budget = Duration::from_millis(100);
+
+    let error = run_script(
+        &source,
+        Some(Path::new("budget-continuation.js")),
+        client.clone(),
+        first_sink.clone(),
+        first_options,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.name, "FlowRuntimeBudgetError");
+    assert_eq!(error.code, "wall-clock-budget");
+    assert_eq!(*client.executions.borrow(), [0, 1]);
+    let first_events = first_sink.events();
+    assert_eq!(
+        first_events
+            .iter()
+            .filter(|event| event["type"] == "node-submitted")
+            .map(|event| event["disposition"].clone())
+            .collect::<Vec<_>>(),
+        [json!("created"), json!("created")]
+    );
+    assert_eq!(
+        first_events
+            .iter()
+            .filter(|event| event["type"] == "node-terminal")
+            .map(|event| event["ordinal"].clone())
+            .collect::<Vec<_>>(),
+        [json!(0)]
+    );
+
+    let replay_sink = Rc::new(VecLifecycleSink::default());
+    let replay = run_script(
+        &source,
+        Some(Path::new("budget-continuation.js")),
+        client.clone(),
+        replay_sink.clone(),
+        RunOptions::new("run-1", json!({})),
+    )
+    .unwrap();
+
+    let replay_events = replay_sink.events();
+    assert_eq!(
+        replay_events
+            .iter()
+            .filter(|event| event["type"] == "node-submitted")
+            .map(|event| event["disposition"].clone())
+            .collect::<Vec<_>>(),
+        [json!("reused"), json!("attached"), json!("created")]
+    );
+    assert_eq!(
+        replay_events
+            .iter()
+            .filter(|event| event["type"] == "node-terminal")
+            .map(|event| event["disposition"].clone())
+            .collect::<Vec<_>>(),
+        [json!("reused"), json!("attached"), json!("created")]
+    );
+    assert_eq!(
+        replay_events
+            .iter()
+            .filter(|event| event["type"] == "log")
+            .map(|event| event["message"].clone())
+            .collect::<Vec<_>>(),
+        [json!("before-third"), json!("tail")]
+    );
+    assert_eq!(*client.executions.borrow(), [0, 1, 2]);
+    assert_eq!(
+        *client.admissions.borrow(),
+        [
+            (1, 0, Disposition::Created),
+            (1, 1, Disposition::Created),
+            (2, 0, Disposition::Reused),
+            (2, 1, Disposition::Attached),
+            (2, 2, Disposition::Created),
+        ]
+    );
+
+    let uninterrupted_client = BudgetContinuationClient::new(None);
+    let uninterrupted = run_script(
+        &source,
+        Some(Path::new("budget-continuation.js")),
+        uninterrupted_client,
+        Rc::new(VecLifecycleSink::default()),
+        RunOptions::new("run-1", json!({})),
+    )
+    .unwrap();
+    assert_eq!(replay.final_value, Some(json!([1, 2, 3])));
+    assert_eq!(replay.final_value, uninterrupted.final_value);
 }
 
 #[test]

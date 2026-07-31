@@ -112,6 +112,83 @@ Prefix `log()` calls are suppressed when their following node is not `created`.
 Tail logs are flushed without a following disposition and can repeat; logs are
 diagnostics, not replay state.
 
+## Continuation after budget exhaustion
+
+`FlowRuntimeBudgetError`/`wall-clock-budget` (exit 10) ends one JavaScript
+evaluation after 24 hours; it does not cancel or delete the child jobs that
+evaluation admitted. Treat this error as a continuation point. The JavaScript
+heap and pending promises are gone, but every admitted job and terminal witness
+remains durable. Re-executing the same flow-run identity rebuilds the heap from
+those witnessed results and continues at the first work that is not already
+durable.
+
+Wait for the runner to become terminal, then use the invocation that matches how
+it was started:
+
+- For a declaratively registered flow, retry the failed runner job in place:
+
+  ```console
+  $ tally queue retry <runner-task-uuid>
+  ```
+
+  The retry keeps the runner task UUID, which is also its `flowRunId`, increments
+  the runner attempt, and preserves the original direct argv, runner pools, and
+  `workloadMutex`. Re-firing the calendar producer is not a retry: it may
+  deduplicate against the failed runner, and any newly admitted runner would get
+  a new task UUID and therefore name a new flow run.
+- For a manual run, repeat the original command with the same run ID, exact
+  script bytes, arguments, catalog bytes, and effective configuration:
+
+  ```console
+  $ tally flow run /nix/store/…-campaign.js \
+      --flow-run-id 4f8608e1-608f-4e04-bf47-0e49fd9801f1 \
+      --args '{"repository":"mecattaf/example"}' \
+      --max-nodes 1000 \
+      --catalog /nix/store/…-catalog.json
+  ```
+
+  Omit `--catalog` only when the original run had no catalog. A changed script,
+  argument, or catalog identity stops before new admission; a changed node
+  payload stops at `replay-divergence`.
+
+At the old frontier, the daemon resolves what happened while the evaluator was
+ending:
+
+- a witnessed pass answers `reused` (unless its evidence has drifted, in which
+  case fresh work is `created`);
+- an admitted job still running answers `attached` and the new evaluator awaits
+  that exact task and attempt;
+- a witnessed non-pass result answers `terminal`; and
+- a host call that never became durable is safely admitted as `created` under
+  the same deterministic key and payload.
+
+The lifecycle stream makes the transition visible. In this abridged JSONL, the
+completed prefix reuses, the live frontier attaches, and only the next node
+creates work:
+
+```json
+{"type":"node-submitted","flowRunId":"4f8608e1-608f-4e04-bf47-0e49fd9801f1","ordinal":0,"disposition":"reused"}
+{"type":"node-terminal","flowRunId":"4f8608e1-608f-4e04-bf47-0e49fd9801f1","ordinal":0,"disposition":"reused"}
+{"type":"node-submitted","flowRunId":"4f8608e1-608f-4e04-bf47-0e49fd9801f1","ordinal":1,"disposition":"attached"}
+{"type":"node-terminal","flowRunId":"4f8608e1-608f-4e04-bf47-0e49fd9801f1","ordinal":1,"disposition":"attached"}
+{"type":"node-submitted","flowRunId":"4f8608e1-608f-4e04-bf47-0e49fd9801f1","ordinal":2,"disposition":"created"}
+```
+
+Node lifecycle events are never suppressed. `log()` is different: a queued log
+is emitted only when its following node answers `created`. Logs before `reused`
+prefix nodes, and before an `attached` frontier node, are therefore suppressed on
+continuation. A log after the last node has no following disposition, so it is
+flushed and may appear once per evaluation.
+
+The 24-hour evaluator budget deliberately remains fixed; it is not configurable
+through `meta` or `services.tally.flows.<name>`. Raising or removing it per
+registration would let a hung awaited node or transport hold an evaluator, its
+`flow` slot, and any process-scoped `workloadMutex` indefinitely. Long campaigns
+use witnessed replay as their checkpoint mechanism instead. Node
+`runtimeMaxSec`, the runner job's registration-level `runtimeMaxSec`, and the
+RPC call deadline remain separate bounds; changing one does not change the
+24-hour evaluation budget.
+
 ## Daemon restart is a transport event
 
 The runner uses one multiplexed daemon connection. On a broken connection, epoch

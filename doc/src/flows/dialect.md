@@ -120,10 +120,12 @@ escape hatches:
 
 The engine has distinct non-catchable runtime backstops. A flow gets 1,000,000
 loop iterations and 512 recursive calls; breaching either is
-`FlowRuntimeLimitError`/`runtime-limit`. It may execute at most 100,000 promise or
-generic microtasks, reported as `FlowRuntimeBudgetError`/`microtask-budget`, and
-one evaluation gets a 24-hour total wall-clock budget, including awaited host
-work, reported as `FlowRuntimeBudgetError`/`wall-clock-budget`.
+`FlowRuntimeLimitError`/`runtime-limit`. Its two fixed evaluation budgets are:
+
+| Budget | Fixed limit | Error |
+|---|---:|---|
+| Promise and generic microtasks | 100,000 | `FlowRuntimeBudgetError`/`microtask-budget` |
+| Total wall clock, including awaited host work | 24 hours | [`FlowRuntimeBudgetError`/`wall-clock-budget`](submission-and-replay.md#continuation-after-budget-exhaustion) — replay the same run to continue |
 
 Separately, each node-producing call site may execute only `meta.iterationCap`
 times; the next call throws `FlowLoopError`/`iteration-cap`. The cap counts
