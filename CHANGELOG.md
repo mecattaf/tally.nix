@@ -85,6 +85,9 @@ authorized.
 
 ### Fixed
 
+- Allowed a campaign to opt into self-posted GitHub mentions with
+  `services.tally.campaigns.<name>.allowSelfTriggered`, while preserving the
+  loop-breaking `false` default for campaigns that run under a bot identity.
 - Made jobs without an explicit working directory execute from
   `workspace.worktreePath`, so flow-submitted agent nodes start inside their
   prepared worktrees across systemd and direct-spawn execution.

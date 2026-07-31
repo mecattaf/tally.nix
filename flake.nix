@@ -1152,6 +1152,7 @@
                   repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
                   label = "spec-campaign";
                   mention = "@tally build";
+                  allowSelfTriggered = true;
                   allowedActors = [ "operator" ];
                   pollIntervalSec = 17;
                   worklist = "specs/*/tasks.json";
@@ -1180,6 +1181,20 @@
                   agentRuntimeMaxSec = 120;
                   driverRuntimeMaxSec = 30;
                   pool.name = "fixture-campaign";
+                };
+                campaigns.defaulted = {
+                  enable = true;
+                  repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
+                  maxTasks = 1;
+                  gates = [
+                    {
+                      id = "content";
+                      argv = [ "/bin/true" ];
+                    }
+                  ];
+                  agent = "shell";
+                  agentArgv = [ "/bin/true" ];
+                  pool.name = "default-campaign";
                 };
               };
             }
@@ -3299,6 +3314,7 @@
                   .producers["campaign-fixture"].sources[0].search.state == "open" and
                   .producers["campaign-fixture"].sources[0].search.kinds == ["issue"] and
                   .producers["campaign-fixture"].triggers.mentions == ["@tally build"] and
+                  .producers["campaign-fixture"].allowSelfTriggered == true and
                   .producers["campaign-fixture"].allowedActors == ["operator"] and
                   .producers["campaign-fixture"].pollIntervalSec == 17 and
                   .producers["campaign-fixture"].postReceipt == true and
@@ -3314,7 +3330,8 @@
                     "${tally}/bin/tally", "flow", "run"
                   ] and
                   .producers["campaign-fixture"].enqueue.argv[4] == "--args" and
-                  .producers["campaign-fixture"].enqueue.argv[6:8] == ["--max-nodes", "19"]
+                  .producers["campaign-fixture"].enqueue.argv[6:8] == ["--max-nodes", "19"] and
+                  .producers["campaign-defaulted"].allowSelfTriggered == false
                 ' "$checkedConfig" >/dev/null
 
                 cp -R ${./test/fixtures/spec-build/repo} "$TMPDIR/spec"
@@ -3350,7 +3367,14 @@
                   .tasks[1].dependencies == ["task-1"]
                 ' worklist.json >/dev/null
 
-                event='{"kind":"gh","source":"search","repo":"acme/spec","number":7,"htmlUrl":"https://github.com/acme/spec/issues/7","itemType":"issue","nodeId":"I-campaign-7","itemAuthor":"operator","triggerActor":"operator","selfActor":"tally-bot","triggerKind":"mention","eventId":"comment-7","commentId":"comment-7","triggerTimestamp":"2026-07-31T09:00:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["spec-campaign"],"assignees":[],"triggeringComment":{"id":"comment-7","author":"operator","body":"@tally build"}}}'
+                default_event='{"kind":"gh","source":"search","repo":"acme/spec","number":6,"htmlUrl":"https://github.com/acme/spec/issues/6","itemType":"issue","nodeId":"I-campaign-6","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-6","commentId":"comment-6","triggerTimestamp":"2026-07-31T08:59:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["campaign"],"assignees":[],"triggeringComment":{"id":"comment-6","author":"operator","body":"@tally build"}}}'
+                default_dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
+                  __producer-dispatch campaign-defaulted --state-dir "$TMPDIR/state" \
+                  --event "$default_event")"
+                test "$(printf '%s' "$default_dispatch" | jq -r '.filtered.reason')" = \
+                  self-trigger-disabled
+
+                event='{"kind":"gh","source":"search","repo":"acme/spec","number":7,"htmlUrl":"https://github.com/acme/spec/issues/7","itemType":"issue","nodeId":"I-campaign-7","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-7","commentId":"comment-7","triggerTimestamp":"2026-07-31T09:00:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["spec-campaign"],"assignees":[],"triggeringComment":{"id":"comment-7","author":"operator","body":"@tally build"}}}'
                 dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
                   __producer-dispatch campaign-fixture --state-dir "$TMPDIR/state" \
                   --event "$event")"
