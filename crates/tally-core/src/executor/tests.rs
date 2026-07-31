@@ -1232,6 +1232,37 @@ fn capture_files_truncate_and_exit_record_is_atomic_and_private() {
 }
 
 #[test]
+fn failure_capture_excerpt_is_a_bounded_private_tail() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    let request = request();
+    let paths = executor.prepare_paths(&request.identity).unwrap();
+
+    std::fs::write(&paths.stderr, b"short failure\n").unwrap();
+    assert_eq!(
+        read_capture_excerpt(&paths.stderr).unwrap(),
+        CaptureExcerpt {
+            text: "short failure\n".to_owned(),
+            truncated: false,
+        }
+    );
+
+    let mut long = vec![b'x'; CAPTURE_EXCERPT_MAX_BYTES + 17];
+    long.extend_from_slice(b"actionable tail\n");
+    std::fs::write(&paths.stderr, long).unwrap();
+    let excerpt = read_capture_excerpt(&paths.stderr).unwrap();
+    assert!(excerpt.truncated);
+    assert!(excerpt
+        .text
+        .starts_with("[... earlier captured stderr omitted ...]\n"));
+    assert!(excerpt.text.ends_with("actionable tail\n"));
+
+    let linked = temp.path().join("linked-capture");
+    std::fs::hard_link(&paths.stderr, &linked).unwrap();
+    assert!(read_capture_excerpt(&paths.stderr).is_err());
+}
+
+#[test]
 fn capture_replacement_rejects_fifo_and_hardlink_truncation_attacks() {
     let temp = tempfile::tempdir().unwrap();
     let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");

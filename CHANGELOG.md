@@ -8,6 +8,9 @@ authorized.
 
 ### Added
 
+- Added `tally adapter smoke <name>` to execute one bounded, witnessed job
+  through real admission, transient-unit launch, capture, and adapter scraping;
+  failed smokes now print a bounded excerpt from the retained stderr capture.
 - Documented fixed-budget replay as the continuation mechanism for flow
   campaigns that exceed one 24-hour evaluation, and added a regression test
   proving that a budget-stopped run reuses its witnessed prefix, attaches to its

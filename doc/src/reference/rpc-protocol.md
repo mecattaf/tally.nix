@@ -265,8 +265,14 @@ positive. Its terminal result is:
 
 ```text
 {task_uuid, job_id, verdict, exit_code, artifact_content_hash,
- attempt, lease_epoch, witness_seq, completion?}
+ attempt, lease_epoch, witness_seq, completion?, stderr_excerpt?, stderr_truncated?}
 ```
+
+The two stderr fields are present only for a failed job carrying the witnessed
+`evidenceClass.kind = "adapter-smoke"` diagnostic marker. `stderr_excerpt` is
+the lossy UTF-8 rendering of at most the final 8 KiB of its retained stderr;
+`stderr_truncated` says whether earlier bytes were omitted. The retained
+capture remains the byte-authoritative source.
 
 For an active job the waiter is memory-resident. For a completed job the daemon reconstructs the
 answer from the verified witness ledger, including after restart. A client connection and its

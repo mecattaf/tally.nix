@@ -50,6 +50,7 @@ assertions.
 | `gc` | Reconcile/prune witness GC roots and optionally collect the Nix store. | GC report JSON. |
 | `queue` | Enqueue, continue, retry, cancel, pause/resume, drain, and await. | RPC result JSON. |
 | `producer` | Preview and exercise configured GitHub producers. | Diagnostic/admission JSON. |
+| `adapter` | Execute a minimal live adapter diagnostic. | Smoke result JSON. |
 | `witness` | Verify/compare chains, verify authorship, or append an advisory observation. | Text or JSON. |
 | `view` | Rebuild the derived TaskChampion view. | Rebuild report JSON. |
 | `attest` | Run a child through the advisory execution-attestation wrapper. | Child output; child's exit. |
@@ -63,6 +64,61 @@ The installed `tallyd` symlink with no arguments is equivalent to `tally daemon 
 
 Several `__...` helper commands exist for systemd units and producers. They are hidden,
 implementation-private, and not part of this CLI contract.
+
+## Adapter smoke
+
+Run exactly one minimal job through the daemon's real admission, lease,
+transient-unit, execution-attestation, capture, adapter-scrape, and witness path:
+
+```console
+$ tally adapter smoke shell
+$ tally adapter smoke codex --cwd /work/project
+$ tally adapter smoke claude-code --pool claude-window \
+    --prompt 'Reply with the single word ok.'
+```
+
+Every invocation is keyless, so it creates a new execution rather than reusing
+an earlier pass. The job is bounded to five minutes, carries `noEnqueue`, and
+records this witnessed `evidenceClass` marker:
+
+```json
+{"kind":"adapter-smoke","label":"adapter-smoke:codex","adapter":"codex"}
+```
+
+The default prompt is `Reply with the single word ok.` Agent adapters receive
+that string as their workload argv. The `shell` smoke instead directly invokes
+a hidden tally helper that prints `ok`; `--prompt` does not turn the shell
+adapter into a free-form command runner.
+
+`--cwd` accepts an absolute path or a path relative to the invoking process.
+When omitted it defaults to the invoking process's current directory. Run an
+agent smoke from a suitable repository, or pass its worktree explicitly, when
+the harness enforces a trusted-working-directory precondition.
+
+`--pool` names one configured pool. Without it, the CLI uses the first
+configured conventional lane for the adapter:
+
+- `shell`: `build`, then `stock`, then `shell`;
+- `codex`: `codex-window`, then `codex`;
+- `claude-code`: `claude-window`, then `claude-code`;
+- `pi`: `pi-window`, then `pi`;
+- another adapter: `<name>-window`, then `<name>`.
+
+If no matching lane is configured, the command requires `--pool`; the CLI
+never guesses among unrelated pools.
+
+The compact result names the task, selected pool and cwd, terminal verdict,
+witness sequence, and capture status. For an adapter that declares
+`sessionRef` or `finalMessage`, success waits for those advisory captures to be
+parsed and projected. Their contents are not judged; smoke proves mechanism,
+not answer quality. A missing declared projection is a diagnostic failure even
+when the process exited zero.
+
+The normal job verdict determines the ordinary CLI exit class. On a failed
+verdict, smoke prints the bounded tail of the retained stderr capture before
+the final error line. An empty capture is stated explicitly. This is the
+important difference from treating a bare adapter exit code as sufficient
+diagnosis.
 
 ## Enqueue
 

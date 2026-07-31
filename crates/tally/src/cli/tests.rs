@@ -166,11 +166,55 @@ fn flow_failure_taxonomy_has_distinguished_exit_codes() {
 fn full_top_level_surface_is_visible() {
     let help = Opts::command().render_long_help().to_string();
     for verb in [
-        "enqueue", "queue", "producer", "witness", "lease", "daemon", "query", "flow",
+        "enqueue", "queue", "producer", "adapter", "witness", "lease", "daemon", "query", "flow",
     ] {
         assert!(help.contains(verb), "missing {verb} from help");
     }
     assert!(!help.contains("__record-unit-exit"));
+}
+
+#[test]
+fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
+    let defaults = Opts::try_parse_from(["tally", "adapter", "smoke", "codex"]).unwrap();
+    assert!(matches!(
+        defaults.command,
+        Some(Command::Adapter {
+            command: AdapterCommand::Smoke(AdapterSmokeArgs {
+                name,
+                cwd: None,
+                prompt,
+                pool: None,
+            })
+        }) if name == "codex" && prompt == "Reply with the single word ok."
+    ));
+
+    let overridden = Opts::try_parse_from([
+        "tally",
+        "adapter",
+        "smoke",
+        "pi",
+        "--cwd",
+        "worktree",
+        "--prompt",
+        "-answer briefly",
+        "--pool",
+        "agent-slot",
+    ])
+    .unwrap();
+    assert!(matches!(
+        overridden.command,
+        Some(Command::Adapter {
+            command: AdapterCommand::Smoke(AdapterSmokeArgs {
+                name,
+                cwd: Some(cwd),
+                prompt,
+                pool: Some(pool),
+            })
+        }) if name == "pi"
+            && cwd == Path::new("worktree")
+            && prompt == "-answer briefly"
+            && pool == "agent-slot"
+    ));
 }
 
 #[test]

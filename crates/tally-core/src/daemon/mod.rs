@@ -379,6 +379,7 @@ pub struct JobResult {
     pub witness_seq: u64,
     pub model: Option<String>,
     pub completion: Option<SemanticCompletion>,
+    pub stderr_excerpt: Option<crate::executor::CaptureExcerpt>,
 }
 
 impl JobResult {
@@ -397,8 +398,19 @@ impl JobResult {
             value["completion"] =
                 serde_json::to_value(completion).expect("semantic completion always serializes");
         }
+        if let Some(excerpt) = &self.stderr_excerpt {
+            value["stderr_excerpt"] = Value::String(excerpt.text.clone());
+            value["stderr_truncated"] = Value::Bool(excerpt.truncated);
+        }
         value
     }
+}
+
+fn is_adapter_smoke(evidence_class: Option<&Value>) -> bool {
+    evidence_class
+        .and_then(|value| value.get("kind"))
+        .and_then(Value::as_str)
+        == Some("adapter-smoke")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

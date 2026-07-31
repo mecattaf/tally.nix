@@ -71,6 +71,14 @@ $ tally producer test github \
 --promote` is the explicit mutating diagnostic and should be treated as a real
 enqueue.
 
+These commands validate the intake side only. Before promoting a campaign,
+also run [`tally adapter smoke <name>`](../operating/cli.md#adapter-smoke) for
+every adapter on its critical path. Producer diagnostics prove that the
+doorbell observes and narrows the intended event; adapter smoke proves that a
+real admitted transient unit can launch the worker and parse its declared
+captures. A campaign is **verified live** only when both checks have run on the
+target daemon.
+
 The strict registry, intake claims, receipts, and effect state machines live in
 `crates/tally-core/src/producers.rs`. Inventory projection is in
 `crates/tally-core/src/producer_query.rs`; unit rendering is in

@@ -298,6 +298,17 @@ impl Daemon {
             &finished.outcome,
             Some(Ok(outcome)) if outcome.captures_available
         );
+        let smoke_stderr_excerpt = is_adapter_smoke(job.row.evidence_class.as_ref())
+            .then(|| {
+                finished
+                    .outcome
+                    .as_ref()
+                    .and_then(|outcome| outcome.as_ref().ok())
+                    .and_then(|outcome| {
+                        crate::executor::read_capture_excerpt(&outcome.paths.stderr).ok()
+                    })
+            })
+            .flatten();
         let effective_gate_manifest = effective_gate_manifest(&self.handler.executor, &job)?;
         let (result_revision, authorship, authorship_sessions) = match &finished.outcome {
             Some(Ok(outcome)) => (
@@ -419,6 +430,14 @@ impl Daemon {
                 }
             };
         let computed_verdict = canonical_verdict(evidence_verdict, semantic_completion.as_ref());
+        let stderr_excerpt = if !matches!(
+            computed_verdict,
+            Verdict::Pass | Verdict::Reused | Verdict::Substituted
+        ) {
+            smoke_stderr_excerpt
+        } else {
+            None
+        };
 
         let (result, evidence, launches, auto_requeue) = {
             let mut context = self.handler.context.write().await;
@@ -485,6 +504,7 @@ impl Daemon {
                 witness_seq: record.seq,
                 model,
                 completion: semantic_completion,
+                stderr_excerpt,
             };
             let stable = job.stable_key();
             let auto_requeue = verdict == Verdict::RuntimeExceeded

@@ -557,6 +557,7 @@ pub(super) fn recovery_gh_completions(
                 witness_seq: record.seq,
                 model: record.model.clone(),
                 completion: record.completion.clone(),
+                stderr_excerpt: None,
             },
         })
         .collect())

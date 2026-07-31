@@ -1,5 +1,13 @@
 use super::*;
 
+pub const CAPTURE_EXCERPT_MAX_BYTES: usize = 8 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureExcerpt {
+    pub text: String,
+    pub truncated: bool,
+}
+
 impl Executor {
     pub fn capture_generation_matches(
         &self,
@@ -145,6 +153,41 @@ impl Executor {
         )?;
         Ok(())
     }
+}
+
+/// Read the bounded tail of a retained stream without following links.
+///
+/// Failure diagnostics favor the tail because command harnesses commonly emit
+/// setup chatter before the actionable process error. Invalid UTF-8 is
+/// lossily represented for terminal display; the retained capture remains the
+/// byte-authoritative copy.
+pub fn read_capture_excerpt(path: &Path) -> Result<CaptureExcerpt, ExecutorError> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    let metadata = file.metadata().map_err(|source| io_error(path, source))?;
+    if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "capture excerpt source {} is not a private regular file",
+            path.display()
+        )));
+    }
+    let max = CAPTURE_EXCERPT_MAX_BYTES as u64;
+    let start = metadata.len().saturating_sub(max);
+    file.seek(SeekFrom::Start(start))
+        .map_err(|source| io_error(path, source))?;
+    let mut bytes = Vec::with_capacity((metadata.len() - start) as usize);
+    file.take(max)
+        .read_to_end(&mut bytes)
+        .map_err(|source| io_error(path, source))?;
+    let truncated = start > 0;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.insert_str(0, "[... earlier captured stderr omitted ...]\n");
+    }
+    Ok(CaptureExcerpt { text, truncated })
 }
 
 pub(super) fn write_capture_generation(

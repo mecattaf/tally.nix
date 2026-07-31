@@ -1677,6 +1677,10 @@
             machine.succeed("test -d /var/lib/tally")
             machine.succeed("test -d /var/log/tally")
             machine.succeed("grep -F '\"enforce\":\"cooperative\"' /etc/tally/config.json")
+            machine.succeed(
+              "cd /tmp && ${tally}/bin/tally --config /etc/tally/config.json --socket /run/tally/tally.sock adapter smoke shell "
+              "| ${pkgs.jq}/bin/jq -e '.adapter == \"shell\" and .pool == \"stock\" and .verdict == \"pass\" and .captureStatus == \"not-declared\"'"
+            )
 
             machine.succeed("systemctl stop tally-daemon.service")
             machine.succeed("install -o root -g root -m 0600 /dev/null /var/lib/tally/data/attestations.jsonl")
