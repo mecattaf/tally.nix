@@ -70,10 +70,13 @@
             ./examples/flows/academic-ocr.js
             ./examples/flows/agency-nightly.js
             ./examples/flows/monthly-review.js
+            ./examples/flows/spec-build.js
+            ./examples/flows/spec_build_driver.py
             ./test/fixtures/flows
             ./test/fixtures/git-ai
             ./test/fixtures/ledger
             ./test/fixtures/shell-command-provider
+            ./test/fixtures/spec-build
             ./test/fixtures/traces
           ];
         };
@@ -222,6 +225,7 @@
           '';
           nativeCheckInputs = [
             pkgs.git
+            pkgs.python3
             pkgs.taskwarrior3
           ];
           postInstall = ''
@@ -586,6 +590,7 @@
             exec ${pkgs.python3}/bin/python3 ${./examples/flows/agency_nightly_driver.py} "$@"
           '';
         };
+        specBuildDriver = import ./nix/lib/spec-build-driver.nix { inherit pkgs; };
         catalogFixtureInput = import ./test/fixtures/catalog/valid.nix;
         catalogFixtureUnchecked = catalogLibrary.renderCatalog (
           catalogFixtureInput
@@ -1130,6 +1135,56 @@
             }
           ];
         };
+        campaignHome = home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            self.homeManagerModules.tally
+            {
+              home = {
+                username = "tally-campaign";
+                homeDirectory = "/tmp/tally-campaign-home";
+                stateVersion = "26.11";
+              };
+              services.tally = {
+                enable = true;
+                campaigns.fixture = {
+                  enable = true;
+                  repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
+                  label = "spec-campaign";
+                  mention = "@tally build";
+                  allowedActors = [ "operator" ];
+                  pollIntervalSec = 17;
+                  worklist = "specs/*/tasks.json";
+                  maxTasks = 3;
+                  gates = [
+                    {
+                      id = "content";
+                      argv = [
+                        "/bin/sh"
+                        "-eu"
+                        "-c"
+                        "test -d build"
+                      ];
+                    }
+                    {
+                      id = "clean";
+                      argv = [
+                        "git"
+                        "diff"
+                        "--exit-code"
+                      ];
+                    }
+                  ];
+                  agent = "shell";
+                  agentArgv = [ "/bin/true" ];
+                  agentRuntimeMaxSec = 120;
+                  driverRuntimeMaxSec = 30;
+                  pool.name = "fixture-campaign";
+                };
+              };
+            }
+          ];
+        };
         disabledHome = home-manager.lib.homeManagerConfiguration {
           inherit pkgs;
           modules = [
@@ -1594,6 +1649,16 @@
                   };
                 };
                 flows.fixture.script = ./test/fixtures/flows/valid.js;
+                campaigns.fixture = {
+                  enable = true;
+                  repositories."acme/spec".checkout = "/tmp/spec";
+                  gates = [
+                    {
+                      id = "tests";
+                      argv = [ "true" ];
+                    }
+                  ];
+                };
                 pools.metered = {
                   resource = "budget";
                   predicate.windowed-consumption = {
@@ -2899,6 +2964,7 @@
           in
           if builtins.isList value then builtins.head value else value;
         checkedHomeConfig = stockHome.config.xdg.configFile."tally/config.json".source;
+        checkedCampaignConfig = campaignHome.config.xdg.configFile."tally/config.json".source;
         systemServices = stockNixos.config.systemd.services;
         systemTimers = stockNixos.config.systemd.timers;
         systemServiceExec = name: systemServices.${name}.serviceConfig.ExecStart;
@@ -2958,6 +3024,9 @@
             unsupportedSystemMessages;
           assert builtins.elem
             "services.tally.flows must be empty in the NixOS module; configure flows with the Home Manager module (tally.homeManagerModules.tally)"
+            unsupportedSystemMessages;
+          assert builtins.elem
+            "services.tally.campaigns must be empty in the NixOS module; configure campaigns with the Home Manager module (tally.homeManagerModules.tally)"
             unsupportedSystemMessages;
           assert builtins.elem
             "services.tally.pools.<name>.usageMeter must be null in the NixOS module; configure usage meters with the Home Manager module (tally.homeManagerModules.tally)"
@@ -3172,6 +3241,7 @@
           inherit tally;
           doc = documentation;
           agency-nightly-driver = agencyNightlyDriver;
+          spec-build-driver = specBuildDriver;
           tally-witness-emit = tallyWitnessEmit;
           default = tally;
         };
@@ -3197,6 +3267,118 @@
           hardening-doc-drift = hardeningDocDrift;
           stock-home-activation = stockHome.activationPackage;
           module-layer = moduleContract;
+          campaign-render =
+            pkgs.runCommand "tally-campaign-render"
+              {
+                activationPackage = campaignHome.activationPackage;
+                checkedConfig = checkedCampaignConfig;
+                nativeBuildInputs = [
+                  pkgs.git
+                  pkgs.jq
+                ];
+              }
+              ''
+                test -e "$activationPackage"
+                ${tally}/bin/tally --mode check-config --config "$checkedConfig" >/dev/null
+                jq -e '
+                  .enqueue.fanoutCap == 64 and
+                  .pools["fixture-campaign"].resource == "mutex" and
+                  .pools["fixture-campaign"].capacity == 1 and
+                  .pools["campaign-control"].resource == "cpu-slot" and
+                  .pools["campaign-control"].capacity == 4 and
+                  .pools["campaign-agent"].resource == "slot" and
+                  .pools["campaign-agent"].capacity == 1 and
+                  .adapters["spec-build-driver"].scrape.finalMessage.mode == "regex" and
+                  .adapters["spec-build-driver"].scrape.finalMessage.pattern == "^TALLY_FINAL_MESSAGE=(.*)$" and
+                  .flows.fixture.workloadMutex == "fixture-campaign" and
+                  (.flows.fixture.script | endswith("spec-build.js")) and
+                  .producers["campaign-fixture"].kind == "gh" and
+                  .producers["campaign-fixture"].enable == true and
+                  .producers["campaign-fixture"].sources[0].search.repositories == ["acme/spec"] and
+                  .producers["campaign-fixture"].sources[0].search.labels == ["spec-campaign"] and
+                  .producers["campaign-fixture"].sources[0].search.state == "open" and
+                  .producers["campaign-fixture"].sources[0].search.kinds == ["issue"] and
+                  .producers["campaign-fixture"].triggers.mentions == ["@tally build"] and
+                  .producers["campaign-fixture"].allowedActors == ["operator"] and
+                  .producers["campaign-fixture"].pollIntervalSec == 17 and
+                  .producers["campaign-fixture"].postReceipt == true and
+                  .producers["campaign-fixture"].postEvidence == true and
+                  .producers["campaign-fixture"].postGateSummary == false and
+                  .producers["campaign-fixture"].closeOnAcceptance == false and
+                  .producers["campaign-fixture"].closeOnPass == false and
+                  .producers["campaign-fixture"].enqueue.pool == ["fixture-campaign", "flow"] and
+                  .producers["campaign-fixture"].enqueue.adapter == "shell" and
+                  .producers["campaign-fixture"].enqueue.evidence == ["exit:0"] and
+                  .producers["campaign-fixture"].enqueue.noEnqueue == false and
+                  .producers["campaign-fixture"].enqueue.argv[0:3] == [
+                    "${tally}/bin/tally", "flow", "run"
+                  ] and
+                  .producers["campaign-fixture"].enqueue.argv[4] == "--args" and
+                  .producers["campaign-fixture"].enqueue.argv[6:8] == ["--max-nodes", "19"]
+                ' "$checkedConfig" >/dev/null
+
+                cp -R ${./test/fixtures/spec-build/repo} "$TMPDIR/spec"
+                chmod -R u+w "$TMPDIR/spec"
+                git -C "$TMPDIR/spec" init --quiet --initial-branch=main
+                jq -n --arg checkout "$TMPDIR/spec" '{
+                  repository: "acme/spec",
+                  repositoryConfig: {
+                    checkout: $checkout,
+                    baseBranch: "main",
+                    remote: "origin",
+                    forge: "local"
+                  },
+                  worklist: "specs/*/tasks.json",
+                  maxTasks: 3
+                }' > "$TMPDIR/worklist-brief.json"
+                export TALLY_BRIEF="$TMPDIR/worklist-brief.json"
+                ${specBuildDriver}/bin/spec-build-driver worklist \
+                  | sed 's/^TALLY_FINAL_MESSAGE=//' > worklist.json
+                jq -e '
+                  .schemaVersion == 1 and
+                  .repository == "acme/spec" and
+                  .source.path == "specs/001-toy/tasks.json" and
+                  (.source.sha256 | test("^sha256:[0-9a-f]{64}$")) and
+                  [.tasks[].id] == ["task-1", "task-2"] and
+                  all(.tasks[];
+                    (.goal | length) > 0 and
+                    (.deliveredBehaviors | length) > 0 and
+                    (.readFirst.specSections | length) > 0 and
+                    (.acceptanceCriteria | length) > 0 and
+                    all(.acceptanceCriteria[]; (.argv | length) > 0)
+                  ) and
+                  .tasks[1].dependencies == ["task-1"]
+                ' worklist.json >/dev/null
+
+                event='{"kind":"gh","source":"search","repo":"acme/spec","number":7,"htmlUrl":"https://github.com/acme/spec/issues/7","itemType":"issue","nodeId":"I-campaign-7","itemAuthor":"operator","triggerActor":"operator","selfActor":"tally-bot","triggerKind":"mention","eventId":"comment-7","commentId":"comment-7","triggerTimestamp":"2026-07-31T09:00:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["spec-campaign"],"assignees":[],"triggeringComment":{"id":"comment-7","author":"operator","body":"@tally build"}}}'
+                dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
+                  __producer-dispatch campaign-fixture --state-dir "$TMPDIR/state" \
+                  --event "$event")"
+                payload="$(printf '%s' "$dispatch" | jq -r '.emitted')"
+                jq -e '
+                  (.argv[5] | fromjson) as $args |
+                  $args.campaign == "fixture" and
+                  $args.repository == "acme/spec" and
+                  $args.issue == {
+                    "number": "7",
+                    "url": "https://github.com/acme/spec/issues/7"
+                  } and
+                  $args.runId == "comment-7" and
+                  $args.worklist == "specs/*/tasks.json" and
+                  $args.maxTasks == 3 and
+                  $args.repositories["acme/spec"].baseBranch == "main" and
+                  $args.repositories["acme/spec"].forge == "github" and
+                  $args.agent.adapter == "shell" and
+                  $args.agent.argv == ["/bin/true"] and
+                  [$args.gates[].id] == ["content", "clean"]
+                ' "$payload" >/dev/null
+                runtime_args="$(jq -r '.argv[5]' "$payload")"
+                ${tally}/bin/tally --config "$checkedConfig" flow check \
+                  ${./examples/flows/spec-build.js} --args "$runtime_args" >/dev/null
+                test "$(jq -r '.argv[3]' "$payload")" = \
+                  "$(jq -r '.flows.fixture.script' "$checkedConfig")"
+                touch "$out"
+              '';
           flow-dialect-accept =
             pkgs.runCommand "tally-flow-dialect-accept"
               {
@@ -3224,6 +3406,7 @@
                   ${./examples/flows/fleet-deploy.js} \
                   ${./examples/flows/monthly-review.js} \
                   ${./examples/flows/pooled-review.js} \
+                  ${./examples/flows/spec-build.js} \
                   ${./examples/flows/worklist-fanout.js}; do
                   ${tally}/bin/tally flow check "$example" >/dev/null
                 done

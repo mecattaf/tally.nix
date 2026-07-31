@@ -25,6 +25,7 @@
 - [The dialect](flows/dialect.md)
 - [Host API reference](flows/host-api.md)
 - [Submission identity and replay](flows/submission-and-replay.md)
+- [Campaigns](flows/campaigns.md)
 - [Pooled-review cookbook](flows/pooled-review.md)
 - [Two more cookbook recipes](flows/cookbook.md)
 - [Cross-host handoff](flows/cross-host-handoff.md)

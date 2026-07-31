@@ -22,6 +22,10 @@ let
 
   priorityRanks = import ../lib/priority-ranks.nix;
 
+  specBuildFlow = ../../examples/flows/spec-build.js;
+  specBuildDriver = import ../lib/spec-build-driver.nix { inherit pkgs; };
+  briefSentinel = "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.";
+
   internalAssertionsOption = mkOption {
     type = types.listOf types.raw;
     default = [ ];
@@ -1743,6 +1747,283 @@ let
     }
   );
 
+  mkCampaignRepositoryType = types.submodule (
+    { config, name, ... }: {
+      options = {
+        checkout = mkOption {
+          type = types.str;
+          example = "/srv/spec-repositories/crm";
+          description = ''
+            Absolute writable Git checkout used to read the frozen corpus and
+            create per-task worktrees. This is operational state, not a Nix
+            store source path.
+          '';
+        };
+        baseBranch = mkOption {
+          type = types.str;
+          default = "main";
+          example = "main";
+          description = "Remote branch fetched immediately before every task worktree is prepared.";
+        };
+        remote = mkOption {
+          type = types.str;
+          default = "origin";
+          example = "origin";
+          description = "Named Git remote used for fetch and push.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions = [
+        {
+          assertion = builtins.match "[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+" name != null;
+          message = "tally campaign repository ${name} must use a safe owner/name identity";
+        }
+        {
+          assertion = lib.hasPrefix "/" config.checkout && !(lib.hasInfix "%" config.checkout);
+          message = "tally campaign repository ${name} checkout must be absolute and contain no systemd specifier";
+        }
+        {
+          assertion = config.baseBranch != "" && !(lib.hasInfix "\u0000" config.baseBranch);
+          message = "tally campaign repository ${name} baseBranch must be non-empty and contain no NUL byte";
+        }
+        {
+          assertion = builtins.match "[A-Za-z0-9._-]+" config.remote != null;
+          message = "tally campaign repository ${name} remote must be a safe Git remote name";
+        }
+      ];
+    }
+  );
+
+  mkCampaignGateType = types.submodule (
+    { config, name, ... }: {
+      options = {
+        id = mkOption {
+          type = types.str;
+          example = "tests";
+          description = "Stable gate identifier used in the witnessed node key.";
+        };
+        argv = mkOption {
+          type = types.listOf types.str;
+          example = [
+            "go"
+            "test"
+            "./..."
+          ];
+          description = "Direct argv executed in each task worktree after the agent exits successfully.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions = [
+        {
+          assertion = validComponent config.id;
+          message = "tally campaign gate ${name} id ${config.id} is not a safe node-key component";
+        }
+        {
+          assertion = config.argv != [ ] && builtins.head config.argv != "";
+          message = "tally campaign gate ${name} argv must start with a non-empty executable";
+        }
+        {
+          assertion = lib.all (argument: !(lib.hasInfix "\u0000" argument)) config.argv;
+          message = "tally campaign gate ${name} argv must not contain NUL bytes";
+        }
+      ];
+    }
+  );
+
+  mkCampaignType = types.submodule (
+    { config, name, ... }: {
+      options = {
+        enable = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Render this spec-driven build campaign.";
+        };
+        repositories = mkOption {
+          type = types.attrsOf mkCampaignRepositoryType;
+          default = { };
+          example."mecattaf/crm".checkout = "/srv/spec-repositories/crm";
+          description = ''
+            GitHub repository identities accepted by this campaign, mapped to
+            the writable local checkouts that contain their frozen specs.
+          '';
+        };
+        label = mkOption {
+          type = types.str;
+          default = "campaign";
+          example = "spec-build";
+          description = "Label required on an open campaign issue.";
+        };
+        mention = mkOption {
+          type = types.str;
+          default = "@tally build";
+          example = "@tally build";
+          description = "Exact mention comment that starts one campaign run.";
+        };
+        allowedActors = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "trusted-maintainer" ];
+          description = "Optional trigger-actor allowlist inherited by the rendered GitHub producer.";
+        };
+        pollIntervalSec = mkOption {
+          type = types.ints.positive;
+          default = 60;
+          description = "GitHub campaign producer polling cadence.";
+        };
+        worklist = mkOption {
+          type = types.str;
+          default = "specs/*/tasks.json";
+          example = "specs/001-crm/tasks.json";
+          description = "Relative glob that must resolve to exactly one versioned JSON worklist.";
+        };
+        maxTasks = mkOption {
+          type = types.ints.between 1 128;
+          default = 64;
+          example = 24;
+          description = "Maximum tasks accepted from the witnessed worklist.";
+        };
+        gates = mkOption {
+          type = types.listOf mkCampaignGateType;
+          default = [ ];
+          example = [
+            {
+              id = "tests";
+              argv = [
+                "go"
+                "test"
+                "./..."
+              ];
+            }
+          ];
+          description = "Ordered direct-argv gates run for every task; the first red gate stops the campaign.";
+        };
+        agent = mkOption {
+          type = types.str;
+          default = "codex";
+          example = "codex";
+          description = "Configured adapter used by implementation nodes.";
+        };
+        agentArgv = mkOption {
+          type = types.listOf types.str;
+          default = [ briefSentinel ];
+          defaultText = lib.literalExpression "the tally structured-brief sentinel";
+          example = [ "/srv/campaign-fixtures/agent" ];
+          description = ''
+            Direct argv appended to the selected adapter. Agent adapters should
+            keep the default structured-brief sentinel; a shell fixture may
+            name its executable directly.
+          '';
+        };
+        agentPriority = mkOption {
+          type = types.enum [
+            "interrupt"
+            "high"
+            "medium"
+            "low"
+          ];
+          default = "low";
+          description = "Priority of each campaign implementation node.";
+        };
+        agentRuntimeMaxSec = mkOption {
+          type = types.nullOr types.ints.positive;
+          default = 14400;
+          example = 21600;
+          description = "Optional process deadline for each implementation node.";
+        };
+        driverRuntimeMaxSec = mkOption {
+          type = types.ints.positive;
+          default = 900;
+          description = "Process deadline for each deterministic worklist, prep, publish, or merge node.";
+        };
+        runtimeMaxSec = mkOption {
+          type = types.nullOr types.ints.positive;
+          default = null;
+          example = 82800;
+          description = ''
+            Optional runner deadline. Null leaves the fixed 24-hour evaluator
+            budget as the campaign continuation boundary.
+          '';
+        };
+        pool.name = mkOption {
+          type = types.str;
+          default = "campaign";
+          example = "campaign";
+          description = "Capacity-1 mutex held by the runner for the whole campaign.";
+        };
+        _tallyAssertions = internalAssertionsOption;
+      };
+
+      config._tallyAssertions = flatten [
+        {
+          assertion = !config.enable || config.repositories != { };
+          message = "enabled tally campaign ${name} requires at least one repository";
+        }
+        {
+          assertion = !config.enable || config.gates != [ ];
+          message = "enabled tally campaign ${name} requires at least one deterministic gate";
+        }
+        {
+          assertion = config.label != "";
+          message = "tally campaign ${name} label must be non-empty";
+        }
+        {
+          assertion = config.mention != "";
+          message = "tally campaign ${name} mention must be non-empty";
+        }
+        {
+          assertion =
+            config.worklist != ""
+            && !(lib.hasPrefix "/" config.worklist)
+            && !(builtins.elem ".." (lib.splitString "/" config.worklist));
+          message = "tally campaign ${name} worklist must be a relative pattern without '..'";
+        }
+        {
+          assertion = config.agent != "" && !(lib.hasInfix "\u0000" config.agent);
+          message = "tally campaign ${name} agent must be non-empty and contain no NUL byte";
+        }
+        {
+          assertion = config.agentArgv != [ ] && builtins.head config.agentArgv != "";
+          message = "tally campaign ${name} agentArgv must start with a non-empty value";
+        }
+        {
+          assertion = validComponent config.pool.name;
+          message = "tally campaign ${name} pool.name ${config.pool.name} is not a safe component";
+        }
+        {
+          assertion =
+            !(builtins.elem config.pool.name [
+              "flow"
+              "build"
+              "campaign-agent"
+              "campaign-control"
+            ]);
+          message = "tally campaign ${name} pool.name must not use a reserved flow or campaign node pool";
+        }
+        {
+          assertion =
+            builtins.length config.allowedActors == builtins.length (unique config.allowedActors)
+            && lib.all (actor: actor != "") config.allowedActors;
+          message = "tally campaign ${name} allowedActors must contain unique non-empty actors";
+        }
+        {
+          assertion =
+            builtins.length (map (gate: gate.id) config.gates)
+            == builtins.length (unique (map (gate: gate.id) config.gates));
+          message = "tally campaign ${name} gate ids must be unique";
+        }
+        {
+          assertion = builtins.length config.gates <= 16;
+          message = "tally campaign ${name} supports at most 16 gates";
+        }
+        (mapAttrsToList (_: repository: repository._tallyAssertions) config.repositories)
+        (map (gate: gate._tallyAssertions) config.gates)
+      ];
+    }
+  );
+
   mkOptions =
     {
       defaultPackage,
@@ -2029,6 +2310,31 @@ let
           Registry of calendar, events-directory, GitHub, build-effect, and
           pool-reachability producers. Every entry requires an explicit kind.
           Only the Home Manager module renders their managed user units.
+        '';
+      };
+      campaigns = mkOption {
+        type = types.attrsOf mkCampaignType;
+        default = { };
+        example.crm = {
+          enable = true;
+          repositories."mecattaf/crm".checkout = "/srv/spec-repositories/crm";
+          gates = [
+            {
+              id = "tests";
+              argv = [
+                "go"
+                "test"
+                "./..."
+              ];
+            }
+          ];
+        };
+        description = ''
+          First-class spec-driven build campaigns. Each enabled entry expands
+          to the shipped spec-build flow, a scoped GitHub mention producer, a
+          capacity-1 runner mutex, and the campaign node pools and driver
+          adapter. Home Manager renders campaigns; the NixOS module rejects
+          them alongside producers and flows.
         '';
       };
       flows = mkOption {
@@ -2397,6 +2703,160 @@ let
       filterAttrs (_: flow: flow.onCalendar != null) flows
     );
 
+  renderCampaignRepositories = mapAttrs (
+    _: repository: {
+      inherit (repository) checkout baseBranch remote;
+      forge = "github";
+    }
+  );
+
+  renderCampaignGates = map (gate: {
+    inherit (gate) id argv;
+  });
+
+  campaignMaxNodes = campaign: 1 + campaign.maxTasks * (4 + builtins.length campaign.gates);
+
+  mkCampaignArgs = cfg: name: campaign: repository: issueNumber: issueUrl: runId: {
+    campaign = name;
+    inherit repository runId;
+    issue = {
+      number = issueNumber;
+      url = issueUrl;
+    };
+    repositories = renderCampaignRepositories campaign.repositories;
+    inherit (campaign) worklist maxTasks;
+    workspaceRoot = "${toString cfg.stateDir}/campaigns/${name}";
+    driver = "${specBuildDriver}/bin/spec-build-driver";
+    inherit (campaign) driverRuntimeMaxSec;
+    agent = {
+      adapter = campaign.agent;
+      argv = campaign.agentArgv;
+      priority = campaign.agentPriority;
+      runtimeMaxSec = campaign.agentRuntimeMaxSec;
+    };
+    gates = renderCampaignGates campaign.gates;
+  };
+
+  mkCampaignFlow =
+    cfg: name: campaign:
+    let
+      repositories = builtins.attrNames campaign.repositories;
+      repository = if repositories == [ ] then "invalid/invalid" else builtins.head repositories;
+    in
+    {
+      script = specBuildFlow;
+      args =
+        mkCampaignArgs cfg name campaign repository "1" "https://example.invalid/campaign/1"
+          "module-check";
+      workloadMutex = campaign.pool.name;
+      maxNodes = campaignMaxNodes campaign;
+      runtimeMaxSec = campaign.runtimeMaxSec;
+    };
+
+  mkCampaignProducer =
+    cfg: name: campaign:
+    let
+      runtimeArgs =
+        mkCampaignArgs cfg name campaign "\${gh.repo}" "\${gh.number}" "\${gh.url}"
+          "\${gh.eventId}";
+    in
+    {
+      kind = "gh";
+      enable = true;
+      sources = [
+        {
+          search = {
+            repositories = builtins.attrNames campaign.repositories;
+            labels = [ campaign.label ];
+            state = "open";
+            kinds = [ "issue" ];
+          };
+        }
+      ];
+      triggers.mentions = [ campaign.mention ];
+      inherit (campaign) allowedActors pollIntervalSec;
+      postReceipt = true;
+      postEvidence = true;
+      postGateSummary = false;
+      requestReview = false;
+      closeOnAcceptance = false;
+      closeOnPass = false;
+      neverMutate = false;
+      enqueue = {
+        argv = [
+          (lib.getExe cfg.package)
+          "flow"
+          "run"
+          (storePathWithContext specBuildFlow)
+          "--args"
+          (builtins.toJSON runtimeArgs)
+          "--max-nodes"
+          (toString (campaignMaxNodes campaign))
+        ];
+        adapter = "shell";
+        pool = [
+          "flow"
+          campaign.pool.name
+        ];
+        priority = "low";
+        runtimeMaxSec = campaign.runtimeMaxSec;
+        evidence = [ "exit:0" ];
+        noEnqueue = false;
+      };
+    };
+
+  mkCampaignConfig =
+    cfg:
+    let
+      enabled = filterAttrs (_: campaign: campaign.enable) cfg.campaigns;
+      requiredFanout = lib.foldl' (capacity: campaign: lib.max capacity (campaignMaxNodes campaign)) 64 (
+        builtins.attrValues enabled
+      );
+      mutexPools = lib.foldl' (
+        pools: campaign:
+        pools
+        // {
+          ${campaign.pool.name} = {
+            resource = lib.mkDefault "mutex";
+            capacity = lib.mkDefault 1;
+            predicate.co-residency = { };
+          };
+        }
+      ) { } (builtins.attrValues enabled);
+    in
+    {
+      enqueue.fanoutCap = lib.mkDefault requiredFanout;
+      flows = mapAttrs (name: campaign: mkCampaignFlow cfg name campaign) enabled;
+      producers = lib.mapAttrs' (
+        name: campaign: lib.nameValuePair "campaign-${name}" (mkCampaignProducer cfg name campaign)
+      ) enabled;
+      pools =
+        mutexPools
+        // optionalAttrs (enabled != { }) {
+          campaign-control = {
+            resource = lib.mkDefault "cpu-slot";
+            capacity = lib.mkDefault 4;
+            enforce = lib.mkDefault "cooperative";
+            hardPreempt = lib.mkDefault false;
+          };
+          campaign-agent = {
+            resource = lib.mkDefault "slot";
+            capacity = lib.mkDefault 1;
+            enforce = lib.mkDefault "cooperative";
+            hardPreempt = lib.mkDefault false;
+          };
+        };
+      adapters = optionalAttrs (enabled != { }) {
+        spec-build-driver = {
+          scrape.finalMessage = {
+            stream = "stdout";
+            mode = "regex";
+            pattern = "^TALLY_FINAL_MESSAGE=(.*)$";
+          };
+        };
+      };
+    };
+
   flowPoolDefaults = {
     resource = lib.mkDefault "cpu-slot";
     capacity = lib.mkDefault 8;
@@ -2491,6 +2951,31 @@ let
         }
         executor._tallyAssertions
       ]) cfg.executors)
+      (mapAttrsToList (name: campaign: [
+        {
+          assertion = validComponent name;
+          message = "tally campaign name ${name} is not a safe unit/file component";
+        }
+        campaign._tallyAssertions
+        {
+          assertion = !campaign.enable || builtins.hasAttr campaign.agent cfg.adapters;
+          message = "tally campaign ${name} references unknown agent adapter ${campaign.agent}";
+        }
+        {
+          assertion = !campaign.enable || cfg.enqueue.fanoutCap >= campaignMaxNodes campaign;
+          message = "tally campaign ${name} requires services.tally.enqueue.fanoutCap >= ${toString (campaignMaxNodes campaign)}";
+        }
+        {
+          assertion =
+            !campaign.enable
+            || (
+              builtins.hasAttr campaign.pool.name cfg.pools
+              && cfg.pools.${campaign.pool.name}.resource == "mutex"
+              && cfg.pools.${campaign.pool.name}.capacity == 1
+            );
+          message = "tally campaign ${name} pool ${campaign.pool.name} must remain a capacity-1 mutex";
+        }
+      ]) cfg.campaigns)
       (mapAttrsToList (name: producer: [
         {
           assertion = validComponent name;
@@ -2710,6 +3195,7 @@ in
     meterEventPath
     flowPoolDefaults
     mkAssertions
+    mkCampaignConfig
     mkCheckedConfig
     mkFlowProducers
     mkInstalledPackage

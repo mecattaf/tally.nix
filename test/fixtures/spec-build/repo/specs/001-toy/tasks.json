@@ -1,0 +1,64 @@
+{
+  "schemaVersion": 1,
+  "tasks": [
+    {
+      "id": "task-1",
+      "title": "Create the first fixture artifact",
+      "goal": "Materialize the first behavior as a committed text artifact.",
+      "deliveredBehaviors": [
+        "build/one.txt exists and contains one followed by a newline"
+      ],
+      "readFirst": {
+        "specSections": [
+          "specs/001-toy/spec.md#task-one"
+        ],
+        "styleReferences": [
+          "specs/001-toy/style/example.txt"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "one-content",
+          "description": "The first artifact has the exact specified bytes.",
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat build/one.txt)\" = one"
+          ]
+        }
+      ],
+      "dependencies": []
+    },
+    {
+      "id": "task-2",
+      "title": "Build on the merged first task",
+      "goal": "Prove serial campaign ordering while materializing the second artifact.",
+      "deliveredBehaviors": [
+        "the task-2 worktree already contains task 1's merged artifact",
+        "build/two.txt exists and contains two followed by a newline"
+      ],
+      "readFirst": {
+        "specSections": [
+          "specs/001-toy/spec.md#task-two"
+        ],
+        "styleReferences": [
+          "specs/001-toy/style/example.txt"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "ordered-content",
+          "description": "Both the dependency artifact and second artifact have their exact bytes.",
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat build/one.txt)\" = one && test \"$(cat build/two.txt)\" = two"
+          ]
+        }
+      ],
+      "dependencies": [
+        "task-1"
+      ]
+    }
+  ]
+}

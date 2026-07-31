@@ -47,6 +47,10 @@ let
       message = "services.tally.flows must be empty in the NixOS module; configure flows with the Home Manager module (tally.homeManagerModules.tally)";
     }
     {
+      assertion = cfg.campaigns == { };
+      message = "services.tally.campaigns must be empty in the NixOS module; configure campaigns with the Home Manager module (tally.homeManagerModules.tally)";
+    }
+    {
       assertion = lib.all (pool: pool.usageMeter == null) (builtins.attrValues cfg.pools);
       message = "services.tally.pools.<name>.usageMeter must be null in the NixOS module; configure usage meters with the Home Manager module (tally.homeManagerModules.tally)";
     }

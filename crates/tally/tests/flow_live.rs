@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::Path;
+use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -52,6 +53,7 @@ const PARTIAL_FAILURE_RUN: &str = "00000000-0000-4000-8000-000000000513";
 const REORDERED_RUN: &str = "00000000-0000-4000-8000-000000000514";
 const CATALOG_PIN_RUN: &str = "00000000-0000-4000-8000-000000000515";
 const REGEX_RESULT_RUN: &str = "00000000-0000-4000-8000-000000000516";
+const SPEC_BUILD_RUN: &str = "00000000-0000-4000-8000-000000000517";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -738,6 +740,43 @@ fn runner(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     command
+}
+
+fn repository_fixture(path: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(path)
+}
+
+fn copy_fixture_tree(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).unwrap();
+    for entry in fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_fixture_tree(&entry.path(), &target);
+        } else {
+            fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn fixture_git(directory: &Path, arguments: &[&str]) -> String {
+    let output = StdCommand::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(arguments)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git -C {} {:?}\nstdout:\n{}\nstderr:\n{}",
+        directory.display(),
+        arguments,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 
 async fn rpc(socket: &Path) -> RpcClient {
@@ -2143,6 +2182,249 @@ async fn retry_cancellation_cap_and_partial_failure_are_live_end_to_end() {
                 "catalog-changed-mid-run"
             );
             assert_eq!(flow_items(&client, CATALOG_PIN_RUN).await.len(), 1);
+
+            daemon.stop().await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
+    let _environment = ENVIRONMENT_LOCK.lock().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let checkout = temp.path().join("checkout");
+            let remote = temp.path().join("remote.git");
+            let control = temp.path().join("control");
+            let workspace_root = temp.path().join("workspaces");
+            fs::create_dir_all(&control).unwrap();
+
+            copy_fixture_tree(
+                &repository_fixture("test/fixtures/spec-build/repo"),
+                &checkout,
+            );
+            fixture_git(
+                temp.path(),
+                &["init", "--bare", "--initial-branch=main", "remote.git"],
+            );
+            fixture_git(&checkout, &["init", "--initial-branch=main"]);
+            fixture_git(&checkout, &["config", "user.name", "Tally Fixture"]);
+            fixture_git(
+                &checkout,
+                &["config", "user.email", "tally-fixture@invalid"],
+            );
+            fixture_git(&checkout, &["add", "."]);
+            fixture_git(&checkout, &["commit", "-m", "fixture: frozen spec"]);
+            fixture_git(
+                &checkout,
+                &["remote", "add", "origin", remote.to_str().unwrap()],
+            );
+            fixture_git(&checkout, &["push", "--set-upstream", "origin", "main"]);
+
+            let driver = temp.path().join("spec-build-driver");
+            shell_program::install(
+                &driver,
+                format!(
+                    "#!/bin/sh\nexec python3 '{}' \"$@\"\n",
+                    repository_fixture("examples/flows/spec_build_driver.py").display()
+                ),
+            );
+
+            let mut config = config();
+            for (name, resource, capacity) in [
+                ("campaign-control", ResourceKind::CpuSlot, 4),
+                ("campaign-agent", ResourceKind::Slot, 1),
+            ] {
+                config.pools.insert(
+                    name.to_owned(),
+                    PoolConfig {
+                        resource,
+                        capacity,
+                        predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+                        ..PoolConfig::default()
+                    },
+                );
+            }
+            config.adapters.insert(
+                "spec-build-driver".to_owned(),
+                AdapterConfig {
+                    scrape: BTreeMap::from([(
+                        "finalMessage".to_owned(),
+                        ScrapeCapture {
+                            stream: ScrapeStream::Stdout,
+                            mode: ScrapeMode::Regex,
+                            pattern: "^TALLY_FINAL_MESSAGE=(.*)$".to_owned(),
+                        },
+                    )]),
+                    ..AdapterConfig::default()
+                },
+            );
+            config.validate().unwrap();
+            let config_path = temp.path().join("config.json");
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+            let daemon_paths = paths(&temp.path().join("daemon"));
+            let daemon = start_daemon(&daemon_paths, config).await;
+            let client = rpc(&daemon_paths.socket).await;
+            let script = repository_fixture("examples/flows/spec-build.js");
+            let agent = repository_fixture("test/fixtures/spec-build/shell-agent.py");
+            let gate = repository_fixture("test/fixtures/spec-build/gate.sh");
+            let arguments = json!({
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "issue": {
+                    "number": "7",
+                    "url": "https://github.com/acme/spec/issues/7"
+                },
+                "runId": "fixture-comment-7",
+                "repositories": {
+                    "acme/spec": {
+                        "checkout": checkout,
+                        "baseBranch": "main",
+                        "remote": "origin",
+                        "forge": "local"
+                    }
+                },
+                "worklist": "specs/*/tasks.json",
+                "maxTasks": 3,
+                "workspaceRoot": workspace_root,
+                "driver": driver,
+                "driverRuntimeMaxSec": 30,
+                "agent": {
+                    "adapter": "shell",
+                    "argv": ["python3", agent, control],
+                    "priority": "low",
+                    "runtimeMaxSec": 30
+                },
+                "gates": [{
+                    "id": "fixture",
+                    "argv": ["/bin/sh", gate, control]
+                }]
+            })
+            .to_string();
+
+            let first = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN,
+                &arguments,
+                20,
+            )
+            .spawn()
+            .unwrap();
+            let first = runner_output(first).await;
+            assert_eq!(first.status.code(), Some(1));
+            assert_eq!(flow_failure(&first)["error"]["code"], "terminal-failure");
+
+            let first_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 4).await;
+            assert_eq!(
+                first_items.len(),
+                4,
+                "fail-fast must admit only worklist, prep, agent, and the first gate"
+            );
+            let mut failed_gate = None;
+            for item in &first_items {
+                let terminal = client
+                    .call(
+                        "queue.await_job",
+                        Some(json!({"task_uuid": item["anchor"]})),
+                    )
+                    .await
+                    .unwrap();
+                if terminal["verdict"] == "failed" {
+                    assert!(failed_gate.is_none(), "only the first gate may fail");
+                    failed_gate = terminal["task_uuid"].as_str().map(str::to_owned);
+                }
+            }
+            let failed_gate = failed_gate.expect("the first task gate did not fail");
+            assert_eq!(
+                fs::read_to_string(control.join("agent-order.log")).unwrap(),
+                "task-1\n"
+            );
+            assert!(!control.join("gate-order.log").exists());
+            assert_eq!(
+                fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
+                "1",
+                "fail-fast must stop before publish, merge, and task-2 prep"
+            );
+
+            let retry = client
+                .call(
+                    "queue.retry",
+                    Some(json!({"task_uuid": failed_gate.clone()})),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry["attempt"], 2);
+            let retried = tokio::time::timeout(
+                Duration::from_secs(20),
+                client.call(
+                    "queue.await_job",
+                    Some(json!({"task_uuid": failed_gate.clone(), "attempt": 2})),
+                ),
+            )
+            .await
+            .expect("retried gate timed out")
+            .unwrap();
+            assert_eq!(retried["verdict"], "pass");
+
+            let replay = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN,
+                &arguments,
+                20,
+            )
+            .spawn()
+            .unwrap();
+            let replay = runner_output(replay).await;
+            assert!(
+                replay.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&replay.stdout),
+                String::from_utf8_lossy(&replay.stderr)
+            );
+            let submitted = runner_events(&replay, "node-submitted");
+            assert_eq!(submitted.len(), 11);
+            assert!(submitted[..4]
+                .iter()
+                .all(|event| event["disposition"] == "reused"));
+            assert!(submitted[4..]
+                .iter()
+                .all(|event| event["disposition"] == "created"));
+            assert_eq!(flow_items(&client, SPEC_BUILD_RUN).await.len(), 11);
+
+            fixture_git(&checkout, &["fetch", "origin", "main"]);
+            assert_eq!(
+                fixture_git(&checkout, &["show", "origin/main:build/one.txt"]),
+                "one"
+            );
+            assert_eq!(
+                fixture_git(&checkout, &["show", "origin/main:build/two.txt"]),
+                "two"
+            );
+            let first_parent = fixture_git(
+                &checkout,
+                &["rev-list", "--first-parent", "--reverse", "origin/main"],
+            );
+            let commits = first_parent.lines().collect::<Vec<_>>();
+            assert_eq!(commits.len(), 3, "initial commit plus two task merges");
+            assert_eq!(
+                fixture_git(&checkout, &["show", "origin/main:build/task-2-base.txt"],),
+                commits[1],
+                "task 2 must be prepared from task 1's merge commit"
+            );
+            assert_eq!(
+                fs::read_to_string(control.join("agent-order.log")).unwrap(),
+                "task-1\ntask-2\n"
+            );
+            assert_eq!(
+                fs::read_to_string(control.join("gate-order.log")).unwrap(),
+                "task-1\ntask-2\n"
+            );
 
             daemon.stop().await;
         })
