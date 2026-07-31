@@ -56,10 +56,23 @@ agent implements (scope = the task; steering = campaign-issue comments) →
 deterministic gate nodes (per-repo commands, passed as args) → push + PR →
 merge on green — then the next task's prep sees the merged result. Fail-fast
 on the first red gate; replay reuses the witnessed prefix, so a stopped or
-budget-exhausted run continues where it died (#234). Once the crm campaign
-proves this flow end-to-end, it graduates into a module surface
-(`services.tally.campaigns`, #235) and a new campaign becomes: freeze the
-spec, open one labeled issue, mention it.
+budget-exhausted run continues where it died (#234).
+
+Context engineering note: "the spec repo is the work source" does not mean
+each agent reads the whole spec. The worklist node projects the tasks
+artifact into per-task briefs (goal, behaviors, read-first pointers,
+style-transfer citations, acceptance), and each agent node receives only its
+own brief through the structured brief transport — the same curation the
+minted issue bodies carried (they were generated from tasks.md sections
+nearly 1:1), now schema-validated, witnessed, and without the GitHub
+round-trip.
+
+Separation of concerns, ruled 2026-07-31: the mechanism is completed and
+validated **inside tally.nix** — generic flow + `services.tally.campaigns`
+module (#235) proven against a fixture spec repo by this repo's own checks —
+and consumer campaigns (crm first) restart on the finished mechanism. The
+tool's roadmap never gates on a consumer project's schedule, and no consumer
+runs on a throwaway estate prototype.
 
 ## The incident: first real agent node, dead in 89 ms
 
@@ -132,5 +145,9 @@ lifecycle stream, and only present in the capture files.
 |---|---|---|
 | #232 | Derive executor cwd from `workspace.worktreePath` | Blocks everything; first |
 | #233 | `tally adapter smoke <name>` — close the verified-live gap | After #232 lands, smoke codex on the estate |
-| #234 | Replay-as-continuation across the 24 h wall-clock budget: docs + test | Before the first full-length campaign run |
-| #235 | `services.tally.campaigns` module | Gated on the crm campaign completing on the estate prototype |
+| #234 | Replay-as-continuation across the 24 h wall-clock budget: docs + test | Before campaigns are documented as arbitrarily long |
+| #235 | `services.tally.campaigns` module + generic spec-build flow | Self-contained: fixture-driven checks in this repo; depends on #232 only |
+
+Order of operations: #232 → #233 → #234/#235 land in this repository, each
+proven by its own tests; then the crm campaign restarts as the first
+consumer of the finished mechanism.
