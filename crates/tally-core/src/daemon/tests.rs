@@ -20,8 +20,8 @@ mod tests {
     use crate::evidence::{hash_artifact_file, RetryPolicy};
     use crate::wire::RequestId;
     use crate::executor::{
-        read_exit_record, write_exit_record, ExecutionPaths, LocalUnitFact, LocalUnitProbe,
-        LocalUnitState, RemoteCapture, RemoteCompletion, RemoteExecutorReply,
+        read_exit_record, write_exit_record, ExecutionBackend, ExecutionPaths, LocalUnitFact,
+        LocalUnitProbe, LocalUnitState, RemoteCapture, RemoteCompletion, RemoteExecutorReply,
         RemoteExecutorRequest, RemoteExecutorResult, RemoteTransport, RemoteTransportError,
         UnitExitRecord, REMOTE_EXECUTOR_PROTOCOL_VERSION, UNIT_EXIT_SCHEMA_VERSION,
     };
@@ -3924,12 +3924,12 @@ mod tests {
                         "argv": ["author wave 3"],
                         "pool": "slot",
                         "adapter": "codex",
-                        "cwd": "/worktrees/issue-28",
+                        "cwd": "/worktrees/explicit-issue-28",
                         "workspace": {
                             "repo": "mecattaf/tally.nix",
                             "baseRev": "origin/main",
                             "branch": "wave-3-ergonomics",
-                            "worktreePath": "/worktrees/issue-28"
+                            "worktreePath": "/worktrees/workspace-issue-28"
                         },
                         "adapterOptions": {
                             "prePromptArgv": ["--dangerously-bypass-approvals-and-sandbox"],
@@ -3958,7 +3958,7 @@ mod tests {
                         "--json",
                         "--dangerously-bypass-approvals-and-sandbox",
                         "-C",
-                        "/worktrees/issue-28",
+                        "/worktrees/explicit-issue-28",
                         "--",
                         "author wave 3",
                     ]
@@ -3979,6 +3979,11 @@ mod tests {
                     false,
                 )
                 .unwrap();
+                assert_eq!(
+                    request.cwd.as_deref(),
+                    Some(Path::new("/worktrees/explicit-issue-28")),
+                    "an explicit payload cwd must win over workspace.worktreePath"
+                );
                 let args = executor
                     .build_systemd_argv(&request)
                     .unwrap()
@@ -3987,13 +3992,15 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert!(args
                     .windows(2)
-                    .any(|pair| { pair == ["--working-directory", "/worktrees/issue-28"] }));
+                    .any(|pair| {
+                        pair == ["--working-directory", "/worktrees/explicit-issue-28"]
+                    }));
                 for expected in [
                     "NO_COLOR=1",
                     "TALLY_WORKSPACE_REPO=mecattaf/tally.nix",
                     "TALLY_WORKSPACE_BASE_REV=origin/main",
                     "TALLY_WORKSPACE_BRANCH=wave-3-ergonomics",
-                    "TALLY_WORKSPACE_PATH=/worktrees/issue-28",
+                    "TALLY_WORKSPACE_PATH=/worktrees/workspace-issue-28",
                 ] {
                     assert!(args.windows(2).any(|pair| pair == ["--setenv", expected]));
                 }
@@ -4004,7 +4011,7 @@ mod tests {
                     "--json".to_owned(),
                     "--dangerously-bypass-approvals-and-sandbox".to_owned(),
                     "-C".to_owned(),
-                    "/worktrees/issue-28".to_owned(),
+                    "/worktrees/explicit-issue-28".to_owned(),
                     "--".to_owned(),
                     "author wave 3".to_owned(),
                 ]));
@@ -4013,8 +4020,139 @@ mod tests {
                         .workspace
                         .unwrap()
                         .worktree_path,
-                    PathBuf::from("/worktrees/issue-28")
+                    PathBuf::from("/worktrees/workspace-issue-28")
                 );
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn flow_workspace_without_cwd_reaches_systemd_as_working_directory() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let worktree = temp.path().join("flow-worktree");
+                fs::create_dir(&worktree).unwrap();
+                let worktree_string = worktree.to_str().unwrap();
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor.clone(),
+                )
+                .await
+                .unwrap();
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": [
+                            "/bin/sh",
+                            "-c",
+                            "test \"$(pwd -P)\" = \"$1\"",
+                            "cwd-check",
+                            worktree_string
+                        ],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "orchestrator",
+                        "dedupKey": "flow:cwd-regression:0",
+                        "submission": {"mode": "full"},
+                        "orchestration": {
+                            "flowName": "cwd-regression",
+                            "flowRunId": "00000000-0000-4000-8000-000000000232",
+                            "scriptHash": "sha256:cwd-regression",
+                            "nodeOrdinal": 0,
+                            "maxNodes": 1
+                        },
+                        "workspace": {
+                            "repo": "mecattaf/tally.nix",
+                            "baseRev": "origin/main",
+                            "branch": "issue-232",
+                            "worktreePath": worktree_string
+                        },
+                        "evidence": [],
+                        "noEnqueue": true,
+                        "credentials": {},
+                        "wait": false
+                    })))
+                    .await
+                    .unwrap();
+                let job_id = Uuid::parse_str(admitted["job_id"].as_str().unwrap()).unwrap();
+                let job = daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&job_id)
+                    .cloned()
+                    .unwrap();
+                assert!(job.row.cwd.is_none(), "flows do not submit raw cwd");
+
+                let request = execution_request(
+                    &executor,
+                    &job,
+                    settings().unit_limits,
+                    ("/run/tally/tally.sock", None),
+                    &paths.data_dir,
+                    &GitAiConfig::default(),
+                    false,
+                )
+                .unwrap();
+                assert_eq!(
+                    request.cwd.as_deref(),
+                    Some(worktree.as_path())
+                );
+                let args = executor
+                    .build_systemd_argv(&request)
+                    .unwrap()
+                    .into_iter()
+                    .map(|argument| argument.into_string().unwrap())
+                    .collect::<Vec<_>>();
+                assert!(args.windows(2).any(|pair| {
+                    pair[0] == "--working-directory" && pair[1] == worktree_string
+                }));
+
+                let mut invalid_job = job.clone();
+                invalid_job
+                    .row
+                    .workspace
+                    .as_mut()
+                    .unwrap()
+                    .worktree_path = PathBuf::from("/worktrees/issue-%n");
+                let invalid_request = execution_request(
+                    &executor,
+                    &invalid_job,
+                    settings().unit_limits,
+                    ("/run/tally/tally.sock", None),
+                    &paths.data_dir,
+                    &GitAiConfig::default(),
+                    false,
+                )
+                .unwrap();
+                assert!(matches!(
+                    executor.build_systemd_argv(&invalid_request),
+                    Err(ExecutorError::InvalidRequest(detail))
+                        if detail == "working directory must not contain systemd specifier character %"
+                ));
+
+                let outcome = executor.execute(request).await.unwrap();
+                assert_eq!(outcome.backend, ExecutionBackend::Direct);
+                assert_eq!(outcome.termination, ExecutionTermination::Exited(0));
             })
             .await;
     }

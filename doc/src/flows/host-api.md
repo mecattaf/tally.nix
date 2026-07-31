@@ -98,7 +98,7 @@ The first argument must be a JSON-serializable object. Its public fields are:
 | `runtimeMaxSec` | Optional positive process deadline. |
 | `evidence` | Optional canonical evidence list: at most one `exit:<0..255>`, any number of `artifact:<path>` with a non-empty path, `store:<nix-store-path>` with no duplicate path, and at most one `hash:sha256[:<digest>]`. |
 | `evidenceClass`, `manifestHash` | Optional evidence-policy values passed to the daemon. |
-| `workspace` | Optional object with exactly `repo`, `baseRev`, `branch`, and absolute `worktreePath` strings. |
+| `workspace` | Optional object with exactly `repo`, `baseRev`, `branch`, and absolute `worktreePath` strings. Because flows do not expose raw `cwd`, a node with workspace metadata executes with `cwd = workspace.worktreePath`. |
 | `brief` | Optional structured JSON object delivered out of band through `TALLY_BRIEF`. |
 | `key` | Optional flow-local author key, rendered as `flow:<run-id>:k:<key>`. It must be unique in one evaluation. |
 | `dedupKey` | Optional raw, potentially cross-run key. It is mutually exclusive with `key`; use it only when cross-run identity is intentional. |
