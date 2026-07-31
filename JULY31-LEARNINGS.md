@@ -58,14 +58,40 @@ merge on green — then the next task's prep sees the merged result. Fail-fast
 on the first red gate; replay reuses the witnessed prefix, so a stopped or
 budget-exhausted run continues where it died (#234).
 
-Context engineering note: "the spec repo is the work source" does not mean
-each agent reads the whole spec. The worklist node projects the tasks
-artifact into per-task briefs (goal, behaviors, read-first pointers,
-style-transfer citations, acceptance), and each agent node receives only its
-own brief through the structured brief transport — the same curation the
-minted issue bodies carried (they were generated from tasks.md sections
-nearly 1:1), now schema-validated, witnessed, and without the GitHub
-round-trip.
+### Where the work graph lives, and what each agent actually reads
+
+A fair objection to "the spec repo is the work source": doesn't that force
+every agent tally dispatches to read the entire project spec, where curated
+issues gave each one a selected context? The objection names a real failure
+mode but attributes it to the wrong layer. Three layers, separated:
+
+- **The work graph is data.** Decomposition, ordering, dependencies, and
+  acceptance criteria live in the spec repo's tasks artifact. It is authored
+  once, at spec-freeze time, where the human effort belongs.
+- **The flow is the interpreter, not the graph.** The generic `spec-build`
+  flow knows nothing about any project. Its first node witnesses the tasks
+  artifact into a schema-validated JSON worklist; every later node is
+  derived from that witnessed result. Same flow for every campaign; only the
+  data varies.
+- **Each agent receives a per-task brief, never the corpus.** The worklist
+  node projects the artifact into one brief per task — goal, delivered
+  behaviors, read-first pointers into specific spec sections,
+  style-transfer reference files, runnable acceptance criteria — and the
+  agent node carries only its own brief through the structured brief
+  transport (`TALLY_BRIEF`). The agent's context is its brief plus exactly
+  the files the brief cites.
+
+"Read tasks.md and do T05" would indeed be lazy context engineering — a
+whole task file plus the spec in every context window. But the curated
+issues never solved that problem; they inherited its solution. The issue
+bodies were generated from tasks.md sections nearly 1:1 — the curation was
+always authored in the tasks artifact, and GitHub was a copy of it. Brief
+projection keeps the identical per-task selection while adding what issue
+bodies never had: schema validation at the worklist boundary, witnessed
+provenance, and no GitHub round-trip on the dispatch path. GitHub keeps the
+roles it is good at — the doorbell (intake mention), the window (receipts,
+evidence, PRs, progress), the margin notes (steering comments) — and stops
+being the blueprint.
 
 Separation of concerns, ruled 2026-07-31: the mechanism is completed and
 validated **inside tally.nix** — generic flow + `services.tally.campaigns`
