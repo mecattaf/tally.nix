@@ -8,15 +8,19 @@ authorized.
 
 ### Added
 
+- Added flow-node `approvalPolicy` and `sandboxPolicy` fields plus campaign
+  `agentApprovalPolicy`/`agentSandboxPolicy` options. Spec-build implementation
+  agents now default to Codex's writable `workspace-write` + `on-request`
+  pairing, while adapters without named policy maps can opt out explicitly.
 - Added `tally adapter smoke <name>` to execute one bounded, witnessed job
   through real admission, transient-unit launch, capture, and adapter scraping;
   failed smokes now print a bounded excerpt from the retained stderr capture.
 - Added first-class Home Manager `services.tally.campaigns.<name>` support: one
   attrset now renders the generic witnessed `spec-build` flow, a scoped GitHub
   mention producer, campaign mutex and node pools, and the packaged policy
-  driver. A fixture repository and live shell-adapter test prove per-task brief
-  delivery, merge-before-next-prep ordering, fail-fast gates, and explicit
-  replay continuation.
+  driver. A fixture repository and live policy-bearing agent-adapter test prove
+  per-task brief delivery, merge-before-next-prep ordering, fail-fast gates,
+  and explicit replay continuation.
 - Documented fixed-budget replay as the continuation mechanism for flow
   campaigns that exceed one 24-hour evaluation, and added a regression test
   proving that a budget-stopped run reuses its witnessed prefix, attaches to its

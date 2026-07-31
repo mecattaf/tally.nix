@@ -1938,6 +1938,28 @@ let
           default = "low";
           description = "Priority of each campaign implementation node.";
         };
+        agentApprovalPolicy = mkOption {
+          type = types.nullOr types.str;
+          default = "on-request";
+          example = "never";
+          description = ''
+            Named adapter approval policy for implementation nodes. The
+            default pairs with workspace-write so an agent may request an
+            adapter-supported escalation. Set null only when the selected
+            adapter declares no approval policies.
+          '';
+        };
+        agentSandboxPolicy = mkOption {
+          type = types.nullOr types.str;
+          default = "workspace-write";
+          example = "read-only";
+          description = ''
+            Named adapter sandbox policy for implementation nodes. The
+            writable default matches the node's obligation to create commits;
+            set read-only explicitly for a non-writing agent, or null only
+            when the selected adapter declares no sandbox policies.
+          '';
+        };
         agentRuntimeMaxSec = mkOption {
           type = types.nullOr types.ints.positive;
           default = 14400;
@@ -1998,6 +2020,14 @@ let
         {
           assertion = config.agentArgv != [ ] && builtins.head config.agentArgv != "";
           message = "tally campaign ${name} agentArgv must start with a non-empty value";
+        }
+        {
+          assertion = config.agentApprovalPolicy == null || config.agentApprovalPolicy != "";
+          message = "tally campaign ${name} agentApprovalPolicy must be null or non-empty";
+        }
+        {
+          assertion = config.agentSandboxPolicy == null || config.agentSandboxPolicy != "";
+          message = "tally campaign ${name} agentSandboxPolicy must be null or non-empty";
         }
         {
           assertion = validComponent config.pool.name;
@@ -2744,6 +2774,8 @@ let
       argv = campaign.agentArgv;
       priority = campaign.agentPriority;
       runtimeMaxSec = campaign.agentRuntimeMaxSec;
+      approvalPolicy = campaign.agentApprovalPolicy;
+      sandboxPolicy = campaign.agentSandboxPolicy;
     };
     gates = renderCampaignGates campaign.gates;
   };
@@ -2971,6 +3003,30 @@ let
         {
           assertion = !campaign.enable || builtins.hasAttr campaign.agent cfg.adapters;
           message = "tally campaign ${name} references unknown agent adapter ${campaign.agent}";
+        }
+        {
+          assertion =
+            !campaign.enable
+            || campaign.agentApprovalPolicy == null
+            || (
+              builtins.hasAttr campaign.agent cfg.adapters
+              &&
+                builtins.hasAttr campaign.agentApprovalPolicy
+                  cfg.adapters.${campaign.agent}.launch.approvalPolicies
+            );
+          message = "tally campaign ${name} agentApprovalPolicy is not declared by adapter ${campaign.agent}";
+        }
+        {
+          assertion =
+            !campaign.enable
+            || campaign.agentSandboxPolicy == null
+            || (
+              builtins.hasAttr campaign.agent cfg.adapters
+              &&
+                builtins.hasAttr campaign.agentSandboxPolicy
+                  cfg.adapters.${campaign.agent}.launch.sandboxPolicies
+            );
+          message = "tally campaign ${name} agentSandboxPolicy is not declared by adapter ${campaign.agent}";
         }
         {
           assertion = !campaign.enable || cfg.enqueue.fanoutCap >= campaignMaxNodes campaign;

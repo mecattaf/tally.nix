@@ -104,6 +104,7 @@ The first argument must be a JSON-serializable object. Its public fields are:
 | `dedupKey` | Optional raw, potentially cross-run key. It is mutually exclusive with `key`; use it only when cross-run identity is intentional. |
 | `label` | Optional human-readable node label stored in orchestration provenance. |
 | `env` | Optional string map. Names beginning `TALLY_` and `CREDENTIALS_DIRECTORY` are reserved. |
+| `approvalPolicy`, `sandboxPolicy` | Optional non-empty named policies. The selected adapter must declare each name in its closed launch-policy map; the host normalizes both into `adapterOptions`. |
 | `resultSchema` | Optional valid JSON Schema for the projected result. It is checked by the runner after terminal acknowledgement. |
 
 There is deliberately no `consumptionEstimate` field. An unknown field is
@@ -242,11 +243,14 @@ fixed by the sugar raise `sugar-option-conflict`, other unknown fields raise
 failure behavior.
 
 Each sugar fixes a different set. `claude()` and `codex()` fix `adapter`, `pools`,
-`argv`, `prompt`, and `brief`; `local()` fixes those plus `adapterOptions` and
-`selection`; `sh()` fixes only `adapter`, `argv`, and `prompt`, so `sh()` is the
-one sugar whose caller chooses `pools`. A literal options object that sets a fixed
-field is rejected by `tally flow check` and by the generation build, not only at
-evaluation time — `claude(prompt, { pools: [...] })` fails at switch.
+`argv`, `prompt`, and `brief`, while allowing the script to select named approval
+and sandbox policies authorized by that adapter. `local()` fixes those policies
+along with `adapterOptions` and `selection`, because its launch object comes from
+the pinned catalog member. `sh()` fixes only `adapter`, `argv`, and `prompt`, so
+`sh()` is the one sugar whose caller chooses `pools`. A literal options object
+that sets a fixed field is rejected by `tally flow check` and by the generation
+build, not only at evaluation time — `claude(prompt, { pools: [...] })` fails at
+switch.
 
 ## `parallel(thunks, options?)`
 

@@ -9,7 +9,9 @@ use std::time::Duration;
 use chrono::Utc;
 use serde_json::{json, Value};
 use tally_client::RpcClient;
-use tally_core::adapters::{AdapterConfig, ScrapeCapture, ScrapeMode, ScrapeStream};
+use tally_core::adapters::{
+    AdapterConfig, AdapterLaunchConfig, ScrapeCapture, ScrapeMode, ScrapeStream,
+};
 use tally_core::config::{
     CoResidencyPredicate, Config, JournaldConfig, PoolConfig, PoolPredicate, ResourceKind,
 };
@@ -30,6 +32,7 @@ use tally_core::taskdb::{
 use tally_core::view::rebuild_taskchampion_view;
 use tally_core::wire::EnqueuePayload;
 use tally_core::witness::{read_verified_attestations, read_verified_records};
+use tally_flow::BRIEF_SENTINEL;
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
@@ -2230,6 +2233,7 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                     repository_fixture("examples/flows/spec_build_driver.py").display()
                 ),
             );
+            let agent = repository_fixture("test/fixtures/spec-build/policy-agent.py");
 
             let mut config = config();
             for (name, resource, capacity) in [
@@ -2260,6 +2264,30 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                     ..AdapterConfig::default()
                 },
             );
+            config.adapters.insert(
+                "codex".to_owned(),
+                AdapterConfig {
+                    argv: vec![
+                        "python3".to_owned(),
+                        agent.display().to_string(),
+                        control.display().to_string(),
+                        "--".to_owned(),
+                    ],
+                    launch: AdapterLaunchConfig {
+                        cwd_argv: Some(vec!["-C".to_owned(), "%<cwd>%".to_owned()]),
+                        approval_policies: BTreeMap::from([(
+                            "on-request".to_owned(),
+                            vec!["--ask-for-approval".to_owned(), "on-request".to_owned()],
+                        )]),
+                        sandbox_policies: BTreeMap::from([(
+                            "workspace-write".to_owned(),
+                            vec!["--sandbox".to_owned(), "workspace-write".to_owned()],
+                        )]),
+                        ..AdapterLaunchConfig::default()
+                    },
+                    ..AdapterConfig::default()
+                },
+            );
             config.validate().unwrap();
             let config_path = temp.path().join("config.json");
             fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
@@ -2268,7 +2296,6 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             let daemon = start_daemon(&daemon_paths, config).await;
             let client = rpc(&daemon_paths.socket).await;
             let script = repository_fixture("examples/flows/spec-build.js");
-            let agent = repository_fixture("test/fixtures/spec-build/shell-agent.py");
             let gate = repository_fixture("test/fixtures/spec-build/gate.sh");
             let arguments = json!({
                 "campaign": "fixture",
@@ -2292,10 +2319,12 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 "driver": driver,
                 "driverRuntimeMaxSec": 30,
                 "agent": {
-                    "adapter": "shell",
-                    "argv": ["python3", agent, control],
+                    "adapter": "codex",
+                    "argv": [BRIEF_SENTINEL],
                     "priority": "low",
-                    "runtimeMaxSec": 30
+                    "runtimeMaxSec": 30,
+                    "approvalPolicy": "on-request",
+                    "sandboxPolicy": "workspace-write"
                 },
                 "gates": [{
                     "id": "fixture",
@@ -2317,6 +2346,11 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             let first = runner_output(first).await;
             assert_eq!(first.status.code(), Some(1));
             assert_eq!(flow_failure(&first)["error"]["code"], "terminal-failure");
+            assert!(
+                !control.join("policy-error.log").exists(),
+                "{}",
+                fs::read_to_string(control.join("policy-error.log")).unwrap_or_default()
+            );
 
             let first_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 4).await;
             assert_eq!(
@@ -2342,6 +2376,10 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             assert_eq!(
                 fs::read_to_string(control.join("agent-order.log")).unwrap(),
                 "task-1\n"
+            );
+            assert_eq!(
+                fs::read_to_string(control.join("policy-order.log")).unwrap(),
+                "task-1:on-request:workspace-write\n"
             );
             assert!(!control.join("gate-order.log").exists());
             assert_eq!(
@@ -2420,6 +2458,10 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             assert_eq!(
                 fs::read_to_string(control.join("agent-order.log")).unwrap(),
                 "task-1\ntask-2\n"
+            );
+            assert_eq!(
+                fs::read_to_string(control.join("policy-order.log")).unwrap(),
+                "task-1:on-request:workspace-write\ntask-2:on-request:workspace-write\n"
             );
             assert_eq!(
                 fs::read_to_string(control.join("gate-order.log")).unwrap(),
