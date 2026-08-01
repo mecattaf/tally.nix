@@ -33,6 +33,20 @@ $ nix develop --command test/cargo-deny.sh
 $ nix flake check -L
 ```
 
+The live flow suite waits on fixed wall-clock budgets sized for an idle machine. When reproducing a
+suspected timeout on a loaded host, set `TALLY_TEST_TIMEOUT_SCALE` to a positive multiplier to widen
+every one of those budgets without editing the tests:
+
+```console
+$ TALLY_TEST_TIMEOUT_SCALE=3 cargo test -p tally --test flow_live
+```
+
+Unset means `1` and is byte-identical to the unscaled budgets. A value that is not a positive finite
+number panics rather than silently running unscaled. The variable is read from the test process
+environment, so it reaches a direct `cargo test` run only; the tests run by `nix flake check` execute
+inside `buildRustPackage`'s pure sandbox and never see it. Diagnosing a red gate happens on the
+direct path anyway. The knob widens waits; it never changes what a test asserts.
+
 `test/cargo-deny.sh` checks advisories, licenses, sources, and duplicate versions with Cargo in
 offline and locked mode. The development shell supplies the RustSec database revision pinned by
 the `advisory-db` flake input; refresh that input deliberately instead of fetching during the gate.
