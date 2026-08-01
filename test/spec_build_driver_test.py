@@ -957,12 +957,21 @@ class LaneLifecycleTests(unittest.TestCase):
                 DRIVER.action_rebase(
                     {
                         **old_brief,
+                        "domainsRequired": True,
                         "workspace": prepared,
                         "publication": {
                             "taskId": "task-1",
                             "branch": stable_branch,
                             "head": published_head,
                             "pullRequest": "local://acme/spec/task-1",
+                            "ownership": {
+                                "taskId": "task-1",
+                                "domainsRequired": True,
+                                "conflictDomains": ["owned-only.txt"],
+                                "ownedPaths": ["owned-only.txt"],
+                                "baseRev": prepared["baseRev"],
+                                "head": published_head,
+                            },
                         },
                         "constraints": [],
                     }
