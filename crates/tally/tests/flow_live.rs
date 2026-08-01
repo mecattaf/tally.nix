@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::time::Duration;
@@ -2395,6 +2395,11 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 control.display().to_string(),
                 "second".to_owned(),
             ];
+            // The pass writes its own successor here instead of posting a
+            // public `/tally reconcile` comment. A scratch directory keeps the
+            // fixture hermetic: nothing drains it, so the file itself is the
+            // observation.
+            let continuation_events = temp.path().join("continuation-events");
             let arguments = |run_id: &str, priority: &str| {
                 json!({
                     "campaign": "fixture",
@@ -2415,7 +2420,21 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     "worklist": "specs/*/tasks.json",
                     "maxTasks": 7,
                     "maxParallel": 3,
-                    "reconcileCommand": "/tally reconcile fixture",
+                    "continuation": {
+                        "argv": [
+                            env!("CARGO_BIN_EXE_tally"),
+                            "flow",
+                            "run",
+                            script,
+                            "--args-from-brief",
+                            "--max-nodes",
+                            "51"
+                        ],
+                        "pool": ["flow", "fixture-campaign"],
+                        "priority": "low",
+                        "runtimeMaxSec": 600,
+                        "eventsDir": continuation_events
+                    },
                     "workspaceRoot": workspace_root,
                     "tally": env!("CARGO_BIN_EXE_tally"),
                     "driver": driver,
@@ -2736,10 +2755,36 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(second_value["diagnoses"][0]["attempt"], 1);
             assert_eq!(second_value["diagnoses"][0]["blocked"], false);
             assert_eq!(second_value["diagnoses"][0]["redacted"], true);
-            assert_eq!(second_value["continuation"]["posted"], true);
+            assert_eq!(second_value["continuation"]["created"], true);
             assert_eq!(
-                second_value["continuation"]["command"],
-                "/tally reconcile fixture"
+                second_value["continuation"]["dedupKey"],
+                format!(
+                    "campaign-continuation:acme/spec:7:{}",
+                    second_value["continuation"]["runId"].as_str().unwrap()
+                )
+            );
+            let second_continuation = PathBuf::from(
+                second_value["continuation"]["event"].as_str().unwrap(),
+            );
+            assert!(second_continuation.starts_with(&continuation_events));
+            let second_event: Value =
+                serde_json::from_slice(&fs::read(&second_continuation).unwrap()).unwrap();
+            assert_eq!(second_event["source"], "events-dir");
+            assert_eq!(second_event["adapter"], "shell");
+            assert_eq!(second_event["pool"], json!(["flow", "fixture-campaign"]));
+            assert_eq!(
+                second_event["dedupKey"],
+                second_value["continuation"]["dedupKey"]
+            );
+            assert_eq!(
+                second_event["brief"]["runId"],
+                second_value["continuation"]["runId"],
+                "the next pass carries the derived continuation identity"
+            );
+            assert_eq!(second_event["brief"]["campaign"], "fixture");
+            assert_eq!(
+                second_event["argv"][1], "flow",
+                "a module-declared campaign re-enters through its own flow-run argv"
             );
             assert!(control.join("started-task-1").exists());
             assert!(control.join("started-task-3").exists());
@@ -2992,7 +3037,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             );
             assert_eq!(fourth_value["deferrals"], json!(["phase-one-checkpoint"]));
             assert_eq!(fourth_value["retries"], json!([]));
-            assert_eq!(fourth_value["continuation"]["posted"], true);
+            assert_eq!(fourth_value["continuation"]["created"], true);
             let fourth_submitted = runner_events(&fourth, "node-submitted");
             assert_eq!(fourth_submitted.len(), 29);
             assert!(fourth_submitted
@@ -3119,7 +3164,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(steer_value["diagnoses"][0]["attempt"], 1);
             assert_eq!(steer_value["diagnoses"][0]["blocked"], false);
             assert_eq!(steer_value["checkpoints"], json!([]));
-            assert_eq!(steer_value["continuation"]["posted"], true);
+            assert_eq!(steer_value["continuation"]["created"], true);
 
             let checkpoint_pass = runner(
                 &config_path,
@@ -3147,7 +3192,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(checkpoint_value["failures"], json!([]));
             assert_eq!(checkpoint_value["diagnoses"], json!([]));
             assert_eq!(checkpoint_value["merged"], json!([]));
-            assert_eq!(checkpoint_value["continuation"]["posted"], true);
+            assert_eq!(checkpoint_value["continuation"]["created"], true);
             assert_eq!(
                 checkpoint_value["reconciled"]["diagnoses"]
                     .as_array()
@@ -3237,7 +3282,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(sixth_value["diagnoses"][0]["taskId"], "task-2");
             assert_eq!(sixth_value["diagnoses"][0]["attempt"], 1);
             assert_eq!(sixth_value["diagnoses"][0]["blocked"], false);
-            assert_eq!(sixth_value["continuation"]["posted"], true);
+            assert_eq!(sixth_value["continuation"]["created"], true);
             let sixth_submitted = runner_events(&sixth, "node-submitted");
             assert_eq!(sixth_submitted.len(), 12);
             assert!(sixth_submitted
@@ -3356,7 +3401,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(seventh_value["diagnoses"][0]["taskId"], "task-2");
             assert_eq!(seventh_value["diagnoses"][0]["attempt"], 2);
             assert_eq!(seventh_value["diagnoses"][0]["blocked"], true);
-            assert_eq!(seventh_value["continuation"]["posted"], true);
+            assert_eq!(seventh_value["continuation"]["created"], true);
             let seventh_submitted = runner_events(&seventh, "node-submitted");
             assert_eq!(seventh_submitted.len(), 12);
             assert_eq!(
@@ -3781,9 +3826,9 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(faulted_value["retries"][0]["posted"], true);
             assert_eq!(faulted_value["retries"][0]["exhausted"], false);
             assert_eq!(
-                faulted_value["continuation"]["posted"],
+                faulted_value["continuation"]["created"],
                 true,
-                "the pass must post the mention that resumes the retry"
+                "the pass must write the event that resumes the retry"
             );
             let retry_ref = fixture_git(
                 &checkout,
@@ -3892,4 +3937,179 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             daemon.stop().await;
         })
         .await;
+}
+
+/// The events-dir continuation is the campaign's whole self-re-entry path, so
+/// this proves the loop end to end without a forge: the packaged driver writes
+/// one bounded payload, the daemon's drain admits it, and a second identical
+/// drop -- the shape a `tally-campaign-poll.timer` race produces -- resolves to
+/// an attach against the live job instead of a second pass.
+#[tokio::test(flavor = "current_thread")]
+async fn spec_build_continuation_event_admits_one_pass_and_attaches_the_duplicate() {
+    let _environment = ENVIRONMENT_LOCK.lock().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let checkout = temp.path().join("checkout");
+            fs::create_dir_all(&checkout).unwrap();
+            fixture_git(&checkout, &["init", "--initial-branch=main"]);
+
+            let mut config = config();
+            config.pools.insert(
+                "fixture-campaign".to_owned(),
+                PoolConfig {
+                    resource: ResourceKind::Mutex,
+                    capacity: 1,
+                    predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+                    ..PoolConfig::default()
+                },
+            );
+            config.validate().unwrap();
+
+            let daemon_paths = paths(&temp.path().join("daemon"));
+            let daemon = start_daemon(&daemon_paths, config).await;
+            let client = rpc(&daemon_paths.socket).await;
+            // Nothing may execute: a queued pass is what the duplicate has to
+            // attach to, and the capacity-1 mutex is what holds it there.
+            pause(&client, "fixture-campaign").await;
+
+            let events_dir = daemon_paths.events_dir();
+            let brief_path = temp.path().join("continue-brief.json");
+            fs::write(
+                &brief_path,
+                serde_json::to_vec(&json!({
+                    "campaign": "fixture",
+                    "repository": "acme/spec",
+                    "repositoryConfig": {
+                        "checkout": checkout,
+                        "baseBranch": "main",
+                        "remote": "origin",
+                        "forge": "github"
+                    },
+                    "issue": {
+                        "number": "7",
+                        "url": "https://github.com/acme/spec/issues/7"
+                    },
+                    "runId": "pass-1",
+                    "continuation": {
+                        "argv": ["/bin/true"],
+                        "pool": ["flow", "fixture-campaign"],
+                        "priority": "low",
+                        "runtimeMaxSec": 60,
+                        "eventsDir": events_dir
+                    },
+                    "brief": null
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            // A GitHub-forge continuation must never reach the forge, so the
+            // only `gh` on the driver's PATH refuses to run.
+            let stub_dir = temp.path().join("bin");
+            fs::create_dir_all(&stub_dir).unwrap();
+            shell_program::install(
+                &stub_dir.join("gh"),
+                "#!/bin/sh\necho 'gh must not be reachable from a continuation' >&2\nexit 91\n",
+            );
+            let stubbed_path = {
+                let mut value = OsString::from(&stub_dir);
+                value.push(":");
+                value.push(std::env::var_os("PATH").unwrap_or_default());
+                value
+            };
+
+            let run_continue = || {
+                let output = StdCommand::new("python3")
+                    .arg(repository_fixture("examples/flows/spec_build_driver.py"))
+                    .arg("continue")
+                    .env("PATH", &stubbed_path)
+                    .env("TALLY_BRIEF", &brief_path)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "driver continue failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let stdout = String::from_utf8(output.stdout).unwrap();
+                let line = stdout
+                    .lines()
+                    .find_map(|line| line.strip_prefix("TALLY_FINAL_MESSAGE="))
+                    .expect("driver emitted no final message");
+                serde_json::from_str::<Value>(line).unwrap()
+            };
+
+            let first = run_continue();
+            assert_eq!(first["created"], true);
+            assert_eq!(first["receipt"], Value::Null);
+            let event_path = PathBuf::from(first["event"].as_str().unwrap());
+            assert_eq!(event_path.parent().unwrap(), events_dir);
+            let payload: Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();
+            assert_eq!(payload["dedupKey"], first["dedupKey"]);
+
+            let drained = client.call("queue.drain", None).await.unwrap();
+            assert_eq!(drained["enqueued"], 1, "{drained}");
+            assert_eq!(drained["rejected"], 0, "{drained}");
+            assert!(!event_path.exists(), "a drained event must be archived");
+
+            let admitted = flow_jobs_with_dedup(&client, first["dedupKey"].as_str().unwrap()).await;
+            assert_eq!(admitted.len(), 1, "{admitted:?}");
+            let task_uuid = admitted[0]["taskUuid"].as_str().unwrap().to_owned();
+            assert_eq!(admitted[0]["source"], "events-dir");
+            assert_eq!(admitted[0]["disposition"], "created");
+            assert_eq!(admitted[0]["argv"], json!(["/bin/true"]));
+            assert_eq!(admitted[0]["pool"], json!(["fixture-campaign", "flow"]));
+            // Held by the capacity-1 campaign mutex, so the duplicate below has
+            // a live job to attach to instead of starting a second pass.
+            assert_eq!(admitted[0]["rowStatus"], "pending");
+            assert_eq!(admitted[0]["liveState"], "paused");
+
+            // The same pass, replayed: byte-identical payload, same identity.
+            let second = run_continue();
+            assert_eq!(second["dedupKey"], first["dedupKey"]);
+            assert_eq!(second["event"], first["event"]);
+            assert_eq!(second["created"], true);
+            let replayed: Value = serde_json::from_slice(&fs::read(&event_path).unwrap()).unwrap();
+            assert_eq!(replayed, payload);
+
+            // The poll-timer race: the identical payload straight through the
+            // enqueue kernel resolves against the live job.
+            let raced = client
+                .call("queue.enqueue", Some(payload.clone()))
+                .await
+                .unwrap();
+            assert_eq!(raced["disposition"], "attached", "{raced}");
+            assert_eq!(raced["task_uuid"], task_uuid);
+
+            let redrained = client.call("queue.drain", None).await.unwrap();
+            assert_eq!(redrained["enqueued"], 1, "{redrained}");
+            assert_eq!(redrained["rejected"], 0, "{redrained}");
+
+            let after = flow_jobs_with_dedup(&client, first["dedupKey"].as_str().unwrap()).await;
+            assert_eq!(
+                after.len(),
+                1,
+                "a duplicate event and a timer race must yield exactly one pass: {after:?}"
+            );
+            assert_eq!(after[0]["taskUuid"], task_uuid);
+            assert_eq!(after[0]["rowStatus"], "pending");
+
+            daemon.stop().await;
+        })
+        .await;
+}
+
+async fn flow_jobs_with_dedup(client: &RpcClient, dedup_key: &str) -> Vec<Value> {
+    let page = client
+        .call("query.jobs", Some(json!({"limit": 1000})))
+        .await
+        .unwrap();
+    page["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|item| item["dedupKey"] == dedup_key)
+        .cloned()
+        .collect()
 }

@@ -15,7 +15,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from typing import Any
 import uuid
 
@@ -54,6 +53,9 @@ MAX_MACHINE_RETRIES = 2
 MAX_RETRY_CHARS = 2_000
 MAX_DIAGNOSIS_CHARS = 12_000
 MAX_DIFF_CHARS = 128 * 1024
+# The daemon rejects an ingress file above 1 MiB. Refuse to write one instead
+# of leaving an unclaimable event in the drain directory.
+MAX_CONTINUATION_EVENT_BYTES = 1024 * 1024
 PUBLIC_REDACTION = "conservative-v2"
 # Receipts written by an earlier redactor stay readable: a redaction identity
 # this driver no longer writes must never brick a running campaign.
@@ -754,7 +756,6 @@ def forge_manifest(
         "maxParallel": max_parallel,
         "agent": agent,
         "gates": gates,
-        "reconcileCommand": None,
     }
     normalized_manifest = {
         "schemaVersion": 1,
@@ -2494,6 +2495,97 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def continuation_spec(value: Any) -> dict[str, Any]:
+    spec = object_exact(
+        value,
+        {"argv", "pool", "priority", "runtimeMaxSec", "eventsDir"},
+        "continuation",
+    )
+    events_dir = Path(required_string(spec.get("eventsDir"), "continuation.eventsDir", 4096))
+    if not events_dir.is_absolute():
+        fail("continuation.eventsDir must be absolute")
+    priority = spec.get("priority")
+    if priority not in {"interrupt", "high", "medium", "low"}:
+        fail("continuation.priority is not a declared priority")
+    runtime = spec.get("runtimeMaxSec")
+    if runtime is not None:
+        runtime = positive_integer(runtime, "continuation.runtimeMaxSec")
+    pool = string_list(spec.get("pool"), "continuation.pool", nonempty=True)
+    if len(pool) != len(set(pool)):
+        fail("continuation.pool must not repeat a pool")
+    return {
+        "argv": argv(spec.get("argv"), "continuation.argv"),
+        "pool": pool,
+        "priority": priority,
+        "runtimeMaxSec": runtime,
+        "eventsDir": events_dir,
+    }
+
+
+def continuation_run_id(campaign: str, repository: str, issue_number: str, run_id: str) -> str:
+    """Derive the successor pass identity from this pass's identity alone.
+
+    Bounded and deterministic: re-running the same pass derives the same
+    successor, so a duplicate event carries a byte-identical payload and the
+    enqueue kernel collapses it. Successive passes chain, so the identity is
+    fresh every time without growing.
+    """
+    material = "\n".join(["spec-build-continuation:v1", campaign, repository, issue_number, run_id])
+    return "continuation-" + hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def write_continuation_event(
+    spec: dict[str, Any], dedup_key: str, brief: Any
+) -> tuple[bool, Path]:
+    """Drop one bounded EnqueuePayload into the daemon's events directory.
+
+    `tally daemon drain` claims it atomically, the frozen enqueue kernel
+    deduplicates it, and the file is retained as an ingress audit record. The
+    name is derived from the dedup key, so an identical event that has not yet
+    been drained is refused here rather than collapsed later.
+    """
+    payload: dict[str, Any] = {
+        "argv": spec["argv"],
+        "adapter": "shell",
+        "pool": spec["pool"],
+        "priority": spec["priority"],
+        "source": "events-dir",
+        "dedupKey": dedup_key,
+        # Full submission is what arms the kernel's dedupKey x payloadHash
+        # dispositions. Without it the identity below is inert and a duplicate
+        # event would start a second pass.
+        "submission": {"mode": "full"},
+        "evidence": ["exit:0"],
+        "noEnqueue": False,
+    }
+    if spec["runtimeMaxSec"] is not None:
+        payload["runtimeMaxSec"] = spec["runtimeMaxSec"]
+    if brief is not None:
+        payload["brief"] = brief
+    events_dir: Path = spec["eventsDir"]
+    name = "campaign-continuation-" + hashlib.sha256(dedup_key.encode("utf-8")).hexdigest()[:32]
+    path = events_dir / f"{name}.json"
+    rendered = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    if len(rendered) > MAX_CONTINUATION_EVENT_BYTES:
+        fail("continuation payload exceeds the bounded event size")
+    events_dir.mkdir(parents=True, exist_ok=True)
+    temporary = events_dir / f".{name}.{uuid.uuid4()}.tmp"
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(rendered)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temporary, path)
+            created = True
+        except FileExistsError:
+            created = False
+    finally:
+        os.unlink(temporary)
+    return created, path
+
+
 def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
         brief,
@@ -2503,7 +2595,8 @@ def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
             "repositoryConfig",
             "issue",
             "runId",
-            "reconcileCommand",
+            "continuation",
+            "brief",
         },
         "continue brief",
     )
@@ -2516,38 +2609,41 @@ def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
     config = repo_config(data.get("repositoryConfig"))
     issue = campaign_issue(data.get("issue"))
     run_id = required_string(data.get("runId"), "runId", 512)
-    command = required_string(data.get("reconcileCommand"), "reconcileCommand", 300)
-    if not command.startswith("/"):
-        fail("reconcileCommand must be an explicit slash command")
-    if config["forge"] == "github":
-        post_verified_issue_comment(repository, issue["number"], command)
-        created = True
-    else:
-        run_key = hashlib.sha256(run_id.encode()).hexdigest()[:24]
-        ref = f"{local_state_prefix(campaign, issue['number'])}/continuation/{run_key}"
-        created, receipt = write_local_blob(
-            config,
-            ref,
-            {
-                "schemaVersion": 1,
-                "kind": "continuation",
-                "campaign": campaign,
-                "issueNumber": issue["number"],
-                "runId": run_id,
-                "command": command,
-            },
-        )
+    spec = continuation_spec(data.get("continuation"))
+    next_run_id = continuation_run_id(campaign, repository, issue["number"], run_id)
+    dedup_key = f"campaign-continuation:{repository}:{issue['number']}:{next_run_id}"
+    next_brief = data.get("brief")
+    if next_brief is not None:
+        if not isinstance(next_brief, dict):
+            fail("continue brief.brief must be an object or null")
+        next_brief = dict(next_brief)
+        next_brief["runId"] = next_run_id
+    created, path = write_continuation_event(spec, dedup_key, next_brief)
+    # The events directory is forge-independent, so a GitHub campaign posts no
+    # comment at all. A local-forge campaign keeps its durable blob receipt:
+    # the fixture suite reads continuation facts back from the forge.
+    receipt = None
+    if config["forge"] != "github":
+        ref = f"{local_state_prefix(campaign, issue['number'])}/continuation/{next_run_id}"
         expected = {
             "schemaVersion": 1,
             "kind": "continuation",
             "campaign": campaign,
             "issueNumber": issue["number"],
             "runId": run_id,
-            "command": command,
+            "dedupKey": dedup_key,
         }
-        if receipt != expected:
+        _, observed = write_local_blob(config, ref, expected)
+        if observed != expected:
             fail(f"local forge continuation {ref!r} disagrees with this pass")
-    return {"command": command, "posted": created}
+        receipt = f"local://{repository}/{ref}"
+    return {
+        "event": str(path),
+        "dedupKey": dedup_key,
+        "runId": next_run_id,
+        "created": created,
+        "receipt": receipt,
+    }
 
 
 def safe_slug(value: str, maximum: int) -> str:
@@ -4446,64 +4542,6 @@ def github_checkpoint_progress_comment(
             ],
             input_text=updated_body,
         )
-def issue_comment_bodies(repository: str, issue_number: str) -> subprocess.CompletedProcess[str]:
-    return run(
-        [
-            "gh",
-            "api",
-            "--paginate",
-            f"repos/{repository}/issues/{issue_number}/comments?per_page=100",
-            "--jq",
-            ".[].body",
-        ],
-        check=False,
-    )
-
-
-def post_verified_issue_comment(repository: str, issue_number: str, body: str) -> None:
-    failures: list[str] = []
-    for attempt in range(3):
-        before = issue_comment_bodies(repository, issue_number)
-        if before.returncode != 0:
-            detail = before.stderr.strip() or before.stdout.strip() or "no output"
-            failures.append(f"attempt {attempt + 1} preflight read: {detail}")
-        else:
-            before_count = before.stdout.splitlines().count(body)
-            posted = run(
-                [
-                    "gh",
-                    "issue",
-                    "comment",
-                    issue_number,
-                    "--repo",
-                    repository,
-                    "--body",
-                    body,
-                ],
-                check=False,
-            )
-            after = issue_comment_bodies(repository, issue_number)
-            if after.returncode == 0 and after.stdout.splitlines().count(body) > before_count:
-                return
-            post_detail = (
-                "posted"
-                if posted.returncode == 0
-                else posted.stderr.strip() or posted.stdout.strip() or "no output"
-            )
-            verify_detail = (
-                "comment count did not advance"
-                if after.returncode == 0
-                else after.stderr.strip() or after.stdout.strip() or "no output"
-            )
-            failures.append(
-                f"attempt {attempt + 1} post={post_detail}; verification={verify_detail}"
-            )
-        if attempt < 2:
-            time.sleep(2**attempt)
-    fail(
-        f"could not post and verify continuation comment on {repository}#{issue_number} "
-        f"after 3 attempts: {'; '.join(failures)}"
-    )
 
 
 def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:

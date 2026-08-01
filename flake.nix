@@ -3527,6 +3527,7 @@
               {
                 activationPackage = campaignHome.activationPackage;
                 checkedConfig = checkedCampaignConfig;
+                stockConfig = checkedHomeConfig;
                 pollScript = campaignPollScript;
                 nativeBuildInputs = [
                   pkgs.git
@@ -3549,7 +3550,6 @@
                 fi
                 jq -e '
                   .producers["campaign-fixture"].enqueue.brief as $fixtureArgs |
-                  .producers["campaign-fixture-reconcile"].enqueue.brief as $reconcileArgs |
                   .producers["campaign-defaulted"].enqueue.brief as $defaultedArgs |
                   .enqueue.fanoutCap == 64 and
                   .pools["fixture-campaign"].resource == "mutex" and
@@ -3608,22 +3608,30 @@
                     "${tally}/bin/tally", "flow", "run"
                   ] and
                   .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "51"] and
-                  .producers["campaign-fixture-reconcile"].kind == "gh" and
-                  .producers["campaign-fixture-reconcile"].allowSelfTriggered == true and
-                  .producers["campaign-fixture-reconcile"].allowedActors == ["operator"] and
-                  .producers["campaign-fixture-reconcile"].postReceipt == false and
-                  .producers["campaign-fixture-reconcile"].postFailureEvidence == true and
-                  .producers["campaign-fixture-reconcile"].postFailureStderr == true and
-                  .producers["campaign-fixture-reconcile"].triggers.commandComments == ["/tally reconcile fixture"] and
-                  .producers["campaign-fixture-reconcile"].enqueue.pool == ["fixture-campaign", "flow"] and
-                  .producers["campaign-fixture-reconcile"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "51"] and
-                  $reconcileArgs.reconcileCommand == "/tally reconcile fixture" and
+                  ([.producers | keys[] | select(test("reconcile"))] == []) and
+                  ([.producers | keys[] | select(startswith("campaign-"))]
+                    == ["campaign-continuation", "campaign-defaulted", "campaign-fixture"]) and
+                  .producers["campaign-continuation"].kind == "events-dir" and
+                  .producers["campaign-continuation"].pollIntervalSec == 5 and
+                  ($fixtureArgs.continuation.argv
+                    == .producers["campaign-fixture"].enqueue.argv) and
+                  $fixtureArgs.continuation.pool == ["flow", "fixture-campaign"] and
+                  $fixtureArgs.continuation.priority == "low" and
+                  ($fixtureArgs.continuation.eventsDir | endswith("/events")) and
+                  ($fixtureArgs | has("reconcileCommand") | not) and
                   .producers["campaign-defaulted"].allowSelfTriggered == false
                   and .producers["campaign-defaulted"].postFailureEvidence == false
                   and .producers["campaign-defaulted"].postFailureStderr == false
-                  and .producers["campaign-defaulted-reconcile"].postFailureEvidence == false
-                  and .producers["campaign-defaulted-reconcile"].postFailureStderr == false
                 ' "$checkedConfig" >/dev/null
+
+                # The generic drain is installed once and unconditionally, so a
+                # host with only the poll surface and no declared campaign
+                # still renders it: arming needs no Nix change.
+                jq -e '
+                  ([.producers | keys[] | select(startswith("campaign-"))]
+                    == ["campaign-continuation"]) and
+                  .producers["campaign-continuation"].kind == "events-dir"
+                ' "$stockConfig" >/dev/null
 
                 cp -R ${./test/fixtures/spec-build/repo} "$TMPDIR/spec"
                 chmod -R u+w "$TMPDIR/spec"
@@ -3969,7 +3977,12 @@
                   .worklist == "specs/*/tasks.json" and
                   .maxTasks == 7 and
                   .maxParallel == 3 and
-                  .reconcileCommand == "/tally reconcile fixture" and
+                  (.continuation.argv | index("--args-from-brief")) == 4 and
+                  .continuation.argv[6] == "51" and
+                  .continuation.pool == ["flow", "fixture-campaign"] and
+                  .continuation.priority == "low" and
+                  (.continuation.eventsDir | endswith("/events")) and
+                  (has("reconcileCommand") | not) and
                   .tally == "${tally}/bin/tally" and
                   .repositories["acme/spec"].baseBranch == "main" and
                   .repositories["acme/spec"].forge == "github" and
@@ -3997,22 +4010,22 @@
                 test "$(jq -r '.argv[3]' "$payload")" = \
                   "$(jq -r '.flows.fixture.script' "$checkedConfig")"
 
-                reconcile_event='{"kind":"gh","source":"search","repo":"acme/spec","number":7,"htmlUrl":"https://github.com/acme/spec/issues/7","itemType":"issue","nodeId":"I-campaign-7","itemAuthor":"operator","triggerActor":"tally-bot","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-8","commentId":"comment-8","triggerTimestamp":"2026-07-31T09:01:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["spec-campaign"],"assignees":[],"triggeringComment":{"id":"comment-8","author":"tally-bot","body":"/tally reconcile fixture"}}}'
-                reconcile_dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
-                  __producer-dispatch campaign-fixture-reconcile \
-                  --state-dir "$TMPDIR/state" --event "$reconcile_event")"
-                reconcile_payload="$(printf '%s' "$reconcile_dispatch" | jq -r '.emitted')"
-                reconcile_args="$(jq -r '.briefPath' "$reconcile_payload")"
-                test -f "$reconcile_args"
+                # The self-nudge is local now: no per-campaign reconcile
+                # producer exists to poll a public comment back, and the one
+                # generic drain that replaced it is an events-dir producer.
                 jq -e '
-                  .runId == "comment-8" and
-                  .reconcileCommand == "/tally reconcile fixture"
-                ' "$reconcile_args" >/dev/null
-                jq -e --arg args "$reconcile_args" '
-                  .briefPath == $args and
-                  (has("brief") | not) and
-                  .pool == ["fixture-campaign", "flow"]
-                ' "$reconcile_payload" >/dev/null
+                  (.producers | has("campaign-fixture-reconcile") | not) and
+                  (.producers | has("campaign-defaulted-reconcile") | not)
+                ' "$checkedConfig" >/dev/null
+                calendar_event='{"kind":"calendar"}'
+                if ${tally}/bin/tally --config "$checkedConfig" \
+                  __producer-dispatch campaign-continuation \
+                  --state-dir "$TMPDIR/state" --data-dir "$TMPDIR/data" \
+                  --event "$calendar_event" 2>"$TMPDIR/continuation-kind.err"; then
+                  echo "campaign-render: campaign-continuation accepted a calendar observation" >&2
+                  exit 1
+                fi
+                grep -Fq 'has kind "events-dir"' "$TMPDIR/continuation-kind.err"
                 touch "$out"
               '';
           flow-dialect-accept =

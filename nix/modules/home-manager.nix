@@ -387,7 +387,18 @@ in
       services.tally.pools.flow = common.flowPoolDefaults;
     })
     (lib.mkIf cfg.enable {
-      assertions = common.mkAssertions cfg;
+      assertions = common.mkAssertions cfg ++ [
+        {
+          # Every campaign class continues itself through this one drain, so
+          # the campaign layer installs it unconditionally rather than once per
+          # declared campaign. The NixOS layer renders no campaign surface at
+          # all, so this belongs here and not in the shared assertions.
+          assertion =
+            builtins.hasAttr "campaign-continuation" cfg.producers
+            && cfg.producers.campaign-continuation.kind == "events-dir";
+          message = "tally requires the generic events-dir producer campaign-continuation";
+        }
+      ];
 
       home.packages = [
         installedPackage

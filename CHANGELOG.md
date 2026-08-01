@@ -322,6 +322,28 @@ authorized.
 
 ### Changed
 
+- Campaigns now continue themselves through the events directory instead of a
+  public `/tally reconcile <name>` comment. A pass that merged work, passed a
+  checkpoint, or published machine steering writes one bounded JSON enqueue
+  payload into `<stateDir>/events`; the 5s drain admits the next pass. Both
+  classes take this path: a module-declared pass writes its own flow-run argv
+  under a run identity derived from the pass it continues, and a forge-native
+  pass writes the same `campaign poll --once` registry scan the timer runs, so
+  the next pass still inherits the `campaign:<repo>:<number>:<revision>` dedup
+  key. This removes GitHub API availability from the campaign's critical path,
+  cuts merge-to-next-pass latency from the poll interval to the drain cadence,
+  and stops publishing the machine's note-to-self. The human at-mention surface
+  is unchanged.
+- Removed `mkCampaignReconcileProducer` and the per-campaign
+  `producers.campaign-<name>-reconcile` GitHub producer, and with it the
+  rendered `reconcileCommand` campaign argument. One generic `events-dir`
+  producer, `producers.campaign-continuation`, is installed once and
+  unconditionally in its place, so arming a forge-native campaign still needs
+  no Nix change. `tally-campaign-poll.timer` is unchanged and becomes the
+  recovery path for a lost continuation event: the campaign pool is a
+  capacity-1 mutex and the continuation payload carries a deterministic
+  `dedupKey` under full submission, so a duplicate event or a race with the
+  timer attaches to the pass already admitted rather than starting a second one.
 - Removed the tracked `legacy-docs/` tree. Those 26 pre-book design and campaign
   records were entirely off the build path; `README.md` now points at them
   through a pinned-commit GitHub link, the same archival form

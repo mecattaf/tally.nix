@@ -74,6 +74,25 @@ def issue() -> dict[str, str]:
     return {"number": "7", "url": "https://github.com/acme/spec/issues/7"}
 
 
+def continuation_spec(events: Path) -> dict[str, object]:
+    """The module-declared continuation the Nix campaign module renders."""
+    return {
+        "argv": [
+            "/nix/store/tally/bin/tally",
+            "flow",
+            "run",
+            "/nix/store/spec-build.js",
+            "--args-from-brief",
+            "--max-nodes",
+            "51",
+        ],
+        "pool": ["flow", "fixture-campaign"],
+        "priority": "low",
+        "runtimeMaxSec": 600,
+        "eventsDir": str(events),
+    }
+
+
 def task(identifier: str, dependencies: list[str] | None = None) -> dict[str, object]:
     return {
         "kind": "implementation",
@@ -977,7 +996,7 @@ class GitHubForgeTests(unittest.TestCase):
                         {"taskId": "task-2", "blockedBy": ["task-1"]},
                     ],
                 )
-                self.assertIsNone(result["config"]["reconcileCommand"])
+                self.assertNotIn("reconcileCommand", result["config"])
                 self.assertIn("#8 — First task", github.state()["master"]["body"])
 
                 escalated = DRIVER.action_escalate(reconcile_brief)
@@ -1025,6 +1044,7 @@ class GitHubForgeTests(unittest.TestCase):
                 integration = {"pullRequest": url}
                 DRIVER.github_progress_comment(data, integration, "b" * 40)
                 DRIVER.github_progress_comment(data, integration, "b" * 40)
+                events = root / "events"
                 continued = DRIVER.action_continue(
                     {
                         "campaign": "fixture",
@@ -1032,58 +1052,150 @@ class GitHubForgeTests(unittest.TestCase):
                         "repositoryConfig": repository_config(checkout, "github"),
                         "issue": issue(),
                         "runId": "pass-1",
-                        "reconcileCommand": "/tally reconcile fixture",
+                        "continuation": continuation_spec(events),
+                        "brief": {"campaign": "fixture", "runId": "pass-1"},
                     }
                 )
+                self.assertTrue(continued["created"])
+                self.assertIsNone(continued["receipt"])
                 self.assertEqual(
-                    continued,
-                    {"command": "/tally reconcile fixture", "posted": True},
+                    continued["dedupKey"],
+                    f"campaign-continuation:acme/spec:7:{continued['runId']}",
                 )
+                payload = json.loads(Path(continued["event"]).read_text(encoding="utf-8"))
+                self.assertEqual(payload["source"], "events-dir")
+                self.assertEqual(payload["adapter"], "shell")
+                self.assertEqual(payload["pool"], ["flow", "fixture-campaign"])
+                self.assertEqual(payload["priority"], "low")
+                self.assertEqual(payload["evidence"], ["exit:0"])
+                self.assertEqual(payload["submission"], {"mode": "full"})
+                self.assertEqual(payload["runtimeMaxSec"], 600)
+                self.assertFalse(payload["noEnqueue"])
+                self.assertEqual(payload["dedupKey"], continued["dedupKey"])
+                self.assertEqual(payload["brief"]["runId"], continued["runId"])
+                self.assertEqual(payload["brief"]["campaign"], "fixture")
+
                 final_state = github.state()
-                self.assertEqual(len(final_state["comments"]), 2)
+                # The machine's note-to-self is process, and process belongs in
+                # the journal: the merge receipt is the only new public comment.
+                self.assertEqual(len(final_state["comments"]), 1)
                 self.assertIn("task=task-1 merged", final_state["comments"][0])
-                self.assertEqual(final_state["comments"][1], "/tally reconcile fixture")
+                self.assertEqual(
+                    sum(call[:2] == ["issue", "comment"] for call in final_state["calls"]),
+                    1,
+                )
                 self.assertEqual(
                     sum(call[:2] == ["pr", "reopen"] for call in final_state["calls"]),
                     1,
                 )
 
-    def test_continuation_comment_is_retried_and_read_after_write_verified(self) -> None:
+    def test_continuation_event_is_derived_bounded_and_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root)
-            state = {
-                "comments": ["/tally reconcile fixture"],
-                "commentFailures": 1,
-                "calls": [],
+            events = root / "events"
+            brief = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "repositoryConfig": repository_config(checkout, "github"),
+                "issue": issue(),
+                "runId": "pass-2",
+                "continuation": continuation_spec(events),
+                "brief": None,
             }
-            with FakeGitHub(root, state) as github, mock.patch.object(
-                DRIVER.time, "sleep", return_value=None
-            ) as sleep:
-                continued = DRIVER.action_continue(
-                    {
-                        "campaign": "fixture",
-                        "repository": "acme/spec",
-                        "repositoryConfig": repository_config(checkout, "github"),
-                        "issue": issue(),
-                        "runId": "pass-2",
-                        "reconcileCommand": "/tally reconcile fixture",
-                    }
+            with FakeGitHub(root, {"comments": [], "calls": []}) as github:
+                first = DRIVER.action_continue(dict(brief))
+                second = DRIVER.action_continue(dict(brief))
+                self.assertEqual(github.state()["comments"], [])
+                self.assertEqual(github.state()["calls"], [])
+            # One pass derives exactly one successor identity, and re-running
+            # the node cannot mint a second event while the first is undrained.
+            self.assertEqual(first["runId"], second["runId"])
+            self.assertEqual(first["event"], second["event"])
+            self.assertTrue(first["created"])
+            self.assertFalse(second["created"])
+            self.assertEqual(
+                [entry.name for entry in sorted(events.iterdir())],
+                [Path(first["event"]).name],
+            )
+            payload = json.loads(Path(first["event"]).read_text(encoding="utf-8"))
+            self.assertNotIn("brief", payload)
+            self.assertTrue(Path(first["event"]).name.endswith(".json"))
+            self.assertFalse(Path(first["event"]).name.endswith(".enqueue.json"))
+            self.assertLess(
+                len(Path(first["event"]).read_bytes()),
+                DRIVER.MAX_CONTINUATION_EVENT_BYTES,
+            )
+            # The successor identity chains, so consecutive passes never
+            # collide on one dedup key.
+            third = DRIVER.action_continue(dict(brief, runId=first["runId"]))
+            self.assertNotEqual(third["runId"], first["runId"])
+            self.assertNotEqual(third["dedupKey"], first["dedupKey"])
+
+    def test_local_forge_continuation_keeps_its_durable_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            events = root / "events"
+            continued = DRIVER.action_continue(
+                {
+                    "campaign": "fixture",
+                    "repository": "acme/spec",
+                    "repositoryConfig": repository_config(checkout),
+                    "issue": issue(),
+                    "runId": "pass-3",
+                    "continuation": continuation_spec(events),
+                    "brief": None,
+                }
+            )
+            self.assertTrue(continued["created"])
+            reference = continued["receipt"].split("acme/spec/", 1)[1]
+            self.assertEqual(
+                reference,
+                f"refs/tally/spec-build/v1/{DRIVER.state_scope('fixture', '7')}"
+                f"/continuation/{continued['runId']}",
+            )
+            listed = git(checkout, "ls-remote", "origin", reference)
+            self.assertTrue(listed, "the local forge kept no continuation receipt")
+            blob = git(checkout, "cat-file", "blob", listed.split()[0])
+            self.assertEqual(
+                json.loads(blob),
+                {
+                    "schemaVersion": 1,
+                    "kind": "continuation",
+                    "campaign": "fixture",
+                    "issueNumber": "7",
+                    "runId": "pass-3",
+                    "dedupKey": continued["dedupKey"],
+                },
+            )
+
+    def test_continuation_rejects_an_unbounded_or_relative_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root)
+            base = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "repositoryConfig": repository_config(checkout, "github"),
+                "issue": issue(),
+                "runId": "pass-4",
+                "brief": None,
+            }
+            relative = continuation_spec(root / "events")
+            relative["eventsDir"] = "events"
+            with self.assertRaises(DRIVER.DriverError):
+                DRIVER.action_continue(dict(base, continuation=relative))
+            oversized = continuation_spec(root / "events")
+            with self.assertRaises(DRIVER.DriverError):
+                DRIVER.action_continue(
+                    dict(
+                        base,
+                        continuation=oversized,
+                        brief={"pad": "x" * (DRIVER.MAX_CONTINUATION_EVENT_BYTES + 1)},
+                    )
                 )
-                self.assertEqual(
-                    continued,
-                    {"command": "/tally reconcile fixture", "posted": True},
-                )
-                final_state = github.state()
-                self.assertEqual(
-                    final_state["comments"].count("/tally reconcile fixture"),
-                    2,
-                )
-                self.assertEqual(
-                    sum(call[:2] == ["issue", "comment"] for call in final_state["calls"]),
-                    2,
-                )
-                sleep.assert_called_once_with(1)
+            self.assertFalse((root / "events").exists())
 
     def test_issue_graph_digest_is_admitted_and_preserves_checkpoint_kind(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

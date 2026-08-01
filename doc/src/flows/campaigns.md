@@ -48,10 +48,11 @@ armed against a NixOS-only host would have nothing to dispatch into. Run
 campaigns from the Home Manager module.
 
 The timer only scans locally armed
-issue locators; an empty registry performs no work. Forge-native campaigns post
-no continuation comment, so this timer is what carries a campaign from one pass
-to the next. It scans every `services.tally.campaignPoll.interval` (60s by
-default). A scan holds the registry lock exclusively across its forge
+issue locators; an empty registry performs no work. A pass that advanced admits
+its own successor through the events directory, so the timer is the recovery
+path for a lost continuation event and the way an outside change to the issue
+graph is noticed, not the ordinary way a campaign reaches its next pass. It
+scans every `services.tally.campaignPoll.interval` (60s by default). A scan holds the registry lock exclusively across its forge
 round-trips, which blocks an interactive `tally campaign arm`, `disarm`, or
 `list` for its duration; `services.tally.campaignPoll.timeout` caps that hold.
 The GitHub CLI identity used
@@ -373,20 +374,25 @@ One enabled attrset expands to all of the following:
 |---|---|
 | `flows.<name>` | The content-addressed shipped `spec-build` script, bounded to one `maxParallel` frontier and its gates. |
 | `producers.campaign-<name>` | A GitHub search producer scoped to the configured repositories, open issues, label, exact mention, and optional actor allowlist. |
-| `producers.campaign-<name>-reconcile` | A GitHub search producer for the exact self-posted continuation command emitted after a pass merges work, passes a checkpoint, or publishes machine steering. |
 | `<pool.name>` | A capacity-1 mutex held for one reconcile pass. |
 | `campaign-agent` | A counted `slot` pool with baseline capacity four, raised when an enabled recurring campaign has a larger `maxParallel`. |
 | `campaign-control` | A `cpu-slot` pool for reconciliation, Git, GitHub, and gate nodes, with the same baseline and recurring-campaign scaling. |
 | `spec-build-driver` | The packaged deterministic policy driver used for reconcile, prep, ownership checks, built-in constraints, checkpoint recording, diff capture, steering, machinery retries, escalation, continuation, publish, rebase, and merge projections. |
 
+One further mechanism is installed once for the whole host rather than per
+campaign: `producers.campaign-continuation`, an `events-dir` producer that
+drains the machine self-continuation every campaign class writes after a pass
+merges work, passes a checkpoint, or publishes machine steering. It is not
+per-campaign state, so arming still requires no Nix change.
+
 The producer posts its receipt and witnessed evidence. Each merge and passed
 checkpoint posts an idempotently marked progress comment. Once task execution,
 integration, and diagnosis settle, a pass that merged work, passed a checkpoint,
-or published machine steering posts the exact continuation command from one
-separate node. That node makes three bounded attempts and verifies that the
-issue's count for the exact command advanced. The next poll admits a fresh pass
-behind the campaign mutex. Neither producer closes the campaign issue. It
-remains the durable steering and scheduler-state channel
+or published machine steering writes its continuation payload from one separate
+node. That node writes no comment: the file lands in the events directory under
+a name and `dedupKey` derived from this pass's identity, and the drain admits a
+fresh pass behind the campaign mutex. Neither the producer nor the drain closes
+the campaign issue. It remains the durable steering and scheduler-state channel
 across passes.
 
 The two shared campaign pools are global resource pools, not reservations per
@@ -675,7 +681,7 @@ parallel(remaining failed tasks): capture diff -> diagnosis agent
   -> marked steering comment
 if any task merged, checkpoint passed, steering or a retry was posted,
 or a checkpoint deferred:
-  post one exact continuation command
+  write one bounded continuation event into the events directory
 clean every prepared task lane
 exit
 ```
@@ -703,7 +709,7 @@ an idempotent progress comment. If the remote base advanced during validation,
 the receipt remains truthful historical evidence but is not complete for the
 next reconciliation; the checkpoint is prepared again on the newer base. A
 diverged or force-replaced base fails closed. The pass-wide continuation is
-posted after every lane settles, including after a checkpoint failure has
+written after every lane settles, including after a checkpoint failure has
 published machine steering; checkpoint recording adds no second retry loop.
 Ignored or untracked build outputs are allowed and removed with the worktree.
 There is no implementation agent, configured per-task gate sequence,
@@ -758,7 +764,7 @@ repeat secret-looking input. Only its concise output passes through conservative
 public redaction and becomes an authenticated, marked campaign comment; raw
 capture, gate output, brief, and diff remain private job inputs.
 
-The pass then posts the exact continuation command even when nothing merged, and
+The pass then writes its continuation event even when nothing merged, and
 even when the diagnosis lane itself faulted: a transient adapter failure must
 never leave a campaign stopped with neither steering nor a mention to resume
 from. The next event has a fresh flow-run identity, re-reads forge state, and
@@ -824,20 +830,32 @@ observes merged PRs and checkpoint refs again, re-reads diagnosis and escalation
 comments plus authorized steering, recomputes the whole frontier, and gives an
 eligible failed node a new isolated lane with current steering.
 Changing campaign arguments or deploying a new content-addressed script between
-passes is ordinary generation change, not replay divergence. Duplicate mentions
+passes is ordinary generation change, not replay divergence. A module-declared
+continuation carries forward the arguments of the pass that wrote it, so a
+redeploy reaches a running campaign at its next mention rather than mid-chain;
+a forge-native continuation re-reads the registry and therefore picks the new
+generation up immediately. Duplicate mentions
 are safe because the campaign mutex serializes passes and each pass re-derives
 the same forge facts before dispatch.
 
 Each pass contains at most one bounded frontier, so the fixed 24-hour evaluator
-budget no longer measures the whole campaign. For a module-declared campaign,
-mention and pass-continuation events are the shipped triggers and no periodic
-timer is involved: a pass that merges, checkpoints, or diagnoses a failure posts
-and verifies its own `/tally reconcile <name>` command, and the campaign's own
-producer triggers the next pass on that comment. A forge-native armed campaign
-is the other case — it posts no continuation comment, so
-[`tally-campaign-poll.timer`](#arm-an-ad-hoc-issue-campaign) is its continuation
-mechanism instead. Each path has exactly one, and they are not
-interchangeable. If the pass process dies before producing that durable
+budget no longer measures the whole campaign. Both campaign classes continue the
+same way and neither posts a public self-nudge: a pass that merges, checkpoints,
+or diagnoses a failure writes one bounded JSON enqueue payload into the daemon's
+events directory, and the 5s drain admits the next pass. A module-declared pass
+writes its own flow-run argv under a derived run identity; a forge-native pass
+writes the same registry scan the timer runs, so the next pass inherits the
+`campaign:<repo>:<number>:<revision>` dedup key. The human at-mention stays
+public and remote; only the machine's note-to-self moved local.
+
+Double-triggering is safe by construction, which is why the timer can stay armed
+underneath. The campaign pool is a capacity-1 mutex, so passes serialize; and
+the continuation payload carries a deterministic `dedupKey` under full
+submission, so a duplicate event — or a race between the event and
+[`tally-campaign-poll.timer`](#arm-an-ad-hoc-issue-campaign) — resolves to an
+attach or reuse against the pass already admitted rather than a second pass.
+The timer therefore remains the recovery path for a lost event. If the pass
+process dies before producing that durable
 outcome, wait for any admitted children to settle and post a fresh mention.
 Stable remote task branches preserve published work; merged PRs preserve
 implementation completion, checkpoint refs preserve successful automated
