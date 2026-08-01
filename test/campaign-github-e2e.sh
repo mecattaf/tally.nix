@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ ${TALLY_CAMPAIGN_E2E_CONFIRM:-} != 1 ]]; then
-  echo "set TALLY_CAMPAIGN_E2E_CONFIRM=1 to create and delete a private GitHub repository" >&2
+  echo "set TALLY_CAMPAIGN_E2E_CONFIRM=1 to create a temporary private GitHub repository" >&2
   exit 2
 fi
 
@@ -111,6 +111,19 @@ git -C "$checkout" add .gitkeep
 git -C "$checkout" commit --quiet -m "fixture: initialize campaign e2e"
 gh repo create "$repository" --private --source "$checkout" --remote origin --push >/dev/null
 created=1
+repository_ready=0
+for _ in $(seq 1 40); do
+  if labels=$(gh label list --repo "$repository" --limit 1000 --json name 2>/dev/null) &&
+    jq -e 'type == "array"' >/dev/null <<<"$labels"; then
+    repository_ready=1
+    break
+  fi
+  sleep 0.5
+done
+if [[ $repository_ready != 1 ]]; then
+  echo "GitHub label API did not become ready for $repository" >&2
+  exit 1
+fi
 
 jq -n \
   --arg checkout "$checkout" \
