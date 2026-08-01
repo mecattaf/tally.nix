@@ -112,9 +112,13 @@ an operator audit after the merge.
 
 The campaign runner follows the same rule. Its complete structured flow
 arguments travel in the producer enqueue's content-addressed brief and are read
-from `TALLY_BRIEF`; the runner argv contains only the flow script path and stable
-control flags. Campaign issue or policy text therefore does not inflate job
-queries or transient-unit status output and is not bounded by process argv size.
+from `TALLY_BRIEF`, with `TALLY_BRIEF_HASH` binding the runner to the admitted
+bytes; the runner argv contains only the pinned tally executable, flow script
+path, and stable control flags. Repository maps, gate definitions, agent argv,
+store paths, and other campaign policy therefore do not inflate job queries or
+transient-unit status output. GitHub issue bodies are not campaign flow args:
+they remain in the separate `TALLY_GH_CONTEXT` file before and after this
+transport.
 
 An implementation node defaults to `agentSandboxPolicy = "workspace-write"`
 because its contract requires a commit, paired with

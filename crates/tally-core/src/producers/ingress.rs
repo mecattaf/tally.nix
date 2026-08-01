@@ -101,6 +101,57 @@ pub fn acknowledged_ingress_ids(events_dir: &Path) -> Result<BTreeSet<String>, P
         .collect())
 }
 
+/// Returns brief files named by producer ingress that has not yet been
+/// archived. The caller must hold the producer ingress lock while using this
+/// snapshot for retention decisions.
+pub(crate) fn pending_ingress_brief_paths(
+    events_dir: &Path,
+) -> Result<BTreeSet<PathBuf>, ProducerError> {
+    let mut paths = Vec::new();
+    if events_dir.is_dir() {
+        let entries = std::fs::read_dir(events_dir)
+            .map_err(|source| ProducerError::Io {
+                path: events_dir.to_owned(),
+                source,
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|source| ProducerError::Io {
+                path: events_dir.to_owned(),
+                source,
+            })?;
+        for entry in entries {
+            let path = entry.path();
+            if entry.file_name().to_str().is_some_and(is_ingress_candidate) {
+                paths.push(path);
+            }
+        }
+        let processing = events_dir.join("processing");
+        if processing.is_dir() {
+            paths.extend(
+                existing_claims(&processing)?
+                    .into_iter()
+                    .map(|claim| claim.path),
+            );
+        }
+    }
+
+    let mut briefs = BTreeSet::new();
+    for path in paths {
+        let bytes = match read_bounded_regular(&path, MAX_INGRESS_BYTES) {
+            Ok(bytes) => bytes,
+            Err(error @ ProducerError::Io { .. }) => return Err(error),
+            Err(_) => continue,
+        };
+        let Ok(payload) = serde_json::from_slice::<EnqueuePayload>(&bytes) else {
+            continue;
+        };
+        if let Some(path) = payload.brief_path {
+            briefs.insert(path);
+        }
+    }
+    Ok(briefs)
+}
+
 pub fn archive_ingress_claim(
     events_dir: &Path,
     claim: &IngressClaim,

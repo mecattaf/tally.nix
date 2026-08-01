@@ -83,6 +83,11 @@ tally flow check SCRIPT [--args JSON | --args-path PATH] [--catalog PATH]
 tally flow run SCRIPT [--args JSON | --args-path PATH | --args-from-brief] --max-nodes N [--catalog PATH] [--flow-run-id ID]
 ```
 
+Manual `--args-path` inputs may be relative or symlinked bounded regular JSON
+files. The internal `--args-from-brief` transport instead requires both
+`TALLY_BRIEF` and `TALLY_BRIEF_HASH` and verifies the canonical file bytes
+before evaluating the flow.
+
 The executable binds `FlowClient` to one multiplexed daemon connection. Every
 node uses full-mode admission; live rows attach and await, terminal rows replay
 their witnessed result, and a daemon restart replaces the connection and

@@ -309,6 +309,9 @@ pub(super) fn execution_environment(
     if let Some(path) = &request.brief_path {
         environment.push(("TALLY_BRIEF".to_owned(), display_path(path)?.to_owned()));
     }
+    if let Some(hash) = &request.brief_hash {
+        environment.push(("TALLY_BRIEF_HASH".to_owned(), hash.clone()));
+    }
     if let Some(manifest) = &request.gate_manifest {
         environment.push((
             "TALLY_GATE_MANIFEST".to_owned(),
@@ -425,8 +428,11 @@ pub(super) fn environment_to_unset(request: &ExecutionRequest) -> Vec<&'static s
     if request.brief_path.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[12]);
     }
-    if request.gate_manifest.is_none() {
+    if request.brief_hash.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[13]);
+    }
+    if request.gate_manifest.is_none() {
+        names.push(OPTIONAL_TALLY_ENVIRONMENT[14]);
     }
     if request.git_ai.is_none() {
         names.push("GIT_AI_CUSTOM_ATTRIBUTES");

@@ -76,12 +76,13 @@ impl DaemonHandler {
         };
         let handler = self.clone();
         let task = tokio::task::spawn_local(async move {
-            let (registry, events_dir, state_dir, gh_program, mut shutdown) = {
+            let (registry, events_dir, state_dir, data_dir, gh_program, mut shutdown) = {
                 let context = handler.context.read().await;
                 (
                     context.config.producers.clone(),
                     context.paths.events_dir(),
                     context.paths.state_dir.clone(),
+                    context.paths.data_dir.clone(),
                     handler.gh_program.clone(),
                     handler.execution_shutdown.clone(),
                 )
@@ -112,6 +113,7 @@ impl DaemonHandler {
                 let registry = registry.clone();
                 let events_dir = events_dir.clone();
                 let state_dir = state_dir.clone();
+                let data_dir = data_dir.clone();
                 let gh_program = gh_program.clone();
                 let origin = origin.clone();
                 let completion_id = completion_id.clone();
@@ -119,7 +121,7 @@ impl DaemonHandler {
                 let semantic_completion = result.completion.clone();
                 let verdict = result.verdict;
                 let completed = tokio::task::spawn_blocking(move || {
-                    let engine = ProducerEngine::new(&registry, events_dir, state_dir);
+                    let engine = ProducerEngine::new(&registry, events_dir, state_dir, data_dir);
                     let mut sink = GhCliMutationSink::with_program(gh_program);
                     engine.complete_gh_once_with_completion(
                         &origin,

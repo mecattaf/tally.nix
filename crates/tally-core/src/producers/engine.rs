@@ -53,6 +53,7 @@ pub struct ProducerEngine<'a> {
     registry: &'a BTreeMap<String, ProducerConfig>,
     events_dir: PathBuf,
     state_dir: PathBuf,
+    brief_root: PathBuf,
 }
 
 impl<'a> ProducerEngine<'a> {
@@ -60,11 +61,13 @@ impl<'a> ProducerEngine<'a> {
         registry: &'a BTreeMap<String, ProducerConfig>,
         events_dir: impl Into<PathBuf>,
         state_dir: impl Into<PathBuf>,
+        brief_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
             registry,
             events_dir: events_dir.into(),
             state_dir: state_dir.into(),
+            brief_root: brief_root.into(),
         }
     }
 
@@ -1016,6 +1019,15 @@ impl<'a> ProducerEngine<'a> {
         name: &str,
         payload: &EnqueuePayload,
     ) -> Result<EmitOutcome, ProducerError> {
+        // Retention takes the exclusive side of this lock before computing its
+        // live set. Hold the shared side across both brief materialization and
+        // ingress publication so it can observe either both or neither.
+        let _brief_lock = payload
+            .brief
+            .as_ref()
+            .map(|_| crate::brief::acquire_shared(&self.brief_root))
+            .transpose()
+            .map_err(|error| ProducerError::InvalidObservation(error.to_string()))?;
         let _ingress_lock = lock_ingress(&self.events_dir)?;
         if ingress_name_exists(&self.events_dir, name)? {
             return Ok(EmitOutcome::Duplicate);
@@ -1027,11 +1039,11 @@ impl<'a> ProducerEngine<'a> {
                     "producer payload contains both brief and briefPath".to_owned(),
                 ));
             }
-            create_dir_durable(&self.state_dir)?;
+            create_dir_durable(&self.brief_root)?;
             let prepared = crate::brief::PreparedBrief::from_value(document)
                 .map_err(|error| ProducerError::InvalidObservation(error.to_string()))?;
             payload.brief_path = Some(
-                crate::brief::store(&self.state_dir, &prepared)
+                crate::brief::store(&self.brief_root, &prepared)
                     .map_err(|error| ProducerError::InvalidObservation(error.to_string()))?,
             );
         }

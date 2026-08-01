@@ -369,8 +369,9 @@ $ tally flow check ./review.js \
 ```
 
 On success, `flow check` prints the script's normalized meta object as compact JSON. Use
-`--args-path /absolute/args.json` instead of `--args JSON` when the input should stay out of the
-checker's process argv; the two flags are mutually exclusive.
+`--args-path args.json` instead of `--args JSON` when the input should stay out of the checker's
+process argv; the two flags are mutually exclusive. Manual argument paths may be relative and may
+resolve through a symlink, but the target must be a regular file no larger than 16 MiB.
 
 Run a flow:
 
@@ -382,10 +383,11 @@ $ tally flow run ./review.js \
     --catalog /nix/store/...-tally-catalog.json
 ```
 
-Flow arguments default to `{}`. `--args JSON` and `--args-path /absolute/args.json` are mutually
+Flow arguments default to `{}`. `--args JSON` and `--args-path args.json` are mutually
 exclusive. Job-launched runners can instead use `--args-from-brief`, which reads the private JSON
-file named by inherited `TALLY_BRIEF`; generated flow and campaign producers use this form so the
-structured input never appears in runner argv. `--max-nodes` defaults to 1,000 and is intersected
+file named by inherited `TALLY_BRIEF` and verifies its canonical bytes against
+`TALLY_BRIEF_HASH`; both variables are required. Generated flow and campaign producers use this
+form so the structured input never appears in runner argv. `--max-nodes` defaults to 1,000 and is intersected
 with a smaller literal `meta.maxNodes`. `--flow-run` is an accepted alias for `--flow-run-id`, so
 one spelling carries across `tally flow run` and `tally query`. A run ID is required from
 `--flow-run-id` or inherited `TALLY_TASK_UUID`; it must be a UUID. When the runner itself is a tally

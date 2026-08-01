@@ -225,6 +225,8 @@ pub(super) struct ProducerDispatchArgs {
     pub(super) event: String,
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
+    #[arg(long, value_name = "PATH")]
+    pub(super) data_dir: Option<PathBuf>,
     #[arg(long, hide = true)]
     pub(super) engine_only: bool,
 }
@@ -563,6 +565,8 @@ pub(super) enum ProducerCommand {
         name: String,
         #[arg(long, value_name = "PATH")]
         state_dir: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
     },
     Poll {
         name: String,
@@ -572,6 +576,8 @@ pub(super) enum ProducerCommand {
         no_enqueue: bool,
         #[arg(long, value_name = "PATH")]
         state_dir: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
     },
     Explain {
         name: String,
@@ -579,6 +585,8 @@ pub(super) enum ProducerCommand {
         item: String,
         #[arg(long, value_name = "PATH")]
         state_dir: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
     },
     Test {
         name: String,
@@ -594,6 +602,8 @@ pub(super) enum ProducerCommand {
         promote: bool,
         #[arg(long, value_name = "PATH")]
         state_dir: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
     },
 }
 

@@ -54,6 +54,11 @@ impl DaemonHandler {
         let params: Params = decode_params(params)?;
         let task_uuid = Uuid::parse_str(&params.task_uuid)
             .map_err(|_| WireError::invalid("task_uuid must be a UUID"))?;
+        let brief_root = self.context.read().await.paths.data_dir.clone();
+        let _brief_lock = tokio::task::spawn_blocking(move || brief::acquire_shared(&brief_root))
+            .await
+            .map_err(|error| internal_wire(format!("brief lock worker failed: {error}")))?
+            .map_err(internal_wire)?;
         let mut context = self.context.write().await;
         if context.jobs.get(&task_uuid).is_some_and(|job| {
             matches!(
@@ -95,6 +100,14 @@ impl DaemonHandler {
             return Err(WireError::invalid(format!(
                 "job {task_uuid} passed and cannot be retried"
             )));
+        }
+        if let Some(hash) = row.brief_hash.as_deref() {
+            let path = context.paths.brief_path(hash).map_err(internal_wire)?;
+            brief::read_verified(&path, hash).map_err(|_| {
+                WireError::invalid(format!(
+                    "job {task_uuid} brief is no longer retained and cannot be retried; enqueue fresh work"
+                ))
+            })?;
         }
         let next_attempt = row
             .attempt
@@ -324,6 +337,18 @@ impl DaemonHandler {
     ) -> Result<Value, WireError> {
         let inline_brief = payload.brief.take();
         let brief_source_path = payload.brief_path.take();
+        let has_brief = inline_brief.is_some() || brief_source_path.is_some();
+        let _brief_lock = if has_brief {
+            let brief_root = self.context.read().await.paths.data_dir.clone();
+            Some(
+                tokio::task::spawn_blocking(move || brief::acquire_shared(&brief_root))
+                    .await
+                    .map_err(|error| internal_wire(format!("brief lock worker failed: {error}")))?
+                    .map_err(internal_wire)?,
+            )
+        } else {
+            None
+        };
         let prepared_brief =
             tokio::task::spawn_blocking(move || brief::prepare(inline_brief, brief_source_path))
                 .await
@@ -414,6 +439,7 @@ impl DaemonHandler {
                 &context.config.producers,
                 context.paths.events_dir(),
                 &context.paths.state_dir,
+                &context.paths.data_dir,
             )
             .validate_gh_origin(origin)
             .map_err(|error| WireError::invalid(error.to_string()))?;

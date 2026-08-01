@@ -134,9 +134,11 @@ The implementation is narrower than the option tree suggests:
   configured `workloadMutex`, if any. The removed `budgetPool` option never
   added a runner or child lease and is now rejected during configuration.
 - A generated runner reads its configured arguments from the private file named
-  by `TALLY_BRIEF`; its argv contains only `--args-from-brief` and stable control
-  flags. Manual checks and runs may use inline `--args` or an absolute
-  `--args-path` JSON file.
+  by `TALLY_BRIEF`, verifies those bytes against inherited `TALLY_BRIEF_HASH`,
+  and is pinned to the configured tally package; its argv contains only
+  `--args-from-brief` and stable control flags. Manual checks and runs may use
+  inline `--args` or an `--args-path` JSON file. Manual paths may be relative or
+  symlinks; the resolved target must be a bounded regular file.
 
 For an unscheduled run, supply a UUID explicitly unless tally is launching the
 runner as a parent job:
@@ -153,7 +155,7 @@ its inherited `TALLY_TASK_UUID`; a job-launched runner requires that UUID and
 `TALLY_JOB_ID` together and uses them for child ancestry. Having neither identity
 source is `flow-run-id-missing` (exit 2); a malformed or half-present inherited
 identity also exits 2. After capturing identity and any requested `TALLY_BRIEF`
-path, the CLI retains `TALLY_SOCKET` but removes other inherited `TALLY_*`
+path and hash, the CLI retains `TALLY_SOCKET` but removes other inherited `TALLY_*`
 variables before executing the script, so child tools cannot mistake the
 runner's identity for their own.
 

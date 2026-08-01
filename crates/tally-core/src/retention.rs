@@ -9,9 +9,11 @@ use fs2::FileExt;
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::brief::{self, BriefError};
 use crate::executor::CAPTURE_ARCHIVE_DIRECTORY;
 use crate::nix_store::GcRootBackend;
-use crate::producers::INGRESS_LOCK_FILE_NAME;
+use crate::producers::{pending_ingress_brief_paths, ProducerError, INGRESS_LOCK_FILE_NAME};
+use crate::taskdb::{read_acknowledged_events, TaskDbError};
 use crate::witness::{is_nix_store_path, read_verified_records, WitnessError, WitnessRecord};
 
 const ROOT_DIRECTORY_PREFIX: &str = "witness-";
@@ -138,6 +140,12 @@ pub struct GcReport {
     pub roots_examined: usize,
     pub roots_pruned: usize,
     pub root_directories_pruned: usize,
+    pub brief_stores_swept: bool,
+    pub briefs_examined: usize,
+    pub briefs_retained: usize,
+    pub briefs_pruned: usize,
+    pub legacy_briefs_examined: usize,
+    pub legacy_briefs_pruned: usize,
     pub state_dir_swept: bool,
     pub capture_archives_examined: usize,
     pub capture_archives_pruned: usize,
@@ -155,6 +163,12 @@ pub enum RetentionError {
     InvalidHorizon { value: String, reason: String },
     #[error("witness ledger error: {0}")]
     Witness(#[from] WitnessError),
+    #[error("brief retention error: {0}")]
+    Brief(#[from] BriefError),
+    #[error("durable row retention error: {0}")]
+    TaskDb(#[from] TaskDbError),
+    #[error("producer ingress retention error: {0}")]
+    Producer(#[from] ProducerError),
     #[error("witness ledger verification failed; GC roots were left untouched")]
     InvalidLedger,
     #[error("retention I/O error at {path}: {source}")]
@@ -337,6 +351,12 @@ pub fn run_gc(
         collect,
     } = request;
     let horizon = parse_horizon(horizon_text)?;
+    // Brief admission takes the shared side before it publishes a durable row
+    // or witness. Take the exclusive side first, then the GC-roots lock, in the
+    // same order as brief-bearing substitution admission.
+    let _brief_lock = state_dir
+        .map(|_| brief::acquire_exclusive(data_dir))
+        .transpose()?;
     let gcroots_dir = data_dir.join("gcroots");
     let lock_path = gcroots_lock_path(&gcroots_dir);
     let _lock = acquire_gc_lock(&gcroots_dir).map_err(|source| io_error(&lock_path, source))?;
@@ -448,6 +468,10 @@ pub fn run_gc(
         }
     }
 
+    let briefs = match state_dir {
+        Some(state_dir) => sweep_brief_stores(data_dir, state_dir, &records, cutoff, dry_run)?,
+        None => BriefSweep::default(),
+    };
     let state = match state_dir {
         Some(state_dir) => sweep_state_directory(state_dir, &state_retention, now, dry_run)?,
         None => StateSweep::default(),
@@ -465,6 +489,12 @@ pub fn run_gc(
         roots_examined,
         roots_pruned,
         root_directories_pruned: directories_pruned,
+        brief_stores_swept: state_dir.is_some(),
+        briefs_examined: briefs.data_examined,
+        briefs_retained: briefs.data_retained,
+        briefs_pruned: briefs.data_pruned,
+        legacy_briefs_examined: briefs.legacy_examined,
+        legacy_briefs_pruned: briefs.legacy_pruned,
         state_dir_swept: state_dir.is_some(),
         capture_archives_examined: state.capture_archives_examined,
         capture_archives_pruned: state.capture_archives_pruned,
@@ -475,6 +505,153 @@ pub fn run_gc(
         events_rejected_pruned: state.events_rejected_pruned,
         collected,
     })
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct BriefSweep {
+    data_examined: usize,
+    data_retained: usize,
+    data_pruned: usize,
+    legacy_examined: usize,
+    legacy_pruned: usize,
+}
+
+/// Marks briefs required by an unwitnessed attempt or a witness inside the
+/// configured retention horizon, then sweeps the canonical data store. The
+/// state store is the legacy producer location shipped by #250; it receives an
+/// age floor as well as the same live-row floor so an upgrade can retire those
+/// duplicate and orphaned files safely.
+fn sweep_brief_stores(
+    data_dir: &Path,
+    state_dir: &Path,
+    records: &[WitnessRecord],
+    retained_cutoff: DateTime<Utc>,
+    dry_run: bool,
+) -> Result<BriefSweep, RetentionError> {
+    let events_dir = state_dir.join(EVENTS_DIRECTORY);
+    let _ingress_lock = events_dir
+        .is_dir()
+        .then(|| lock_ingress_for_sweep(&events_dir))
+        .transpose()?;
+    let pending_paths = pending_ingress_brief_paths(&events_dir)?;
+    let events = read_acknowledged_events(&events_dir)?;
+
+    let witnessed_attempts = records
+        .iter()
+        .filter_map(|record| {
+            record
+                .task_uuid
+                .as_ref()
+                .map(|task| (task.clone(), record.attempt))
+        })
+        .collect::<BTreeSet<_>>();
+    let mut retained = records
+        .iter()
+        .filter(|record| {
+            record_timestamp(record).is_ok_and(|timestamp| timestamp >= retained_cutoff)
+        })
+        .filter_map(|record| record.brief_hash.clone())
+        .collect::<BTreeSet<_>>();
+
+    for event in &events {
+        let Some(hash) = event.row.brief_hash.as_ref() else {
+            continue;
+        };
+        let attempt = event
+            .retries
+            .iter()
+            .map(|retry| retry.attempt)
+            .max()
+            .unwrap_or(event.row.attempt);
+        let identity = (event.row.uuid.to_string(), attempt);
+        if !witnessed_attempts.contains(&identity) {
+            retained.insert(hash.clone());
+        }
+    }
+    for path in &pending_paths {
+        if let Ok(prepared) = brief::PreparedBrief::from_path(path) {
+            retained.insert(prepared.hash().to_owned());
+        }
+    }
+
+    let mut sweep = BriefSweep::default();
+    for (hash, path, _) in managed_brief_files(data_dir)? {
+        sweep.data_examined += 1;
+        if retained.contains(&hash) {
+            sweep.data_retained += 1;
+        } else {
+            sweep.data_pruned += 1;
+            remove_managed_brief(&path, dry_run)?;
+        }
+    }
+
+    if data_dir != state_dir {
+        let legacy_cutoff = SystemTime::from(retained_cutoff);
+        for (hash, path, modified) in managed_brief_files(state_dir)? {
+            sweep.legacy_examined += 1;
+            if retained.contains(&hash)
+                || pending_paths.contains(&path)
+                || modified >= legacy_cutoff
+            {
+                continue;
+            }
+            sweep.legacy_pruned += 1;
+            remove_managed_brief(&path, dry_run)?;
+        }
+    }
+    Ok(sweep)
+}
+
+fn managed_brief_files(root: &Path) -> Result<Vec<(String, PathBuf, SystemTime)>, RetentionError> {
+    let directory = root.join(brief::BRIEF_DIRECTORY);
+    if !directory.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut entries = std::fs::read_dir(&directory)
+        .map_err(|source| io_error(&directory, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| io_error(&directory, source))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut managed = Vec::new();
+    for entry in entries {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let Some(digest) = file_name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .filter(|digest| {
+                digest.len() == 64
+                    && digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+        else {
+            continue;
+        };
+        let metadata =
+            std::fs::symlink_metadata(&path).map_err(|source| io_error(&path, source))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        let hash = format!("sha256:{digest}");
+        brief::read_verified(&path, &hash)?;
+        let modified = metadata
+            .modified()
+            .map_err(|source| io_error(&path, source))?;
+        managed.push((hash, path, modified));
+    }
+    Ok(managed)
+}
+
+fn remove_managed_brief(path: &Path, dry_run: bool) -> Result<(), RetentionError> {
+    if dry_run {
+        return Ok(());
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(source) => Err(io_error(path, source)),
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -714,7 +891,13 @@ mod tests {
     use chrono::{SecondsFormat, TimeZone};
 
     use super::*;
-    use crate::taskdb::{AdmissionOrigin, EnqueueSource};
+    use crate::adapters::AdapterJobOptions;
+    use crate::config::Priority;
+    use crate::executor::Uuid;
+    use crate::taskdb::{
+        write_enqueue_event_atomic, AdmissionOrigin, DurableEnqueueEvent, EnqueueSource, RowSeed,
+        CURRENT_ROW_VERSION,
+    };
     use crate::witness::{
         Derivation, DerivationOutput, LaborClass, Verdict, WitnessBody, WitnessLedger,
     };
@@ -787,6 +970,89 @@ mod tests {
                 authorship_sessions: None,
             })
             .unwrap()
+    }
+
+    fn append_brief_witness(
+        ledger: &mut WitnessLedger,
+        timestamp: DateTime<Utc>,
+        task_uuid: Uuid,
+        brief_hash: &str,
+    ) -> WitnessRecord {
+        ledger
+            .append(WitnessBody {
+                task_uuid: Some(task_uuid.to_string()),
+                transition_timestamp: timestamp.to_rfc3339_opts(SecondsFormat::Millis, true),
+                verdict: Verdict::Pass,
+                exit_code: 0,
+                artifact_content_hash: None,
+                store_paths: None,
+                drv: None,
+                gpu_seconds: None,
+                wall_clock: 1.0,
+                attempt: 1,
+                lease_epoch: 1,
+                dedup_key: None,
+                payload_hash: None,
+                brief_hash: Some(brief_hash.to_owned()),
+                origin: AdmissionOrigin::direct(EnqueueSource::Manual),
+                orchestration: None,
+                labor_class: LaborClass::Fresh,
+                trace_ref: None,
+                pools: vec!["slot".to_owned()],
+                executor: None,
+                host_id: None,
+                charge: None,
+                model: None,
+                evidence_class: None,
+                manifest_hash: None,
+                completion: None,
+                result_revision: None,
+                authorship: None,
+                authorship_sessions: None,
+            })
+            .unwrap()
+    }
+
+    fn brief_event(task_uuid: Uuid, brief_hash: &str) -> DurableEnqueueEvent {
+        DurableEnqueueEvent::new(RowSeed {
+            row_version: CURRENT_ROW_VERSION,
+            uuid: task_uuid,
+            description: "brief retention fixture".to_owned(),
+            priority: Priority::Medium,
+            source: EnqueueSource::Manual,
+            adapter: "shell".to_owned(),
+            pools: vec!["slot".to_owned()],
+            executor: None,
+            model: None,
+            cwd: None,
+            workspace: None,
+            adapter_options: AdapterJobOptions::default(),
+            gate_manifest: None,
+            resumed_from: None,
+            dedup_key: None,
+            payload_hash: None,
+            brief_hash: Some(brief_hash.to_owned()),
+            orchestration: None,
+            session_ref: None,
+            final_message: None,
+            job_token_hash: None,
+            lease_epoch: 1,
+            attempt: 1,
+            argv: vec!["true".to_owned()],
+            evidence: Vec::new(),
+            drv: None,
+            parent_uuid: None,
+            consumption_estimate: None,
+            runtime_max_sec: None,
+            no_enqueue: false,
+            credentials: BTreeMap::new(),
+            origin: Some(AdmissionOrigin::direct(EnqueueSource::Manual)),
+            gh_origin: None,
+            related_trigger: None,
+            evidence_class: None,
+            manifest_hash: None,
+        })
+        .unwrap()
     }
 
     #[test]
@@ -977,6 +1243,95 @@ mod tests {
             vec![SHARED.to_owned()],
             None,
         );
+    }
+
+    #[test]
+    fn brief_sweep_marks_live_and_recent_rows_and_collects_legacy_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
+
+        let live = brief::PreparedBrief::from_value(serde_json::json!({"kind": "live"})).unwrap();
+        let recent =
+            brief::PreparedBrief::from_value(serde_json::json!({"kind": "recent"})).unwrap();
+        let expired =
+            brief::PreparedBrief::from_value(serde_json::json!({"kind": "expired"})).unwrap();
+        let orphan =
+            brief::PreparedBrief::from_value(serde_json::json!({"kind": "orphan"})).unwrap();
+        for prepared in [&live, &recent, &expired, &orphan] {
+            brief::store(&data, prepared).unwrap();
+        }
+
+        let live_task = Uuid::new_v4();
+        let recent_task = Uuid::new_v4();
+        let expired_task = Uuid::new_v4();
+        for event in [
+            brief_event(live_task, live.hash()),
+            brief_event(recent_task, recent.hash()),
+            brief_event(expired_task, expired.hash()),
+        ] {
+            write_enqueue_event_atomic(&state.join("events"), &event).unwrap();
+        }
+        let mut ledger = WitnessLedger::open(data.join("witness.jsonl")).unwrap();
+        append_brief_witness(
+            &mut ledger,
+            now - chrono::TimeDelta::days(1),
+            recent_task,
+            recent.hash(),
+        );
+        append_brief_witness(
+            &mut ledger,
+            now - chrono::TimeDelta::days(40),
+            expired_task,
+            expired.hash(),
+        );
+        drop(ledger);
+
+        let legacy_live = brief::store(&state, &live).unwrap();
+        let legacy_expired = brief::store(&state, &expired).unwrap();
+        let legacy_fresh_orphan = brief::store(&state, &orphan).unwrap();
+        set_mtime(&legacy_live, now - chrono::TimeDelta::days(40));
+        set_mtime(&legacy_expired, now - chrono::TimeDelta::days(40));
+        set_mtime(&legacy_fresh_orphan, now - chrono::TimeDelta::days(1));
+
+        let request = GcRequest {
+            data_dir: &data,
+            state_dir: Some(&state),
+            horizon_text: "30d",
+            state_retention: StateRetentionPolicy::default(),
+            now,
+            dry_run: true,
+            collect: false,
+        };
+        let dry = run_gc(request.clone(), &FakeBackend::default()).unwrap();
+        assert!(dry.brief_stores_swept);
+        assert_eq!(dry.briefs_examined, 4);
+        assert_eq!(dry.briefs_retained, 2);
+        assert_eq!(dry.briefs_pruned, 2);
+        assert_eq!(dry.legacy_briefs_examined, 3);
+        assert_eq!(dry.legacy_briefs_pruned, 1);
+        assert!(brief::content_path(&data, expired.hash()).unwrap().exists());
+
+        let report = run_gc(
+            GcRequest {
+                dry_run: false,
+                ..request
+            },
+            &FakeBackend::default(),
+        )
+        .unwrap();
+        assert_eq!(report.briefs_pruned, 2);
+        assert_eq!(report.legacy_briefs_pruned, 1);
+        assert!(brief::content_path(&data, live.hash()).unwrap().exists());
+        assert!(brief::content_path(&data, recent.hash()).unwrap().exists());
+        assert!(!brief::content_path(&data, expired.hash()).unwrap().exists());
+        assert!(!brief::content_path(&data, orphan.hash()).unwrap().exists());
+        assert!(legacy_live.exists());
+        assert!(!legacy_expired.exists());
+        assert!(legacy_fresh_orphan.exists());
     }
 
     #[test]

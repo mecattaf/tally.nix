@@ -1025,6 +1025,9 @@ fn transported_brief_materializes_privately_and_provisions_exact_path() {
     assert!(environment
         .iter()
         .any(|(name, value)| name == "TALLY_BRIEF" && value == &path.to_string_lossy()));
+    assert!(environment
+        .iter()
+        .any(|(name, value)| name == "TALLY_BRIEF_HASH" && value == prepared.hash()));
 }
 
 #[test]

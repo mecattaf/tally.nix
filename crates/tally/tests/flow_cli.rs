@@ -126,6 +126,21 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
         "{}",
         String::from_utf8_lossy(&from_path.stderr)
     );
+    let relative_link = temp.path().join("args-link.json");
+    std::os::unix::fs::symlink(&args_path, &relative_link).unwrap();
+    let from_relative_link = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .current_dir(temp.path())
+        .args(["flow", "check"])
+        .arg(fixture("valid.js"))
+        .args(["--args-path", "args-link.json", "--catalog"])
+        .arg(fixture("catalog.json"))
+        .output()
+        .unwrap();
+    assert!(
+        from_relative_link.status.success(),
+        "{}",
+        String::from_utf8_lossy(&from_relative_link.stderr)
+    );
 
     let drv = Command::new(env!("CARGO_BIN_EXE_tally"))
         .args(["flow", "check"])
@@ -306,15 +321,12 @@ fn flow_run_captures_identity_and_reads_args_from_inherited_brief() {
     let config = write_config(temp.path());
     let socket = temp.path().join("tally.sock");
     let args_path = temp.path().join("runner-args.json");
-    fs::write(
-        &args_path,
-        serde_json::to_vec(&json!({
-            "marker": "issue-250",
-            "body": "x".repeat(256 * 1024),
-        }))
-        .unwrap(),
-    )
+    let prepared = tally_core::brief::PreparedBrief::from_value(json!({
+        "marker": "issue-250",
+        "configBlob": "x".repeat(256 * 1024),
+    }))
     .unwrap();
+    fs::write(&args_path, prepared.canonical()).unwrap();
     let server = serve_empty_flow_history(&socket, Some("00000000-0000-4000-8000-000000000048"));
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
         .arg("--config")
@@ -331,6 +343,7 @@ fn flow_run_captures_identity_and_reads_args_from_inherited_brief() {
             "abababababababababababababababababababababababababababababababab",
         )
         .env("TALLY_BRIEF", &args_path)
+        .env("TALLY_BRIEF_HASH", prepared.hash())
         .output()
         .unwrap();
     server.join().unwrap();
@@ -353,8 +366,23 @@ fn flow_run_captures_identity_and_reads_args_from_inherited_brief() {
     );
     assert_eq!(
         events[1]["report"]["finalValue"],
-        json!({"marker": "issue-250", "bodyBytes": 256 * 1024})
+        json!({"marker": "issue-250", "configBytes": 256 * 1024})
     );
+
+    let rejected = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .arg("--config")
+        .arg(&config)
+        .args(["flow", "run"])
+        .arg(fixture("args-from-brief.js"))
+        .args(["--args-from-brief", "--max-nodes", "12"])
+        .env("TALLY_TASK_UUID", "00000000-0000-4000-8000-000000000048")
+        .env("TALLY_JOB_ID", "00000000-0000-4000-8000-000000000048")
+        .env("TALLY_BRIEF", &args_path)
+        .env("TALLY_BRIEF_HASH", format!("sha256:{}", "0".repeat(64)))
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("TALLY_BRIEF_HASH"));
 }
 
 #[test]
