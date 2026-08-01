@@ -1162,6 +1162,7 @@
                   maxTasks = 3;
                   gates = [
                     {
+                      kind = "command";
                       id = "content";
                       preflightArgv = [ "/bin/true" ];
                       argv = [
@@ -1172,6 +1173,7 @@
                       ];
                     }
                     {
+                      kind = "forbidPaths";
                       id = "no-db-artifacts";
                       forbidPaths = [
                         "*.db"
@@ -1179,6 +1181,7 @@
                         "*.db-shm"
                         "*.sqlite*"
                       ];
+                      runtimeMaxSec = 11;
                     }
                   ];
                   agent = "shell";
@@ -1195,6 +1198,7 @@
                   maxTasks = 1;
                   gates = [
                     {
+                      kind = "command";
                       id = "content";
                       preflightArgv = [ "/bin/true" ];
                       argv = [ "/bin/true" ];
@@ -1246,6 +1250,41 @@
                       pool = "slot";
                     };
                   };
+                };
+              };
+            }
+          ];
+        };
+        invalidCampaignGates = [
+          {
+            kind = "command";
+            id = "mixed";
+            preflightArgv = [ "true" ];
+            argv = [ "true" ];
+            forbidPaths = [ "*.db" ];
+          }
+          {
+            kind = "forbidPaths";
+            id = "ambiguous-double-star";
+            forbidPaths = [ "src/**.db" ];
+          }
+        ];
+        invalidCampaignHome = home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            self.homeManagerModules.tally
+            {
+              home = {
+                username = "tally-invalid-campaign";
+                homeDirectory = "/tmp/tally-invalid-campaign-home";
+                stateVersion = "26.11";
+              };
+              services.tally = {
+                enable = true;
+                campaigns.invalid = {
+                  enable = true;
+                  repositories."acme/spec".checkout = "/tmp/spec";
+                  gates = invalidCampaignGates;
                 };
               };
             }
@@ -1631,6 +1670,28 @@
         invalidProducerAttempt = builtins.tryEval (
           builtins.deepSeq invalidProducerHome.activationPackage true
         );
+        invalidCampaignSchema = pkgs.lib.evalModules {
+          modules = [
+            {
+              options.services.tally = moduleCommon.mkOptions {
+                defaultPackage = tally;
+                defaultDataDir = "/tmp/tally-data";
+                defaultStateDir = "/tmp/tally-state";
+              };
+              config.services.tally.campaigns.invalid = {
+                repositories."acme/spec".checkout = "/tmp/spec";
+                gates = invalidCampaignGates;
+              };
+            }
+          ];
+        };
+        invalidCampaignAssertions = builtins.filter (entry: !entry.assertion) (
+          moduleCommon.mkAssertions invalidCampaignSchema.config.services.tally
+        );
+        invalidCampaignMessages = map (entry: entry.message) invalidCampaignAssertions;
+        invalidCampaignAttempt = builtins.tryEval (
+          builtins.deepSeq invalidCampaignHome.activationPackage true
+        );
         nixosBase = {
           system.stateVersion = "26.11";
           boot.loader.grub.enable = false;
@@ -1676,6 +1737,7 @@
                   repositories."acme/spec".checkout = "/tmp/spec";
                   gates = [
                     {
+                      kind = "command";
                       id = "tests";
                       preflightArgv = [ "true" ];
                       argv = [ "true" ];
@@ -3320,13 +3382,15 @@
                   (.flows.fixture.script | endswith("spec-build.js")) and
                   $fixtureArgs.agent.approvalPolicy == null and
                   $fixtureArgs.agent.sandboxPolicy == null and
+                  $fixtureArgs.gates[0].kind == "command" and
                   $fixtureArgs.gates[0].preflightArgv == ["/bin/true"] and
                   $fixtureArgs.gates[0].runtimeMaxSec == 900 and
                   ($fixtureArgs.gates[0] | has("forbidPaths") | not) and
+                  $fixtureArgs.gates[1].kind == "forbidPaths" and
                   $fixtureArgs.gates[1].forbidPaths == ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"] and
                   ($fixtureArgs.gates[1] | has("preflightArgv") | not) and
                   ($fixtureArgs.gates[1] | has("argv") | not) and
-                  ($fixtureArgs.gates[1] | has("runtimeMaxSec") | not) and
+                  $fixtureArgs.gates[1].runtimeMaxSec == 11 and
                   $defaultedArgs.agent.adapter == "codex" and
                   $defaultedArgs.agent.approvalPolicy == "on-request" and
                   $defaultedArgs.agent.sandboxPolicy == "workspace-write" and
@@ -3361,6 +3425,8 @@
                 git -C "$TMPDIR/spec" init --quiet --initial-branch=main
                 git -C "$TMPDIR/spec" config user.name "Tally Fixture"
                 git -C "$TMPDIR/spec" config user.email "tally-fixture@invalid"
+                printf '%s\n' legacy > "$TMPDIR/spec/legacy.db"
+                printf '%s\n' source > "$TMPDIR/spec/rename-source"
                 git -C "$TMPDIR/spec" add --all
                 git -C "$TMPDIR/spec" commit --quiet -m "fixture: frozen spec"
                 jq -n --arg checkout "$TMPDIR/spec" '{
@@ -3394,25 +3460,33 @@
                 ' worklist.json >/dev/null
 
                 base_rev="$(git -C "$TMPDIR/spec" rev-parse HEAD)"
+                write_constraint_brief() {
+                  jq -n \
+                    --arg base "$base_rev" \
+                    --arg branch "$1" \
+                    --argjson patterns "$2" \
+                    --arg worktree "$TMPDIR/spec" \
+                    '{
+                      gate: {
+                        kind: "forbidPaths",
+                        id: "no-db-artifacts",
+                        forbidPaths: $patterns,
+                        runtimeMaxSec: 11
+                      },
+                      workspace: {
+                        taskId: "task-1",
+                        baseRev: $base,
+                        branch: $branch,
+                        worktreePath: $worktree
+                      }
+                    }' > "$TMPDIR/constraint-brief.json"
+                }
+
                 mkdir -p "$TMPDIR/spec/build/nested"
                 printf '%s\n' transient > "$TMPDIR/spec/build/nested/transient.db"
                 git -C "$TMPDIR/spec" add build/nested/transient.db
                 git -C "$TMPDIR/spec" commit --quiet -m "fixture: add forbidden artifact"
-                jq -n \
-                  --arg base "$base_rev" \
-                  --arg worktree "$TMPDIR/spec" \
-                  '{
-                    gate: {
-                      id: "no-db-artifacts",
-                      forbidPaths: ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"]
-                    },
-                    workspace: {
-                      taskId: "task-1",
-                      baseRev: $base,
-                      branch: "main",
-                      worktreePath: $worktree
-                    }
-                  }' > "$TMPDIR/constraint-brief.json"
+                write_constraint_brief main '["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"]'
                 export TALLY_BRIEF="$TMPDIR/constraint-brief.json"
                 if ${specBuildDriver}/bin/spec-build-driver constraint \
                   > "$TMPDIR/constraint-fail.out" 2> "$TMPDIR/constraint-fail.err"; then
@@ -3423,14 +3497,88 @@
                 grep -F 'build/nested/transient.db' "$TMPDIR/constraint-fail.err" >/dev/null
                 git -C "$TMPDIR/spec" rm --quiet build/nested/transient.db
                 git -C "$TMPDIR/spec" commit --quiet -m "fixture: remove forbidden artifact"
+                if ${specBuildDriver}/bin/spec-build-driver constraint \
+                  > "$TMPDIR/constraint-history-fail.out" \
+                  2> "$TMPDIR/constraint-history-fail.err"; then
+                  echo "forbidPaths constraint forgot an artifact deleted by a later commit" >&2
+                  exit 1
+                fi
+                grep -F 'build/nested/transient.db' \
+                  "$TMPDIR/constraint-history-fail.err" >/dev/null
+
+                git -C "$TMPDIR/spec" switch --detach "$base_rev" >/dev/null
+                git -C "$TMPDIR/spec" switch -c deletion-only >/dev/null
+                git -C "$TMPDIR/spec" rm --quiet legacy.db
+                printf '%s\n' allowed > "$TMPDIR/spec/allowed.txt"
+                git -C "$TMPDIR/spec" add allowed.txt
+                git -C "$TMPDIR/spec" commit --quiet -m "fixture: delete legacy artifact"
+                deletion_head="$(git -C "$TMPDIR/spec" rev-parse HEAD)"
+                write_constraint_brief deletion-only \
+                  '["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"]'
                 ${specBuildDriver}/bin/spec-build-driver constraint \
                   | sed 's/^TALLY_FINAL_MESSAGE=//' > "$TMPDIR/constraint-pass.json"
-                jq -e '
+                jq -e --arg base "$base_rev" --arg head "$deletion_head" '
                   .gateId == "no-db-artifacts" and
-                  .gateType == "forbidPaths" and
+                  .kind == "forbidPaths" and
                   .patterns == ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"] and
-                  .checkedPaths == 0
+                  .checkedPaths == 1 and
+                  .baseRev == $base and
+                  .head == $head
                 ' "$TMPDIR/constraint-pass.json" >/dev/null
+
+                git -C "$TMPDIR/spec" switch --detach "$base_rev" >/dev/null
+                git -C "$TMPDIR/spec" switch -c case-and-double-star >/dev/null
+                mkdir -p "$TMPDIR/spec/src/deep"
+                printf '%s\n' direct > "$TMPDIR/spec/src/App.SQLite"
+                printf '%s\n' nested > "$TMPDIR/spec/src/deep/App.SQLite"
+                git -C "$TMPDIR/spec" add src
+                git -C "$TMPDIR/spec" commit --quiet -m "fixture: add mixed-case sqlite paths"
+                write_constraint_brief case-and-double-star '["src/**/*.sqlite*"]'
+                if ${specBuildDriver}/bin/spec-build-driver constraint \
+                  > "$TMPDIR/constraint-case-fail.out" 2> "$TMPDIR/constraint-case-fail.err"; then
+                  echo "forbidPaths constraint matched paths case-sensitively" >&2
+                  exit 1
+                fi
+                grep -F 'src/App.SQLite' "$TMPDIR/constraint-case-fail.err" >/dev/null
+                grep -F 'src/deep/App.SQLite' "$TMPDIR/constraint-case-fail.err" >/dev/null
+
+                git -C "$TMPDIR/spec" switch --detach "$base_rev" >/dev/null
+                git -C "$TMPDIR/spec" switch -c trailing-double-star >/dev/null
+                printf '%s\n' tracked-file > "$TMPDIR/spec/tracked-root"
+                git -C "$TMPDIR/spec" add tracked-root
+                git -C "$TMPDIR/spec" commit --quiet -m "fixture: add path named tracked-root"
+                write_constraint_brief trailing-double-star '["tracked-root/**"]'
+                if ${specBuildDriver}/bin/spec-build-driver constraint \
+                  > "$TMPDIR/constraint-trailing-fail.out" \
+                  2> "$TMPDIR/constraint-trailing-fail.err"; then
+                  echo "trailing ** did not span zero path components" >&2
+                  exit 1
+                fi
+                grep -F '"tracked-root"' "$TMPDIR/constraint-trailing-fail.err" >/dev/null
+
+                git -C "$TMPDIR/spec" switch --detach "$base_rev" >/dev/null
+                git -C "$TMPDIR/spec" switch -c rename-case >/dev/null
+                mkdir -p "$TMPDIR/spec/nested"
+                git -C "$TMPDIR/spec" mv rename-source nested/RENAMED.DB
+                git -C "$TMPDIR/spec" commit --quiet -m "fixture: rename to forbidden path"
+                write_constraint_brief rename-case '["nested/*.db"]'
+                if ${specBuildDriver}/bin/spec-build-driver constraint \
+                  > "$TMPDIR/constraint-rename-fail.out" \
+                  2> "$TMPDIR/constraint-rename-fail.err"; then
+                  echo "forbidPaths constraint missed a renamed mixed-case path" >&2
+                  exit 1
+                fi
+                grep -F 'nested/RENAMED.DB' "$TMPDIR/constraint-rename-fail.err" >/dev/null
+
+                write_constraint_brief rename-case '["src/**.db"]'
+                if ${specBuildDriver}/bin/spec-build-driver constraint \
+                  > "$TMPDIR/constraint-pattern-fail.out" \
+                  2> "$TMPDIR/constraint-pattern-fail.err"; then
+                  echo "forbidPaths constraint accepted an ambiguous ** component" >&2
+                  exit 1
+                fi
+                grep -F "may use '**' only as a complete path component" \
+                  "$TMPDIR/constraint-pattern-fail.err" >/dev/null
 
                 default_event='{"kind":"gh","source":"search","repo":"acme/spec","number":6,"htmlUrl":"https://github.com/acme/spec/issues/6","itemType":"issue","nodeId":"I-campaign-6","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-6","commentId":"comment-6","triggerTimestamp":"2026-07-31T08:59:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["campaign"],"assignees":[],"triggeringComment":{"id":"comment-6","author":"operator","body":"@tally build"}}}'
                 mkdir -p "$TMPDIR/data"
@@ -3468,14 +3616,16 @@
                   .agent.approvalPolicy == null and
                   .agent.sandboxPolicy == null and
                   [.gates[].id] == ["content", "no-db-artifacts"] and
+                  .gates[0].kind == "command" and
                   .gates[0].preflightArgv == ["/bin/true"] and
                   .gates[0].argv == ["/bin/sh", "-eu", "-c", "test -d build"] and
                   .gates[0].runtimeMaxSec == 900 and
                   (.gates[0] | has("forbidPaths") | not) and
+                  .gates[1].kind == "forbidPaths" and
                   .gates[1].forbidPaths == ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"] and
                   (.gates[1] | has("preflightArgv") | not) and
                   (.gates[1] | has("argv") | not) and
-                  (.gates[1] | has("runtimeMaxSec") | not)
+                  .gates[1].runtimeMaxSec == 11
                 ' "$runtime_args" >/dev/null
                 jq -e --arg args "$runtime_args" \
                   '.briefPath == $args and (has("brief") | not)' "$payload" >/dev/null
@@ -3713,6 +3863,17 @@
               invalidProducerMessages;
             assert !invalidProducerAttempt.success;
             pkgs.runCommand "tally-producer-kind-required" { } ''
+              touch "$out"
+            '';
+          campaign-gates-rejected =
+            assert builtins.any (
+              message: nixpkgs.lib.hasInfix "fields must agree with kind" message
+            ) invalidCampaignMessages;
+            assert builtins.any (
+              message: nixpkgs.lib.hasInfix "use '**' only as a complete path component" message
+            ) invalidCampaignMessages;
+            assert !invalidCampaignAttempt.success;
+            pkgs.runCommand "tally-campaign-gates-rejected" { } ''
               touch "$out"
             '';
           forbidden-options-absent =

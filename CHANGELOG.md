@@ -108,6 +108,10 @@ authorized.
   captures are now regression-tested through retry trace lookup and recovered
   stderr receipts. Core and flow also share one wire `TaskRef` type, preventing
   validator drift from becoming a flow-runner protocol failure.
+- Made `forbidPaths` campaign gates history-scoped and case-insensitive, bound
+  their witnessed result to the checked base and head, and re-evaluate them at
+  publication so cleanup commits and stale green nodes cannot publish an
+  unexamined artifact. Gate kinds and constraint deadlines are now explicit.
 - Moved generated flow and campaign arguments out of runner argv and into the
   daemon's content-addressed structured-brief transport. Runners now read those
   arguments through `TALLY_BRIEF`, verify them against `TALLY_BRIEF_HASH`, and
