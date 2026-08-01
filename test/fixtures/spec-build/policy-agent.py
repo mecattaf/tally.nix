@@ -11,6 +11,7 @@ import time
 
 brief = json.loads(Path(os.environ["TALLY_BRIEF"]).read_text(encoding="utf-8"))
 task = brief["task"]["id"]
+role = brief.get("role", "implementation")
 control = Path(sys.argv[1])
 worktree = Path.cwd()
 launch = sys.argv[2:]
@@ -27,7 +28,66 @@ if launch[:5] != expected_prefix or len(launch) != 6 or "TALLY_BRIEF" not in lau
     raise SystemExit(detail)
 
 with (control / "policy-order.log").open("a", encoding="utf-8") as stream:
-    stream.write(f"{task}:{launch[1]}:{launch[3]}\n")
+    stream.write(f"{role}:{task}:{launch[1]}:{launch[3]}\n")
+
+if role == "diagnosis":
+    required = {"failure", "gateOutputs", "taskBrief", "diff", "previousDiagnoses"}
+    missing = sorted(required - set(brief))
+    if missing:
+        raise SystemExit(f"diagnosis brief omitted inputs: {missing!r}")
+    failure = brief["failure"]
+    diff = brief["diff"]
+    gates = brief["gateOutputs"]
+    task_brief = brief["taskBrief"]
+    if task_brief["task"]["id"] != task:
+        raise SystemExit("diagnosis did not receive the failed task brief")
+    expected = {
+        "task-1": "build/one.txt",
+        "task-2": "build/two.txt",
+    }.get(task)
+    if not diff["available"]:
+        raise SystemExit("diagnosis diff input was unavailable")
+    if expected is not None and expected not in diff["patch"]:
+        raise SystemExit(f"diagnosis diff omitted {expected}")
+    if not gates:
+        raise SystemExit("diagnosis did not receive gate outputs")
+    if task == "task-1":
+        if "build/transient.db" not in failure["captureStderr"]:
+            raise SystemExit("task 1 diagnosis omitted constraint stderr")
+        steering = (
+            "Remove the forbidden transient database artifact before rerunning gates. "
+            "Do not expose ghp_0123456789abcdefghijklmnopqrstuvwxyz in public output."
+        )
+    elif task == "task-2":
+        if "task 2 deterministic gate failure" not in failure["captureStderr"]:
+            raise SystemExit("task 2 diagnosis omitted command-gate stderr")
+        steering = "The deterministic task 2 gate remains red; inspect build/two.txt and retry."
+    elif task == "phase-one-checkpoint":
+        if "phase one checkpoint remains red" not in failure["captureStderr"]:
+            raise SystemExit("checkpoint diagnosis omitted checkpoint stderr")
+        steering = (
+            "The phase-one checkpoint still sees the temporary marker. Retry after the "
+            "unrelated cleanup task merges."
+        )
+    else:
+        raise SystemExit(f"unexpected diagnosis task: {task}")
+    receipt = {
+        "task": task,
+        "stage": failure["stage"],
+        "gateCount": len(gates),
+        "previous": len(brief["previousDiagnoses"]),
+        "hasBrief": task_brief["task"]["id"] == task,
+        "hasDiff": diff["available"],
+        "hasPatch": bool(diff["patch"]),
+        "hasStderr": bool(failure["captureStderr"]),
+    }
+    with (control / "diagnosis-inputs.log").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(receipt, sort_keys=True) + "\n")
+    print("TALLY_FINAL_MESSAGE=" + json.dumps(steering))
+    raise SystemExit(0)
+
+if role != "implementation":
+    raise SystemExit(f"unexpected fixture role: {role}")
 
 if task in {"task-1", "task-3"}:
     (control / f"started-{task}").touch()
@@ -45,12 +105,13 @@ output.mkdir(exist_ok=True)
 if task == "task-1":
     (output / "one.txt").write_text("one\n", encoding="utf-8")
     (output / "checkpoint-red").write_text("pending phase validation\n", encoding="utf-8")
-    # The integration test requests one forbidden artifact, then clears that
-    # steering condition before a fresh reconcile attempt proves recovery.
-    if (control / "inject-forbidden-path").exists() and not (
-        control / "constraint-cleared"
-    ).exists():
+    steering = brief["steering"]["machineDiagnoses"]
+    if not steering:
         (output / "transient.db").write_text("not a database\n", encoding="utf-8")
+    else:
+        if len(steering) != 1 or "[redacted-token]" not in steering[0]["diagnosis"]:
+            raise SystemExit("task 1 retry did not receive redacted machine steering")
+        (control / "task-1-steering-visible").touch()
 elif task == "task-2":
     if (output / "one.txt").read_text(encoding="utf-8") != "one\n":
         raise SystemExit("task 2 did not start from task 1's merged result")
@@ -65,8 +126,8 @@ elif task == "task-3":
 elif task == "task-4":
     (output / "four.txt").write_text("four\n", encoding="utf-8")
     (output / "checkpoint-red").unlink()
-elif task == "task-5":
-    (output / "five.txt").write_text("five\n", encoding="utf-8")
+elif task == "task-6":
+    (output / "six.txt").write_text("six\n", encoding="utf-8")
 else:
     raise SystemExit(f"unexpected fixture task: {task}")
 

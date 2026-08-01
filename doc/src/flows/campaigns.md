@@ -218,16 +218,17 @@ is also the account authenticated by `gh`, as in the single-account example
 above. `allowedActors` filters external actors on both producers;
 `allowSelfTriggered` is the separate authorization for the authenticated `gh`
 identity and therefore does not require adding that identity to the external
-allowlist. The merge-continuation producer matches only the exact continuation
-command and always opts into authenticated self-triggering. A successful pass
-posts that command once, without widening external campaign admission.
+allowlist. The pass-continuation producer matches only the exact continuation
+command and always opts into authenticated self-triggering. A pass that merged
+work, passed a checkpoint, or published machine steering posts that command
+once, without widening external campaign admission.
 
 `postFailureEvidence` posts one comment for each failed attempt, so retries can
 accumulate several receipts. `postFailureStderr` requires it and adds only the
 bounded, conservatively redacted tail. Redaction cannot recognize every
 application secret; leave both defaults off for a public repository unless the
 publication policy has been deliberately reviewed. Both the mention and
-merge-continuation producers inherit these settings.
+pass-continuation producers inherit these settings.
 
 Every gate sets an `id`, an explicit `kind`, and the fields for that kind:
 `kind = "command"` requires `preflightArgv` and `argv`, while `kind =
@@ -297,18 +298,18 @@ One enabled attrset expands to all of the following:
 |---|---|
 | `flows.<name>` | The content-addressed shipped `spec-build` script, bounded to one `maxParallel` frontier and its gates. |
 | `producers.campaign-<name>` | A GitHub search producer scoped to the configured repositories, open issues, label, exact mention, and optional actor allowlist. |
-| `producers.campaign-<name>-reconcile` | A GitHub search producer for the exact self-posted continuation command emitted after a merge. |
+| `producers.campaign-<name>-reconcile` | A GitHub search producer for the exact self-posted continuation command emitted after a pass merges work, passes a checkpoint, or publishes machine steering. |
 | `<pool.name>` | A capacity-1 mutex held for one reconcile pass. |
 | `campaign-agent` | A counted `slot` pool with baseline capacity four, raised when an enabled recurring campaign has a larger `maxParallel`. |
 | `campaign-control` | A `cpu-slot` pool for reconciliation, Git, GitHub, and gate nodes, with the same baseline and recurring-campaign scaling. |
-| `spec-build-driver` | The packaged deterministic policy driver used for reconcile, prep, ownership checks, built-in constraints, checkpoint recording, publish, rebase, and merge projections. |
+| `spec-build-driver` | The packaged deterministic policy driver used for reconcile, prep, ownership checks, built-in constraints, checkpoint recording, diff capture, steering, escalation, continuation, publish, rebase, and merge projections. |
 
-The producer posts its receipt and witnessed evidence. Each merge posts an
-idempotently marked progress comment. After the pass finishes its integration
-sequence, one separate node posts the exact continuation command. Each passed
-checkpoint posts its own idempotently marked checkpoint progress plus that
-command. The next poll admits a fresh pass behind the campaign mutex. Neither
-producer closes the campaign issue; it remains the durable steering channel
+The producer posts its receipt and witnessed evidence. Each merge and passed
+checkpoint posts an idempotently marked progress comment. Once task execution,
+integration, and diagnosis settle, a pass that merged work, passed a checkpoint,
+or published machine steering posts exactly one continuation command; the next
+poll admits a fresh pass behind the campaign mutex. Neither producer closes the
+campaign issue. It remains the durable steering and scheduler-state channel
 across passes.
 
 Before admitting the first real run after deployment, verify the selected
@@ -452,9 +453,11 @@ a dependent consolidation task instead of declaring unsafe sharing.
 A `checkpoint` node has exactly `id`, `kind`, `title`, `argv`,
 `runtimeMaxSec`, and `dependencies`. Its direct argv is the deeper validation:
 an integration scenario, a real-binary smoke, or another accumulated-system
-invariant. It has no agent brief, acceptance criteria, or conflict domains
-because it does not implement or publish changes. Shell syntax is never
-implicit; declare `sh -c` when the checkpoint itself requires a shell.
+invariant. It has no implementation agent, acceptance criteria, or conflict
+domains because it does not implement or publish changes. The direct command still
+receives a structured `TALLY_BRIEF` containing its task, workspace, and prior
+machine diagnoses, so a retry can observe durable steering. Shell syntax is
+never implicit; declare `sh -c` when the checkpoint itself requires a shell.
 
 IDs are stable node components. Dependencies must name earlier nodes, which
 makes the array a validated topological order. Acceptance criteria are runnable,
@@ -474,17 +477,25 @@ The pass first sweeps run-local lanes left by older, no-longer-live pass
 identities. Its reconcile node then parses, normalizes, schema-validates, and
 witnesses this artifact together with its relative path and SHA-256 digest. The
 same node queries merged pull requests carrying tally's exact campaign/task
-marker and validates the expected checkpoint refs, subtracts both sets of
-completed node IDs, applies `dependencies ⊆ completed`, and selects at most
-`maxParallel` conflict-disjoint nodes. A pull-request proof must also target the
+marker, validates the expected checkpoint refs, and reads authenticated machine
+comments carrying tally's campaign/task markers. Merged implementation IDs plus
+valid checkpoint IDs are completed. A pull-request proof must also target the
 configured base and use the stable task head branch. Unknown, retargeted, or
 otherwise unusable marked PRs are skipped with warnings in the witnessed
-result; multiple valid proofs for one task remain a hard ambiguity. Later nodes
-use only that witnessed result. An implementation node receives its one task,
-assigned workspace, campaign issue locator, and bounded mission. It is
+result; multiple valid proofs for one task remain a hard ambiguity.
+
+Two contiguous diagnosis receipts directly block only an incomplete node;
+blocking then propagates through its incomplete descendants. Reconciliation
+applies `dependencies ⊆ completed` and selects at most `maxParallel` unblocked,
+conflict-disjoint nodes. Later nodes use only that witnessed result.
+
+An implementation node receives its one task, assigned workspace, campaign
+issue locator, accumulated machine diagnoses, and bounded mission. It is
 explicitly told not to read another task from the worklist, to keep every commit
-inside its enforced domains, and not to push, open a pull request, or merge.
-Those are separate deterministic nodes.
+inside its enforced domains, and not to push, open a pull request, or merge. A
+checkpoint command receives the corresponding structured retry brief but no
+implementation agent. Publication and integration remain separate deterministic
+nodes.
 
 A passed checkpoint is recorded as a lightweight Git tag below
 `refs/tags/tally/spec-build/v1/`. The expected ref includes the campaign, issue,
@@ -503,9 +514,14 @@ implemented = marked merged PRs
 checkpointed = valid content-bound checkpoint refs
 completed = implemented + checkpointed
 remaining = worklist - completed
-ready = nodes in remaining whose dependencies are all in completed
+diagnoses = authenticated marked diagnosis comments (attempts 1 and 2)
+directly_blocked = incomplete nodes with both diagnosis receipts
+blocked = directly_blocked plus their incomplete descendants
+ready = unblocked nodes in remaining whose dependencies are all in completed
 frontier = first maxParallel ready nodes with disjoint implementation conflictDomains
 
+if remaining is nonempty and frontier is empty:
+  -> post the one marked escalation with accumulated diagnoses -> exit
 if implemented is empty, an implementation is in the frontier, and command gates exist:
   prepare an isolated worktree at current remote main
   -> run each command gate.preflightArgv -> clean up the preflight lane
@@ -514,10 +530,12 @@ parallel(frontier):
     -> each configured gate -> recheck ownership -> push stable task branch
     -> open/reuse PR
   checkpoint: prepare isolated worktree -> run checkpoint argv
-    -> record content-bound completion ref -> clean up
+    -> record content-bound completion ref
 serial(successful publications): compare current base -> rebase if moved
   -> re-run each configured gate only on a changed rebased head -> merge
-if any task merged: post one continuation command for the pass
+parallel(failed tasks): capture diff -> diagnosis agent -> marked steering comment
+if any task merged, checkpoint passed, or steering was posted:
+  post one exact continuation command
 clean every prepared task lane
 exit
 ```
@@ -540,8 +558,9 @@ runs its argv as an ordinary settled `campaign-control` node with `exit:0`
 evidence, the declared deadline, and the checkpoint's `taskRef`. On success the
 driver verifies that `HEAD` is still the prepared base, no tracked file changed,
 and the remote base did not move during validation. Only then does it publish
-the completion tag and continuation comment. Ignored or untracked build outputs
-are allowed and removed with the worktree. There is no implementation agent,
+the completion tag and an idempotent progress comment. The pass-wide
+continuation is posted after every lane settles. Ignored or untracked build
+outputs are allowed and removed with the worktree. There is no implementation agent,
 configured per-task gate sequence, publication branch, pull request, rebase, or
 merge for this node kind.
 
@@ -572,61 +591,78 @@ reopened when the replacement head is published.
 
 A preflight failure stops the pass before any agent is admitted. Agent,
 ownership, task gate, checkpoint, publication, rebase, and merge failures are
-settled into the pass report. A failed checkpoint publishes no completion ref,
-so the ordinary
-dependency test leaves only its DAG descendants unready; independent frontier
-nodes continue and successful implementation siblings still publish and merge.
-There is no `awaiting operator` state or human approval transition. A failed
-implementation remains unmerged, and a failed checkpoint remains unrecorded,
-so either is eligible for a later fresh pass.
+settled into the pass report. A failed implementation remains unmerged and a failed checkpoint
+publishes no completion ref. Either failure is diagnosed after its lane settles;
+successful conflict-disjoint siblings still publish, record checkpoints, and
+merge. The first marked diagnosis leaves the node eligible for one fresh retry.
+The second marks that node directly blocked. Blocking propagates only through
+its dependency descendants, so unrelated ready subtrees continue to advance.
 
 ## Failure, steering, and re-entry
 
-Use the campaign issue comments for steering. Each new agent attempt reads that
-channel before changing code. tally never changes a running node's immutable
-brief.
+Use the campaign issue comments for human and machine steering. tally never
+changes a running node's immutable brief. After a task node fails, a separate
+diagnosis agent receives four explicit inputs: the failed node's bounded capture
+stderr, every gate output collected for the task, the exact task brief, and a
+bounded diff against its witnessed base. The diagnosis agent is told not to
+modify the repository or repeat secret-looking input. Only its concise output
+passes through conservative public redaction and becomes an authenticated,
+marked campaign comment; raw capture, gate output, brief, and diff remain private
+job inputs.
 
-After a node failure:
+The pass then posts the exact continuation command even when nothing merged.
+The next event has a fresh flow-run identity, re-reads forge state, and includes
+the first machine diagnosis in the implementation or checkpoint brief. A second
+failure produces attempt 2 and blocks that node. Because attempts live in forge
+comments, not runner memory or a campaign-local checkpoint, a redeploy, crash,
+timer, or fresh mention derives the same scheduler state.
 
-1. Start with `tally query run <runner-task-uuid>`. Its task table identifies
-   the blocked campaign task and failed stage, and its failure section carries
-   the retained capture path and bounded stderr tail. Use
-   `tally query log --flow-run <runner-task-uuid>` only when the transition or
-   provenance history is needed. A public campaign
-   receipt is absent by default; it includes failure metadata only with
-   `postFailureEvidence` and a conservatively redacted tail only with the
-   additional `postFailureStderr` opt-in. Task-specific records expose
-   `taskRef`, so the worklist ID is visible
-   without a UUID lookup.
-2. Add the steering decision to the campaign issue.
-3. Correct any host or base defect exposed by preflight, then post the
-   configured mention again:
+Escalation is a state transition, not the first failure: it occurs only when the
+worklist is incomplete and the recomputed unblocked frontier is empty. The
+driver posts one marked escalation containing compact summaries of all machine
+diagnoses and never posts it again for that campaign issue. Start investigation
+with `tally query run <runner-task-uuid>`: its task table identifies the blocked
+campaign task and failed stage, and its failure section carries the retained
+capture path and bounded stderr tail. Use `tally query log --flow-run
+<runner-task-uuid>` only when transition or provenance history is needed. A
+public campaign receipt is absent by default; it includes failure metadata only
+with `postFailureEvidence` and a conservatively redacted tail only with the
+additional `postFailureStderr` opt-in. Task-specific records retain `taskRef`,
+so the worklist ID is visible without a UUID lookup.
 
-   ```console
-   $ gh issue comment ISSUE --repo OWNER/REPO --body '<configured mention>'
-   ```
+An operator can then repair and merge a marked task PR or otherwise resolve the
+forge state before posting a fresh mention. Preflight remains outside this
+task-attempt protocol because it proves campaign admission before any task agent
+runs; repair its host or base defect and re-enter with the configured mention.
+
+```console
+$ gh issue comment ISSUE --repo OWNER/REPO --body '<configured mention>'
+```
 
 That fresh event creates a fresh flow-run identity. The pass does not reuse or
 repair an old runner prefix: it observes merged PRs and checkpoint refs again,
-recomputes the whole frontier, and gives the failed node a new isolated lane
-with current steering.
+re-reads diagnosis and escalation comments, recomputes the whole frontier, and
+gives an eligible failed node a new isolated lane with current steering.
 Changing campaign arguments or deploying a new content-addressed script between
-passes is therefore ordinary generation change, not replay divergence. Duplicate
-mentions are safe because the campaign mutex serializes passes and each pass
-subtracts the same forge facts before dispatch.
+passes is ordinary generation change, not replay divergence. Duplicate mentions
+are safe because the campaign mutex serializes passes and each pass re-derives
+the same forge facts before dispatch.
 
 Each pass contains at most one bounded frontier, so the fixed 24-hour evaluator
-budget no longer measures the whole campaign. Merge and mention events are the
-shipped campaign triggers; there is no periodic campaign timer. If a pass
-process dies or merges nothing, wait for any admitted children to settle and
-post a fresh mention. Stable remote task branches preserve published work;
-merged PRs preserve implementation completion, and checkpoint refs preserve
-successful automated barriers. Generic flows that truly require one run
-identity still use [submission identity and replay](submission-and-replay.md).
-Spec-build deliberately refuses a replayed flow-run ID after its first node:
-frontier branches execute concurrently and do not promise the same ordinal
-interleaving. Recovery must use a fresh mention and therefore a fresh forge
-event ID.
+budget no longer measures the whole campaign. Mention and pass-continuation
+events are the shipped campaign triggers; there is no periodic campaign timer.
+A pass that merges, checkpoints, or diagnoses a failure posts its own next-pass
+command. If the pass process dies before producing that durable outcome, wait
+for any admitted children to settle and post a fresh mention. Stable remote task
+branches preserve published work; merged PRs preserve implementation
+completion, checkpoint refs preserve successful automated barriers, and marked
+issue comments preserve failure attempts and the one escalation.
+
+Generic flows that truly require one run identity still use [submission
+identity and replay](submission-and-replay.md). Spec-build deliberately refuses
+a replayed flow-run ID after its first node: frontier branches execute
+concurrently and do not promise the same ordinal interleaving. Recovery must use
+a fresh mention or continuation and therefore a fresh forge event ID.
 
 ## Starting recurring automation
 

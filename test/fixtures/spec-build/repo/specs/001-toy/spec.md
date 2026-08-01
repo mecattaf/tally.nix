@@ -33,6 +33,12 @@ checkpoint is failing.
 
 ## Task five
 
-Task five starts only after the phase-one checkpoint. It creates
-`build/five.txt` containing exactly `five` followed by a newline and may run
-beside task two. Its rebased head must be gated again after task two merges.
+Create `build/five.txt` only after task two merges. The failure fixture never
+implements this task: it exists to prove that a blocked task blocks descendants.
+
+## Task six
+
+Create `build/six.txt` containing exactly `six` followed by a newline. This task
+depends only on task one and must continue while task two exhausts its steered
+attempts. It runs beside the failing checkpoint and task four; because task four
+integrates first, this task's rebased head must be gated again.

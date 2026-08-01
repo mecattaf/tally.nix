@@ -43,7 +43,7 @@
         "sh",
         "-eu",
         "-c",
-        "test \"$(cat build/one.txt)\" = one && test ! -e build/checkpoint-red"
+        "test \"$(cat build/one.txt)\" = one; if test -e build/checkpoint-red; then echo 'phase one checkpoint remains red' >&2; exit 1; fi; grep -q '\"attempt\":1' \"$TALLY_BRIEF\""
       ],
       "runtimeMaxSec": 10,
       "dependencies": [
@@ -158,10 +158,10 @@
     {
       "id": "task-5",
       "kind": "implementation",
-      "title": "Create the post-checkpoint fixture artifact",
-      "goal": "Exercise re-gating when two checkpoint descendants integrate in order.",
+      "title": "Build only after the blocked second task",
+      "goal": "Prove that direct blocking propagates to dependency descendants.",
       "deliveredBehaviors": [
-        "build/five.txt exists and contains five followed by a newline"
+        "build/five.txt exists only after task 2 merges"
       ],
       "readFirst": {
         "specSections": [
@@ -174,7 +174,7 @@
       "acceptanceCriteria": [
         {
           "id": "five-content",
-          "description": "The post-checkpoint artifact has the exact specified bytes.",
+          "description": "The dependent artifact has the exact specified bytes.",
           "argv": [
             "sh",
             "-c",
@@ -183,10 +183,44 @@
         }
       ],
       "dependencies": [
-        "phase-one-checkpoint"
+        "task-2"
       ],
       "conflictDomains": [
         "build/five.txt"
+      ]
+    },
+    {
+      "id": "task-6",
+      "kind": "implementation",
+      "title": "Create another independent fixture artifact",
+      "goal": "Prove unrelated progress and re-gating after task 4 moves main.",
+      "deliveredBehaviors": [
+        "build/six.txt exists and contains six followed by a newline"
+      ],
+      "readFirst": {
+        "specSections": [
+          "specs/001-toy/spec.md#task-six"
+        ],
+        "styleReferences": [
+          "specs/001-toy/style/example.txt"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "six-content",
+          "description": "The unrelated artifact has the exact specified bytes.",
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat build/six.txt)\" = six"
+          ]
+        }
+      ],
+      "dependencies": [
+        "task-1"
+      ],
+      "conflictDomains": [
+        "build/six.txt"
       ]
     }
   ]

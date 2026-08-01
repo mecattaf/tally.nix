@@ -64,6 +64,8 @@ const SPEC_BUILD_RUN_5: &str = "00000000-0000-4000-8000-000000000521";
 const SPEC_BUILD_DUPLICATE_GATE_RUN: &str = "00000000-0000-4000-8000-000000000522";
 const SPEC_BUILD_RUN_6: &str = "00000000-0000-4000-8000-000000000523";
 const SPEC_BUILD_RUN_7: &str = "00000000-0000-4000-8000-000000000524";
+const SPEC_BUILD_RUN_8: &str = "00000000-0000-4000-8000-000000000525";
+const SPEC_BUILD_RUN_9: &str = "00000000-0000-4000-8000-000000000526";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -888,7 +890,7 @@ async fn await_items(client: &RpcClient, items: &[Value]) {
 }
 
 async fn runner_output(child: Child) -> std::process::Output {
-    tokio::time::timeout(Duration::from_secs(30), child.wait_with_output())
+    tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
         .await
         .expect("flow runner timed out")
         .unwrap()
@@ -2314,6 +2316,14 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                         control.display().to_string(),
                         "--".to_owned(),
                     ],
+                    scrape: BTreeMap::from([(
+                        "finalMessage".to_owned(),
+                        ScrapeCapture {
+                            stream: ScrapeStream::Stdout,
+                            mode: ScrapeMode::Regex,
+                            pattern: "^TALLY_FINAL_MESSAGE=(.*)$".to_owned(),
+                        },
+                    )]),
                     launch: AdapterLaunchConfig {
                         cwd_argv: Some(vec!["-C".to_owned(), "%<cwd>%".to_owned()]),
                         approval_policies: BTreeMap::from([(
@@ -2381,7 +2391,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                         }
                     },
                     "worklist": "specs/*/tasks.json",
-                    "maxTasks": 6,
+                    "maxTasks": 7,
                     "maxParallel": 3,
                     "reconcileCommand": "/tally reconcile fixture",
                     "workspaceRoot": workspace_root,
@@ -2465,7 +2475,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 &script,
                 SPEC_BUILD_RUN,
                 &arguments("fixture-comment-7", "low"),
-                32,
+                48,
             )
             .spawn()
             .unwrap();
@@ -2579,7 +2589,6 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .contains("_campaign-preflight")
             );
 
-            fs::write(control.join("inject-forbidden-path"), b"").unwrap();
             fs::write(control.join("post-change-failed-once"), b"").unwrap();
 
             let second = runner(
@@ -2588,7 +2597,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 &script,
                 SPEC_BUILD_RUN_2,
                 &arguments("fixture-comment-8", "medium"),
-                32,
+                48,
             )
             .spawn()
             .unwrap();
@@ -2608,6 +2617,15 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(second_value["merged"][0]["taskId"], "task-3");
             assert_eq!(second_value["failures"][0]["taskId"], "task-1");
             assert_eq!(second_value["failures"][0]["stage"], "ownership");
+            assert_eq!(second_value["diagnoses"][0]["taskId"], "task-1");
+            assert_eq!(second_value["diagnoses"][0]["attempt"], 1);
+            assert_eq!(second_value["diagnoses"][0]["blocked"], false);
+            assert_eq!(second_value["diagnoses"][0]["redacted"], true);
+            assert_eq!(second_value["continuation"]["posted"], true);
+            assert_eq!(
+                second_value["continuation"]["command"],
+                "/tally reconcile fixture"
+            );
             assert!(control.join("started-task-1").exists());
             assert!(control.join("started-task-3").exists());
             let second_submitted = runner_events(&second, "node-submitted");
@@ -2620,17 +2638,17 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
 
             assert_eq!(
                 second_submitted.len(),
-                20,
+                24,
                 "unexpected second-pass nodes: {:?}",
                 second_submitted
                     .iter()
                     .map(|event| event["label"].as_str().unwrap_or("<missing>"))
                     .collect::<Vec<_>>()
             );
-            let second_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_2, 20).await;
+            let second_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_2, 24).await;
             assert_eq!(
                 second_items.len(),
-                20,
+                24,
                 "unexpected durable second-pass nodes: {:?}",
                 json!({
                     "durable": second_items
@@ -2645,18 +2663,37 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     "report": second_value,
                 })
             );
-            assert!(second_items[..2]
-                .iter()
-                .all(|item| item.get("taskRef").is_none()));
             assert_eq!(
-                second_items[2..]
+                second_submitted
+                    .iter()
+                    .filter(|event| event["taskRef"] == "fixture/task-1")
+                    .count(),
+                11
+            );
+            assert_eq!(
+                second_submitted
+                    .iter()
+                    .filter(|event| event["taskRef"] == "fixture/task-3")
+                    .count(),
+                10
+            );
+            assert_eq!(
+                second_submitted
+                    .iter()
+                    .filter(|event| event.get("taskRef").is_none())
+                    .count(),
+                3,
+                "sweep, reconcile, and one end-of-pass continuation have no task ref"
+            );
+            assert_eq!(
+                second_items
                     .iter()
                     .filter(|item| item["taskRef"] == "fixture/task-1")
                     .count(),
-                8
+                11
             );
             assert_eq!(
-                second_items[2..]
+                second_items
                     .iter()
                     .filter(|item| item["taskRef"] == "fixture/task-3")
                     .count(),
@@ -2675,6 +2712,13 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             }
             let failed_constraint =
                 failed_constraint.expect("the conflict-domain ownership check was not projected");
+            assert_eq!(
+                second_items
+                    .iter()
+                    .filter(|item| item.get("taskRef").is_none())
+                    .count(),
+                3
+            );
             let projected_constraint = client
                 .call("query.job", Some(json!({"id": failed_constraint.clone()})))
                 .await
@@ -2718,15 +2762,13 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 "pass exit left prep state behind"
             );
 
-            fs::write(control.join("constraint-cleared"), b"").unwrap();
-
             let third = runner(
                 &config_path,
                 &daemon_paths.socket,
                 &script,
                 SPEC_BUILD_RUN_3,
                 &arguments("fixture-comment-9", "medium"),
-                32,
+                48,
             )
             .spawn()
             .unwrap();
@@ -2739,15 +2781,42 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             );
             let third_value = &flow_report(&third)["report"]["finalValue"];
             assert_eq!(third_value["reconciled"]["frontier"], json!(["task-1"]));
+            assert_eq!(third_value["reconciled"]["diagnoses"][0]["attempt"], 1);
             assert_eq!(third_value["merged"][0]["taskId"], "task-1");
             assert_eq!(third_value["failures"], json!([]));
-            let third_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_3, 12).await;
-            assert!(third_items[..2]
-                .iter()
-                .all(|item| item.get("taskRef").is_none()));
-            assert!(third_items[2..]
-                .iter()
-                .all(|item| item["taskRef"] == "fixture/task-1"));
+            assert_eq!(third_value["diagnoses"], json!([]));
+            assert!(control.join("task-1-steering-visible").exists());
+            let third_submitted = runner_events(&third, "node-submitted");
+            assert_eq!(third_submitted.len(), 13);
+            assert_eq!(
+                third_submitted
+                    .iter()
+                    .filter(|event| event["taskRef"] == "fixture/task-1")
+                    .count(),
+                10
+            );
+            assert_eq!(
+                third_submitted
+                    .iter()
+                    .filter(|event| event.get("taskRef").is_none())
+                    .count(),
+                3
+            );
+            let third_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_3, 13).await;
+            assert_eq!(
+                third_items
+                    .iter()
+                    .filter(|item| item["taskRef"] == "fixture/task-1")
+                    .count(),
+                10
+            );
+            assert_eq!(
+                third_items
+                    .iter()
+                    .filter(|item| item.get("taskRef").is_none())
+                    .count(),
+                3
+            );
 
             fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
@@ -2764,8 +2833,8 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 &daemon_paths.socket,
                 &script,
                 SPEC_BUILD_RUN_4,
-                &arguments("fixture-comment-10", "high"),
-                32,
+                &arguments("fixture-comment-10-frontier", "high"),
+                48,
             )
             .spawn()
             .unwrap();
@@ -2779,45 +2848,65 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             let fourth_value = &flow_report(&fourth)["report"]["finalValue"];
             assert_eq!(
                 fourth_value["reconciled"]["frontier"],
-                json!(["phase-one-checkpoint", "task-4"])
+                json!(["phase-one-checkpoint", "task-4", "task-6"])
             );
             assert_eq!(fourth_value["merged"][0]["taskId"], "task-4");
+            assert_eq!(fourth_value["merged"][1]["taskId"], "task-6");
+            assert_eq!(fourth_value["merged"][1]["regated"], true);
             assert_eq!(fourth_value["checkpoints"], json!([]));
             assert_eq!(
                 fourth_value["failures"][0]["taskId"],
                 "phase-one-checkpoint"
             );
             assert_eq!(fourth_value["failures"][0]["stage"], "checkpoint");
+            assert_eq!(
+                fourth_value["diagnoses"][0]["taskId"],
+                "phase-one-checkpoint"
+            );
+            assert_eq!(fourth_value["diagnoses"][0]["attempt"], 1);
+            assert_eq!(fourth_value["diagnoses"][0]["blocked"], false);
+            assert_eq!(fourth_value["continuation"]["posted"], true);
             let fourth_submitted = runner_events(&fourth, "node-submitted");
-            assert_eq!(fourth_submitted.len(), 15);
+            assert_eq!(fourth_submitted.len(), 32);
             assert!(fourth_submitted
                 .iter()
                 .all(|event| event["disposition"] == "created"));
-            assert!(fourth_submitted[..2]
-                .iter()
-                .all(|event| event.get("taskRef").is_none()));
             assert_eq!(
-                fourth_submitted[2..]
+                fourth_submitted
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/phase-one-checkpoint")
                     .count(),
-                3
+                6
             );
             assert_eq!(
-                fourth_submitted[2..]
+                fourth_submitted
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-4")
                     .count(),
                 10
             );
+            assert_eq!(
+                fourth_submitted
+                    .iter()
+                    .filter(|event| event["taskRef"] == "fixture/task-6")
+                    .count(),
+                13
+            );
+            assert_eq!(
+                fourth_submitted
+                    .iter()
+                    .filter(|event| event.get("taskRef").is_none())
+                    .count(),
+                3
+            );
+            assert!(fourth_submitted
+                .iter()
+                .any(|event| event["label"] == "regate-task-6-no-db-artifacts"));
             assert!(fourth_submitted
                 .iter()
                 .any(|event| event["label"] == "checkpoint-phase-one-checkpoint"));
 
-            let fourth_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_4, 15).await;
-            assert!(fourth_items[..2]
-                .iter()
-                .all(|item| item.get("taskRef").is_none()));
+            let fourth_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_4, 32).await;
             let failed_checkpoint = fourth_items
                 .iter()
                 .find(|item| {
@@ -2830,16 +2919,26 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     "sh",
                     "-eu",
                     "-c",
-                    "test \"$(cat build/one.txt)\" = one && test ! -e build/checkpoint-red"
+                    "test \"$(cat build/one.txt)\" = one; if test -e build/checkpoint-red; then echo 'phase one checkpoint remains red' >&2; exit 1; fi; grep -q '\"attempt\":1' \"$TALLY_BRIEF\""
                 ])
             );
             assert_eq!(failed_checkpoint["runtimeMaxSec"], 10);
             assert_eq!(failed_checkpoint["taskRef"], "fixture/phase-one-checkpoint");
+            assert!(task_capture(
+                &daemon_paths,
+                failed_checkpoint["anchor"].as_str().unwrap(),
+                "phase-one-checkpoint"
+            )
+            .contains("phase one checkpoint remains red"));
 
             fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
                 fixture_git(&checkout, &["show", "origin/main:build/four.txt"]),
                 "four"
+            );
+            assert_eq!(
+                fixture_git(&checkout, &["show", "origin/main:build/six.txt"]),
+                "six"
             );
             assert!(
                 StdCommand::new("git")
@@ -2858,7 +2957,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 &daemon_paths.socket,
                 &script,
                 SPEC_BUILD_RUN_5,
-                &arguments("fixture-comment-10", "low"),
+                &arguments("fixture-comment-10-checkpoint", "low"),
                 32,
             )
             .spawn()
@@ -2877,7 +2976,18 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             );
             assert_eq!(checkpoint_value["state"], "advanced");
             assert_eq!(checkpoint_value["failures"], json!([]));
+            assert_eq!(checkpoint_value["diagnoses"], json!([]));
             assert_eq!(checkpoint_value["merged"], json!([]));
+            assert_eq!(checkpoint_value["continuation"]["posted"], true);
+            assert_eq!(
+                checkpoint_value["reconciled"]["diagnoses"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|diagnosis| diagnosis["taskId"] == "phase-one-checkpoint")
+                    .unwrap()["attempt"],
+                1
+            );
             assert_eq!(
                 checkpoint_value["checkpoints"][0]["taskId"],
                 "phase-one-checkpoint"
@@ -2899,14 +3009,22 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .unwrap(),
                 checkpoint_revision
             );
-            let checkpoint_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_5, 6).await;
-            assert_eq!(checkpoint_items.len(), 6);
-            assert!(checkpoint_items[..2]
+            let checkpoint_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_5, 7).await;
+            assert_eq!(checkpoint_items.len(), 7);
+            assert_eq!(
+                checkpoint_items
                 .iter()
-                .all(|item| item.get("taskRef").is_none()));
-            assert!(checkpoint_items[2..]
-                .iter()
-                .all(|item| item["taskRef"] == "fixture/phase-one-checkpoint"));
+                    .filter(|item| item["taskRef"] == "fixture/phase-one-checkpoint")
+                    .count(),
+                4
+            );
+            assert_eq!(
+                checkpoint_items
+                    .iter()
+                    .filter(|item| item.get("taskRef").is_none())
+                    .count(),
+                3
+            );
             assert!(checkpoint_items.iter().all(|item| {
                 item["orchestration"]["nodeLabel"] != "agent-phase-one-checkpoint"
                     && item["orchestration"]["nodeLabel"] != "publish-phase-one-checkpoint"
@@ -2936,50 +3054,60 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             let sixth_value = &flow_report(&sixth)["report"]["finalValue"];
             assert_eq!(
                 sixth_value["reconciled"]["frontier"],
-                json!(["task-2", "task-5"])
+                json!(["task-2"])
             );
             assert_eq!(
                 sixth_value["reconciled"]["checkpoints"][0]["taskId"],
                 "phase-one-checkpoint"
             );
-            assert_eq!(sixth_value["merged"][0]["taskId"], "task-2");
-            assert_eq!(sixth_value["merged"][1]["taskId"], "task-5");
-            assert_eq!(sixth_value["merged"][1]["regated"], true);
-            assert_eq!(sixth_value["failures"], json!([]));
+            assert_eq!(sixth_value["state"], "steered");
+            assert_eq!(sixth_value["merged"], json!([]));
+            assert_eq!(sixth_value["failures"][0]["taskId"], "task-2");
+            assert_eq!(sixth_value["failures"][0]["stage"], "gate:fixture-first");
+            assert_eq!(sixth_value["diagnoses"][0]["taskId"], "task-2");
+            assert_eq!(sixth_value["diagnoses"][0]["attempt"], 1);
+            assert_eq!(sixth_value["diagnoses"][0]["blocked"], false);
+            assert_eq!(sixth_value["continuation"]["posted"], true);
             let sixth_submitted = runner_events(&sixth, "node-submitted");
-            assert_eq!(sixth_submitted.len(), 25);
+            assert_eq!(sixth_submitted.len(), 12);
             assert!(sixth_submitted
                 .iter()
                 .all(|event| event["disposition"] == "created"));
-            assert!(sixth_submitted[..2]
-                .iter()
-                .all(|event| event.get("taskRef").is_none()));
             assert_eq!(
-                sixth_submitted[2..]
+                sixth_submitted
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-2")
                     .count(),
-                10
+                9
             );
             assert_eq!(
-                sixth_submitted[2..]
+                sixth_submitted
                     .iter()
-                    .filter(|event| event["taskRef"] == "fixture/task-5")
+                    .filter(|event| event.get("taskRef").is_none())
                     .count(),
-                13
+                3,
+                "a failure-only pass must sweep, reconcile, and post one continuation"
             );
-            assert!(sixth_submitted
-                .iter()
-                .any(|event| event["label"] == "regate-task-5-no-db-artifacts"));
 
             fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/two.txt"]),
-                "two"
+                fixture_git(&checkout, &["show", "origin/main:build/four.txt"]),
+                "four"
             );
             assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/five.txt"]),
-                "five"
+                fixture_git(&checkout, &["show", "origin/main:build/six.txt"]),
+                "six"
+            );
+            let main_paths = fixture_git(
+                &checkout,
+                &["ls-tree", "-r", "--name-only", "origin/main"],
+            );
+            assert!(!main_paths.lines().any(|path| path == "build/two.txt"));
+            assert!(!main_paths.lines().any(|path| path == "build/five.txt"));
+            assert_eq!(
+                fixture_git(&checkout, &["rev-parse", "origin/main"]),
+                task_2_base,
+                "the first failed task-2 attempt must leave main unchanged"
             );
             assert!(
                 !fixture_git(&checkout, &["ls-tree", "-r", "--name-only", "origin/main"])
@@ -2997,24 +3125,15 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 &["rev-list", "--first-parent", "--reverse", "origin/main"],
             );
             let commits = first_parent.lines().collect::<Vec<_>>();
-            assert_eq!(
-                commits.len(),
-                6,
-                "initial commit plus five implementation merges"
-            );
-            assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/task-2-base.txt"]),
-                task_2_base,
-                "the dependent task must be prepared from current checkpointed forge state"
-            );
+            assert_eq!(commits.len(), 5, "initial commit plus four task merges");
 
             let replay = runner(
                 &config_path,
                 &daemon_paths.socket,
                 &script,
                 SPEC_BUILD_RUN_4,
-                &arguments("fixture-comment-10", "high"),
-                32,
+                &arguments("fixture-comment-10-frontier", "high"),
+                48,
             )
             .spawn()
             .unwrap();
@@ -3031,9 +3150,9 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(replayed.len(), 1);
             assert_eq!(replayed[0]["label"], "spec-build-sweep");
             assert_eq!(replayed[0]["disposition"], "reused");
-            assert_eq!(flow_items(&client, SPEC_BUILD_RUN_4).await.len(), 15);
+            assert_eq!(flow_items(&client, SPEC_BUILD_RUN_4).await.len(), 32);
 
-            let complete = runner(
+            let seventh = runner(
                 &config_path,
                 &daemon_paths.socket,
                 &script,
@@ -3043,35 +3162,183 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             )
             .spawn()
             .unwrap();
-            let complete = runner_output(complete).await;
+            let seventh = runner_output(seventh).await;
             assert!(
-                complete.status.success(),
+                seventh.status.success(),
                 "stdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&complete.stdout),
-                String::from_utf8_lossy(&complete.stderr)
+                String::from_utf8_lossy(&seventh.stdout),
+                String::from_utf8_lossy(&seventh.stderr)
             );
-            let complete_value = &flow_report(&complete)["report"]["finalValue"];
-            assert_eq!(complete_value["state"], "complete");
+            let seventh_value = &flow_report(&seventh)["report"]["finalValue"];
+            assert_eq!(seventh_value["state"], "steered");
             assert_eq!(
-                complete_value["reconciled"]["merged"]
+                seventh_value["reconciled"]["frontier"],
+                json!(["task-2"])
+            );
+            let prior_task_2 = seventh_value["reconciled"]["diagnoses"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|diagnosis| diagnosis["taskId"] == "task-2")
+                .unwrap();
+            assert_eq!(prior_task_2["attempt"], 1);
+            assert_eq!(seventh_value["failures"][0]["taskId"], "task-2");
+            assert_eq!(seventh_value["diagnoses"][0]["taskId"], "task-2");
+            assert_eq!(seventh_value["diagnoses"][0]["attempt"], 2);
+            assert_eq!(seventh_value["diagnoses"][0]["blocked"], true);
+            assert_eq!(seventh_value["continuation"]["posted"], true);
+            let seventh_submitted = runner_events(&seventh, "node-submitted");
+            assert_eq!(seventh_submitted.len(), 12);
+            assert_eq!(
+                seventh_submitted
+                    .iter()
+                    .filter(|event| event["taskRef"] == "fixture/task-2")
+                    .count(),
+                9
+            );
+            assert_eq!(
+                seventh_submitted
+                    .iter()
+                    .filter(|event| event.get("taskRef").is_none())
+                    .count(),
+                3
+            );
+
+            let eighth = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_8,
+                &arguments("fixture-comment-13", "low"),
+                48,
+            )
+            .spawn()
+            .unwrap();
+            let eighth = runner_output(eighth).await;
+            assert!(
+                eighth.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&eighth.stdout),
+                String::from_utf8_lossy(&eighth.stderr)
+            );
+            let eighth_value = &flow_report(&eighth)["report"]["finalValue"];
+            assert_eq!(eighth_value["state"], "blocked");
+            assert_eq!(
+                eighth_value["reconciled"]["merged"]
                     .as_array()
                     .unwrap()
                     .iter()
                     .map(|fact| fact["taskId"].as_str().unwrap())
                     .collect::<Vec<_>>(),
-                vec!["task-1", "task-2", "task-3", "task-4", "task-5"]
+                vec!["task-1", "task-3", "task-4", "task-6"]
             );
             assert_eq!(
-                complete_value["reconciled"]["checkpoints"][0]["taskId"],
+                eighth_value["reconciled"]["checkpoints"][0]["taskId"],
                 "phase-one-checkpoint"
             );
-            assert_eq!(complete_value["reconciled"]["remaining"], json!([]));
-            assert_eq!(complete_value["reconciled"]["frontier"], json!([]));
-            let complete_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_7, 2).await;
-            assert_eq!(complete_items.len(), 2);
-            assert!(complete_items
+            assert_eq!(
+                eighth_value["reconciled"]["remaining"],
+                json!(["task-2", "task-5"])
+            );
+            assert_eq!(eighth_value["reconciled"]["frontier"], json!([]));
+            assert_eq!(eighth_value["reconciled"]["quiescent"], true);
+            assert_eq!(
+                eighth_value["reconciled"]["blocked"],
+                json!([
+                    {"taskId": "task-2", "blockedBy": ["task-2"]},
+                    {"taskId": "task-5", "blockedBy": ["task-2"]}
+                ])
+            );
+            assert_eq!(eighth_value["escalation"]["posted"], true);
+            assert_eq!(eighth_value["escalation"]["diagnosisCount"], 4);
+            let eighth_submitted = runner_events(&eighth, "node-submitted");
+            assert_eq!(eighth_submitted.len(), 3);
+            assert!(eighth_submitted
                 .iter()
-                .all(|item| item.get("taskRef").is_none()));
+                .all(|event| event.get("taskRef").is_none()));
+
+            let escalation_ref = fixture_git(
+                &checkout,
+                &[
+                    "ls-remote",
+                    "origin",
+                    "refs/tally/spec-build/v1/*/escalation",
+                ],
+            );
+            let escalation_oid = escalation_ref
+                .split_whitespace()
+                .next()
+                .expect("local forge omitted the escalation ref");
+            let escalation: Value = serde_json::from_str(&fixture_git(
+                &checkout,
+                &["cat-file", "blob", escalation_oid],
+            ))
+            .unwrap();
+            let escalation_body = escalation["body"].as_str().unwrap();
+            assert!(escalation_body.contains("Accumulated machine diagnoses"));
+            assert!(escalation_body.contains("`task-1` attempt 1"));
+            assert!(escalation_body.contains("`phase-one-checkpoint` attempt 1"));
+            assert!(escalation_body.contains("`task-2` attempt 1"));
+            assert!(escalation_body.contains("`task-2` attempt 2"));
+            let task_1_diagnosis_ref = fixture_git(
+                &checkout,
+                &[
+                    "ls-remote",
+                    "origin",
+                    "refs/tally/spec-build/v1/*/diagnosis/task-1/1",
+                ],
+            );
+            let task_1_diagnosis_oid = task_1_diagnosis_ref
+                .split_whitespace()
+                .next()
+                .expect("local forge omitted task 1 diagnosis");
+            let task_1_diagnosis: Value = serde_json::from_str(&fixture_git(
+                &checkout,
+                &["cat-file", "blob", task_1_diagnosis_oid],
+            ))
+            .unwrap();
+            assert!(task_1_diagnosis["diagnosis"]
+                .as_str()
+                .unwrap()
+                .contains("[redacted-token]"));
+            assert!(!task_1_diagnosis["diagnosis"]
+                .as_str()
+                .unwrap()
+                .contains("ghp_"));
+
+            let ninth = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_9,
+                &arguments("fixture-comment-14", "low"),
+                48,
+            )
+            .spawn()
+            .unwrap();
+            let ninth = runner_output(ninth).await;
+            assert!(
+                ninth.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&ninth.stdout),
+                String::from_utf8_lossy(&ninth.stderr)
+            );
+            let ninth_value = &flow_report(&ninth)["report"]["finalValue"];
+            assert_eq!(ninth_value["state"], "blocked");
+            assert!(ninth_value["reconciled"]["escalation"]
+                .as_str()
+                .unwrap()
+                .ends_with("/escalation"));
+            assert_eq!(ninth_value["escalation"], Value::Null);
+            let ninth_submitted = runner_events(&ninth, "node-submitted");
+            assert_eq!(
+                ninth_submitted.len(),
+                2,
+                "escalation must be projected once"
+            );
+            assert!(ninth_submitted
+                .iter()
+                .all(|event| event.get("taskRef").is_none()));
             assert!(
                 !fixture_git(&checkout, &["worktree", "list", "--porcelain"])
                     .contains(workspace_root.to_str().unwrap())
@@ -3079,36 +3346,77 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
 
             let agent_order = fs::read_to_string(control.join("agent-order.log")).unwrap();
             let agents = agent_order.lines().collect::<Vec<_>>();
-            assert_eq!(agents.len(), 6);
+            assert_eq!(agents.len(), 7);
             let mut first_frontier = agents[..2].to_vec();
             first_frontier.sort_unstable();
             assert_eq!(first_frontier, vec!["task-1", "task-3"]);
             assert_eq!(agents[2], "task-1");
-            assert_eq!(agents[3], "task-4");
-            let mut post_checkpoint_frontier = agents[4..].to_vec();
-            post_checkpoint_frontier.sort_unstable();
-            assert_eq!(post_checkpoint_frontier, vec!["task-2", "task-5"]);
+            let mut fourth_frontier = agents[3..5].to_vec();
+            fourth_frontier.sort_unstable();
+            assert_eq!(fourth_frontier, vec!["task-4", "task-6"]);
+            assert_eq!(agents[5], "task-2");
+            assert_eq!(agents[6], "task-2");
 
             let policy_order = fs::read_to_string(control.join("policy-order.log")).unwrap();
             let policies = policy_order.lines().collect::<Vec<_>>();
-            assert_eq!(policies.len(), 6);
+            assert_eq!(policies.len(), 11);
+            assert_eq!(
+                policies
+                    .iter()
+                    .filter(|line| line.starts_with("diagnosis:"))
+                    .count(),
+                4
+            );
+            assert_eq!(
+                policies
+                    .iter()
+                    .filter(|line| line.starts_with("implementation:"))
+                    .count(),
+                7
+            );
             assert!(policies
                 .iter()
                 .all(|line| line.ends_with(":on-request:workspace-write")));
+
+            let diagnosis_inputs =
+                fs::read_to_string(control.join("diagnosis-inputs.log")).unwrap();
+            let diagnosis_inputs = diagnosis_inputs
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(diagnosis_inputs.len(), 4);
+            assert_eq!(diagnosis_inputs[0]["task"], "task-1");
+            assert_eq!(diagnosis_inputs[0]["previous"], 0);
+            assert_eq!(diagnosis_inputs[0]["hasPatch"], true);
+            assert_eq!(diagnosis_inputs[1]["task"], "phase-one-checkpoint");
+            assert_eq!(diagnosis_inputs[1]["previous"], 0);
+            assert_eq!(diagnosis_inputs[1]["hasPatch"], false);
+            assert_eq!(diagnosis_inputs[2]["task"], "task-2");
+            assert_eq!(diagnosis_inputs[2]["previous"], 0);
+            assert_eq!(diagnosis_inputs[2]["hasPatch"], true);
+            assert_eq!(diagnosis_inputs[3]["task"], "task-2");
+            assert_eq!(diagnosis_inputs[3]["previous"], 1);
+            assert_eq!(diagnosis_inputs[3]["hasPatch"], true);
+            assert!(diagnosis_inputs.iter().all(|receipt| {
+                receipt["hasBrief"] == true
+                    && receipt["hasDiff"] == true
+                    && receipt["hasStderr"] == true
+                    && receipt["gateCount"].as_u64().unwrap() >= 1
+            }));
 
             let gated = fs::read_to_string(control.join("gate-order.log")).unwrap();
             let gated = gated.lines().collect::<Vec<_>>();
             for (receipt, expected) in [
                 ("task-1:first", 1),
                 ("task-1:second", 1),
-                ("task-2:first", 1),
-                ("task-2:second", 1),
+                ("task-2:first", 2),
+                ("task-2:second", 0),
                 ("task-3:first", 1),
                 ("task-3:second", 1),
                 ("task-4:first", 1),
                 ("task-4:second", 1),
-                ("task-5:first", 2),
-                ("task-5:second", 2),
+                ("task-6:first", 2),
+                ("task-6:second", 2),
             ] {
                 assert_eq!(
                     gated

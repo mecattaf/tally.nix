@@ -2,12 +2,13 @@
 //
 // Every invocation witnesses current forge state, selects one dependency-ready
 // and conflict-disjoint frontier, advances those tasks in isolated worktrees,
-// and exits. Merged pull requests and content-bound checkpoint refs are the
-// durable completion facts; a new mention or continuation invocation always
-// starts from those facts instead of a prior runner's witnessed prefix.
+// and exits. Merged pull requests, content-bound checkpoint refs, machine
+// diagnosis comments, and the one escalation marker are durable forge facts;
+// every invocation starts from those facts instead of a prior runner's
+// witnessed prefix.
 export const meta = {
   name: "spec-build",
-  description: "Reconcile one witnessed spec-build frontier against durable forge facts",
+  description: "Reconcile one witnessed spec-build frontier against durable forge state",
   pools: ["campaign-agent", "campaign-control"],
   argsSchema: {
     type: "object",
@@ -383,6 +384,33 @@ const effectiveConfigSchema = {
   additionalProperties: false
 };
 
+const diagnosisFactSchema = {
+  type: "object",
+  required: ["taskId", "attempt", "comment", "diagnosis"],
+  properties: {
+    taskId: taskIdSchema,
+    attempt: { type: "integer", minimum: 1, maximum: 2 },
+    comment: { type: "string", minLength: 1 },
+    diagnosis: { type: "string", minLength: 1, maxLength: 12000 }
+  },
+  additionalProperties: false
+};
+
+const blockedFactSchema = {
+  type: "object",
+  required: ["taskId", "blockedBy"],
+  properties: {
+    taskId: taskIdSchema,
+    blockedBy: {
+      type: "array",
+      minItems: 1,
+      uniqueItems: true,
+      items: taskIdSchema
+    }
+  },
+  additionalProperties: false
+};
+
 const reconcileSchema = {
   type: "object",
   required: [
@@ -395,6 +423,10 @@ const reconcileSchema = {
     "checkpoints",
     "remaining",
     "frontier",
+    "diagnoses",
+    "blocked",
+    "quiescent",
+    "escalation",
     "complete",
     "warnings"
   ],
@@ -417,6 +449,10 @@ const reconcileSchema = {
     checkpoints: { type: "array", items: checkpointFactSchema },
     remaining: { type: "array", items: taskIdSchema },
     frontier: { type: "array", maxItems: 128, items: taskSchema },
+    diagnoses: { type: "array", maxItems: 256, items: diagnosisFactSchema },
+    blocked: { type: "array", maxItems: 128, items: blockedFactSchema },
+    quiescent: { type: "boolean" },
+    escalation: { type: ["string", "null"], minLength: 1 },
     complete: { type: "boolean" },
     warnings: stringList,
     config: effectiveConfigSchema
@@ -568,6 +604,56 @@ const mergeSchema = {
   additionalProperties: false
 };
 
+const diffSchema = {
+  type: "object",
+  required: [
+    "taskId",
+    "available",
+    "baseRev",
+    "head",
+    "status",
+    "patch",
+    "truncated",
+    "reason"
+  ],
+  properties: {
+    taskId: taskIdSchema,
+    available: { type: "boolean" },
+    baseRev: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
+    head: { type: ["string", "null"], pattern: "^[0-9a-f]{40,64}$" },
+    status: { type: "string", maxLength: 16032 },
+    patch: { type: "string", maxLength: 131104 },
+    truncated: { type: "boolean" },
+    reason: { type: ["string", "null"], minLength: 1 }
+  },
+  additionalProperties: false
+};
+
+const steeringSchema = {
+  type: "object",
+  required: ["taskId", "attempt", "comment", "blocked", "posted", "redacted"],
+  properties: {
+    taskId: taskIdSchema,
+    attempt: { type: "integer", minimum: 1, maximum: 2 },
+    comment: { type: "string", minLength: 1 },
+    blocked: { type: "boolean" },
+    posted: { type: "boolean" },
+    redacted: { type: "boolean" }
+  },
+  additionalProperties: false
+};
+
+const escalationSchema = {
+  type: "object",
+  required: ["posted", "comment", "diagnosisCount"],
+  properties: {
+    posted: { type: "boolean" },
+    comment: { type: "string", minLength: 1 },
+    diagnosisCount: { type: "integer", minimum: 1, maximum: 256 }
+  },
+  additionalProperties: false
+};
+
 const continuationSchema = {
   type: "object",
   required: ["command", "posted"],
@@ -576,6 +662,12 @@ const continuationSchema = {
     posted: { const: true }
   },
   additionalProperties: false
+};
+
+const diagnosisResultSchema = {
+  type: "string",
+  minLength: 1,
+  maxLength: 12000
 };
 
 function driverNode(
@@ -635,7 +727,7 @@ function bounded(value, limit) {
   return text.length > limit ? `${text.slice(0, limit)}...` : text;
 }
 
-function nodeFailure(task, stage, node) {
+function failureReport(task, stage, node) {
   return {
     taskId: task.id,
     stage,
@@ -657,6 +749,96 @@ function cleanupBrief(repositoryConfig, taskId, workspace) {
     brief.workspace = workspace;
   }
   return brief;
+}
+
+function taskFailure(task, stage, node, taskBrief, gateOutputs, prepared, baseRev) {
+  return {
+    task,
+    report: failureReport(task, stage, node),
+    stage,
+    node,
+    taskBrief,
+    gateOutputs: gateOutputs || [],
+    prepared: prepared || null,
+    baseRev: baseRev || (prepared && prepared.baseRev) || null
+  };
+}
+
+function machineDiagnoses(reconciliation, taskId) {
+  return reconciliation.diagnoses.filter(item => item.taskId === taskId);
+}
+
+function implementationBrief(task, prepared, reconciliation) {
+  return {
+    schemaVersion: 1,
+    mission: task.brief
+      ? `Implement only forge task ${task.id}: ${task.title}. The exact operator-authored task brief is task.brief.body below. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task issue; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Read the master campaign issue comments and the machineDiagnoses below for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`
+      : `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task from the worklist; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Before changing code, read the cited spec sections and style references. Read the campaign issue comments and the machineDiagnoses below for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
+    campaign: {
+      name: effective.campaign,
+      repository: args.repository,
+      issue: args.issue,
+      runId: args.runId
+    },
+    task,
+    workspace: prepared,
+    steering: {
+      channel: "github-issue-comments",
+      repository: args.repository,
+      issueNumber: args.issue.number,
+      issueUrl: args.issue.url,
+      machineDiagnoses: machineDiagnoses(reconciliation, task.id)
+    }
+  };
+}
+
+function checkpointBrief(task, prepared, reconciliation) {
+  return {
+    schemaVersion: 1,
+    mission: `Run automated checkpoint ${task.id}: ${task.title}. The command is fixed by the worklist. Read the campaign issue comments and the machineDiagnoses below as the durable failure history for this retry. Do not modify the repository.`,
+    campaign: {
+      name: effective.campaign,
+      repository: args.repository,
+      issue: args.issue,
+      runId: args.runId
+    },
+    task,
+    workspace: prepared,
+    steering: {
+      channel: "github-issue-comments",
+      repository: args.repository,
+      issueNumber: args.issue.number,
+      issueUrl: args.issue.url,
+      machineDiagnoses: machineDiagnoses(reconciliation, task.id)
+    }
+  };
+}
+
+function applyAgentPolicies(spec) {
+  if (effective.agent.runtimeMaxSec !== null) {
+    spec.runtimeMaxSec = effective.agent.runtimeMaxSec;
+  }
+  if (effective.agent.approvalPolicy !== null) {
+    spec.approvalPolicy = effective.agent.approvalPolicy;
+  }
+  if (effective.agent.sandboxPolicy !== null) {
+    spec.sandboxPolicy = effective.agent.sandboxPolicy;
+  }
+  return spec;
+}
+
+function reconciledProjection(reconciliation) {
+  return {
+    merged: reconciliation.merged,
+    checkpoints: reconciliation.checkpoints,
+    remaining: reconciliation.remaining,
+    frontier: reconciliation.frontier.map(task => task.id),
+    diagnoses: reconciliation.diagnoses,
+    blocked: reconciliation.blocked,
+    quiescent: reconciliation.quiescent,
+    escalation: reconciliation.escalation,
+    warnings: reconciliation.warnings
+  };
 }
 
 async function runGate(task, gate, workspace, prefix) {
@@ -836,6 +1018,55 @@ async function sweepCampaign(repositoryConfig) {
   }
   const domainsRequired = effective.maxParallel > 1;
 
+  if (reconciliation.complete) {
+    return {
+      campaign: effective.campaign,
+      repository: args.repository,
+      issue: args.issue,
+      worklist: reconciliation.source,
+      state: "complete",
+      reconciled: reconciledProjection(reconciliation),
+      maintenance: sweepNode.result,
+      checkpoints: [],
+      merged: [],
+      failures: [],
+      diagnoses: [],
+      continuation: null,
+      escalation: null
+    };
+  }
+
+  if (reconciliation.quiescent) {
+    let escalation = null;
+    if (reconciliation.escalation === null) {
+      const escalated = await driverNode(
+        "escalate",
+        reconcileBrief,
+        "escalate",
+        "spec-build-escalate",
+        escalationSchema,
+        null,
+        false,
+        null
+      );
+      escalation = escalated.result;
+    }
+    return {
+      campaign: effective.campaign,
+      repository: args.repository,
+      issue: args.issue,
+      worklist: reconciliation.source,
+      state: "blocked",
+      reconciled: reconciledProjection(reconciliation),
+      maintenance: sweepNode.result,
+      checkpoints: [],
+      merged: [],
+      failures: [],
+      diagnoses: [],
+      continuation: null,
+      escalation
+    };
+  }
   // A merged campaign PR is the durable proof that an earlier pass cleared
   // admission. Until that first merge exists, every fresh pass gates a
   // separate pristine-base lane and cleans it before any agent can start.
@@ -902,17 +1133,18 @@ async function sweepCampaign(repositoryConfig) {
   const laneOutcomes = await parallel(
     reconciliation.frontier.map(task => () => (async () => {
       const taskRef = `${effective.campaign}/${task.id}`;
+      const prepBrief = {
+        campaign: effective.campaign,
+        repository: args.repository,
+        repositoryConfig,
+        issue: args.issue,
+        runId: args.runId,
+        workspaceRoot: args.workspaceRoot,
+        task
+      };
       const prepared = await driverNode(
         "prep",
-        {
-          campaign: effective.campaign,
-          repository: args.repository,
-          repositoryConfig,
-          issue: args.issue,
-          runId: args.runId,
-          workspaceRoot: args.workspaceRoot,
-          task
-        },
+        prepBrief,
         `prep-${task.id}`,
         `prep-${task.id}`,
         workspaceSchema,
@@ -921,11 +1153,15 @@ async function sweepCampaign(repositoryConfig) {
         taskRef
       );
       if (!nodePassed(prepared)) {
-        return { task, failure: nodeFailure(task, "prep", prepared) };
+        return {
+          task,
+          failure: taskFailure(task, "prep", prepared, prepBrief, [], null, null)
+        };
       }
       const workspace = workspaceFor(prepared.result);
 
       if (task.kind === "checkpoint") {
+        const taskBrief = checkpointBrief(task, prepared.result, reconciliation);
         const checkpoint = await sh(task.argv, {
           pools: ["campaign-control"],
           priority: "low",
@@ -933,93 +1169,94 @@ async function sweepCampaign(repositoryConfig) {
           env: { CAMPAIGN_TASK_ID: task.id },
           runtimeMaxSec: task.runtimeMaxSec,
           evidence: ["exit:0"],
+          brief: taskBrief,
           key: `checkpoint-${task.id}`,
           label: `checkpoint-${task.id}`,
           settle: true,
           taskRef
         });
-        let recorded = null;
-        if (checkpoint.verdict === "pass") {
-          recorded = await driverNode(
-            "checkpoint",
-            {
-              campaign: effective.campaign,
-              repository: args.repository,
-              repositoryConfig,
-              issue: args.issue,
-              reconcileCommand: effective.reconcileCommand,
-              task,
-              source: reconciliation.source,
-              workspace: prepared.result
-            },
-            `checkpoint-record-${task.id}`,
-            `checkpoint-record-${task.id}`,
-            checkpointCompletionSchema,
-            workspace,
-            true,
-            taskRef
-          );
-        }
+        const gateOutputs = [
+          { phase: "checkpoint", gateId: task.id, kind: "checkpoint", node: checkpoint }
+        ];
         if (checkpoint.verdict !== "pass") {
           return {
             task,
             prepared: prepared.result,
-            failure: nodeFailure(task, "checkpoint", checkpoint)
+            failure: taskFailure(
+              task,
+              "checkpoint",
+              checkpoint,
+              taskBrief,
+              gateOutputs,
+              prepared.result,
+              prepared.result.baseRev
+            )
           };
         }
+        const recorded = await driverNode(
+          "checkpoint",
+          {
+            campaign: effective.campaign,
+            repository: args.repository,
+            repositoryConfig,
+            issue: args.issue,
+            task,
+            source: reconciliation.source,
+            workspace: prepared.result
+          },
+          `checkpoint-record-${task.id}`,
+          `checkpoint-record-${task.id}`,
+          checkpointCompletionSchema,
+          workspace,
+          true,
+          taskRef
+        );
         if (!nodePassed(recorded)) {
           return {
             task,
             prepared: prepared.result,
-            failure: nodeFailure(task, "checkpoint:record", recorded)
+            failure: taskFailure(
+              task,
+              "checkpoint:record",
+              recorded,
+              taskBrief,
+              gateOutputs,
+              prepared.result,
+              prepared.result.baseRev
+            )
           };
         }
         return { task, prepared: prepared.result, checkpoint: recorded.result };
       }
 
-      const agentSpec = {
+      const taskBrief = implementationBrief(task, prepared.result, reconciliation);
+      const agentSpec = applyAgentPolicies({
         argv: effective.agent.argv,
         adapter: effective.agent.adapter,
         pools: ["campaign-agent"],
         priority: effective.agent.priority,
         workspace,
         evidence: ["exit:0"],
-        brief: {
-          schemaVersion: 1,
-          mission: task.brief
-            ? `Implement only forge task ${task.id}: ${task.title}. The exact operator-authored task brief is task.brief.body below. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task issue; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Read the master campaign issue comments for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`
-            : `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task from the worklist; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Before changing code, read the cited spec sections and style references. Read the campaign issue comments for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
-          campaign: {
-            name: effective.campaign,
-            repository: args.repository,
-            issue: args.issue,
-            runId: args.runId
-          },
-          task,
-          workspace: prepared.result,
-          steering: {
-            channel: "github-issue-comments",
-            repository: args.repository,
-            issueNumber: args.issue.number,
-            issueUrl: args.issue.url
-          }
-        },
+        brief: taskBrief,
         key: `agent-${task.id}`,
         label: `agent-${task.id}`,
         taskRef
-      };
-      if (effective.agent.runtimeMaxSec !== null) {
-        agentSpec.runtimeMaxSec = effective.agent.runtimeMaxSec;
-      }
-      if (effective.agent.approvalPolicy !== null) {
-        agentSpec.approvalPolicy = effective.agent.approvalPolicy;
-      }
-      if (effective.agent.sandboxPolicy !== null) {
-        agentSpec.sandboxPolicy = effective.agent.sandboxPolicy;
-      }
+      });
       const agent = await job(agentSpec, { settle: true });
       if (agent.verdict !== "pass") {
-        return { task, prepared: prepared.result, failure: nodeFailure(task, "agent", agent) };
+        return {
+          task,
+          prepared: prepared.result,
+          failure: taskFailure(
+            task,
+            "agent",
+            agent,
+            taskBrief,
+            [],
+            prepared.result,
+            prepared.result.baseRev
+          )
+        };
       }
 
       const ownership = await driverNode(
@@ -1040,18 +1277,43 @@ async function sweepCampaign(repositoryConfig) {
         return {
           task,
           prepared: prepared.result,
-          failure: nodeFailure(task, "ownership", ownership)
+          failure: taskFailure(
+            task,
+            "ownership",
+            ownership,
+            taskBrief,
+            [
+              {
+                phase: "ownership",
+                gateId: "conflict-domains",
+                kind: "ownership",
+                node: ownership
+              }
+            ],
+            prepared.result,
+            prepared.result.baseRev
+          )
         };
       }
 
       const constraintResults = [];
+      const gateOutputs = [];
       for (const gate of effective.gates) {
         const gated = await runGate(task, gate, workspace, "gate");
+        gateOutputs.push({ phase: "gate", gateId: gate.id, kind: gate.kind, node: gated });
         if (gated.verdict !== "pass") {
           return {
             task,
             prepared: prepared.result,
-            failure: nodeFailure(task, `gate:${gate.id}`, gated)
+            failure: taskFailure(
+              task,
+              `gate:${gate.id}`,
+              gated,
+              taskBrief,
+              gateOutputs,
+              prepared.result,
+              prepared.result.baseRev
+            )
           };
         }
         if (gate.kind === "forbidPaths") {
@@ -1084,14 +1346,24 @@ async function sweepCampaign(repositoryConfig) {
         return {
           task,
           prepared: prepared.result,
-          failure: nodeFailure(task, "publish", publication)
+          failure: taskFailure(
+            task,
+            "publish",
+            publication,
+            taskBrief,
+            gateOutputs,
+            prepared.result,
+            prepared.result.baseRev
+          )
         };
       }
       return {
         task,
         prepared: prepared.result,
         publication: publication.result,
-        constraints: constraintResults
+        constraints: constraintResults,
+        taskBrief,
+        gateOutputs
       };
     })()),
     { settle: true }
@@ -1102,7 +1374,18 @@ async function sweepCampaign(repositoryConfig) {
       return outcome.value;
     }
     const task = reconciliation.frontier[index];
-    return { task, failure: nodeFailure(task, "lane", outcome.error) };
+    return {
+      task,
+      failure: taskFailure(
+        task,
+        "lane",
+        outcome.error,
+        { schemaVersion: 1, task, mission: "Diagnose a failed task lane." },
+        [],
+        null,
+        null
+      )
+    };
   });
   const failures = lanes.filter(lane => lane.failure).map(lane => lane.failure);
   const checkpoints = lanes.filter(lane => lane.checkpoint).map(lane => lane.checkpoint);
@@ -1139,17 +1422,39 @@ async function sweepCampaign(repositoryConfig) {
       taskRef
     );
     if (!nodePassed(integration)) {
-      failures.push(nodeFailure(task, "rebase", integration));
+      failures.push(
+        taskFailure(
+          task,
+          "rebase",
+          integration,
+          lane.taskBrief,
+          lane.gateOutputs,
+          lane.prepared,
+          lane.prepared.baseRev
+        )
+      );
       continue;
     }
 
     let regateFailed = false;
+    const gateOutputs = lane.gateOutputs.slice();
     if (integration.result.regate) {
       const integratedWorkspace = workspaceFor(lane.prepared, integration.result.baseRev);
       for (const gate of effective.gates) {
         const gated = await runGate(task, gate, integratedWorkspace, "regate");
+        gateOutputs.push({ phase: "regate", gateId: gate.id, kind: gate.kind, node: gated });
         if (gated.verdict !== "pass") {
-          failures.push(nodeFailure(task, `regate:${gate.id}`, gated));
+          failures.push(
+            taskFailure(
+              task,
+              `regate:${gate.id}`,
+              gated,
+              lane.taskBrief,
+              gateOutputs,
+              lane.prepared,
+              integration.result.baseRev
+            )
+          );
           regateFailed = true;
           break;
         }
@@ -1180,17 +1485,157 @@ async function sweepCampaign(repositoryConfig) {
       taskRef
     );
     if (!nodePassed(merge)) {
-      failures.push(nodeFailure(task, "merge", merge));
+      failures.push(
+        taskFailure(
+          task,
+          "merge",
+          merge,
+          lane.taskBrief,
+          gateOutputs,
+          lane.prepared,
+          integration.result.baseRev
+        )
+      );
       continue;
     }
     merged.push(merge.result);
   }
 
-  // Progress remains one comment per merged task, but only one exact command
-  // is posted for the pass. Its producer queues behind this pass's mutex.
+  const diagnosisOutcomes = await parallel(
+    failures.map(failure => () => (async () => {
+      const task = failure.task;
+      const taskRef = `${effective.campaign}/${task.id}`;
+      let diff = {
+        taskId: task.id,
+        available: false,
+        baseRev: failure.baseRev || "0".repeat(40),
+        head: null,
+        status: "",
+        patch: "",
+        truncated: false,
+        reason: "task failed before a worktree was prepared"
+      };
+      if (failure.prepared !== null) {
+        const diffWorkspace = {
+          taskId: failure.prepared.taskId,
+          baseRev: failure.baseRev || failure.prepared.baseRev,
+          branch: failure.prepared.branch,
+          publishBranch: failure.prepared.publishBranch,
+          worktreePath: failure.prepared.worktreePath
+        };
+        const captured = await driverNode(
+          "diff",
+          { repositoryConfig, workspace: diffWorkspace },
+          `diff-${task.id}`,
+          `diff-${task.id}`,
+          diffSchema,
+          workspaceFor(diffWorkspace),
+          false,
+          taskRef
+        );
+        diff = captured.result;
+      }
+      const previousDiagnoses = machineDiagnoses(reconciliation, task.id);
+      const diagnosisBrief = {
+        schemaVersion: 1,
+        role: "diagnosis",
+        mission: `Diagnose failed spec-build task ${task.id}. Return only concise, actionable steering for the next task attempt. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`,
+        campaign: {
+          name: effective.campaign,
+          repository: args.repository,
+          issue: args.issue,
+          runId: args.runId
+        },
+        task,
+        failure: {
+          stage: failure.stage,
+          verdict: failure.node && failure.node.verdict
+            ? failure.node.verdict
+            : "flow-error",
+          exitCode: failure.node && failure.node.exitCode !== undefined
+            ? failure.node.exitCode
+            : null,
+          captureStderr: failure.node && failure.node.stderrExcerpt
+            ? failure.node.stderrExcerpt
+            : "",
+          captureStderrTruncated: Boolean(
+            failure.node && failure.node.stderrTruncated
+          ),
+          detail: bounded(
+            failure.node && failure.node.error ? failure.node.error : failure.node,
+            4000
+          )
+        },
+        gateOutputs: failure.gateOutputs,
+        taskBrief: failure.taskBrief,
+        diff,
+        previousDiagnoses
+      };
+      const diagnosisSpec = applyAgentPolicies({
+        argv: effective.agent.argv,
+        adapter: effective.agent.adapter,
+        pools: ["campaign-agent"],
+        priority: effective.agent.priority,
+        evidence: ["exit:0"],
+        brief: diagnosisBrief,
+        key: `diagnose-${task.id}`,
+        label: `diagnose-${task.id}`,
+        taskRef,
+        resultSchema: diagnosisResultSchema
+      });
+      if (failure.prepared !== null && diff.available) {
+        diagnosisSpec.workspace = workspaceFor(
+          failure.prepared,
+          failure.baseRev || failure.prepared.baseRev
+        );
+      }
+      const diagnosed = await job(diagnosisSpec, { settle: false });
+      const attempt = previousDiagnoses.length + 1;
+      const steering = await driverNode(
+        "steer",
+        {
+          campaign: effective.campaign,
+          repository: args.repository,
+          repositoryConfig,
+          issue: args.issue,
+          taskId: task.id,
+          attempt,
+          diagnosis: diagnosed.result
+        },
+        `steer-${task.id}`,
+        `steer-${task.id}`,
+        steeringSchema,
+        null,
+        false,
+        taskRef
+      );
+      return steering.result;
+    })()),
+    { settle: true }
+  );
+  const diagnosisFailure = diagnosisOutcomes.find(outcome => !outcome.ok);
+  const diagnoses = diagnosisOutcomes
+    .filter(outcome => outcome.ok)
+    .map(outcome => outcome.value);
+  let terminalError = diagnosisFailure ? diagnosisFailure.error : null;
   if (
-    merged.length > 0 &&
-    repositoryConfig.forge === "github" &&
+    terminalError === null &&
+    merged.length === 0 &&
+    checkpoints.length === 0 &&
+    diagnoses.length === 0
+  ) {
+    const error = new Error(
+      "a non-quiescent campaign frontier produced no merge, checkpoint, or machine steering"
+    );
+    error.name = "SpecBuildInvariantError";
+    error.code = "frontier-without-outcome";
+    terminalError = error;
+  }
+
+  let continuation = null;
+  if (
+    terminalError === null &&
+    (merged.length > 0 || checkpoints.length > 0 || diagnoses.length > 0) &&
     effective.reconcileCommand !== null
   ) {
     const continued = await driverNode(
@@ -1211,13 +1656,14 @@ async function sweepCampaign(repositoryConfig) {
       null
     );
     if (!nodePassed(continued)) {
-      failures.push(
-        nodeFailure(
-          { id: merged[merged.length - 1].taskId },
-          "continuation",
-          continued
-        )
-      );
+      const taskId = merged.length > 0
+        ? merged[merged.length - 1].taskId
+        : checkpoints.length > 0
+          ? checkpoints[checkpoints.length - 1].taskId
+          : diagnoses[diagnoses.length - 1].taskId;
+      failures.push(failureReport({ id: taskId }, "continuation", continued));
+    } else {
+      continuation = continued.result;
     }
   }
 
@@ -1242,10 +1688,14 @@ async function sweepCampaign(repositoryConfig) {
     const outcome = cleanupOutcomes[index];
     const lane = cleanupLanes[index];
     if (!outcome.ok) {
-      failures.push(nodeFailure(lane.task, "cleanup", outcome.error));
+      failures.push(failureReport(lane.task, "cleanup", outcome.error));
     } else if (!nodePassed(outcome.value)) {
-      failures.push(nodeFailure(lane.task, "cleanup", outcome.value));
+      failures.push(failureReport(lane.task, "cleanup", outcome.value));
     }
+  }
+
+  if (terminalError !== null) {
+    throw terminalError;
   }
 
   return {
@@ -1253,23 +1703,20 @@ async function sweepCampaign(repositoryConfig) {
     repository: args.repository,
     issue: args.issue,
     worklist: reconciliation.source,
-    state: reconciliation.complete
-      ? "complete"
-      : merged.length > 0 || checkpoints.length > 0
-        ? "advanced"
+    state: merged.length > 0 || checkpoints.length > 0
+      ? "advanced"
+      : diagnoses.length > 0
+        ? "steered"
         : failures.length > 0
           ? "needs-attention"
           : "idle",
-    reconciled: {
-      merged: reconciliation.merged,
-      checkpoints: reconciliation.checkpoints,
-      remaining: reconciliation.remaining,
-      frontier: reconciliation.frontier.map(task => task.id),
-      warnings: reconciliation.warnings
-    },
+    reconciled: reconciledProjection(reconciliation),
     maintenance: sweepNode.result,
     checkpoints,
     merged,
-    failures
+    failures: failures.map(failure => failure.report || failure),
+    diagnoses,
+    continuation,
+    escalation: null
   };
 })();

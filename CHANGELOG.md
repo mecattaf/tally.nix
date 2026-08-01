@@ -26,6 +26,13 @@ authorized.
   done/running/blocked/pending, live node elapsed time and remaining runtime
   budget, and failed stages with their retained `.err` path and bounded stderr
   tail.
+- Added machine-authored spec-build failure steering and forge-derived
+  quiescence. Failed task lanes now feed their stderr capture, gate outputs,
+  exact brief, and bounded diff to a diagnosis agent, publish one redacted
+  steering comment, retry once, and directly block only after a second marked
+  diagnosis. Unrelated subtrees keep advancing; an incomplete empty frontier
+  posts exactly one escalation with accumulated diagnoses, while failure-only
+  passes now self-trigger the next fresh reconciliation.
 - Added accept-time campaign gate preflights: every command gate declares a
   base-safe `preflightArgv` separately from its post-change `argv`. The exact
   probe executes once on the fetched base, with the same task environment and a
