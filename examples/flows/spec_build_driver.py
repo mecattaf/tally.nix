@@ -1198,6 +1198,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     warnings.extend(parallelism_warnings(ready, frontier, max_parallel))
     result = {
         "schemaVersion": 1,
+        "campaign": campaign,
         "repository": repository,
         "source": worklist["source"],
         "tasks": worklist["tasks"],

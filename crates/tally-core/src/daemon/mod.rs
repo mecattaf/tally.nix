@@ -122,9 +122,9 @@ use crate::query::{
     RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
 };
 use crate::query_v2::{
-    query_flow_proofs, query_job as query_job_v2, query_jobs as query_jobs_v2, query_lifecycle_log,
-    query_proof, snapshot_metadata, JobsFilter, LifecycleLogFilter, LiveJobFact,
-    ObservabilityError, RowDetailFact,
+    collapse_lifecycle_echoes, query_flow_proofs, query_job as query_job_v2,
+    query_jobs as query_jobs_v2, query_lifecycle_log, query_proof, query_run, snapshot_metadata,
+    JobsFilter, LifecycleLogFilter, LiveJobFact, ObservabilityError, RowDetailFact,
 };
 use crate::recovery::{
     collect_durable_recovery_facts, collect_local_unit_facts, recover, DurableRecoveryFacts,
@@ -629,6 +629,7 @@ const DISPATCHER_METHODS: &[(&str, DispatchMethod)] = &[
     ("lease.status", DispatchMethod::LeaseStatus),
     ("query.jobs", DispatchMethod::Query),
     ("query.job", DispatchMethod::Query),
+    ("query.run", DispatchMethod::Query),
     ("query.status", DispatchMethod::Query),
     ("query.storage", DispatchMethod::Query),
     ("query.log", DispatchMethod::Query),

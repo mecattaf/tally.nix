@@ -6,7 +6,7 @@ REST facade, connect-time negotiation, or multi-tenant authentication layer. Fil
 permissions protect the socket; SSH and Unix-socket forwarding are the remote-access story.
 
 This chapter describes the protocol shipped at commit `4c85563`. The advertised table contains
-**23 public methods**. Two daemon-internal producer methods also exist in the dispatcher, but
+**25 public methods**. Two daemon-internal producer methods also exist in the dispatcher, but
 they are not advertised and are not part of this contract.
 
 ## Versions at a glance
@@ -130,6 +130,7 @@ The table between the markers is checked against the daemon's `RPC_METHODS` cons
 | `lease.status` | `{lease?: string, jobId?: string}` | `LeaseStatus` |
 | `query.jobs` | Jobs filters plus `limit` and `cursor` | Paginated job collection |
 | `query.job` | `{id: string}` | Job detail |
+| `query.run` | `{id: string}` | Compact flow-run status |
 | `query.status` | `{pool?: string}` | Status view |
 | `query.storage` | `{}` | Daemon-owned storage metrics and intake state |
 | `query.log` | Lifecycle filters plus `limit` and `cursor` | Paginated lifecycle collection |
@@ -320,6 +321,8 @@ shapes are:
 - collection: `{schemaVersion, protocolVersion, items, nextCursor, snapshot}`;
 - snapshot: `{createdAt, cursor, history, witnessHead:{seq,hash}}`;
 - job detail: `{schemaVersion, protocolVersion, job, attempts, snapshot}`;
+- run status: `{schemaVersion, protocolVersion, flowRunId, flowName?, campaign?, repository?,
+  state, counts, tasks, currentNodes, failures, snapshot}`;
 - pool view: `{schemaVersion, protocolVersion, pools}`;
 - proof: `{schemaVersion, protocolVersion, taskUuid, attempt, leaseEpoch, status,
   witnessExpected, witnessRecord, authorship?, evidence, advisoryAttestations, ledger, history}`.
@@ -341,10 +344,24 @@ admission fields are `dedupKey`, the node's submission identity, and `dispositio
 no row — `attached`, and full-mode `reused` and `terminal` — are reported by the flow runner's
 `node-submitted` and `node-terminal` lifecycle events instead.
 
+`query.run` accepts a flow-run UUID as `id` and returns the compact state needed during an
+operator check. `currentNodes` carries node label, task reference, live state, start time,
+elapsed seconds, configured `runtimeMaxSec`, and saturating `budgetRemainingSeconds`.
+`failures` carries the failed stage, canonical verdict, attempt/epoch, retained failure-capture
+path when present, and the bounded stderr tail. For the built-in `spec-build` flow, the latest
+schema-validated reconciliation result also supplies the full campaign task table. Its tasks are
+classified as `done`, `running`, `blocked`, or `pending`, with unresolved dependencies,
+current/failing node, and merged pull request where available. Other flows still receive current
+nodes and failures but have an empty task table.
+
 `query.log` filters by `task`, `flowRun`, `attempt`, `session`, lifecycle `event`, `source`,
-`since`, and `until`. Lifecycle items expose `taskRef` when their durable row/witness did. A lifecycle event carries no orchestration capsule, so `flowRun` is resolved
+`since`, and `until`, and accepts optional `provenance`. Lifecycle items expose `taskRef` when their durable row/witness did. A lifecycle event carries no orchestration capsule, so `flowRun` is resolved
 to the run's task UUIDs through the durable rows and the witness chain. A `failed` lifecycle item
 includes `stderrTail` and `stderrTruncated`, bounded as described for terminal waits above.
+Omitting `provenance` preserves the original RPC behavior and returns the source provenance
+stream. The CLI sends `provenance:false` for its default human renderer and `--json`; the daemon
+then collapses terminal journal/witness pairs and suppresses evidence echoes before pagination.
+CLI `--provenance` sends `true` and preserves the source stream unchanged.
 `query.trace` requires `task` and optionally selects `attempt`. Both return collection
 envelopes; trace also includes a `generations` array describing capture capability, completeness,
 retained range, byte count, truncation, and redaction provenance. Trace items and generation

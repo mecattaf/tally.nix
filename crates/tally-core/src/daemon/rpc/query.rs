@@ -129,6 +129,51 @@ impl DaemonHandler {
                     trace_availability(&result.job.anchor, &lanes, &adapters, &self.executor);
                 serde_json::to_value(result).map_err(internal_wire)
             }
+            "query.run" => {
+                #[derive(Deserialize)]
+                #[serde(deny_unknown_fields)]
+                struct Params {
+                    id: String,
+                }
+                let params: Params = decode_params(params)?;
+                if params.id.trim().is_empty() {
+                    return Err(WireError::invalid("query run ID must not be empty"));
+                }
+                let mut result =
+                    query_run(&params.id, &details, &live, &history, &witness, Utc::now())
+                        .map_err(observability_wire)?;
+                for failure in &mut result.failures {
+                    let (Some(attempt), Some(lease_epoch), Ok(uuid)) = (
+                        failure.attempt,
+                        failure.lease_epoch,
+                        Uuid::parse_str(&failure.task_uuid),
+                    ) else {
+                        continue;
+                    };
+                    let identity = ExecutionIdentity {
+                        job_id: uuid,
+                        task_uuid: Some(uuid),
+                        task_ref: failure.task_ref.clone(),
+                    };
+                    let Ok(Some(paths)) =
+                        self.executor
+                            .retained_capture_paths(&identity, attempt, lease_epoch)
+                    else {
+                        continue;
+                    };
+                    let Some(path) = paths.failure_stderr.as_ref() else {
+                        continue;
+                    };
+                    failure.capture_path = Some(path.display().to_string());
+                    if failure.stderr_tail.is_none() {
+                        if let Ok(excerpt) = crate::executor::read_capture_excerpt(path) {
+                            failure.stderr_tail = Some(excerpt.text);
+                            failure.stderr_truncated = Some(excerpt.truncated);
+                        }
+                    }
+                }
+                serde_json::to_value(result).map_err(internal_wire)
+            }
             "query.status" => {
                 #[derive(Deserialize)]
                 #[serde(deny_unknown_fields)]
@@ -536,6 +581,8 @@ impl DaemonHandler {
             limit: Option<usize>,
             #[serde(default)]
             cursor: Option<String>,
+            #[serde(default)]
+            provenance: Option<bool>,
         }
         let params: Params = decode_params(params)?;
         let fingerprint = serde_json::to_string(&json!({
@@ -547,6 +594,7 @@ impl DaemonHandler {
             "source": params.source.clone(),
             "since": params.since.clone(),
             "until": params.until.clone(),
+            "provenance": params.provenance,
         }))
         .map_err(internal_wire)?;
         if let Some(cursor) = params.cursor.as_deref() {
@@ -562,27 +610,27 @@ impl DaemonHandler {
             witness,
             ..
         } = self.query_projection().await?;
-        let envelope = Some(
-            serde_json::to_value(
-                query_lifecycle_log(
-                    &details,
-                    &history,
-                    &witness,
-                    &LifecycleLogFilter {
-                        task: params.task,
-                        flow_run: params.flow_run,
-                        attempt: params.attempt,
-                        session: params.session,
-                        event: params.event,
-                        source: params.source,
-                        since: params.since,
-                        until: params.until,
-                    },
-                )
-                .map_err(observability_wire)?,
-            )
-            .map_err(internal_wire)?,
-        );
+        let explicit_event = params.event.is_some();
+        let mut result = query_lifecycle_log(
+            &details,
+            &history,
+            &witness,
+            &LifecycleLogFilter {
+                task: params.task,
+                flow_run: params.flow_run,
+                attempt: params.attempt,
+                session: params.session,
+                event: params.event,
+                source: params.source,
+                since: params.since,
+                until: params.until,
+            },
+        )
+        .map_err(observability_wire)?;
+        if params.provenance == Some(false) {
+            result = collapse_lifecycle_echoes(result, !explicit_event);
+        }
+        let envelope = Some(serde_json::to_value(result).map_err(internal_wire)?);
         self.pages
             .borrow_mut()
             .page("query.log", &fingerprint, params.limit, None, envelope)
@@ -670,6 +718,7 @@ fn observability_wire(error: ObservabilityError) -> WireError {
         ObservabilityError::UnknownJob(_) | ObservabilityError::UnknownAttempt { .. } => {
             WireError::not_found(error.to_string())
         }
+        ObservabilityError::InvalidRunProjection(_) => internal_wire(error),
     }
 }
 

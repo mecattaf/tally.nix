@@ -290,7 +290,7 @@ async fn smoke_runs_real_jobs_parses_declared_captures_and_surfaces_pre_output_s
             let log = run_tally(
                 &config_path,
                 &paths.socket,
-                &["query", "log", "--task", task_uuid],
+                &["query", "log", "--task", task_uuid, "--json"],
             )
             .await;
             assert_eq!(

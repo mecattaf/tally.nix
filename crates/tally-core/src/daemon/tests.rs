@@ -8762,6 +8762,43 @@ mod tests {
                     .unwrap()
                     .iter()
                     .all(|event| event["taskRef"] == "crm/t07"));
+                let compact_lifecycle = client
+                    .call(
+                        "query.log",
+                        Some(json!({
+                            "task": task_uuid.to_string(),
+                            "limit": 100,
+                            "provenance": false,
+                        })),
+                    )
+                    .await
+                    .unwrap();
+                assert!(compact_lifecycle["items"].as_array().unwrap().len()
+                    < lifecycle["items"].as_array().unwrap().len());
+                assert!(!compact_lifecycle["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| matches!(
+                        event["event"].as_str(),
+                        Some("evidence_pass" | "evidence_fail")
+                    )));
+                assert!(compact_lifecycle["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|event| {
+                        event["origin"] == "journal+witness"
+                            && event["terminalVerdict"] == "pass"
+                    }));
+                let run = client
+                    .call("query.run", Some(json!({"id": flow_run_id.clone()})))
+                    .await
+                    .unwrap();
+                assert_eq!(run["flowRunId"], flow_run_id);
+                assert_eq!(run["flowName"], "brief-round-trip");
+                assert_eq!(run["state"], "idle");
+                assert!(run["tasks"].as_array().unwrap().is_empty());
                 let unrelated = client
                     .call(
                         "query.jobs",

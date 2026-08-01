@@ -815,6 +815,11 @@ pub(super) enum QueryCommand {
     Job {
         id: String,
     },
+    Run {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
     Status {
         #[arg(long)]
         pool: Option<String>,
@@ -842,6 +847,12 @@ pub(super) enum QueryCommand {
         limit: Option<usize>,
         #[arg(long)]
         cursor: Option<String>,
+        /// Emit the structured lifecycle envelope instead of human lines.
+        #[arg(long)]
+        json: bool,
+        /// Preserve journal, evidence, and witness echoes as separate records.
+        #[arg(long)]
+        provenance: bool,
     },
     Proof {
         #[arg(long)]
