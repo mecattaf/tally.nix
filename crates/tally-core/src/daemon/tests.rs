@@ -3822,7 +3822,7 @@ mod tests {
                 assert!(published_stderr.contains("child process failed: actionable detail"));
                 assert!(!published_stderr
                     .contains("ghp_012345678901234567890123456789012345"));
-                assert_eq!(receipt["evidence"]["stderrRedaction"], "conservative-v1");
+                assert_eq!(receipt["evidence"]["stderrRedaction"], "conservative-v2");
                 assert_eq!(receipt["evidence"]["stderrRedacted"], true);
                 assert_eq!(receipt["evidence"]["stderrTruncated"], false);
             })

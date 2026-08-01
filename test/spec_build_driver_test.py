@@ -281,7 +281,7 @@ class ForgeNativeReconcileTests(unittest.TestCase):
             with (
                 mock.patch.object(DRIVER, "issue_graph_worklist", return_value=worklist),
                 mock.patch.object(DRIVER, "merged_github_tasks", return_value=([], [])) as merged,
-                mock.patch.object(DRIVER, "forge_campaign_state", return_value=([], None)),
+                mock.patch.object(DRIVER, "forge_campaign_state", return_value=([], [], None, [])),
                 mock.patch.object(DRIVER, "sync_issue_checkboxes"),
             ):
                 result = DRIVER.action_reconcile(
@@ -392,6 +392,44 @@ class FakeTally:
         state = self.state()
         state.update(values)
         self.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+REDACTION_VECTORS = Path(
+    os.environ.get(
+        "SPEC_BUILD_REDACTION_VECTORS",
+        Path(__file__).resolve().parents[1] / "test/fixtures/redaction/vectors.json",
+    )
+)
+
+
+class RedactionVectorTests(unittest.TestCase):
+    def test_shared_vector_holds_for_public_steering(self) -> None:
+        corpus = json.loads(REDACTION_VECTORS.read_text(encoding="utf-8"))
+        cases = corpus["cases"]
+        self.assertTrue(cases)
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                text, redacted = DRIVER.redact_public_text(case["input"])
+                self.assertEqual(
+                    text,
+                    case["output"].replace(
+                        "%LINE%", "[redacted sensitive diagnosis line]"
+                    ),
+                )
+                self.assertEqual(redacted, case["redacted"])
+
+    def test_a_diagnosis_naming_tasks_and_revisions_survives_intact(self) -> None:
+        steering = (
+            "task-1 and subtask-2 both failed after disk-1 filled.\n"
+            "Rebase onto 6347cbb9f4a2b1c0d5e6f70819a2b3c4d5e6f708 and retry the gate.\n"
+            "The auth token bug is unrelated."
+        )
+        text, redacted = DRIVER.redact_public_text(steering)
+        self.assertEqual(text, steering)
+        self.assertFalse(redacted)
+
+    def test_receipts_written_by_a_superseded_redactor_stay_readable(self) -> None:
+        self.assertIn("conservative-v1", DRIVER.PUBLIC_REDACTIONS)
+        self.assertIn(DRIVER.PUBLIC_REDACTION, DRIVER.PUBLIC_REDACTIONS)
 
 
 class GitHubForgeTests(unittest.TestCase):
@@ -608,6 +646,200 @@ class GitHubForgeTests(unittest.TestCase):
                 self.assertFalse(repeated["posted"])
                 self.assertEqual(repeated["comment"], escalated["comment"])
                 self.assertEqual(len(github.state()["comments"]), 2)
+
+    def test_worklist_edits_degrade_receipts_instead_of_bricking_the_campaign(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            worklist = checkout / "specs/campaign/tasks.json"
+            worklist.parent.mkdir(parents=True)
+
+            def write_worklist(*identifiers: str) -> None:
+                worklist.write_text(
+                    json.dumps(
+                        {
+                            "schemaVersion": 1,
+                            "tasks": [task(identifier) for identifier in identifiers],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                git(checkout, "add", "specs/campaign/tasks.json")
+                git(checkout, "commit", "--quiet", "-m", "operator: edit the worklist")
+                git(checkout, "push", "--quiet", "origin", "main")
+
+            def diagnosis_body(identifier: str, attempt: int, text: str) -> str:
+                return (
+                    f"{DRIVER.diagnosis_marker('fixture', '7', identifier, attempt)}\n\n"
+                    f"{DRIVER.diagnosis_heading(identifier, attempt)}\n\n{text}"
+                )
+
+            write_worklist("task-1", "task-2")
+            state = {
+                "actor": "tally-bot",
+                "merged": [],
+                "byHead": {},
+                "comments": [],
+                "issueComments": [
+                    {
+                        "body": diagnosis_body("task-2", 1, "first failure"),
+                        "html_url": "https://github.com/acme/spec/issues/7#one",
+                        "user": {"login": "tally-bot"},
+                    },
+                    {
+                        "body": diagnosis_body("task-2", 2, "second failure"),
+                        "html_url": "https://github.com/acme/spec/issues/7#two",
+                        "user": {"login": "tally-bot"},
+                    },
+                ],
+                "calls": [],
+            }
+            reconcile_brief = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "repositoryConfig": repository_config(checkout, "github"),
+                "issue": issue(),
+                "worklist": "specs/*/tasks.json",
+                "maxTasks": 2,
+                "maxParallel": 2,
+            }
+            with FakeGitHub(root, state) as github:
+                blocked = DRIVER.action_reconcile(reconcile_brief)
+                self.assertEqual(
+                    blocked["blocked"], [{"taskId": "task-2", "blockedBy": ["task-2"]}]
+                )
+
+                # The operator renames the diagnosed task between passes.
+                write_worklist("task-1", "task-2-renamed")
+                renamed = DRIVER.action_reconcile(reconcile_brief)
+                self.assertEqual(renamed["diagnoses"], [])
+                self.assertEqual(renamed["blocked"], [])
+                self.assertEqual(
+                    [
+                        warning
+                        for warning in renamed["warnings"]
+                        if "no longer names that task" in warning
+                    ],
+                    [
+                        "dropped machine diagnosis for 'task-2': "
+                        "the worklist no longer names that task",
+                        "dropped machine diagnosis for 'task-2': "
+                        "the worklist no longer names that task",
+                    ],
+                )
+                self.assertEqual(
+                    [item["id"] for item in renamed["frontier"]],
+                    ["task-1", "task-2-renamed"],
+                )
+
+                # An operator who deletes the first receipt leaves a gap, not a halt.
+                write_worklist("task-1", "task-2")
+                gapped_state = github.state()
+                gapped_state["issueComments"] = [gapped_state["issueComments"][1]]
+                github.state_path.write_text(
+                    json.dumps(gapped_state), encoding="utf-8"
+                )
+                gapped = DRIVER.action_reconcile(reconcile_brief)
+                self.assertEqual(gapped["diagnoses"], [])
+                self.assertEqual(gapped["blocked"], [])
+                self.assertIn(
+                    "dropped machine diagnosis for 'task-2' attempt 2: "
+                    "no attempt 1 receipt precedes it",
+                    gapped["warnings"],
+                )
+
+                # Escalation reconciles the same edited worklist. It reaches its
+                # own quiescence check instead of dying on the dropped receipts.
+                with self.assertRaisesRegex(
+                    DRIVER.DriverError, "incomplete empty frontier"
+                ):
+                    DRIVER.action_escalate(reconcile_brief)
+
+    def test_machinery_retries_are_bounded_and_spend_no_steering_attempt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            worklist = checkout / "specs/campaign/tasks.json"
+            worklist.parent.mkdir(parents=True)
+            worklist.write_text(
+                json.dumps({"schemaVersion": 1, "tasks": [task("task-1")]}),
+                encoding="utf-8",
+            )
+            git(checkout, "add", "specs/campaign/tasks.json")
+            git(checkout, "commit", "--quiet", "-m", "fixture: worklist")
+            git(checkout, "push", "--quiet", "origin", "main")
+            reconcile_brief = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "repositoryConfig": repository_config(checkout),
+                "issue": issue(),
+                "worklist": "specs/*/tasks.json",
+                "maxTasks": 1,
+                "maxParallel": 1,
+            }
+
+            def retry(stage: str) -> dict[str, object]:
+                return DRIVER.action_retry(
+                    {
+                        "campaign": "fixture",
+                        "repository": "acme/spec",
+                        "repositoryConfig": repository_config(checkout),
+                        "issue": issue(),
+                        "taskId": "task-1",
+                        "stage": stage,
+                        "detail": "the integration checkout could not be staged",
+                    }
+                )
+
+            first = retry("merge")
+            self.assertTrue(first["posted"])
+            self.assertEqual(first["attempt"], 1)
+            self.assertFalse(first["exhausted"])
+            second = retry("rebase")
+            self.assertTrue(second["posted"])
+            self.assertEqual(second["attempt"], 2)
+            self.assertTrue(second["exhausted"])
+
+            # The budget is spent: the caller must steer the next fault instead.
+            third = retry("merge")
+            self.assertFalse(third["posted"])
+            self.assertTrue(third["exhausted"])
+
+            reconciled = DRIVER.action_reconcile(reconcile_brief)
+            self.assertEqual(
+                [(item["taskId"], item["attempt"]) for item in reconciled["retries"]],
+                [("task-1", 1), ("task-1", 2)],
+            )
+            self.assertEqual(reconciled["diagnoses"], [])
+            self.assertEqual(reconciled["blocked"], [])
+            self.assertEqual([item["id"] for item in reconciled["frontier"]], ["task-1"])
+
+    def test_a_checkpoint_defers_only_while_unrelated_work_can_still_change_it(self) -> None:
+        tasks = [
+            task("task-1"),
+            {
+                "kind": "checkpoint",
+                "id": "phase-one",
+                "title": "Validate phase one",
+                "argv": ["true"],
+                "runtimeMaxSec": 10,
+                "dependencies": ["task-1"],
+            },
+            task("task-2", ["phase-one"]),
+            task("task-3"),
+        ]
+        remaining = [candidate for candidate in tasks if candidate["id"] != "task-1"]
+        deferrals = DRIVER.checkpoint_deferrals(tasks, remaining, {"task-1"}, set())
+        self.assertEqual(
+            deferrals, [{"taskId": "phase-one", "waitingOn": ["task-3"]}]
+        )
+
+        # task-2 sits below the checkpoint and task-3 is blocked, so neither can
+        # change its verdict: the checkpoint runs for real and reaches quiescence.
+        self.assertEqual(
+            DRIVER.checkpoint_deferrals(tasks, remaining, {"task-1"}, {"task-3"}),
+            [],
+        )
 
     def test_forge_native_issue_graph_derives_blocking_and_escalation_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

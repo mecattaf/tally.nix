@@ -1225,7 +1225,7 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
         .as_str()
         .unwrap()
         .contains("ghp_012345678901234567890123456789012345"));
-    assert_eq!(failure_evidence["stderrRedaction"], "conservative-v1");
+    assert_eq!(failure_evidence["stderrRedaction"], "conservative-v2");
     assert_eq!(failure_evidence["stderrRedacted"], true);
     assert_eq!(failure_evidence["stderrTruncated"], false);
 

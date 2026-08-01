@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command as StdCommand;
 use std::process::Stdio;
@@ -69,6 +70,11 @@ const SPEC_BUILD_RUN_9: &str = "00000000-0000-4000-8000-000000000526";
 const SPEC_BUILD_ORPHAN_RUN: &str = "00000000-0000-4000-8000-000000000527";
 const SPEC_BUILD_DEFERRED_RUN: &str = "00000000-0000-4000-8000-000000000528";
 const SPEC_BUILD_ATTACHED_RUN: &str = "00000000-0000-4000-8000-000000000529";
+const SPEC_BUILD_RUN_CHECKPOINT_STEER: &str = "00000000-0000-4000-8000-000000000530";
+const SPEC_BUILD_RUN_RENAMED: &str = "00000000-0000-4000-8000-000000000531";
+const SPEC_BUILD_RUN_MACHINERY: &str = "00000000-0000-4000-8000-000000000532";
+const SPEC_BUILD_RUN_RECOVERED: &str = "00000000-0000-4000-8000-000000000533";
+const SPEC_BUILD_RUN_HALTED: &str = "00000000-0000-4000-8000-000000000534";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -2343,10 +2349,16 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                             "on-request".to_owned(),
                             vec!["--ask-for-approval".to_owned(), "on-request".to_owned()],
                         )]),
-                        sandbox_policies: BTreeMap::from([(
-                            "workspace-write".to_owned(),
-                            vec!["--sandbox".to_owned(), "workspace-write".to_owned()],
-                        )]),
+                        sandbox_policies: BTreeMap::from([
+                            (
+                                "workspace-write".to_owned(),
+                                vec!["--sandbox".to_owned(), "workspace-write".to_owned()],
+                            ),
+                            (
+                                "read-only".to_owned(),
+                                vec!["--sandbox".to_owned(), "read-only".to_owned()],
+                            ),
+                        ]),
                         ..AdapterLaunchConfig::default()
                     },
                     ..AdapterConfig::default()
@@ -2417,7 +2429,8 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                         "priority": priority,
                         "runtimeMaxSec": 30,
                         "approvalPolicy": "on-request",
-                        "sandboxPolicy": "workspace-write"
+                        "sandboxPolicy": "workspace-write",
+                        "diagnosisSandboxPolicy": "read-only"
                     },
                     "gates": [
                         {
@@ -2956,7 +2969,15 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             let fourth_value = &flow_report(&fourth)["report"]["finalValue"];
             assert_eq!(
                 fourth_value["reconciled"]["frontier"],
-                json!(["phase-one-checkpoint", "task-4", "task-6"])
+                json!(["task-4", "task-6", "phase-one-checkpoint"]),
+                "a checkpoint unrelated outstanding work can still flip is considered last"
+            );
+            assert_eq!(
+                fourth_value["reconciled"]["deferrals"],
+                json!([{
+                    "taskId": "phase-one-checkpoint",
+                    "waitingOn": ["task-4", "task-6"]
+                }])
             );
             assert_eq!(fourth_value["merged"][0]["taskId"], "task-4");
             assert_eq!(fourth_value["merged"][1]["taskId"], "task-6");
@@ -2968,14 +2989,15 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             );
             assert_eq!(fourth_value["failures"][0]["stage"], "checkpoint");
             assert_eq!(
-                fourth_value["diagnoses"][0]["taskId"],
-                "phase-one-checkpoint"
+                fourth_value["diagnoses"],
+                json!([]),
+                "a checkpoint red only because unrelated work is outstanding spends no attempt"
             );
-            assert_eq!(fourth_value["diagnoses"][0]["attempt"], 1);
-            assert_eq!(fourth_value["diagnoses"][0]["blocked"], false);
+            assert_eq!(fourth_value["deferrals"], json!(["phase-one-checkpoint"]));
+            assert_eq!(fourth_value["retries"], json!([]));
             assert_eq!(fourth_value["continuation"]["posted"], true);
             let fourth_submitted = runner_events(&fourth, "node-submitted");
-            assert_eq!(fourth_submitted.len(), 32);
+            assert_eq!(fourth_submitted.len(), 29);
             assert!(fourth_submitted
                 .iter()
                 .all(|event| event["disposition"] == "created"));
@@ -2984,7 +3006,8 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/phase-one-checkpoint")
                     .count(),
-                6
+                3,
+                "a deferred checkpoint prepares, runs, and cleans up without steering"
             );
             assert_eq!(
                 fourth_submitted
@@ -3014,7 +3037,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 .iter()
                 .any(|event| event["label"] == "checkpoint-phase-one-checkpoint"));
 
-            let fourth_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_4, 32).await;
+            let fourth_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_4, 29).await;
             let failed_checkpoint = fourth_items
                 .iter()
                 .find(|item| {
@@ -3027,7 +3050,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     "sh",
                     "-eu",
                     "-c",
-                    "test \"$(cat build/one.txt)\" = one; if test -e build/checkpoint-red; then echo 'phase one checkpoint remains red' >&2; exit 1; fi; grep -q '\"attempt\":1' \"$TALLY_BRIEF\""
+                    "test \"$(cat build/one.txt)\" = one; if test -e build/checkpoint-red; then echo 'phase one checkpoint remains red' >&2; exit 1; fi; grep -q '\"attempt\":1' \"$TALLY_BRIEF\" || { echo 'phase one checkpoint has no prior steering' >&2; exit 1; }"
                 ])
             );
             assert_eq!(failed_checkpoint["runtimeMaxSec"], 10);
@@ -3059,6 +3082,47 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .is_some_and(|code| code != 0),
                 "an independent task must be able to advance while the checkpoint is red"
             );
+
+            // The unrelated cleanup task has merged, so the checkpoint's verdict
+            // is now its own and a red run does spend an attempt.
+            let checkpoint_steer = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_CHECKPOINT_STEER,
+                &arguments("fixture-comment-10-checkpoint-steer", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let checkpoint_steer = runner_output(checkpoint_steer).await;
+            assert!(
+                checkpoint_steer.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&checkpoint_steer.stdout),
+                String::from_utf8_lossy(&checkpoint_steer.stderr)
+            );
+            let steer_value = &flow_report(&checkpoint_steer)["report"]["finalValue"];
+            assert_eq!(
+                steer_value["reconciled"]["frontier"],
+                json!(["phase-one-checkpoint"])
+            );
+            assert_eq!(
+                steer_value["reconciled"]["deferrals"],
+                json!([]),
+                "no unrelated implementation work is left to defer the checkpoint"
+            );
+            assert_eq!(steer_value["state"], "steered");
+            assert_eq!(steer_value["failures"][0]["taskId"], "phase-one-checkpoint");
+            assert_eq!(steer_value["failures"][0]["stage"], "checkpoint");
+            assert_eq!(
+                steer_value["diagnoses"][0]["taskId"],
+                "phase-one-checkpoint"
+            );
+            assert_eq!(steer_value["diagnoses"][0]["attempt"], 1);
+            assert_eq!(steer_value["diagnoses"][0]["blocked"], false);
+            assert_eq!(steer_value["checkpoints"], json!([]));
+            assert_eq!(steer_value["continuation"]["posted"], true);
 
             let checkpoint_pass = runner(
                 &config_path,
@@ -3259,7 +3323,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(replayed.len(), 1);
             assert_eq!(replayed[0]["label"], "spec-build-sweep");
             assert_eq!(replayed[0]["disposition"], "reused");
-            assert_eq!(flow_items(&client, SPEC_BUILD_RUN_4).await.len(), 32);
+            assert_eq!(flow_items(&client, SPEC_BUILD_RUN_4).await.len(), 29);
 
             let seventh = runner(
                 &config_path,
@@ -3547,9 +3611,13 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .count(),
                 7
             );
-            assert!(policies
-                .iter()
-                .all(|line| line.ends_with(":on-request:workspace-write")));
+            assert!(policies.iter().all(|line| {
+                if line.starts_with("diagnosis:") {
+                    line.ends_with(":on-request:read-only")
+                } else {
+                    line.ends_with(":on-request:workspace-write")
+                }
+            }));
 
             let diagnosis_inputs =
                 fs::read_to_string(control.join("diagnosis-inputs.log")).unwrap();
@@ -3600,6 +3668,229 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     "unexpected gate count for {receipt}: {gated:?}"
                 );
             }
+
+            // campaigns.md invites worklist edits between passes. Renaming a task
+            // that carries two diagnosis receipts must degrade the campaign's
+            // memory of those attempts, not brick reconciliation.
+            fixture_git(&checkout, &["fetch", "origin"]);
+            fixture_git(&checkout, &["reset", "--hard", "origin/main"]);
+            let worklist_path = checkout.join("specs/001-toy/tasks.json");
+            let renamed_worklist = fs::read_to_string(&worklist_path)
+                .unwrap()
+                .replace("\"task-2\"", "\"task-2b\"");
+            fs::write(&worklist_path, renamed_worklist).unwrap();
+            fixture_git(&checkout, &["add", "specs/001-toy/tasks.json"]);
+            fixture_git(&checkout, &["commit", "-m", "operator: rename the diagnosed task"]);
+            fixture_git(&checkout, &["push", "origin", "main"]);
+
+            let renamed = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_RENAMED,
+                &arguments("fixture-comment-15-renamed", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let renamed = runner_output(renamed).await;
+            assert!(
+                renamed.status.success(),
+                "a worklist rename must not brick the campaign\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&renamed.stdout),
+                String::from_utf8_lossy(&renamed.stderr)
+            );
+            let renamed_value = &flow_report(&renamed)["report"]["finalValue"];
+            let renamed_warnings = renamed_value["reconciled"]["warnings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|warning| warning.as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                renamed_warnings
+                    .iter()
+                    .filter(|warning| warning.contains("'task-2'")
+                        && warning.contains("no longer names that task"))
+                    .count(),
+                2,
+                "both orphaned task-2 receipts must be witnessed: {renamed_warnings:?}"
+            );
+            assert_eq!(
+                renamed_value["reconciled"]["blocked"],
+                json!([]),
+                "receipts for a dropped task must stop blocking the renamed subtree"
+            );
+            assert_eq!(renamed_value["reconciled"]["quiescent"], false);
+            assert!(renamed_value["reconciled"]["remaining"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|task| task == "task-2b"));
+            assert_eq!(renamed_value["state"], "advanced");
+            assert_eq!(
+                renamed_value["checkpoints"][0]["taskId"],
+                "phase-one-checkpoint",
+                "the checkpoint rebinds to the edited worklist digest"
+            );
+            assert!(renamed_value["reconciled"]["escalation"]
+                .as_str()
+                .unwrap()
+                .ends_with("/escalation"));
+
+            // Campaign machinery, not the task's work: an unwritable workspace
+            // root denies the merge node the integration checkout it stages
+            // there. That fault must buy a retry rather than spend one of the
+            // renamed task's two steering attempts.
+            let sealed = fs::metadata(&workspace_root).unwrap().permissions();
+            let mut locked = sealed.clone();
+            locked.set_mode(0o500);
+            fs::set_permissions(&workspace_root, locked).unwrap();
+            let faulted = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_MACHINERY,
+                &arguments("fixture-comment-16-machinery", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let faulted = runner_output(faulted).await;
+            fs::set_permissions(&workspace_root, sealed).unwrap();
+            assert!(
+                faulted.status.success(),
+                "a machinery fault must settle into a retry\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&faulted.stdout),
+                String::from_utf8_lossy(&faulted.stderr)
+            );
+            let faulted_value = &flow_report(&faulted)["report"]["finalValue"];
+            assert_eq!(faulted_value["reconciled"]["frontier"], json!(["task-2b"]));
+            assert_eq!(faulted_value["failures"][0]["taskId"], "task-2b");
+            assert_eq!(
+                faulted_value["failures"][0]["stage"],
+                "merge",
+                "faulted report: {}",
+                serde_json::to_string_pretty(faulted_value).unwrap()
+            );
+            assert_eq!(faulted_value["state"], "retrying");
+            assert_eq!(
+                faulted_value["diagnoses"],
+                json!([]),
+                "campaign machinery says nothing about whether the work is wrong"
+            );
+            assert_eq!(faulted_value["retries"][0]["taskId"], "task-2b");
+            assert_eq!(faulted_value["retries"][0]["attempt"], 1);
+            assert_eq!(faulted_value["retries"][0]["posted"], true);
+            assert_eq!(faulted_value["retries"][0]["exhausted"], false);
+            assert_eq!(
+                faulted_value["continuation"]["posted"],
+                true,
+                "the pass must post the mention that resumes the retry"
+            );
+            let retry_ref = fixture_git(
+                &checkout,
+                &["ls-remote", "origin", "refs/tally/spec-build/v1/*/retry/task-2b/1"],
+            );
+            let retry_oid = retry_ref
+                .split_whitespace()
+                .next()
+                .expect("local forge omitted the machinery retry receipt");
+            let retry: Value = serde_json::from_str(&fixture_git(
+                &checkout,
+                &["cat-file", "blob", retry_oid],
+            ))
+            .unwrap();
+            assert_eq!(retry["kind"], "retry");
+            assert_eq!(retry["taskId"], "task-2b");
+            assert!(retry["reason"].as_str().unwrap().contains("`merge`"));
+
+            let recovered = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_RECOVERED,
+                &arguments("fixture-comment-17-recovered", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let recovered = runner_output(recovered).await;
+            assert!(
+                recovered.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&recovered.stdout),
+                String::from_utf8_lossy(&recovered.stderr)
+            );
+            let recovered_value = &flow_report(&recovered)["report"]["finalValue"];
+            assert_eq!(
+                recovered_value["reconciled"]["retries"][0]["taskId"],
+                "task-2b",
+                "the retry receipt is a durable forge fact"
+            );
+            assert_eq!(
+                recovered_value["reconciled"]["diagnoses"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|diagnosis| diagnosis["taskId"] == "task-2b")
+                    .count(),
+                0,
+                "the machinery fault spent no steering attempt"
+            );
+            assert_eq!(recovered_value["state"], "advanced");
+            assert_eq!(recovered_value["merged"][0]["taskId"], "task-2b");
+
+            fixture_git(&checkout, &["fetch", "origin"]);
+            assert_eq!(
+                fixture_git(&checkout, &["show", "origin/main:build/two.txt"]),
+                "two"
+            );
+
+            // task-5 is beyond what the fixture agent implements, so both its
+            // implementation and its diagnosis die. A steering lane that throws
+            // must still leave the campaign a mention to resume from.
+            let halted = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_HALTED,
+                &arguments("fixture-comment-18-halted", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let halted = runner_output(halted).await;
+            assert_eq!(halted.status.code(), Some(1));
+            let halted_submitted = runner_events(&halted, "node-submitted");
+            assert!(
+                halted_submitted
+                    .iter()
+                    .any(|event| event["label"] == "diagnose-task-5"),
+                "the diagnosis lane must have been dispatched"
+            );
+            assert!(
+                halted_submitted
+                    .iter()
+                    .any(|event| event["label"] == "spec-build-continue"),
+                "a thrown steering lane must not swallow the continuation: {:?}",
+                halted_submitted
+                    .iter()
+                    .map(|event| event["label"].as_str().unwrap_or("<missing>"))
+                    .collect::<Vec<_>>()
+            );
+            let continuation_ref = fixture_git(
+                &checkout,
+                &[
+                    "ls-remote",
+                    "origin",
+                    "refs/tally/spec-build/v1/*/continuation/*",
+                ],
+            );
+            assert!(
+                !continuation_ref.trim().is_empty(),
+                "the campaign must carry a durable continuation receipt"
+            );
 
             daemon.stop().await;
         })

@@ -116,7 +116,8 @@ export const meta = {
           priority: { enum: ["interrupt", "high", "medium", "low"] },
           runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
           approvalPolicy: { type: ["string", "null"], minLength: 1 },
-          sandboxPolicy: { type: ["string", "null"], minLength: 1 }
+          sandboxPolicy: { type: ["string", "null"], minLength: 1 },
+          diagnosisSandboxPolicy: { type: ["string", "null"], minLength: 1 }
         },
         additionalProperties: false
       },
@@ -459,6 +460,33 @@ const diagnosisFactSchema = {
   additionalProperties: false
 };
 
+const retryFactSchema = {
+  type: "object",
+  required: ["taskId", "attempt", "comment", "reason"],
+  properties: {
+    taskId: taskIdSchema,
+    attempt: { type: "integer", minimum: 1, maximum: 2 },
+    comment: { type: "string", minLength: 1 },
+    reason: { type: "string", minLength: 1, maxLength: 2000 }
+  },
+  additionalProperties: false
+};
+
+const deferralFactSchema = {
+  type: "object",
+  required: ["taskId", "waitingOn"],
+  properties: {
+    taskId: taskIdSchema,
+    waitingOn: {
+      type: "array",
+      minItems: 1,
+      uniqueItems: true,
+      items: taskIdSchema
+    }
+  },
+  additionalProperties: false
+};
+
 const blockedFactSchema = {
   type: "object",
   required: ["taskId", "blockedBy"],
@@ -487,6 +515,8 @@ const reconcileSchema = {
     "remaining",
     "frontier",
     "diagnoses",
+    "retries",
+    "deferrals",
     "blocked",
     "quiescent",
     "escalation",
@@ -513,6 +543,8 @@ const reconcileSchema = {
     remaining: { type: "array", items: taskIdSchema },
     frontier: { type: "array", maxItems: 128, items: taskSchema },
     diagnoses: { type: "array", maxItems: 256, items: diagnosisFactSchema },
+    retries: { type: "array", maxItems: 256, items: retryFactSchema },
+    deferrals: { type: "array", maxItems: 128, items: deferralFactSchema },
     blocked: { type: "array", maxItems: 128, items: blockedFactSchema },
     quiescent: { type: "boolean" },
     escalation: { type: ["string", "null"], minLength: 1 },
@@ -748,11 +780,12 @@ const steeringSchema = {
 
 const escalationSchema = {
   type: "object",
-  required: ["posted", "comment", "diagnosisCount"],
+  required: ["posted", "comment", "diagnosisCount", "retryCount"],
   properties: {
     posted: { type: "boolean" },
     comment: { type: "string", minLength: 1 },
-    diagnosisCount: { type: "integer", minimum: 1, maximum: 256 }
+    diagnosisCount: { type: "integer", minimum: 1, maximum: 256 },
+    retryCount: { type: "integer", minimum: 0, maximum: 256 }
   },
   additionalProperties: false
 };
@@ -763,6 +796,20 @@ const continuationSchema = {
   properties: {
     command: { type: "string", pattern: "^/[^\\r\\n]+$", maxLength: 300 },
     posted: { const: true }
+  },
+  additionalProperties: false
+};
+
+const retrySchema = {
+  type: "object",
+  required: ["taskId", "attempt", "comment", "exhausted", "posted", "redacted"],
+  properties: {
+    taskId: taskIdSchema,
+    attempt: { type: "integer", minimum: 0, maximum: 2 },
+    comment: { type: ["string", "null"], minLength: 1 },
+    exhausted: { type: "boolean" },
+    posted: { type: "boolean" },
+    redacted: { type: "boolean" }
   },
   additionalProperties: false
 };
@@ -876,6 +923,34 @@ function machineDiagnoses(reconciliation, taskId) {
   return reconciliation.diagnoses.filter(item => item.taskId === taskId);
 }
 
+// A campaign has two unrelated kinds of failure and must not price them the
+// same. A red gate, a rejected ownership boundary, an agent that exits non-zero
+// and a red checkpoint command are all evidence that the task's work is wrong,
+// and each one spends one of the task's two steering attempts. Preparing a
+// worktree, rebasing, publishing and merging are campaign machinery: when they
+// fault they say nothing about the work, so they buy a bounded forge-counted
+// retry instead. A checkpoint that runs while unrelated implementation work is
+// still outstanding is neither - its verdict is not yet meaningful.
+function failureClass(reconciliation, failure) {
+  const stage = failure.stage;
+  if (
+    stage === "checkpoint" &&
+    reconciliation.deferrals.some(item => item.taskId === failure.task.id)
+  ) {
+    return "deferred";
+  }
+  if (
+    stage === "agent" ||
+    stage === "ownership" ||
+    stage === "checkpoint" ||
+    stage.startsWith("gate:") ||
+    stage.startsWith("regate:")
+  ) {
+    return "work";
+  }
+  return "machinery";
+}
+
 function implementationBrief(task, prepared, reconciliation) {
   return {
     schemaVersion: 1,
@@ -936,15 +1011,24 @@ function checkpointBrief(task, prepared, reconciliation) {
   };
 }
 
-function applyAgentPolicies(spec) {
+// The diagnosis brief prohibits mutation. An operator whose adapter declares no
+// read-only policy sets diagnosisSandboxPolicy to null explicitly.
+function diagnosisSandboxed(agent) {
+  if (agent.diagnosisSandboxPolicy !== undefined) {
+    return agent;
+  }
+  return { ...agent, diagnosisSandboxPolicy: "read-only" };
+}
+
+function applyAgentPolicies(spec, sandboxPolicy = effective.agent.sandboxPolicy) {
   if (effective.agent.runtimeMaxSec !== null) {
     spec.runtimeMaxSec = effective.agent.runtimeMaxSec;
   }
   if (effective.agent.approvalPolicy !== null) {
     spec.approvalPolicy = effective.agent.approvalPolicy;
   }
-  if (effective.agent.sandboxPolicy !== null) {
-    spec.sandboxPolicy = effective.agent.sandboxPolicy;
+  if (sandboxPolicy !== null && sandboxPolicy !== undefined) {
+    spec.sandboxPolicy = sandboxPolicy;
   }
   return spec;
 }
@@ -956,6 +1040,8 @@ function reconciledProjection(reconciliation) {
     remaining: reconciliation.remaining,
     frontier: reconciliation.frontier.map(task => task.id),
     diagnoses: reconciliation.diagnoses,
+    retries: reconciliation.retries,
+    deferrals: reconciliation.deferrals,
     blocked: reconciliation.blocked,
     quiescent: reconciliation.quiescent,
     escalation: reconciliation.escalation,
@@ -1095,7 +1181,7 @@ function sweepDeferral(sweepNode) {
         campaign: args.campaign,
         repositoryConfig: args.repositories[args.repository],
         maxParallel: args.maxParallel,
-        agent: args.agent,
+        agent: diagnosisSandboxed(args.agent),
         gates: args.gates,
         reconcileCommand: args.reconcileCommand
       };
@@ -1181,6 +1267,8 @@ function sweepDeferral(sweepNode) {
       merged: [],
       failures: [],
       diagnoses: [],
+      retries: [],
+      deferrals: [],
       continuation: null,
       escalation: null
     };
@@ -1213,6 +1301,8 @@ function sweepDeferral(sweepNode) {
       merged: [],
       failures: [],
       diagnoses: [],
+      retries: [],
+      deferrals: [],
       continuation: null,
       escalation
     };
@@ -1651,8 +1741,68 @@ function sweepDeferral(sweepNode) {
     merged.push(merge.result);
   }
 
+  const steerable = [];
+  const machineryFaults = [];
+  const deferrals = [];
+  for (const failure of failures) {
+    const kind = failureClass(reconciliation, failure);
+    if (kind === "work") {
+      steerable.push(failure);
+    } else if (kind === "machinery") {
+      machineryFaults.push(failure);
+    } else {
+      deferrals.push(failure);
+    }
+  }
+
+  // A machinery fault buys a retry only while the task's forge-counted retry
+  // budget lasts. Once it is spent the fault is steered like any other failure,
+  // so a permanently broken lane still reaches escalation instead of looping.
+  const retryOutcomes = await parallel(
+    machineryFaults.map(failure => () => (async () => {
+      const task = failure.task;
+      const recorded = await driverNode(
+        "retry",
+        {
+          campaign: effective.campaign,
+          repository: args.repository,
+          repositoryConfig,
+          issue: args.issue,
+          taskId: task.id,
+          stage: failure.stage,
+          detail: bounded(
+            failure.node && failure.node.error ? failure.node.error : failure.node,
+            1500
+          )
+        },
+        `retry-${task.id}`,
+        `retry-${task.id}`,
+        retrySchema,
+        null,
+        false,
+        taskRefFor(task.id)
+      );
+      return { failure, result: recorded.result };
+    })()),
+    { settle: true }
+  );
+  const retries = [];
+  let retryError = null;
+  for (let index = 0; index < retryOutcomes.length; index += 1) {
+    const outcome = retryOutcomes[index];
+    if (!outcome.ok) {
+      retryError = retryError || outcome.error;
+      continue;
+    }
+    if (outcome.value.result.posted) {
+      retries.push(outcome.value.result);
+    } else {
+      steerable.push(outcome.value.failure);
+    }
+  }
+
   const diagnosisOutcomes = await parallel(
-    failures.map(failure => () => (async () => {
+    steerable.map(failure => () => (async () => {
       const task = failure.task;
       const taskRef = taskRefFor(task.id);
       let diff = {
@@ -1721,18 +1871,23 @@ function sweepDeferral(sweepNode) {
         diff,
         previousDiagnoses
       };
-      const diagnosisSpec = applyAgentPolicies({
-        argv: effective.agent.argv,
-        adapter: effective.agent.adapter,
-        pools: ["campaign-agent"],
-        priority: effective.agent.priority,
-        evidence: ["exit:0"],
-        brief: diagnosisBrief,
-        key: `diagnose-${task.id}`,
-        label: `diagnose-${task.id}`,
-        taskRef,
-        resultSchema: diagnosisResultSchema
-      });
+      // The diagnosis brief prohibits mutation, so the node is sandboxed to
+      // match rather than inheriting the implementation node's writable policy.
+      const diagnosisSpec = applyAgentPolicies(
+        {
+          argv: effective.agent.argv,
+          adapter: effective.agent.adapter,
+          pools: ["campaign-agent"],
+          priority: effective.agent.priority,
+          evidence: ["exit:0"],
+          brief: diagnosisBrief,
+          key: `diagnose-${task.id}`,
+          label: `diagnose-${task.id}`,
+          taskRef,
+          resultSchema: diagnosisResultSchema
+        },
+        effective.agent.diagnosisSandboxPolicy
+      );
       if (failure.prepared !== null && diff.available) {
         diagnosisSpec.workspace = workspaceFor(
           failure.prepared,
@@ -1767,27 +1922,27 @@ function sweepDeferral(sweepNode) {
   const diagnoses = diagnosisOutcomes
     .filter(outcome => outcome.ok)
     .map(outcome => outcome.value);
-  let terminalError = diagnosisFailure ? diagnosisFailure.error : null;
-  if (
-    terminalError === null &&
-    merged.length === 0 &&
-    checkpoints.length === 0 &&
-    diagnoses.length === 0
-  ) {
+  let terminalError = diagnosisFailure ? diagnosisFailure.error : retryError;
+  const advanced =
+    merged.length > 0 ||
+    checkpoints.length > 0 ||
+    diagnoses.length > 0 ||
+    retries.length > 0 ||
+    deferrals.length > 0;
+  if (terminalError === null && !advanced) {
     const error = new Error(
-      "a non-quiescent campaign frontier produced no merge, checkpoint, or machine steering"
+      "a non-quiescent campaign frontier produced no merge, checkpoint, retry, or machine steering"
     );
     error.name = "SpecBuildInvariantError";
     error.code = "frontier-without-outcome";
     terminalError = error;
   }
 
+  // The continuation is posted even when the steering lane threw. A transient
+  // adapter fault must not leave the campaign stopped with neither steering nor
+  // a mention to resume from.
   let continuation = null;
-  if (
-    terminalError === null &&
-    (merged.length > 0 || checkpoints.length > 0 || diagnoses.length > 0) &&
-    effective.reconcileCommand !== null
-  ) {
+  if (advanced && effective.reconcileCommand !== null) {
     const continued = await driverNode(
       "continue",
       {
@@ -1806,12 +1961,13 @@ function sweepDeferral(sweepNode) {
       null
     );
     if (!nodePassed(continued)) {
-      const taskId = merged.length > 0
-        ? merged[merged.length - 1].taskId
-        : checkpoints.length > 0
-          ? checkpoints[checkpoints.length - 1].taskId
-          : diagnoses[diagnoses.length - 1].taskId;
-      failures.push(failureReport({ id: taskId }, "continuation", continued));
+      const witness = merged
+        .concat(checkpoints, diagnoses, retries)
+        .map(fact => fact.taskId)
+        .concat(deferrals.map(failure => failure.task.id));
+      failures.push(
+        failureReport({ id: witness[witness.length - 1] }, "continuation", continued)
+      );
     } else {
       continuation = continued.result;
     }
@@ -1853,19 +2009,21 @@ function sweepDeferral(sweepNode) {
     repository: args.repository,
     issue: args.issue,
     worklist: reconciliation.source,
+    // The frontier-without-outcome invariant above has already thrown unless
+    // one of these three outcomes holds, so there is no fourth arm to name.
     state: merged.length > 0 || checkpoints.length > 0
       ? "advanced"
       : diagnoses.length > 0
         ? "steered"
-        : failures.length > 0
-          ? "needs-attention"
-          : "idle",
+        : "retrying",
     reconciled: reconciledProjection(reconciliation),
     maintenance: sweepNode.result,
     checkpoints,
     merged,
     failures: failures.map(failure => failure.report || failure),
     diagnoses,
+    retries,
+    deferrals: deferrals.map(failure => failure.task.id),
     continuation,
     escalation: null
   };

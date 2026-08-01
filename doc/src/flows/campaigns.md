@@ -84,7 +84,8 @@ that hand-maintained copy. Start from one JSON worklist:
       "priority": "low",
       "runtimeMaxSec": 14400,
       "approvalPolicy": "on-request",
-      "sandboxPolicy": "workspace-write"
+      "sandboxPolicy": "workspace-write",
+      "diagnosisSandboxPolicy": "read-only"
     },
     "gates": [
       {
@@ -241,6 +242,7 @@ services.tally = {
     # implementation node is writable and may request bounded escalation.
     agentApprovalPolicy = "on-request";
     agentSandboxPolicy = "workspace-write";
+    agentDiagnosisSandboxPolicy = "read-only";
     gates = [
       {
         kind = "forbidPaths";
@@ -345,11 +347,13 @@ transport for recurring campaigns.
 An implementation node defaults to `agentSandboxPolicy = "workspace-write"`
 because its contract requires a commit, paired with
 `agentApprovalPolicy = "on-request"` so the adapter can surface a request to go
-beyond that boundary. Both names must exist in the selected adapter's launch
-maps; deployment fails early otherwise. Set `agentSandboxPolicy = "read-only"`
-when a deliberately non-writing campaign agent needs that constraint. Set either
-option to `null` only for an adapter such as the shell fixture that declares no
-corresponding policy map.
+beyond that boundary. A diagnosis node's brief prohibits mutation, so it does
+not inherit that writable policy: `agentDiagnosisSandboxPolicy` defaults to
+`"read-only"` and holds the node to its stated obligation. Every configured name
+must exist in the selected adapter's launch maps; deployment fails early
+otherwise. Set `agentSandboxPolicy = "read-only"` when a deliberately non-writing
+campaign agent needs that constraint. Set any of these options to `null` only for
+an adapter such as the shell fixture that declares no corresponding policy map.
 
 One enabled attrset expands to all of the following:
 
@@ -361,7 +365,7 @@ One enabled attrset expands to all of the following:
 | `<pool.name>` | A capacity-1 mutex held for one reconcile pass. |
 | `campaign-agent` | A counted `slot` pool with baseline capacity four, raised when an enabled recurring campaign has a larger `maxParallel`. |
 | `campaign-control` | A `cpu-slot` pool for reconciliation, Git, GitHub, and gate nodes, with the same baseline and recurring-campaign scaling. |
-| `spec-build-driver` | The packaged deterministic policy driver used for reconcile, prep, ownership checks, built-in constraints, checkpoint recording, diff capture, steering, escalation, continuation, publish, rebase, and merge projections. |
+| `spec-build-driver` | The packaged deterministic policy driver used for reconcile, prep, ownership checks, built-in constraints, checkpoint recording, diff capture, steering, machinery retries, escalation, continuation, publish, rebase, and merge projections. |
 
 The producer posts its receipt and witnessed evidence. Each merge and passed
 checkpoint posts an idempotently marked progress comment. Once task execution,
@@ -633,10 +637,13 @@ checkpointed = valid content-and-exact-base-bound checkpoint refs
 completed = implemented + checkpointed
 remaining = worklist - completed
 diagnoses = authenticated marked diagnosis comments (attempts 1 and 2)
+retries = authenticated marked machinery-fault comments (at most 2 per node)
 directly_blocked = incomplete nodes with both diagnosis receipts
 blocked = directly_blocked plus their incomplete descendants
+deferred = incomplete checkpoints with unblocked, unrelated implementation work left
 ready = unblocked nodes in remaining whose dependencies are all in completed
-frontier = first maxParallel ready nodes with disjoint implementation conflictDomains
+frontier = first maxParallel ready nodes with disjoint implementation
+  conflictDomains, deferred checkpoints considered last
 
 if remaining is nonempty and frontier is empty:
   -> post the one marked escalation with accumulated diagnoses -> exit
@@ -651,8 +658,11 @@ parallel(frontier):
     -> record content-and-exact-base-bound completion ref
 serial(successful publications): compare current base -> rebase if moved
   -> re-run each configured gate only on a changed rebased head -> merge
-parallel(failed tasks): capture diff -> diagnosis agent -> marked steering comment
-if any task merged, checkpoint passed, or steering was posted:
+parallel(machinery faults with retry budget left): marked retry comment
+parallel(remaining failed tasks): capture diff -> diagnosis agent
+  -> marked steering comment
+if any task merged, checkpoint passed, steering or a retry was posted,
+or a checkpoint deferred:
   post one exact continuation command
 clean every prepared task lane
 exit
@@ -736,12 +746,37 @@ repeat secret-looking input. Only its concise output passes through conservative
 public redaction and becomes an authenticated, marked campaign comment; raw
 capture, gate output, brief, and diff remain private job inputs.
 
-The pass then posts the exact continuation command even when nothing merged.
-The next event has a fresh flow-run identity, re-reads forge state, and includes
-the first machine diagnosis in the implementation or checkpoint brief. A second
-failure produces attempt 2 and blocks that node. Because attempts live in forge
-comments, not runner memory or a campaign-local checkpoint, a redeploy, crash,
-timer, or fresh mention derives the same scheduler state.
+The pass then posts the exact continuation command even when nothing merged, and
+even when the diagnosis lane itself faulted: a transient adapter failure must
+never leave a campaign stopped with neither steering nor a mention to resume
+from. The next event has a fresh flow-run identity, re-reads forge state, and
+includes the first machine diagnosis in the implementation or checkpoint brief.
+A second failure produces attempt 2 and blocks that node. Because attempts live
+in forge comments, not runner memory or a campaign-local checkpoint, a redeploy,
+crash, timer, or fresh mention derives the same scheduler state.
+
+Only evidence that the task's work is wrong spends an attempt: a non-zero agent,
+a rejected ownership boundary, a red gate or re-gate, and a red checkpoint
+command. Campaign machinery — preparing a lane, an unexpected lane exception,
+rebasing, publishing, and merging — says nothing about the work, so a fault
+there posts a marked retry comment and the continuation instead. That retry
+budget is bounded at two per task and is read back from the forge like every
+other campaign fact, so a permanently broken lane still spends its two steering
+attempts and reaches escalation rather than retrying forever.
+
+A checkpoint reads the accumulated tree, so a red verdict while unrelated
+implementation work is still outstanding says nothing about the checkpoint. Such
+a run is a deferral: it spends no attempt, and the reconciler considers a
+deferrable checkpoint last so it never displaces real work from a bounded
+frontier. Tasks that are already blocked, and tasks on either side of the
+checkpoint's own dependency chain, cannot change its verdict and so never defer
+it — the campaign still reaches quiescence.
+
+Between passes an operator may rename, drop, or re-scope worklist tasks. Machine
+receipts naming a task the worklist no longer has, and receipts left without the
+attempt that should precede them, are reported as reconciler warnings and
+ignored. A worklist edit degrades the campaign's memory of past attempts; it
+never bricks the campaign.
 
 Escalation is a state transition, not the first failure: it occurs only when the
 worklist is incomplete and the recomputed unblocked frontier is empty. The

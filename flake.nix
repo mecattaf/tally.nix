@@ -75,6 +75,7 @@
             ./test/fixtures/flows
             ./test/fixtures/git-ai
             ./test/fixtures/ledger
+            ./test/fixtures/redaction
             ./test/fixtures/shell-command-provider
             ./test/fixtures/spec-build
             ./test/fixtures/traces
@@ -1221,6 +1222,7 @@
                   agentArgv = [ "/bin/true" ];
                   agentApprovalPolicy = null;
                   agentSandboxPolicy = null;
+                  agentDiagnosisSandboxPolicy = null;
                   agentRuntimeMaxSec = 120;
                   driverRuntimeMaxSec = 30;
                   pool.name = "fixture-campaign";
@@ -3189,9 +3191,9 @@
           # implementations of one budget, and nothing else makes them agree.
           # The fixture campaign has the shape the CLI unit test uses --
           # maxParallel 3, two gates, one of them a command gate -- so both
-          # sides must land on 48. Drift on either side breaks a test rather
+          # sides must land on 51. Drift on either side breaks a test rather
           # than silently capping a run below its own worst case.
-          assert campaignHome.config.services.tally.flows.fixture.maxNodes == 48;
+          assert campaignHome.config.services.tally.flows.fixture.maxNodes == 51;
           assert systemServices ? tally-drain;
           assert systemTimers ? tally-drain;
           assert systemTimers.tally-drain.timerConfig.OnActiveSec == "1s";
@@ -3480,6 +3482,7 @@
                 export HOME="$TMPDIR/home"
                 mkdir -p "$HOME"
                 export SPEC_BUILD_DRIVER_SOURCE=${./examples/flows/spec_build_driver.py}
+                export SPEC_BUILD_REDACTION_VECTORS=${./test/fixtures/redaction/vectors.json}
                 python3 ${./test/spec_build_driver_test.py}
                 touch "$out"
               '';
@@ -3526,6 +3529,7 @@
                   $fixtureArgs.tally == "${tally}/bin/tally" and
                   $fixtureArgs.agent.approvalPolicy == null and
                   $fixtureArgs.agent.sandboxPolicy == null and
+                  $fixtureArgs.agent.diagnosisSandboxPolicy == null and
                   $fixtureArgs.gates[0].kind == "command" and
                   $fixtureArgs.gates[0].preflightArgv == ["/bin/true"] and
                   $fixtureArgs.gates[0].runtimeMaxSec == 900 and
@@ -3538,6 +3542,7 @@
                   $defaultedArgs.agent.adapter == "codex" and
                   $defaultedArgs.agent.approvalPolicy == "on-request" and
                   $defaultedArgs.agent.sandboxPolicy == "workspace-write" and
+                  $defaultedArgs.agent.diagnosisSandboxPolicy == "read-only" and
                   .producers["campaign-fixture"].kind == "gh" and
                   .producers["campaign-fixture"].enable == true and
                   .producers["campaign-fixture"].sources[0].search.repositories == ["acme/spec"] and
@@ -3562,7 +3567,7 @@
                   .producers["campaign-fixture"].enqueue.argv[0:3] == [
                     "${tally}/bin/tally", "flow", "run"
                   ] and
-                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "48"] and
+                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "51"] and
                   .producers["campaign-fixture-reconcile"].kind == "gh" and
                   .producers["campaign-fixture-reconcile"].allowSelfTriggered == true and
                   .producers["campaign-fixture-reconcile"].allowedActors == ["operator"] and
@@ -3571,7 +3576,7 @@
                   .producers["campaign-fixture-reconcile"].postFailureStderr == true and
                   .producers["campaign-fixture-reconcile"].triggers.commandComments == ["/tally reconcile fixture"] and
                   .producers["campaign-fixture-reconcile"].enqueue.pool == ["fixture-campaign", "flow"] and
-                  .producers["campaign-fixture-reconcile"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "48"] and
+                  .producers["campaign-fixture-reconcile"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "51"] and
                   $reconcileArgs.reconcileCommand == "/tally reconcile fixture" and
                   .producers["campaign-defaulted"].allowSelfTriggered == false
                   and .producers["campaign-defaulted"].postFailureEvidence == false
@@ -3932,6 +3937,7 @@
                   .agent.argv == ["/bin/true"] and
                   .agent.approvalPolicy == null and
                   .agent.sandboxPolicy == null and
+                  .agent.diagnosisSandboxPolicy == null and
                   [.gates[].id] == ["content", "no-db-artifacts"] and
                   .gates[0].kind == "command" and
                   .gates[0].preflightArgv == ["/bin/true"] and

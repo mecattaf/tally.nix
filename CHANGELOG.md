@@ -201,6 +201,39 @@ authorized.
   recoverable published head, post-rebase policy failures abandon it with the
   same exact lease, completed-sweep replay refusal is limited to `reused`, and
   the single continuation comment is retried and read-after-write verified.
+- Narrowed public redaction so it stops destroying the reports it protects.
+  Secret prefixes now match only at a token's start, so ordinary words such as
+  `task-1`, `subtask-2` and `disk-1` survive; a bare lowercase git object id is
+  no longer mistaken for a hex secret; and a marker such as `token` or `secret`
+  hides a whole line only where it stands in key position, so a diagnosis about
+  an auth-token bug is still readable. Real credentials are still caught, on a
+  labelled line as well as bare. Failure stderr and machine steering hand-write
+  the same rules in Rust and Python and now both assert against one committed
+  vector at `test/fixtures/redaction/vectors.json`; the redaction identity is
+  `conservative-v2`, and receipts written by the superseded redactor stay
+  readable.
+- Stopped a worklist edit between campaign passes from bricking the campaign.
+  Machine receipts naming a task the worklist no longer has, and receipts left
+  without the attempt that should precede them, are now witnessed reconciler
+  warnings that drop the receipt instead of hard failures that also disabled
+  escalation's own self-report.
+- Separated campaign machinery faults from evidence that a task's work is
+  wrong. A red gate, rejected ownership, a non-zero agent, and a red checkpoint
+  command still spend one of a task's two steering attempts; preparing a lane,
+  a lane exception, rebasing, publishing and merging now post a bounded,
+  forge-counted retry receipt and the continuation instead. The retry budget is
+  two per task, so a permanently broken lane still reaches escalation.
+- Stopped campaign checkpoints from spending steering attempts on work they do
+  not own. A checkpoint that runs red while unblocked, unrelated implementation
+  work is still outstanding now defers instead of failing, and the reconciler
+  considers a deferrable checkpoint last so it never displaces real work from a
+  bounded frontier.
+- Made a campaign pass post its continuation even when the diagnosis lane
+  itself faulted, so one transient adapter failure no longer stops a campaign
+  with neither steering nor a mention to resume from.
+- Held campaign diagnosis nodes to the read-only obligation their brief states
+  through the new `agentDiagnosisSandboxPolicy`, which defaults to `read-only`
+  rather than inheriting the implementation node's writable sandbox.
 - Completed campaign task-reference observability in `query trace` records and
   generations and in every `query standup` bucket; task-ref-qualified archived
   captures are now regression-tested through retry trace lookup and recovered

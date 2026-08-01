@@ -15,11 +15,12 @@ role = brief.get("role", "implementation")
 control = Path(sys.argv[1])
 worktree = Path.cwd()
 launch = sys.argv[2:]
+expected_sandbox = "read-only" if role == "diagnosis" else "workspace-write"
 expected_prefix = [
     "--ask-for-approval",
     "on-request",
     "--sandbox",
-    "workspace-write",
+    expected_sandbox,
     "--",
 ]
 if launch[:5] != expected_prefix or len(launch) != 6 or "TALLY_BRIEF" not in launch[5]:
@@ -54,8 +55,12 @@ if role == "diagnosis":
     if task == "task-1":
         if "build/transient.db" not in failure["captureStderr"]:
             raise SystemExit("task 1 diagnosis omitted constraint stderr")
+        # Names a task id containing "sk-", a git object id, and prose about a
+        # token bug. Redaction must keep all three and drop only the credential.
         steering = (
-            "Remove the forbidden transient database artifact before rerunning gates. "
+            "task-1 left build/transient.db behind; the subtask-2 cleanup never ran.\n"
+            "Rebase onto 6347cbb9f4a2b1c0d5e6f70819a2b3c4d5e6f708 and rerun the gates.\n"
+            "The auth token bug is unrelated to this failure.\n"
             "Do not expose ghp_0123456789abcdefghijklmnopqrstuvwxyz in public output."
         )
     elif task == "task-2":
@@ -63,11 +68,11 @@ if role == "diagnosis":
             raise SystemExit("task 2 diagnosis omitted command-gate stderr")
         steering = "The deterministic task 2 gate remains red; inspect build/two.txt and retry."
     elif task == "phase-one-checkpoint":
-        if "phase one checkpoint remains red" not in failure["captureStderr"]:
+        if "phase one checkpoint has no prior steering" not in failure["captureStderr"]:
             raise SystemExit("checkpoint diagnosis omitted checkpoint stderr")
         steering = (
-            "The phase-one checkpoint still sees the temporary marker. Retry after the "
-            "unrelated cleanup task merges."
+            "The phase-one checkpoint reached its own attempt without durable steering. "
+            "Retry now that the accumulated tree is settled."
         )
     else:
         raise SystemExit(f"unexpected diagnosis task: {task}")
@@ -115,10 +120,19 @@ if task == "task-1":
     if not steering:
         (output / "transient.db").write_text("not a database\n", encoding="utf-8")
     else:
-        if len(steering) != 1 or "[redacted-token]" not in steering[0]["diagnosis"]:
+        diagnosis = steering[0]["diagnosis"]
+        if len(steering) != 1 or "[redacted-token]" not in diagnosis:
             raise SystemExit("task 1 retry did not receive redacted machine steering")
+        for survivor in (
+            "task-1",
+            "subtask-2",
+            "6347cbb9f4a2b1c0d5e6f70819a2b3c4d5e6f708",
+            "The auth token bug is unrelated",
+        ):
+            if survivor not in diagnosis:
+                raise SystemExit(f"redaction destroyed steering content: {survivor!r}")
         (control / "task-1-steering-visible").touch()
-elif task == "task-2":
+elif task in {"task-2", "task-2b"}:
     if (output / "one.txt").read_text(encoding="utf-8") != "one\n":
         raise SystemExit("task 2 did not start from task 1's merged result")
     if not (output / "task-2-base.txt").exists():
