@@ -118,6 +118,15 @@ $ tally adapter smoke codex
 That command is the activation check introduced by issue #233; campaign
 rendering does not depend on its implementation.
 
+An accepted campaign then performs its own gate preflight. After the worklist
+has been schema-validated and witnessed, tally prepares task 1 from the fetched
+remote base and runs every configured gate there, in declaration order, as
+`preflight-gate-<id>`. Each node executes the exact direct argv on the campaign
+host and records ordinary `exit:0` evidence. A red preflight stops evaluation
+before the implementation adapter is admitted, so its capture and witnessed
+node are the failure receipt rather than an agent cycle spent discovering the
+same broken gate.
+
 ## The per-task brief contract
 
 `worklist` is a relative glob beneath the configured checkout. It must resolve
@@ -178,9 +187,15 @@ push, open a pull request, or merge. Those are separate deterministic nodes.
 For every witnessed task, `spec-build` executes this chain serially:
 
 ```text
-fetch current remote main -> prepare worktree -> agent -> configured gates
+validate worklist -> fetch current remote main -> prepare task 1 worktree
+  -> preflight configured gates on that base -> agent -> configured gates
   -> push branch -> open/reuse PR -> merge -> fetch current main for next task
 ```
+
+The preflight runs once per campaign flow run. It uses task 1's still-unmodified
+worktree, so the checkout and execution host are the same ones the first agent
+and post-change gates will use. Replays reuse passing preflight witnesses and do
+not silently rerun or skip a recorded red result.
 
 The agent must leave a clean worktree with at least one commit descended from
 the prepared base. Publication refuses dirty, empty, or non-descendant work.
@@ -188,8 +203,9 @@ The merge is witnessed before the next prep node is submitted. Consequently,
 task 2 is prepared from a remote base that already contains task 1's merge;
 declaring a dependency is not merely descriptive.
 
-The first non-passing agent, gate, publish, or merge node stops JavaScript
-evaluation. No later gate, pull request, merge, or task prep is admitted.
+The first non-passing preflight, agent, gate, publish, or merge node stops
+JavaScript evaluation. No later gate, pull request, merge, or task prep is
+admitted.
 
 ## Failure, steering, and replay
 
@@ -204,10 +220,12 @@ After a non-passing node:
 2. Add the steering decision to the campaign issue.
 3. Correct the failed frontier. Retry a failed agent node with
    `tally queue retry <agent-task-uuid>`; its new attempt reads the comments.
-   For a red deterministic gate, correct and commit the existing worktree, then
-   retry that failed gate with `tally queue retry <gate-task-uuid>`. A passing
-   agent node cannot be retried implicitly, and tally does not invent a repair
-   attempt after a red gate.
+   For a red preflight caused by the host or base checkout, correct that defect
+   and retry it with `tally queue retry <preflight-task-uuid>`. For a red
+   post-change deterministic gate, correct and commit the existing worktree,
+   then retry it with `tally queue retry <gate-task-uuid>`. A passing agent node
+   cannot be retried implicitly, and tally does not invent a repair attempt
+   after a red gate.
 4. Retry the failed runner job:
 
    ```console

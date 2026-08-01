@@ -102,8 +102,9 @@ export const meta = {
     },
     additionalProperties: false
   },
-  // A campaign is bounded by maxTasks <= 128 and gates <= 16. The shared
-  // driver call site is reached four times per task plus the worklist node.
+  // A campaign is bounded by maxTasks <= 128 and gates <= 16. Its node budget
+  // includes one worklist node, one base preflight per gate, and every
+  // per-task prep/agent/gates/publish/merge chain.
   iterationCap: 4096,
   selectors: []
 };
@@ -312,6 +313,22 @@ function workspaceFor(prepared) {
       null
     );
     const workspace = workspaceFor(prepared.result);
+
+    // The first prepared worktree is a fresh checkout of the fetched remote
+    // base. Prove every exact gate argv there before an implementation adapter
+    // is admitted; these named nodes become a clear, replayable receipt.
+    if (merged.length === 0) {
+      for (const gate of args.gates) {
+        await sh(gate.argv, {
+          pools: ["campaign-control"],
+          priority: "low",
+          workspace,
+          evidence: ["exit:0"],
+          key: `preflight-gate-${gate.id}`,
+          label: `preflight-gate-${gate.id}`
+        });
+      }
+    }
 
     const agentSpec = {
       argv: args.agent.argv,

@@ -3338,7 +3338,7 @@
                     "${tally}/bin/tally", "flow", "run"
                   ] and
                   .producers["campaign-fixture"].enqueue.argv[4] == "--args" and
-                  .producers["campaign-fixture"].enqueue.argv[6:8] == ["--max-nodes", "19"] and
+                  .producers["campaign-fixture"].enqueue.argv[6:8] == ["--max-nodes", "21"] and
                   .producers["campaign-defaulted"].allowSelfTriggered == false
                 ' "$checkedConfig" >/dev/null
 
