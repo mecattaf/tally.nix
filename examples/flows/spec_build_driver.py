@@ -22,6 +22,15 @@ TASK_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 COMPONENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
 REPOSITORY = re.compile(r"^[^/ \t]+/[^/ \t]+$")
 GIT_OID = re.compile(r"^[0-9a-f]{40,64}$")
+CAMPAIGN_BEGIN = "<!-- tally:campaign:v1 -->"
+CAMPAIGN_END = "<!-- tally:campaign:v1:end -->"
+WORKLIST_BEGIN = "<!-- tally:campaign-worklist:v1 -->"
+WORKLIST_END = "<!-- tally:campaign-worklist:v1:end -->"
+TASK_MARKER_PREFIX = "<!-- tally:campaign-task:v1 id="
+BRIEF_SENTINEL = (
+    "Read the file whose path is in the TALLY_BRIEF environment variable and execute "
+    "the mission it contains. That brief is your complete instruction set."
+)
 
 
 class DriverError(RuntimeError):
@@ -45,6 +54,14 @@ def required_string(value: Any, context: str, maximum: int | None = None) -> str
     if not isinstance(value, str) or not value or any(ord(char) < 32 for char in value):
         fail(f"{context} must be a non-empty string without control characters")
     if maximum is not None and len(value) > maximum:
+        fail(f"{context} exceeds {maximum} characters")
+    return value
+
+
+def required_body(value: Any, context: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value.strip() or "\0" in value:
+        fail(f"{context} must be non-empty text without NUL bytes")
+    if len(value) > maximum:
         fail(f"{context} exceeds {maximum} characters")
     return value
 
@@ -93,6 +110,7 @@ def run(
     *,
     cwd: Path | None = None,
     check: bool = True,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -100,6 +118,7 @@ def run(
             cwd=cwd,
             check=False,
             text=True,
+            input=input_text,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
@@ -337,6 +356,335 @@ def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
             "sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
         },
         "tasks": tasks,
+    }
+
+
+def github_json(arguments: list[str], context: str) -> Any:
+    viewed = run(["gh", *arguments])
+    try:
+        return json.loads(viewed.stdout)
+    except json.JSONDecodeError as error:
+        fail(f"{context} returned invalid JSON: {error}")
+
+
+def managed_section(body: str, start: str, end: str, context: str) -> str:
+    start_index = body.find(start)
+    if start_index < 0:
+        fail(f"{context} is missing {start}")
+    content_start = start_index + len(start)
+    end_index = body.find(end, content_start)
+    if end_index < 0:
+        fail(f"{context} is missing {end}")
+    if body.find(start, content_start) >= 0 or body.find(end, end_index + len(end)) >= 0:
+        fail(f"{context} repeats a managed campaign marker")
+    return body[content_start:end_index].strip()
+
+
+def forge_agent(value: Any) -> dict[str, Any]:
+    agent = object_exact(
+        value,
+        {
+            "adapter",
+            "argv",
+            "priority",
+            "runtimeMaxSec",
+            "approvalPolicy",
+            "sandboxPolicy",
+        },
+        "campaign agent",
+    )
+    adapter = agent.get("adapter", "codex")
+    adapter = required_string(adapter, "campaign agent.adapter")
+    arguments = agent.get("argv", [BRIEF_SENTINEL])
+    arguments = argv(arguments, "campaign agent.argv")
+    priority = agent.get("priority", "low")
+    if priority not in {"interrupt", "high", "medium", "low"}:
+        fail("campaign agent.priority is invalid")
+    runtime = agent.get("runtimeMaxSec", 14_400)
+    if runtime is not None:
+        runtime = positive_integer(runtime, "campaign agent.runtimeMaxSec")
+    approval = agent.get("approvalPolicy", "on-request")
+    if approval is not None:
+        approval = required_string(approval, "campaign agent.approvalPolicy")
+    sandbox = agent.get("sandboxPolicy", "workspace-write")
+    if sandbox is not None:
+        sandbox = required_string(sandbox, "campaign agent.sandboxPolicy")
+    return {
+        "adapter": adapter,
+        "argv": arguments,
+        "priority": priority,
+        "runtimeMaxSec": runtime,
+        "approvalPolicy": approval,
+        "sandboxPolicy": sandbox,
+    }
+
+
+def forge_gates(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or not 1 <= len(value) <= 16:
+        fail("campaign gates must contain 1..=16 entries")
+    result: list[dict[str, Any]] = []
+    identifiers: set[str] = set()
+    for index, candidate in enumerate(value):
+        context = f"campaign gates[{index}]"
+        if not isinstance(candidate, dict):
+            fail(f"{context} must be an object")
+        kind = candidate.get("kind")
+        if kind == "command":
+            gate = object_exact(
+                candidate,
+                {"kind", "id", "preflightArgv", "argv", "runtimeMaxSec"},
+                context,
+            )
+            normalized = {
+                "kind": "command",
+                "id": required_string(gate.get("id"), f"{context}.id", 80),
+                "preflightArgv": argv(gate.get("preflightArgv"), f"{context}.preflightArgv"),
+                "argv": argv(gate.get("argv"), f"{context}.argv"),
+                "runtimeMaxSec": positive_integer(
+                    gate.get("runtimeMaxSec", 900), f"{context}.runtimeMaxSec"
+                ),
+            }
+        elif kind == "forbidPaths":
+            gate = object_exact(
+                candidate,
+                {"kind", "id", "forbidPaths", "runtimeMaxSec"},
+                context,
+            )
+            identifier = required_string(gate.get("id"), f"{context}.id", 80)
+            patterns = string_list(gate.get("forbidPaths"), f"{context}.forbidPaths", nonempty=True)
+            if len(patterns) > 128 or len(patterns) != len(set(patterns)):
+                fail(f"{context}.forbidPaths must contain 1..=128 unique patterns")
+            for pattern in patterns:
+                path = Path(pattern)
+                if path.is_absolute() or ".." in path.parts or pattern.endswith("/"):
+                    fail(f"{context}.forbidPaths contains an unsafe pattern")
+            normalized = {
+                "kind": "forbidPaths",
+                "id": identifier,
+                "forbidPaths": patterns,
+                "runtimeMaxSec": positive_integer(
+                    gate.get("runtimeMaxSec", 900), f"{context}.runtimeMaxSec"
+                ),
+            }
+        else:
+            fail(f"{context}.kind must be command or forbidPaths")
+        identifier = normalized["id"]
+        if not COMPONENT.fullmatch(identifier) or identifier in identifiers:
+            fail("campaign gate ids must be safe and unique")
+        identifiers.add(identifier)
+        result.append(normalized)
+    return result
+
+
+def forge_manifest(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    manifest = object_exact(
+        value,
+        {
+            "schemaVersion",
+            "name",
+            "repository",
+            "maxTasks",
+            "maxParallel",
+            "driverRuntimeMaxSec",
+            "runtimeMaxSec",
+            "pool",
+            "agent",
+            "gates",
+            "tasks",
+        },
+        "campaign manifest",
+    )
+    if manifest.get("schemaVersion") != 1:
+        fail("campaign manifest schemaVersion must equal 1")
+    campaign = required_string(manifest.get("name"), "campaign manifest.name", 80)
+    if not COMPONENT.fullmatch(campaign):
+        fail("campaign manifest.name is not a safe component")
+    repository_config = repo_config(manifest.get("repository"))
+    max_tasks = manifest.get("maxTasks", 64)
+    if not isinstance(max_tasks, int) or isinstance(max_tasks, bool) or not 1 <= max_tasks <= 100:
+        fail("campaign manifest.maxTasks must be in 1..=100")
+    max_parallel = manifest.get("maxParallel", 1)
+    if (
+        not isinstance(max_parallel, int)
+        or isinstance(max_parallel, bool)
+        or not 1 <= max_parallel <= max_tasks
+    ):
+        fail("campaign manifest.maxParallel must be positive and not exceed maxTasks")
+    positive_integer(
+        manifest.get("driverRuntimeMaxSec", 900),
+        "campaign manifest.driverRuntimeMaxSec",
+    )
+    runtime = manifest.get("runtimeMaxSec")
+    if runtime is not None:
+        positive_integer(runtime, "campaign manifest.runtimeMaxSec")
+    pool = manifest.get("pool", "campaign")
+    if not isinstance(pool, str) or not COMPONENT.fullmatch(pool):
+        fail("campaign manifest.pool is not a safe component")
+    agent = forge_agent(manifest.get("agent"))
+    gates = forge_gates(manifest.get("gates"))
+    candidates = manifest.get("tasks")
+    if not isinstance(candidates, list) or not 1 <= len(candidates) <= max_tasks:
+        fail(f"campaign manifest.tasks must contain 1..={max_tasks} entries")
+    references: list[dict[str, Any]] = []
+    prior: set[str] = set()
+    issues: set[int] = set()
+    for index, candidate in enumerate(candidates):
+        context = f"campaign manifest.tasks[{index}]"
+        task = object_exact(
+            candidate,
+            {"id", "issue", "dependencies", "conflictDomains"},
+            context,
+        )
+        identifier = required_string(task.get("id"), f"{context}.id", 80)
+        if not TASK_ID.fullmatch(identifier) or identifier in prior:
+            fail(f"{context}.id is invalid or duplicated")
+        number = task.get("issue")
+        if not isinstance(number, int) or isinstance(number, bool) or number < 1 or number in issues:
+            fail(f"{context}.issue must be a unique positive integer")
+        dependencies = string_list(task.get("dependencies", []), f"{context}.dependencies")
+        if len(dependencies) != len(set(dependencies)) or any(item not in prior for item in dependencies):
+            fail(f"{context}.dependencies must be unique earlier task ids")
+        conflicts = normalize_conflict_domains(
+            task.get("conflictDomains"),
+            f"{context}.conflictDomains",
+            required=max_parallel > 1,
+        )
+        references.append(
+            {
+                "id": identifier,
+                "issue": number,
+                "dependencies": dependencies,
+                "conflictDomains": conflicts,
+            }
+        )
+        prior.add(identifier)
+        issues.add(number)
+    config = {
+        "campaign": campaign,
+        "repositoryConfig": {
+            "checkout": str(repository_config["checkout"]),
+            "baseBranch": repository_config["baseBranch"],
+            "remote": repository_config["remote"],
+            "forge": repository_config["forge"],
+        },
+        "maxParallel": max_parallel,
+        "agent": agent,
+        "gates": gates,
+        "reconcileCommand": None,
+    }
+    return config, references
+
+
+def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
+    data = object_exact(brief, {"repository", "issue", "worklist"}, "reconcile brief")
+    repository = required_string(data.get("repository"), "repository")
+    if not REPOSITORY.fullmatch(repository):
+        fail("repository must use owner/name form")
+    issue = campaign_issue(data.get("issue"))
+    expected_url = f"https://github.com/{repository}/issues/{issue['number']}"
+    if issue["url"] != expected_url:
+        fail("campaign issue URL does not match repository and issue number")
+    selector = object_exact(data.get("worklist"), {"kind"}, "worklist")
+    if selector.get("kind") != "github-issue":
+        fail("forge-native worklist.kind must equal github-issue")
+    master = github_json(
+        ["api", f"repos/{repository}/issues/{issue['number']}"],
+        "campaign master issue",
+    )
+    if not isinstance(master, dict) or master.get("pull_request") is not None:
+        fail("campaign master locator did not resolve to an issue")
+    if master.get("state") != "open" or master.get("html_url") != expected_url:
+        fail("campaign master issue must be open and canonical")
+    body = master.get("body")
+    if not isinstance(body, str):
+        fail("campaign master issue has no body")
+    section = managed_section(body, CAMPAIGN_BEGIN, CAMPAIGN_END, "campaign master issue")
+    if not section.startswith("```json") or not section.endswith("```"):
+        fail("campaign manifest must be one fenced JSON object")
+    try:
+        manifest_value = json.loads(section[len("```json") : -3].strip())
+    except json.JSONDecodeError as error:
+        fail(f"campaign manifest is invalid JSON: {error}")
+    config, references = forge_manifest(manifest_value)
+    subissues = github_json(
+        [
+            "api",
+            f"repos/{repository}/issues/{issue['number']}/sub_issues?per_page=100",
+        ],
+        "campaign sub-issues",
+    )
+    if not isinstance(subissues, list):
+        fail("campaign sub-issues response must be an array")
+    by_number: dict[int, dict[str, Any]] = {}
+    for index, candidate in enumerate(subissues):
+        if not isinstance(candidate, dict):
+            fail(f"campaign sub-issues[{index}] must be an object")
+        number = candidate.get("number")
+        if (
+            not isinstance(number, int)
+            or isinstance(number, bool)
+            or number < 1
+            or number in by_number
+        ):
+            fail("campaign sub-issues must have unique positive issue numbers")
+        if candidate.get("pull_request") is not None:
+            fail(f"campaign sub-issue #{number} is a pull request")
+        if candidate.get("state") not in {"open", "closed"}:
+            fail(f"campaign sub-issue #{number} has an unknown state")
+        by_number[number] = candidate
+    expected_numbers = {reference["issue"] for reference in references}
+    if set(by_number) != expected_numbers:
+        fail("campaign manifest task issues and native sub-issues differ")
+    tasks: list[dict[str, Any]] = []
+    for reference in references:
+        candidate = by_number[reference["issue"]]
+        title = required_string(candidate.get("title"), f"task {reference['id']} title", 300)
+        task_body = required_body(candidate.get("body"), f"task {reference['id']} body", 64_000)
+        task_url = required_string(candidate.get("html_url"), f"task {reference['id']} URL")
+        expected_task_url = f"https://github.com/{repository}/issues/{reference['issue']}"
+        if task_url != expected_task_url:
+            fail(f"task {reference['id']} issue URL is not canonical")
+        tasks.append(
+            {
+                "id": reference["id"],
+                "kind": "implementation",
+                "title": title,
+                "brief": {
+                    "issue": {"number": str(reference["issue"]), "url": task_url},
+                    "body": task_body,
+                },
+                "dependencies": reference["dependencies"],
+                "conflictDomains": reference["conflictDomains"],
+            }
+        )
+    source_value = {
+        "manifest": manifest_value,
+        "master": {
+            "body": body,
+            "state": master.get("state"),
+            "updatedAt": master.get("updated_at"),
+        },
+        "tasks": [
+            {
+                "number": candidate.get("number"),
+                "title": candidate.get("title"),
+                "body": candidate.get("body"),
+                "state": candidate.get("state"),
+                "updatedAt": candidate.get("updated_at"),
+            }
+            for candidate in subissues
+        ],
+    }
+    digest = hashlib.sha256(
+        json.dumps(source_value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "schemaVersion": 1,
+        "repository": repository,
+        "source": {"kind": "github-issue", "url": expected_url, "sha256": f"sha256:{digest}"},
+        "tasks": tasks,
+        "config": config,
+        "masterBody": body,
     }
 
 
@@ -649,35 +997,91 @@ def task_conflicts(task: dict[str, Any], selected: list[dict[str, Any]]) -> bool
     )
 
 
+def sync_issue_checkboxes(
+    repository: str,
+    issue_number: str,
+    body: str,
+    tasks: list[dict[str, Any]],
+    merged_ids: set[str],
+) -> None:
+    start_index = body.find(WORKLIST_BEGIN)
+    if start_index < 0:
+        fail(f"campaign master issue is missing {WORKLIST_BEGIN}")
+    content_start = start_index + len(WORKLIST_BEGIN)
+    end_index = body.find(WORKLIST_END, content_start)
+    if end_index < 0:
+        fail(f"campaign master issue is missing {WORKLIST_END}")
+    if body.find(WORKLIST_BEGIN, content_start) >= 0 or body.find(
+        WORKLIST_END, end_index + len(WORKLIST_END)
+    ) >= 0:
+        fail("campaign master issue repeats a worklist marker")
+    lines = [""]
+    for task in tasks:
+        state = "x" if task["id"] in merged_ids else " "
+        title = task["title"].replace("\r", " ").replace("\n", " ")
+        lines.append(
+            f"- [{state}] {TASK_MARKER_PREFIX}{task['id']} --> "
+            f"#{task['brief']['issue']['number']} — {title}"
+        )
+    lines.append("")
+    content = "\n".join(lines)
+    updated = body[:content_start] + content + body[end_index:]
+    if updated != body:
+        run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                issue_number,
+                "--repo",
+                repository,
+                "--body-file",
+                "-",
+            ],
+            input_text=updated,
+        )
+
+
 def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
-    data = object_exact(
-        brief,
-        {
-            "campaign",
-            "repository",
-            "repositoryConfig",
-            "issue",
-            "worklist",
-            "maxTasks",
-            "maxParallel",
-        },
-        "reconcile brief",
-    )
-    campaign = required_string(data.get("campaign"), "campaign")
-    if not COMPONENT.fullmatch(campaign):
-        fail("campaign is not a safe component")
-    issue = campaign_issue(data.get("issue"))
-    worklist = action_worklist(
-        {
-            "repository": data.get("repository"),
-            "repositoryConfig": data.get("repositoryConfig"),
-            "worklist": data.get("worklist"),
-            "maxTasks": data.get("maxTasks"),
-            "maxParallel": data.get("maxParallel"),
-        }
-    )
-    repository = worklist["repository"]
-    config = repo_config(data.get("repositoryConfig"))
+    forge_native = isinstance(brief.get("worklist"), dict)
+    if forge_native:
+        data = object_exact(brief, {"repository", "issue", "worklist"}, "reconcile brief")
+        worklist = issue_graph_worklist(data)
+        campaign = worklist["config"]["campaign"]
+        issue = campaign_issue(data.get("issue"))
+        repository = worklist["repository"]
+        config = repo_config(worklist["config"]["repositoryConfig"])
+        max_parallel = worklist["config"]["maxParallel"]
+    else:
+        data = object_exact(
+            brief,
+            {
+                "campaign",
+                "repository",
+                "repositoryConfig",
+                "issue",
+                "worklist",
+                "maxTasks",
+                "maxParallel",
+            },
+            "reconcile brief",
+        )
+        campaign = required_string(data.get("campaign"), "campaign")
+        if not COMPONENT.fullmatch(campaign):
+            fail("campaign is not a safe component")
+        issue = campaign_issue(data.get("issue"))
+        worklist = action_worklist(
+            {
+                "repository": data.get("repository"),
+                "repositoryConfig": data.get("repositoryConfig"),
+                "worklist": data.get("worklist"),
+                "maxTasks": data.get("maxTasks"),
+                "maxParallel": data.get("maxParallel"),
+            }
+        )
+        repository = worklist["repository"]
+        config = repo_config(data.get("repositoryConfig"))
+        max_parallel = data["maxParallel"]
     if config["forge"] == "github":
         merged, warnings = merged_github_tasks(
             repository,
@@ -703,6 +1107,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         worklist["source"],
         {fact["taskId"] for fact in merged},
     )
+    merged_ids = {fact["taskId"] for fact in merged}
     completed_ids = {fact["taskId"] for fact in merged + checkpoints}
     remaining = [task for task in worklist["tasks"] if task["id"] not in completed_ids]
     ready = [
@@ -710,14 +1115,21 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         for task in remaining
         if all(dependency in completed_ids for dependency in task["dependencies"])
     ]
-    max_parallel = data["maxParallel"]
     frontier: list[dict[str, Any]] = []
     for task in ready:
         if len(frontier) == max_parallel:
             break
         if not task_conflicts(task, frontier):
             frontier.append(task)
-    return {
+    if forge_native:
+        sync_issue_checkboxes(
+            repository,
+            issue["number"],
+            worklist["masterBody"],
+            worklist["tasks"],
+            merged_ids,
+        )
+    result = {
         "schemaVersion": 1,
         "repository": repository,
         "source": worklist["source"],
@@ -729,6 +1141,9 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         "complete": not remaining,
         "warnings": warnings,
     }
+    if forge_native:
+        result["config"] = worklist["config"]
+    return result
 
 
 def safe_slug(value: str, maximum: int) -> str:
@@ -1557,6 +1972,10 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
         return url
     campaign = required_string(data.get("campaign"), "campaign")
     task_ref = f"{campaign}/{task['id']}"
+    closes = ""
+    if isinstance(task.get("brief"), dict):
+        task_issue = campaign_issue(task["brief"].get("issue"))
+        closes = f"\n\nCloses #{task_issue['number']}"
     body = (
         f"{marker}\n"
         f"Spec-build campaign progress for {repository}#{issue['number']}.\n\n"
@@ -1564,6 +1983,7 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
         f"Task ref: `{task_ref}`\n\n"
         f"Witnessed gates are the merge criterion. Campaign issue: {issue['url']}\n"
         f"Head: `{head}`"
+        f"{closes}"
     )
     created = run(
         [
@@ -2139,6 +2559,41 @@ def github_progress_comment(
         fail("task must be an object")
     task_id = required_string(task.get("id"), "task.id")
     task_title = required_string(task.get("title"), "task.title")
+    if isinstance(task.get("brief"), dict):
+        issue_view = github_json(
+            ["api", f"repos/{repository}/issues/{issue_number}"],
+            "campaign issue",
+        )
+        issue_body = issue_view.get("body") if isinstance(issue_view, dict) else None
+        if not isinstance(issue_body, str):
+            fail("campaign issue has no body while recording merge progress")
+        task_marker = f"{TASK_MARKER_PREFIX}{task_id} -->"
+        updated_lines: list[str] = []
+        found_line = False
+        for line in issue_body.splitlines(keepends=True):
+            if task_marker in line:
+                if found_line:
+                    fail(f"campaign worklist repeats task marker {task_id!r}")
+                found_line = True
+                line = re.sub(r"^- \[[ xX]\]", "- [x]", line)
+            updated_lines.append(line)
+        if not found_line:
+            fail(f"campaign worklist lacks task marker {task_id!r}")
+        updated_body = "".join(updated_lines)
+        if updated_body != issue_body:
+            run(
+                [
+                    "gh",
+                    "issue",
+                    "edit",
+                    issue_number,
+                    "--repo",
+                    repository,
+                    "--body-file",
+                    "-",
+                ],
+                input_text=updated_body,
+            )
     marker = (
         "<!-- tally:spec-build:v1 "
         f"campaign={campaign} issue={issue_number} task={task_id} merged -->"
@@ -2173,8 +2628,6 @@ def github_progress_comment(
                 body,
             ]
         )
-
-
 def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
         brief,

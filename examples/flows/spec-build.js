@@ -12,20 +12,13 @@ export const meta = {
   argsSchema: {
     type: "object",
     required: [
-      "campaign",
       "repository",
       "issue",
       "runId",
-      "repositories",
       "worklist",
-      "maxTasks",
-      "maxParallel",
-      "reconcileCommand",
       "workspaceRoot",
       "driver",
-      "driverRuntimeMaxSec",
-      "agent",
-      "gates"
+      "driverRuntimeMaxSec"
     ],
     properties: {
       campaign: {
@@ -59,7 +52,17 @@ export const meta = {
           additionalProperties: false
         }
       },
-      worklist: { type: "string", minLength: 1 },
+      worklist: {
+        oneOf: [
+          { type: "string", minLength: 1 },
+          {
+            type: "object",
+            required: ["kind"],
+            properties: { kind: { const: "github-issue" } },
+            additionalProperties: false
+          }
+        ]
+      },
       maxTasks: { type: "integer", minimum: 1, maximum: 128 },
       maxParallel: { type: "integer", minimum: 1, maximum: 128 },
       reconcileCommand: { type: "string", pattern: "^/[^\\r\\n]+$", maxLength: 300 },
@@ -138,6 +141,29 @@ export const meta = {
         }
       }
     },
+    oneOf: [
+      {
+        required: [
+          "campaign",
+          "repositories",
+          "maxTasks",
+          "maxParallel",
+          "reconcileCommand",
+          "agent",
+          "gates"
+        ]
+      },
+      {
+        properties: {
+          worklist: {
+            type: "object",
+            required: ["kind"],
+            properties: { kind: { const: "github-issue" } },
+            additionalProperties: false
+          }
+        }
+      }
+    ],
     additionalProperties: false
   },
   // One pass is bounded by maxParallel <= 128 and gates <= 16. Before the
@@ -242,18 +268,62 @@ const checkpointTaskSchema = {
   additionalProperties: false
 };
 
+const issueTaskSchema = {
+  type: "object",
+  required: ["id", "kind", "title", "brief", "dependencies", "conflictDomains"],
+  properties: {
+    id: taskIdSchema,
+    kind: { const: "implementation" },
+    title: { type: "string", minLength: 1, maxLength: 300 },
+    brief: {
+      type: "object",
+      required: ["issue", "body"],
+      properties: {
+        issue: {
+          type: "object",
+          required: ["number", "url"],
+          properties: {
+            number: { type: "string", pattern: "^[1-9][0-9]*$" },
+            url: { type: "string", minLength: 1 }
+          },
+          additionalProperties: false
+        },
+        body: { type: "string", minLength: 1, maxLength: 64000 }
+      },
+      additionalProperties: false
+    },
+    dependencies: { type: "array", items: taskIdSchema },
+    conflictDomains: stringList
+  },
+  additionalProperties: false
+};
+
 const taskSchema = {
-  oneOf: [implementationTaskSchema, checkpointTaskSchema]
+  oneOf: [implementationTaskSchema, checkpointTaskSchema, issueTaskSchema]
 };
 
 const sourceSchema = {
-  type: "object",
-  required: ["path", "sha256"],
-  properties: {
-    path: { type: "string", minLength: 1 },
-    sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
-  },
-  additionalProperties: false
+  oneOf: [
+    {
+      type: "object",
+      required: ["path", "sha256"],
+      properties: {
+        path: { type: "string", minLength: 1 },
+        sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
+      },
+      additionalProperties: false
+    },
+    {
+      type: "object",
+      required: ["kind", "url", "sha256"],
+      properties: {
+        kind: { const: "github-issue" },
+        url: { type: "string", minLength: 1 },
+        sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
+      },
+      additionalProperties: false
+    }
+  ]
 };
 
 const mergedFactSchema = {
@@ -274,6 +344,41 @@ const checkpointFactSchema = {
     taskId: taskIdSchema,
     ref: { type: "string", pattern: "^refs/tags/tally/spec-build/v1/" },
     revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
+  },
+  additionalProperties: false
+};
+
+const effectiveConfigSchema = {
+  type: "object",
+  required: [
+    "campaign",
+    "repositoryConfig",
+    "maxParallel",
+    "agent",
+    "gates",
+    "reconcileCommand"
+  ],
+  properties: {
+    campaign: {
+      type: "string",
+      maxLength: 80,
+      pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+    },
+    repositoryConfig: {
+      type: "object",
+      required: ["checkout", "baseBranch", "remote", "forge"],
+      properties: {
+        checkout: { type: "string", pattern: "^/" },
+        baseBranch: { type: "string", minLength: 1 },
+        remote: { type: "string", minLength: 1 },
+        forge: { enum: ["github", "local"] }
+      },
+      additionalProperties: false
+    },
+    maxParallel: { type: "integer", minimum: 1, maximum: 128 },
+    agent: { type: "object" },
+    gates: { type: "array", minItems: 1, maxItems: 16 },
+    reconcileCommand: { type: ["string", "null"] }
   },
   additionalProperties: false
 };
@@ -307,7 +412,8 @@ const reconcileSchema = {
     remaining: { type: "array", items: taskIdSchema },
     frontier: { type: "array", maxItems: 128, items: taskSchema },
     complete: { type: "boolean" },
-    warnings: stringList
+    warnings: stringList,
+    config: effectiveConfigSchema
   },
   additionalProperties: false
 };
@@ -460,6 +566,8 @@ function driverNode(
   return job(spec, { settle });
 }
 
+let effective = null;
+
 function workspaceFor(prepared, baseRev) {
   return {
     repo: args.repository,
@@ -492,7 +600,7 @@ function nodeFailure(task, stage, node) {
 
 function cleanupBrief(repositoryConfig, taskId, workspace) {
   const brief = {
-    campaign: args.campaign,
+    campaign: effective.campaign,
     repository: args.repository,
     repositoryConfig,
     runId: args.runId,
@@ -507,7 +615,7 @@ function cleanupBrief(repositoryConfig, taskId, workspace) {
 
 async function runGate(task, gate, workspace, prefix) {
   const key = `${prefix}-${task.id}-${gate.id}`;
-  const taskRef = `${args.campaign}/${task.id}`;
+  const taskRef = `${effective.campaign}/${task.id}`;
   if (gate.kind === "command") {
     return sh(gate.argv, {
       pools: ["campaign-control"],
@@ -554,30 +662,11 @@ async function runPreflightGate(task, gate, workspace) {
     key: `preflight-gate-${gate.id}`,
     label: `preflight-gate-${gate.id}`,
     settle: true,
-    taskRef: `${args.campaign}/${task.id}`
+    taskRef: `${effective.campaign}/${task.id}`
   });
 }
 
-(async () => {
-  const gateIds = [];
-  for (const gate of args.gates) {
-    if (gateIds.indexOf(gate.id) !== -1) {
-      const error = new Error(`campaign gate id ${gate.id} is duplicated`);
-      error.name = "SpecBuildConfigurationError";
-      error.code = "duplicate-gate-id";
-      throw error;
-    }
-    gateIds.push(gate.id);
-  }
-
-  const repositoryConfig = args.repositories[args.repository];
-  if (!repositoryConfig) {
-    const error = new Error(`campaign repository ${args.repository} is not configured`);
-    error.name = "SpecBuildConfigurationError";
-    error.code = "repository-not-configured";
-    throw error;
-  }
-
+async function sweepCampaign(repositoryConfig) {
   // Producer admission holds the campaign's capacity-1 mutex. Once the prior
   // pass and its admitted children have settled (the documented recovery
   // rule), every other run namespace is stale and can be reclaimed before this
@@ -585,7 +674,7 @@ async function runPreflightGate(task, gate, workspace) {
   const sweepNode = await driverNode(
     "sweep",
     {
-      campaign: args.campaign,
+      campaign: effective.campaign,
       repository: args.repository,
       repositoryConfig,
       runId: args.runId,
@@ -600,30 +689,74 @@ async function runPreflightGate(task, gate, workspace) {
   );
   if (sweepNode.disposition !== "created") {
     const error = new Error(
-      `spec-build campaign ${args.campaign} requires a fresh flow-run identity; ` +
+      `spec-build campaign ${effective.campaign} requires a fresh flow-run identity; ` +
         `the sweep node was ${sweepNode.disposition}`
     );
     error.name = "SpecBuildReplayError";
     error.code = "campaign-replay-refused";
     error.details = {
-      campaign: args.campaign,
+      campaign: effective.campaign,
       disposition: sweepNode.disposition,
       recovery: "post a fresh campaign mention"
     };
     throw error;
   }
+  return sweepNode;
+}
+
+(async () => {
+  const forgeNative = typeof args.worklist === "object";
+  if (!forgeNative) {
+    const configuredGateIds = [];
+    for (const gate of args.gates) {
+      if (configuredGateIds.indexOf(gate.id) !== -1) {
+        const error = new Error(`campaign gate id ${gate.id} is duplicated`);
+        error.name = "SpecBuildConfigurationError";
+        error.code = "duplicate-gate-id";
+        throw error;
+      }
+      configuredGateIds.push(gate.id);
+    }
+  }
+  effective = forgeNative
+    ? null
+    : {
+        campaign: args.campaign,
+        repositoryConfig: args.repositories[args.repository],
+        maxParallel: args.maxParallel,
+        agent: args.agent,
+        gates: args.gates,
+        reconcileCommand: args.reconcileCommand
+      };
+  let sweepNode = null;
+  if (!forgeNative) {
+    if (!effective.repositoryConfig) {
+      const error = new Error(`campaign repository ${args.repository} is not configured`);
+      error.name = "SpecBuildConfigurationError";
+      error.code = "repository-not-configured";
+      throw error;
+    }
+    sweepNode = await sweepCampaign(effective.repositoryConfig);
+  }
+  const reconcileBrief = forgeNative
+    ? {
+        repository: args.repository,
+        issue: args.issue,
+        worklist: args.worklist
+      }
+    : {
+        campaign: args.campaign,
+        repository: args.repository,
+        repositoryConfig: args.repositories[args.repository],
+        issue: args.issue,
+        worklist: args.worklist,
+        maxTasks: args.maxTasks,
+        maxParallel: args.maxParallel
+      };
 
   const reconciliationNode = await driverNode(
     "reconcile",
-    {
-      campaign: args.campaign,
-      repository: args.repository,
-      repositoryConfig,
-      issue: args.issue,
-      worklist: args.worklist,
-      maxTasks: args.maxTasks,
-      maxParallel: args.maxParallel
-    },
+    reconcileBrief,
     "reconcile",
     "spec-build-reconcile",
     reconcileSchema,
@@ -632,11 +765,33 @@ async function runPreflightGate(task, gate, workspace) {
     null
   );
   const reconciliation = reconciliationNode.result;
-
+  if (forgeNative) {
+    effective = reconciliation.config;
+  }
+  if (!effective || !effective.repositoryConfig) {
+    const error = new Error(`campaign repository ${args.repository} is not configured`);
+    error.name = "SpecBuildConfigurationError";
+    error.code = "repository-not-configured";
+    throw error;
+  }
+  const repositoryConfig = effective.repositoryConfig;
+  const gateIds = [];
+  for (const gate of effective.gates) {
+    if (gateIds.indexOf(gate.id) !== -1) {
+      const error = new Error(`campaign gate id ${gate.id} is duplicated`);
+      error.name = "SpecBuildConfigurationError";
+      error.code = "duplicate-gate-id";
+      throw error;
+    }
+    gateIds.push(gate.id);
+  }
+  if (forgeNative) {
+    sweepNode = await sweepCampaign(repositoryConfig);
+  }
   // A merged campaign PR is the durable proof that an earlier pass cleared
   // admission. Until that first merge exists, every fresh pass gates a
   // separate pristine-base lane and cleans it before any agent can start.
-  const commandGates = args.gates.filter(gate => gate.kind === "command");
+  const commandGates = effective.gates.filter(gate => gate.kind === "command");
   if (
     !reconciliation.complete &&
     reconciliation.merged.length === 0 &&
@@ -644,11 +799,11 @@ async function runPreflightGate(task, gate, workspace) {
   ) {
     const preflightTask = reconciliation.frontier.find(task => task.kind === "implementation");
     if (preflightTask !== undefined) {
-      const preflightTaskRef = `${args.campaign}/${preflightTask.id}`;
+      const preflightTaskRef = `${effective.campaign}/${preflightTask.id}`;
       const preflight = await driverNode(
         "preflight",
         {
-          campaign: args.campaign,
+          campaign: effective.campaign,
           repository: args.repository,
           repositoryConfig,
           issue: args.issue,
@@ -698,11 +853,11 @@ async function runPreflightGate(task, gate, workspace) {
 
   const laneOutcomes = await parallel(
     reconciliation.frontier.map(task => () => (async () => {
-      const taskRef = `${args.campaign}/${task.id}`;
+      const taskRef = `${effective.campaign}/${task.id}`;
       const prepared = await driverNode(
         "prep",
         {
-          campaign: args.campaign,
+          campaign: effective.campaign,
           repository: args.repository,
           repositoryConfig,
           issue: args.issue,
@@ -740,11 +895,11 @@ async function runPreflightGate(task, gate, workspace) {
           recorded = await driverNode(
             "checkpoint",
             {
-              campaign: args.campaign,
+              campaign: effective.campaign,
               repository: args.repository,
               repositoryConfig,
               issue: args.issue,
-              reconcileCommand: args.reconcileCommand,
+              reconcileCommand: effective.reconcileCommand,
               task,
               source: reconciliation.source,
               workspace: prepared.result
@@ -775,17 +930,19 @@ async function runPreflightGate(task, gate, workspace) {
       }
 
       const agentSpec = {
-        argv: args.agent.argv,
-        adapter: args.agent.adapter,
+        argv: effective.agent.argv,
+        adapter: effective.agent.adapter,
         pools: ["campaign-agent"],
-        priority: args.agent.priority,
+        priority: effective.agent.priority,
         workspace,
         evidence: ["exit:0"],
         brief: {
           schemaVersion: 1,
-          mission: `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task from the worklist; deterministic campaign nodes own those operations. Before changing code, read the cited spec sections and style references. Read the campaign issue comments for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
+          mission: task.brief
+            ? `Implement only forge task ${task.id}: ${task.title}. The exact operator-authored task brief is task.brief.body below. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task issue; deterministic campaign nodes own those operations. Read the master campaign issue comments for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`
+            : `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task from the worklist; deterministic campaign nodes own those operations. Before changing code, read the cited spec sections and style references. Read the campaign issue comments for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
           campaign: {
-            name: args.campaign,
+            name: effective.campaign,
             repository: args.repository,
             issue: args.issue,
             runId: args.runId
@@ -803,14 +960,14 @@ async function runPreflightGate(task, gate, workspace) {
         label: `agent-${task.id}`,
         taskRef
       };
-      if (args.agent.runtimeMaxSec !== null) {
-        agentSpec.runtimeMaxSec = args.agent.runtimeMaxSec;
+      if (effective.agent.runtimeMaxSec !== null) {
+        agentSpec.runtimeMaxSec = effective.agent.runtimeMaxSec;
       }
-      if (args.agent.approvalPolicy !== null) {
-        agentSpec.approvalPolicy = args.agent.approvalPolicy;
+      if (effective.agent.approvalPolicy !== null) {
+        agentSpec.approvalPolicy = effective.agent.approvalPolicy;
       }
-      if (args.agent.sandboxPolicy !== null) {
-        agentSpec.sandboxPolicy = args.agent.sandboxPolicy;
+      if (effective.agent.sandboxPolicy !== null) {
+        agentSpec.sandboxPolicy = effective.agent.sandboxPolicy;
       }
       const agent = await job(agentSpec, { settle: true });
       if (agent.verdict !== "pass") {
@@ -818,7 +975,7 @@ async function runPreflightGate(task, gate, workspace) {
       }
 
       const constraintResults = [];
-      for (const gate of args.gates) {
+      for (const gate of effective.gates) {
         const gated = await runGate(task, gate, workspace, "gate");
         if (gated.verdict !== "pass") {
           return {
@@ -835,7 +992,7 @@ async function runPreflightGate(task, gate, workspace) {
       const publication = await driverNode(
         "publish",
         {
-          campaign: args.campaign,
+          campaign: effective.campaign,
           repository: args.repository,
           repositoryConfig,
           issue: args.issue,
@@ -886,12 +1043,12 @@ async function runPreflightGate(task, gate, workspace) {
   // moved base causes a rebase and a second witnessed gate pass.
   for (const lane of publications) {
     const task = lane.task;
-    const taskRef = `${args.campaign}/${task.id}`;
+    const taskRef = `${effective.campaign}/${task.id}`;
     const workspace = workspaceFor(lane.prepared);
     const integration = await driverNode(
       "rebase",
       {
-        campaign: args.campaign,
+        campaign: effective.campaign,
         repository: args.repository,
         repositoryConfig,
         issue: args.issue,
@@ -917,7 +1074,7 @@ async function runPreflightGate(task, gate, workspace) {
     let regateFailed = false;
     if (integration.result.regate) {
       const integratedWorkspace = workspaceFor(lane.prepared, integration.result.baseRev);
-      for (const gate of args.gates) {
+      for (const gate of effective.gates) {
         const gated = await runGate(task, gate, integratedWorkspace, "regate");
         if (gated.verdict !== "pass") {
           failures.push(nodeFailure(task, `regate:${gate.id}`, gated));
@@ -933,7 +1090,7 @@ async function runPreflightGate(task, gate, workspace) {
     const merge = await driverNode(
       "merge",
       {
-        campaign: args.campaign,
+        campaign: effective.campaign,
         repository: args.repository,
         repositoryConfig,
         issue: args.issue,
@@ -959,16 +1116,20 @@ async function runPreflightGate(task, gate, workspace) {
 
   // Progress remains one comment per merged task, but only one exact command
   // is posted for the pass. Its producer queues behind this pass's mutex.
-  if (merged.length > 0 && repositoryConfig.forge === "github") {
+  if (
+    merged.length > 0 &&
+    repositoryConfig.forge === "github" &&
+    effective.reconcileCommand !== null
+  ) {
     const continued = await driverNode(
       "continue",
       {
-        campaign: args.campaign,
+        campaign: effective.campaign,
         repository: args.repository,
         repositoryConfig,
         issue: args.issue,
         runId: args.runId,
-        reconcileCommand: args.reconcileCommand
+        reconcileCommand: effective.reconcileCommand
       },
       "continue",
       "spec-build-continue",
@@ -1001,7 +1162,7 @@ async function runPreflightGate(task, gate, workspace) {
       cleanupSchema,
       null,
       true,
-      `${args.campaign}/${lane.task.id}`
+      `${effective.campaign}/${lane.task.id}`
     )),
     { settle: true }
   );
@@ -1016,7 +1177,7 @@ async function runPreflightGate(task, gate, workspace) {
   }
 
   return {
-    campaign: args.campaign,
+    campaign: effective.campaign,
     repository: args.repository,
     issue: args.issue,
     worklist: reconciliation.source,

@@ -231,7 +231,18 @@
             pkgs.python3
             pkgs.taskwarrior3
           ];
+          nativeBuildInputs = [ pkgs.makeWrapper ];
           postInstall = ''
+            mkdir -p "$out/share/tally/flows" "$out/libexec/tally"
+            cp ${./examples/flows/spec-build.js} "$out/share/tally/flows/spec-build.js"
+            ln -s ${specBuildDriver}/bin/spec-build-driver "$out/libexec/tally/spec-build-driver"
+            wrapProgram "$out/bin/tally" \
+              --prefix PATH : ${
+                pkgs.lib.makeBinPath [
+                  pkgs.gh
+                  pkgs.git
+                ]
+              }
             ln -s tally $out/bin/tallyd
           '';
           meta.mainProgram = "tally";
@@ -3419,6 +3430,7 @@
                 ];
               }
               ''
+                trap 'echo "campaign-render: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
                 test -e "$activationPackage"
                 ${tally}/bin/tally --mode check-config --config "$checkedConfig" >/dev/null
                 jq -e '
@@ -3429,9 +3441,9 @@
                   .pools["fixture-campaign"].resource == "mutex" and
                   .pools["fixture-campaign"].capacity == 1 and
                   .pools["campaign-control"].resource == "cpu-slot" and
-                  .pools["campaign-control"].capacity == 3 and
+                  .pools["campaign-control"].capacity == 4 and
                   .pools["campaign-agent"].resource == "slot" and
-                  .pools["campaign-agent"].capacity == 3 and
+                  .pools["campaign-agent"].capacity == 4 and
                   .adapters["spec-build-driver"].scrape.finalMessage.mode == "regex" and
                   .adapters["spec-build-driver"].scrape.finalMessage.pattern == "^TALLY_FINAL_MESSAGE=(.*)$" and
                   .flows.fixture.workloadMutex == "fixture-campaign" and

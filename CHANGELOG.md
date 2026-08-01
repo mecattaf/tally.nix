@@ -15,6 +15,12 @@ authorized.
   checkpoint leaves only its DAG descendants unready while independent
   frontiers continue; it never creates an operator pause. Every worklist node
   now declares an explicit `kind` of `implementation` or `checkpoint`.
+- Added forge-native ad-hoc campaign containers. `tally campaign project`
+  creates or maintains a master GitHub issue, native task sub-issues,
+  dependency links, and merged-PR-derived checkboxes; `tally campaign arm`
+  registers that issue without a Nix edit or deploy. A generic Home Manager
+  poller now re-reads armed issue graphs into the shipped stateless reconciler,
+  while `services.tally.campaigns` remains the recurring-work surface.
 - Added accept-time campaign gate preflights: every command gate declares a
   base-safe `preflightArgv` separately from its post-change `argv`. The exact
   probe executes once on the fetched base, with the same task environment and a
