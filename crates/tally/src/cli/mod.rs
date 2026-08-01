@@ -6,6 +6,7 @@ mod enqueue;
 mod exit;
 mod flow;
 mod queue;
+mod text;
 
 #[cfg(test)]
 mod tests;

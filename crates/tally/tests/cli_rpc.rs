@@ -319,12 +319,26 @@ impl RpcHandler for HumanQueryHandler {
                         "taskRef": "crm/t02", "ordinal": 3, "label": "cleanup-t02", "state": "running",
                         "startedAt": "2026-08-01T10:00:00Z", "elapsedSeconds": 9,
                         "runtimeMaxSec": 60, "budgetRemainingSeconds": 51
+                    }, {
+                        "taskUuid": "00000000-0000-4000-8000-000000000265",
+                        "taskRef": "crm/t03", "ordinal": 4, "label": "gate-t03", "state": "running",
+                        "startedAt": "2026-08-01T09:00:00Z", "elapsedSeconds": 460,
+                        "runtimeMaxSec": 60, "budgetRemainingSeconds": -400
+                    }, {
+                        "taskUuid": "00000000-0000-4000-8000-000000000266",
+                        "taskRef": "crm/t04", "ordinal": 5, "label": "gate-t04", "state": "queued"
                     }],
                     "failures": [{
                         "taskUuid": "00000000-0000-4000-8000-000000000264",
                         "taskRef": "crm/t02", "ordinal": 2, "stage": "agent-t02", "verdict": "failed",
                         "attempt": 1, "leaseEpoch": 4, "timestamp": "2026-08-01T10:00:03Z",
-                        "capturePath": "/tmp/tally/crm.t02.err", "stderrTail": "actionable failure\n", "stderrTruncated": false
+                        "capturePath": "/tmp/tally/crm.t02.err",
+                        "stderrTail": "\u{1b}[2Jactionable failure\n    at gate.rs:1\n",
+                        "stderrTruncated": false
+                    }, {
+                        "taskUuid": "00000000-0000-4000-8000-000000000267",
+                        "taskRef": "crm/t05", "ordinal": 6, "stage": "agent-t05", "verdict": "failed",
+                        "attempt": 1, "leaseEpoch": 2, "timestamp": "2026-08-01T10:00:05Z"
                     }],
                     "snapshot": {}
                 })),
@@ -994,9 +1008,55 @@ async fn query_run_human_view_includes_tasks_budget_and_failure_pointer() {
                 "budget=51s",
                 "/tmp/tally/crm.t02.err",
                 "actionable failure",
+                // A node past its budget is distinguishable from one on it.
+                "budget=-6m40s",
+                // A node that never started says so rather than "unknown".
+                "elapsed=not-started",
+                // An absent capture pointer is stated, not omitted.
+                "capture: <not retained>",
+                // Failure-tail indentation survives; the six-space frame plus
+                // the line's own four spaces.
+                "\n          at gate.rs:1",
             ] {
                 assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
             }
+            assert!(
+                !text.contains('\u{1b}'),
+                "adapter-controlled escape reached the terminal:\n{text:?}"
+            );
+            server.await.unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn query_run_status_filter_narrows_the_board_but_not_the_counts() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_connection(stream, HumanQueryHandler).await.unwrap();
+            });
+            let output = run_tally(
+                &socket,
+                &[
+                    "query",
+                    "run",
+                    "00000000-0000-4000-8000-000000000262",
+                    "--status",
+                    "blocked",
+                ],
+            )
+            .await;
+            assert!(output.status.success(), "{output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(text.contains("1 done, 0 running, 1 blocked, 0 pending"));
+            assert!(text.contains("crm/t02"), "{text}");
+            assert!(!text.contains("crm/t01"), "{text}");
             server.await.unwrap();
         })
         .await;

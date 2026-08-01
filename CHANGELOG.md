@@ -25,7 +25,9 @@ authorized.
   flow pass. Spec-build runs show reconciled campaign tasks as
   done/running/blocked/pending, live node elapsed time and remaining runtime
   budget, and failed stages with their retained `.err` path and bounded stderr
-  tail.
+  tail. `--status <done|running|blocked|pending>` narrows that board to one
+  state while the summary counts stay whole-run, so a 128-task worklist stays
+  readable in a terminal.
 - Added machine-authored spec-build failure steering and forge-derived
   quiescence. Failed task lanes now feed their stderr capture, gate outputs,
   exact brief, and bounded diff to a diagnosis agent, publish one redacted
@@ -144,6 +146,27 @@ authorized.
 
 ### Fixed
 
+- Stopped adapter-controlled terminal control from reaching an operator's TTY.
+  Every human rendering of adapter text — `query run` and `query log` tables,
+  failure stderr tails, and the `adapter smoke` capture excerpt — now passes
+  through one shared filter that removes escape sequences, C0/C1 controls, and
+  bidirectional overrides. Failure tails keep their leading whitespace, so
+  stack traces and diffs stay readable.
+- Removed a per-record scan from `query log`: node labels were resolved for
+  every candidate lifecycle record before filtering, costing
+  O(records x (witnesses + rows)) on the daemon thread even for a single-task
+  query. Labels are now indexed once and applied only to records that survive
+  the filter.
+- Corrected three `query run` readings. A finished flow with no reconciled task
+  table reports `complete` instead of `idle`; exit codes print whenever the
+  lifecycle record carries one, not only after a witness merge; and a node past
+  its runtime budget reports a negative remainder instead of saturating at zero.
+  A queued node now reads `elapsed=not-started`, and an absent failure capture
+  prints `capture: <not retained>` rather than being omitted.
+- Merged a terminal witness into only the newest journal terminal for an
+  execution, so a `preempted` followed by a `failed` no longer reports the same
+  canonical verdict twice, and a second witness sharing one execution identity
+  survives as its own record instead of being dropped by a map overwrite.
 - Bound campaign worklists to the fetched remote-base blob and checkpoint
   receipts to one exact base revision. Immutable create-only receipts now prove
   dependency ancestry, reject forged or annotated targets, and are invalidated

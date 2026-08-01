@@ -1,3 +1,4 @@
+use super::text::{compact_text, sanitize_line};
 use super::*;
 
 pub(super) async fn run_queue(
@@ -236,7 +237,7 @@ pub(super) async fn run_query(
             )
             .await
         }
-        QueryCommand::Run { id, json } => {
+        QueryCommand::Run { id, json, status } => {
             let client = connect_rpc(socket, config_path).await?;
             let result = client
                 .call_with_deadline("query.run", Some(json!({"id": id})), rpc_timeout)
@@ -245,7 +246,7 @@ pub(super) async fn run_query(
                 println!("{}", serde_json::to_string(&result)?);
                 Ok(())
             } else {
-                print_run_human(&result)
+                print_run_human(&result, status.map(RunTaskFilter::as_str))
             }
         }
         QueryCommand::Status { pool } => {
@@ -434,12 +435,7 @@ fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
             detail.push(format!("elapsed={}", human_seconds_f64(seconds)));
         }
         if let Some(exit_code) = item["exitCode"].as_i64() {
-            if item
-                .get("terminalVerdict")
-                .is_some_and(|value| !value.is_null())
-            {
-                detail.push(format!("exit={exit_code}"));
-            }
+            detail.push(format!("exit={exit_code}"));
         }
         if let Some(stderr) = item["stderrTail"].as_str() {
             detail.push(format!(
@@ -475,7 +471,7 @@ fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
     Ok(())
 }
 
-fn print_run_human(run: &Value) -> Result<()> {
+fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
     let flow_run_id = run["flowRunId"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid run response"))?;
@@ -501,15 +497,25 @@ fn print_run_human(run: &Value) -> Result<()> {
     let tasks = run["tasks"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid run task table"))?;
+    // The counts above stay whole-run; the filter narrows the board only.
+    let shown = tasks
+        .iter()
+        .filter(|task| status_filter.is_none_or(|status| task["status"] == status))
+        .collect::<Vec<_>>();
     if tasks.is_empty() {
         println!("No reconciled task table is available for this run.");
+    } else if shown.is_empty() {
+        println!(
+            "No task is {}.",
+            status_filter.unwrap_or("in the requested state")
+        );
     } else {
         println!();
         println!(
             "{:<9}  {:<18}  {:<24}  TITLE",
             "STATUS", "TASK", "CURRENT / BLOCKED BY"
         );
-        for task in tasks {
+        for task in shown {
             let task_ref = task["taskRef"].as_str().unwrap_or("-");
             let context = task["failureStage"]
                 .as_str()
@@ -546,13 +552,15 @@ fn print_run_human(run: &Value) -> Result<()> {
                 .as_str()
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| short_identity(node["taskUuid"].as_str().unwrap_or("unknown")));
+            // A node with no start event has not begun; "unknown" read as a
+            // missing measurement rather than the absence of one.
             let elapsed = node["elapsedSeconds"]
                 .as_u64()
                 .map(human_seconds)
-                .unwrap_or_else(|| "unknown".to_owned());
+                .unwrap_or_else(|| "not-started".to_owned());
             let budget = node["budgetRemainingSeconds"]
-                .as_u64()
-                .map(human_seconds)
+                .as_i64()
+                .map(human_seconds_signed)
                 .unwrap_or_else(|| "unbounded".to_owned());
             println!(
                 "  {:<18}  {:<24}  {:<10}  elapsed={} budget={}",
@@ -584,8 +592,12 @@ fn print_run_human(run: &Value) -> Result<()> {
                 compact_text(failure["stage"].as_str().unwrap_or("unknown-stage")),
                 compact_text(failure["verdict"].as_str().unwrap_or("failed"))
             );
-            if let Some(path) = failure["capturePath"].as_str() {
-                println!("    capture: {}", compact_text(path));
+            // Always emit the line. Doctrine sends operators and agents to the
+            // capture first, and a silently omitted pointer cannot be told
+            // apart from a capture that exists but failed to resolve.
+            match failure["capturePath"].as_str() {
+                Some(path) => println!("    capture: {}", compact_text(path)),
+                None => println!("    capture: <not retained>"),
             }
             if let Some(stderr) = failure["stderrTail"].as_str() {
                 let truncated = failure["stderrTruncated"].as_bool().unwrap_or(false);
@@ -593,8 +605,10 @@ fn print_run_human(run: &Value) -> Result<()> {
                     "    stderr tail{}:",
                     if truncated { " (truncated)" } else { "" }
                 );
+                // Indentation is the structure of a stack trace or a diff, so
+                // the tail keeps it; only terminal control is stripped.
                 for line in stderr.lines() {
-                    println!("      {}", compact_text(line));
+                    println!("      {}", sanitize_line(line));
                 }
             }
         }
@@ -619,10 +633,6 @@ fn short_identity(value: &str) -> String {
     value.chars().take(8).collect()
 }
 
-fn compact_text(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
 fn human_seconds(seconds: u64) -> String {
     if seconds >= 3_600 {
         format!("{}h{:02}m", seconds / 3_600, seconds % 3_600 / 60)
@@ -630,6 +640,14 @@ fn human_seconds(seconds: u64) -> String {
         format!("{}m{:02}s", seconds / 60, seconds % 60)
     } else {
         format!("{seconds}s")
+    }
+}
+
+fn human_seconds_signed(seconds: i64) -> String {
+    if seconds < 0 {
+        format!("-{}", human_seconds(seconds.unsigned_abs()))
+    } else {
+        human_seconds(seconds.unsigned_abs())
     }
 }
 

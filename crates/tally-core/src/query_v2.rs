@@ -635,8 +635,7 @@ pub fn query_lifecycle_log(
         .map(|flow_run| flow_run_tasks(flow_run, details, witness));
     let mut ordered = Vec::<(DateTime<Utc>, u8, u64, LifecycleEventProjection)>::new();
     for record in &history.records {
-        let mut projection = lifecycle_projection(record);
-        projection.node_label = node_label_for_task(&projection.task_uuid, details, witness);
+        let projection = lifecycle_projection(record);
         if lifecycle_matches(&projection, filter, flow_tasks.as_ref(), since, until) {
             ordered.push((
                 parse_timestamp(&projection.timestamp)?,
@@ -647,8 +646,7 @@ pub fn query_lifecycle_log(
         }
     }
     for record in witness {
-        let mut projection = witness_lifecycle_projection(record);
-        projection.node_label = node_label_for_task(&projection.task_uuid, details, witness);
+        let projection = witness_lifecycle_projection(record);
         if lifecycle_matches(&projection, filter, flow_tasks.as_ref(), since, until) {
             ordered.push((
                 parse_timestamp(&projection.timestamp)?,
@@ -656,6 +654,16 @@ pub fn query_lifecycle_log(
                 record.seq,
                 projection,
             ));
+        }
+    }
+    // Label resolution is a scan of every witness and detail row, so it runs
+    // once over the whole corpus and only for records that survived the
+    // filter -- never once per candidate record, which made a `--task <uuid>`
+    // query cost O(records x (witnesses + details)) on the daemon thread.
+    if !ordered.is_empty() {
+        let labels = NodeLabelIndex::build(details, witness);
+        for entry in &mut ordered {
+            entry.3.node_label = labels.lookup(&entry.3.task_uuid);
         }
     }
     ordered.sort_by(|left, right| {
@@ -690,18 +698,26 @@ pub fn collapse_lifecycle_echoes(
     type EchoKey = (String, Option<u32>, Option<u64>);
     let key =
         |item: &LifecycleEventProjection| (item.task_uuid.clone(), item.attempt, item.lease_epoch);
-    let journal_terminals = envelope
-        .items
-        .iter()
-        .filter(|item| item.origin == "journal" && terminal_event(item.event))
-        .map(&key)
-        .collect::<BTreeSet<EchoKey>>();
-    let witnesses = envelope
-        .items
-        .iter()
-        .filter(|item| item.origin == "witness")
-        .map(|item| (key(item), item.clone()))
-        .collect::<BTreeMap<EchoKey, _>>();
+    // Items arrive in transition order, so the last journal terminal for a key
+    // is its newest. A key can carry more than one -- `preempted` followed by
+    // `failed` -- and merging the canonical verdict into every one of them
+    // reports the same outcome twice. Only the newest absorbs the witness;
+    // the earlier transitions stay in the log as themselves.
+    let mut merge_targets = BTreeMap::<EchoKey, String>::new();
+    for item in &envelope.items {
+        if item.origin == "journal" && terminal_event(item.event) {
+            merge_targets.insert(key(item), item.event_id.clone());
+        }
+    }
+    // First witness per key wins the merge. Any further witness sharing the
+    // key is not the one folded in, so it survives as its own row rather than
+    // being dropped by a silent overwrite.
+    let mut witnesses = BTreeMap::<EchoKey, LifecycleEventProjection>::new();
+    for item in &envelope.items {
+        if item.origin == "witness" {
+            witnesses.entry(key(item)).or_insert_with(|| item.clone());
+        }
+    }
 
     envelope.items = envelope
         .items
@@ -711,10 +727,18 @@ pub fn collapse_lifecycle_echoes(
                 return None;
             }
             let item_key = key(&item);
-            if item.origin == "witness" && journal_terminals.contains(&item_key) {
+            if item.origin == "witness"
+                && merge_targets.contains_key(&item_key)
+                && witnesses
+                    .get(&item_key)
+                    .is_some_and(|merged| merged.event_id == item.event_id)
+            {
                 return None;
             }
-            if item.origin == "journal" && terminal_event(item.event) {
+            if item.origin == "journal"
+                && terminal_event(item.event)
+                && merge_targets.get(&item_key) == Some(&item.event_id)
+            {
                 if let Some(witness) = witnesses.get(&item_key) {
                     item.origin = "journal+witness".to_owned();
                     item.task_ref = item.task_ref.or_else(|| witness.task_ref.clone());
@@ -807,8 +831,11 @@ pub struct RunNodeProjection {
     pub elapsed_seconds: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_max_sec: Option<u64>,
+    /// Signed on purpose: a node past its budget reports how far past it is.
+    /// A saturating floor of zero made a 400-second overrun indistinguishable
+    /// from a node landing exactly on budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget_remaining_seconds: Option<u64>,
+    pub budget_remaining_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1038,9 +1065,10 @@ pub fn query_run(
                 started_at,
                 elapsed_seconds,
                 runtime_max_sec: node.runtime_max_sec,
-                budget_remaining_seconds: node
-                    .runtime_max_sec
-                    .map(|budget| budget.saturating_sub(elapsed_seconds.unwrap_or(0))),
+                budget_remaining_seconds: node.runtime_max_sec.map(|budget| {
+                    i64::try_from(budget).unwrap_or(i64::MAX)
+                        - i64::try_from(elapsed_seconds.unwrap_or(0)).unwrap_or(i64::MAX)
+                }),
             }
         })
         .collect::<Vec<_>>();
@@ -1206,7 +1234,19 @@ pub fn query_run(
             }
             counts
         });
-    let all_tasks_done = !tasks.is_empty() && counts.done == tasks.len();
+    // Only spec-build reconciles a task table. Every other flow finishes with
+    // nothing in `tasks`, so completion for those runs is the node verdicts:
+    // each admitted node reached a terminal pass on its current attempt.
+    let all_nodes_terminal = !nodes.is_empty()
+        && nodes.iter().all(|node| {
+            node.terminal_attempt == node.current_attempt
+                && node.terminal_verdict.is_some_and(passing_verdict)
+        });
+    let all_tasks_done = if tasks.is_empty() {
+        all_nodes_terminal
+    } else {
+        counts.done == tasks.len()
+    };
     let parent_failed = parent
         .as_ref()
         .and_then(|parent| parent.terminal_verdict)
@@ -2049,22 +2089,49 @@ fn node_label(node: &JobSummary) -> String {
         .unwrap_or_else(|| node.anchor.clone())
 }
 
-fn node_label_for_task(
-    task_uuid: &str,
-    details: &[RowDetailFact],
-    witness: &[WitnessRecord],
-) -> Option<String> {
-    witness
-        .iter()
-        .rev()
-        .find(|record| record.task_uuid.as_deref() == Some(task_uuid))
-        .and_then(|record| orchestration_string(record.orchestration.as_ref(), "nodeLabel"))
-        .or_else(|| {
-            details
-                .iter()
-                .find(|detail| detail.task_uuid == task_uuid)
-                .and_then(|detail| orchestration_string(detail.orchestration.as_ref(), "nodeLabel"))
-        })
+/// One pass over the witness ledger and durable rows, answering the same
+/// question `node_label_for_task` answered per call: the label carried by a
+/// task's newest witness, falling back to its oldest durable row.
+struct NodeLabelIndex {
+    witness: BTreeMap<String, Option<String>>,
+    detail: BTreeMap<String, Option<String>>,
+}
+
+impl NodeLabelIndex {
+    fn build(details: &[RowDetailFact], witness: &[WitnessRecord]) -> Self {
+        let mut witness_labels = BTreeMap::new();
+        for record in witness {
+            let Some(task_uuid) = record.task_uuid.as_deref() else {
+                continue;
+            };
+            // Later records overwrite earlier ones, so the newest witness for
+            // a task wins even when it carries no label of its own.
+            witness_labels.insert(
+                task_uuid.to_owned(),
+                orchestration_string(record.orchestration.as_ref(), "nodeLabel"),
+            );
+        }
+        let mut detail_labels = BTreeMap::<String, Option<String>>::new();
+        for detail in details {
+            detail_labels
+                .entry(detail.task_uuid.clone())
+                .or_insert_with(|| {
+                    orchestration_string(detail.orchestration.as_ref(), "nodeLabel")
+                });
+        }
+        Self {
+            witness: witness_labels,
+            detail: detail_labels,
+        }
+    }
+
+    fn lookup(&self, task_uuid: &str) -> Option<String> {
+        self.witness
+            .get(task_uuid)
+            .cloned()
+            .flatten()
+            .or_else(|| self.detail.get(task_uuid).cloned().flatten())
+    }
 }
 
 const fn passing_verdict(verdict: Verdict) -> bool {
@@ -2779,6 +2846,133 @@ mod tests {
         assert_eq!(view.current_nodes[0].label, "agent-t02");
         assert_eq!(view.current_nodes[0].elapsed_seconds, Some(12));
         assert_eq!(view.current_nodes[0].budget_remaining_seconds, Some(48));
+    }
+
+    #[test]
+    fn run_view_reports_a_budget_overrun_as_a_negative_remainder() {
+        let flow_run = "00000000-0000-4000-8000-000000000249";
+        let reconciliation = reconciliation_detail(flow_run);
+        let node = flow_node_detail(flow_run, RowStatus::Pending);
+        let mut history = history();
+        let mut started = lifecycle_record(1, TallyEvent::Started, 1, 7, &node.task_uuid);
+        started.fields.task_uuid.clone_from(&node.task_uuid);
+        started.fields.task_ref = Some(TaskRef::new("crm/t02").unwrap());
+        started.observed_at = "2026-08-01T10:00:00.000Z".to_owned();
+        history.records = vec![started];
+        let live = LiveJobFact {
+            anchor: node.task_uuid.clone(),
+            job_id: node.task_uuid.clone(),
+            live_state: "running".to_owned(),
+            attempt: 1,
+            lease_epoch: 7,
+            unit: "tally-job-crm-t02.service".to_owned(),
+            labor_class: LaborClass::Fresh,
+        };
+        let view = query_run(
+            flow_run,
+            &[reconciliation, node],
+            &[live],
+            &history,
+            &[],
+            // 460 s elapsed against a 60 s budget.
+            parse_timestamp("2026-08-01T10:07:40.000Z").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(view.current_nodes[0].elapsed_seconds, Some(460));
+        assert_eq!(view.current_nodes[0].budget_remaining_seconds, Some(-400));
+    }
+
+    #[test]
+    fn run_view_completes_a_flow_that_has_no_reconciled_task_table() {
+        let flow_run = "00000000-0000-4000-8000-000000000249";
+        let node = flow_node_detail(flow_run, RowStatus::Completed);
+        let witness = terminal_witness(
+            &node.task_uuid,
+            Verdict::Pass,
+            node.orchestration.clone().unwrap(),
+        );
+
+        let pending = query_run(
+            flow_run,
+            std::slice::from_ref(&node),
+            &[],
+            &history(),
+            &[],
+            parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+        )
+        .unwrap();
+        assert!(pending.tasks.is_empty());
+        assert_eq!(pending.state, RunState::Idle);
+
+        let finished = query_run(
+            flow_run,
+            &[node],
+            &[],
+            &history(),
+            &[witness],
+            parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+        )
+        .unwrap();
+        assert!(finished.tasks.is_empty());
+        assert_eq!(finished.state, RunState::Complete);
+    }
+
+    #[test]
+    fn lifecycle_labels_resolve_from_the_witness_then_the_durable_row() {
+        let flow_run = "00000000-0000-4000-8000-000000000249";
+        let mut labelled = detail(RowStatus::Completed);
+        labelled.orchestration = Some(flow_orchestration(
+            flow_run,
+            1,
+            "agent-t02",
+            Some("crm/t02"),
+        ));
+        let mut other = detail(RowStatus::Completed);
+        other.task_uuid = "00000000-0000-4000-8000-000000000252".to_owned();
+        other.orchestration = Some(flow_orchestration(flow_run, 2, "gate-t02", Some("crm/t02")));
+        let mut history = history();
+        let mut unrelated = lifecycle_record(2, TallyEvent::Completed, 1, 7, &other.task_uuid);
+        unrelated.fields.task_uuid.clone_from(&other.task_uuid);
+        history.records = vec![
+            lifecycle_record(1, TallyEvent::Completed, 1, 7, &labelled.task_uuid),
+            unrelated,
+        ];
+
+        // The durable row answers when no witness carries the task.
+        let filtered = query_lifecycle_log(
+            &[labelled.clone(), other.clone()],
+            &history,
+            &[],
+            &LifecycleLogFilter {
+                task: Some(labelled.task_uuid.clone()),
+                ..LifecycleLogFilter::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].node_label.as_deref(), Some("agent-t02"));
+
+        // A witness for the same task outranks the row.
+        let witness = terminal_witness(
+            &labelled.task_uuid,
+            Verdict::Pass,
+            flow_orchestration(flow_run, 1, "retry-t02", None),
+        );
+        let promoted = query_lifecycle_log(
+            &[labelled.clone(), other],
+            &history,
+            &[witness],
+            &LifecycleLogFilter {
+                task: Some(labelled.task_uuid.clone()),
+                ..LifecycleLogFilter::default()
+            },
+        )
+        .unwrap();
+        assert!(promoted
+            .items
+            .iter()
+            .all(|item| item.node_label.as_deref() == Some("retry-t02")));
     }
 
     #[test]

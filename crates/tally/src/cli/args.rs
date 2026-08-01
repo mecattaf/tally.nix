@@ -387,6 +387,27 @@ impl From<CliPriority> for Priority {
     }
 }
 
+/// Task states a campaign board can be narrowed to. A frozen worklist may hold
+/// 128 tasks, and an operator checking a run usually wants one of these slices.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub(super) enum RunTaskFilter {
+    Done,
+    Running,
+    Blocked,
+    Pending,
+}
+
+impl RunTaskFilter {
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Running => "running",
+            Self::Blocked => "blocked",
+            Self::Pending => "pending",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub(super) enum CliSource {
     Manual,
@@ -839,6 +860,9 @@ pub(super) enum QueryCommand {
         id: String,
         #[arg(long)]
         json: bool,
+        /// Show only task rows in this state. Counts stay whole-run.
+        #[arg(long, value_name = "STATE")]
+        status: Option<RunTaskFilter>,
     },
     Status {
         #[arg(long)]

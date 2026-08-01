@@ -90,7 +90,8 @@ never introduce one.
 
 1. On any failed node, read the bounded stderr tail in `tally query run` first;
    use `tally query log --task <uuid> --json` when the exact `stderrTail` field
-   or transition provenance is needed.
+   or transition provenance is needed. A `capture: <not retained>` line means
+   no capture exists to read — do not go looking for the file.
    A campaign failure receipt contains a conservatively redacted copy only when
    its GitHub producer explicitly enables both failure-publication switches. Read
    `~/.local/state/tally/capture/<task-uuid>.err` only when the tail is

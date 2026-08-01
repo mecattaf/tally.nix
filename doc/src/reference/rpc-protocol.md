@@ -346,13 +346,15 @@ no row — `attached`, and full-mode `reused` and `terminal` — are reported by
 
 `query.run` accepts a flow-run UUID as `id` and returns the compact state needed during an
 operator check. `currentNodes` carries node label, task reference, live state, start time,
-elapsed seconds, configured `runtimeMaxSec`, and saturating `budgetRemainingSeconds`.
-`failures` carries the failed stage, canonical verdict, attempt/epoch, retained failure-capture
-path when present, and the bounded stderr tail. For the built-in `spec-build` flow, the latest
-schema-validated reconciliation result also supplies the full campaign task table. Its tasks are
-classified as `done`, `running`, `blocked`, or `pending`, with unresolved dependencies,
-current/failing node, and merged pull request where available. Other flows still receive current
-nodes and failures but have an empty task table.
+elapsed seconds, configured `runtimeMaxSec`, and `budgetRemainingSeconds`. That remainder is
+signed: a node past its budget reports the overrun as a negative value rather than saturating at
+zero. `failures` carries the failed stage, canonical verdict, attempt/epoch, retained
+failure-capture path when present, and the bounded stderr tail. For the built-in `spec-build`
+flow, the latest schema-validated reconciliation result also supplies the full campaign task
+table. Its tasks are classified as `done`, `running`, `blocked`, or `pending`, with unresolved
+dependencies, current/failing node, and merged pull request where available. Other flows still
+receive current nodes and failures but have an empty task table; for those runs `state` reaches
+`complete` when every admitted node holds a passing terminal verdict on its current attempt.
 
 `query.log` filters by `task`, `flowRun`, `attempt`, `session`, lifecycle `event`, `source`,
 `since`, and `until`, and accepts optional `provenance`. Lifecycle items expose `taskRef` when their durable row/witness did. A lifecycle event carries no orchestration capsule, so `flowRun` is resolved
