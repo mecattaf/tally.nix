@@ -10,8 +10,8 @@ authorization to execute them.
 
 ## Development environment
 
-Use the flake development shell; it provides Rust, Cargo, Clippy, rustfmt, jq, SQLite,
-Taskwarrior, and the other tools used by the checks.
+Use the flake development shell; it provides Rust, Cargo, Clippy, rustfmt, jq, and the other
+tools used by the checks.
 
 ```console
 $ nix develop
@@ -70,7 +70,7 @@ event drain and producer timers fire autonomously from a fresh boot:
 $ nix build -L .#checks.x86_64-linux.stock-host-activation --no-link
 ```
 
-Run all four scenario entry points. The first three are local. The fourth must skip with exit 0
+Run all three scenario entry points. The first two are local. The third must skip with exit 0
 when no host is selected:
 
 ```console
@@ -78,8 +78,6 @@ $ env -u TALLY_TEST_REMOTE_HOST nix develop --command \
     test/scenarios/run fleet-conformance
 $ env -u TALLY_TEST_REMOTE_HOST nix develop --command \
     test/scenarios/run fanout-guardrail
-$ env -u TALLY_TEST_REMOTE_HOST nix develop --command \
-    test/scenarios/run slow-sqlite
 $ env -u TALLY_TEST_REMOTE_HOST nix develop --command \
     test/scenarios/run pool-vanished/return
 ```

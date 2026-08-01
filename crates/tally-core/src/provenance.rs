@@ -1,6 +1,6 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use taskchampion::Uuid;
+use uuid::Uuid;
 
 pub use tally_client::{TaskRef, MAX_TASK_REF_COMPONENT_BYTES};
 

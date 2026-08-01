@@ -54,18 +54,18 @@ artifact hashes, store paths, and payload identity. It can expose agreement,
 missing attestations, or self-consistent divergence. Those chains remain
 explicitly `unauthenticated-by-construction`.
 
-## Views can be rebuilt
+## Views are derived, never canonical
 
-TaskChampion and journal-backed query fields are projections, not the ledger.
-With the daemon stopped, `tally view rebuild --yes` reconstructs TaskChampion
-from acknowledged durable events and the verified current witness chain,
-moving an existing projection aside first. Losing or changing that view does
-not change canonical verdict history.
+Journal-backed query fields are projections, not the ledger. They are rebuilt
+on every daemon start from acknowledged durable events and the verified current
+witness chain; losing or changing them does not change canonical verdict
+history. The TaskChampion replica that used to be one of those projections was
+deleted outright — nothing read it, and its rewrite path was the #252 disk
+pathology.
 
 The record builder, validator, append lock/fsync, clean-cut refusal, and all
 chain verification live in `crates/tally-core/src/witness.rs`. Query authority
-joins live in `crates/tally-core/src/query_v2.rs`, and view reconstruction lives
-in `crates/tally-core/src/view.rs`. Tests
+joins live in `crates/tally-core/src/query_v2.rs`. Tests
 `ledger_fixture_is_green_and_tamper_is_red`,
 `unknown_additive_fields_verify_and_round_trip_in_raw_order`,
 `old_format_is_red_and_open_returns_an_actionable_archive_error`, and

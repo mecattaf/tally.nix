@@ -17,8 +17,8 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use taskchampion::Uuid;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::adapters::AdapterJobOptions;
 use crate::completion::{

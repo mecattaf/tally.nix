@@ -795,7 +795,7 @@ impl GuardrailState {
                 .map_err(|error| WireError::invalid(error.to_string()))?;
         }
         if let Some(resume_from) = &payload.resume_from {
-            taskchampion::Uuid::parse_str(resume_from)
+            uuid::Uuid::parse_str(resume_from)
                 .map_err(|_| WireError::invalid("resumeFrom must be a task UUID"))?;
             if payload.task_uuid.is_some() {
                 return Err(WireError::invalid(
@@ -860,7 +860,7 @@ impl GuardrailState {
             }
         }
         if let Some(task_uuid) = &payload.task_uuid {
-            taskchampion::Uuid::parse_str(task_uuid)
+            uuid::Uuid::parse_str(task_uuid)
                 .map_err(|_| WireError::invalid("taskUuid must be a UUID"))?;
             if let Some(origin) = payload.gh_origin.as_ref() {
                 let expected = gh_trigger_task_uuid(origin)

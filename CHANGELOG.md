@@ -309,6 +309,37 @@ authorized.
   rather than silently running unscaled. The variable is read from the test
   process environment, so it applies to a direct `cargo test` reproduce run and
   not to the sandboxed tests run by `nix flake check`.
+- Removed the TaskChampion live projection in full. Nothing read the replica at
+  query time, its distinctive features (sync, recurrence, reports) were compiled
+  out, and every ordinary terminal completion issued a full O(N) replica rewrite
+  — the pathology that grew one incident host's data store to 270 GiB from 6,981
+  tasks. Deleted with it: the unbounded post-ack commit channel and its worker
+  thread, the offline `tally view rebuild` verb (`tally view` no longer parses),
+  the `taskchampion` and `rusqlite` dependencies together with their bundled
+  SQLite chain, the stock-Taskwarrior compatibility test and the `slow-sqlite`
+  scenario that both existed only to exercise the replica, and `taskwarrior3`
+  from the package check inputs and the development shell. The durable store is
+  untouched: flat JSON enqueue events, the hash-chained witness ledger, and
+  recovery read exactly the same bytes as before, and query v1/v2 semantics are
+  unchanged.
+  **Upgrade note:** an existing `<data_dir>/taskdata/` directory and any
+  `taskdata.pre-rebuild-*` archives become inert. Nothing reads or writes them,
+  no retention lane sweeps them, and they still count against the data-store
+  byte budget — deleting them by hand is what actually returns the space.
+- Bumped `query storage`'s `schemaVersion` from 2 to 3 and removed its
+  `taskchampion` section (`databaseBytes`, `walBytes`, `shmBytes`,
+  `totalBytes`, `taskCount`, `operationHighWater`, `readError`) along with
+  `growthPerCompletion.taskchampionBytes` and
+  `growthPerCompletion.taskchampionOperations`. The fields are gone outright
+  rather than emitted as null placeholders. The rest of the storage monitor —
+  data/state directory budgets, the free-space floor, and hard-pressure intake
+  refusal — is unchanged.
+- Removed the projection-archive retention lane, which had nothing left to
+  sweep: the `retention.projectionArchiveHorizon` NixOS/Home Manager option, the
+  `--projection-archive-horizon` flag on `tally gc`, the corresponding
+  `projectionArchiveHorizon` config key, and the `projectionArchivesExamined` /
+  `projectionArchivesPruned` fields of the GC report. The option is removed
+  outright, so a configuration that still sets it is now rejected.
 - Changed `tally query log` to print one terse human line per lifecycle
   transition by default. `--json` retains structured fields; both human and
   JSON modes collapse journal/evidence/witness echoes, while `--provenance`

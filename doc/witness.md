@@ -53,30 +53,17 @@ Unknown additive witness fields remain hash-covered through raw JSON verificatio
 would alter existing canonical bytes or required-field meaning is not silently normalized into
 old history.
 
-## TaskChampion is a view
+## Derived views are not the ledger
 
-TaskChampion is a local projection for Taskwarrior-compatible access, not a source of truth. Its
-storage format may change without a witness-schema ceremony. The authoritative inputs are the
-acknowledged durable events under tally's state directory and the verified records in
-`witness.jsonl`.
+Query projections are derived state, not a source of truth. They are rebuilt on every daemon
+start from the authoritative inputs: the acknowledged durable events under tally's state
+directory and the verified records in `witness.jsonl`.
 
-Rebuild the projection while the daemon is stopped:
+The TaskChampion replica and its offline `tally view rebuild` verb were deleted outright.
+Nothing read the replica at query time, its interesting features were compiled out, and its
+full-rewrite path was the #252 disk pathology. Any surviving `<data_dir>/taskdata/` directory
+or `taskdata.pre-rebuild-*` archive is inert: nothing reads or writes it, and an operator may
+delete it.
 
-```console
-$ tally view rebuild --yes
-{"rebuilt":true,"rows":42,"witnessRecords":37}
-```
-
-Use `--data-dir DIR` when rebuilding a non-default tally data directory. The durable events still
-come from the normal tally state directory selected by `XDG_STATE_HOME` (or its default). Without
-`--yes`, an existing projection requires interactive confirmation.
-
-The command takes the same `daemon.lock` used by the daemon and refuses with an error naming that
-path when the daemon or its replica writer still owns it. If `taskdata/` exists, the command moves
-it to `taskdata.pre-rebuild-<RFC3339 timestamp>` before constructing a new projection; it never
-deletes the old replica. The rebuild then verifies the complete current witness chain and projects
-all acknowledged rows, terminal statuses, attempts, lease epochs, and labor classes from durable
-facts. Its `witnessRecords` count is a single plain-schema count, not an epoch map.
-
-Store-path lifetime is independent of this disposable projection. See
+Store-path lifetime is independent of every derived view. See
 [Retention and Nix store evidence](retention.md) for the witness-liveness floor and GC-root rules.

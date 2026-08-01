@@ -3,13 +3,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use taskchampion::Status;
 use thiserror::Error;
 
 use crate::completion::{GateSummaryStatus, SemanticCompletion};
 use crate::journal::{JournalEntry, TallyEvent};
 use crate::provenance::{Orchestration, TaskRef};
-use crate::taskdb::{GhOrigin, RelatedTrigger, TaskRow, WorkspaceMetadata};
+use crate::taskdb::{GhOrigin, RelatedTrigger, TaskRow, TaskStatus, WorkspaceMetadata};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
 pub const QUERY_SCHEMA_VERSION: u32 = 1;
@@ -99,11 +98,9 @@ impl From<&TaskRow> for RowFact {
                 .value("orchestration_json")
                 .and_then(|value| serde_json::from_str(value).ok()),
             status: match row.status {
-                Status::Pending => RowStatus::Pending,
-                Status::Completed => RowStatus::Completed,
-                Status::Deleted => RowStatus::Deleted,
-                Status::Recurring => RowStatus::Recurring,
-                Status::Unknown(_) => RowStatus::Unknown,
+                TaskStatus::Pending => RowStatus::Pending,
+                TaskStatus::Completed => RowStatus::Completed,
+                TaskStatus::Deleted => RowStatus::Deleted,
             },
             priority: row.priority.clone(),
             pools: row.value("pool").map(|value| {

@@ -28,7 +28,6 @@ const EVENTS_DIRECTORY: &str = "events";
 /// pinned by the witness ledger: the witness record is the durable evidence and
 /// an archive is only replay material.
 pub const DEFAULT_CAPTURE_ARCHIVE_MAX_AGE: &str = "30d";
-pub const DEFAULT_PROJECTION_ARCHIVE_MAX_AGE: &str = "30d";
 pub const DEFAULT_EVENTS_DONE_MAX_AGE: &str = "180d";
 pub const DEFAULT_EVENTS_REJECTED_MAX_AGE: &str = "30d";
 pub const DEFAULT_EVENTS_REJECTED_MAX_COUNT: usize = 10_000;
@@ -80,7 +79,6 @@ pub struct GcRequest<'a> {
     pub state_dir: Option<&'a Path>,
     pub horizon_text: &'a str,
     pub state_retention: StateRetentionPolicy,
-    pub projection_archive_max_age: Duration,
     pub now: DateTime<Utc>,
     pub dry_run: bool,
     pub collect: bool,
@@ -156,8 +154,6 @@ pub struct GcReport {
     pub events_done_pruned: usize,
     pub events_rejected_examined: usize,
     pub events_rejected_pruned: usize,
-    pub projection_archives_examined: usize,
-    pub projection_archives_pruned: usize,
     pub collected: bool,
 }
 
@@ -350,13 +346,11 @@ pub fn run_gc(
         state_dir,
         horizon_text,
         state_retention,
-        projection_archive_max_age,
         now,
         dry_run,
         collect,
     } = request;
     let horizon = parse_horizon(horizon_text)?;
-    let projection_cutoff = cutoff(now, projection_archive_max_age)?;
     // Brief admission takes the shared side before it publishes a durable row
     // or witness. Take the exclusive side first, then the GC-roots lock, in the
     // same order as brief-bearing substitution admission.
@@ -482,7 +476,6 @@ pub fn run_gc(
         Some(state_dir) => sweep_state_directory(state_dir, &state_retention, now, dry_run)?,
         None => StateSweep::default(),
     };
-    let projections = sweep_projection_archives(data_dir, projection_cutoff, dry_run)?;
 
     let collected = collect && !dry_run;
     if collected {
@@ -510,92 +503,8 @@ pub fn run_gc(
         events_done_pruned: state.events_done_pruned,
         events_rejected_examined: state.events_rejected_examined,
         events_rejected_pruned: state.events_rejected_pruned,
-        projection_archives_examined: projections.examined,
-        projection_archives_pruned: projections.pruned,
         collected,
     })
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-struct ProjectionArchiveSweep {
-    examined: usize,
-    pruned: usize,
-}
-
-fn sweep_projection_archives(
-    data_dir: &Path,
-    cutoff: DateTime<Utc>,
-    dry_run: bool,
-) -> Result<ProjectionArchiveSweep, RetentionError> {
-    let mut sweep = ProjectionArchiveSweep::default();
-    if !data_dir.is_dir() {
-        return Ok(sweep);
-    }
-    let mut entries = std::fs::read_dir(data_dir)
-        .map_err(|source| io_error(data_dir, source))?
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| io_error(data_dir, source))?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
-            continue;
-        };
-        let Some(timestamp) = name.strip_prefix("taskdata.pre-rebuild-") else {
-            continue;
-        };
-        let Ok(timestamp) = DateTime::parse_from_rfc3339(timestamp) else {
-            continue;
-        };
-        let timestamp = timestamp.with_timezone(&Utc);
-        let path = entry.path();
-        let metadata =
-            std::fs::symlink_metadata(&path).map_err(|source| io_error(&path, source))?;
-        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-            return Err(RetentionError::UnsafeRoot {
-                path,
-                reason: "managed projection archive is not a real directory".to_owned(),
-            });
-        }
-        sweep.examined += 1;
-        if timestamp >= cutoff {
-            continue;
-        }
-        validate_plain_tree(&path)?;
-        sweep.pruned += 1;
-        if !dry_run {
-            match std::fs::remove_dir_all(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(source) => return Err(io_error(&path, source)),
-            }
-        }
-    }
-    Ok(sweep)
-}
-
-fn validate_plain_tree(root: &Path) -> Result<(), RetentionError> {
-    let mut pending = vec![root.to_owned()];
-    while let Some(directory) = pending.pop() {
-        let entries =
-            std::fs::read_dir(&directory).map_err(|source| io_error(&directory, source))?;
-        for entry in entries {
-            let entry = entry.map_err(|source| io_error(&directory, source))?;
-            let path = entry.path();
-            let metadata =
-                std::fs::symlink_metadata(&path).map_err(|source| io_error(&path, source))?;
-            if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() {
-                pending.push(path);
-            } else if !metadata.file_type().is_file() {
-                return Err(RetentionError::UnsafeRoot {
-                    path,
-                    reason: "managed projection archive contains a symlink or special file"
-                        .to_owned(),
-                });
-            }
-        }
-    }
-    Ok(())
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1300,7 +1209,6 @@ mod tests {
             state_dir: None,
             horizon_text: "30d",
             state_retention: StateRetentionPolicy::default(),
-            projection_archive_max_age: parse_horizon(DEFAULT_PROJECTION_ARCHIVE_MAX_AGE).unwrap(),
             now,
             dry_run,
             collect: true,
@@ -1394,7 +1302,6 @@ mod tests {
             state_dir: Some(&state),
             horizon_text: "30d",
             state_retention: StateRetentionPolicy::default(),
-            projection_archive_max_age: parse_horizon(DEFAULT_PROJECTION_ARCHIVE_MAX_AGE).unwrap(),
             now,
             dry_run: true,
             collect: false,
@@ -1481,7 +1388,6 @@ mod tests {
             state_dir: Some(&state),
             horizon_text: "30d",
             state_retention: StateRetentionPolicy::default(),
-            projection_archive_max_age: parse_horizon(DEFAULT_PROJECTION_ARCHIVE_MAX_AGE).unwrap(),
             now,
             dry_run: true,
             collect: false,
@@ -1549,8 +1455,6 @@ mod tests {
                     events_rejected_max_count: 2,
                     ..StateRetentionPolicy::default()
                 },
-                projection_archive_max_age: parse_horizon(DEFAULT_PROJECTION_ARCHIVE_MAX_AGE)
-                    .unwrap(),
                 now,
                 dry_run: false,
                 collect: false,
@@ -1574,27 +1478,6 @@ mod tests {
                 .join(format!("events/rejected/hostile-{index}.json"))
                 .exists());
         }
-    }
-
-    #[test]
-    fn projection_archive_horizon_prunes_only_old_managed_archives() {
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path();
-        let now = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
-        drop(WitnessLedger::open(data.join("witness.jsonl")).unwrap());
-        let old = data.join("taskdata.pre-rebuild-2026-06-01T00:00:00.000Z");
-        let fresh = data.join("taskdata.pre-rebuild-2026-07-25T00:00:00.000Z");
-        let unmanaged = data.join("taskdata.pre-rebuild-not-a-timestamp");
-        for directory in [&old, &fresh, &unmanaged] {
-            fs::create_dir_all(directory).unwrap();
-            fs::write(directory.join("taskchampion.sqlite3"), b"projection").unwrap();
-        }
-        let report = run_gc(gc_request(data, now, false), &FakeBackend::default()).unwrap();
-        assert_eq!(report.projection_archives_examined, 2);
-        assert_eq!(report.projection_archives_pruned, 1);
-        assert!(!old.exists());
-        assert!(fresh.exists());
-        assert!(unmanaged.exists());
     }
 
     #[test]
@@ -1637,8 +1520,6 @@ mod tests {
                 state_dir: Some(&state),
                 horizon_text: "30d",
                 state_retention: StateRetentionPolicy::default(),
-                projection_archive_max_age: parse_horizon(DEFAULT_PROJECTION_ARCHIVE_MAX_AGE)
-                    .unwrap(),
                 now,
                 dry_run: false,
                 collect: false,

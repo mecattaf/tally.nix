@@ -7,8 +7,8 @@ use std::path::Path;
 use chrono::DateTime;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use taskchampion::Uuid;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::adapters::{AdapterConfig, ScrapeStream, TraceFraming};
 use crate::executor::{encode_base64, ExecutionIdentity, Executor};

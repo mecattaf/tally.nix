@@ -296,17 +296,6 @@ impl DaemonHandler {
         context.jobs.insert(task_uuid, job.clone());
         drop(context);
 
-        if self
-            .commits
-            .send(CommitCommand::Upsert {
-                row: Box::new(row.clone()),
-                status: Status::Pending,
-                labor_class: LaborClass::Recovered,
-            })
-            .is_err()
-        {
-            eprintln!("tally: post-ack replica worker stopped before retry projection");
-        }
         self.emit_post_ack(enqueued_event(&job));
         if let Some(job) = launch {
             self.spawn_execution(job);
@@ -1108,9 +1097,6 @@ impl DaemonHandler {
                     context.jobs.insert(job_id, job.clone());
                     let evidence = serde_json::to_string(&row.evidence).map_err(internal_wire)?;
                     drop(context);
-                    if self.commits.send(CommitCommand::Rebuild).is_err() {
-                        eprintln!("tally: post-ack replica worker stopped before reuse projection");
-                    }
                     self.complete_gh_post_ack(job.row.clone(), result.clone());
                     self.emit_post_ack(enqueued_event(&job));
                     self.emit_post_ack(completed_event(&job, &result, evidence));
@@ -1265,18 +1251,6 @@ impl DaemonHandler {
         context.jobs.insert(job_id, job.clone());
         drop(context);
 
-        if task_uuid.is_some()
-            && self
-                .commits
-                .send(CommitCommand::Upsert {
-                    row: Box::new(row.clone()),
-                    status: Status::Pending,
-                    labor_class: LaborClass::Fresh,
-                })
-                .is_err()
-        {
-            eprintln!("tally: post-ack replica worker stopped before enqueue projection");
-        }
         self.emit_post_ack(enqueued_event(&job));
         if let Some(job) = launch {
             self.spawn_execution(job);

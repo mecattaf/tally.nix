@@ -154,30 +154,6 @@ mod tests {
         }
     }
 
-    struct StallingCommitter {
-        started: Option<oneshot::Sender<()>>,
-        release: Arc<AtomicBool>,
-    }
-
-    impl ReplicaCommitter for StallingCommitter {
-        fn commit<'a>(
-            &'a mut self,
-            _command: CommitCommand,
-        ) -> Pin<Box<dyn Future<Output = Result<(), String>> + 'a>> {
-            let started = self.started.take();
-            let release = self.release.clone();
-            Box::pin(async move {
-                if let Some(started) = started {
-                    let _ = started.send(());
-                }
-                while !release.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                Ok(())
-            })
-        }
-    }
-
     fn daemon_test_defaults() -> Config {
         let mut config = Config::default();
         // Most daemon tests use the Rust test harness as the executor binary.
@@ -629,8 +605,8 @@ mod tests {
                     .unwrap();
                 assert_eq!(storage["dataDir"]["level"], "hard");
                 assert_eq!(storage["intake"]["accepting"], false);
-                assert!(storage["taskchampion"]["databaseBytes"].as_u64().unwrap() > 0);
-                assert!(storage["taskchampion"]["operationHighWater"].is_number());
+                assert_eq!(storage["schemaVersion"], 3);
+                assert!(storage["taskchampion"].is_null());
 
                 let rows_before = daemon.handler.context.read().await.rows.len();
                 let refused = daemon
@@ -5262,16 +5238,6 @@ mod tests {
                 assert_eq!(repaired.payload["leaseEpoch"], 1);
 
                 drop(reopened);
-                let mut db = TaskDb::open(&paths.data_dir).await.unwrap();
-                let projected = db
-                    .get_row(Uuid::parse_str(admitted["task_uuid"].as_str().unwrap()).unwrap())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert_eq!(projected.value("session_ref"), Some("session-opaque"));
-                assert_eq!(projected.value("model"), Some("Provider/Model.Exact-CASE"));
-                assert_eq!(projected.value("final_message"), Some("{\"answer\":42}"));
-                drop(db);
 
                 let deduplicated =
                     Daemon::open_with_executor(config, paths.clone(), settings(), executor)
@@ -6608,189 +6574,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn stalled_replica_commit_does_not_stall_rpc_or_late_wait() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let temp = tempdir().unwrap();
-                let paths = DaemonPaths {
-                    socket: temp.path().join("run/tally.sock"),
-                    state_dir: temp.path().join("state"),
-                    data_dir: temp.path().join("data"),
-                };
-                prepare_paths(&paths).unwrap();
-                drop(WitnessLedger::open(paths.witness_path()).unwrap());
-                let epoch = bump_epoch(&paths.state_dir).unwrap();
-                let executor = direct_executor(&paths.state_dir)
-                    .with_systemd_run(temp.path().join("absent-systemd-run"))
-                    .with_unit_probe(ExitFileProbe);
-                let (commit_started_tx, commit_started_rx) = oneshot::channel();
-                let release_commit = Arc::new(AtomicBool::new(false));
-                let daemon = Daemon::build(
-                    one_pool_config(),
-                    paths.clone(),
-                    settings(),
-                    executor,
-                    epoch,
-                    empty_plan(),
-                    Box::new(StallingCommitter {
-                        started: Some(commit_started_tx),
-                        release: release_commit.clone(),
-                    }),
-                )
-                .unwrap();
-                let context = daemon.handler.context.clone();
-                let (shutdown_tx, shutdown_rx) = watch::channel(false);
-                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-
-                let client = RpcClient::connect(&paths.socket).await.unwrap();
-                let admitted = client
-                    .call(
-                        "queue.enqueue",
-                        Some(json!({
-                            "argv": ["true"],
-                            "pool": "slot",
-                            "priority": "high",
-                            "adapter": "shell",
-                            "source": "orchestrator",
-                            "evidence": ["exit:0"]
-                        })),
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(admitted["task_uuid"], admitted["job_id"]);
-                let durable_job_id = admitted["job_id"].as_str().unwrap();
-                assert_eq!(
-                    context
-                        .read()
-                        .await
-                        .guardrails
-                        .parent(durable_job_id)
-                        .unwrap()
-                        .parent_uuid,
-                    durable_job_id
-                );
-                commit_started_rx.await.unwrap();
-
-                tokio::time::timeout(
-                    Duration::from_millis(250),
-                    client.call("query.status", Some(json!({}))),
-                )
-                .await
-                .expect("the socket must stay responsive while commit is stalled")
-                .unwrap();
-
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    loop {
-                        let complete = context
-                            .read()
-                            .await
-                            .jobs
-                            .values()
-                            .all(|job| job.state == JobState::Completed);
-                        if complete {
-                            break;
-                        }
-                        tokio::task::yield_now().await;
-                    }
-                })
-                .await
-                .unwrap();
-
-                let task_uuid = admitted["task_uuid"].as_str().unwrap();
-                let waited = tokio::time::timeout(
-                    Duration::from_millis(100),
-                    client.call("queue.await_job", Some(json!({"task_uuid": task_uuid}))),
-                )
-                .await
-                .expect("a late wait must resolve immediately")
-                .unwrap();
-                assert_eq!(waited["verdict"], "pass");
-
-                let barrier = admitted["barrier"].as_str().unwrap();
-                let barrier_result = client
-                    .call("queue.await_barrier", Some(json!({"barrier": barrier})))
-                    .await
-                    .unwrap();
-                assert_eq!(barrier_result["complete"], true);
-                assert!(paths.events_dir().read_dir().unwrap().next().is_some());
-                assert!(paths.witness_path().metadata().unwrap().len() > 0);
-
-                release_commit.store(true, Ordering::Release);
-                shutdown_tx.send(true).unwrap();
-                daemon_task.await.unwrap().unwrap();
-                assert!(!paths.socket.exists());
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
-    async fn shutdown_never_detaches_a_stalled_replica_writer() {
-        let local = LocalSet::new();
-        local
-            .run_until(async {
-                let temp = tempdir().unwrap();
-                let paths = DaemonPaths {
-                    socket: temp.path().join("run/tally.sock"),
-                    state_dir: temp.path().join("state"),
-                    data_dir: temp.path().join("data"),
-                };
-                prepare_paths(&paths).unwrap();
-                drop(WitnessLedger::open(paths.witness_path()).unwrap());
-                let epoch = bump_epoch(&paths.state_dir).unwrap();
-                let executor = direct_executor(&paths.state_dir)
-                    .with_systemd_run(temp.path().join("absent-systemd-run"))
-                    .with_unit_probe(ExitFileProbe);
-                let (commit_started_tx, commit_started_rx) = oneshot::channel();
-                let release_commit = Arc::new(AtomicBool::new(false));
-                let daemon = Daemon::build(
-                    one_pool_config(),
-                    paths.clone(),
-                    settings(),
-                    executor,
-                    epoch,
-                    empty_plan(),
-                    Box::new(StallingCommitter {
-                        started: Some(commit_started_tx),
-                        release: release_commit.clone(),
-                    }),
-                )
-                .unwrap();
-                let (shutdown_tx, shutdown_rx) = watch::channel(false);
-                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
-                let client = RpcClient::connect(&paths.socket).await.unwrap();
-                client
-                    .call(
-                        "queue.enqueue",
-                        Some(json!({
-                            "argv": ["true"],
-                            "pool": "slot",
-                            "priority": "high",
-                            "adapter": "shell",
-                            "source": "manual",
-                            "evidence": ["exit:0"]
-                        })),
-                    )
-                    .await
-                    .unwrap();
-                commit_started_rx.await.unwrap();
-                shutdown_tx.send(true).unwrap();
-                tokio::time::sleep(Duration::from_millis(1_100)).await;
-                assert!(!daemon_task.is_finished());
-                assert!(acquire_daemon_lock(&paths.state_dir).is_err());
-
-                release_commit.store(true, Ordering::Release);
-                tokio::time::timeout(Duration::from_secs(2), daemon_task)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap();
-                drop(acquire_daemon_lock(&paths.state_dir).unwrap());
-            })
-            .await;
-    }
-
-    #[tokio::test(flavor = "current_thread")]
     async fn restart_re_adopts_an_in_flight_multi_pool_job_with_the_complete_set() {
         let local = LocalSet::new();
         local
@@ -7710,7 +7493,7 @@ mod tests {
 
                 // Open and drop one daemon before inspecting through the next
                 // generation. This exercises lifecycle reload independently of
-                // both the TaskChampion cache and the witness ledger.
+                // the witness ledger.
                 let first = Daemon::open_with_executor(
                     one_pool_config(),
                     paths.clone(),
