@@ -666,75 +666,7 @@ async function runPreflightGate(task, gate, workspace) {
   });
 }
 
-(async () => {
-  const forgeNative = typeof args.worklist === "object";
-  if (!forgeNative) {
-    const configuredGateIds = [];
-    for (const gate of args.gates) {
-      if (configuredGateIds.indexOf(gate.id) !== -1) {
-        const error = new Error(`campaign gate id ${gate.id} is duplicated`);
-        error.name = "SpecBuildConfigurationError";
-        error.code = "duplicate-gate-id";
-        throw error;
-      }
-      configuredGateIds.push(gate.id);
-    }
-  }
-  const reconcileBrief = forgeNative
-    ? {
-        repository: args.repository,
-        issue: args.issue,
-        worklist: args.worklist
-      }
-    : {
-        campaign: args.campaign,
-        repository: args.repository,
-        repositoryConfig: args.repositories[args.repository],
-        issue: args.issue,
-        worklist: args.worklist,
-        maxTasks: args.maxTasks,
-        maxParallel: args.maxParallel
-      };
-
-  const reconciliationNode = await driverNode(
-    "reconcile",
-    reconcileBrief,
-    "reconcile",
-    "spec-build-reconcile",
-    reconcileSchema,
-    null,
-    false,
-    null
-  );
-  const reconciliation = reconciliationNode.result;
-  effective = forgeNative
-    ? reconciliation.config
-    : {
-        campaign: args.campaign,
-        repositoryConfig: args.repositories[args.repository],
-        maxParallel: args.maxParallel,
-        agent: args.agent,
-        gates: args.gates,
-        reconcileCommand: args.reconcileCommand
-      };
-  if (!effective || !effective.repositoryConfig) {
-    const error = new Error(`campaign repository ${args.repository} is not configured`);
-    error.name = "SpecBuildConfigurationError";
-    error.code = "repository-not-configured";
-    throw error;
-  }
-  const repositoryConfig = effective.repositoryConfig;
-  const gateIds = [];
-  for (const gate of effective.gates) {
-    if (gateIds.indexOf(gate.id) !== -1) {
-      const error = new Error(`campaign gate id ${gate.id} is duplicated`);
-      error.name = "SpecBuildConfigurationError";
-      error.code = "duplicate-gate-id";
-      throw error;
-    }
-    gateIds.push(gate.id);
-  }
-
+async function sweepCampaign(repositoryConfig) {
   // Producer admission holds the campaign's capacity-1 mutex. Once the prior
   // pass and its admitted children have settled (the documented recovery
   // rule), every other run namespace is stale and can be reclaimed before this
@@ -768,6 +700,93 @@ async function runPreflightGate(task, gate, workspace) {
       recovery: "post a fresh campaign mention"
     };
     throw error;
+  }
+  return sweepNode;
+}
+
+(async () => {
+  const forgeNative = typeof args.worklist === "object";
+  if (!forgeNative) {
+    const configuredGateIds = [];
+    for (const gate of args.gates) {
+      if (configuredGateIds.indexOf(gate.id) !== -1) {
+        const error = new Error(`campaign gate id ${gate.id} is duplicated`);
+        error.name = "SpecBuildConfigurationError";
+        error.code = "duplicate-gate-id";
+        throw error;
+      }
+      configuredGateIds.push(gate.id);
+    }
+  }
+  effective = forgeNative
+    ? null
+    : {
+        campaign: args.campaign,
+        repositoryConfig: args.repositories[args.repository],
+        maxParallel: args.maxParallel,
+        agent: args.agent,
+        gates: args.gates,
+        reconcileCommand: args.reconcileCommand
+      };
+  let sweepNode = null;
+  if (!forgeNative) {
+    if (!effective.repositoryConfig) {
+      const error = new Error(`campaign repository ${args.repository} is not configured`);
+      error.name = "SpecBuildConfigurationError";
+      error.code = "repository-not-configured";
+      throw error;
+    }
+    sweepNode = await sweepCampaign(effective.repositoryConfig);
+  }
+  const reconcileBrief = forgeNative
+    ? {
+        repository: args.repository,
+        issue: args.issue,
+        worklist: args.worklist
+      }
+    : {
+        campaign: args.campaign,
+        repository: args.repository,
+        repositoryConfig: args.repositories[args.repository],
+        issue: args.issue,
+        worklist: args.worklist,
+        maxTasks: args.maxTasks,
+        maxParallel: args.maxParallel
+      };
+
+  const reconciliationNode = await driverNode(
+    "reconcile",
+    reconcileBrief,
+    "reconcile",
+    "spec-build-reconcile",
+    reconcileSchema,
+    null,
+    false,
+    null
+  );
+  const reconciliation = reconciliationNode.result;
+  if (forgeNative) {
+    effective = reconciliation.config;
+  }
+  if (!effective || !effective.repositoryConfig) {
+    const error = new Error(`campaign repository ${args.repository} is not configured`);
+    error.name = "SpecBuildConfigurationError";
+    error.code = "repository-not-configured";
+    throw error;
+  }
+  const repositoryConfig = effective.repositoryConfig;
+  const gateIds = [];
+  for (const gate of effective.gates) {
+    if (gateIds.indexOf(gate.id) !== -1) {
+      const error = new Error(`campaign gate id ${gate.id} is duplicated`);
+      error.name = "SpecBuildConfigurationError";
+      error.code = "duplicate-gate-id";
+      throw error;
+    }
+    gateIds.push(gate.id);
+  }
+  if (forgeNative) {
+    sweepNode = await sweepCampaign(repositoryConfig);
   }
   // A merged campaign PR is the durable proof that an earlier pass cleared
   // admission. Until that first merge exists, every fresh pass gates a

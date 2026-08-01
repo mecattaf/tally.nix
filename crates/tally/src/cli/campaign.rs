@@ -987,7 +987,10 @@ fn max_flow_nodes(manifest: &CampaignManifest) -> u32 {
     } else {
         command_gates + 2
     };
-    (1 + preflight + manifest.max_parallel * (5 + 2 * manifest.gates.len())) as u32
+    // Sweep, reconcile, one possible continuation, and each worst-case
+    // implementation lane: prep, agent, gates, publish, rebase, optional
+    // re-gates, merge, and cleanup. Checkpoint lanes are smaller.
+    (3 + preflight + manifest.max_parallel * (6 + 2 * manifest.gates.len())) as u32
 }
 
 async fn dispatch_campaign(
@@ -2271,5 +2274,30 @@ mod tests {
             "examples/flows/spec-build.js",
         )
         .is_err());
+    }
+
+    #[test]
+    fn flow_node_bound_includes_pass_maintenance_and_cleanup() {
+        let mut value = manifest_value_for_test(json!([]));
+        let object = value.as_object_mut().unwrap();
+        object.insert("maxParallel".into(), json!(3));
+        object.insert(
+            "gates".into(),
+            json!([
+                {
+                    "kind": "command",
+                    "id": "test",
+                    "preflightArgv": ["true"],
+                    "argv": ["true"]
+                },
+                {
+                    "kind": "forbidPaths",
+                    "id": "no-databases",
+                    "forbidPaths": ["*.db"]
+                }
+            ]),
+        );
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        assert_eq!(max_flow_nodes(&manifest), 36);
     }
 }

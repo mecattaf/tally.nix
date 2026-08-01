@@ -3441,7 +3441,7 @@
                   .pools["fixture-campaign"].resource == "mutex" and
                   .pools["fixture-campaign"].capacity == 1 and
                   .pools["campaign-control"].resource == "cpu-slot" and
-                  .pools["campaign-control"].capacity == 3 and
+                  .pools["campaign-control"].capacity == 4 and
                   .pools["campaign-agent"].resource == "slot" and
                   .pools["campaign-agent"].capacity == 4 and
                   .adapters["spec-build-driver"].scrape.finalMessage.mode == "regex" and
