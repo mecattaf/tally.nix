@@ -6,62 +6,7 @@ use serde_json::Value;
 
 use crate::{FlowError, SourceLocation};
 
-const MAX_TASK_REF_COMPONENT_BYTES: usize = 80;
-
-/// A campaign-scoped human task identifier such as `crm/t07`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskRef(String);
-
-impl TaskRef {
-    pub fn new(value: impl Into<String>) -> Result<Self, String> {
-        let value = value.into();
-        let (campaign, task_id) = value
-            .split_once('/')
-            .ok_or_else(|| "taskRef must be formatted as <campaign>/<task-id>".to_owned())?;
-        if task_id.contains('/') {
-            return Err("taskRef must contain exactly one slash".to_owned());
-        }
-        for (label, component) in [("campaign", campaign), ("task id", task_id)] {
-            if !component
-                .as_bytes()
-                .first()
-                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-                || component.len() > MAX_TASK_REF_COMPONENT_BYTES
-                || !component
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-            {
-                return Err(format!(
-                    "taskRef {label} must start with an ASCII letter, digit, or '_' and contain at most {MAX_TASK_REF_COMPONENT_BYTES} ASCII letters, digits, '_', '.', or '-'"
-                ));
-            }
-        }
-        Ok(Self(value))
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Serialize for TaskRef {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for TaskRef {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-    }
-}
+pub use tally_client::TaskRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

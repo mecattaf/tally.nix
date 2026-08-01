@@ -2,89 +2,9 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use taskchampion::Uuid;
 
+pub use tally_client::{TaskRef, MAX_TASK_REF_COMPONENT_BYTES};
+
 pub const DEFAULT_FLOW_MAX_NODES: u64 = 1_000;
-pub const MAX_TASK_REF_COMPONENT_BYTES: usize = 80;
-
-/// A stable operator-facing task name scoped by its campaign, for example
-/// `crm/t07`. The durable UUID remains the execution identity; this reference
-/// is additive orchestration provenance used to make operational surfaces
-/// human-readable.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct TaskRef(String);
-
-impl TaskRef {
-    pub fn new(value: impl Into<String>) -> Result<Self, String> {
-        let value = value.into();
-        let (campaign, task_id) = value
-            .split_once('/')
-            .ok_or_else(|| "taskRef must be formatted as <campaign>/<task-id>".to_owned())?;
-        if task_id.contains('/') {
-            return Err("taskRef must contain exactly one slash".to_owned());
-        }
-        validate_task_ref_component(campaign, "campaign")?;
-        validate_task_ref_component(task_id, "task id")?;
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub fn campaign(&self) -> &str {
-        self.0
-            .split_once('/')
-            .expect("validated taskRef always contains a slash")
-            .0
-    }
-
-    pub fn task_id(&self) -> &str {
-        self.0
-            .split_once('/')
-            .expect("validated taskRef always contains a slash")
-            .1
-    }
-}
-
-fn validate_task_ref_component(value: &str, label: &str) -> Result<(), String> {
-    if !value
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-        || value.len() > MAX_TASK_REF_COMPONENT_BYTES
-        || !value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
-    {
-        return Err(format!(
-            "taskRef {label} must start with an ASCII letter, digit, or '_' and contain at most {MAX_TASK_REF_COMPONENT_BYTES} ASCII letters, digits, '_', '.', or '-'"
-        ));
-    }
-    Ok(())
-}
-
-impl std::fmt::Display for TaskRef {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl Serialize for TaskRef {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        serializer.serialize_str(self.as_str())
-    }
-}
-
-impl<'de> Deserialize<'de> for TaskRef {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
-    }
-}
 
 /// An orchestration capsule is intentionally opaque apart from the admission
 /// fields the kernel owns. Keeping the original `Value` preserves

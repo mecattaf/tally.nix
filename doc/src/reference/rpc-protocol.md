@@ -346,7 +346,8 @@ to the run's task UUIDs through the durable rows and the witness chain. A `faile
 includes `stderrTail` and `stderrTruncated`, bounded as described for terminal waits above.
 `query.trace` requires `task` and optionally selects `attempt`. Both return collection
 envelopes; trace also includes a `generations` array describing capture capability, completeness,
-retained range, byte count, truncation, and redaction provenance.
+retained range, byte count, truncation, and redaction provenance. Trace items and generation
+summaries both include optional `taskRef`.
 
 `query.proof` selects either a task with an optional attempt, or a `flowRun`; supplying both, or
 neither, is an invalid request, and `attempt` applies only to a task. Its `status` is `verified`,
@@ -370,7 +371,8 @@ pretty-printed JSON object; the CLI unwraps that string before printing.
 
 `query.standup` returns a window, completed and in-flight entries, reuse and gate-failure
 summaries, cancellations, and canonical GPU seconds. The RPC accepts a `source` filter even
-though the current CLI exposes only `--since`.
+though the current CLI exposes only `--since`. Each completed, in-flight, gate-failed, and
+cancelled entry includes optional `taskRef`.
 
 ### Pagination cursors
 

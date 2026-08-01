@@ -167,8 +167,9 @@ $ tally query trace --task <task-uuid> --attempt 2 --limit 100
 The log is tally's durable observation history. The trace is exposed only when
 the adapter declares a JSON-lines provider stream. Trace records preserve
 provider order, parsed JSON when valid, raw text, and base64 for non-UTF-8
-bytes. The response also says whether the generation is complete, unavailable,
-unsupported, or truncated. A running remote trace can honestly report
+bytes. Both each trace record and each generation summary expose `taskRef` when
+the attempt belongs to a campaign task. The response also says whether the
+generation is complete, unavailable, unsupported, or truncated. A running remote trace can honestly report
 `remote-live-trace-unavailable`; it is never presented as an empty successful
 trace.
 
@@ -181,6 +182,10 @@ A `failed` log item carries `stderrTail` and `stderrTruncated`. The tail is a
 lossy UTF-8 rendering bounded to 2 KiB including the omission marker; it is a
 diagnostic projection, not evidence. Read it first. Inspect the retained raw
 capture only when the bounded tail is insufficient.
+
+The `completed`, `inFlight`, `gateFails`, and `cancelled` entries returned by
+`query standup` likewise expose `taskRef`, so the campaign digest does not
+require a UUID-to-worklist lookup.
 
 Query reads at most 16 MiB from one capture generation. Larger local capture
 files remain on disk, but the trace reports

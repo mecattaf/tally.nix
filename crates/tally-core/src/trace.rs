@@ -74,6 +74,8 @@ pub struct TraceRetainedRange {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TraceRecord {
     pub task_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<TaskRef>,
     pub job_id: Option<String>,
     pub attempt: u32,
     pub lease_epoch: u64,
@@ -97,6 +99,8 @@ pub struct TraceRecord {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TraceGeneration {
     pub task_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<TaskRef>,
     pub job_id: Option<String>,
     pub attempt: u32,
     pub lease_epoch: u64,
@@ -378,6 +382,7 @@ pub fn query_trace(
             let observed_at = payload.as_ref().and_then(observation_time);
             items.push(TraceRecord {
                 task_uuid: lane.task_uuid.clone(),
+                task_ref: lane.task_ref.clone(),
                 job_id: lane.job_id.clone(),
                 attempt: lane.attempt,
                 lease_epoch: lane.lease_epoch,
@@ -399,6 +404,7 @@ pub fn query_trace(
         let count = items.len() - first_index;
         generations.push(TraceGeneration {
             task_uuid: lane.task_uuid.clone(),
+            task_ref: lane.task_ref.clone(),
             job_id: lane.job_id.clone(),
             attempt: lane.attempt,
             lease_epoch: lane.lease_epoch,
@@ -447,6 +453,7 @@ fn unavailable_generation(
 ) -> TraceGeneration {
     TraceGeneration {
         task_uuid: lane.task_uuid.clone(),
+        task_ref: lane.task_ref.clone(),
         job_id: lane.job_id.clone(),
         attempt: lane.attempt,
         lease_epoch: lane.lease_epoch,

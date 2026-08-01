@@ -18,6 +18,88 @@ use tokio::time::Instant;
 
 /// The protocol's default symmetric request and response frame limit (16 MiB).
 pub const DEFAULT_MAX_FRAME_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_TASK_REF_COMPONENT_BYTES: usize = 80;
+
+/// A stable operator-facing task name scoped by its campaign, for example
+/// `crm/t07`. The durable UUID remains the execution identity; this reference
+/// is additive orchestration provenance used to make operational surfaces
+/// human-readable.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TaskRef(String);
+
+impl TaskRef {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        let (campaign, task_id) = value
+            .split_once('/')
+            .ok_or_else(|| "taskRef must be formatted as <campaign>/<task-id>".to_owned())?;
+        if task_id.contains('/') {
+            return Err("taskRef must contain exactly one slash".to_owned());
+        }
+        validate_task_ref_component(campaign, "campaign")?;
+        validate_task_ref_component(task_id, "task id")?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn campaign(&self) -> &str {
+        self.0
+            .split_once('/')
+            .expect("validated taskRef always contains a slash")
+            .0
+    }
+
+    pub fn task_id(&self) -> &str {
+        self.0
+            .split_once('/')
+            .expect("validated taskRef always contains a slash")
+            .1
+    }
+}
+
+fn validate_task_ref_component(value: &str, label: &str) -> Result<(), String> {
+    if !value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        || value.len() > MAX_TASK_REF_COMPONENT_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        return Err(format!(
+            "taskRef {label} must start with an ASCII letter, digit, or '_' and contain at most {MAX_TASK_REF_COMPONENT_BYTES} ASCII letters, digits, '_', '.', or '-'"
+        ));
+    }
+    Ok(())
+}
+
+impl std::fmt::Display for TaskRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for TaskRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -852,6 +934,48 @@ mod tests {
             serde_json::to_string(&request).unwrap(),
             r#"{"id":"cli-1","method":"query.status","params":{"pool":"gpu"}}"#
         );
+    }
+
+    #[test]
+    fn task_ref_is_the_shared_bounded_wire_scalar() {
+        let maximum = "a".repeat(MAX_TASK_REF_COMPONENT_BYTES);
+        for valid in [
+            "crm/t07".to_owned(),
+            "_campaign/_task".to_owned(),
+            "campaign.v2/task-id_7".to_owned(),
+            format!("{maximum}/{maximum}"),
+        ] {
+            let task_ref = TaskRef::new(valid.clone()).unwrap();
+            assert_eq!(task_ref.as_str(), valid);
+            assert_eq!(
+                serde_json::to_string(&task_ref).unwrap(),
+                format!(r#""{valid}""#)
+            );
+            assert_eq!(
+                serde_json::from_str::<TaskRef>(&format!(r#""{valid}""#)).unwrap(),
+                task_ref
+            );
+        }
+
+        for invalid in [
+            "crm".to_owned(),
+            "crm/t07/extra".to_owned(),
+            "crm/task id".to_owned(),
+            "/t07".to_owned(),
+            "crm/".to_owned(),
+            ".crm/t07".to_owned(),
+            "crm/-t07".to_owned(),
+            format!("{maximum}x/t07"),
+            format!("crm/{maximum}x"),
+            "crème/t07".to_owned(),
+        ] {
+            assert!(TaskRef::new(&invalid).is_err(), "accepted {invalid:?}");
+        }
+
+        let task_ref = TaskRef::new("crm/t07").unwrap();
+        assert_eq!(task_ref.campaign(), "crm");
+        assert_eq!(task_ref.task_id(), "t07");
+        assert!(task_ref < TaskRef::new("crm/t08").unwrap());
     }
 
     #[test]
