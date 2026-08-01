@@ -91,14 +91,15 @@ The transcript must show all six tests passing, by name:
 - `real_user_manager_executor_smoke`
 - `real_user_manager_journal_paths`
 
-Run the two release scenarios from the same checkout:
+Run the release scenario from the same checkout:
 
 ```console
 $ env -u TALLY_TEST_REMOTE_HOST nix develop --command \
     test/scenarios/run fleet-conformance
-$ env -u TALLY_TEST_REMOTE_HOST nix develop --command \
-    test/scenarios/run slow-sqlite
 ```
+
+This ladder ran a second `slow-sqlite` scenario until the TaskChampion projection was
+deleted; that scenario asserted only the deleted replica writer and went with it.
 
 Repeat the six-test live gate before every authorized release and after any change to
 `crates/tally-core/src/executor.rs`, `crates/tally-core/src/lease.rs`, or
@@ -107,7 +108,7 @@ confined to a disposable microVM; never run it against the designated live host.
 
 Capture stdout and stderr with pipe-failure preservation. Retain the full local-ladder and live
 transcripts, including the commit SHA, host name, pinned advisory database revision, six live-test
-names, and both scenario results. Attach that evidence to the GitHub release rather than pasting
+names, and the scenario result. Attach that evidence to the GitHub release rather than pasting
 only a summary.
 
 ## Upgrade and rollback

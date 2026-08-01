@@ -367,6 +367,12 @@ authorized.
   `projectionArchiveHorizon` config key, and the `projectionArchivesExamined` /
   `projectionArchivesPruned` fields of the GC report. The option is removed
   outright, so a configuration that still sets it is now rejected.
+- Corrected the release runbook's scenario ladder, which the TaskChampion delete
+  had left naming `slow-sqlite` — a scenario the same change deleted. A releaser
+  following `RELEASING.md` verbatim hit `usage: … {fleet-conformance|fanout-guardrail|pool-vanished/return}`
+  and exit 2 at the gate step, and could not produce the scenario evidence the
+  document requires them to attach to the release. `CONTRIBUTING.md` had been
+  updated in that change; `RELEASING.md` had not.
 - Changed `tally query log` to print one terse human line per lifecycle
   transition by default. `--json` retains structured fields; both human and
   JSON modes collapse journal/evidence/witness echoes, while `--provenance`
