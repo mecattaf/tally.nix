@@ -5,6 +5,7 @@ use std::fs;
 use std::io::Read;
 use std::process::{Command as ProcessCommand, Stdio};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tally_core::config::ResourceKind;
@@ -23,7 +24,8 @@ const DEFAULT_AGENT_PRIORITY: &str = "low";
 const DEFAULT_AGENT_APPROVAL_POLICY: &str = "on-request";
 const DEFAULT_AGENT_SANDBOX_POLICY: &str = "workspace-write";
 const BRIEF_SENTINEL: &str = "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.";
-const REGISTRY_SCHEMA_VERSION: u32 = 1;
+const REGISTRY_SCHEMA_VERSION: u32 = 2;
+const SYSTEM_COMMENT_PREFIX: &str = "<!-- tally:spec-build:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -90,11 +92,16 @@ impl CampaignGate {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CampaignTaskReference {
     id: String,
+    kind: String,
     issue: u64,
     #[serde(default)]
     dependencies: Vec<String>,
     #[serde(default)]
     conflict_domains: Vec<String>,
+    #[serde(default)]
+    argv: Option<Vec<String>>,
+    #[serde(default)]
+    runtime_max_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,14 +128,22 @@ struct CampaignManifest {
 #[derive(Debug, Clone)]
 struct ProjectTask {
     id: String,
+    kind: String,
     title: String,
     body: String,
     issue: Option<u64>,
     dependencies: Vec<String>,
     conflict_domains: Vec<String>,
+    argv: Option<Vec<String>>,
+    runtime_max_sec: Option<u64>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GithubActor {
+    login: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct GithubIssue {
     number: u64,
     #[serde(default)]
@@ -138,8 +153,19 @@ struct GithubIssue {
     state: String,
     html_url: String,
     updated_at: String,
+    user: GithubActor,
     #[serde(default)]
     pull_request: Option<Value>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GithubComment {
+    id: u64,
+    body: String,
+    html_url: String,
+    created_at: String,
+    updated_at: String,
+    user: GithubActor,
 }
 
 #[derive(Debug, Clone)]
@@ -153,21 +179,27 @@ struct IssueLocator {
 struct CampaignGraph {
     locator: IssueLocator,
     manifest: CampaignManifest,
+    master: GithubIssue,
     tasks: Vec<GithubIssue>,
-    digest: String,
+    executable_digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CampaignRegistration {
     schema_version: u32,
+    registration_id: String,
     issue_url: String,
     repository: String,
     issue_number: u64,
     armed_at: String,
     arm_serial: u64,
+    approved_graph_digest: String,
+    authenticated_actor: String,
+    allowed_actors: Vec<String>,
+    allow_test_local_forge: bool,
     #[serde(default)]
-    last_revision: Option<String>,
+    last_observation: Option<String>,
     flow: PathBuf,
     driver: PathBuf,
     workspace_root: PathBuf,
@@ -248,6 +280,7 @@ pub(super) async fn run_campaign(
             run_campaign_poll(socket, config_path, rpc_timeout, args).await
         }
         CampaignCommand::List(args) => run_campaign_list(args),
+        CampaignCommand::Disarm(args) => run_campaign_disarm(args),
     }
 }
 
@@ -384,6 +417,119 @@ fn os_arguments(values: &[&str]) -> Vec<OsString> {
     values.iter().map(OsString::from).collect()
 }
 
+fn safe_github_login(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 39
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+fn authenticated_actor() -> Result<String> {
+    let actor: GithubActor = gh_json(&os_arguments(&["api", "user"]))?;
+    if !safe_github_login(&actor.login) {
+        return Err(invalid("gh api user returned an invalid GitHub login"));
+    }
+    Ok(actor.login.to_ascii_lowercase())
+}
+
+fn normalize_allowed_actors(values: &[String], authenticated: &str) -> Result<Vec<String>> {
+    let mut actors = if values.is_empty() {
+        BTreeSet::from([authenticated.to_owned()])
+    } else {
+        values
+            .iter()
+            .map(|value| {
+                if !safe_github_login(value) {
+                    return Err(invalid(format!(
+                        "campaign --allow-actor value {value:?} is not a valid GitHub login"
+                    )));
+                }
+                Ok(value.to_ascii_lowercase())
+            })
+            .collect::<Result<BTreeSet<_>>>()?
+    };
+    actors.insert(authenticated.to_owned());
+    Ok(actors.into_iter().collect())
+}
+
+fn require_authenticated_actor(registration: &CampaignRegistration) -> Result<()> {
+    let actor = authenticated_actor()?;
+    if actor != registration.authenticated_actor {
+        bail!(
+            "armed campaign {} was approved by gh actor {:?}, but the current gh actor is {:?}; re-arm explicitly with the intended identity",
+            registration.issue_url,
+            registration.authenticated_actor,
+            actor
+        );
+    }
+    Ok(())
+}
+
+fn require_allowed_issue_authors(graph: &CampaignGraph, allowed: &[String]) -> Result<()> {
+    let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    for (context, issue) in std::iter::once(("master", &graph.master)).chain(
+        graph
+            .tasks
+            .iter()
+            .map(|issue| ("task", issue)),
+    ) {
+        let actor = issue.user.login.to_ascii_lowercase();
+        if !allowed.contains(actor.as_str()) {
+            bail!(
+                "campaign {context} issue #{} was authored by unapproved actor {:?}; arm with --allow-actor only after reviewing that actor's input",
+                issue.number,
+                issue.user.login
+            );
+        }
+    }
+    Ok(())
+}
+
+fn fetch_steering(locator: &IssueLocator, allowed: &[String]) -> Result<Vec<Value>> {
+    let endpoint = format!(
+        "repos/{}/issues/{}/comments?per_page=100",
+        locator.repository, locator.number
+    );
+    let pages: Vec<Vec<GithubComment>> = gh_json(&os_arguments(&[
+        "api",
+        "--paginate",
+        "--slurp",
+        &endpoint,
+    ]))?;
+    let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut comments = Vec::new();
+    for comment in pages.into_iter().flatten() {
+        if comment.body.contains(SYSTEM_COMMENT_PREFIX) {
+            continue;
+        }
+        let actor = comment.user.login.to_ascii_lowercase();
+        if !allowed.contains(actor.as_str()) {
+            continue;
+        }
+        if comment.body.contains('\0') || comment.body.chars().count() > 64_000 {
+            bail!(
+                "approved steering comment {} exceeds the campaign comment contract",
+                comment.html_url
+            );
+        }
+        comments.push(json!({
+            "id": comment.id,
+            "url": comment.html_url,
+            "author": actor,
+            "body": comment.body,
+            "createdAt": comment.created_at,
+            "updatedAt": comment.updated_at,
+        }));
+    }
+    if comments.len() > 1_000 {
+        return Err(invalid("campaign has more than 1000 approved steering comments"));
+    }
+    Ok(comments)
+}
+
 fn fetch_issue(locator: &IssueLocator) -> Result<GithubIssue> {
     let endpoint = format!("repos/{}/issues/{}", locator.repository, locator.number);
     let issue: GithubIssue = gh_json(&os_arguments(&["api", &endpoint]))?;
@@ -486,6 +632,12 @@ fn validate_manifest(manifest: &CampaignManifest) -> Result<()> {
     let mut prior = BTreeSet::new();
     let mut issues = BTreeSet::new();
     for task in &manifest.tasks {
+        if !matches!(task.kind.as_str(), "implementation" | "checkpoint") {
+            return Err(invalid(format!(
+                "campaign task {} kind must be implementation or checkpoint",
+                task.id
+            )));
+        }
         if !safe_task_id(&task.id) {
             return Err(invalid(format!(
                 "campaign task id {:?} is invalid",
@@ -515,8 +667,37 @@ fn validate_manifest(manifest: &CampaignManifest) -> Result<()> {
                 )));
             }
         }
-        validate_conflict_domains(&task.conflict_domains, manifest.max_parallel > 1)
-            .with_context(|| format!("campaign task {} conflictDomains", task.id))?;
+        match task.kind.as_str() {
+            "implementation" => {
+                if task.argv.is_some() || task.runtime_max_sec.is_some() {
+                    return Err(invalid(format!(
+                        "implementation task {} must not carry argv or runtimeMaxSec",
+                        task.id
+                    )));
+                }
+                validate_conflict_domains(&task.conflict_domains, manifest.max_parallel > 1)
+                    .with_context(|| format!("campaign task {} conflictDomains", task.id))?;
+            }
+            "checkpoint" => {
+                if !task.conflict_domains.is_empty() {
+                    return Err(invalid(format!(
+                        "checkpoint task {} must not carry conflictDomains",
+                        task.id
+                    )));
+                }
+                let argv = task.argv.as_ref().ok_or_else(|| {
+                    invalid(format!("checkpoint task {} requires argv", task.id))
+                })?;
+                validate_argv(argv, &format!("checkpoint task {} argv", task.id))?;
+                if !matches!(task.runtime_max_sec, Some(value) if value > 0) {
+                    return Err(invalid(format!(
+                        "checkpoint task {} requires a positive runtimeMaxSec",
+                        task.id
+                    )));
+                }
+            }
+            _ => unreachable!(),
+        }
     }
     Ok(())
 }
@@ -598,10 +779,13 @@ fn validate_gates(gates: &[CampaignGate]) -> Result<()> {
 }
 
 fn validate_argv(argv: &[String], context: &str) -> Result<()> {
-    if argv.is_empty() || argv[0].is_empty() || argv.iter().any(|argument| argument.contains('\0'))
+    if argv.is_empty()
+        || argv
+            .iter()
+            .any(|argument| argument.is_empty() || argument.chars().any(char::is_control))
     {
         return Err(invalid(format!(
-            "{context} must be a non-empty direct argv without NUL bytes"
+            "{context} must be a non-empty direct argv of non-empty strings without control characters"
         )));
     }
     Ok(())
@@ -704,40 +888,87 @@ fn fetch_campaign_graph(locator: &IssueLocator) -> Result<CampaignGraph> {
         }
         tasks.push(issue);
     }
+    // This is the admitted executable graph. Managed checkbox state, issue
+    // open/closed projection, update timestamps, and master prose outside the
+    // fenced manifest are deliberately excluded. The Python reconciler
+    // reconstructs this exact value and refuses any digest mismatch.
     let digest_value = json!({
         "manifest": &manifest,
-        "master": {
-            "number": master.number,
-            "title": &master.title,
-            "body": &master.body,
-            "state": &master.state,
-            "updatedAt": &master.updated_at,
-        },
         "tasks": tasks.iter().map(|issue| json!({
             "number": issue.number,
             "title": issue.title,
-            "body": issue.body,
-            "state": issue.state,
-            "updatedAt": issue.updated_at,
+            "body": issue.body.as_deref().unwrap_or_default(),
         })).collect::<Vec<_>>(),
     });
     let digest = sha256_json(&digest_value)?;
     Ok(CampaignGraph {
         locator: locator.clone(),
         manifest,
+        master,
         tasks,
-        digest,
+        executable_digest: digest,
     })
 }
 
 fn sha256_json(value: &Value) -> Result<String> {
-    let bytes = serde_json::to_vec(value)?;
-    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    fn write(value: &Value, output: &mut String) -> Result<()> {
+        match value {
+            Value::Null => output.push_str("null"),
+            Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+            Value::Number(value) => output.push_str(&value.to_string()),
+            Value::String(value) => output.push_str(&serde_json::to_string(value)?),
+            Value::Array(values) => {
+                output.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    write(value, output)?;
+                }
+                output.push(']');
+            }
+            Value::Object(values) => {
+                output.push('{');
+                let mut keys = values.keys().collect::<Vec<_>>();
+                keys.sort();
+                for (index, key) in keys.into_iter().enumerate() {
+                    if index > 0 {
+                        output.push(',');
+                    }
+                    output.push_str(&serde_json::to_string(key)?);
+                    output.push(':');
+                    write(&values[key], output)?;
+                }
+                output.push('}');
+            }
+        }
+        Ok(())
+    }
+
+    let mut canonical = String::new();
+    write(value, &mut canonical)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical.as_bytes())))
 }
 
-fn campaign_revision(graph: &CampaignGraph, arm_serial: u64) -> Result<String> {
+fn campaign_observation(
+    graph: &CampaignGraph,
+    steering: &[Value],
+    arm_serial: u64,
+) -> Result<String> {
     sha256_json(&json!({
-        "graph": graph.digest,
+        "graph": graph.executable_digest,
+        "forgeState": {
+            "master": {
+                "state": graph.master.state,
+                "updatedAt": graph.master.updated_at,
+            },
+            "tasks": graph.tasks.iter().map(|issue| json!({
+                "number": issue.number,
+                "state": issue.state,
+                "updatedAt": issue.updated_at,
+            })).collect::<Vec<_>>(),
+        },
+        "steering": steering,
         "armSerial": arm_serial,
     }))
 }
@@ -748,6 +979,14 @@ fn resolve_state_dir(value: Option<PathBuf>) -> Result<PathBuf> {
         return Err(invalid("campaign state directory must be absolute"));
     }
     Ok(path)
+}
+
+fn default_campaign_workspace_root() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("XDG_CACHE_HOME") {
+        return Ok(PathBuf::from(path).join("tally/campaigns/workspaces"));
+    }
+    let home = std::env::var_os("HOME").context("HOME and XDG_CACHE_HOME are both unset")?;
+    Ok(PathBuf::from(home).join(".cache/tally/campaigns/workspaces"))
 }
 
 fn resolve_asset(
@@ -803,11 +1042,21 @@ fn resolve_driver(value: Option<PathBuf>) -> Result<PathBuf> {
     )
 }
 
+fn github_repository_from_remote(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches('/').trim_end_matches(".git");
+    let path = value
+        .strip_prefix("https://github.com/")
+        .or_else(|| value.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| value.strip_prefix("git@github.com:"))?;
+    parse_repository(path).ok()
+}
+
 fn validate_host(
     graph: &CampaignGraph,
     config_path: Option<&Path>,
     flow: &Path,
     driver: &Path,
+    allow_test_local_forge: bool,
 ) -> Result<()> {
     let config = load_client_config(config_path)?;
     let required_nodes = max_flow_nodes(&graph.manifest);
@@ -890,11 +1139,78 @@ fn validate_host(
             checkout.display()
         )));
     }
+    if graph.manifest.repository.forge == "local" {
+        if !allow_test_local_forge {
+            return Err(invalid(
+                "forge=local is test-only for issue campaigns; pass --allow-test-local-forge only in an isolated mechanism test",
+            ));
+        }
+    } else {
+        let remote = ProcessCommand::new("git")
+            .arg("-C")
+            .arg(checkout)
+            .args([
+                "remote",
+                "get-url",
+                graph.manifest.repository.remote.as_str(),
+            ])
+            .output()
+            .context("cannot execute git while binding campaign remote")?;
+        if !remote.status.success() {
+            bail!(
+                "cannot resolve campaign remote {:?}: {}",
+                graph.manifest.repository.remote,
+                String::from_utf8_lossy(&remote.stderr).trim()
+            );
+        }
+        let remote = String::from_utf8(remote.stdout)
+            .context("campaign remote URL was not valid UTF-8")?;
+        let bound = github_repository_from_remote(&remote).ok_or_else(|| {
+            invalid("GitHub issue campaigns require an https or SSH github.com checkout remote")
+        })?;
+        if !bound.eq_ignore_ascii_case(&graph.locator.repository) {
+            bail!(
+                "campaign issue repository {} does not match checkout remote repository {}",
+                graph.locator.repository,
+                bound
+            );
+        }
+    }
     Ok(())
 }
 
 fn registry_dir(state_dir: &Path) -> PathBuf {
     state_dir.join("campaigns/armed")
+}
+
+struct RegistryLock(fs::File);
+
+impl RegistryLock {
+    fn acquire(state_dir: &Path, exclusive: bool) -> Result<Self> {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let directory = registry_dir(state_dir);
+        fs::create_dir_all(&directory)?;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(directory.join("registry.lock"))?;
+        if exclusive {
+            FileExt::lock_exclusive(&file)?;
+        } else {
+            FileExt::lock_shared(&file)?;
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.0);
+    }
 }
 
 fn registration_path(state_dir: &Path, issue_url: &str) -> PathBuf {
@@ -929,14 +1245,28 @@ fn read_registration(path: &Path) -> Result<CampaignRegistration> {
     let registration: CampaignRegistration = serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid campaign registration {}", path.display()))?;
     if registration.schema_version != REGISTRY_SCHEMA_VERSION
+        || uuid::Uuid::parse_str(&registration.registration_id).is_err()
         || registration.issue_number == 0
         || registration.arm_serial == 0
+        || !registration
+            .approved_graph_digest
+            .strip_prefix("sha256:")
+            .is_some_and(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+        || !safe_github_login(&registration.authenticated_actor)
+        || registration.allowed_actors.is_empty()
+        || registration
+            .allowed_actors
+            .iter()
+            .any(|actor| !safe_github_login(actor) || actor != &actor.to_ascii_lowercase())
+        || !registration
+            .allowed_actors
+            .contains(&registration.authenticated_actor)
         || !registration.flow.is_absolute()
         || !registration.driver.is_absolute()
         || !registration.workspace_root.is_absolute()
     {
         return Err(invalid(format!(
-            "campaign registration {} violates schema v1",
+            "campaign registration {} violates schema v2; explicitly disarm and re-arm legacy registrations",
             path.display()
         )));
     }
@@ -988,9 +1318,9 @@ fn max_flow_nodes(manifest: &CampaignManifest) -> u32 {
         command_gates + 2
     };
     // Sweep, reconcile, one possible continuation, and each worst-case
-    // implementation lane: prep, agent, gates, publish, rebase, optional
-    // re-gates, merge, and cleanup. Checkpoint lanes are smaller.
-    (3 + preflight + manifest.max_parallel * (6 + 2 * manifest.gates.len())) as u32
+    // implementation lane: prep, agent, ownership, gates, publish, rebase,
+    // optional re-gates, merge, and cleanup. Checkpoint lanes are smaller.
+    (3 + preflight + manifest.max_parallel * (7 + 2 * manifest.gates.len())) as u32
 }
 
 async fn dispatch_campaign(
@@ -998,21 +1328,42 @@ async fn dispatch_campaign(
     config_path: Option<&Path>,
     rpc_timeout: Duration,
     graph: &CampaignGraph,
+    steering: &[Value],
     registration: &mut CampaignRegistration,
     wait: bool,
 ) -> Result<Value> {
-    validate_host(graph, config_path, &registration.flow, &registration.driver)?;
-    let revision = campaign_revision(graph, registration.arm_serial)?;
+    if graph.executable_digest != registration.approved_graph_digest {
+        bail!(
+            "campaign executable graph changed from admitted {} to {}; inspect the issue graph and run `tally campaign arm {}` to approve it",
+            registration.approved_graph_digest,
+            graph.executable_digest,
+            registration.issue_url
+        );
+    }
+    validate_host(
+        graph,
+        config_path,
+        &registration.flow,
+        &registration.driver,
+        registration.allow_test_local_forge,
+    )?;
+    let revision = campaign_observation(graph, steering, registration.arm_serial)?;
     let executable = std::env::current_exe().context("cannot resolve tally executable")?;
     let brief = json!({
+        "campaignIdentity": &registration.registration_id,
         "repository": &graph.locator.repository,
         "issue": {
             "number": graph.locator.number.to_string(),
             "url": &graph.locator.url,
         },
         "runId": &revision,
-        "worklist": { "kind": "github-issue" },
+        "worklist": {
+            "kind": "github-issue",
+            "graphDigest": &registration.approved_graph_digest,
+        },
+        "steering": steering,
         "workspaceRoot": &registration.workspace_root,
+        "tally": &executable,
         "driver": &registration.driver,
         "driverRuntimeMaxSec": graph.manifest.driver_runtime_max_sec,
     });
@@ -1055,7 +1406,7 @@ async fn dispatch_campaign(
             "issue": &graph.locator.url,
             "revision": &revision,
         })),
-        manifest_hash: Some(graph.digest.clone()),
+        manifest_hash: Some(graph.executable_digest.clone()),
         consumption_estimate: None,
         runtime_max_sec: graph.manifest.runtime_max_sec,
         no_enqueue: false,
@@ -1074,7 +1425,7 @@ async fn dispatch_campaign(
     let admitted = client
         .call("queue.enqueue", Some(serde_json::to_value(payload)?))
         .await?;
-    registration.last_revision = Some(revision);
+    registration.last_observation = Some(revision);
     if !wait || admitted.get("verdict").and_then(Value::as_str).is_some() {
         return Ok(admitted);
     }
@@ -1093,8 +1444,13 @@ async fn run_campaign_arm(
     args: CampaignArmArgs,
 ) -> Result<()> {
     let locator = parse_issue_url(&args.issue)?;
-    let graph = fetch_campaign_graph(&locator)?;
     let state_dir = resolve_state_dir(args.state_dir)?;
+    let _lock = RegistryLock::acquire(&state_dir, true)?;
+    let authenticated_actor = authenticated_actor()?;
+    let allowed_actors = normalize_allowed_actors(&args.allowed_actors, &authenticated_actor)?;
+    let graph = fetch_campaign_graph(&locator)?;
+    require_allowed_issue_authors(&graph, &allowed_actors)?;
+    let steering = fetch_steering(&locator, &allowed_actors)?;
     let path = registration_path(&state_dir, &locator.url);
     let prior = if path.exists() {
         Some(read_registration(&path)?)
@@ -1105,7 +1461,7 @@ async fn run_campaign_arm(
     let driver = resolve_driver(args.driver)?;
     let workspace_root = args
         .workspace_root
-        .unwrap_or_else(|| state_dir.join("campaigns/workspaces"));
+        .map_or_else(default_campaign_workspace_root, Ok)?;
     if !workspace_root.is_absolute() {
         return Err(invalid("campaign workspace root must be absolute"));
     }
@@ -1117,12 +1473,19 @@ async fn run_campaign_arm(
     })?;
     let mut registration = CampaignRegistration {
         schema_version: REGISTRY_SCHEMA_VERSION,
+        registration_id: prior
+            .as_ref()
+            .map_or_else(|| uuid::Uuid::now_v7().to_string(), |value| value.registration_id.clone()),
         issue_url: locator.url.clone(),
         repository: locator.repository.clone(),
         issue_number: locator.number,
         armed_at: Utc::now().to_rfc3339(),
         arm_serial,
-        last_revision: prior.and_then(|value| value.last_revision),
+        approved_graph_digest: graph.executable_digest.clone(),
+        authenticated_actor,
+        allowed_actors,
+        allow_test_local_forge: args.allow_test_local_forge,
+        last_observation: prior.and_then(|value| value.last_observation),
         flow,
         driver,
         workspace_root,
@@ -1132,6 +1495,7 @@ async fn run_campaign_arm(
         config_path,
         &registration.flow,
         &registration.driver,
+        registration.allow_test_local_forge,
     )?;
     write_registration(&state_dir, &registration)?;
     if args.no_enqueue {
@@ -1141,6 +1505,8 @@ async fn run_campaign_arm(
                 "status": "armed",
                 "issue": locator.url,
                 "tasks": graph.tasks.len(),
+                "graphDigest": graph.executable_digest,
+                "allowedActors": registration.allowed_actors,
                 "enqueued": false,
             }))?
         );
@@ -1151,6 +1517,7 @@ async fn run_campaign_arm(
         config_path,
         rpc_timeout,
         &graph,
+        &steering,
         &mut registration,
         args.wait,
     )
@@ -1179,39 +1546,54 @@ async fn run_campaign_poll(
         return Err(invalid("campaign poll currently requires --once"));
     }
     let state_dir = resolve_state_dir(args.state_dir)?;
+    let _lock = RegistryLock::acquire(&state_dir, true)?;
     let entries = registrations(&state_dir)?;
     let mut observed = 0usize;
     let mut dispatched = 0usize;
+    let mut pruned = 0usize;
     let mut failures = Vec::new();
     for (path, mut registration) in entries {
         observed += 1;
         let attempt = async {
             let locator = parse_issue_url(&registration.issue_url)?;
+            require_authenticated_actor(&registration)?;
             let master = fetch_issue(&locator)?;
             if master.state != "open" {
-                return Ok(false);
+                fs::remove_file(&path)?;
+                return Ok((false, true));
             }
             let graph = fetch_campaign_graph(&locator)?;
-            let revision = campaign_revision(&graph, registration.arm_serial)?;
-            if registration.last_revision.as_deref() == Some(&revision) {
-                return Ok(false);
+            require_allowed_issue_authors(&graph, &registration.allowed_actors)?;
+            if graph.executable_digest != registration.approved_graph_digest {
+                bail!(
+                    "executable graph changed from admitted {} to {}; explicit re-arm is required",
+                    registration.approved_graph_digest,
+                    graph.executable_digest
+                );
+            }
+            let steering = fetch_steering(&locator, &registration.allowed_actors)?;
+            let observation = campaign_observation(&graph, &steering, registration.arm_serial)?;
+            if registration.last_observation.as_deref() == Some(&observation) {
+                return Ok((false, false));
             }
             dispatch_campaign(
                 socket,
                 config_path,
                 rpc_timeout,
                 &graph,
+                &steering,
                 &mut registration,
-                false,
+                args.wait,
             )
             .await?;
             write_registration(&state_dir, &registration)?;
-            Ok::<_, anyhow::Error>(true)
+            Ok::<_, anyhow::Error>((true, false))
         }
         .await;
         match attempt {
-            Ok(true) => dispatched += 1,
-            Ok(false) => {}
+            Ok((true, _)) => dispatched += 1,
+            Ok((_, true)) => pruned += 1,
+            Ok((false, false)) => {}
             Err(error) => failures.push(format!("{}: {error:#}", path.display())),
         }
     }
@@ -1220,6 +1602,7 @@ async fn run_campaign_poll(
         serde_json::to_string(&json!({
             "observed": observed,
             "dispatched": dispatched,
+            "pruned": pruned,
             "failures": failures,
         }))?
     );
@@ -1232,11 +1615,30 @@ async fn run_campaign_poll(
 
 fn run_campaign_list(args: CampaignListArgs) -> Result<()> {
     let state_dir = resolve_state_dir(args.state_dir)?;
+    let _lock = RegistryLock::acquire(&state_dir, false)?;
     let values = registrations(&state_dir)?
         .into_iter()
         .map(|(_, registration)| registration)
         .collect::<Vec<_>>();
     println!("{}", serde_json::to_string(&values)?);
+    Ok(())
+}
+
+fn run_campaign_disarm(args: CampaignDisarmArgs) -> Result<()> {
+    let locator = parse_issue_url(&args.issue)?;
+    let state_dir = resolve_state_dir(args.state_dir)?;
+    let _lock = RegistryLock::acquire(&state_dir, true)?;
+    let path = registration_path(&state_dir, &locator.url);
+    let removed = if path.exists() {
+        fs::remove_file(&path)?;
+        true
+    } else {
+        false
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&json!({"issue": locator.url, "disarmed": removed}))?
+    );
     Ok(())
 }
 
@@ -1378,6 +1780,29 @@ fn project_tasks(document: &Value) -> Result<Vec<ProjectTask>> {
         let item = candidate
             .as_object()
             .ok_or_else(|| invalid(format!("{context} must be an object")))?;
+        let kind = required_project_string(item, "kind", &context)?.to_owned();
+        if !matches!(kind.as_str(), "implementation" | "checkpoint") {
+            return Err(invalid(format!(
+                "{context}.kind must be implementation or checkpoint"
+            )));
+        }
+        let allowed = match kind.as_str() {
+            "implementation" => BTreeSet::from([
+                "id", "kind", "title", "body", "goal", "deliveredBehaviors",
+                "readFirst", "acceptanceCriteria", "issue", "dependencies",
+                "conflictDomains",
+            ]),
+            "checkpoint" => BTreeSet::from([
+                "id", "kind", "title", "body", "issue", "dependencies", "argv",
+                "runtimeMaxSec",
+            ]),
+            _ => unreachable!(),
+        };
+        if let Some(field) = item.keys().find(|field| !allowed.contains(field.as_str())) {
+            return Err(invalid(format!(
+                "{context} contains unsupported field {field:?} for kind {kind}"
+            )));
+        }
         let id = required_project_string(item, "id", &context)?.to_owned();
         if !safe_task_id(&id) || !prior.insert(id.clone()) {
             return Err(invalid(format!("{context}.id is invalid or duplicated")));
@@ -1412,10 +1837,33 @@ fn project_tasks(document: &Value) -> Result<Vec<ProjectTask>> {
                 )));
             }
         }
-        let conflict_domains = project_string_list(
-            item.get("conflictDomains"),
-            &format!("{context}.conflictDomains"),
-        )?;
+        let conflict_domains = if kind == "implementation" {
+            project_string_list(
+                item.get("conflictDomains"),
+                &format!("{context}.conflictDomains"),
+            )?
+        } else {
+            Vec::new()
+        };
+        let argv = if kind == "checkpoint" {
+            let values = project_string_list(item.get("argv"), &format!("{context}.argv"))?;
+            validate_argv(&values, &format!("{context}.argv"))?;
+            Some(values)
+        } else {
+            None
+        };
+        let runtime_max_sec = if kind == "checkpoint" {
+            Some(
+                item.get("runtimeMaxSec")
+                    .and_then(Value::as_u64)
+                    .filter(|value| *value > 0)
+                    .ok_or_else(|| {
+                        invalid(format!("{context}.runtimeMaxSec must be a positive integer"))
+                    })?,
+            )
+        } else {
+            None
+        };
         let body = render_project_task_body(item, &context)?;
         if body.chars().count() > 64_000 {
             return Err(invalid(format!(
@@ -1424,11 +1872,14 @@ fn project_tasks(document: &Value) -> Result<Vec<ProjectTask>> {
         }
         tasks.push(ProjectTask {
             id,
+            kind,
             title,
             body,
             issue,
             dependencies,
             conflict_domains,
+            argv,
+            runtime_max_sec,
         });
     }
     Ok(tasks)
@@ -1456,12 +1907,20 @@ fn task_references(tasks: &[ProjectTask]) -> Result<Value> {
         tasks
             .iter()
             .map(|task| {
-                Ok(json!({
+                let mut reference = json!({
                     "id": task.id,
+                    "kind": task.kind,
                     "issue": task.issue.ok_or_else(|| invalid(format!("task {} has no projected issue", task.id)))?,
                     "dependencies": task.dependencies,
                     "conflictDomains": task.conflict_domains,
-                }))
+                });
+                if task.kind == "checkpoint" {
+                    let object = reference.as_object_mut().expect("reference is an object");
+                    object.remove("conflictDomains");
+                    object.insert("argv".to_owned(), json!(task.argv));
+                    object.insert("runtimeMaxSec".to_owned(), json!(task.runtime_max_sec));
+                }
+                Ok(reference)
             })
             .collect::<Result<Vec<_>>>()?,
     ))
@@ -1690,6 +2149,7 @@ fn edit_master(
 fn merged_project_tasks(
     repository: &str,
     manifest: &CampaignManifest,
+    tasks: &[ProjectTask],
     issue_number: u64,
 ) -> Result<BTreeSet<String>> {
     if manifest.repository.forge != "github" {
@@ -1709,12 +2169,41 @@ fn merged_project_tasks(
     ])?;
     let mut merged = BTreeSet::new();
     let mut claimed_urls = BTreeSet::new();
+    let graph_digest = sha256_json(&json!({
+        "manifest": manifest,
+        "tasks": tasks.iter().map(|task| json!({
+            "number": task.issue.expect("projection assigns every issue"),
+            "title": task.title,
+            "body": format!("{TASK_MARKER_PREFIX}{} -->\n\n{}", task.id, task.body.trim()),
+        })).collect::<Vec<_>>(),
+    }))?;
     for task in &manifest.tasks {
+        if task.kind == "checkpoint" {
+            let reference = checkpoint_reference(
+                &manifest.name,
+                issue_number,
+                &task.id,
+                &graph_digest,
+            )?;
+            if projected_checkpoint_complete(manifest, &reference)? {
+                merged.insert(task.id.clone());
+            }
+            continue;
+        }
+        let revision = sha256_json(&json!({
+            "source": graph_digest,
+            "task": task.id,
+        }))?;
         let marker = format!(
-            "<!-- tally:spec-build:v1 campaign={} issue={} task={} -->",
-            manifest.name, issue_number, task.id
+            "<!-- tally:spec-build:v2 campaign={} issue={} task={} revision={} -->",
+            manifest.name, issue_number, task.id, revision
         );
-        let branch = stable_publish_branch(&manifest.name, issue_number, &task.id);
+        let branch = stable_publish_branch(
+            &manifest.name,
+            issue_number,
+            &task.id,
+            Some(&revision),
+        );
         let mut matching = candidates
             .iter()
             .filter(|candidate| {
@@ -1782,10 +2271,126 @@ fn merged_project_tasks(
     Ok(merged)
 }
 
-fn stable_publish_branch(campaign: &str, issue_number: u64, task_id: &str) -> String {
+fn projected_checkpoint_complete(manifest: &CampaignManifest, reference: &str) -> Result<bool> {
+    let git = |arguments: &[&str]| -> Result<std::process::Output> {
+        ProcessCommand::new("git")
+            .arg("-C")
+            .arg(&manifest.repository.checkout)
+            .args(arguments)
+            .output()
+            .context("cannot query projected checkpoint completion")
+    };
+    let listed = git(&[
+        "ls-remote",
+        "--refs",
+        &manifest.repository.remote,
+        reference,
+    ])?;
+    if !listed.status.success() {
+        bail!(
+            "cannot query checkpoint ref {reference}: {}",
+            String::from_utf8_lossy(&listed.stderr).trim()
+        );
+    }
+    let stdout = String::from_utf8(listed.stdout).context("git ls-remote was not UTF-8")?;
+    if stdout.trim().is_empty() {
+        return Ok(false);
+    }
+    let lines = stdout.lines().collect::<Vec<_>>();
+    if lines.len() != 1 {
+        bail!("checkpoint ref {reference} returned more than one remote row");
+    }
+    let target = lines[0]
+        .split_once('\t')
+        .filter(|(_, name)| *name == reference)
+        .map(|(target, _)| target)
+        .filter(|target| {
+            (40..=64).contains(&target.len())
+                && target.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .ok_or_else(|| invalid(format!("checkpoint ref {reference} returned malformed output")))?;
+    let fetched_base = git(&[
+        "fetch",
+        "--prune",
+        "--no-tags",
+        &manifest.repository.remote,
+    ])?;
+    if !fetched_base.status.success() {
+        bail!("cannot refresh campaign base while projecting checkpoint state");
+    }
+    let fetched_tag = git(&[
+        "fetch",
+        "--no-tags",
+        &manifest.repository.remote,
+        reference,
+    ])?;
+    if !fetched_tag.status.success() {
+        bail!("cannot fetch checkpoint ref {reference}");
+    }
+    let object_type = git(&["cat-file", "-t", target])?;
+    if !object_type.status.success() || String::from_utf8_lossy(&object_type.stdout).trim() != "commit"
+    {
+        return Ok(false);
+    }
+    let base = format!(
+        "{}/{}",
+        manifest.repository.remote, manifest.repository.base_branch
+    );
+    Ok(git(&["merge-base", "--is-ancestor", target, &base])?
+        .status
+        .success())
+}
+
+fn stable_publish_branch(
+    campaign: &str,
+    issue_number: u64,
+    task_id: &str,
+    revision: Option<&str>,
+) -> String {
     let slug = campaign.trim_matches(['.', '-']);
     let slug = &slug[..slug.len().min(32)];
-    format!("tally/{slug}-issue-{issue_number}/{task_id}")
+    let suffix = revision
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .map(|value| format!("-{}", &value[..value.len().min(16)]))
+        .unwrap_or_default();
+    format!("tally/{slug}-issue-{issue_number}/{task_id}{suffix}")
+}
+
+fn checkpoint_reference(
+    campaign: &str,
+    issue_number: u64,
+    task_id: &str,
+    source: &str,
+) -> Result<String> {
+    let digest = source
+        .strip_prefix("sha256:")
+        .filter(|value| value.len() == 64)
+        .ok_or_else(|| invalid("checkpoint source is not a SHA-256 identity"))?;
+    let mut readable = campaign
+        .to_ascii_lowercase()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_lowercase() || character.is_ascii_digit() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    while readable.contains("--") {
+        readable = readable.replace("--", "-");
+    }
+    readable = readable.trim_matches('-').chars().take(24).collect();
+    readable = readable.trim_end_matches('-').to_owned();
+    if readable.is_empty() {
+        readable = "campaign".to_owned();
+    }
+    let campaign_identity = format!("{:x}", Sha256::digest(campaign.as_bytes()));
+    Ok(format!(
+        "refs/tags/tally/spec-build/v1/{}-{}-issue-{issue_number}/{task_id}-{digest}",
+        readable,
+        &campaign_identity[..12],
+    ))
 }
 
 fn validate_project_shape(config: &Value, tasks: &[ProjectTask]) -> Result<()> {
@@ -2125,7 +2730,7 @@ fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
     })?;
     validate_manifest(&manifest)?;
     reconcile_dependencies(&repository, &tasks)?;
-    let merged = merged_project_tasks(&repository, &manifest, locator.number)?;
+    let merged = merged_project_tasks(&repository, &manifest, &tasks, locator.number)?;
     master_body = render_master_body(&master_body, &config, &tasks, &merged)?;
     edit_master(
         &repository,
@@ -2206,8 +2811,8 @@ mod tests {
         let document = json!({
             "schemaVersion": 1,
             "tasks": [
-                {"id": "foundation", "title": "Foundation", "body": "Do the first thing.", "dependencies": [], "conflictDomains": ["src"]},
-                {"id": "finish", "title": "Finish", "body": "Do the next thing.", "dependencies": ["foundation"], "conflictDomains": ["tests"]}
+                {"id": "foundation", "kind": "implementation", "title": "Foundation", "body": "Do the first thing.", "dependencies": [], "conflictDomains": ["src"]},
+                {"id": "finish", "kind": "implementation", "title": "Finish", "body": "Do the next thing.", "dependencies": ["foundation"], "conflictDomains": ["tests"]}
             ]
         });
         let tasks = project_tasks(&document).unwrap();
@@ -2221,6 +2826,7 @@ mod tests {
             "schemaVersion": 1,
             "tasks": [{
                 "id": "foundation",
+                "kind": "implementation",
                 "title": "Foundation",
                 "body": "x".repeat(64_001),
                 "dependencies": [],
@@ -2234,6 +2840,7 @@ mod tests {
     fn worklist_projection_must_match_manifest_but_checkbox_state_is_not_truth() {
         let value = manifest_value_for_test(json!([{
             "id": "foundation",
+            "kind": "implementation",
             "issue": 43,
             "dependencies": [],
             "conflictDomains": []
@@ -2252,8 +2859,8 @@ mod tests {
         let document = json!({
             "schemaVersion": 1,
             "tasks": [
-                {"id": "one", "title": "One", "body": "First.", "dependencies": [], "conflictDomains": []},
-                {"id": "two", "title": "Two", "body": "Second.", "dependencies": ["one"], "conflictDomains": []}
+                {"id": "one", "kind": "implementation", "title": "One", "body": "First.", "dependencies": [], "conflictDomains": []},
+                {"id": "two", "kind": "implementation", "title": "Two", "body": "Second.", "dependencies": ["one"], "conflictDomains": []}
             ]
         });
         let mut config = manifest_value_for_test(json!([]));
@@ -2298,6 +2905,45 @@ mod tests {
             ]),
         );
         let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
-        assert_eq!(max_flow_nodes(&manifest), 36);
+        assert_eq!(max_flow_nodes(&manifest), 39);
+    }
+
+    #[test]
+    fn manifest_accepts_native_checkpoints_and_rejects_unknown_kinds() {
+        let value = manifest_value_for_test(json!([
+            {
+                "id": "build",
+                "kind": "implementation",
+                "issue": 43,
+                "dependencies": [],
+                "conflictDomains": []
+            },
+            {
+                "id": "verify",
+                "kind": "checkpoint",
+                "issue": 44,
+                "dependencies": ["build"],
+                "argv": ["nix", "flake", "check"],
+                "runtimeMaxSec": 900
+            }
+        ]));
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        validate_manifest(&manifest).unwrap();
+        let mut invalid = manifest_value_for_test(json!([{
+            "id": "mystery",
+            "kind": "approval",
+            "issue": 43,
+            "dependencies": [],
+            "conflictDomains": []
+        }]));
+        let manifest: CampaignManifest = serde_json::from_value(invalid.take()).unwrap();
+        assert!(validate_manifest(&manifest).is_err());
+    }
+
+    #[test]
+    fn arm_argv_validation_matches_the_driver() {
+        assert!(validate_argv(&["true".into(), "".into()], "argv").is_err());
+        assert!(validate_argv(&["true".into(), "line\nbreak".into()], "argv").is_err());
+        validate_argv(&["true".into(), "--flag".into()], "argv").unwrap();
     }
 }

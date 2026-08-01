@@ -27,6 +27,10 @@ export const meta = {
         maxLength: 80,
         pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
       },
+      campaignIdentity: {
+        type: "string",
+        pattern: "^[0-9a-fA-F-]{36}$"
+      },
       repository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
       issue: {
         type: "object",
@@ -58,8 +62,11 @@ export const meta = {
           { type: "string", minLength: 1 },
           {
             type: "object",
-            required: ["kind"],
-            properties: { kind: { const: "github-issue" } },
+            required: ["kind", "graphDigest"],
+            properties: {
+              kind: { const: "github-issue" },
+              graphDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
+            },
             additionalProperties: false
           }
         ]
@@ -68,8 +75,26 @@ export const meta = {
       maxParallel: { type: "integer", minimum: 1, maximum: 128 },
       reconcileCommand: { type: "string", pattern: "^/[^\\r\\n]+$", maxLength: 300 },
       workspaceRoot: { type: "string", pattern: "^/" },
+      tally: { type: "string", pattern: "^/" },
       driver: { type: "string", pattern: "^/" },
       driverRuntimeMaxSec: { type: "integer", minimum: 1 },
+      steering: {
+        type: "array",
+        maxItems: 1000,
+        items: {
+          type: "object",
+          required: ["id", "url", "author", "body", "createdAt", "updatedAt"],
+          properties: {
+            id: { type: "integer", minimum: 1 },
+            url: { type: "string", minLength: 1 },
+            author: { type: "string", minLength: 1, maxLength: 39 },
+            body: { type: "string", maxLength: 64000 },
+            createdAt: { type: "string", minLength: 1 },
+            updatedAt: { type: "string", minLength: 1 }
+          },
+          additionalProperties: false
+        }
+      },
       agent: {
         type: "object",
         required: [
@@ -85,7 +110,7 @@ export const meta = {
           argv: {
             type: "array",
             minItems: 1,
-            items: { type: "string" }
+            items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
           },
           priority: { enum: ["interrupt", "high", "medium", "low"] },
           runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
@@ -110,12 +135,12 @@ export const meta = {
                 preflightArgv: {
                   type: "array",
                   minItems: 1,
-                  items: { type: "string" }
+                  items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
                 },
                 argv: {
                   type: "array",
                   minItems: 1,
-                  items: { type: "string" }
+                  items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
                 },
                 runtimeMaxSec: { type: "integer", minimum: 1 }
               },
@@ -155,11 +180,15 @@ export const meta = {
         ]
       },
       {
+        required: ["campaignIdentity", "steering", "tally"],
         properties: {
           worklist: {
             type: "object",
-            required: ["kind"],
-            properties: { kind: { const: "github-issue" } },
+            required: ["kind", "graphDigest"],
+            properties: {
+              kind: { const: "github-issue" },
+              graphDigest: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
+            },
             additionalProperties: false
           }
         }
@@ -258,7 +287,7 @@ const checkpointTaskSchema = {
     argv: {
       type: "array",
       minItems: 1,
-      items: { type: "string" }
+      items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
     },
     runtimeMaxSec: { type: "integer", minimum: 1 },
     dependencies: {
@@ -271,7 +300,7 @@ const checkpointTaskSchema = {
 
 const issueTaskSchema = {
   type: "object",
-  required: ["id", "kind", "title", "brief", "dependencies", "conflictDomains"],
+  required: ["id", "kind", "title", "brief", "dependencies", "conflictDomains", "revision"],
   properties: {
     id: taskIdSchema,
     kind: { const: "implementation" },
@@ -294,13 +323,43 @@ const issueTaskSchema = {
       additionalProperties: false
     },
     dependencies: { type: "array", items: taskIdSchema },
-    conflictDomains: stringList
+    conflictDomains: stringList,
+    revision: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
+  },
+  additionalProperties: false
+};
+
+const issueCheckpointTaskSchema = {
+  type: "object",
+  required: [
+    "id",
+    "kind",
+    "title",
+    "brief",
+    "argv",
+    "runtimeMaxSec",
+    "dependencies",
+    "revision"
+  ],
+  properties: {
+    id: taskIdSchema,
+    kind: { const: "checkpoint" },
+    title: { type: "string", minLength: 1, maxLength: 300 },
+    brief: issueTaskSchema.properties.brief,
+    argv: {
+      type: "array",
+      minItems: 1,
+      items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
+    },
+    runtimeMaxSec: { type: "integer", minimum: 1 },
+    dependencies: { type: "array", items: taskIdSchema },
+    revision: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
   },
   additionalProperties: false
 };
 
 const taskSchema = {
-  oneOf: [implementationTaskSchema, checkpointTaskSchema, issueTaskSchema]
+  oneOf: [implementationTaskSchema, checkpointTaskSchema, issueTaskSchema, issueCheckpointTaskSchema]
 };
 
 const sourceSchema = {
@@ -317,11 +376,12 @@ const sourceSchema = {
     },
     {
       type: "object",
-      required: ["kind", "url", "sha256"],
+      required: ["kind", "url", "sha256", "revision"],
       properties: {
         kind: { const: "github-issue" },
         url: { type: "string", minLength: 1 },
-        sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
+        sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+        revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
       },
       additionalProperties: false
     }
@@ -334,7 +394,8 @@ const mergedFactSchema = {
   properties: {
     taskId: taskIdSchema,
     pullRequest: { type: "string", minLength: 1 },
-    mergeCommit: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
+    mergeCommit: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
+    revision: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
   },
   additionalProperties: false
 };
@@ -706,6 +767,11 @@ function driverNode(
 }
 
 let effective = null;
+let campaignTaskIdentity = null;
+
+function taskRefFor(taskId) {
+  return `${campaignTaskIdentity}/${taskId}`;
+}
 
 function workspaceFor(prepared, baseRev) {
   return {
@@ -773,7 +839,7 @@ function implementationBrief(task, prepared, reconciliation) {
   return {
     schemaVersion: 1,
     mission: task.brief
-      ? `Implement only forge task ${task.id}: ${task.title}. The exact operator-authored task brief is task.brief.body below. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task issue; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Read the master campaign issue comments and the machineDiagnoses below for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`
+      ? `Implement only forge task ${task.id}: ${task.title}. The exact admitted task brief is task.brief.body below. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, read another task issue, or fetch issue comments; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Treat only steering.authorizedComments and steering.machineDiagnoses below as steering. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`
       : `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task from the worklist; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Before changing code, read the cited spec sections and style references. Read the campaign issue comments and the machineDiagnoses below for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
     campaign: {
       name: effective.campaign,
@@ -783,20 +849,28 @@ function implementationBrief(task, prepared, reconciliation) {
     },
     task,
     workspace: prepared,
-    steering: {
-      channel: "github-issue-comments",
-      repository: args.repository,
-      issueNumber: args.issue.number,
-      issueUrl: args.issue.url,
-      machineDiagnoses: machineDiagnoses(reconciliation, task.id)
-    }
+    steering: task.brief
+      ? {
+          channel: "locally-authorized-snapshot",
+          authorizedComments: args.steering,
+          machineDiagnoses: machineDiagnoses(reconciliation, task.id)
+        }
+      : {
+          channel: "github-issue-comments",
+          repository: args.repository,
+          issueNumber: args.issue.number,
+          issueUrl: args.issue.url,
+          machineDiagnoses: machineDiagnoses(reconciliation, task.id)
+        }
   };
 }
 
 function checkpointBrief(task, prepared, reconciliation) {
   return {
     schemaVersion: 1,
-    mission: `Run automated checkpoint ${task.id}: ${task.title}. The command is fixed by the worklist. Read the campaign issue comments and the machineDiagnoses below as the durable failure history for this retry. Do not modify the repository.`,
+    mission: task.brief
+      ? `Run automated checkpoint ${task.id}: ${task.title}. The command is fixed by the admitted issue graph. Do not fetch issue comments; treat only steering.authorizedComments and steering.machineDiagnoses below as steering. Do not modify the repository.`
+      : `Run automated checkpoint ${task.id}: ${task.title}. The command is fixed by the worklist. Read the campaign issue comments and the machineDiagnoses below as the durable failure history for this retry. Do not modify the repository.`,
     campaign: {
       name: effective.campaign,
       repository: args.repository,
@@ -805,13 +879,19 @@ function checkpointBrief(task, prepared, reconciliation) {
     },
     task,
     workspace: prepared,
-    steering: {
-      channel: "github-issue-comments",
-      repository: args.repository,
-      issueNumber: args.issue.number,
-      issueUrl: args.issue.url,
-      machineDiagnoses: machineDiagnoses(reconciliation, task.id)
-    }
+    steering: task.brief
+      ? {
+          channel: "locally-authorized-snapshot",
+          authorizedComments: args.steering,
+          machineDiagnoses: machineDiagnoses(reconciliation, task.id)
+        }
+      : {
+          channel: "github-issue-comments",
+          repository: args.repository,
+          issueNumber: args.issue.number,
+          issueUrl: args.issue.url,
+          machineDiagnoses: machineDiagnoses(reconciliation, task.id)
+        }
   };
 }
 
@@ -844,7 +924,7 @@ function reconciledProjection(reconciliation) {
 
 async function runGate(task, gate, workspace, prefix) {
   const key = `${prefix}-${task.id}-${gate.id}`;
-  const taskRef = `${effective.campaign}/${task.id}`;
+  const taskRef = taskRefFor(task.id);
   if (gate.kind === "command") {
     return sh(gate.argv, {
       pools: ["campaign-control"],
@@ -891,7 +971,7 @@ async function runPreflightGate(task, gate, workspace) {
     key: `preflight-gate-${gate.id}`,
     label: `preflight-gate-${gate.id}`,
     settle: true,
-    taskRef: `${effective.campaign}/${task.id}`
+    taskRef: taskRefFor(task.id)
   });
 }
 
@@ -935,6 +1015,7 @@ async function sweepCampaign(repositoryConfig) {
 
 (async () => {
   const forgeNative = typeof args.worklist === "object";
+  campaignTaskIdentity = forgeNative ? args.campaignIdentity : args.campaign;
   if (!forgeNative) {
     const configuredGateIds = [];
     for (const gate of args.gates) {
@@ -1079,7 +1160,7 @@ async function sweepCampaign(repositoryConfig) {
   ) {
     const preflightTask = reconciliation.frontier.find(task => task.kind === "implementation");
     if (preflightTask !== undefined) {
-      const preflightTaskRef = `${effective.campaign}/${preflightTask.id}`;
+      const preflightTaskRef = taskRefFor(preflightTask.id);
       const preflight = await driverNode(
         "preflight",
         {
@@ -1133,7 +1214,7 @@ async function sweepCampaign(repositoryConfig) {
 
   const laneOutcomes = await parallel(
     reconciliation.frontier.map(task => () => (async () => {
-      const taskRef = `${effective.campaign}/${task.id}`;
+      const taskRef = taskRefFor(task.id);
       const prepBrief = {
         campaign: effective.campaign,
         repository: args.repository,
@@ -1398,7 +1479,7 @@ async function sweepCampaign(repositoryConfig) {
   // moved base causes a rebase and a second witnessed gate pass.
   for (const lane of publications) {
     const task = lane.task;
-    const taskRef = `${effective.campaign}/${task.id}`;
+    const taskRef = taskRefFor(task.id);
     const workspace = workspaceFor(lane.prepared);
     const integration = await driverNode(
       "rebase",
@@ -1681,7 +1762,7 @@ async function sweepCampaign(repositoryConfig) {
       cleanupSchema,
       null,
       true,
-      `${effective.campaign}/${lane.task.id}`
+      taskRefFor(lane.task.id)
     )),
     { settle: true }
   );

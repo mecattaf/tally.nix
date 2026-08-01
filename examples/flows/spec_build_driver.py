@@ -138,6 +138,13 @@ def emit(value: dict[str, Any]) -> None:
     print("TALLY_FINAL_MESSAGE=" + json.dumps(value, sort_keys=True, separators=(",", ":")))
 
 
+def canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 def run(
     command: list[str],
     *,
@@ -593,7 +600,9 @@ def forge_gates(value: Any) -> list[dict[str, Any]]:
     return result
 
 
-def forge_manifest(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def forge_manifest(
+    value: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     manifest = object_exact(
         value,
         {
@@ -627,11 +636,11 @@ def forge_manifest(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         or not 1 <= max_parallel <= max_tasks
     ):
         fail("campaign manifest.maxParallel must be positive and not exceed maxTasks")
-    positive_integer(
+    driver_runtime = positive_integer(
         manifest.get("driverRuntimeMaxSec", 900),
         "campaign manifest.driverRuntimeMaxSec",
     )
-    runtime = manifest.get("runtimeMaxSec")
+    runtime = manifest.get("runtimeMaxSec", 86_400)
     if runtime is not None:
         positive_integer(runtime, "campaign manifest.runtimeMaxSec")
     pool = manifest.get("pool", "campaign")
@@ -647,11 +656,23 @@ def forge_manifest(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     issues: set[int] = set()
     for index, candidate in enumerate(candidates):
         context = f"campaign manifest.tasks[{index}]"
-        task = object_exact(
-            candidate,
-            {"id", "issue", "dependencies", "conflictDomains"},
-            context,
-        )
+        if not isinstance(candidate, dict):
+            fail(f"{context} must be an object")
+        kind = candidate.get("kind")
+        if kind == "implementation":
+            task = object_exact(
+                candidate,
+                {"id", "kind", "issue", "dependencies", "conflictDomains"},
+                context,
+            )
+        elif kind == "checkpoint":
+            task = object_exact(
+                candidate,
+                {"id", "kind", "issue", "dependencies", "argv", "runtimeMaxSec"},
+                context,
+            )
+        else:
+            fail(f"{context}.kind must be implementation or checkpoint")
         identifier = required_string(task.get("id"), f"{context}.id", 80)
         if not TASK_ID.fullmatch(identifier) or identifier in prior:
             fail(f"{context}.id is invalid or duplicated")
@@ -661,17 +682,32 @@ def forge_manifest(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         dependencies = string_list(task.get("dependencies", []), f"{context}.dependencies")
         if len(dependencies) != len(set(dependencies)) or any(item not in prior for item in dependencies):
             fail(f"{context}.dependencies must be unique earlier task ids")
-        conflicts = normalize_conflict_domains(
-            task.get("conflictDomains"),
-            f"{context}.conflictDomains",
-            required=max_parallel > 1,
+        conflicts = (
+            normalize_conflict_domains(
+                task.get("conflictDomains"),
+                f"{context}.conflictDomains",
+                required=max_parallel > 1,
+            )
+            if kind == "implementation"
+            else []
+        )
+        checkpoint_argv = (
+            argv(task.get("argv"), f"{context}.argv") if kind == "checkpoint" else None
+        )
+        checkpoint_runtime = (
+            positive_integer(task.get("runtimeMaxSec"), f"{context}.runtimeMaxSec")
+            if kind == "checkpoint"
+            else None
         )
         references.append(
             {
                 "id": identifier,
+                "kind": kind,
                 "issue": number,
                 "dependencies": dependencies,
                 "conflictDomains": conflicts,
+                "argv": checkpoint_argv,
+                "runtimeMaxSec": checkpoint_runtime,
             }
         )
         prior.add(identifier)
@@ -689,7 +725,25 @@ def forge_manifest(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         "gates": gates,
         "reconcileCommand": None,
     }
-    return config, references
+    normalized_manifest = {
+        "schemaVersion": 1,
+        "name": campaign,
+        "repository": {
+            "checkout": str(repository_config["checkout"]),
+            "baseBranch": repository_config["baseBranch"],
+            "remote": repository_config["remote"],
+            "forge": repository_config["forge"],
+        },
+        "maxTasks": max_tasks,
+        "maxParallel": max_parallel,
+        "driverRuntimeMaxSec": driver_runtime,
+        "runtimeMaxSec": runtime,
+        "pool": pool,
+        "agent": agent,
+        "gates": gates,
+        "tasks": references,
+    }
+    return config, references, normalized_manifest
 
 
 def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
@@ -701,9 +755,12 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     expected_url = f"https://github.com/{repository}/issues/{issue['number']}"
     if issue["url"] != expected_url:
         fail("campaign issue URL does not match repository and issue number")
-    selector = object_exact(data.get("worklist"), {"kind"}, "worklist")
+    selector = object_exact(data.get("worklist"), {"kind", "graphDigest"}, "worklist")
     if selector.get("kind") != "github-issue":
         fail("forge-native worklist.kind must equal github-issue")
+    admitted_digest = required_string(selector.get("graphDigest"), "worklist.graphDigest")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", admitted_digest):
+        fail("worklist.graphDigest must be a lowercase SHA-256 identity")
     master = github_json(
         ["api", f"repos/{repository}/issues/{issue['number']}"],
         "campaign master issue",
@@ -722,7 +779,7 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
         manifest_value = json.loads(section[len("```json") : -3].strip())
     except json.JSONDecodeError as error:
         fail(f"campaign manifest is invalid JSON: {error}")
-    config, references = forge_manifest(manifest_value)
+    config, references, normalized_manifest = forge_manifest(manifest_value)
     subissues = github_json(
         [
             "api",
@@ -761,44 +818,62 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
         expected_task_url = f"https://github.com/{repository}/issues/{reference['issue']}"
         if task_url != expected_task_url:
             fail(f"task {reference['id']} issue URL is not canonical")
-        tasks.append(
-            {
-                "id": reference["id"],
-                "kind": "implementation",
-                "title": title,
-                "brief": {
-                    "issue": {"number": str(reference["issue"]), "url": task_url},
-                    "body": task_body,
-                },
-                "dependencies": reference["dependencies"],
-                "conflictDomains": reference["conflictDomains"],
-            }
-        )
+        common = {
+            "id": reference["id"],
+            "kind": reference["kind"],
+            "title": title,
+            "brief": {
+                "issue": {"number": str(reference["issue"]), "url": task_url},
+                "body": task_body,
+            },
+            "dependencies": reference["dependencies"],
+        }
+        if reference["kind"] == "implementation":
+            common["conflictDomains"] = reference["conflictDomains"]
+        else:
+            common["argv"] = reference["argv"]
+            common["runtimeMaxSec"] = reference["runtimeMaxSec"]
+        tasks.append(common)
     source_value = {
-        "manifest": manifest_value,
-        "master": {
-            "body": body,
-            "state": master.get("state"),
-            "updatedAt": master.get("updated_at"),
-        },
+        "manifest": normalized_manifest,
         "tasks": [
             {
-                "number": candidate.get("number"),
-                "title": candidate.get("title"),
-                "body": candidate.get("body"),
-                "state": candidate.get("state"),
-                "updatedAt": candidate.get("updated_at"),
+                "number": reference["issue"],
+                "title": by_number[reference["issue"]].get("title"),
+                "body": by_number[reference["issue"]].get("body"),
             }
-            for candidate in subissues
+            for reference in references
         ],
     }
-    digest = hashlib.sha256(
-        json.dumps(source_value, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    digest = canonical_sha256(source_value)
+    if digest != admitted_digest:
+        fail(
+            "live issue executable graph does not match the armed digest; "
+            "inspect it and explicitly re-arm"
+        )
+    for task in tasks:
+        task["revision"] = canonical_sha256(
+            {"source": admitted_digest, "task": task["id"]}
+        )
+    repository_config = repo_config(config["repositoryConfig"])
+    checkout = repository_config["checkout"]
+    remote = repository_config["remote"]
+    git(checkout, "fetch", "--prune", "--no-tags", remote)
+    source_revision = git(
+        checkout,
+        "rev-parse",
+        "--verify",
+        f"{remote}/{repository_config['baseBranch']}^{{commit}}",
+    ).stdout.strip()
     return {
         "schemaVersion": 1,
         "repository": repository,
-        "source": {"kind": "github-issue", "url": expected_url, "sha256": f"sha256:{digest}"},
+        "source": {
+            "kind": "github-issue",
+            "url": expected_url,
+            "sha256": admitted_digest,
+            "revision": source_revision,
+        },
         "tasks": tasks,
         "config": config,
         "masterBody": body,
@@ -1140,10 +1215,29 @@ def forge_campaign_state(
     return diagnoses, escalations[0] if escalations else None
 
 
-def pull_request_marker(campaign: str, issue_number: str, task_id: str) -> str:
+def task_revision(task: dict[str, Any]) -> str | None:
+    value = task.get("revision")
+    if value is None:
+        return None
+    value = required_string(value, f"task {task.get('id')} revision")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+        fail("task revision must be a lowercase SHA-256 identity")
+    return value
+
+
+def pull_request_marker(
+    campaign: str, issue_number: str, task_id: str, revision: str | None = None
+) -> str:
+    if revision is None:
+        return (
+            "<!-- tally:spec-build:v1 "
+            f"campaign={campaign} issue={issue_number} task={task_id} -->"
+        )
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", revision):
+        fail("pull request marker revision must be a lowercase SHA-256 identity")
     return (
-        "<!-- tally:spec-build:v1 "
-        f"campaign={campaign} issue={issue_number} task={task_id} -->"
+        "<!-- tally:spec-build:v2 "
+        f"campaign={campaign} issue={issue_number} task={task_id} revision={revision} -->"
     )
 
 
@@ -1219,19 +1313,24 @@ def merged_github_tasks(
     warnings: list[str] = []
     claimed_urls: set[str] = set()
     markers = {
-        task["id"]: pull_request_marker(campaign, issue_number, task["id"])
+        task["id"]: pull_request_marker(
+            campaign, issue_number, task["id"], task_revision(task)
+        )
         for task in tasks
         if task["kind"] == "implementation"
     }
-    campaign_marker_prefix = (
-        "<!-- tally:spec-build:v1 "
-        f"campaign={campaign} issue={issue_number} task="
+    revisions = {task["id"]: task_revision(task) for task in tasks}
+    campaign_marker_prefixes = (
+        f"<!-- tally:spec-build:v1 campaign={campaign} issue={issue_number} task=",
+        f"<!-- tally:spec-build:v2 campaign={campaign} issue={issue_number} task=",
     )
     for candidate in candidates:
         if not isinstance(candidate, dict) or not isinstance(candidate.get("body"), str):
             continue
         body = candidate["body"]
-        if campaign_marker_prefix in body and not any(marker in body for marker in markers.values()):
+        if any(prefix in body for prefix in campaign_marker_prefixes) and not any(
+            marker in body for marker in markers.values()
+        ):
             url = candidate.get("url")
             identity = url if isinstance(url, str) and url else "an unidentifiable pull request"
             warnings.append(
@@ -1281,13 +1380,16 @@ def merged_github_tasks(
             "taskId": task_id,
             "pullRequest": url_value,
             "mergeCommit": oid,
+            **({"revision": revisions[task_id]} if revisions[task_id] is not None else {}),
         }, None
 
     for task in tasks:
         if task["kind"] != "implementation":
             continue
         marker = markers[task["id"]]
-        branch = stable_publish_branch(campaign, issue_number, task["id"])
+        branch = stable_publish_branch(
+            campaign, issue_number, task["id"], task_revision(task)
+        )
         matching = [
             candidate
             for candidate in candidates
@@ -1367,9 +1469,12 @@ def merged_github_tasks(
     return facts, list(dict.fromkeys(warnings))
 
 
-def stable_publish_branch(campaign: str, issue_number: str, task_id: str) -> str:
+def stable_publish_branch(
+    campaign: str, issue_number: str, task_id: str, revision: str | None = None
+) -> str:
     campaign_slug = safe_slug(campaign, 32)
-    return f"tally/{campaign_slug}-issue-{issue_number}/{task_id}"
+    suffix = "" if revision is None else "-" + revision.removeprefix("sha256:")[:16]
+    return f"tally/{campaign_slug}-issue-{issue_number}/{task_id}{suffix}"
 
 
 def merged_local_tasks(
@@ -1394,7 +1499,8 @@ def merged_local_tasks(
     for task in tasks:
         if task["kind"] != "implementation":
             continue
-        branch = stable_publish_branch(campaign, issue_number, task["id"])
+        revision = task_revision(task)
+        branch = stable_publish_branch(campaign, issue_number, task["id"], revision)
         remote_ref = f"refs/remotes/{remote}/{branch}"
         if git(checkout, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode:
             continue
@@ -1406,6 +1512,7 @@ def merged_local_tasks(
                 "taskId": task["id"],
                 "pullRequest": f"local://{repository}/{branch}",
                 "mergeCommit": head,
+                **({"revision": revision} if revision is not None else {}),
             }
         )
     return facts
@@ -1485,7 +1592,7 @@ def sync_issue_checkboxes(
     issue_number: str,
     body: str,
     tasks: list[dict[str, Any]],
-    merged_ids: set[str],
+    completed_ids: set[str],
 ) -> None:
     start_index = body.find(WORKLIST_BEGIN)
     if start_index < 0:
@@ -1500,12 +1607,68 @@ def sync_issue_checkboxes(
         fail("campaign master issue repeats a worklist marker")
     lines = [""]
     for task in tasks:
-        state = "x" if task["id"] in merged_ids else " "
+        state = "x" if task["id"] in completed_ids else " "
         title = task["title"].replace("\r", " ").replace("\n", " ")
         lines.append(
             f"- [{state}] {TASK_MARKER_PREFIX}{task['id']} --> "
             f"#{task['brief']['issue']['number']} — {title}"
         )
+
+
+def close_completed_issue_campaign(
+    repository: str,
+    issue_number: str,
+    source: dict[str, str],
+    tasks: list[dict[str, Any]],
+) -> None:
+    for task in tasks:
+        task_issue = campaign_issue(task["brief"].get("issue"))
+        viewed = github_json(
+            ["api", f"repos/{repository}/issues/{task_issue['number']}"],
+            f"campaign task issue {task['id']}",
+        )
+        if not isinstance(viewed, dict):
+            fail(f"campaign task issue {task['id']} did not return an object")
+        if viewed.get("state") == "open":
+            run(
+                [
+                    "gh",
+                    "issue",
+                    "close",
+                    task_issue["number"],
+                    "--repo",
+                    repository,
+                ]
+            )
+    digest = required_string(source.get("sha256"), "source.sha256")
+    marker = f"<!-- tally:campaign-complete:v1 source={digest} -->"
+    comments = run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            f"repos/{repository}/issues/{issue_number}/comments?per_page=100",
+            "--jq",
+            ".[] | .body",
+        ]
+    ).stdout
+    if marker not in comments:
+        run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                issue_number,
+                "--repo",
+                repository,
+                "--body",
+                (
+                    f"{marker}\nCampaign complete: {len(tasks)} task(s) are bound to "
+                    f"durable merge/checkpoint facts for `{digest}`."
+                ),
+            ]
+        )
+    run(["gh", "issue", "close", issue_number, "--repo", repository])
     lines.append("")
     content = "\n".join(lines)
     updated = body[:content_start] + content + body[end_index:]
@@ -1602,12 +1765,8 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         repository = worklist["repository"]
         config = repo_config(data.get("repositoryConfig"))
         max_parallel = data["maxParallel"]
-    base_rev = (
-        None
-        if forge_native
-        else required_string(
-            worklist["source"].get("revision"), "worklist source revision"
-        )
+    base_rev = required_string(
+        worklist["source"].get("revision"), "worklist source revision"
     )
     if config["forge"] == "github":
         merged, warnings = merged_github_tasks(
@@ -1683,8 +1842,15 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             issue["number"],
             worklist["masterBody"],
             worklist["tasks"],
-            merged_ids,
+            completed_ids,
         )
+        if not remaining:
+            close_completed_issue_campaign(
+                repository,
+                issue["number"],
+                worklist["source"],
+                worklist["tasks"],
+            )
     warnings.extend(parallelism_warnings(ready, frontier, max_parallel))
     result = {
         "schemaVersion": 1,
@@ -2351,7 +2517,7 @@ def write_atomic(path: Path, value: dict[str, Any]) -> None:
 
 
 def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
-    _, config, identity = prep_identity(brief)
+    data, config, identity = prep_identity(brief)
     checkout: Path = config["checkout"]
     remote = config["remote"]
     base_branch = config["baseBranch"]
@@ -2360,7 +2526,10 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     repository_slug = safe_slug(identity["repository"].split("/", 1)[1], 40)
     branch = f"tally-work/{campaign_slug}-{run_hash}/{identity['taskId']}"
     publish_branch = stable_publish_branch(
-        identity["campaign"], identity["issueNumber"], identity["taskId"]
+        identity["campaign"],
+        identity["issueNumber"],
+        identity["taskId"],
+        task_revision(data["task"]),
     )
     worktree = (
         identity["workspaceRoot"] / repository_slug / run_hash / identity["taskId"]
@@ -2924,7 +3093,10 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
     task = data["task"]
     issue = campaign_issue(data.get("issue"))
     marker = pull_request_marker(
-        required_string(data.get("campaign"), "campaign"), issue["number"], task["id"]
+        required_string(data.get("campaign"), "campaign"),
+        issue["number"],
+        task["id"],
+        task_revision(task),
     )
     existing = run(
         [
@@ -3476,6 +3648,40 @@ def github_checkpoint_progress_comment(
                 body,
             ]
         )
+    issue_view = github_json(
+        ["api", f"repos/{repository}/issues/{issue['number']}"],
+        "campaign issue",
+    )
+    issue_body = issue_view.get("body") if isinstance(issue_view, dict) else None
+    if not isinstance(issue_body, str):
+        fail("campaign issue has no body while recording checkpoint progress")
+    task_marker = f"{TASK_MARKER_PREFIX}{task_id} -->"
+    updated_lines: list[str] = []
+    found = False
+    for line in issue_body.splitlines(keepends=True):
+        if task_marker in line:
+            if found:
+                fail(f"campaign worklist repeats task marker {task_id!r}")
+            found = True
+            line = re.sub(r"^- \[[ xX]\]", "- [x]", line)
+        updated_lines.append(line)
+    if not found:
+        fail(f"campaign worklist lacks task marker {task_id!r}")
+    updated_body = "".join(updated_lines)
+    if updated_body != issue_body:
+        run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                issue["number"],
+                "--repo",
+                repository,
+                "--body-file",
+                "-",
+            ],
+            input_text=updated_body,
+        )
 
 
 def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
@@ -3502,7 +3708,16 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     config = repo_config(data.get("repositoryConfig"))
     task = object_exact(
         data.get("task"),
-        {"id", "kind", "title", "argv", "runtimeMaxSec", "dependencies"},
+        {
+            "id",
+            "kind",
+            "title",
+            "argv",
+            "runtimeMaxSec",
+            "dependencies",
+            "brief",
+            "revision",
+        },
         "checkpoint task",
     )
     task_id = required_string(task.get("id"), "checkpoint task.id", 80)
@@ -3512,8 +3727,18 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     argv(task.get("argv"), "checkpoint task.argv")
     positive_integer(task.get("runtimeMaxSec"), "checkpoint task.runtimeMaxSec")
     string_list(task.get("dependencies"), "checkpoint task.dependencies")
-    source = object_exact(data.get("source"), {"path", "sha256", "revision"}, "source")
-    required_string(source.get("path"), "source.path")
+    revision = task_revision(task)
+    source_value = data.get("source")
+    if isinstance(source_value, dict) and source_value.get("kind") == "github-issue":
+        source = object_exact(
+            source_value, {"kind", "url", "sha256", "revision"}, "source"
+        )
+        required_string(source.get("url"), "source.url")
+        if revision is None:
+            fail("issue-backed checkpoint task must carry its admitted revision")
+    else:
+        source = object_exact(source_value, {"path", "sha256", "revision"}, "source")
+        required_string(source.get("path"), "source.path")
     source_sha256 = required_string(source.get("sha256"), "source.sha256")
     source_revision = required_string(source.get("revision"), "source.revision")
     if not re.fullmatch(r"[0-9a-f]{40,64}", source_revision):
@@ -3704,6 +3929,10 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
         merge_commit = merge_github(data, config, integration)
     else:
         merge_commit = merge_local(data, config, integration)
+        # forge=local is an explicit mechanism-test mode, but its issue
+        # container still needs a forge mutation so the poller observes the
+        # completed lane and admits the dependency-ready successor.
+        github_progress_comment(data, integration, merge_commit)
     return {
         "taskId": task_id,
         "head": head,
