@@ -73,15 +73,26 @@ services.tally.storage = {
   dataDir = {
     warningBytes = 34359738368;
     hardBytes = 68719476736;
-    minimumFreeBytes = 268435456;
+    warningFreeBytes = 17179869184;
+    minimumFreeBytes = 8589934592;
   };
   stateDir = {
     warningBytes = 34359738368;
     hardBytes = 68719476736;
-    minimumFreeBytes = 268435456;
+    warningFreeBytes = 17179869184;
+    minimumFreeBytes = 8589934592;
   };
 };
 ```
+
+`minimumFreeBytes` is the hard admission floor; `warningFreeBytes` must be larger and is the
+early, durable warning threshold. Size these from observed `growthPerCompletion`, not merely from
+the current store size. The gap from warning to hard should cover at least the maximum
+completion growth possible during `storage.pollIntervalSec`, plus every already-admitted job
+that may still finish after intake closes and an operator-response margin. The 16 GiB/8 GiB
+defaults replace the former 256 MiB floor, which represented only a few pathological projection
+updates. Lower them only when the largest admitted wave and measured write amplification fit
+comfortably below the replacement floor.
 
 The timer runs this command:
 
@@ -233,9 +244,10 @@ $ tally gc --horizon 30d --projection-archive-horizon 0s --skip-state-dir
 Omitting `--collect` prevents this recovery pass from running host-wide Nix GC. It still applies
 the chosen witness-root horizon, so use the configured `retention.horizon` in place of `30d`.
 Only timestamp-valid, plain-tree projection archives are eligible; the active `taskdata`
-directory is never touched. The cached storage view records recovery on its next sample (within
-`storage.pollIntervalSec`); restart the daemon only if an immediate fresh sample is operationally
-necessary.
+directory is never touched. The cached allocated-byte view records recovery on its next
+single-flight sample (within `storage.pollIntervalSec` after the previous sample completes). The
+free-space axis is rechecked on the next intake as well as on that sample; restart the daemon only
+if an immediate fresh tree measurement is operationally necessary.
 
 ### Ownership boundaries of the byte budgets
 

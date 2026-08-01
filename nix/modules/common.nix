@@ -2500,10 +2500,16 @@ let
                     example = 17179869184;
                     description = "Allocated dataDir bytes that refuse new intake.";
                   };
+                  warningFreeBytes = mkOption {
+                    type = types.ints.positive;
+                    default = 17179869184;
+                    example = 34359738368;
+                    description = "Available dataDir-filesystem bytes below which a durable early warning is emitted.";
+                  };
                   minimumFreeBytes = mkOption {
                     type = types.ints.positive;
-                    default = 268435456;
-                    example = 1073741824;
+                    default = 8589934592;
+                    example = 17179869184;
                     description = "Available bytes required on the dataDir filesystem before new intake is accepted.";
                   };
                 };
@@ -2526,10 +2532,16 @@ let
                     example = 17179869184;
                     description = "Allocated stateDir bytes that refuse new intake.";
                   };
+                  warningFreeBytes = mkOption {
+                    type = types.ints.positive;
+                    default = 17179869184;
+                    example = 34359738368;
+                    description = "Available stateDir-filesystem bytes below which a durable early warning is emitted.";
+                  };
                   minimumFreeBytes = mkOption {
                     type = types.ints.positive;
-                    default = 268435456;
-                    example = 1073741824;
+                    default = 8589934592;
+                    example = 17179869184;
                     description = "Available bytes required on the stateDir filesystem before new intake is accepted.";
                   };
                 };
@@ -2993,10 +3005,20 @@ let
     storage = {
       inherit (cfg.storage) pollIntervalSec;
       dataDir = {
-        inherit (cfg.storage.dataDir) warningBytes hardBytes minimumFreeBytes;
+        inherit (cfg.storage.dataDir)
+          warningBytes
+          hardBytes
+          warningFreeBytes
+          minimumFreeBytes
+          ;
       };
       stateDir = {
-        inherit (cfg.storage.stateDir) warningBytes hardBytes minimumFreeBytes;
+        inherit (cfg.storage.stateDir)
+          warningBytes
+          hardBytes
+          warningFreeBytes
+          minimumFreeBytes
+          ;
       };
     };
     attestations.exec = {

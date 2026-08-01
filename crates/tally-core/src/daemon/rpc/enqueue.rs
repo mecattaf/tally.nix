@@ -335,7 +335,9 @@ impl DaemonHandler {
         ingress_id: Option<String>,
         caller: CallerIdentity,
     ) -> Result<Value, WireError> {
-        let storage = self.cached_storage();
+        // Tree and SQLite measurement stay on the periodic blocking sampler,
+        // but the cheap statvfs guard must be current for every admission.
+        let storage = self.refresh_storage_for_intake();
         let warning_origin = payload.gh_origin.clone().or_else(|| {
             payload
                 .origin

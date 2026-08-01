@@ -582,6 +582,7 @@ mod tests {
                 let budget = crate::config::StorageBudgetConfig {
                     warning_bytes: 1024 * 1024,
                     hard_bytes: 2 * 1024 * 1024,
+                    warning_free_bytes: 2,
                     minimum_free_bytes: 1,
                 };
                 config.storage.data_dir = budget.clone();
@@ -673,8 +674,6 @@ mod tests {
                     .storage
                     .borrow_mut()
                     .monitor
-                    .as_mut()
-                    .unwrap()
                     .set_sample_delay(Duration::from_millis(200));
 
                 let handler = daemon.handler.clone();
@@ -693,7 +692,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn enqueue_uses_the_cached_storage_snapshot_when_a_periodic_sample_is_due() {
+    async fn storage_timer_samples_once_per_configured_interval() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut config = one_pool_config();
+                config.storage.poll_interval_sec = 1;
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon =
+                    Daemon::open_with_executor(config, paths, settings(), executor)
+                        .await
+                        .unwrap();
+                let handler = daemon.handler.clone();
+                let initial = handler.cached_storage().sampled_at;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+
+                tokio::time::sleep(Duration::from_millis(1_150)).await;
+                let first = handler.cached_storage().sampled_at;
+                assert_ne!(first, initial, "first configured tick did not sample");
+                tokio::time::sleep(Duration::from_millis(1_150)).await;
+                let second = handler.cached_storage().sampled_at;
+                assert_ne!(
+                    second, first,
+                    "second configured tick was incorrectly suppressed"
+                );
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_sampler_panic_does_not_lose_the_monitor() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -702,13 +738,60 @@ mod tests {
                 let daemon = fs1_daemon(&paths).await;
                 daemon
                     .handler
+                    .storage
+                    .borrow_mut()
+                    .monitor
+                    .set_sample_panic_once();
+
+                let failed = daemon.handler.refresh_storage_now().await;
+                assert!(failed.monitor_error.is_some());
+                assert!(!failed.intake.accepting);
+
+                let recovered = daemon.handler.refresh_storage_now().await;
+                assert!(recovered.monitor_error.is_none());
+                assert!(recovered.intake.accepting);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enqueue_keeps_tree_metrics_cached_but_checks_free_space_live() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut config = one_pool_config();
+                let budget = crate::config::StorageBudgetConfig {
+                    warning_bytes: u64::MAX - 1,
+                    hard_bytes: u64::MAX,
+                    warning_free_bytes: 100,
+                    minimum_free_bytes: 50,
+                };
+                config.storage.data_dir = budget.clone();
+                config.storage.state_dir = budget;
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                daemon
+                    .handler
                     .pause(Some(json!({"all": true})))
                     .await
                     .unwrap();
-                let due_since = Instant::now() - Duration::from_secs(120);
-                daemon.handler.storage.borrow_mut().last_sample = due_since;
-
+                let before = daemon.handler.cached_storage();
                 daemon
+                    .handler
+                    .storage
+                    .borrow_mut()
+                    .monitor
+                    .set_free_space_override(49, 1_000);
+
+                let rows_before = daemon.handler.context.read().await.rows.len();
+                let refused = daemon
                     .handler
                     .enqueue_as_client(Some(json!({
                         "argv": ["true"],
@@ -718,9 +801,22 @@ mod tests {
                         "evidence": ["exit:0"]
                     })))
                     .await
-                    .unwrap();
+                    .unwrap_err();
 
-                assert_eq!(daemon.handler.storage.borrow().last_sample, due_since);
+                assert_eq!(refused.code, WireErrorCode::StorageBudgetExceeded);
+                assert_eq!(daemon.handler.context.read().await.rows.len(), rows_before);
+                let after = daemon.handler.cached_storage();
+                assert_eq!(after.sampled_at, before.sampled_at);
+                assert_eq!(after.data_dir.filesystem_available_bytes, Some(49));
+                assert_eq!(after.data_dir.level, crate::storage::BudgetLevel::Hard);
+                assert!(!after.intake.accepting);
+                assert!(after.active_warnings.iter().any(|warning| {
+                    warning.store == "dataDir"
+                        && warning.pressures.iter().any(|pressure| {
+                            pressure.resource
+                                == crate::storage::StoragePressureResource::FilesystemAvailableBytes
+                        })
+                }));
             })
             .await;
     }
@@ -735,10 +831,10 @@ mod tests {
                 let daemon = fs1_daemon(&paths).await;
                 {
                     let mut storage = daemon.handler.storage.borrow_mut();
-                    storage.snapshot = storage
-                        .snapshot
-                        .clone()
-                        .with_monitor_error("test monitor outage");
+                    storage
+                        .monitor
+                        .record_sample_worker_failure("test monitor outage");
+                    storage.snapshot = storage.monitor.query_snapshot();
                 }
                 let rows_before = daemon.handler.context.read().await.rows.len();
                 let refused = daemon

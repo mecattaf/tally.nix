@@ -177,7 +177,7 @@ impl Daemon {
                             if storage_samples.is_empty() {
                                 let handler = self.handler.clone();
                                 storage_samples.spawn_local(async move {
-                                    handler.refresh_storage_if_due().await
+                                    handler.refresh_storage_now().await
                                 });
                             }
                         }

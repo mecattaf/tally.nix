@@ -14,6 +14,7 @@ use crate::taskdb::TASKDATA_DIRECTORY;
 pub const STORAGE_STATE_FILE: &str = "storage-metrics.json";
 pub const STORAGE_WARNING_FILE: &str = "storage-warnings.jsonl";
 pub const STORAGE_RECOVERY_PERCENT: u64 = 90;
+pub const STORAGE_FREE_RECOVERY_MIN_BYTES: u64 = 1024 * 1024 * 1024;
 const STORAGE_METRICS_SCHEMA_VERSION: u32 = 2;
 const STORAGE_STATE_SCHEMA_VERSION: u32 = 2;
 const STORAGE_WARNING_SCHEMA_VERSION: u32 = 2;
@@ -68,6 +69,7 @@ pub struct StoreMetrics {
     pub file_count: u64,
     pub warning_bytes: u64,
     pub hard_bytes: u64,
+    pub warning_free_bytes: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filesystem_available_bytes: Option<u64>,
     pub minimum_free_bytes: u64,
@@ -125,6 +127,7 @@ pub struct ActiveStorageWarning {
 pub struct StorageMetrics {
     pub schema_version: u32,
     pub sampled_at: String,
+    pub free_space_checked_at: String,
     pub completion_count: u64,
     pub intake: IntakeStatus,
     pub data_dir: StoreMetrics,
@@ -172,7 +175,7 @@ struct StoragePoint {
     taskchampion_operations: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct PersistentState {
     schema_version: u32,
@@ -196,9 +199,70 @@ pub struct StorageMonitor {
     pending_warnings: Vec<StorageWarningRecord>,
     notices: Vec<String>,
     next_warning_sequence_floor: u64,
-    last_error: Option<String>,
+    sample_error: Option<String>,
+    free_space_error: Option<String>,
     #[cfg(test)]
     sample_delay: Option<std::time::Duration>,
+    #[cfg(test)]
+    sample_panic_once: bool,
+    #[cfg(test)]
+    free_space_override: Option<(u64, u64)>,
+}
+
+pub(crate) struct StorageSampleRequest {
+    data_dir: PathBuf,
+    state_dir: PathBuf,
+    completion_count: u64,
+    #[cfg(test)]
+    delay: Option<std::time::Duration>,
+    #[cfg(test)]
+    panic: bool,
+}
+
+pub(crate) struct StorageMeasurement {
+    sampled_at: String,
+    completion_count: u64,
+    data_usage: DirectoryUsage,
+    state_usage: DirectoryUsage,
+    data_available: u64,
+    state_available: u64,
+    taskchampion: TaskchampionMetrics,
+}
+
+struct PressureEvaluation {
+    data_decision: BudgetDecision,
+    state_decision: BudgetDecision,
+    data_episode: Option<u64>,
+    state_episode: Option<u64>,
+}
+
+impl StorageSampleRequest {
+    pub(crate) fn run(self) -> Result<StorageMeasurement, StorageError> {
+        #[cfg(test)]
+        if self.panic {
+            panic!("injected storage sampler panic");
+        }
+        #[cfg(test)]
+        if let Some(delay) = self.delay {
+            std::thread::sleep(delay);
+        }
+
+        let sampled_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let data_usage = directory_usage(&self.data_dir)?;
+        let state_usage = directory_usage(&self.state_dir)?;
+        let data_available = filesystem_available(&self.data_dir)?;
+        let state_available = filesystem_available(&self.state_dir)?;
+        let taskchampion = taskchampion_metrics(&self.data_dir);
+        Ok(StorageMeasurement {
+            sampled_at,
+            completion_count: self.completion_count,
+            data_usage,
+            state_usage,
+            data_available,
+            state_available,
+            taskchampion,
+        })
+    }
 }
 
 impl StorageMonitor {
@@ -231,9 +295,14 @@ impl StorageMonitor {
             pending_warnings: Vec::new(),
             notices,
             next_warning_sequence_floor,
-            last_error: None,
+            sample_error: None,
+            free_space_error: None,
             #[cfg(test)]
             sample_delay: None,
+            #[cfg(test)]
+            sample_panic_once: false,
+            #[cfg(test)]
+            free_space_override: None,
         };
         let _ = monitor.refresh(completion_count);
         monitor
@@ -243,15 +312,62 @@ impl StorageMonitor {
         std::time::Duration::from_secs(self.config.poll_interval_sec)
     }
 
+    pub(crate) fn sample_request(&mut self, completion_count: u64) -> StorageSampleRequest {
+        StorageSampleRequest {
+            data_dir: self.data_dir.clone(),
+            state_dir: self.state_dir.clone(),
+            completion_count,
+            #[cfg(test)]
+            delay: self.sample_delay,
+            #[cfg(test)]
+            panic: std::mem::take(&mut self.sample_panic_once),
+        }
+    }
+
     pub fn refresh(&mut self, completion_count: u64) -> Result<&StorageMetrics, StorageError> {
-        match self.sample(completion_count) {
-            Ok(snapshot) => {
-                self.last_error = None;
-                self.snapshot = snapshot;
+        let measurement = self.sample_request(completion_count).run();
+        self.apply_measurement_result(measurement)
+    }
+
+    pub(crate) fn apply_measurement_result(
+        &mut self,
+        measurement: Result<StorageMeasurement, StorageError>,
+    ) -> Result<&StorageMetrics, StorageError> {
+        match measurement.and_then(|measurement| self.apply_measurement(measurement)) {
+            Ok(()) => {
+                self.sample_error = None;
+                self.free_space_error = None;
                 Ok(&self.snapshot)
             }
             Err(error) => {
-                self.last_error = Some(error.to_string());
+                self.sample_error = Some(error.to_string());
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn record_sample_worker_failure(&mut self, error: impl Into<String>) {
+        self.sample_error = Some(error.into());
+    }
+
+    pub(crate) fn refresh_free_space(&mut self) -> Result<&StorageMetrics, StorageError> {
+        let checked_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
+        let available = self.measure_free_space();
+        match available.and_then(|(data_available, state_available)| {
+            if self.sample_error.is_some() {
+                self.snapshot.free_space_checked_at = checked_at;
+                self.snapshot.data_dir.filesystem_available_bytes = Some(data_available);
+                self.snapshot.state_dir.filesystem_available_bytes = Some(state_available);
+                return Ok(());
+            }
+            self.apply_free_space(checked_at, data_available, state_available)
+        }) {
+            Ok(()) => {
+                self.free_space_error = None;
+                Ok(&self.snapshot)
+            }
+            Err(error) => {
+                self.free_space_error = Some(error.to_string());
                 Err(error)
             }
         }
@@ -262,9 +378,17 @@ impl StorageMonitor {
     }
 
     pub fn query_snapshot(&self) -> StorageMetrics {
-        match &self.last_error {
-            Some(error) => self.snapshot.clone().with_monitor_error(error.clone()),
-            None => self.snapshot.clone(),
+        let errors = [
+            self.sample_error.as_deref(),
+            self.free_space_error.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+        if errors.is_empty() {
+            self.snapshot.clone()
+        } else {
+            self.snapshot.clone().with_monitor_error(errors.join("; "))
         }
     }
 
@@ -281,18 +405,37 @@ impl StorageMonitor {
         self.sample_delay = Some(delay);
     }
 
-    fn sample(&mut self, completion_count: u64) -> Result<StorageMetrics, StorageError> {
-        #[cfg(test)]
-        if let Some(delay) = self.sample_delay {
-            std::thread::sleep(delay);
-        }
+    #[cfg(test)]
+    pub fn set_sample_panic_once(&mut self) {
+        self.sample_panic_once = true;
+    }
 
-        let sampled_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
-        let data_usage = directory_usage(&self.data_dir)?;
-        let state_usage = directory_usage(&self.state_dir)?;
-        let data_available = filesystem_available(&self.data_dir)?;
-        let state_available = filesystem_available(&self.state_dir)?;
-        let taskchampion = taskchampion_metrics(&self.data_dir);
+    #[cfg(test)]
+    pub fn set_free_space_override(&mut self, data_available: u64, state_available: u64) {
+        self.free_space_override = Some((data_available, state_available));
+    }
+
+    fn measure_free_space(&self) -> Result<(u64, u64), StorageError> {
+        #[cfg(test)]
+        if let Some(available) = self.free_space_override {
+            return Ok(available);
+        }
+        Ok((
+            filesystem_available(&self.data_dir)?,
+            filesystem_available(&self.state_dir)?,
+        ))
+    }
+
+    fn apply_measurement(&mut self, measurement: StorageMeasurement) -> Result<(), StorageError> {
+        let StorageMeasurement {
+            sampled_at,
+            completion_count,
+            data_usage,
+            state_usage,
+            data_available,
+            state_available,
+            taskchampion,
+        } = measurement;
         let point = StoragePoint {
             sampled_at: sampled_at.clone(),
             completion_count,
@@ -302,8 +445,113 @@ impl StorageMonitor {
             taskchampion_operations: taskchampion.operation_high_water,
         };
 
+        let previous = self.state.as_ref().and_then(|state| {
+            if completion_count > state.current.completion_count {
+                Some(state.current.clone())
+            } else if completion_count == state.current.completion_count {
+                state.previous.clone()
+            } else {
+                None
+            }
+        });
+        let evaluation = self.evaluate_and_persist(
+            &sampled_at,
+            previous.clone(),
+            point.clone(),
+            data_usage.allocated,
+            state_usage.allocated,
+            data_available,
+            state_available,
+            true,
+        )?;
+        let (active_warnings, intake) = active_warnings_and_intake(
+            &evaluation,
+            data_usage.allocated,
+            state_usage.allocated,
+            data_available,
+            state_available,
+            &self.config,
+        )?;
+
+        self.snapshot = StorageMetrics {
+            schema_version: STORAGE_METRICS_SCHEMA_VERSION,
+            sampled_at: sampled_at.clone(),
+            free_space_checked_at: sampled_at,
+            completion_count,
+            intake,
+            data_dir: store_metrics(
+                &data_usage,
+                data_available,
+                &self.config.data_dir,
+                evaluation.data_decision.level,
+            ),
+            state_dir: store_metrics(
+                &state_usage,
+                state_available,
+                &self.config.state_dir,
+                evaluation.state_decision.level,
+            ),
+            taskchampion,
+            growth_per_completion: previous
+                .as_ref()
+                .and_then(|previous| growth(previous, &point)),
+            active_warnings,
+            monitor_error: None,
+        };
+        Ok(())
+    }
+
+    fn apply_free_space(
+        &mut self,
+        checked_at: String,
+        data_available: u64,
+        state_available: u64,
+    ) -> Result<(), StorageError> {
+        let state = self.state.as_ref().ok_or_else(|| {
+            StorageError::State("free-space check has no completed tree sample".to_owned())
+        })?;
+        let evaluation = self.evaluate_and_persist(
+            &checked_at,
+            state.previous.clone(),
+            state.current.clone(),
+            self.snapshot.data_dir.size_bytes,
+            self.snapshot.state_dir.size_bytes,
+            data_available,
+            state_available,
+            false,
+        )?;
+        let (active_warnings, intake) = active_warnings_and_intake(
+            &evaluation,
+            self.snapshot.data_dir.size_bytes,
+            self.snapshot.state_dir.size_bytes,
+            data_available,
+            state_available,
+            &self.config,
+        )?;
+        self.snapshot.free_space_checked_at = checked_at;
+        self.snapshot.intake = intake;
+        self.snapshot.data_dir.filesystem_available_bytes = Some(data_available);
+        self.snapshot.data_dir.level = evaluation.data_decision.level;
+        self.snapshot.state_dir.filesystem_available_bytes = Some(state_available);
+        self.snapshot.state_dir.level = evaluation.state_decision.level;
+        self.snapshot.active_warnings = active_warnings;
+        self.snapshot.monitor_error = None;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn evaluate_and_persist(
+        &mut self,
+        observed_at: &str,
+        previous: Option<StoragePoint>,
+        current: StoragePoint,
+        data_size: u64,
+        state_size: u64,
+        data_available: u64,
+        state_available: u64,
+        persist_always: bool,
+    ) -> Result<PressureEvaluation, StorageError> {
         let (
-            previous,
             old_data_level,
             old_state_level,
             old_data_pressures,
@@ -314,7 +562,6 @@ impl StorageMonitor {
         ) = self.state.as_ref().map_or_else(
             || {
                 (
-                    None,
                     BudgetLevel::Ok,
                     BudgetLevel::Ok,
                     Vec::new(),
@@ -325,15 +572,7 @@ impl StorageMonitor {
                 )
             },
             |state| {
-                let previous = if completion_count > state.current.completion_count {
-                    Some(state.current.clone())
-                } else if completion_count == state.current.completion_count {
-                    state.previous.clone()
-                } else {
-                    None
-                };
                 (
-                    previous,
                     state.data_dir_level,
                     state.state_dir_level,
                     state.data_dir_pressures.clone(),
@@ -346,16 +585,15 @@ impl StorageMonitor {
                 )
             },
         );
-
         let data_decision = budget_decision(
-            data_usage.allocated,
+            data_size,
             data_available,
             &self.config.data_dir,
             old_data_level,
             &old_data_pressures,
         );
         let state_decision = budget_decision(
-            state_usage.allocated,
+            state_size,
             state_available,
             &self.config.state_dir,
             old_state_level,
@@ -365,11 +603,11 @@ impl StorageMonitor {
         record_transition(
             &self.data_dir,
             &mut self.pending_warnings,
-            &sampled_at,
+            observed_at,
             "dataDir",
             old_data_level,
             &data_decision,
-            data_usage.allocated,
+            data_size,
             data_available,
             &self.config.data_dir,
             &mut data_episode,
@@ -378,21 +616,20 @@ impl StorageMonitor {
         record_transition(
             &self.data_dir,
             &mut self.pending_warnings,
-            &sampled_at,
+            observed_at,
             "stateDir",
             old_state_level,
             &state_decision,
-            state_usage.allocated,
+            state_size,
             state_available,
             &self.config.state_dir,
             &mut state_episode,
             &mut next_sequence,
         )?;
-
         let persistent = PersistentState {
             schema_version: STORAGE_STATE_SCHEMA_VERSION,
-            previous: previous.clone(),
-            current: point.clone(),
+            previous,
+            current,
             data_dir_level: data_decision.level,
             state_dir_level: state_decision.level,
             data_dir_pressures: pressure_resources(&data_decision),
@@ -401,72 +638,16 @@ impl StorageMonitor {
             data_dir_episode: data_episode,
             state_dir_episode: state_episode,
         };
-        write_json_atomic(&self.data_dir.join(STORAGE_STATE_FILE), &persistent)?;
+        if persist_always || self.state.as_ref() != Some(&persistent) {
+            write_json_atomic(&self.data_dir.join(STORAGE_STATE_FILE), &persistent)?;
+        }
         self.state = Some(persistent);
         self.next_warning_sequence_floor = next_sequence;
-
-        let mut active_warnings = Vec::new();
-        push_active_warning(
-            &mut active_warnings,
-            "dataDir",
-            &data_decision,
-            data_usage.allocated,
-            data_available,
-            &self.config.data_dir,
+        Ok(PressureEvaluation {
+            data_decision,
+            state_decision,
             data_episode,
-        )?;
-        push_active_warning(
-            &mut active_warnings,
-            "stateDir",
-            &state_decision,
-            state_usage.allocated,
-            state_available,
-            &self.config.state_dir,
             state_episode,
-        )?;
-        let hard = active_warnings
-            .iter()
-            .filter(|warning| warning.level == BudgetLevel::Hard)
-            .map(|warning| warning.message.clone())
-            .collect::<Vec<_>>();
-        let intake = if hard.is_empty() {
-            IntakeStatus {
-                accepting: true,
-                reason: None,
-            }
-        } else {
-            IntakeStatus {
-                accepting: false,
-                reason: Some(format!(
-                    "{}; new intake is refused while already-admitted work continues",
-                    hard.join("; ")
-                )),
-            }
-        };
-
-        Ok(StorageMetrics {
-            schema_version: STORAGE_METRICS_SCHEMA_VERSION,
-            sampled_at,
-            completion_count,
-            intake,
-            data_dir: store_metrics(
-                &data_usage,
-                data_available,
-                &self.config.data_dir,
-                data_decision.level,
-            ),
-            state_dir: store_metrics(
-                &state_usage,
-                state_available,
-                &self.config.state_dir,
-                state_decision.level,
-            ),
-            taskchampion,
-            growth_per_completion: previous
-                .as_ref()
-                .and_then(|previous| growth(previous, &point)),
-            active_warnings,
-            monitor_error: None,
         })
     }
 }
@@ -485,7 +666,9 @@ fn budget_decision(
     previous_pressures: &[StoragePressureResource],
 ) -> BudgetDecision {
     let hard_size_recovery = lower_recovery(budget.hard_bytes);
-    let free_recovery = upper_recovery(budget.minimum_free_bytes);
+    let hard_free_recovery = free_recovery(budget.minimum_free_bytes);
+    let warning_size_recovery = lower_recovery(budget.warning_bytes);
+    let warning_free_recovery = free_recovery(budget.warning_free_bytes);
     let previous_size_pressure =
         previous_pressures.contains(&StoragePressureResource::AllocatedBytes);
     let previous_free_pressure =
@@ -497,7 +680,7 @@ fn budget_decision(
     let hard_free = available < budget.minimum_free_bytes
         || (previous_level == BudgetLevel::Hard
             && previous_free_pressure
-            && available < free_recovery);
+            && available < hard_free_recovery);
     if hard_size || hard_free {
         let mut pressures = Vec::new();
         if hard_size {
@@ -513,7 +696,7 @@ fn budget_decision(
                 resource: StoragePressureResource::FilesystemAvailableBytes,
                 observed_bytes: available,
                 threshold_bytes: budget.minimum_free_bytes,
-                recovery_bytes: free_recovery,
+                recovery_bytes: hard_free_recovery,
             });
         }
         return BudgetDecision {
@@ -522,20 +705,35 @@ fn budget_decision(
         };
     }
 
-    let warning_recovery = lower_recovery(budget.warning_bytes);
-    let warning = size >= budget.warning_bytes
+    let warning_size = size >= budget.warning_bytes
         || (previous_level != BudgetLevel::Ok
             && previous_size_pressure
-            && size >= warning_recovery);
-    if warning {
-        return BudgetDecision {
-            level: BudgetLevel::Warning,
-            pressures: vec![StoragePressure {
+            && size >= warning_size_recovery);
+    let warning_free = available < budget.warning_free_bytes
+        || (previous_level != BudgetLevel::Ok
+            && previous_free_pressure
+            && available < warning_free_recovery);
+    if warning_size || warning_free {
+        let mut pressures = Vec::new();
+        if warning_size {
+            pressures.push(StoragePressure {
                 resource: StoragePressureResource::AllocatedBytes,
                 observed_bytes: size,
                 threshold_bytes: budget.warning_bytes,
-                recovery_bytes: warning_recovery,
-            }],
+                recovery_bytes: warning_size_recovery,
+            });
+        }
+        if warning_free {
+            pressures.push(StoragePressure {
+                resource: StoragePressureResource::FilesystemAvailableBytes,
+                observed_bytes: available,
+                threshold_bytes: budget.warning_free_bytes,
+                recovery_bytes: warning_free_recovery,
+            });
+        }
+        return BudgetDecision {
+            level: BudgetLevel::Warning,
+            pressures,
         };
     }
 
@@ -550,10 +748,9 @@ fn lower_recovery(threshold: u64) -> u64 {
         as u64
 }
 
-fn upper_recovery(threshold: u64) -> u64 {
-    let numerator = u128::from(threshold) * 100;
-    ((numerator + u128::from(STORAGE_RECOVERY_PERCENT - 1)) / u128::from(STORAGE_RECOVERY_PERCENT))
-        .min(u128::from(u64::MAX)) as u64
+fn free_recovery(threshold: u64) -> u64 {
+    let proportional = threshold.div_ceil(10);
+    threshold.saturating_add(proportional.max(STORAGE_FREE_RECOVERY_MIN_BYTES))
 }
 
 fn pressure_resources(decision: &BudgetDecision) -> Vec<StoragePressureResource> {
@@ -562,6 +759,56 @@ fn pressure_resources(decision: &BudgetDecision) -> Vec<StoragePressureResource>
         .iter()
         .map(|pressure| pressure.resource)
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn active_warnings_and_intake(
+    evaluation: &PressureEvaluation,
+    data_size: u64,
+    state_size: u64,
+    data_available: u64,
+    state_available: u64,
+    config: &StorageConfig,
+) -> Result<(Vec<ActiveStorageWarning>, IntakeStatus), StorageError> {
+    let mut active_warnings = Vec::new();
+    push_active_warning(
+        &mut active_warnings,
+        "dataDir",
+        &evaluation.data_decision,
+        data_size,
+        data_available,
+        &config.data_dir,
+        evaluation.data_episode,
+    )?;
+    push_active_warning(
+        &mut active_warnings,
+        "stateDir",
+        &evaluation.state_decision,
+        state_size,
+        state_available,
+        &config.state_dir,
+        evaluation.state_episode,
+    )?;
+    let hard = active_warnings
+        .iter()
+        .filter(|warning| warning.level == BudgetLevel::Hard)
+        .map(|warning| warning.message.clone())
+        .collect::<Vec<_>>();
+    let intake = if hard.is_empty() {
+        IntakeStatus {
+            accepting: true,
+            reason: None,
+        }
+    } else {
+        IntakeStatus {
+            accepting: false,
+            reason: Some(format!(
+                "{}; new intake is refused while already-admitted work continues",
+                hard.join("; ")
+            )),
+        }
+    };
+    Ok((active_warnings, intake))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -583,11 +830,11 @@ fn record_transition(
         return Ok(());
     }
     let sequence = *next_sequence;
-    let threshold = match decision.level {
-        BudgetLevel::Ok | BudgetLevel::Warning => budget.warning_bytes,
-        BudgetLevel::Hard => budget.hard_bytes,
-    };
-    let message = transition_message(store, decision, size, available, budget);
+    let threshold = decision
+        .pressures
+        .first()
+        .map_or_else(|| budget.warning_bytes, |pressure| pressure.threshold_bytes);
+    let message = transition_message(store, decision, size, available);
     let record = StorageWarningRecord {
         schema_version: STORAGE_WARNING_SCHEMA_VERSION,
         sequence,
@@ -611,22 +858,35 @@ fn record_transition(
     Ok(())
 }
 
-fn transition_message(
-    store: &str,
-    decision: &BudgetDecision,
-    size: u64,
-    available: u64,
-    budget: &StorageBudgetConfig,
-) -> String {
+fn transition_message(store: &str, decision: &BudgetDecision, size: u64, available: u64) -> String {
     match decision.level {
         BudgetLevel::Ok => format!(
             "tally {store} storage pressure recovered: allocated {size} bytes; filesystem available {available} bytes"
         ),
-        BudgetLevel::Warning => format!(
-            "tally {store} allocated-size warning is active: {size} bytes (warning {}, recovers below {})",
-            budget.warning_bytes,
-            lower_recovery(budget.warning_bytes)
-        ),
+        BudgetLevel::Warning => {
+            let reasons = decision
+                .pressures
+                .iter()
+                .map(|pressure| match pressure.resource {
+                    StoragePressureResource::AllocatedBytes => format!(
+                        "allocated {} bytes (warning {}, recovers below {})",
+                        pressure.observed_bytes,
+                        pressure.threshold_bytes,
+                        pressure.recovery_bytes
+                    ),
+                    StoragePressureResource::FilesystemAvailableBytes => format!(
+                        "filesystem available {} bytes (warning below {}, recovers at {})",
+                        pressure.observed_bytes,
+                        pressure.threshold_bytes,
+                        pressure.recovery_bytes
+                    ),
+                })
+                .collect::<Vec<_>>();
+            format!(
+                "tally {store} storage warning is active: {}",
+                reasons.join("; ")
+            )
+        }
         BudgetLevel::Hard => {
             let reasons = decision
                 .pressures
@@ -671,11 +931,10 @@ fn push_active_warning(
             "active {store} pressure has no durable warning episode"
         ))
     })?;
-    let threshold = if decision.level == BudgetLevel::Hard {
-        budget.hard_bytes
-    } else {
-        budget.warning_bytes
-    };
+    let threshold = decision
+        .pressures
+        .first()
+        .map_or(budget.warning_bytes, |pressure| pressure.threshold_bytes);
     warnings.push(ActiveStorageWarning {
         warning_sequence,
         store: store.to_owned(),
@@ -683,7 +942,7 @@ fn push_active_warning(
         size_bytes: size,
         threshold_bytes: threshold,
         pressures: decision.pressures.clone(),
-        message: transition_message(store, decision, size, available, budget),
+        message: transition_message(store, decision, size, available),
     });
     Ok(())
 }
@@ -700,6 +959,7 @@ fn store_metrics(
         file_count: usage.files,
         warning_bytes: budget.warning_bytes,
         hard_bytes: budget.hard_bytes,
+        warning_free_bytes: budget.warning_free_bytes,
         filesystem_available_bytes: Some(available),
         minimum_free_bytes: budget.minimum_free_bytes,
         level,
@@ -717,13 +977,16 @@ fn unavailable_snapshot(
         file_count: 0,
         warning_bytes: budget.warning_bytes,
         hard_bytes: budget.hard_bytes,
+        warning_free_bytes: budget.warning_free_bytes,
         filesystem_available_bytes: None,
         minimum_free_bytes: budget.minimum_free_bytes,
         level: BudgetLevel::Ok,
     };
+    let unavailable_at = Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true);
     StorageMetrics {
         schema_version: STORAGE_METRICS_SCHEMA_VERSION,
-        sampled_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+        sampled_at: unavailable_at.clone(),
+        free_space_checked_at: unavailable_at,
         completion_count,
         intake: unavailable_intake(error),
         data_dir: empty_store(&config.data_dir),
@@ -927,7 +1190,19 @@ fn directory_usage(root: &Path) -> Result<DirectoryUsage, StorageError> {
 }
 
 fn filesystem_available(path: &Path) -> Result<u64, StorageError> {
-    fs2::available_space(path).map_err(|source| io_error(path, source))
+    let mut candidate = path;
+    loop {
+        match fs2::available_space(candidate) {
+            Ok(available) => return Ok(available),
+            Err(source) if source.kind() == io::ErrorKind::NotFound => {
+                let Some(parent) = candidate.parent() else {
+                    return Err(io_error(candidate, source));
+                };
+                candidate = parent;
+            }
+            Err(source) => return Err(io_error(candidate, source)),
+        }
+    }
 }
 
 fn file_len(path: &Path) -> u64 {
@@ -1036,11 +1311,13 @@ mod tests {
             data_dir: StorageBudgetConfig {
                 warning_bytes: warning,
                 hard_bytes: hard,
+                warning_free_bytes: 2,
                 minimum_free_bytes: 1,
             },
             state_dir: StorageBudgetConfig {
                 warning_bytes: warning,
                 hard_bytes: hard,
+                warning_free_bytes: 2,
                 minimum_free_bytes: 1,
             },
         }
@@ -1074,12 +1351,16 @@ mod tests {
 
     #[test]
     fn free_space_floor_is_hard_and_hysteretic() {
+        let gib = 1024 * 1024 * 1024;
+        assert_eq!(free_recovery(100), gib + 100);
+        assert_eq!(free_recovery(20 * gib), 22 * gib);
         let budget = StorageBudgetConfig {
             warning_bytes: 1_000,
             hard_bytes: 2_000,
-            minimum_free_bytes: 900,
+            warning_free_bytes: 4 * gib,
+            minimum_free_bytes: 2 * gib,
         };
-        let hard = budget_decision(10, 899, &budget, BudgetLevel::Ok, &[]);
+        let hard = budget_decision(10, 2 * gib - 1, &budget, BudgetLevel::Ok, &[]);
         assert_eq!(hard.level, BudgetLevel::Hard);
         assert_eq!(
             hard.pressures[0].resource,
@@ -1088,20 +1369,75 @@ mod tests {
 
         let still_hard = budget_decision(
             10,
-            950,
+            2 * gib + gib / 2,
             &budget,
             BudgetLevel::Hard,
             &[StoragePressureResource::FilesystemAvailableBytes],
         );
         assert_eq!(still_hard.level, BudgetLevel::Hard);
-        let recovered = budget_decision(
+        let warning = budget_decision(
             10,
-            1_000,
+            3 * gib,
             &budget,
             BudgetLevel::Hard,
             &[StoragePressureResource::FilesystemAvailableBytes],
         );
+        assert_eq!(warning.level, BudgetLevel::Warning);
+        assert_eq!(warning.pressures[0].threshold_bytes, 4 * gib);
+        let still_warning = budget_decision(
+            10,
+            4 * gib + gib / 2,
+            &budget,
+            BudgetLevel::Warning,
+            &[StoragePressureResource::FilesystemAvailableBytes],
+        );
+        assert_eq!(still_warning.level, BudgetLevel::Warning);
+        let recovered = budget_decision(
+            10,
+            5 * gib,
+            &budget,
+            BudgetLevel::Warning,
+            &[StoragePressureResource::FilesystemAvailableBytes],
+        );
         assert_eq!(recovered.level, BudgetLevel::Ok);
+    }
+
+    #[test]
+    fn live_free_space_warning_is_durable_and_escalates_in_one_episode() {
+        let root = TempDir::new().unwrap();
+        let data = root.path().join("data");
+        let state = root.path().join("state");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let mut policy = config(u64::MAX - 1, u64::MAX);
+        policy.data_dir.warning_free_bytes = 100;
+        policy.data_dir.minimum_free_bytes = 50;
+        policy.state_dir.warning_free_bytes = 100;
+        policy.state_dir.minimum_free_bytes = 50;
+        let mut monitor = StorageMonitor::open(&data, &state, policy, 0);
+        let sampled_at = monitor.snapshot().sampled_at.clone();
+
+        monitor.set_free_space_override(75, 1_000);
+        monitor.refresh_free_space().unwrap();
+        let warning = monitor.snapshot();
+        assert_eq!(warning.sampled_at, sampled_at);
+        assert_eq!(warning.data_dir.level, BudgetLevel::Warning);
+        assert!(warning.intake.accepting);
+        assert_eq!(warning.active_warnings[0].warning_sequence, 1);
+        assert_eq!(warning.active_warnings[0].threshold_bytes, 100);
+        assert!(warning.active_warnings[0]
+            .message
+            .contains("filesystem available"));
+
+        monitor.set_free_space_override(49, 1_000);
+        monitor.refresh_free_space().unwrap();
+        let hard = monitor.snapshot();
+        assert_eq!(hard.data_dir.level, BudgetLevel::Hard);
+        assert!(!hard.intake.accepting);
+        assert_eq!(hard.active_warnings[0].warning_sequence, 1);
+        assert_eq!(monitor.take_warnings().len(), 2);
+        let durable = std::fs::read_to_string(data.join(STORAGE_WARNING_FILE)).unwrap();
+        assert_eq!(durable.lines().count(), 2);
     }
 
     #[test]
@@ -1109,6 +1445,7 @@ mod tests {
         let budget = StorageBudgetConfig {
             warning_bytes: 1_000,
             hard_bytes: 2_000,
+            warning_free_bytes: 2,
             minimum_free_bytes: 1,
         };
         let hard = budget_decision(2_000, 10_000, &budget, BudgetLevel::Ok, &[]);
@@ -1153,6 +1490,7 @@ mod tests {
         let budget = StorageBudgetConfig {
             warning_bytes: 1_000,
             hard_bytes: 2_000,
+            warning_free_bytes: 2,
             minimum_free_bytes: 1,
         };
         let warning = budget_decision(1_000, 10_000, &budget, BudgetLevel::Ok, &[]);
@@ -1289,6 +1627,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let vanished = root.path().join("vanished");
         assert_eq!(directory_usage(&vanished).unwrap().allocated, 0);
+        assert!(filesystem_available(&vanished).unwrap() > 0);
     }
 
     #[test]

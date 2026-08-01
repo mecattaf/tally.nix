@@ -20,17 +20,22 @@ $ tally query storage | jq '{intake, dataDir, stateDir, taskchampion, growthPerC
 ```
 
 The two store sizes use allocated filesystem blocks for budget decisions and also expose
-apparent bytes and file counts. Each store reports `filesystemAvailableBytes` and its configured
-`minimumFreeBytes`; falling below that floor is hard pressure even when the store's own allocated
-bytes are small. `taskchampion` separates `databaseBytes`, `walBytes`, and `shmBytes`, then reports
-`taskCount` and the append-only SQLite `operationHighWater`. A projection read failure is visible
-as `readError`; the total-store and free-space decisions remain authoritative.
+apparent bytes and file counts. Each store reports `filesystemAvailableBytes`,
+`warningFreeBytes`, and `minimumFreeBytes`; falling below the first emits an early warning and
+falling below the second is hard pressure even when the store's own allocated bytes are small.
+`taskchampion` separates `databaseBytes`, `walBytes`, and `shmBytes`, then reports `taskCount` and
+the append-only SQLite `operationHighWater`. A projection read failure is visible as `readError`;
+the total-store and free-space decisions remain authoritative.
 
-Directory measurement is an off-thread, cached sample. `sampledAt` is the age boundary:
-`query storage`, `query status`, and every enqueue return that snapshot without walking either
-tree. The periodic sampler starts at most one single-flight refresh per
-`storage.pollIntervalSec`. The blocking walk does not occupy the daemon's current-thread runtime,
-accept loop, intake path, completion path, lease tick, or watchdog.
+Directory measurement is an off-thread, cached sample. `sampledAt` is the tree/SQLite age
+boundary; `freeSpaceCheckedAt` is the latest cheap filesystem probe. `query storage` and
+`query status` return the cache without filesystem work. Every enqueue performs only `statvfs`,
+updates the free-space fields and pressure state, and never walks either tree. The periodic timer
+starts one sample on every configured interval when the previous single-flight sample is done;
+there is no second elapsed-time guard. If a walk overruns an interval, the next idle tick starts
+the next walk. The blocking walk does not occupy the daemon's current-thread runtime, accept loop,
+intake path, completion path, lease tick, or watchdog, and a blocking-worker panic cannot take
+ownership of or permanently lose the monitor.
 
 `growthPerCompletion` compares samples across canonical witness-count boundaries. Signed byte
 rates make both growth and successful compaction visible. `query status` embeds the same object
@@ -39,9 +44,11 @@ contract.
 
 Warning and hard transitions are fsynced to `<dataDir>/storage-warnings.jsonl` and emitted on the
 daemon's journal stream. A level recovers only after allocated bytes fall below 90% of the crossed
-threshold (or free bytes rise to the inverse recovery boundary). Warning-to-hard-to-warning
-changes stay in one episode until full recovery, so GitHub campaign intake with evidence receipts
-enabled gets at most one idempotent issue comment for that pressure episode.
+threshold. Free space must rise above the crossed threshold by the larger of 10% or 1 GiB; this
+absolute band prevents shared-filesystem noise from repeatedly closing and reopening an episode.
+Warning-to-hard-to-warning changes stay in one episode until full recovery, so GitHub campaign
+intake with evidence receipts enabled gets at most one idempotent issue comment for that pressure
+episode.
 
 At a hard size or free-space threshold, tally rejects only new enqueue and continuation requests
 with `storage-budget-exceeded`; admitted work, retry, cancel, pause, resume, and every query remain
