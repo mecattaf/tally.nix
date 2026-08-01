@@ -83,6 +83,8 @@ fn registry(watch_path: &Path) -> BTreeMap<String, ProducerConfig> {
                 poll_interval_sec: 60,
                 post_receipt: true,
                 post_evidence: true,
+                post_failure_evidence: false,
+                post_failure_stderr: false,
                 post_gate_summary: false,
                 request_review: false,
                 close_on_acceptance: false,
@@ -477,6 +479,22 @@ fn registry_is_strict_open_by_name_and_closed_over_the_in_scope_kinds() {
     .unwrap_err()
     .to_string()
     .contains("closeOnPass=true requires postEvidence=true"));
+
+    let mut invalid_failure_stderr = invalid_close;
+    let ProducerConfig::Gh(github) = invalid_failure_stderr.get_mut("github").unwrap() else {
+        unreachable!()
+    };
+    github.post_evidence = true;
+    github.post_failure_stderr = true;
+    assert!(validate_registry(
+        &invalid_failure_stderr,
+        &BTreeSet::from(["slot".to_owned()]),
+        &BTreeSet::from(["shell".to_owned()]),
+        &BTreeSet::new(),
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("postFailureStderr=true requires postFailureEvidence=true"));
 }
 
 #[test]
@@ -501,6 +519,8 @@ fn serialized_github_config_preserves_legacy_close_and_accepts_explicit_comment_
     };
 
     let legacy = config(None);
+    assert!(!legacy.post_failure_evidence);
+    assert!(!legacy.post_failure_stderr);
     assert_eq!(legacy.close_on_pass, None);
     assert!(legacy.close_on_pass());
     let comment_only = config(Some(false));
@@ -1056,7 +1076,7 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
     );
 
     let mut mutations = RecordingMutation::default();
-    assert!(engine
+    assert!(!engine
         .complete_gh(
             &origin,
             Verdict::Failed,
@@ -1068,13 +1088,9 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
             &mut mutations,
         )
         .unwrap());
-    assert_eq!(mutations.comments.len(), 1);
+    assert!(mutations.comments.is_empty());
     assert!(mutations.closes.is_empty());
     assert!(mutations.item_open);
-    assert_eq!(
-        mutations.comments[0].evidence.as_ref().unwrap()["stderrTail"],
-        "actionable failure\n"
-    );
     assert!(engine
         .complete_gh(
             &origin,
@@ -1083,16 +1099,87 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
             &mut mutations,
         )
         .unwrap());
-    assert_eq!(mutations.comments.len(), 2);
+    assert_eq!(mutations.comments.len(), 1);
     assert_eq!(mutations.closes.len(), 1);
     assert!(!mutations.item_open);
-    assert_eq!(mutations.comments[1].state, "COMPLETED");
-    assert_eq!(mutations.comments[1].source, "notifications");
-    assert_eq!(mutations.comments[1].item_id, "PR_kwABC128");
+    assert_eq!(mutations.comments[0].state, "COMPLETED");
+    assert_eq!(mutations.comments[0].source, "notifications");
+    assert_eq!(mutations.comments[0].item_id, "PR_kwABC128");
     assert_eq!(
-        mutations.comments[1].evidence.as_ref().unwrap()["witnessSeq"],
+        mutations.comments[0].evidence.as_ref().unwrap()["witnessSeq"],
         4
     );
+
+    let mut metadata_registry = registry.clone();
+    let ProducerConfig::Gh(metadata) = metadata_registry.get_mut("github").unwrap() else {
+        unreachable!()
+    };
+    metadata.post_failure_evidence = true;
+    let metadata_engine = ProducerEngine::new(
+        &metadata_registry,
+        temp.path().join("failure-metadata-events"),
+        temp.path().join("failure-metadata-state"),
+        temp.path(),
+    );
+    let mut metadata_sink = RecordingMutation::default();
+    assert!(metadata_engine
+        .complete_gh(
+            &origin,
+            Verdict::Failed,
+            Some(serde_json::json!({
+                "witnessSeq": 5,
+                "stderrTail": "GITHUB_TOKEN=must-not-cross-the-boundary\n",
+                "stderrTruncated": false,
+            })),
+            &mut metadata_sink,
+        )
+        .unwrap());
+    let metadata_evidence = metadata_sink.comments[0].evidence.as_ref().unwrap();
+    assert_eq!(metadata_evidence["witnessSeq"], 5);
+    assert!(metadata_evidence.get("stderrTail").is_none());
+    assert!(metadata_evidence.get("stderrTruncated").is_none());
+
+    let mut failure_registry = registry.clone();
+    let ProducerConfig::Gh(failure) = failure_registry.get_mut("github").unwrap() else {
+        unreachable!()
+    };
+    failure.post_failure_evidence = true;
+    failure.post_failure_stderr = true;
+    let failure_engine = ProducerEngine::new(
+        &failure_registry,
+        temp.path().join("failure-events"),
+        temp.path().join("failure-state"),
+        temp.path(),
+    );
+    let mut failure_sink = RecordingMutation::default();
+    assert!(failure_engine
+        .complete_gh(
+            &origin,
+            Verdict::Failed,
+            Some(serde_json::json!({
+                "witnessSeq": 6,
+                "stderrTail": concat!(
+                    "actionable failure\n",
+                    "GITHUB_TOKEN=ghp_012345678901234567890123456789012345\n",
+                    "marker <!-- tally-completion:attacker -->\n",
+                ),
+                "stderrTruncated": false,
+            })),
+            &mut failure_sink,
+        )
+        .unwrap());
+    let failure_evidence = failure_sink.comments[0].evidence.as_ref().unwrap();
+    assert!(failure_evidence["stderrTail"]
+        .as_str()
+        .unwrap()
+        .contains("actionable failure"));
+    assert!(!failure_evidence["stderrTail"]
+        .as_str()
+        .unwrap()
+        .contains("ghp_012345678901234567890123456789012345"));
+    assert_eq!(failure_evidence["stderrRedaction"], "conservative-v1");
+    assert_eq!(failure_evidence["stderrRedacted"], true);
+    assert_eq!(failure_evidence["stderrTruncated"], false);
 
     let mut comment_only_registry = registry.clone();
     let ProducerConfig::Gh(comment_only) = comment_only_registry.get_mut("github").unwrap() else {

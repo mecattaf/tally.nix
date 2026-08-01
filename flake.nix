@@ -1158,6 +1158,8 @@
                   allowSelfTriggered = true;
                   allowedActors = [ "operator" ];
                   pollIntervalSec = 17;
+                  postFailureEvidence = true;
+                  postFailureStderr = true;
                   worklist = "specs/*/tasks.json";
                   maxTasks = 3;
                   gates = [
@@ -1245,6 +1247,14 @@
                     kind = "gh";
                     postEvidence = false;
                     closeOnPass = true;
+                    enqueue = {
+                      argv = [ "gh-job" ];
+                      pool = "slot";
+                    };
+                  };
+                  bad-failure-stderr = {
+                    kind = "gh";
+                    postFailureStderr = true;
                     enqueue = {
                       argv = [ "gh-job" ];
                       pool = "slot";
@@ -1654,6 +1664,14 @@
                   kind = "gh";
                   postEvidence = false;
                   closeOnPass = true;
+                  enqueue = {
+                    argv = [ "gh-job" ];
+                    pool = "slot";
+                  };
+                };
+                bad-failure-stderr = {
+                  kind = "gh";
+                  postFailureStderr = true;
                   enqueue = {
                     argv = [ "gh-job" ];
                     pool = "slot";
@@ -3287,6 +3305,9 @@
               .producers.github.allowSelfTriggered == false and
               .producers.github.allowedActors == [] and
               .producers.github.postReceipt == true and
+              .producers.github.postEvidence == false and
+              .producers.github.postFailureEvidence == false and
+              .producers.github.postFailureStderr == false and
               .producers.github.postGateSummary == true and
               .producers.github.requestReview == true and
               .producers.github.closeOnAcceptance == true and
@@ -3406,6 +3427,8 @@
                   .producers["campaign-fixture"].pollIntervalSec == 17 and
                   .producers["campaign-fixture"].postReceipt == true and
                   .producers["campaign-fixture"].postEvidence == true and
+                  .producers["campaign-fixture"].postFailureEvidence == true and
+                  .producers["campaign-fixture"].postFailureStderr == true and
                   .producers["campaign-fixture"].postGateSummary == false and
                   .producers["campaign-fixture"].closeOnAcceptance == false and
                   .producers["campaign-fixture"].closeOnPass == false and
@@ -3418,6 +3441,8 @@
                   ] and
                   .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "20"] and
                   .producers["campaign-defaulted"].allowSelfTriggered == false
+                  and .producers["campaign-defaulted"].postFailureEvidence == false
+                  and .producers["campaign-defaulted"].postFailureStderr == false
                 ' "$checkedConfig" >/dev/null
 
                 cp -R ${./test/fixtures/spec-build/repo} "$TMPDIR/spec"
@@ -3860,6 +3885,9 @@
               ''tally producer misspelled has unknown kind "event-directory"; expected one of calendar, build-effect, pool-reachability, gh, events-dir''
               invalidProducerMessages;
             assert builtins.elem "gh producer bad-close closeOnPass=true requires postEvidence=true"
+              invalidProducerMessages;
+            assert builtins.elem
+              "gh producer bad-failure-stderr postFailureStderr=true requires postFailureEvidence=true"
               invalidProducerMessages;
             assert !invalidProducerAttempt.success;
             pkgs.runCommand "tally-producer-kind-required" { } ''

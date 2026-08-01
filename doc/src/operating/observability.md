@@ -220,14 +220,15 @@ snapshot, then start a new watch. Do not pretend the stream was continuous.
 |---|---|---|---|
 | Witness and attestation ledgers | `~/.local/share/tally/` | `/var/lib/tally/data/` | Append-only |
 | Lifecycle history and watch log | same data directory | same data directory | Lifecycle is unbounded; watch keeps 4,096 records |
-| Enqueue events, captures, unit exits, meters | `~/.local/state/tally/` | `/var/lib/tally/state/` | No general automatic pruning |
+| Enqueue events, captures, unit exits, meters | `~/.local/state/tally/` | `/var/lib/tally/state/` | Selected sets only; see retention policy |
 | Current stdout/raw adapter stderr | Ordinary: `<stateDir>/capture/<uuid>.out` and `.adapter.err`; task-ref node: `<uuid>.<task-id>.out` and `.adapter.err` | same layout | Accumulates |
-| Failure-only stderr | Ordinary: `<stateDir>/capture/<uuid>.err`; task-ref node: `<uuid>.<task-id>.err`; only present after `failed` | same layout | Accumulates |
-| Older attempt captures | Ordinary: `<stateDir>/capture/archive/<uuid>/`; task-ref node: `archive/<uuid>.<task-id>/`; each retains the same stream distinction | same layout | Accumulates |
+| Failure-only stderr | Ordinary: `<stateDir>/capture/<uuid>.err`; task-ref node: `<uuid>.<task-id>.err`; atomic UTF-8 projection capped at 2 KiB, only present after `failed` | same layout | Current generation remains; archived copy follows the archive horizon |
+| Older attempt captures | Ordinary: `<stateDir>/capture/archive/<uuid>/`; task-ref node: `archive/<uuid>.<task-id>/`; each retains the same stream distinction | same layout | Pruned by `captureArchiveHorizon` (30 days by default) on the coordinator |
 | Worker-side remote state | configured executor `stateDir` | configured executor `stateDir` | Accumulates on the worker |
 
 `.adapter.err` may contain benign adapter-runtime chatter on a healthy job;
-`.err` is the failure signal. These files are private implementation storage.
+the presence of current-generation `.err` is the failure signal. `.err` is not
+a second raw stream. These files are private implementation storage.
 Prefer the query API: it validates authority, attempt identity, bounds, and
 pagination that a direct file read would have to reconstruct. Capacity planning
 and the one managed GC path are covered in

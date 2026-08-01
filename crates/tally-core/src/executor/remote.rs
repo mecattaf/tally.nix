@@ -417,6 +417,7 @@ impl Executor {
         };
         let stdout = decode_base64(stdout)?;
         let stderr = decode_base64(stderr)?;
+        let _capture_lock = self.lock_capture(identity)?;
         if !self.capture_generation_matches(identity, expected_attempt, expected_lease_epoch)? {
             self.archive_current_capture(identity)?;
         }

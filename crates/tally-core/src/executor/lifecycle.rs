@@ -942,6 +942,7 @@ impl Executor {
         &self,
         identity: &ExecutionIdentity,
     ) -> Result<ExecutionPaths, ExecutorError> {
+        let _capture_lock = self.lock_capture(identity)?;
         self.archive_current_capture(identity)?;
         let paths = self.paths(identity);
         let capture = paths

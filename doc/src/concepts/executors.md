@@ -58,13 +58,16 @@ Every generation writes stdout to `<uuid>.out` and the adapter's raw stderr to
 stderr scrapes and provider traces; routine harness chatter can therefore be
 retained without looking like a failure.
 
-When the canonical terminal lifecycle event is `failed`, the coordinator also
-materializes `<uuid>.err` and reads at most its final 2 KiB. That tail is copied
-into the failed lifecycle record and terminal result. Earlier bytes are marked
-as omitted. A successful job has no `<uuid>.err`, so external monitors may use
-that filename as a failure-only signal. Older generations use the same suffixes
-under `capture/archive/<uuid>/`; pre-split `.err` captures remain readable for
-compatibility.
+When the canonical terminal lifecycle event is `failed`, the coordinator reads
+at most the final 2 KiB and atomically materializes that UTF-8 diagnostic as
+`<uuid>.err`. It is not a duplicate raw stream. A per-identity capture lock
+couples the generation check with materialization, and startup reconstructs a
+missing current projection from a failed witness. The same tail is copied into
+the failed lifecycle record and terminal result; earlier bytes are marked as
+omitted. A successful generation has no `<uuid>.err`, so external monitors may
+use that filename's presence as a failure-only signal. Older generations use
+the same suffixes under `capture/archive/<uuid>/`; pre-split `.err` captures
+remain readable for compatibility.
 
 ## Recovery keeps execution singular
 

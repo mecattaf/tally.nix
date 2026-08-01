@@ -45,6 +45,10 @@ services.tally = {
     # The operator posts the mention using this same account's gh token.
     allowSelfTriggered = true;
     allowedActors = [ "mecattaf" ];
+    # Public failure comments and stderr publication are independently
+    # default-off. Diagnose locally unless this campaign explicitly needs them.
+    postFailureEvidence = false;
+    postFailureStderr = false;
     worklist = "specs/001-crm/tasks.json";
     maxTasks = 32;
 
@@ -87,6 +91,11 @@ authenticated GitHub identity is a bot: comments posted by the bot cannot start
 another campaign run. Set it to `true` only when the trusted person posting the
 campaign mention is also the account authenticated by `gh`, as in the
 single-account example above. `allowedActors` still applies independently.
+`postFailureEvidence` posts one comment for each failed attempt, so retries can
+accumulate several receipts. `postFailureStderr` requires it and adds only the
+bounded, conservatively redacted tail. Redaction cannot recognize every
+application secret; leave both defaults off for a public repository unless the
+publication policy has been deliberately reviewed.
 
 Every gate sets an `id`, an explicit `kind`, and the fields for that kind:
 `kind = "command"` requires `preflightArgv` and `argv`, while `kind =
@@ -305,9 +314,11 @@ and never changes a running node's immutable brief.
 
 After a non-passing node:
 
-1. Inspect the campaign receipt/evidence. A failed runner receipt includes its
-   bounded stderr tail; for a node terminal failure, the structured flow error
-   carries the failed child and that child's captured tail. Locate the full
+1. Inspect `tally query log` and the local structured flow error, which carries
+   the failed child and that child's bounded captured tail. A public campaign
+   receipt is absent by default; it includes failure metadata only with
+   `postFailureEvidence` and a conservatively redacted tail only with the
+   additional `postFailureStderr` opt-in. Locate the full
    lifecycle with `tally query log --flow-run <runner-task-uuid>` when needed.
    Task-specific records expose `taskRef`, so the worklist ID is visible
    without a UUID lookup.

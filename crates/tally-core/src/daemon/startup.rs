@@ -253,6 +253,7 @@ impl Daemon {
             &completed_witness,
             Utc::now(),
         )?;
+        reconcile_failure_stderr(&completed_witness, &executor)?;
         let initial_gh_completions = recovery_gh_completions(&plan, &completed_witness, &executor)?;
         let initial_lost_pools = ProducerEngine::new(
             &config.producers,
@@ -589,6 +590,45 @@ pub(super) fn recovery_gh_completions(
             },
         })
         .collect())
+}
+
+pub(super) fn reconcile_failure_stderr(
+    records: &[crate::witness::WitnessRecord],
+    executor: &Executor,
+) -> Result<(), DaemonError> {
+    for record in records {
+        if terminal_lifecycle_event(record.verdict, record.artifact_content_hash.is_some())
+            != TallyEvent::Failed
+        {
+            continue;
+        }
+        let Some(task_uuid) = record.task_uuid.as_deref() else {
+            continue;
+        };
+        let task_uuid = Uuid::parse_str(task_uuid).map_err(|_| {
+            DaemonError::Invalid(format!(
+                "terminal witness {} has invalid task UUID {task_uuid:?}",
+                record.seq
+            ))
+        })?;
+        let identity = ExecutionIdentity {
+            job_id: task_uuid,
+            task_uuid: Some(task_uuid),
+            task_ref: record
+                .orchestration
+                .as_ref()
+                .and_then(Orchestration::task_ref),
+        };
+        if let Err(error) =
+            executor.persist_failure_stderr(&identity, record.attempt, record.lease_epoch)
+        {
+            eprintln!(
+                "tally: could not recover failure stderr for {task_uuid} attempt={} leaseEpoch={}: {error}",
+                record.attempt, record.lease_epoch
+            );
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn reconcile_reuse_witnesses(

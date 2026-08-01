@@ -48,7 +48,10 @@ launching another job.
 
 GitHub completion effects are also explicit policy: receipts, evidence
 comments, gate summaries, review requests, and item state changes are separate
-choices. `neverMutate` is an absolute override. Canonical completion remains in
+choices. `postEvidence` is pass/reuse-only. Public failure metadata and its
+conservatively redacted stderr tail require the separate, default-off
+`postFailureEvidence` and `postFailureStderr` controls. `neverMutate` is an
+absolute override. Canonical completion remains in
 the witness ledger even when every GitHub mutation is disabled or an external
 API call must be retried.
 

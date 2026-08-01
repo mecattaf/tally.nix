@@ -1169,7 +1169,19 @@ let
           type = types.bool;
           default = false;
           example = true;
-          description = "Post an idempotent evidence comment after any terminal verdict, including the bounded stderr tail on failure.";
+          description = "Post an idempotent evidence comment after a passing or reused verdict.";
+        };
+        postFailureEvidence = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Explicitly post one idempotent evidence comment for each failed attempt; disabled by default because failure metadata originates in private execution state.";
+        };
+        postFailureStderr = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Include a conservatively redacted, bounded stderr tail in explicitly enabled failure evidence; requires postFailureEvidence.";
         };
         postGateSummary = mkOption {
           type = types.bool;
@@ -1236,6 +1248,10 @@ let
           {
             assertion = !config.closeOnPass || config.postEvidence;
             message = "gh producer ${name} closeOnPass=true requires postEvidence=true";
+          }
+          {
+            assertion = !config.postFailureStderr || config.postFailureEvidence;
+            message = "gh producer ${name} postFailureStderr=true requires postFailureEvidence=true";
           }
           {
             assertion =
@@ -2002,6 +2018,18 @@ let
           default = 60;
           description = "GitHub campaign producer polling cadence.";
         };
+        postFailureEvidence = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Explicitly post one public failure receipt for each failed campaign attempt; disabled by default.";
+        };
+        postFailureStderr = mkOption {
+          type = types.bool;
+          default = false;
+          example = true;
+          description = "Include the conservatively redacted 2 KiB stderr tail in public campaign failure receipts; requires postFailureEvidence.";
+        };
         worklist = mkOption {
           type = types.str;
           default = "specs/*/tasks.json";
@@ -2135,6 +2163,10 @@ let
         {
           assertion = config.mention != "";
           message = "tally campaign ${name} mention must be non-empty";
+        }
+        {
+          assertion = !config.postFailureStderr || config.postFailureEvidence;
+          message = "tally campaign ${name} postFailureStderr=true requires postFailureEvidence=true";
         }
         {
           assertion =
@@ -2696,6 +2728,8 @@ let
               pollIntervalSec
               postReceipt
               postEvidence
+              postFailureEvidence
+              postFailureStderr
               postGateSummary
               requestReview
               closeOnAcceptance
@@ -2982,6 +3016,7 @@ let
       inherit (campaign) allowSelfTriggered allowedActors pollIntervalSec;
       postReceipt = true;
       postEvidence = true;
+      inherit (campaign) postFailureEvidence postFailureStderr;
       postGateSummary = false;
       requestReview = false;
       closeOnAcceptance = false;

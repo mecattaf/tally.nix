@@ -2140,6 +2140,18 @@ mod tests {
     }
 
     #[test]
+    fn substituted_terminal_results_are_successful_lifecycle_events() {
+        assert_eq!(
+            terminal_lifecycle_event(Verdict::Substituted, false),
+            TallyEvent::WitnessEmitted
+        );
+        assert_eq!(
+            terminal_lifecycle_event(Verdict::Substituted, true),
+            TallyEvent::Completed
+        );
+    }
+
+    #[test]
     fn recovery_replays_a_terminal_github_failure_with_its_stderr_tail() {
         let temp = tempdir().unwrap();
         let executor = direct_executor(&temp.path().join("state"));
@@ -2168,7 +2180,6 @@ mod tests {
         fs::create_dir_all(paths.stderr.parent().unwrap()).unwrap();
         fs::create_dir_all(paths.capture_generation.parent().unwrap()).unwrap();
         fs::write(&paths.stderr, b"recovered actionable stderr\n").unwrap();
-        executor.persist_failure_stderr(&paths).unwrap();
         fs::write(
             &paths.capture_generation,
             br#"{"attempt":1,"leaseEpoch":1}"#,
@@ -2192,6 +2203,13 @@ mod tests {
             labor_class: LaborClass::Fresh,
             guardrail_depth: 0,
         });
+
+        assert!(!paths.failure_stderr.exists());
+        startup::reconcile_failure_stderr(std::slice::from_ref(&record), &executor).unwrap();
+        assert_eq!(
+            fs::read(&paths.failure_stderr).unwrap(),
+            b"recovered actionable stderr\n"
+        );
 
         let recovered = startup::recovery_gh_completions(
             &plan,
@@ -3460,14 +3478,42 @@ mod tests {
                 failed.verdict = Verdict::Failed;
                 failed.exit_code = 1;
                 failed.stderr_excerpt = Some(crate::executor::CaptureExcerpt {
-                    text: "child process failed: actionable detail\n".to_owned(),
+                    text: concat!(
+                        "child process failed: actionable detail\n",
+                        "GITHUB_TOKEN=ghp_012345678901234567890123456789012345\n",
+                        "opaque 0123456789abcdef0123456789abcdef0123456789abcdef\n",
+                        "marker <!-- tally-completion:attacker -->\n",
+                    )
+                    .to_owned(),
                     truncated: false,
                 });
+                daemon
+                    .handler
+                    .complete_gh_post_ack(row.clone(), failed.clone());
+                daemon.handler.drain_post_ack_tasks().await;
+                // `postEvidence` retains its success-only meaning. A failure
+                // does not even inspect the public item unless the separate
+                // failure policy is explicitly enabled.
+                assert_eq!(fs::read(&calls).unwrap(), b"xxxx");
+
+                {
+                    let mut context = daemon.handler.context.write().await;
+                    let ProducerConfig::Gh(github) =
+                        context.config.producers.get_mut("github").unwrap()
+                    else {
+                        unreachable!()
+                    };
+                    github.post_failure_evidence = true;
+                    github.post_failure_stderr = true;
+                }
+                failed.witness_seq = 11;
                 daemon.handler.complete_gh_post_ack(row, failed);
                 daemon.handler.drain_post_ack_tasks().await;
                 assert_eq!(fs::read(calls).unwrap(), b"xxxxxx");
-                let requests = fs::read_to_string(requests_path)
-                    .unwrap()
+                let requests = fs::read_to_string(requests_path).unwrap();
+                assert!(!requests.contains("ghp_012345678901234567890123456789012345"));
+                assert!(!requests.contains("0123456789abcdef0123456789abcdef0123456789abcdef"));
+                let requests = requests
                     .lines()
                     .map(|line| serde_json::from_str::<Value>(line).unwrap())
                     .collect::<Vec<_>>();
@@ -3482,14 +3528,18 @@ mod tests {
                     })
                     .unwrap();
                 let body = failure_comment["variables"]["body"].as_str().unwrap();
+                assert_eq!(body.matches("<!-- tally-completion:").count(), 1);
+                assert!(!body.contains("<!-- tally-completion:attacker -->"));
                 let (_, remainder) = body.split_once('\n').unwrap();
                 let (encoded, _) = remainder.split_once("\n\n").unwrap();
                 let receipt: Value = serde_json::from_str(encoded).unwrap();
                 assert_eq!(receipt["evidence"]["verdict"], "failed");
-                assert_eq!(
-                    receipt["evidence"]["stderrTail"],
-                    "child process failed: actionable detail\n"
-                );
+                let published_stderr = receipt["evidence"]["stderrTail"].as_str().unwrap();
+                assert!(published_stderr.contains("child process failed: actionable detail"));
+                assert!(!published_stderr
+                    .contains("ghp_012345678901234567890123456789012345"));
+                assert_eq!(receipt["evidence"]["stderrRedaction"], "conservative-v1");
+                assert_eq!(receipt["evidence"]["stderrRedacted"], true);
                 assert_eq!(receipt["evidence"]["stderrTruncated"], false);
             })
             .await;

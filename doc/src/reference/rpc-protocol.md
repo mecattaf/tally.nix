@@ -271,9 +271,9 @@ positive. Its terminal result is:
 The two stderr fields are present for every failed job whose capture is
 available. `stderr_excerpt` is the lossy UTF-8 rendering of at most the final
 2 KiB of its retained stderr, including any omission marker;
-`stderr_truncated` says whether earlier bytes were omitted. The retained
-`.err` capture remains byte-authoritative. Successful jobs retain raw adapter
-stderr separately as `.adapter.err` and do not materialize `.err`.
+`stderr_truncated` says whether earlier bytes were omitted. The retained `.err`
+file is the same bounded UTF-8 diagnostic projection; the byte-authoritative
+raw stream remains `.adapter.err`. Successful jobs do not materialize `.err`.
 
 For an active job the waiter is memory-resident. For a completed job the daemon reconstructs the
 answer from the verified witness ledger, including after restart. A client connection and its

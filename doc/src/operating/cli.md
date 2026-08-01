@@ -320,7 +320,8 @@ separates advisory attestations, and includes ledger verification state.
 
 Each `failed` log item includes the bounded `stderrTail` and a
 `stderrTruncated` boolean. Start there before constructing a capture path by
-hand.
+hand. The current generation's `.err` is the same bounded diagnostic
+projection; raw adapter bytes remain in `.adapter.err`.
 
 `query log --flow-run` restricts the lifecycle stream to one run's nodes. A lifecycle event
 carries no orchestration capsule, so the run's task UUIDs are resolved from the durable rows and

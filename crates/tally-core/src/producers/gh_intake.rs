@@ -1298,7 +1298,12 @@ impl GhMutationSink for GhCliMutationSink {
         let remote_key = stable_key(&["gh-remote-completion", completion_id]);
         let remote_marker = format!("<!-- tally-completion:{remote_key} -->");
         let encoded = serde_json::to_string(mutation)
-            .map_err(|error| format!("cannot encode GitHub evidence: {error}"))?;
+            .map_err(|error| format!("cannot encode GitHub evidence: {error}"))?
+            // JSON does not require HTML-significant characters to be escaped.
+            // Escape them explicitly so untrusted evidence cannot inject a
+            // second tally completion marker into the raw issue comment.
+            .replace('<', "\\u003c")
+            .replace('>', "\\u003e");
         let body = mutation.assisted_by.as_ref().map_or_else(
             || format!("{remote_marker}\n{encoded}"),
             |assisted_by| format!("{remote_marker}\n{encoded}\n\n{}", assisted_by.trailer()),

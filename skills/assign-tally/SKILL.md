@@ -66,15 +66,16 @@ re-mention is always safe and always cheap.
 
 ## Observe
 
-Monitor **ground truth only**: merged PRs, non-empty capture `.err` files, and
+Monitor **ground truth only**: merged PRs, the presence of capture `.err` files, and
 the runner unit's liveness. Do not build monitors on `tally query log
 --flow-run` — it freezes silently on long runs (DEBT: #247). Silence is not
 success: any watcher must fire on every terminal state, including "runner gone
 with work remaining."
 
 Known adapter noise such as "Reading additional input from stdin..." is retained
-in `.adapter.err`. The conventional `.err` path is materialized only after a
-failed terminal verdict, so it is a valid failure signal.
+in `.adapter.err`. The conventional `.err` path is an atomic, bounded
+diagnostic projection materialized only after a failed terminal verdict, so
+its presence is a valid current-generation failure signal.
 
 A healthy campaign gets zero intervention. Do not comment, do not steer, do not
 "check in" on the agents. Wall-clock alone is never a reason to interfere.
@@ -85,8 +86,9 @@ The campaign must keep working unless it is genuinely blocked or done. There are
 no approval pauses, no "phase done, awaiting operator" states, and Claude must
 never introduce one.
 
-1. On any failed node, read the bounded `stderrTail` in `tally query log` or the
-   campaign failure receipt first. Read
+1. On any failed node, read the bounded `stderrTail` in `tally query log` first.
+   A campaign failure receipt contains a conservatively redacted copy only when
+   its GitHub producer explicitly enables both failure-publication switches. Read
    `~/.local/state/tally/capture/<task-uuid>.err` only when the tail is
    truncated or insufficient; `.adapter.err` is the raw adapter stream.
 2. Transient (network, quota, wall-clock budget) → re-trigger. Until forge-state

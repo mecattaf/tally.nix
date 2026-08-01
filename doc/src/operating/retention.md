@@ -1,13 +1,14 @@
 # Retention and growth
 
 tally has targeted retention for Nix store evidence, structured brief bytes,
-capture archives, and producer ingress. It does not have a general artifact
-retention engine.
+per-attempt capture archives, and consumed/rejected producer events. It does
+not have a general artifact retention engine.
 
 `store:<path>` evidence and `drv()` records receive Nix GC roots. The Home
 Manager and NixOS timers drop expired roots and invoke Nix garbage collection.
 Ordinary `artifact:<path>` files, lifecycle observations, durable enqueue rows,
-and the ledgers are outside the Nix-root mechanism.
+current captures, and the ledgers are outside the age-based pruners and Nix-root
+mechanism.
 
 Structured briefs have one canonical copy under `<dataDir>/briefs`. Producers
 write there directly; daemon admission verifies and reuses that file. The GC
@@ -57,6 +58,10 @@ Both the Home Manager and NixOS modules render the retention service and timer:
 services.tally.retention = {
   enable = true;
   horizon = "30d";
+  captureArchiveHorizon = "30d";
+  eventsDoneHorizon = "180d";
+  eventsRejectedHorizon = "30d";
+  eventsRejectedMaxCount = 10000;
   onCalendar = "daily";
 };
 ```
@@ -64,7 +69,11 @@ services.tally.retention = {
 The timer runs this command:
 
 ```console
-$ tally gc --horizon 30d --collect
+$ tally gc --horizon 30d --collect \
+    --capture-archive-horizon 30d \
+    --events-done-horizon 180d \
+    --events-rejected-horizon 30d \
+    --events-rejected-max-count 10000
 ```
 
 The NixOS service runs the same command with its configured `--data-dir`
@@ -83,9 +92,10 @@ The GC command:
 5. on a mutating run, re-registers every live root and stops before pruning if
    one cannot be secured;
 6. removes expired brief bytes and an expired witness's root only when absent
-   from the corresponding live set; and
-7. prunes configured state-directory archives/ingress and, with `--collect`,
-   runs `nix store gc`.
+   from the corresponding live set;
+7. prunes coordinator-side per-attempt capture archives and consumed/rejected
+   producer-event files according to their independent age/count policies; and
+8. with `--collect`, runs `nix store gc`.
 
 The witness ledger is never rewritten. A recent witness therefore forms a
 liveness floor even when an older witness names the same path.
@@ -164,13 +174,15 @@ The current storage story is intentionally uneven:
 |---|---|---|
 | `witness.jsonl` | Append-only, unbounded | Never truncate; archive only as a complete, verified ledger during an explicit migration. |
 | `attestations.jsonl` | Append-only, unbounded | Preserve if advisory history matters; it is a separate chain from verdicts. |
-| `lifecycle.jsonl` | Explicit policy string `unbounded` | No supported compaction command exists. Do not hand-edit it. |
+| `lifecycle.jsonl` | Unbounded until explicit offline `tally history compact` | Compact only with the daemon stopped and preserve the recorded truncation boundary. |
 | `changes.jsonl` | Latest 4,096 change records | Automatic; invalid or foreign contents reset to an empty feed at startup, and slow readers receive `cursor-expired`. |
 | `<dataDir>/briefs` | Live attempts plus witnesses inside `retention.horizon`; hashes remain durable after bytes expire | Automatic through `tally gc`; enqueue fresh work when an expired failed job can no longer be retried. |
-| Current and archived captures | `.out` and raw `.adapter.err` accumulate per generation; failed generations also have `.err`; query reads at most 16 MiB | Do not remove active-generation files. Archiving old captures sacrifices trace and scrape reconstruction. |
+| Current captures | One `.out` and raw `.adapter.err` generation per task identity; a failed generation also has a bounded `.err` projection of at most 2 KiB | Do not remove active-generation files. `.adapter.err` is the sole byte-authoritative stderr stream. |
+| Archived captures | Per-attempt `.out` and raw `.adapter.err`; failed attempts may include the bounded `.err` projection | Coordinator `tally gc` prunes files older than `captureArchiveHorizon` (30 days by default). Witnesses do not pin them. Remote-worker state needs its own policy. |
 | Worker `stateDir` | Captures, launch markers, exit records, and execution attestations accumulate | Preserve live/ambiguous generations. No worker-side GC is shipped. |
 | Ordinary `artifact:<path>` files | Owned by the workload; no tally GC root | Apply a workload-specific policy only after accepting the reuse and audit consequences below. |
-| Enqueue events and unit-exit state | Durable recovery inputs; no general pruner | Do not prune by age. |
+| Producer events | Pending files are durable recovery inputs; consumed `events/done` defaults to 180 days, rejected files to 30 days/10,000 | Let `tally gc` prune only the managed done/rejected sets. |
+| Unit-exit state | Durable recovery input; no general pruner | Do not prune by age. |
 | In-memory barrier tracker | At most 64 unclaimed drain snapshots; connected waits scale with active calls, and disconnected waiters are evicted on the next tracker operation | Automatic and restart-local. |
 | In-memory parent guardrails | Terminal parents retire after their outstanding-child count reaches zero | Automatic; rebuilt from active durable rows. |
 
@@ -185,8 +197,9 @@ On the NixOS system module, inspect `/var/lib/tally/data` and
 `/var/lib/tally/state` instead. Inspect each remote executor's configured
 worker `stateDir` separately.
 
-There is no sanctioned command that compacts lifecycle history, captures,
-enqueue events, and exit records together. Under space pressure, quiesce the
+There is no sanctioned command that compacts every state class together.
+Use `tally gc` for the managed archive/event sets and `tally history compact`
+for lifecycle history. Under broader space pressure, quiesce the
 coordinator, take a recoverable archive outside `stateDir`, and verify queries
 and recovery before retiring that archive. Never present an ad-hoc `find
 -mtime -delete` policy as tally GC.

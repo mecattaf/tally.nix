@@ -413,8 +413,10 @@ impl JobResult {
 const fn terminal_lifecycle_event(verdict: Verdict, has_artifact: bool) -> TallyEvent {
     match (verdict, has_artifact) {
         (Verdict::Preempted, _) => TallyEvent::Preempted,
-        (Verdict::Pass | Verdict::Reused, true) => TallyEvent::Completed,
-        (Verdict::Pass | Verdict::Reused, false) => TallyEvent::WitnessEmitted,
+        (Verdict::Pass | Verdict::Reused | Verdict::Substituted, true) => TallyEvent::Completed,
+        (Verdict::Pass | Verdict::Reused | Verdict::Substituted, false) => {
+            TallyEvent::WitnessEmitted
+        }
         _ => TallyEvent::Failed,
     }
 }
@@ -437,6 +439,11 @@ fn retained_failure_stderr_excerpt(
             .as_ref()
             .and_then(Orchestration::task_ref),
     };
+    if let Ok(Some(excerpt)) =
+        executor.persist_failure_stderr(&identity, record.attempt, record.lease_epoch)
+    {
+        return Some(excerpt);
+    }
     let paths = executor
         .retained_capture_paths(&identity, record.attempt, record.lease_epoch)
         .ok()??;

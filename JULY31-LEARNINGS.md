@@ -139,10 +139,12 @@ makes that one-real-execution check a first-class verb that surfaces the
 captured stderr — the incident's root cause was invisible in the journal and
 lifecycle stream, and only present in the capture files.
 
-Follow-up #249 closes that diagnostic gap: every failed lifecycle event and
-GitHub failure receipt now carries a bounded stderr tail. Raw adapter chatter
-is retained as `.adapter.err`; the failure-only `.err` path is absent on
-healthy jobs.
+Follow-up #249 closes that diagnostic gap locally: every failed lifecycle
+event carries a bounded stderr tail. Raw adapter chatter is retained as
+`.adapter.err`; the failure-only `.err` projection is absent on healthy jobs.
+Forge publication is a separate trust boundary: campaign failure receipts are
+off by default and require explicit `postFailureEvidence` plus
+`postFailureStderr`; any published tail is conservatively redacted.
 
 ## Secondary observations worth keeping
 

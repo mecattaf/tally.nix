@@ -397,6 +397,10 @@ pub struct GhProducer {
     #[serde(default)]
     pub post_evidence: bool,
     #[serde(default)]
+    pub post_failure_evidence: bool,
+    #[serde(default)]
+    pub post_failure_stderr: bool,
+    #[serde(default)]
     pub post_gate_summary: bool,
     #[serde(default)]
     pub request_review: bool,

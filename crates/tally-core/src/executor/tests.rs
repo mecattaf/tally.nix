@@ -1279,10 +1279,22 @@ fn failure_capture_excerpt_is_a_bounded_private_tail() {
     let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
     let request = request();
     let paths = executor.prepare_paths(&request.identity).unwrap();
+    write_capture_generation(
+        &paths.capture_generation,
+        CaptureGeneration {
+            attempt: request.attempt,
+            lease_epoch: request.lease_epoch,
+        },
+    )
+    .unwrap();
 
     std::fs::write(&paths.stderr, b"short failure\n").unwrap();
-    let failure_path = executor.persist_failure_stderr(&paths).unwrap();
-    assert_eq!(failure_path, paths.failure_stderr);
+    let excerpt = executor
+        .persist_failure_stderr(&request.identity, request.attempt, request.lease_epoch)
+        .unwrap()
+        .unwrap();
+    let failure_path = paths.failure_stderr.clone();
+    assert_eq!(excerpt.text, "short failure\n");
     assert_eq!(std::fs::read(&failure_path).unwrap(), b"short failure\n");
     assert_eq!(
         std::fs::metadata(&failure_path)
@@ -1310,6 +1322,23 @@ fn failure_capture_excerpt_is_a_bounded_private_tail() {
         .text
         .starts_with("[... earlier captured stderr omitted ...]\n"));
     assert!(excerpt.text.ends_with("actionable tail\n"));
+    let persisted = executor
+        .persist_failure_stderr(&request.identity, request.attempt, request.lease_epoch)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&failure_path).unwrap(),
+        persisted.text.as_bytes()
+    );
+    assert!(std::fs::metadata(&failure_path).unwrap().len() <= CAPTURE_EXCERPT_MAX_BYTES as u64);
+
+    let mut split_codepoint = "€".as_bytes().to_vec();
+    split_codepoint.extend(std::iter::repeat_n(b'x', CAPTURE_EXCERPT_MAX_BYTES - 1));
+    std::fs::write(&paths.stderr, split_codepoint).unwrap();
+    let excerpt = read_capture_excerpt(&paths.stderr).unwrap();
+    assert!(excerpt.truncated);
+    assert!(!excerpt.text.contains('�'));
+    assert!(excerpt.text.len() <= CAPTURE_EXCERPT_MAX_BYTES);
 
     let linked = temp.path().join("linked-capture");
     std::fs::hard_link(&paths.stderr, &linked).unwrap();
@@ -1322,8 +1351,6 @@ fn raw_and_failure_stderr_archive_as_distinct_generation_files() {
     let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
     let request = request();
     let paths = executor.prepare_paths(&request.identity).unwrap();
-    std::fs::write(&paths.stderr, b"adapter chatter\nactionable failure\n").unwrap();
-    executor.persist_failure_stderr(&paths).unwrap();
     write_capture_generation(
         &paths.capture_generation,
         CaptureGeneration {
@@ -1332,6 +1359,13 @@ fn raw_and_failure_stderr_archive_as_distinct_generation_files() {
         },
     )
     .unwrap();
+    let mut raw = vec![b'x'; CAPTURE_EXCERPT_MAX_BYTES + 17];
+    raw.extend_from_slice(b"actionable failure\n");
+    std::fs::write(&paths.stderr, &raw).unwrap();
+    let failure = executor
+        .persist_failure_stderr(&request.identity, request.attempt, request.lease_epoch)
+        .unwrap()
+        .unwrap();
 
     let retry = executor.prepare_paths(&request.identity).unwrap();
     assert!(!retry.failure_stderr.exists());
@@ -1345,11 +1379,102 @@ fn raw_and_failure_stderr_archive_as_distinct_generation_files() {
         .ends_with("attempt-0000000001-epoch-00000000000000000007.adapter.err"));
     let archived_failure = archived.failure_stderr.unwrap();
     assert!(archived_failure.ends_with("attempt-0000000001-epoch-00000000000000000007.err"));
-    for path in [archived.stderr, archived_failure] {
-        assert_eq!(
-            std::fs::read(path).unwrap(),
-            b"adapter chatter\nactionable failure\n"
-        );
+    assert_eq!(std::fs::read(archived.stderr).unwrap(), raw);
+    assert_eq!(
+        std::fs::read(archived_failure).unwrap(),
+        failure.text.as_bytes()
+    );
+    assert!(failure.text.len() <= CAPTURE_EXCERPT_MAX_BYTES);
+}
+
+#[test]
+fn stale_failure_persistence_cannot_mark_a_new_capture_generation_failed() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    let request = request();
+    let first = executor.prepare_paths(&request.identity).unwrap();
+    write_capture_generation(
+        &first.capture_generation,
+        CaptureGeneration {
+            attempt: 1,
+            lease_epoch: 7,
+        },
+    )
+    .unwrap();
+    std::fs::write(&first.stderr, b"old failed attempt\n").unwrap();
+
+    let second = executor.prepare_paths(&request.identity).unwrap();
+    write_capture_generation(
+        &second.capture_generation,
+        CaptureGeneration {
+            attempt: 2,
+            lease_epoch: 8,
+        },
+    )
+    .unwrap();
+    std::fs::write(&second.stderr, b"healthy adapter chatter\n").unwrap();
+
+    assert_eq!(
+        executor
+            .persist_failure_stderr(&request.identity, 1, 7)
+            .unwrap(),
+        None
+    );
+    assert!(!second.failure_stderr.exists());
+}
+
+#[test]
+fn concurrent_retry_and_late_failure_persistence_never_leave_a_false_err_signal() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    for _ in 0..16 {
+        let mut request = request();
+        let uuid = Uuid::new_v4();
+        request.identity.job_id = uuid;
+        request.identity.task_uuid = Some(uuid);
+        let first = executor.prepare_paths(&request.identity).unwrap();
+        write_capture_generation(
+            &first.capture_generation,
+            CaptureGeneration {
+                attempt: 1,
+                lease_epoch: 7,
+            },
+        )
+        .unwrap();
+        std::fs::write(&first.stderr, b"old failed attempt\n").unwrap();
+
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let late_executor = executor.clone();
+        let late_identity = request.identity.clone();
+        let late_barrier = barrier.clone();
+        let late = std::thread::spawn(move || {
+            late_barrier.wait();
+            late_executor
+                .persist_failure_stderr(&late_identity, 1, 7)
+                .unwrap()
+        });
+        let retry_executor = executor.clone();
+        let retry_identity = request.identity.clone();
+        let retry = std::thread::spawn(move || {
+            barrier.wait();
+            let paths = retry_executor.prepare_paths(&retry_identity).unwrap();
+            write_capture_generation(
+                &paths.capture_generation,
+                CaptureGeneration {
+                    attempt: 2,
+                    lease_epoch: 8,
+                },
+            )
+            .unwrap();
+            std::fs::write(&paths.stderr, b"healthy adapter chatter\n").unwrap();
+            paths
+        });
+        late.join().unwrap();
+        let current = retry.join().unwrap();
+        assert!(executor
+            .capture_generation_matches(&request.identity, 2, 8)
+            .unwrap());
+        assert!(!current.failure_stderr.exists());
     }
 }
 
@@ -1418,10 +1543,6 @@ fn wave_5_red_case_two_attempt_provider_captures_are_distinct_and_queryable() {
     let paths = executor.prepare_paths(&request.identity).unwrap();
     std::fs::write(&paths.stdout, b"{\"attempt\":1,\"message\":\"first\"}\n").unwrap();
     std::fs::write(&paths.stderr, b"first failure stderr\n").unwrap();
-    assert_eq!(
-        executor.persist_failure_stderr(&paths).unwrap(),
-        paths.failure_stderr
-    );
     write_capture_generation(
         &paths.capture_generation,
         CaptureGeneration {
@@ -1430,6 +1551,15 @@ fn wave_5_red_case_two_attempt_provider_captures_are_distinct_and_queryable() {
         },
     )
     .unwrap();
+    let failure = executor
+        .persist_failure_stderr(&request.identity, 1, 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(failure.text, "first failure stderr\n");
+    assert_eq!(
+        std::fs::read(&paths.failure_stderr).unwrap(),
+        b"first failure stderr\n"
+    );
 
     let second = executor.prepare_paths(&request.identity).unwrap();
     let task_uuid = request.identity.task_uuid.unwrap().to_string();
