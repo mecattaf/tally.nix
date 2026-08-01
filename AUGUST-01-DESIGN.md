@@ -197,7 +197,7 @@ move to the publish node — bind/rebind on the final squash commit, with the
 steward-authored message carrying the trailer. Arming git-ai (advisory first)
 is therefore one work item with the `mergeMethod` option, not a separate one.
 
-## 8. Wave-3 backlog owed by the August 1 audit
+## 8. Wave-3 backlog owed by the August 1 audit (see also §9)
 
 To be minted as issues once wave 2 lands; audit evidence lives in the session
 record.
@@ -219,3 +219,99 @@ record.
    a boolean instead of requesting a review; unset `closeOnPass` silently
    inherits `postEvidence`; hardPreempt doc/code divergence on co-allocated
    pools; worklist reads skip `fetch` wherever a repo-file worklist remains.
+
+## 9. Substrate accretions, tombstones, and the rulings since
+
+An adversarial deliberation ran against the post-wave-2 baseline with one
+question: which integrated-but-dormant or ambient-but-underexploited substrates
+delete bespoke work, the way §7 found git-ai already holding the provenance
+stack wave 3 would otherwise invent? Ranked findings, then the rejections —
+recorded so nothing gets re-litigated — then the operator rulings made on top.
+
+### 9.1 Accretions, ranked
+
+1. **Events-dir self-re-entry.** A campaign currently continues itself through
+   a public `/tally reconcile <name>` comment that a second gh producer polls
+   back. The continuation moves to a JSON file dropped in the shipped eventsDir
+   producer (5 s drain). Deletes one producer per campaign, removes GitHub API
+   availability from the campaign's critical path, cuts merge→next-pass latency
+   to seconds, and erases the loudest two-surface violation in the tree. The
+   human at-mention keeps the remoteness property; only the machine's
+   self-nudge moves local. Prerequisite for every quiet-profile item.
+2. **GitHub native sub-issues** (API verified live on this account). The
+   parent's `subIssuesSummary` progress bar makes #258's checkbox projection a
+   computed property tally never writes; one GraphQL walk (parent → subIssues →
+   `closedByPullRequestsReferences` → `pullRequest.merged`) replaces the
+   driver's PR-scanning read path. Role division is strict: sub-issues carry
+   identity, status projection, and the per-task steering thread; they refuse
+   topology (the DAG stays in the worklist artifact) and truth — a closed
+   sub-issue is human-clickable, so `pullRequest.merged` remains the only
+   oracle and a closed-but-unmerged sub-issue renders as a loud anomaly in the
+   status verb. Ceiling 100 sub-issues per parent; the agency shape is a
+   two-level hierarchy (program parent → domain campaigns → task sub-issues),
+   which per-domain campaigns already wanted. Arm-time capability probe,
+   degrading to checkbox rendering.
+3. **Sticky-comment upsert.** Store the ack/receipt comment's node id and edit
+   it instead of marker-scanning; closes the duplicate-ack class (#245) and
+   subsumes the split-`postReceipt` item in §8.1. Line held: receipts and
+   progress upsert silently; steering, escalation, and the closing summary are
+   always fresh comments, so the operator is actually notified.
+4. **git-ai arming catches** (beyond §7): the provider pins binary version
+   1.6.17 — `required` mode couples every code result to one dotfiles binary
+   fleet-wide, so arm advisory-first and document the coupling;
+   `globalAwaitOk` must stay false under parallel lanes (the global fallback
+   barrier is process-wide; the per-worktree path is safe); a note binds up to
+   16 session tuples per commit — durable pointers into the coder's own
+   harness sessions, raw material for diagnosis and the mechanization ladder.
+5. **TaskChampion live projection: delete** (ruling recorded in 9.3). Nothing
+   reads it, the interesting features are compiled out, and it caused the #252
+   pathology. Deleting subtracts #252 in full, ~1,160 lines, and the sqlite
+   dependency chain; the durable store (flat JSON events + hash-chained
+   witness) is untouched.
+6. **systemd cgroup accounting** for the always-empty charge/gpuSeconds
+   witness fields — a few `--property=` lines plus one `systemctl show` in the
+   exit recorder. Fills a gap; subsumes nothing; ranked low honestly.
+7. **Git's own worktree metadata** over the bespoke marker files, plus the
+   missing `git worktree prune`: today every failed lane permanently leaks a
+   worktree, branch, and marker, and the two drivers carry two incompatible
+   worktree managers. Do before the two-repo seam touches this code.
+
+### 9.2 Tombstones
+
+Rejected with reasons; do not re-propose: TaskChampion sync / recurrence /
+reports (no distributed state to reconcile; timers are strictly better; the
+status verb is free from the reconciler). journald as lifecycle store or
+capture transport (vacuums oldest-first, shreds >48 KiB lines — capture files
+were the entire July 31 diagnosis; the `--since <cursor>` half of #247 is the
+one salvageable piece). `OnFailure=` for diagnosis dispatch (diagnosis is a
+reconciler decision, not a unit side effect; cannot distinguish red gate from
+adapter crash). tmpfiles / fs quotas for disk budgets (ENOSPC-at-arbitrary-
+write is the quiet starvation the storage monitor exists to eliminate). GitHub
+merge queues in place of the tally-side re-gate (adds a queued state and
+per-repo settings; a net roadmap addition — keep the re-gate). git-notes for
+steering and worklist-in-refs (squash catch, invisible in UI, two copies of
+truth). The Nix store as brief CAS (world-readable, unsweepable, daemon
+round-trip on the hot path). D-Bus/varlink transport swaps (rewrites working
+code, removes zero items).
+
+### 9.3 Rulings on the record (2026-08-01)
+
+1. **TaskChampion live projection: full-delete.** `tally view rebuild` may
+   survive as an offline verb; the live commit channel goes. #252 closes via
+   the delete, not via repair of the rebuild path.
+2. **git-ai: always on.** Enable estate-wide immediately; advisory while the
+   publish-node binding (bind/rebind on the final squash commit, §7) proves
+   itself on real squash merges; then flip to `required`, accepting the 1.6.17
+   fleet coupling with eyes open. First step of the work item stays the
+   empirical squash-fidelity check (per-line attribution vs summary-only).
+3. **Sub-issues: adopted**, under 9.1.2's role division and oracle invariant.
+4. **One-pass driver consolidation.** Accretions 9.1.1/9.1.3/9.1.7, the
+   sub-issues read path, and the §8 items that land in the same driver mass
+   ship as one serialized train through `spec_build_driver.py` /
+   `spec-build.js`, not as four sequenced rebases.
+
+Supersession consequences for the open board: #252 → 9.3.1; #245 → 9.1.3;
+the split-`postReceipt` half of §8.1 → 9.1.3; the per-merge-comment off-switch
+half of §8.1 and #297's stale-PR-scan finding → 9.1.2. Superseded issues close
+with a pointer when the superseding mechanism lands; they are never dispatched
+as written.
