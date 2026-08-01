@@ -1,20 +1,22 @@
 # Campaigns
 
-`services.tally.campaigns` turns a frozen specification corpus into an ordered
-build campaign. The spec repository defines the work, one GitHub issue admits
-and steers a run, and tally witnesses the workflow. A new campaign needs no new
-flow or producer code.
+`services.tally.campaigns` turns a frozen specification corpus into a
+forge-reconciled build campaign. The spec repository defines the work, merged
+pull requests are its durable checkboxes, one GitHub issue admits and steers
+reconcile passes, and tally witnesses every observation and gate. A new campaign
+needs no new flow or producer code.
 
 Keep those roles separate:
 
 - **The spec repository is the work source.** Its versioned tasks artifact
   contains the decomposition and each complete per-task brief.
-- **GitHub is intake, steering, and projection.** An exact mention on one open,
-  labeled campaign issue starts a run. Issue comments steer later agent
-  attempts. Receipts, evidence, and per-task pull requests project progress.
+- **GitHub is intake, steering, state, and projection.** An exact mention on one
+  open, labeled campaign issue starts a pass. Merged task pull requests are the
+  completion facts read by every later pass. Issue comments steer later agent
+  attempts; receipts and evidence project each reconciliation.
 - **tally is the workflow engine.** It validates and witnesses the worklist,
-  creates each worktree, delivers one task, runs deterministic gates, and
-  publishes and merges in order.
+  selects the dependency-ready frontier, creates isolated worktrees, runs
+  deterministic gates, and serializes re-gated merges.
 
 The module deliberately supplies mechanism, not project policy. Repository
 owners still choose the corpus shape, gates, adapter, label, trusted actors, and
@@ -51,6 +53,7 @@ services.tally = {
     postFailureStderr = false;
     worklist = "specs/001-crm/tasks.json";
     maxTasks = 32;
+    maxParallel = 4;
 
     agent = "codex";
     # These are the defaults. Keep them explicit here to show that the
@@ -79,23 +82,30 @@ services.tally = {
       }
     ];
 
-    # Held by the runner for the whole campaign, so two mentions cannot
-    # advance this campaign concurrently.
+    # Held for one bounded reconcile pass, so two triggers cannot mutate this
+    # campaign concurrently.
     pool.name = "crm-campaign";
   };
 };
 ```
 
-`allowSelfTriggered` defaults to `false`. Keep that loop-breaker when tally's
-authenticated GitHub identity is a bot: comments posted by the bot cannot start
-another campaign run. Set it to `true` only when the trusted person posting the
-campaign mention is also the account authenticated by `gh`, as in the
-single-account example above. `allowedActors` still applies independently.
+`allowSelfTriggered` defaults to `false` on the operator-facing mention
+producer. Keep that loop-breaker when tally's authenticated GitHub identity is
+a bot. Set it to `true` only when the trusted person posting the campaign mention
+is also the account authenticated by `gh`, as in the single-account example
+above. `allowedActors` applies to both producers. The separately rendered
+merge-continuation producer matches only the exact continuation command and
+allows authenticated self-triggering, but retains that same actor allowlist.
+When `allowedActors` is non-empty, include the `gh` identity so its merge
+comments can start the next pass. One merged task therefore creates one
+deduplicated next-pass event without widening campaign admission.
+
 `postFailureEvidence` posts one comment for each failed attempt, so retries can
 accumulate several receipts. `postFailureStderr` requires it and adds only the
 bounded, conservatively redacted tail. Redaction cannot recognize every
 application secret; leave both defaults off for a public repository unless the
-publication policy has been deliberately reviewed.
+publication policy has been deliberately reviewed. Both the mention and
+merge-continuation producers inherit these settings.
 
 Every gate sets an `id`, an explicit `kind`, and the fields for that kind:
 `kind = "command"` requires `preflightArgv` and `argv`, while `kind =
@@ -131,9 +141,10 @@ evidence, its declared `runtimeMaxSec`, a stable `gate-<task>-<id>` key, and a
 canonical witness. Its schema-validated result records the prepared base and
 the exact checked head. Publication re-evaluates every constraint against the
 clean head it is about to push, so a passed stable node cannot be reused for a
-later unexamined commit. A match therefore fails the node—or the exact-head
-publication recheck—and stops publication exactly like a nonzero argv gate; it
-is not an operator audit after the merge.
+later unexamined commit. The rebase path applies the same pattern set to its
+rewritten head before force-pushing it. A match therefore fails the node—or the
+exact-head publication recheck—and stops publication exactly like a nonzero
+argv gate; it is not an operator audit after the merge.
 
 This mechanism constrains task branches advanced by this campaign. It does not
 turn the same rule into a repository-wide GitHub branch protection for unrelated
@@ -162,17 +173,18 @@ One enabled attrset expands to all of the following:
 
 | Rendered mechanism | Contract |
 |---|---|
-| `flows.<name>` | The content-addressed shipped `spec-build` script, bounded from `maxTasks` and the gate count. |
+| `flows.<name>` | The content-addressed shipped `spec-build` script, bounded to one `maxParallel` frontier and its gates. |
 | `producers.campaign-<name>` | A GitHub search producer scoped to the configured repositories, open issues, label, exact mention, and optional actor allowlist. |
-| `<pool.name>` | A capacity-1 mutex held by the runner process. |
-| `campaign-agent` | A capacity-1 `slot` pool for implementation agents. |
-| `campaign-control` | A small `cpu-slot` pool for worklist, Git, GitHub, and gate nodes. |
-| `spec-build-driver` | The packaged deterministic policy driver used for worklist, prep, built-in constraints, publish, and merge projections. |
+| `producers.campaign-<name>-reconcile` | A GitHub search producer for the exact self-posted continuation command emitted after a merge. |
+| `<pool.name>` | A capacity-1 mutex held for one reconcile pass. |
+| `campaign-agent` | A counted `slot` pool whose rendered capacity is the largest enabled `maxParallel`. |
+| `campaign-control` | A small `cpu-slot` pool for reconciliation, Git, GitHub, and gate nodes. |
+| `spec-build-driver` | The packaged deterministic policy driver used for reconcile, prep, built-in constraints, publish, rebase, and merge projections. |
 
-The producer posts its receipt and witnessed evidence, and each merge posts one
-idempotently marked progress comment. It does not close the campaign issue on
-either pass or acceptance. The issue remains the durable steering channel
-across runs.
+The producer posts its receipt and witnessed evidence. Each merge posts an
+idempotently marked progress comment plus the exact continuation command; the
+next poll admits a fresh pass behind the campaign mutex. Neither producer closes
+the campaign issue. It remains the durable steering channel across passes.
 
 Before admitting the first real run after deployment, verify the selected
 implementation adapter on that host:
@@ -195,14 +207,14 @@ gate declares two direct argvs deliberately:
   exist in the frozen spec-only base and therefore is not required to be green
   before an agent has built them.
 
-After the worklist has been schema-validated and witnessed, tally prepares task
-1 from the fetched remote base and runs every `preflightArgv` there, in
-declaration order, as `preflight-gate-<id>`. The declared argv is passed through
-without rewriting. Preflight and post-change invocations use the same worktree
-contract, the same `runtimeMaxSec`, and `CAMPAIGN_TASK_ID`; during preflight that
-variable is the first witnessed task ID. If the real merge criterion is itself
-base-safe, repeat it as `preflightArgv` explicitly rather than relying on an
-implicit fallback.
+After the worklist and forge state have been schema-validated and witnessed,
+the first pass prepares a separate pristine worktree from the fetched remote
+base and runs every command gate's `preflightArgv` there, in declaration order,
+as `preflight-gate-<id>`. The declared argv is passed through without rewriting.
+Preflight and post-change invocations use the same worktree contract, the same
+`runtimeMaxSec`, and `CAMPAIGN_TASK_ID`; during preflight that variable is the
+first frontier task ID. If the real merge criterion is itself base-safe, repeat
+it as `preflightArgv` explicitly rather than relying on an implicit fallback.
 
 Each preflight records ordinary `exit:0` evidence. A red or timed-out preflight
 stops evaluation before the implementation adapter is admitted, so its capture
@@ -251,24 +263,28 @@ accepts schema version 1:
           ]
         }
       ],
-      "dependencies": []
+      "dependencies": [],
+      "conflictDomains": [
+        "src/domain/customer.rs",
+        "src/domain/mod.rs"
+      ]
     }
   ]
 }
 ```
 
-Every task requires all seven fields shown above. IDs are stable node-key
-components. Dependencies must name earlier tasks, which makes the array a
-validated topological order. Acceptance criteria are runnable, direct-argv
-instructions for the agent and reviewers; the campaign's configured `gates`
-remain the independent merge criterion executed by tally.
+Every task requires the first seven fields shown above. `conflictDomains` may be
+omitted only while `maxParallel = 1`; every task must provide a non-empty array
+when parallelism is enabled. Entries are normalized relative file or directory
+paths without `..`. Equal paths and ancestor/descendant paths overlap, so
+`src/domain` conflicts with `src/domain/customer.rs`. A reconcile pass greedily
+selects ready tasks in worklist order while keeping the selected domains
+disjoint.
 
-The first flow node parses, normalizes, schema-validates, and witnesses this
-artifact together with its relative path and SHA-256 digest. Later nodes use
-only that result. The implementation node receives a structured brief containing
-its own task, assigned workspace, campaign issue locator, and a bounded mission.
-It is explicitly told not to read another task from the worklist and not to
-push, open a pull request, or merge. Those are separate deterministic nodes.
+IDs are stable task components. Dependencies must name earlier tasks, which
+makes the array a validated topological order. Acceptance criteria are runnable,
+direct-argv instructions for the agent and reviewers; the campaign's configured
+`gates` remain the independent merge criterion executed by tally.
 
 Every task-specific node also carries the campaign-scoped reference
 `<campaign>/<task-id>` (for example `crm/customer-model`). It is additive
@@ -277,42 +293,74 @@ node receipts, lifecycle and query output, `TALLY_TASK_REF`, unit names, and
 capture names. The worklist discovery node has no task ID and therefore no
 `taskRef`.
 
-## Ordering and merge criterion
+The first node of every pass parses, normalizes, schema-validates, and witnesses
+this artifact together with its relative path and SHA-256 digest. The same node
+queries merged pull requests carrying tally's campaign/task marker, subtracts
+those task IDs, applies `dependencies ⊆ merged`, and selects at most
+`maxParallel` conflict-disjoint tasks. Later nodes use only that witnessed
+result. The implementation node receives its one task, assigned workspace,
+campaign issue locator, and bounded mission. It is explicitly told not to read
+another task from the worklist and not to push, open a pull request, or merge.
+Those are separate deterministic nodes.
 
-For every witnessed task, `spec-build` executes this chain serially:
+## Reconciliation, parallelism, and the merge criterion
+
+One invocation is one bounded reconcile pass:
 
 ```text
-validate worklist -> fetch current remote main -> prepare task 1 worktree
-  -> run command-gate preflights on that base -> agent -> configured gates
-  -> push branch -> open/reuse PR -> merge -> fetch current main for next task
+merged = marked merged PRs
+remaining = worklist - merged
+ready = tasks in remaining whose dependencies are all in merged
+frontier = first maxParallel ready tasks with disjoint conflictDomains
+
+if merged is empty and command gates exist:
+  prepare an isolated worktree at current remote main
+  -> run each command gate.preflightArgv -> clean up the preflight lane
+parallel(frontier): prepare isolated worktree -> agent -> each configured gate
+  -> push stable task branch -> open/reuse PR
+serial(successful publications): compare current base -> rebase if moved
+  -> re-run each configured gate only on a changed rebased head -> merge
+exit
 ```
 
-The preflight runs once per campaign flow run. It uses task 1's still-unmodified
-worktree, so the checkout and execution host are the same ones the first agent
-and post-change gates will use. The argv differs only where the operator has
-explicitly separated a base-safe `preflightArgv` from the post-change `argv`;
-environment, workspace, host, and deadline do not drift. Replays reuse passing
-preflight witnesses and do not silently rerun or skip a recorded red result.
-Because it validates task 1's prepared workspace, each preflight node carries
-task 1's `taskRef`.
+Until the first marked campaign pull request is merged, every fresh pass with a
+command gate runs the preflight on a separate pristine-base worktree before
+admitting any agent. Each command gate explicitly separates a base-safe
+`preflightArgv` from its post-change merge-criterion `argv`. Preflight uses the
+first frontier task's environment, the same execution host and deadline as the
+post-change gate, and a lane that is cleaned before dispatch. The first merged
+task is durable forge proof that campaign admission passed; later passes do not
+repeat preflight.
+Because it validates the first frontier task's prepared environment, each
+preflight node carries that task's `taskRef`.
 
 The agent must leave a clean worktree with at least one commit descended from
 the prepared base. Publication refuses dirty, empty, or non-descendant work.
-The merge is witnessed before the next prep node is submitted. Consequently,
-task 2 is prepared from a remote base that already contains task 1's merge;
-declaring a dependency is not merely descriptive.
+Each task has a stable remote branch across passes and a run-local worktree lane,
+so a dead runner cannot make a later pass share a writable directory with an
+old child.
 
-The first non-passing command preflight, agent, command gate, constraint gate,
-publish, or merge node stops JavaScript evaluation. No later gate, pull request,
-merge, or task prep is admitted.
+Publications may finish in parallel, but integration follows deterministic
+frontier order. Before each merge the driver fetches current base. If the
+already-gated head contains it, integration is a no-op. If base moved, the
+driver rebases with an exact force-with-lease, tally re-runs every configured
+gate on that new head, and merge refuses if either base or task branch moved
+again. Thus concurrent implementation does not weaken “witnessed gates are the
+merge criterion." A dependent task cannot enter any frontier until its
+prerequisite PR is observed merged by a later pass.
 
-## Failure, steering, and replay
+A preflight failure stops the pass before any agent is admitted. Agent, task
+gate, publication, rebase, and merge failures are settled into the pass report.
+A failed task remains unmerged and therefore eligible for a later pass;
+successful conflict-disjoint siblings still publish and merge.
 
-Use the campaign issue comments for steering. Each new agent attempt is told to
-read that channel before changing code. tally never treats a comment as new work
-and never changes a running node's immutable brief.
+## Failure, steering, and re-entry
 
-After a non-passing node:
+Use the campaign issue comments for steering. Each new agent attempt reads that
+channel before changing code. tally never changes a running node's immutable
+brief.
+
+After a task failure:
 
 1. Inspect `tally query log` and the local structured flow error, which carries
    the failed child and that child's bounded captured tail. A public campaign
@@ -323,33 +371,27 @@ After a non-passing node:
    Task-specific records expose `taskRef`, so the worklist ID is visible
    without a UUID lookup.
 2. Add the steering decision to the campaign issue.
-3. Correct the failed frontier. Retry a failed agent node with
-   `tally queue retry <agent-task-uuid>`; its new attempt reads the comments.
-   For a red preflight caused by the host or base checkout, correct that defect
-   and retry it with `tally queue retry <preflight-task-uuid>`. For a red
-   post-change command gate, correct and commit the existing worktree, then
-   retry it with `tally queue retry <gate-task-uuid>`. For a red `forbidPaths`
-   gate, rewrite or squash the branch so every offending commit is unreachable
-   from its head before retrying; a later deletion commit does not erase the
-   artifact from history. A passing agent node cannot be retried implicitly,
-   and tally does not invent a repair attempt after a red gate.
-4. Retry the failed runner job:
+3. Correct any host or base defect exposed by preflight, then post the
+   configured mention again:
 
    ```console
-   $ tally queue retry <runner-task-uuid>
+   $ gh issue comment ISSUE --repo OWNER/REPO --body '<configured mention>'
    ```
 
-The runner task UUID is the flow-run identity. Its new attempt re-executes the
-same content-addressed script with the same arguments: passing prefix nodes are
-`reused`, the explicitly retried frontier now projects its latest witness, and
-only the next node is `created`. A non-pass witness is never retried merely by
-restarting the runner.
+That fresh event creates a fresh flow-run identity. The pass does not reuse or
+repair an old runner prefix: it observes merged PRs again, recomputes the whole
+frontier, and gives the failed task a new isolated lane with current steering.
+Changing campaign arguments or deploying a new content-addressed script between
+passes is therefore ordinary generation change, not replay divergence. Duplicate
+mentions are safe because the campaign mutex serializes passes and each pass
+subtracts the same forge facts before dispatch.
 
-Campaigns longer than the fixed 24-hour evaluator budget use the same mechanism.
-The budget exit is a continuation boundary, not cancellation: retry the runner
-job and tally reconstructs state from durable node witnesses. The full identity,
-frontier, and divergence rules are in [Submission identity and
-replay](submission-and-replay.md#continuation-after-budget-exhaustion).
+Each pass contains at most one bounded frontier, so the fixed 24-hour evaluator
+budget no longer measures the whole campaign. If a pass process dies, wait for
+any admitted children to settle and post a fresh mention. Stable remote task
+branches preserve published work; merged PRs preserve completion. Generic flows
+that truly require one run identity still use [submission identity and
+replay](submission-and-replay.md).
 
 ## Starting a new repository
 

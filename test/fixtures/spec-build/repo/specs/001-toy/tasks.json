@@ -27,7 +27,10 @@
           ]
         }
       ],
-      "dependencies": []
+      "dependencies": [],
+      "conflictDomains": [
+        "build/one.txt"
+      ]
     },
     {
       "id": "task-2",
@@ -58,6 +61,72 @@
       ],
       "dependencies": [
         "task-1"
+      ],
+      "conflictDomains": [
+        "build/two.txt"
+      ]
+    },
+    {
+      "id": "task-3",
+      "title": "Create an independent fixture artifact",
+      "goal": "Materialize work that can advance alongside the first task.",
+      "deliveredBehaviors": [
+        "build/three.txt exists and contains three followed by a newline"
+      ],
+      "readFirst": {
+        "specSections": [
+          "specs/001-toy/spec.md#task-three"
+        ],
+        "styleReferences": [
+          "specs/001-toy/style/example.txt"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "three-content",
+          "description": "The independent artifact has the exact specified bytes.",
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat build/three.txt)\" = three"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "build/three.txt"
+      ]
+    },
+    {
+      "id": "task-4",
+      "title": "Create a second independent fixture artifact",
+      "goal": "Exercise re-gating after another frontier task moves main.",
+      "deliveredBehaviors": [
+        "build/four.txt exists and contains four followed by a newline"
+      ],
+      "readFirst": {
+        "specSections": [
+          "specs/001-toy/spec.md#task-four"
+        ],
+        "styleReferences": [
+          "specs/001-toy/style/example.txt"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "four-content",
+          "description": "The second independent artifact has the exact specified bytes.",
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat build/four.txt)\" = four"
+          ]
+        }
+      ],
+      "dependencies": [],
+      "conflictDomains": [
+        "build/one.txt",
+        "build/four.txt"
       ]
     }
   ]

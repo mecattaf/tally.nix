@@ -58,6 +58,15 @@ merge on green — then the next task's prep sees the merged result. Fail-fast
 on the first red gate; replay reuses the witnessed prefix, so a stopped or
 budget-exhausted run continues where it died (#234).
 
+**Superseded on 2026-08-01 by #253:** campaign continuation is now a fresh,
+bounded reconcile pass over marked merged pull requests, not replay of one
+campaign-long runner. Dependency-ready tasks with disjoint declared conflict
+domains may implement concurrently; successful publications integrate in a
+deterministic sequence and any base-changing rebase is gated again before
+merge. Replay remains the right mechanism for flows that genuinely require one
+run identity, but not for forge-backed campaigns whose completion facts already
+live in merged PRs.
+
 ### Where the work graph lives, and what each agent actually reads
 
 A fair objection to "the spec repo is the work source": doesn't that force
@@ -156,12 +165,13 @@ off by default and require explicit `postFailureEvidence` plus
   dispatch with correct placeholder expansion, idempotent event identity.
   Intake needed zero fixes. The at-mention mechanism is keeper
   infrastructure; only its multiplicity was wrong.
-- **Sequencing is a merge-ordering property, not a trigger property.** Each
-  task's worktree is cut from current main, so "merge task N before prep of
-  N+1" is what makes the dependency chain real. Any shape that lets two
-  tasks prep concurrently against the same base is wrong regardless of who
-  triggers it — the capacity-1 campaign lane and the in-flow merge node are
-  the enforcement, not human pacing.
+- **Sequencing is a merge-ordering property, not a trigger property.** A
+  dependent task's worktree must be cut only after its dependencies are
+  observed merged. #253 refined the original serial conclusion: independent,
+  conflict-disjoint tasks may prepare against the same base, provided their
+  integrations are serialized and a head rebased onto moved main is gated
+  again before merge. The dependency and conflict-domain tests are the
+  enforcement, not human pacing.
 - **Gates are the merge criterion.** Build, vet, race-enabled test, lint as
   witnessed nodes, then merge mechanically. An agent re-reviewing green
   gates before merge re-introduces the puppeteer. Spot-checking merged

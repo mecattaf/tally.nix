@@ -57,7 +57,11 @@ const REORDERED_RUN: &str = "00000000-0000-4000-8000-000000000514";
 const CATALOG_PIN_RUN: &str = "00000000-0000-4000-8000-000000000515";
 const REGEX_RESULT_RUN: &str = "00000000-0000-4000-8000-000000000516";
 const SPEC_BUILD_RUN: &str = "00000000-0000-4000-8000-000000000517";
-const SPEC_BUILD_DUPLICATE_GATE_RUN: &str = "00000000-0000-4000-8000-000000000518";
+const SPEC_BUILD_RUN_2: &str = "00000000-0000-4000-8000-000000000518";
+const SPEC_BUILD_RUN_3: &str = "00000000-0000-4000-8000-000000000519";
+const SPEC_BUILD_RUN_4: &str = "00000000-0000-4000-8000-000000000520";
+const SPEC_BUILD_RUN_5: &str = "00000000-0000-4000-8000-000000000521";
+const SPEC_BUILD_DUPLICATE_GATE_RUN: &str = "00000000-0000-4000-8000-000000000522";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -2223,7 +2227,7 @@ async fn retry_cancellation_cap_and_partial_failure_are_live_end_to_end() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
+async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs() {
     let _environment = ENVIRONMENT_LOCK.lock().await;
     tokio::task::LocalSet::new()
         .run_until(async {
@@ -2269,7 +2273,7 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             let mut config = config();
             for (name, resource, capacity) in [
                 ("campaign-control", ResourceKind::CpuSlot, 4),
-                ("campaign-agent", ResourceKind::Slot, 1),
+                ("campaign-agent", ResourceKind::Slot, 3),
             ] {
                 config.pools.insert(
                     name.to_owned(),
@@ -2353,60 +2357,66 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 control.display().to_string(),
                 "second".to_owned(),
             ];
-            let arguments = json!({
-                "campaign": "fixture",
-                "repository": "acme/spec",
-                "issue": {
-                    "number": "7",
-                    "url": "https://github.com/acme/spec/issues/7"
-                },
-                "runId": "fixture-comment-7",
-                "repositories": {
-                    "acme/spec": {
-                        "checkout": checkout,
-                        "baseBranch": "main",
-                        "remote": "origin",
-                        "forge": "local"
-                    }
-                },
-                "worklist": "specs/*/tasks.json",
-                "maxTasks": 3,
-                "workspaceRoot": workspace_root,
-                "driver": driver,
-                "driverRuntimeMaxSec": 30,
-                "agent": {
-                    "adapter": "codex",
-                    "argv": [BRIEF_SENTINEL],
-                    "priority": "low",
-                    "runtimeMaxSec": 30,
-                    "approvalPolicy": "on-request",
-                    "sandboxPolicy": "workspace-write"
-                },
-                "gates": [
-                    {
-                        "kind": "forbidPaths",
-                        "id": "no-db-artifacts",
-                        "forbidPaths": ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"],
-                        "runtimeMaxSec": 1
+            let arguments = |run_id: &str, priority: &str| {
+                json!({
+                    "campaign": "fixture",
+                    "repository": "acme/spec",
+                    "issue": {
+                        "number": "7",
+                        "url": "https://github.com/acme/spec/issues/7"
                     },
-                    {
-                        "kind": "command",
-                        "id": "fixture-first",
-                        "preflightArgv": first_preflight_argv.clone(),
-                        "argv": first_gate_argv.clone(),
-                        "runtimeMaxSec": 1
+                    "runId": run_id,
+                    "repositories": {
+                        "acme/spec": {
+                            "checkout": checkout,
+                            "baseBranch": "main",
+                            "remote": "origin",
+                            "forge": "local"
+                        }
                     },
-                    {
-                        "kind": "command",
-                        "id": "fixture-second",
-                        "preflightArgv": second_preflight_argv.clone(),
-                        "argv": second_gate_argv.clone(),
-                        "runtimeMaxSec": 1
-                    }
-                ]
-            });
+                    "worklist": "specs/*/tasks.json",
+                    "maxTasks": 4,
+                    "maxParallel": 3,
+                    "reconcileCommand": "/tally reconcile fixture",
+                    "workspaceRoot": workspace_root,
+                    "driver": driver,
+                    "driverRuntimeMaxSec": 30,
+                    "agent": {
+                        "adapter": "codex",
+                        "argv": [BRIEF_SENTINEL],
+                        "priority": priority,
+                        "runtimeMaxSec": 30,
+                        "approvalPolicy": "on-request",
+                        "sandboxPolicy": "workspace-write"
+                    },
+                    "gates": [
+                        {
+                            "kind": "forbidPaths",
+                            "id": "no-db-artifacts",
+                            "forbidPaths": ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"],
+                            "runtimeMaxSec": 1
+                        },
+                        {
+                            "kind": "command",
+                            "id": "fixture-first",
+                            "preflightArgv": first_preflight_argv.clone(),
+                            "argv": first_gate_argv.clone(),
+                            "runtimeMaxSec": 1
+                        },
+                        {
+                            "kind": "command",
+                            "id": "fixture-second",
+                            "preflightArgv": second_preflight_argv.clone(),
+                            "argv": second_gate_argv.clone(),
+                            "runtimeMaxSec": 1
+                        }
+                    ]
+                })
+                .to_string()
+            };
 
-            let mut duplicate_arguments = arguments.clone();
+            let mut duplicate_arguments: Value =
+                serde_json::from_str(&arguments("duplicate-gate", "low")).unwrap();
             duplicate_arguments["gates"][2]["id"] = json!("fixture-first");
             let duplicate = runner(
                 &config_path,
@@ -2440,25 +2450,24 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 flow_items(&client, SPEC_BUILD_DUPLICATE_GATE_RUN)
                     .await
                     .is_empty(),
-                "duplicate gate ids must be rejected before the worklist node is admitted"
+                "duplicate gate ids must be rejected before reconciliation is admitted"
             );
-
-            let arguments = arguments.to_string();
 
             let first = runner(
                 &config_path,
                 &daemon_paths.socket,
                 &script,
                 SPEC_BUILD_RUN,
-                &arguments,
-                20,
+                &arguments("fixture-comment-7", "low"),
+                32,
             )
             .spawn()
             .unwrap();
             let first = runner_output(first).await;
             assert_eq!(first.status.code(), Some(1));
             let failure = flow_failure(&first);
-            assert_eq!(failure["error"]["code"], "terminal-failure");
+            assert_eq!(failure["error"]["code"], "preflight-failed");
+            assert_eq!(failure["error"]["details"]["gateId"], "fixture-first");
             assert_eq!(
                 failure["error"]["details"]["node"]["stderrExcerpt"],
                 "fixture preflight exceeds its bounded deadline before any agent dispatch\n"
@@ -2488,11 +2497,11 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 fs::read_to_string(control.join("policy-error.log")).unwrap_or_default()
             );
 
-            let first_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 3).await;
+            let first_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 4).await;
             assert_eq!(
                 first_items.len(),
-                3,
-                "a red preflight must admit only worklist, prep, and that preflight gate"
+                4,
+                "a red preflight must admit only reconcile, prep, gate, and cleanup"
             );
             assert!(first_items[0].get("taskRef").is_none());
             assert!(first_items[1..]
@@ -2555,477 +2564,304 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             assert_eq!(
                 fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
                 "1",
-                "fail-fast must stop before publish, merge, and task-2 prep"
+                "preflight failure must stop before every implementation lane"
+            );
+            assert!(
+                !fixture_git(&checkout, &["worktree", "list", "--porcelain"])
+                    .contains("_campaign-preflight")
             );
 
-            let retry = client
-                .call(
-                    "queue.retry",
-                    Some(json!({"task_uuid": failed_preflight.clone()})),
-                )
-                .await
-                .unwrap();
-            assert_eq!(retry["attempt"], 2);
-            let retried = tokio::time::timeout(
-                Duration::from_secs(20),
-                client.call(
-                    "queue.await_job",
-                    Some(json!({"task_uuid": failed_preflight.clone(), "attempt": 2})),
-                ),
-            )
-            .await
-            .expect("retried gate timed out")
-            .unwrap();
-            assert_eq!(retried["verdict"], "pass");
+            fs::write(control.join("inject-forbidden-path"), b"").unwrap();
+            fs::write(control.join("post-change-failed-once"), b"").unwrap();
 
-            let constrained = runner(
+            let second = runner(
                 &config_path,
                 &daemon_paths.socket,
                 &script,
-                SPEC_BUILD_RUN,
-                &arguments,
-                20,
+                SPEC_BUILD_RUN_2,
+                &arguments("fixture-comment-8", "medium"),
+                32,
             )
             .spawn()
             .unwrap();
-            let constrained = runner_output(constrained).await;
-            assert_eq!(constrained.status.code(), Some(1));
-            assert_eq!(
-                flow_failure(&constrained)["error"]["code"],
-                "result-schema-mismatch",
-                "a failed constraint has no passing structured result; its red node verdict remains authoritative"
+            let second = runner_output(second).await;
+            assert!(
+                second.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&second.stdout),
+                String::from_utf8_lossy(&second.stderr)
             );
-            let submitted = runner_events(&constrained, "node-submitted");
-            assert_eq!(submitted.len(), 6);
-            assert!(submitted[..3]
-                .iter()
-                .all(|event| event["disposition"] == "reused"));
-            assert!(submitted[3..]
-                .iter()
-                .all(|event| event["disposition"] == "created"));
+            let second_value = &flow_report(&second)["report"]["finalValue"];
+            assert_eq!(second_value["state"], "advanced");
+            assert_eq!(
+                second_value["reconciled"]["frontier"],
+                json!(["task-1", "task-3"])
+            );
+            assert_eq!(second_value["merged"][0]["taskId"], "task-3");
+            assert_eq!(second_value["failures"][0]["taskId"], "task-1");
+            assert_eq!(second_value["failures"][0]["stage"], "gate:no-db-artifacts");
+            assert!(control.join("started-task-1").exists());
+            assert!(control.join("started-task-3").exists());
 
-            let constrained_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 6).await;
+            let second_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_2, 16).await;
+            assert!(second_items[0].get("taskRef").is_none());
+            assert_eq!(
+                second_items[1..]
+                    .iter()
+                    .filter(|item| item["taskRef"] == "fixture/task-1")
+                    .count(),
+                7
+            );
+            assert_eq!(
+                second_items[1..]
+                    .iter()
+                    .filter(|item| item["taskRef"] == "fixture/task-3")
+                    .count(),
+                8
+            );
             let mut failed_constraint = None;
-            for item in &constrained_items {
-                let terminal = client
-                    .call(
-                        "queue.await_job",
-                        Some(json!({"task_uuid": item["anchor"]})),
-                    )
+            for item in &second_items {
+                let projected = client
+                    .call("query.job", Some(json!({"id": item["anchor"]})))
                     .await
                     .unwrap();
-                if terminal["verdict"] == "failed" {
-                    assert!(
-                        failed_constraint.is_none(),
-                        "only the forbidden-path constraint may fail"
-                    );
-                    assert_eq!(
-                        item["orchestration"]["nodeLabel"],
-                        "gate-task-1-no-db-artifacts"
-                    );
-                    failed_constraint = terminal["task_uuid"].as_str().map(str::to_owned);
+                if projected["job"]["orchestration"]["nodeLabel"] == "gate-task-1-no-db-artifacts" {
+                    failed_constraint = item["anchor"].as_str().map(str::to_owned);
+                    break;
                 }
             }
             let failed_constraint =
-                failed_constraint.expect("the forbidden-path constraint did not fail");
+                failed_constraint.expect("the forbidden-path constraint was not projected");
             let projected_constraint = client
                 .call("query.job", Some(json!({"id": failed_constraint.clone()})))
                 .await
                 .unwrap();
             assert_eq!(projected_constraint["job"]["taskRef"], "fixture/task-1");
-            assert_eq!(
-                projected_constraint["job"]["unit"],
-                format!("tally-job-fixture-task-1-{failed_constraint}.service")
-            );
-            assert_eq!(
-                projected_constraint["job"]["runtimeMaxSec"],
-                1,
-                "constraint gates must honor their own declared deadline"
-            );
+            assert_eq!(projected_constraint["job"]["runtimeMaxSec"], 1);
             assert!(task_capture(&daemon_paths, &failed_constraint, "task-1")
                 .contains("build/transient.db"));
-            assert_eq!(
-                fs::read_to_string(control.join("agent-order.log")).unwrap(),
-                "task-1\n"
-            );
-            assert_eq!(
-                fs::read_to_string(control.join("policy-order.log")).unwrap(),
-                "task-1:on-request:workspace-write\n"
-            );
             assert_eq!(
                 fs::read_to_string(control.join("preflight-order.log")).unwrap(),
                 "preflight:task-1:first\npreflight:task-1:second\n"
             );
-            assert!(!control.join("gate-order.log").exists());
+
+            fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
-                fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
-                "1",
-                "the constraint must stop publication, merge, and task-2 prep"
+                fixture_git(&checkout, &["show", "origin/main:build/three.txt"]),
+                "three"
             );
-
-            let task_one_run = fs::read_dir(workspace_root.join("spec"))
-                .unwrap()
-                .map(|entry| entry.unwrap().path())
-                .find(|path| path.is_dir())
-                .expect("task-1 run directory is missing");
-            let task_one_worktree = task_one_run.join("task-1");
-            assert!(task_one_worktree.join("build/transient.db").is_file());
-            let clean_task_one_head =
-                fixture_git(&task_one_worktree, &["rev-parse", "HEAD^"]);
-            fixture_git(&task_one_worktree, &["rm", "build/transient.db"]);
-            fixture_git(
-                &task_one_worktree,
-                &[
-                    "commit",
-                    "-m",
-                    "fixture: remove forbidden database artifact",
-                ],
-            );
-
-            let retry = client
-                .call(
-                    "queue.retry",
-                    Some(json!({"task_uuid": failed_constraint.clone()})),
-                )
-                .await
-                .unwrap();
-            assert_eq!(retry["attempt"], 2);
-            let retried = tokio::time::timeout(
-                Duration::from_secs(20),
-                client.call(
-                    "queue.await_job",
-                    Some(json!({"task_uuid": failed_constraint.clone(), "attempt": 2})),
-                ),
-            )
-            .await
-            .expect("retried constraint timed out")
-            .unwrap();
-            assert_eq!(
-                retried["verdict"], "failed",
-                "deleting an artifact later must not erase it from branch-history policy"
-            );
-            assert!(task_capture(&daemon_paths, &failed_constraint, "task-1")
-                .contains("build/transient.db"));
-
-            let task_one_branch =
-                fixture_git(&task_one_worktree, &["branch", "--show-current"]);
-            fixture_git(
-                &task_one_worktree,
-                &["switch", "--detach", clean_task_one_head.as_str()],
-            );
-            fixture_git(
-                &task_one_worktree,
-                &[
-                    "branch",
-                    "--force",
-                    task_one_branch.as_str(),
-                    clean_task_one_head.as_str(),
-                ],
-            );
-            fixture_git(
-                &task_one_worktree,
-                &["switch", task_one_branch.as_str()],
-            );
-
-            let retry = client
-                .call(
-                    "queue.retry",
-                    Some(json!({"task_uuid": failed_constraint.clone()})),
-                )
-                .await
-                .unwrap();
-            assert_eq!(retry["attempt"], 3);
-            let retried = tokio::time::timeout(
-                Duration::from_secs(20),
-                client.call(
-                    "queue.await_job",
-                    Some(json!({"task_uuid": failed_constraint, "attempt": 3})),
-                ),
-            )
-            .await
-            .expect("history-clean constraint retry timed out")
-            .unwrap();
-            assert_eq!(retried["verdict"], "pass");
-
-            let post_change_failure = runner(
-                &config_path,
-                &daemon_paths.socket,
-                &script,
-                SPEC_BUILD_RUN,
-                &arguments,
-                20,
-            )
-            .spawn()
-            .unwrap();
-            let post_change_failure = runner_output(post_change_failure).await;
-            assert_eq!(post_change_failure.status.code(), Some(1));
-            assert_eq!(
-                flow_failure(&post_change_failure)["error"]["code"],
-                "terminal-failure"
-            );
-            let submitted = runner_events(&post_change_failure, "node-submitted");
-            assert_eq!(submitted.len(), 7);
-            assert!(submitted[..6]
-                .iter()
-                .all(|event| event["disposition"] == "reused"));
-            assert_eq!(submitted[6]["disposition"], "created");
-
-            let post_change_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 7).await;
-            let mut failed_gate = None;
-            for item in &post_change_items {
-                let terminal = client
-                    .call(
-                        "queue.await_job",
-                        Some(json!({"task_uuid": item["anchor"]})),
-                    )
-                    .await
-                    .unwrap();
-                if terminal["verdict"] == "failed" {
-                    assert!(failed_gate.is_none(), "only the post-change gate may fail");
-                    failed_gate = terminal["task_uuid"].as_str().map(str::to_owned);
-                }
-            }
-            let failed_gate = failed_gate.expect("the first post-change gate did not fail");
-            let projected_gate = client
-                .call("query.job", Some(json!({"id": failed_gate.clone()})))
-                .await
-                .unwrap();
-            assert_eq!(projected_gate["job"]["argv"], json!(first_gate_argv));
-            assert_eq!(
-                projected_gate["job"]["orchestration"]["nodeLabel"],
-                "gate-task-1-fixture-first"
-            );
-            assert_eq!(projected_gate["job"]["runtimeMaxSec"], 1);
-            assert!(task_capture(&daemon_paths, &failed_gate, "task-1")
-                .contains("fixture post-change gate fails once before publish"));
-            assert!(!control.join("gate-order.log").exists());
-            assert_eq!(
-                fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
-                "1",
-                "a red post-change gate must stop before publish, merge, and task-2 prep"
-            );
-
-            fs::write(
-                task_one_worktree.join("build/LATE.SQLite"),
-                "late forbidden artifact\n",
-            )
-            .unwrap();
-            fixture_git(&task_one_worktree, &["add", "build/LATE.SQLite"]);
-            fixture_git(
-                &task_one_worktree,
-                &["commit", "-m", "fixture: mutate head after constraint"],
-            );
-
-            let retry = client
-                .call(
-                    "queue.retry",
-                    Some(json!({"task_uuid": failed_gate.clone()})),
-                )
-                .await
-                .unwrap();
-            assert_eq!(retry["attempt"], 2);
-            let retried = tokio::time::timeout(
-                Duration::from_secs(20),
-                client.call(
-                    "queue.await_job",
-                    Some(json!({"task_uuid": failed_gate, "attempt": 2})),
-                ),
-            )
-            .await
-            .expect("retried post-change gate timed out")
-            .unwrap();
-            assert_eq!(retried["verdict"], "pass");
-
-            let stale_publication = runner(
-                &config_path,
-                &daemon_paths.socket,
-                &script,
-                SPEC_BUILD_RUN,
-                &arguments,
-                20,
-            )
-            .spawn()
-            .unwrap();
-            let stale_publication = runner_output(stale_publication).await;
-            assert_eq!(stale_publication.status.code(), Some(1));
-            assert_eq!(
-                flow_failure(&stale_publication)["error"]["code"],
-                "result-schema-mismatch",
-                "failed publication has no successful publication result"
-            );
-            let submitted = runner_events(&stale_publication, "node-submitted");
-            assert_eq!(submitted.len(), 9);
-            assert!(submitted[..7]
-                .iter()
-                .all(|event| event["disposition"] == "reused"));
-            assert!(submitted[7..]
-                .iter()
-                .all(|event| event["disposition"] == "created"));
-
-            let stale_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 9).await;
-            let mut failed_publication = None;
-            for item in &stale_items {
-                let terminal = client
-                    .call(
-                        "queue.await_job",
-                        Some(json!({"task_uuid": item["anchor"]})),
-                    )
-                    .await
-                    .unwrap();
-                if terminal["verdict"] == "failed" {
-                    assert!(
-                        failed_publication.is_none(),
-                        "only publication's exact-head constraint recheck may fail"
-                    );
-                    assert_eq!(
-                        item["orchestration"]["nodeLabel"],
-                        "publish-task-1"
-                    );
-                    failed_publication = terminal["task_uuid"].as_str().map(str::to_owned);
-                }
-            }
-            let failed_publication = failed_publication
-                .expect("publication reused a constraint verdict from a different head");
-            assert!(task_capture(&daemon_paths, &failed_publication, "task-1")
-                .contains("build/LATE.SQLite"));
-            assert_eq!(
-                fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
-                "1",
-                "a stale constraint receipt must stop publication"
-            );
-
-            fixture_git(
-                &task_one_worktree,
-                &["switch", "--detach", clean_task_one_head.as_str()],
-            );
-            fixture_git(
-                &task_one_worktree,
-                &[
-                    "branch",
-                    "--force",
-                    task_one_branch.as_str(),
-                    clean_task_one_head.as_str(),
-                ],
-            );
-            fixture_git(
-                &task_one_worktree,
-                &["switch", task_one_branch.as_str()],
-            );
-            let retry = client
-                .call(
-                    "queue.retry",
-                    Some(json!({"task_uuid": failed_publication.clone()})),
-                )
-                .await
-                .unwrap();
-            assert_eq!(retry["attempt"], 2);
-            let retried = tokio::time::timeout(
-                Duration::from_secs(20),
-                client.call(
-                    "queue.await_job",
-                    Some(json!({"task_uuid": failed_publication, "attempt": 2})),
-                ),
-            )
-            .await
-            .expect("history-clean publication retry timed out")
-            .unwrap();
-            assert_eq!(retried["verdict"], "pass");
-
-            let replay = runner(
-                &config_path,
-                &daemon_paths.socket,
-                &script,
-                SPEC_BUILD_RUN,
-                &arguments,
-                20,
-            )
-            .spawn()
-            .unwrap();
-            let replay = runner_output(replay).await;
             assert!(
-                replay.status.success(),
-                "stdout:\n{}\nstderr:\n{}",
-                String::from_utf8_lossy(&replay.stdout),
-                String::from_utf8_lossy(&replay.stderr)
+                StdCommand::new("git")
+                    .arg("-C")
+                    .arg(&checkout)
+                    .args(["cat-file", "-e", "origin/main:build/one.txt"])
+                    .status()
+                    .unwrap()
+                    .code()
+                    .is_some_and(|code| code != 0),
+                "the failed task must remain unmerged"
             );
-            let submitted = runner_events(&replay, "node-submitted");
-            assert_eq!(submitted.len(), 17);
-            assert!(submitted[..9]
-                .iter()
-                .all(|event| event["disposition"] == "reused"));
-            assert!(submitted[9..]
-                .iter()
-                .all(|event| event["disposition"] == "created"));
-            assert!(submitted[0].get("taskRef").is_none());
-            assert!(submitted[1..=9]
-                .iter()
-                .all(|event| event["taskRef"] == "fixture/task-1"));
-            assert!(submitted[10..]
-                .iter()
-                .all(|event| event["taskRef"] == "fixture/task-2"));
-            assert_eq!(flow_items(&client, SPEC_BUILD_RUN).await.len(), 17);
 
-            fixture_git(&checkout, &["fetch", "origin", "main"]);
+            fs::write(control.join("constraint-cleared"), b"").unwrap();
+
+            let third = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_3,
+                &arguments("fixture-comment-9", "medium"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let third = runner_output(third).await;
+            assert!(
+                third.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&third.stdout),
+                String::from_utf8_lossy(&third.stderr)
+            );
+            let third_value = &flow_report(&third)["report"]["finalValue"];
+            assert_eq!(third_value["reconciled"]["frontier"], json!(["task-1"]));
+            assert_eq!(third_value["merged"][0]["taskId"], "task-1");
+            assert_eq!(third_value["failures"], json!([]));
+            let third_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_3, 9).await;
+            assert!(third_items[0].get("taskRef").is_none());
+            assert!(third_items[1..]
+                .iter()
+                .all(|item| item["taskRef"] == "fixture/task-1"));
+
+            fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
                 fixture_git(&checkout, &["show", "origin/main:build/one.txt"]),
                 "one"
             );
+            let task_2_base = fixture_git(&checkout, &["rev-parse", "origin/main"]);
+
+            let fourth = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_4,
+                &arguments("timer-2026-08-01T12:00:00Z", "high"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let fourth = runner_output(fourth).await;
+            assert!(
+                fourth.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&fourth.stdout),
+                String::from_utf8_lossy(&fourth.stderr)
+            );
+            let fourth_value = &flow_report(&fourth)["report"]["finalValue"];
+            assert_eq!(
+                fourth_value["reconciled"]["frontier"],
+                json!(["task-2", "task-4"])
+            );
+            assert_eq!(fourth_value["merged"][0]["taskId"], "task-2");
+            assert_eq!(fourth_value["merged"][1]["taskId"], "task-4");
+            assert_eq!(fourth_value["merged"][1]["regated"], true);
+            assert_eq!(fourth_value["failures"], json!([]));
+            let fourth_submitted = runner_events(&fourth, "node-submitted");
+            assert_eq!(fourth_submitted.len(), 20);
+            assert!(fourth_submitted
+                .iter()
+                .all(|event| event["disposition"] == "created"));
+            assert!(fourth_submitted[0].get("taskRef").is_none());
+            assert_eq!(
+                fourth_submitted[1..]
+                    .iter()
+                    .filter(|event| event["taskRef"] == "fixture/task-2")
+                    .count(),
+                8
+            );
+            assert_eq!(
+                fourth_submitted[1..]
+                    .iter()
+                    .filter(|event| event["taskRef"] == "fixture/task-4")
+                    .count(),
+                11
+            );
+            assert!(fourth_submitted
+                .iter()
+                .any(|event| event["label"] == "regate-task-4-no-db-artifacts"));
+
+            let fourth_items = flow_items(&client, SPEC_BUILD_RUN_4).await;
+            assert!(fourth_items[0].get("taskRef").is_none());
+            assert!(fourth_items.iter().any(|item| {
+                item["orchestration"]["nodeLabel"] == "gate-task-4-no-db-artifacts"
+            }));
+            assert!(fourth_items.iter().any(|item| {
+                item["orchestration"]["nodeLabel"] == "regate-task-4-no-db-artifacts"
+            }));
+
+            fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
                 fixture_git(&checkout, &["show", "origin/main:build/two.txt"]),
                 "two"
             );
-            let contains_forbidden_path = |tree: &str| {
-                tree.lines().any(|path| {
-                    let basename = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-                    basename.ends_with(".db")
-                        || basename.ends_with(".db-wal")
-                        || basename.ends_with(".db-shm")
-                        || basename.contains(".sqlite")
-                })
-            };
             assert!(
-                !contains_forbidden_path(&fixture_git(
-                    &checkout,
-                    &["ls-tree", "-r", "--name-only", "origin/main"]
-                )),
-                "the merged tree contains a forbidden artifact"
+                !fixture_git(&checkout, &["ls-tree", "-r", "--name-only", "origin/main"])
+                    .lines()
+                    .any(|path| {
+                        let basename = path.rsplit('/').next().unwrap_or(path);
+                        basename.ends_with(".db")
+                            || basename.ends_with(".db-wal")
+                            || basename.ends_with(".db-shm")
+                            || basename.contains(".sqlite")
+                    })
             );
-            for commit in fixture_git(&checkout, &["rev-list", "origin/main"]).lines() {
-                assert!(
-                    !contains_forbidden_path(&fixture_git(
-                        &checkout,
-                        &["ls-tree", "-r", "--name-only", commit]
-                    )),
-                    "main-reachable commit {commit} contains a forbidden artifact"
-                );
-            }
             let first_parent = fixture_git(
                 &checkout,
                 &["rev-list", "--first-parent", "--reverse", "origin/main"],
             );
             let commits = first_parent.lines().collect::<Vec<_>>();
-            assert_eq!(commits.len(), 3, "initial commit plus two task merges");
+            assert_eq!(commits.len(), 5, "initial commit plus four task merges");
             assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/task-2-base.txt"],),
-                commits[1],
-                "task 2 must be prepared from task 1's merge commit"
+                fixture_git(&checkout, &["show", "origin/main:build/task-2-base.txt"]),
+                task_2_base,
+                "the dependent task must be prepared from current merged forge state"
             );
             assert_eq!(
-                fs::read_to_string(control.join("agent-order.log")).unwrap(),
-                "task-1\ntask-2\n"
+                fixture_git(&checkout, &["show", "origin/main:build/four.txt"]),
+                "four"
             );
+
+            let complete = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_5,
+                &arguments("fixture-comment-10", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let complete = runner_output(complete).await;
+            assert!(
+                complete.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&complete.stdout),
+                String::from_utf8_lossy(&complete.stderr)
+            );
+            let complete_value = &flow_report(&complete)["report"]["finalValue"];
+            assert_eq!(complete_value["state"], "complete");
             assert_eq!(
-                fs::read_to_string(control.join("policy-order.log")).unwrap(),
-                "task-1:on-request:workspace-write\ntask-2:on-request:workspace-write\n"
+                complete_value["reconciled"]["merged"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|fact| fact["taskId"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["task-1", "task-2", "task-3", "task-4"]
             );
-            assert_eq!(
-                fs::read_to_string(control.join("preflight-order.log")).unwrap(),
-                "preflight:task-1:first\npreflight:task-1:second\n"
-            );
-            assert_eq!(
-                fs::read_to_string(control.join("gate-order.log")).unwrap(),
-                "task-1:first\ntask-1:second\ntask-2:first\ntask-2:second\n"
-            );
+            assert_eq!(complete_value["reconciled"]["remaining"], json!([]));
+            assert_eq!(complete_value["reconciled"]["frontier"], json!([]));
+            let complete_items = flow_items(&client, SPEC_BUILD_RUN_5).await;
+            assert_eq!(complete_items.len(), 1);
+            assert!(complete_items[0].get("taskRef").is_none());
+
+            let agent_order = fs::read_to_string(control.join("agent-order.log")).unwrap();
+            let agents = agent_order.lines().collect::<Vec<_>>();
+            assert_eq!(agents.len(), 5);
+            let mut first_frontier = agents[..2].to_vec();
+            first_frontier.sort_unstable();
+            assert_eq!(first_frontier, vec!["task-1", "task-3"]);
+            assert_eq!(agents[2], "task-1");
+            let mut fourth_frontier = agents[3..].to_vec();
+            fourth_frontier.sort_unstable();
+            assert_eq!(fourth_frontier, vec!["task-2", "task-4"]);
+
+            let policy_order = fs::read_to_string(control.join("policy-order.log")).unwrap();
+            let policies = policy_order.lines().collect::<Vec<_>>();
+            assert_eq!(policies.len(), 5);
+            assert!(policies
+                .iter()
+                .all(|line| line.ends_with(":on-request:workspace-write")));
+
+            let gated = fs::read_to_string(control.join("gate-order.log")).unwrap();
+            let gated = gated.lines().collect::<Vec<_>>();
+            for (receipt, expected) in [
+                ("task-1:first", 1),
+                ("task-1:second", 1),
+                ("task-2:first", 1),
+                ("task-2:second", 1),
+                ("task-3:first", 1),
+                ("task-3:second", 1),
+                ("task-4:first", 2),
+                ("task-4:second", 2),
+            ] {
+                assert_eq!(
+                    gated
+                        .iter()
+                        .filter(|candidate| **candidate == receipt)
+                        .count(),
+                    expected,
+                    "unexpected gate count for {receipt}: {gated:?}"
+                );
+            }
 
             daemon.stop().await;
         })
