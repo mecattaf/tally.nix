@@ -1172,16 +1172,12 @@
                       ];
                     }
                     {
-                      id = "clean";
-                      preflightArgv = [
-                        "git"
-                        "diff"
-                        "--exit-code"
-                      ];
-                      argv = [
-                        "git"
-                        "diff"
-                        "--exit-code"
+                      id = "no-db-artifacts";
+                      forbidPaths = [
+                        "*.db"
+                        "*.db-wal"
+                        "*.db-shm"
+                        "*.sqlite*"
                       ];
                     }
                   ];
@@ -3324,7 +3320,11 @@
                   $fixtureArgs.agent.sandboxPolicy == null and
                   $fixtureArgs.gates[0].preflightArgv == ["/bin/true"] and
                   $fixtureArgs.gates[0].runtimeMaxSec == 900 and
-                  $fixtureArgs.gates[1].preflightArgv == ["git", "diff", "--exit-code"] and
+                  ($fixtureArgs.gates[0] | has("forbidPaths") | not) and
+                  $fixtureArgs.gates[1].forbidPaths == ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"] and
+                  ($fixtureArgs.gates[1] | has("preflightArgv") | not) and
+                  ($fixtureArgs.gates[1] | has("argv") | not) and
+                  ($fixtureArgs.gates[1] | has("runtimeMaxSec") | not) and
                   $defaultedArgs.agent.adapter == "codex" and
                   $defaultedArgs.agent.approvalPolicy == "on-request" and
                   $defaultedArgs.agent.sandboxPolicy == "workspace-write" and
@@ -3350,13 +3350,17 @@
                   .producers["campaign-fixture"].enqueue.argv[0:3] == [
                     "${tally}/bin/tally", "flow", "run"
                   ] and
-                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "21"] and
+                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "20"] and
                   .producers["campaign-defaulted"].allowSelfTriggered == false
                 ' "$checkedConfig" >/dev/null
 
                 cp -R ${./test/fixtures/spec-build/repo} "$TMPDIR/spec"
                 chmod -R u+w "$TMPDIR/spec"
                 git -C "$TMPDIR/spec" init --quiet --initial-branch=main
+                git -C "$TMPDIR/spec" config user.name "Tally Fixture"
+                git -C "$TMPDIR/spec" config user.email "tally-fixture@invalid"
+                git -C "$TMPDIR/spec" add --all
+                git -C "$TMPDIR/spec" commit --quiet -m "fixture: frozen spec"
                 jq -n --arg checkout "$TMPDIR/spec" '{
                   repository: "acme/spec",
                   repositoryConfig: {
@@ -3386,6 +3390,45 @@
                   ) and
                   .tasks[1].dependencies == ["task-1"]
                 ' worklist.json >/dev/null
+
+                base_rev="$(git -C "$TMPDIR/spec" rev-parse HEAD)"
+                mkdir -p "$TMPDIR/spec/build/nested"
+                printf '%s\n' transient > "$TMPDIR/spec/build/nested/transient.db"
+                git -C "$TMPDIR/spec" add build/nested/transient.db
+                git -C "$TMPDIR/spec" commit --quiet -m "fixture: add forbidden artifact"
+                jq -n \
+                  --arg base "$base_rev" \
+                  --arg worktree "$TMPDIR/spec" \
+                  '{
+                    gate: {
+                      id: "no-db-artifacts",
+                      forbidPaths: ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"]
+                    },
+                    workspace: {
+                      taskId: "task-1",
+                      baseRev: $base,
+                      branch: "main",
+                      worktreePath: $worktree
+                    }
+                  }' > "$TMPDIR/constraint-brief.json"
+                export TALLY_BRIEF="$TMPDIR/constraint-brief.json"
+                if ${specBuildDriver}/bin/spec-build-driver constraint \
+                  > "$TMPDIR/constraint-fail.out" 2> "$TMPDIR/constraint-fail.err"; then
+                  echo "forbidPaths constraint accepted a committed .db path" >&2
+                  exit 1
+                fi
+                grep -F 'forbidPaths gate' "$TMPDIR/constraint-fail.err" >/dev/null
+                grep -F 'build/nested/transient.db' "$TMPDIR/constraint-fail.err" >/dev/null
+                git -C "$TMPDIR/spec" rm --quiet build/nested/transient.db
+                git -C "$TMPDIR/spec" commit --quiet -m "fixture: remove forbidden artifact"
+                ${specBuildDriver}/bin/spec-build-driver constraint \
+                  | sed 's/^TALLY_FINAL_MESSAGE=//' > "$TMPDIR/constraint-pass.json"
+                jq -e '
+                  .gateId == "no-db-artifacts" and
+                  .gateType == "forbidPaths" and
+                  .patterns == ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"] and
+                  .checkedPaths == 0
+                ' "$TMPDIR/constraint-pass.json" >/dev/null
 
                 default_event='{"kind":"gh","source":"search","repo":"acme/spec","number":6,"htmlUrl":"https://github.com/acme/spec/issues/6","itemType":"issue","nodeId":"I-campaign-6","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-6","commentId":"comment-6","triggerTimestamp":"2026-07-31T08:59:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["campaign"],"assignees":[],"triggeringComment":{"id":"comment-6","author":"operator","body":"@tally build"}}}'
                 default_dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
@@ -3417,7 +3460,15 @@
                   .agent.argv == ["/bin/true"] and
                   .agent.approvalPolicy == null and
                   .agent.sandboxPolicy == null and
-                  [.gates[].id] == ["content", "clean"]
+                  [.gates[].id] == ["content", "no-db-artifacts"] and
+                  .gates[0].preflightArgv == ["/bin/true"] and
+                  .gates[0].argv == ["/bin/sh", "-eu", "-c", "test -d build"] and
+                  .gates[0].runtimeMaxSec == 900 and
+                  (.gates[0] | has("forbidPaths") | not) and
+                  .gates[1].forbidPaths == ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"] and
+                  (.gates[1] | has("preflightArgv") | not) and
+                  (.gates[1] | has("argv") | not) and
+                  (.gates[1] | has("runtimeMaxSec") | not)
                 ' "$runtime_args" >/dev/null
                 jq -e --arg args "$runtime_args" \
                   '.briefPath == $args and (has("brief") | not)' "$payload" >/dev/null

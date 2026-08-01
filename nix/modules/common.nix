@@ -1816,26 +1816,49 @@ let
           description = "Stable gate identifier used in the witnessed node key.";
         };
         preflightArgv = mkOption {
-          type = types.listOf types.str;
+          type = types.nullOr (types.listOf types.str);
+          default = null;
           example = [
             "sh"
             "-euc"
             "command -v go >/dev/null; command -v gcc >/dev/null; go env CGO_ENABLED >/dev/null"
           ];
           description = ''
-            Base-safe direct argv executed before the first agent dispatch.
-            Declare the actual host and toolchain probe; do not make the
-            post-change merge criterion pretend that unbuilt output exists.
+            Base-safe direct argv executed before the first agent dispatch for
+            a command gate. Required with argv and unavailable with
+            forbidPaths. Declare the actual host and toolchain probe; do not
+            make the post-change merge criterion pretend that unbuilt output
+            exists.
           '';
         };
         argv = mkOption {
-          type = types.listOf types.str;
+          type = types.nullOr (types.listOf types.str);
+          default = null;
           example = [
             "go"
             "test"
             "./..."
           ];
-          description = "Direct argv executed in each task worktree after the agent exits successfully.";
+          description = ''
+            Direct argv executed in each task worktree after the agent exits
+            successfully. Requires preflightArgv and is mutually exclusive
+            with forbidPaths.
+          '';
+        };
+        forbidPaths = mkOption {
+          type = types.nullOr (types.listOf types.str);
+          default = null;
+          example = [
+            "*.db"
+            "*.db-wal"
+            "*.db-shm"
+            "*.sqlite*"
+          ];
+          description = ''
+            Repository-relative path globs forbidden in the committed task
+            diff. A slashless glob matches a basename at any depth; slashful
+            globs are rooted at the repository. Mutually exclusive with argv.
+          '';
         };
         runtimeMaxSec = mkOption {
           type = types.ints.positive;
@@ -1852,20 +1875,49 @@ let
           message = "tally campaign gate ${name} id ${config.id} is not a safe node-key component";
         }
         {
-          assertion = config.preflightArgv != [ ] && builtins.head config.preflightArgv != "";
+          assertion =
+            (config.argv != null && config.preflightArgv != null && config.forbidPaths == null)
+            || (config.argv == null && config.preflightArgv == null && config.forbidPaths != null);
+          message = "tally campaign gate ${name} must be either a command with preflightArgv and argv or a forbidPaths constraint";
+        }
+        {
+          assertion =
+            config.preflightArgv == null
+            || (config.preflightArgv != [ ] && builtins.head config.preflightArgv != "");
           message = "tally campaign gate ${name} preflightArgv must start with a non-empty executable";
         }
         {
-          assertion = lib.all (argument: !(lib.hasInfix "\u0000" argument)) config.preflightArgv;
+          assertion =
+            config.preflightArgv == null
+            || lib.all (argument: !(lib.hasInfix "\u0000" argument)) config.preflightArgv;
           message = "tally campaign gate ${name} preflightArgv must not contain NUL bytes";
         }
         {
-          assertion = config.argv != [ ] && builtins.head config.argv != "";
+          assertion = config.argv == null || (config.argv != [ ] && builtins.head config.argv != "");
           message = "tally campaign gate ${name} argv must start with a non-empty executable";
         }
         {
-          assertion = lib.all (argument: !(lib.hasInfix "\u0000" argument)) config.argv;
+          assertion =
+            config.argv == null || lib.all (argument: !(lib.hasInfix "\u0000" argument)) config.argv;
           message = "tally campaign gate ${name} argv must not contain NUL bytes";
+        }
+        {
+          assertion =
+            config.forbidPaths == null
+            || (
+              config.forbidPaths != [ ]
+              && builtins.length config.forbidPaths <= 128
+              && builtins.length config.forbidPaths == builtins.length (unique config.forbidPaths)
+              && lib.all (
+                pattern:
+                pattern != ""
+                && builtins.stringLength pattern <= 1024
+                && !(lib.hasPrefix "/" pattern)
+                && !(builtins.elem ".." (lib.splitString "/" pattern))
+                && !(lib.hasInfix "\u0000" pattern)
+              ) config.forbidPaths
+            );
+          message = "tally campaign gate ${name} forbidPaths must contain 1-128 unique relative globs without '..' or NUL bytes";
         }
       ];
     }
@@ -1954,10 +2006,11 @@ let
             }
           ];
           description = ''
-            Ordered gates with an explicit base-safe preflight argv and a
-            post-change merge-criterion argv. Both run with the same task
-            environment and deadline; the first red invocation stops the
-            campaign.
+            Ordered command or built-in constraint gates run for every task.
+            Command gates declare separate base-safe preflightArgv and
+            post-change argv values with one deadline; forbidPaths constraints
+            begin after the agent creates a committed diff. The first red
+            invocation stops the campaign.
           '';
         };
         agent = mkOption {
@@ -2410,6 +2463,15 @@ let
           repositories."mecattaf/crm".checkout = "/srv/spec-repositories/crm";
           gates = [
             {
+              id = "no-db-artifacts";
+              forbidPaths = [
+                "*.db"
+                "*.db-wal"
+                "*.db-shm"
+                "*.sqlite*"
+              ];
+            }
+            {
               id = "tests";
               preflightArgv = [
                 "sh"
@@ -2806,18 +2868,26 @@ let
     }
   );
 
-  renderCampaignGates = map (gate: {
-    inherit (gate)
-      id
-      preflightArgv
-      argv
-      runtimeMaxSec
-      ;
-  });
+  renderCampaignGates = map (
+    gate:
+    {
+      inherit (gate) id;
+    }
+    // optionalAttrs (gate.argv != null) {
+      inherit (gate)
+        preflightArgv
+        argv
+        runtimeMaxSec
+        ;
+    }
+    // optionalAttrs (gate.forbidPaths != null) { inherit (gate) forbidPaths; }
+  );
 
   campaignMaxNodes =
     campaign:
-    1 + builtins.length campaign.gates + campaign.maxTasks * (4 + builtins.length campaign.gates);
+    1
+    + builtins.length (builtins.filter (gate: gate.argv != null) campaign.gates)
+    + campaign.maxTasks * (4 + builtins.length campaign.gates);
 
   mkCampaignArgs = cfg: name: campaign: repository: issueNumber: issueUrl: runId: {
     campaign = name;

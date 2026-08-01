@@ -8,7 +8,7 @@ authorized.
 
 ### Added
 
-- Added accept-time campaign gate preflights: every gate now declares a
+- Added accept-time campaign gate preflights: every command gate declares a
   base-safe `preflightArgv` separately from its post-change `argv`. The exact
   probe executes once on the fetched base, with the same task environment and a
   bounded deadline, before the first agent dispatch; a witnessed
@@ -18,6 +18,10 @@ authorized.
   transient unit names, and capture filenames. Campaign diagnostics now retain
   the stable worklist ID alongside the durable task UUID across retries,
   recovery, and remote execution.
+- Added declarative campaign constraint gates alongside command gates, starting
+  with `forbidPaths` globs over each task's committed pull-request diff. A
+  forbidden path now becomes a cheap, witnessed, fail-fast gate failure before
+  publication or merge instead of a post-merge operator audit.
 - Added flow-node `approvalPolicy` and `sandboxPolicy` fields plus campaign
   `agentApprovalPolicy`/`agentSandboxPolicy` options. Spec-build implementation
   agents now default to Codex's writable `workspace-write` + `on-request`
