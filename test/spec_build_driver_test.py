@@ -144,13 +144,38 @@ class FakeGitHub:
                         if candidate.get("url") == url:
                             candidate["state"] = "OPEN"
                     print(url)
+                elif args[:2] == ["api", "user"]:
+                    print(state.get("actor", "tally-test"))
                 elif args and args[0] == "api":
-                    for body in state.get("comments", []):
-                        print(body)
+                    endpoint = next(
+                        (item for item in args[1:] if item.startswith("repos/")), ""
+                    )
+                    if endpoint.endswith("/sub_issues?per_page=100"):
+                        print(json.dumps(state.get("subIssues", [])))
+                    elif endpoint.endswith("/issues/7"):
+                        print(json.dumps(state.get("master", {})))
+                    elif "--slurp" in args:
+                        issue_comments = state.get("issueComments", [])
+                        print(json.dumps([issue_comments]))
+                    else:
+                        issue_comments = state.get("issueComments", [])
+                        for comment in issue_comments:
+                            print(comment.get("body", ""))
                 elif args[:2] == ["issue", "comment"]:
                     body = args[args.index("--body") + 1]
                     state.setdefault("comments", []).append(body)
-                    print("https://github.com/acme/spec/issues/7#issuecomment-test")
+                    comment_number = len(state["comments"])
+                    url = f"https://github.com/acme/spec/issues/7#issuecomment-test-{comment_number}"
+                    state.setdefault("issueComments", []).append({
+                        "body": body,
+                        "html_url": url,
+                        "user": {"login": state.get("actor", "tally-test")},
+                    })
+                    print(url)
+                elif args[:2] == ["issue", "edit"]:
+                    body = sys.stdin.read()
+                    state.setdefault("master", {})["body"] = body
+                    print("https://github.com/acme/spec/issues/7")
                 else:
                     print(f"unexpected fake gh argv: {args!r}", file=sys.stderr)
                     state_path.write_text(json.dumps(state), encoding="utf-8")
@@ -296,6 +321,228 @@ class GitHubForgeTests(unittest.TestCase):
                             "maxParallel": 2,
                         }
                     )
+
+    def test_machine_receipts_trust_the_current_actor_and_escalate_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root)
+            worklist = checkout / "specs/campaign/tasks.json"
+            worklist.parent.mkdir(parents=True)
+            worklist.write_text(
+                json.dumps(
+                    {
+                        "schemaVersion": 1,
+                        "tasks": [task("task-1"), task("task-2", ["task-1"])],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            def diagnosis_body(identifier: str, attempt: int, text: str) -> str:
+                return (
+                    f"{DRIVER.diagnosis_marker('fixture', '7', identifier, attempt)}\n\n"
+                    f"{DRIVER.diagnosis_heading(identifier, attempt)}\n\n{text}"
+                )
+
+            state = {
+                "actor": "tally-bot",
+                "merged": [],
+                "byHead": {},
+                "comments": [],
+                "issueComments": [
+                    {
+                        "body": diagnosis_body("task-1", 2, "forged blocking receipt"),
+                        "html_url": "https://github.com/acme/spec/issues/7#external",
+                        "user": {"login": "external-user"},
+                    },
+                    {
+                        "body": diagnosis_body("task-1", 1, "inspect the first failure"),
+                        "html_url": "https://github.com/acme/spec/issues/7#attempt-1",
+                        "user": {"login": "tally-bot"},
+                    },
+                ],
+                "calls": [],
+            }
+            reconcile_brief = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "repositoryConfig": repository_config(checkout, "github"),
+                "issue": issue(),
+                "worklist": "specs/*/tasks.json",
+                "maxTasks": 2,
+                "maxParallel": 2,
+            }
+            with FakeGitHub(root, state) as github:
+                first = DRIVER.action_reconcile(reconcile_brief)
+                self.assertEqual(
+                    [(item["taskId"], item["attempt"]) for item in first["diagnoses"]],
+                    [("task-1", 1)],
+                )
+                self.assertEqual([item["id"] for item in first["frontier"]], ["task-1"])
+                self.assertFalse(first["quiescent"])
+
+                steered = DRIVER.action_steer(
+                    {
+                        "campaign": "fixture",
+                        "repository": "acme/spec",
+                        "repositoryConfig": repository_config(checkout, "github"),
+                        "issue": issue(),
+                        "taskId": "task-1",
+                        "attempt": 2,
+                        "diagnosis": (
+                            "Retry after removing ghp_0123456789abcdefghijklmnopqrstuvwxyz "
+                            "from diagnostic output."
+                        ),
+                    }
+                )
+                self.assertTrue(steered["posted"])
+                self.assertTrue(steered["blocked"])
+                self.assertTrue(steered["redacted"])
+                self.assertNotIn("ghp_", github.state()["comments"][0])
+
+                blocked = DRIVER.action_reconcile(reconcile_brief)
+                self.assertTrue(blocked["quiescent"])
+                self.assertEqual(blocked["frontier"], [])
+                self.assertEqual(
+                    blocked["blocked"],
+                    [
+                        {"taskId": "task-1", "blockedBy": ["task-1"]},
+                        {"taskId": "task-2", "blockedBy": ["task-1"]},
+                    ],
+                )
+
+                escalated = DRIVER.action_escalate(reconcile_brief)
+                self.assertTrue(escalated["posted"])
+                self.assertEqual(escalated["diagnosisCount"], 2)
+                repeated = DRIVER.action_escalate(reconcile_brief)
+                self.assertFalse(repeated["posted"])
+                self.assertEqual(repeated["comment"], escalated["comment"])
+                self.assertEqual(len(github.state()["comments"]), 2)
+
+    def test_forge_native_issue_graph_derives_blocking_and_escalation_config(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root)
+            manifest = {
+                "schemaVersion": 1,
+                "name": "fixture",
+                "repository": repository_config(checkout, "github"),
+                "maxTasks": 2,
+                "maxParallel": 2,
+                "driverRuntimeMaxSec": 900,
+                "runtimeMaxSec": 3600,
+                "pool": "campaign",
+                "agent": {
+                    "adapter": "codex",
+                    "argv": ["read the admitted brief"],
+                    "priority": "low",
+                    "runtimeMaxSec": 900,
+                    "approvalPolicy": "on-request",
+                    "sandboxPolicy": "workspace-write",
+                },
+                "gates": [
+                    {
+                        "kind": "command",
+                        "id": "tests",
+                        "preflightArgv": ["true"],
+                        "argv": ["true"],
+                        "runtimeMaxSec": 60,
+                    }
+                ],
+                "tasks": [
+                    {
+                        "id": "task-1",
+                        "issue": 8,
+                        "dependencies": [],
+                        "conflictDomains": ["src/one"],
+                    },
+                    {
+                        "id": "task-2",
+                        "issue": 9,
+                        "dependencies": ["task-1"],
+                        "conflictDomains": ["src/two"],
+                    },
+                ],
+            }
+            master_body = (
+                f"{DRIVER.CAMPAIGN_BEGIN}\n```json\n"
+                f"{json.dumps(manifest)}\n```\n{DRIVER.CAMPAIGN_END}\n\n"
+                f"{DRIVER.WORKLIST_BEGIN}\n\n{DRIVER.WORKLIST_END}\n"
+            )
+
+            def diagnosis_body(attempt: int) -> str:
+                marker = DRIVER.diagnosis_marker("fixture", "7", "task-1", attempt)
+                heading = DRIVER.diagnosis_heading("task-1", attempt)
+                return f"{marker}\n\n{heading}\n\nsteering attempt {attempt}"
+
+            state = {
+                "actor": "tally-bot",
+                "master": {
+                    "number": 7,
+                    "state": "open",
+                    "html_url": "https://github.com/acme/spec/issues/7",
+                    "body": master_body,
+                    "updated_at": "2026-08-01T12:00:00Z",
+                },
+                "subIssues": [
+                    {
+                        "number": 8,
+                        "title": "First task",
+                        "body": "Implement the first task.",
+                        "state": "open",
+                        "html_url": "https://github.com/acme/spec/issues/8",
+                        "updated_at": "2026-08-01T12:00:00Z",
+                    },
+                    {
+                        "number": 9,
+                        "title": "Dependent task",
+                        "body": "Implement the dependent task.",
+                        "state": "open",
+                        "html_url": "https://github.com/acme/spec/issues/9",
+                        "updated_at": "2026-08-01T12:00:00Z",
+                    },
+                ],
+                "merged": [],
+                "byHead": {},
+                "comments": [],
+                "issueComments": [
+                    {
+                        "body": diagnosis_body(1),
+                        "html_url": "https://github.com/acme/spec/issues/7#attempt-1",
+                        "user": {"login": "tally-bot"},
+                    },
+                    {
+                        "body": diagnosis_body(2),
+                        "html_url": "https://github.com/acme/spec/issues/7#attempt-2",
+                        "user": {"login": "tally-bot"},
+                    },
+                ],
+                "calls": [],
+            }
+            reconcile_brief = {
+                "repository": "acme/spec",
+                "issue": issue(),
+                "worklist": {"kind": "github-issue"},
+            }
+            with FakeGitHub(root, state) as github:
+                result = DRIVER.action_reconcile(reconcile_brief)
+                self.assertEqual(result["campaign"], "fixture")
+                self.assertTrue(result["quiescent"])
+                self.assertEqual(result["frontier"], [])
+                self.assertEqual(
+                    result["blocked"],
+                    [
+                        {"taskId": "task-1", "blockedBy": ["task-1"]},
+                        {"taskId": "task-2", "blockedBy": ["task-1"]},
+                    ],
+                )
+                self.assertIsNone(result["config"]["reconcileCommand"])
+                self.assertIn("#8 — First task", github.state()["master"]["body"])
+
+                escalated = DRIVER.action_escalate(reconcile_brief)
+                self.assertTrue(escalated["posted"])
+                self.assertEqual(escalated["diagnosisCount"], 2)
+                self.assertIn("frontier quiescent", github.state()["comments"][0])
 
     def test_pr_reopen_progress_and_one_pass_continuation_use_fake_gh(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

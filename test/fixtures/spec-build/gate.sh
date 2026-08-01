@@ -11,6 +11,12 @@ if [ "$task" = task-1 ] && [ "$gate" = first ] && [ ! -e "$control/post-change-f
   exit 1
 fi
 
+if [ "$task" = task-2 ] && [ "$gate" = first ]; then
+  printf '%s:%s\n' "$task" "$gate" >>"$control/gate-order.log"
+  printf '%s\n' 'task 2 deterministic gate failure after implementation' >&2
+  exit 1
+fi
+
 case "$task" in
   task-1)
     test "$(cat build/one.txt)" = one
@@ -28,6 +34,9 @@ case "$task" in
     ;;
   task-5)
     test "$(cat build/five.txt)" = five
+    ;;
+  task-6)
+    test "$(cat build/six.txt)" = six
     ;;
   *)
     printf 'unknown fixture task: %s\n' "$task" >&2

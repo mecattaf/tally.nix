@@ -2087,7 +2087,7 @@ let
           type = types.str;
           default = "codex";
           example = "codex";
-          description = "Configured adapter used by implementation nodes.";
+          description = "Configured adapter used by implementation and diagnosis nodes.";
         };
         agentArgv = mkOption {
           type = types.listOf types.str;
@@ -2095,9 +2095,10 @@ let
           defaultText = lib.literalExpression "the tally structured-brief sentinel";
           example = [ "/srv/campaign-fixtures/agent" ];
           description = ''
-            Direct argv appended to the selected adapter. Agent adapters should
-            keep the default structured-brief sentinel; a shell fixture may
-            name its executable directly.
+            Direct argv appended to the selected adapter for implementation
+            and diagnosis. Agent adapters should keep the default
+            structured-brief sentinel; a shell fixture may name its executable
+            directly.
           '';
         };
         agentPriority = mkOption {
@@ -2108,17 +2109,17 @@ let
             "low"
           ];
           default = "low";
-          description = "Priority of each campaign implementation node.";
+          description = "Priority of each campaign implementation or diagnosis node.";
         };
         agentApprovalPolicy = mkOption {
           type = types.nullOr types.str;
           default = "on-request";
           example = "never";
           description = ''
-            Named adapter approval policy for implementation nodes. The
-            default pairs with workspace-write so an agent may request an
-            adapter-supported escalation. Set null only when the selected
-            adapter declares no approval policies.
+            Named adapter approval policy for implementation and diagnosis
+            nodes. The default pairs with workspace-write so an implementation
+            agent may request an adapter-supported escalation. Set null only
+            when the selected adapter declares no approval policies.
           '';
         };
         agentSandboxPolicy = mkOption {
@@ -2126,22 +2127,23 @@ let
           default = "workspace-write";
           example = "read-only";
           description = ''
-            Named adapter sandbox policy for implementation nodes. The
-            writable default matches the node's obligation to create commits;
-            set read-only explicitly for a non-writing agent, or null only
-            when the selected adapter declares no sandbox policies.
+            Named adapter sandbox policy for implementation and diagnosis
+            nodes. The writable default matches the implementation node's
+            obligation to create commits; diagnosis briefs prohibit mutation.
+            Set read-only explicitly for a wholly non-writing adapter, or null
+            only when the selected adapter declares no sandbox policies.
           '';
         };
         agentRuntimeMaxSec = mkOption {
           type = types.nullOr types.ints.positive;
           default = 14400;
           example = 21600;
-          description = "Optional process deadline for each implementation node.";
+          description = "Optional process deadline for each implementation or diagnosis node.";
         };
         driverRuntimeMaxSec = mkOption {
           type = types.ints.positive;
           default = 900;
-          description = "Process deadline for each deterministic reconcile, prep, publish, rebase, or merge node.";
+          description = "Process deadline for each deterministic spec-build driver node.";
         };
         runtimeMaxSec = mkOption {
           type = types.nullOr types.ints.positive;
@@ -2150,7 +2152,8 @@ let
           description = ''
             Optional deadline for one bounded reconcile-pass runner. Null
             leaves the fixed 24-hour evaluator budget as its safety boundary;
-            campaign continuation lives in merged forge state, not this run.
+            campaign continuation lives in marked pull requests and issue
+            comments, not this run.
           '';
         };
         pool.name = mkOption {
@@ -3102,19 +3105,20 @@ let
 
   campaignReconcileCommand = name: "/tally reconcile ${name}";
 
-  # Sweep, reconcile, an optional one-per-pass continuation, optional
+  # Sweep, reconcile, one optional pass-level continuation, optional
   # pristine-base preflight prep/gates/cleanup, and one frontier's worst-case
   # implementation lanes: prep, agent, ownership check, initial gates,
-  # publication, rebase check, optional re-gates, merge, and cleanup. A
-  # checkpoint lane is smaller (prep, direct validation, durable fact, cleanup).
-  # This is a pass bound, not the complete worklist size.
+  # publication, rebase, optional re-gates, merge, diff/diagnosis/steering,
+  # and cleanup. Checkpoint lanes are smaller; quiescent escalation needs only
+  # sweep, reconcile, and escalation. This is a pass bound, not the complete
+  # worklist size.
   campaignMaxNodes =
     campaign:
     let
       commandGateCount = builtins.length (builtins.filter (gate: gate.kind == "command") campaign.gates);
       preflightNodes = if commandGateCount == 0 then 0 else 2 + commandGateCount;
     in
-    3 + preflightNodes + campaign.maxParallel * (7 + 2 * builtins.length campaign.gates);
+    3 + preflightNodes + campaign.maxParallel * (10 + 2 * builtins.length campaign.gates);
 
   mkCampaignArgs = cfg: name: campaign: repository: issueNumber: issueUrl: runId: {
     campaign = name;
@@ -3230,7 +3234,8 @@ let
         }
       ];
       triggers.commandComments = [ (campaignReconcileCommand name) ];
-      # One pass-level node posts this finite, event-id-deduplicated command.
+      # One pass-level node posts this finite, event-id-deduplicated command
+      # after any merge, checkpoint, or machine steering receipt.
       # Authenticated self-trigger permission is separate from the external
       # actor allowlist, so an operator-only list cannot silence continuation.
       allowSelfTriggered = true;

@@ -1187,7 +1187,7 @@
                   postFailureEvidence = true;
                   postFailureStderr = true;
                   worklist = "specs/*/tasks.json";
-                  maxTasks = 6;
+                  maxTasks = 7;
                   maxParallel = 3;
                   gates = [
                     {
@@ -3508,7 +3508,7 @@
                   .producers["campaign-fixture"].enqueue.argv[0:3] == [
                     "${tally}/bin/tally", "flow", "run"
                   ] and
-                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "39"] and
+                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "48"] and
                   .producers["campaign-fixture-reconcile"].kind == "gh" and
                   .producers["campaign-fixture-reconcile"].allowSelfTriggered == true and
                   .producers["campaign-fixture-reconcile"].allowedActors == ["operator"] and
@@ -3517,7 +3517,7 @@
                   .producers["campaign-fixture-reconcile"].postFailureStderr == true and
                   .producers["campaign-fixture-reconcile"].triggers.commandComments == ["/tally reconcile fixture"] and
                   .producers["campaign-fixture-reconcile"].enqueue.pool == ["fixture-campaign", "flow"] and
-                  .producers["campaign-fixture-reconcile"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "39"] and
+                  .producers["campaign-fixture-reconcile"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "48"] and
                   $reconcileArgs.reconcileCommand == "/tally reconcile fixture" and
                   .producers["campaign-defaulted"].allowSelfTriggered == false
                   and .producers["campaign-defaulted"].postFailureEvidence == false
@@ -3544,7 +3544,7 @@
                     forge: "local"
                   },
                   worklist: "specs/*/tasks.json",
-                  maxTasks: 6,
+                  maxTasks: 7,
                   maxParallel: 3
                 }' > "$TMPDIR/worklist-brief.json"
                 export TALLY_BRIEF="$TMPDIR/worklist-brief.json"
@@ -3555,7 +3555,7 @@
                   .repository == "acme/spec" and
                   .source.path == "specs/001-toy/tasks.json" and
                   (.source.sha256 | test("^sha256:[0-9a-f]{64}$")) and
-                  [.tasks[].id] == ["task-1", "phase-one-checkpoint", "task-2", "task-3", "task-4", "task-5"] and
+                  [.tasks[].id] == ["task-1", "phase-one-checkpoint", "task-2", "task-3", "task-4", "task-5", "task-6"] and
                   all(.tasks[] | select(.kind == "implementation");
                     (.goal | length) > 0 and
                     (.deliveredBehaviors | length) > 0 and
@@ -3564,14 +3564,14 @@
                     (.acceptanceCriteria | length) > 0 and
                     all(.acceptanceCriteria[]; (.argv | length) > 0)
                   ) and
-                  .tasks[1] == {
-                    id: "phase-one-checkpoint",
-                    kind: "checkpoint",
-                    title: "Validate the accumulated first phase",
-                    argv: ["sh", "-eu", "-c", "test \"$(cat build/one.txt)\" = one && test ! -e build/checkpoint-red"],
-                    runtimeMaxSec: 10,
-                    dependencies: ["task-1"]
-                  } and
+                  .tasks[1].id == "phase-one-checkpoint" and
+                  .tasks[1].kind == "checkpoint" and
+                  .tasks[1].title == "Validate the accumulated first phase" and
+                  .tasks[1].argv[0:3] == ["sh", "-eu", "-c"] and
+                  (.tasks[1].argv[3] |
+                    contains("checkpoint-red") and contains("TALLY_BRIEF")) and
+                  .tasks[1].runtimeMaxSec == 10 and
+                  .tasks[1].dependencies == ["task-1"] and
                   .tasks[2].dependencies == ["phase-one-checkpoint"]
                 ' worklist.json >/dev/null
 
@@ -3855,7 +3855,7 @@
                   } and
                   .runId == "comment-7" and
                   .worklist == "specs/*/tasks.json" and
-                  .maxTasks == 6 and
+                  .maxTasks == 7 and
                   .maxParallel == 3 and
                   .reconcileCommand == "/tally reconcile fixture" and
                   .repositories["acme/spec"].baseBranch == "main" and

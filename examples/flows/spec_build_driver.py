@@ -31,6 +31,17 @@ BRIEF_SENTINEL = (
     "Read the file whose path is in the TALLY_BRIEF environment variable and execute "
     "the mission it contains. That brief is your complete instruction set."
 )
+DIAGNOSIS_MARKER = re.compile(
+    r"^<!-- tally:spec-build:diagnosis:v1 "
+    r"campaign=([A-Za-z0-9_][A-Za-z0-9_.-]*) "
+    r"issue=([1-9][0-9]*) "
+    r"task=([a-z0-9](?:[a-z0-9-]*[a-z0-9])?) "
+    r"attempt=([12]) -->$"
+)
+MAX_DIAGNOSIS_CHARS = 12_000
+MAX_DIFF_CHARS = 128 * 1024
+PUBLIC_REDACTION = "conservative-v1"
+PUBLIC_DIAGNOSIS_TRUNCATION = "\n[... diagnosis truncated after redaction ...]"
 
 
 class DriverError(RuntimeError):
@@ -77,6 +88,16 @@ def full_git_oid(value: Any, context: str) -> str:
     if not GIT_OID.fullmatch(oid):
         fail(f"{context} must be a full Git object ID")
     return oid
+
+
+def required_text(value: Any, context: str, maximum: int) -> str:
+    if not isinstance(value, str) or not value.strip():
+        fail(f"{context} must be non-empty text")
+    if len(value) > maximum:
+        fail(f"{context} exceeds {maximum} characters")
+    if any(ord(char) < 32 and char not in "\n\t\r" for char in value):
+        fail(f"{context} contains unsupported control characters")
+    return value.replace("\r\n", "\n").replace("\r", "\n").strip()
 
 
 def string_list(value: Any, context: str, *, nonempty: bool = False) -> list[str]:
@@ -143,8 +164,17 @@ def run(
     return result
 
 
-def git(checkout: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return run(["git", "-C", str(checkout), *arguments], check=check)
+def git(
+    checkout: Path,
+    *arguments: str,
+    check: bool = True,
+    input_text: str | None = None,
+) -> subprocess.CompletedProcess[str]:
+    return run(
+        ["git", "-C", str(checkout), *arguments],
+        check=check,
+        input_text=input_text,
+    )
 
 
 def repo_config(value: Any) -> dict[str, Any]:
@@ -726,6 +756,332 @@ def campaign_issue(value: Any) -> dict[str, str]:
     return {"number": number, "url": url}
 
 
+def diagnosis_marker(campaign: str, issue_number: str, task_id: str, attempt: int) -> str:
+    return (
+        "<!-- tally:spec-build:diagnosis:v1 "
+        f"campaign={campaign} issue={issue_number} task={task_id} attempt={attempt} -->"
+    )
+
+
+def diagnosis_heading(task_id: str, attempt: int) -> str:
+    return f"### Machine steering for `{task_id}` (attempt {attempt}/2)"
+
+
+def escalation_marker(campaign: str, issue_number: str) -> str:
+    return (
+        "<!-- tally:spec-build:escalation:v1 "
+        f"campaign={campaign} issue={issue_number} -->"
+    )
+
+
+def public_token_is_sensitive(value: str) -> bool:
+    token = value.strip("'\"`()[]{},;")
+    lower = token.lower()
+    prefixes = (
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "sk-",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxr-",
+    )
+    if (
+        any(prefix in lower for prefix in prefixes)
+        or (("AKIA" in token or "ASIA" in token) and len(token) >= 16)
+        or ("://" in token and ("@" in token or "?" in token))
+    ):
+        return True
+    jwt_parts = token.split(".")
+    if len(jwt_parts) == 3 and all(len(part) >= 8 for part in jwt_parts):
+        return True
+    if len(token) < 32 or not token.isascii():
+        return False
+    has_lower = any(char.islower() for char in token)
+    has_upper = any(char.isupper() for char in token)
+    has_digit = any(char.isdigit() for char in token)
+    if all(char in "0123456789abcdefABCDEF" for char in token):
+        return True
+    token_like = all(char.isalnum() or char in "+/_-=" for char in token)
+    return token_like and has_digit and ((has_lower and has_upper) or len(token) >= 40)
+
+
+def redact_public_text(value: str) -> tuple[str, bool]:
+    sensitive_markers = (
+        "authorization",
+        "bearer ",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "api_key",
+        "api-key",
+        "apikey",
+        "private key",
+        "access key",
+        "access_key",
+        "secret_key",
+        "client_secret",
+        "client key",
+        "cookie",
+        "dsn=",
+        "session_id",
+        "sessionid",
+    )
+    output: list[str] = []
+    redacted = False
+    private_key_block = False
+    for line in value.splitlines(keepends=True):
+        lower = line.lower()
+        if "-----begin " in lower and "private key-----" in lower:
+            private_key_block = True
+        if private_key_block or any(marker in lower for marker in sensitive_markers):
+            output.append("[redacted sensitive diagnosis line]")
+            if line.endswith("\n"):
+                output.append("\n")
+            redacted = True
+        else:
+            for chunk in re.split(r"(\s+)", line):
+                if chunk and not chunk.isspace() and public_token_is_sensitive(chunk):
+                    output.append("[redacted-token]")
+                    redacted = True
+                else:
+                    output.append(chunk)
+        if "-----end " in lower and "private key-----" in lower:
+            private_key_block = False
+    return "".join(output).strip(), redacted
+
+
+def bound_public_diagnosis(value: str) -> str:
+    if len(value) <= MAX_DIAGNOSIS_CHARS:
+        return value
+    width = MAX_DIAGNOSIS_CHARS - len(PUBLIC_DIAGNOSIS_TRUNCATION)
+    return value[:width].rstrip() + PUBLIC_DIAGNOSIS_TRUNCATION
+
+
+def github_machine_comments(repository: str, issue_number: str) -> list[dict[str, Any]]:
+    actor = required_string(
+        run(["gh", "api", "user", "--jq", ".login"]).stdout.strip(),
+        "authenticated GitHub actor",
+    )
+    viewed = run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{repository}/issues/{issue_number}/comments?per_page=100",
+        ]
+    )
+    try:
+        pages = json.loads(viewed.stdout)
+    except json.JSONDecodeError as error:
+        fail(f"gh issue comments returned invalid JSON: {error}")
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        fail("gh issue comments pagination must return arrays")
+    comments = [candidate for page in pages for candidate in page]
+    return [
+        candidate
+        for candidate in comments
+        if isinstance(candidate, dict)
+        and isinstance(candidate.get("user"), dict)
+        and isinstance(candidate["user"].get("login"), str)
+        and candidate["user"]["login"].casefold() == actor.casefold()
+    ]
+
+
+def state_scope(campaign: str, issue_number: str) -> str:
+    return hashlib.sha256(f"{campaign}\0{issue_number}".encode()).hexdigest()[:24]
+
+
+def local_state_prefix(campaign: str, issue_number: str) -> str:
+    return f"refs/tally/spec-build/v1/{state_scope(campaign, issue_number)}"
+
+
+def local_remote_refs(config: dict[str, Any], pattern: str) -> dict[str, str]:
+    checkout: Path = config["checkout"]
+    viewed = git(checkout, "ls-remote", config["remote"], pattern)
+    refs: dict[str, str] = {}
+    for line in viewed.stdout.splitlines():
+        fields = line.split("\t", 1)
+        if len(fields) != 2 or not re.fullmatch(r"[0-9a-f]{40,64}", fields[0]):
+            fail("local forge returned a malformed state ref")
+        refs[fields[1]] = fields[0]
+    return refs
+
+
+def read_local_blob(config: dict[str, Any], ref: str) -> dict[str, Any]:
+    checkout: Path = config["checkout"]
+    git(checkout, "fetch", "--quiet", config["remote"], ref)
+    content = git(checkout, "cat-file", "blob", "FETCH_HEAD").stdout
+    try:
+        value = json.loads(content)
+    except json.JSONDecodeError as error:
+        fail(f"local forge state {ref!r} is invalid JSON: {error}")
+    if not isinstance(value, dict):
+        fail(f"local forge state {ref!r} must contain an object")
+    return value
+
+
+def write_local_blob(
+    config: dict[str, Any], ref: str, value: dict[str, Any]
+) -> tuple[bool, dict[str, Any]]:
+    existing = local_remote_refs(config, ref)
+    if ref in existing:
+        return False, read_local_blob(config, ref)
+    rendered = json.dumps(value, sort_keys=True, separators=(",", ":"))
+    checkout: Path = config["checkout"]
+    object_id = required_string(
+        git(checkout, "hash-object", "-w", "--stdin", input_text=rendered).stdout.strip(),
+        "local forge state object",
+    )
+    git(checkout, "push", "--quiet", config["remote"], f"{object_id}:{ref}")
+    return True, value
+
+
+def forge_campaign_state(
+    repository: str,
+    config: dict[str, Any],
+    campaign: str,
+    issue_number: str,
+    task_ids: set[str] | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    diagnoses: list[dict[str, Any]] = []
+    escalations: list[str] = []
+    if config["forge"] == "github":
+        comments = github_machine_comments(repository, issue_number)
+        expected_escalation = escalation_marker(campaign, issue_number)
+        for comment in comments:
+            body = comment.get("body")
+            if not isinstance(body, str) or not body:
+                continue
+            first_line = body.splitlines()[0]
+            match = DIAGNOSIS_MARKER.fullmatch(first_line)
+            if match is not None:
+                marker_campaign, marker_issue, task_id, attempt_text = match.groups()
+                if marker_campaign != campaign or marker_issue != issue_number:
+                    continue
+                if task_ids is not None and task_id not in task_ids:
+                    fail(f"machine diagnosis names unknown campaign task {task_id!r}")
+                attempt = int(attempt_text)
+                heading = diagnosis_heading(task_id, attempt)
+                prefix = f"{first_line}\n\n{heading}\n\n"
+                if not body.startswith(prefix):
+                    fail(f"machine diagnosis for {task_id!r} has malformed content")
+                diagnoses.append(
+                    {
+                        "taskId": task_id,
+                        "attempt": attempt,
+                        "comment": required_string(
+                            comment.get("html_url"), "machine diagnosis comment URL"
+                        ),
+                        "diagnosis": required_text(
+                            body[len(prefix) :],
+                            f"machine diagnosis for {task_id!r}",
+                            MAX_DIAGNOSIS_CHARS,
+                        ),
+                    }
+                )
+            elif first_line == expected_escalation:
+                escalations.append(
+                    required_string(comment.get("html_url"), "machine escalation comment URL")
+                )
+    else:
+        prefix = local_state_prefix(campaign, issue_number)
+        refs = local_remote_refs(config, f"{prefix}/*")
+        diagnosis_prefix = f"{prefix}/diagnosis/"
+        for ref in sorted(refs):
+            if not ref.startswith(diagnosis_prefix):
+                continue
+            receipt = object_exact(
+                read_local_blob(config, ref),
+                {
+                    "schemaVersion",
+                    "kind",
+                    "campaign",
+                    "issueNumber",
+                    "taskId",
+                    "attempt",
+                    "diagnosis",
+                    "redaction",
+                },
+                f"local forge diagnosis {ref}",
+            )
+            if (
+                receipt.get("schemaVersion") != 1
+                or receipt.get("kind") != "diagnosis"
+                or receipt.get("campaign") != campaign
+                or receipt.get("issueNumber") != issue_number
+                or receipt.get("redaction") != PUBLIC_REDACTION
+            ):
+                fail(f"local forge diagnosis {ref!r} has invalid identity")
+            task_id = required_string(receipt.get("taskId"), "local diagnosis taskId")
+            if not TASK_ID.fullmatch(task_id):
+                fail(f"local forge diagnosis {ref!r} has unsafe taskId")
+            if task_ids is not None and task_id not in task_ids:
+                fail(f"machine diagnosis names unknown campaign task {task_id!r}")
+            attempt = receipt.get("attempt")
+            if attempt not in {1, 2}:
+                fail(f"local forge diagnosis {ref!r} has invalid attempt")
+            expected_ref = f"{diagnosis_prefix}{task_id}/{attempt}"
+            if ref != expected_ref:
+                fail(f"local forge diagnosis {ref!r} disagrees with its identity")
+            diagnoses.append(
+                {
+                    "taskId": task_id,
+                    "attempt": attempt,
+                    "comment": f"local://{repository}/{ref}",
+                    "diagnosis": required_text(
+                        receipt.get("diagnosis"),
+                        f"local diagnosis for {task_id!r}",
+                        MAX_DIAGNOSIS_CHARS,
+                    ),
+                }
+            )
+        escalation_ref = f"{prefix}/escalation"
+        if escalation_ref in refs:
+            receipt = object_exact(
+                read_local_blob(config, escalation_ref),
+                {"schemaVersion", "kind", "campaign", "issueNumber", "body"},
+                "local forge escalation",
+            )
+            if (
+                receipt.get("schemaVersion") != 1
+                or receipt.get("kind") != "escalation"
+                or receipt.get("campaign") != campaign
+                or receipt.get("issueNumber") != issue_number
+            ):
+                fail("local forge escalation has invalid identity")
+            required_text(receipt.get("body"), "local forge escalation body", 60_000)
+            escalations.append(f"local://{repository}/{escalation_ref}")
+
+    if len(escalations) > 1:
+        fail("multiple machine escalations claim this campaign")
+    seen: set[tuple[str, int]] = set()
+    for diagnosis in diagnoses:
+        identity = (diagnosis["taskId"], diagnosis["attempt"])
+        if identity in seen:
+            fail(
+                f"multiple machine diagnoses claim task {identity[0]!r} attempt {identity[1]}"
+            )
+        seen.add(identity)
+    task_order = {
+        task_id: index
+        for index, task_id in enumerate(sorted(task_ids or {d["taskId"] for d in diagnoses}))
+    }
+    diagnoses.sort(key=lambda item: (task_order.get(item["taskId"], len(task_order)), item["attempt"]))
+    for task_id in {item["taskId"] for item in diagnoses}:
+        attempts = [item["attempt"] for item in diagnoses if item["taskId"] == task_id]
+        if attempts not in ([1], [1, 2]):
+            fail(f"machine diagnosis attempts for {task_id!r} are not contiguous")
+    return diagnoses, escalations[0] if escalations else None
+
+
 def pull_request_marker(campaign: str, issue_number: str, task_id: str) -> str:
     return (
         "<!-- tally:spec-build:v1 "
@@ -1175,11 +1531,37 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     )
     merged_ids = {fact["taskId"] for fact in merged}
     completed_ids = {fact["taskId"] for fact in merged + checkpoints}
+    task_ids = {task["id"] for task in worklist["tasks"]}
+    diagnoses, escalation = forge_campaign_state(
+        repository,
+        config,
+        campaign,
+        issue["number"],
+        task_ids,
+    )
+    order = {task["id"]: index for index, task in enumerate(worklist["tasks"])}
+    diagnoses.sort(key=lambda item: (order[item["taskId"]], item["attempt"]))
     remaining = [task for task in worklist["tasks"] if task["id"] not in completed_ids]
+    direct_blocked = {
+        diagnosis["taskId"]
+        for diagnosis in diagnoses
+        if diagnosis["attempt"] == 2 and diagnosis["taskId"] not in completed_ids
+    }
+    blocked_by: dict[str, set[str]] = {}
+    blocked: list[dict[str, Any]] = []
+    for task in worklist["tasks"]:
+        roots = {task["id"]} if task["id"] in direct_blocked else set()
+        for dependency in task["dependencies"]:
+            roots.update(blocked_by.get(dependency, set()))
+        blocked_by[task["id"]] = roots
+        if task["id"] not in completed_ids and roots:
+            blocked.append({"taskId": task["id"], "blockedBy": sorted(roots, key=order.get)})
+    blocked_ids = {fact["taskId"] for fact in blocked}
     ready = [
         task
         for task in remaining
-        if all(dependency in completed_ids for dependency in task["dependencies"])
+        if task["id"] not in blocked_ids
+        and all(dependency in completed_ids for dependency in task["dependencies"])
     ]
     frontier: list[dict[str, Any]] = []
     for task in ready:
@@ -1206,12 +1588,373 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         "checkpoints": checkpoints,
         "remaining": [task["id"] for task in remaining],
         "frontier": frontier,
+        "diagnoses": diagnoses,
+        "blocked": blocked,
+        "quiescent": bool(remaining) and not frontier,
+        "escalation": escalation,
         "complete": not remaining,
         "warnings": warnings,
     }
     if forge_native:
         result["config"] = worklist["config"]
     return result
+
+
+def action_diff(brief: dict[str, Any]) -> dict[str, Any]:
+    data = object_exact(brief, {"repositoryConfig", "workspace"}, "diff brief")
+    repo_config(data.get("repositoryConfig"))
+    workspace = object_exact(
+        data.get("workspace"),
+        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
+        "workspace",
+    )
+    task_id = required_string(workspace.get("taskId"), "workspace.taskId")
+    if not TASK_ID.fullmatch(task_id):
+        fail("workspace.taskId is not safe")
+    base_rev = required_string(workspace.get("baseRev"), "workspace.baseRev")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", base_rev):
+        fail("workspace.baseRev must be a full Git object ID")
+    branch = required_string(workspace.get("branch"), "workspace.branch")
+    required_string(workspace.get("publishBranch"), "workspace.publishBranch")
+    worktree = Path(required_string(workspace.get("worktreePath"), "workspace.worktreePath"))
+    if not worktree.is_absolute():
+        fail("workspace.worktreePath must be absolute")
+    if not worktree.is_dir():
+        return {
+            "taskId": task_id,
+            "available": False,
+            "baseRev": base_rev,
+            "head": None,
+            "status": "",
+            "patch": "",
+            "truncated": False,
+            "reason": "prepared worktree is no longer available",
+        }
+    git(worktree, "rev-parse", "--git-dir")
+    actual_branch = git(worktree, "branch", "--show-current").stdout.strip()
+    if actual_branch != branch:
+        fail(f"diff worktree is on branch {actual_branch!r}, expected {branch!r}")
+    head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    status = git(worktree, "status", "--short", "--untracked-files=all").stdout
+    chunks = [git(worktree, "diff", "--binary", "--no-ext-diff", base_rev, "--").stdout]
+    untracked = git(
+        worktree, "ls-files", "--others", "--exclude-standard", "-z"
+    ).stdout.split("\0")
+    for relative in (path for path in untracked if path):
+        untracked_diff = git(
+            worktree,
+            "diff",
+            "--no-index",
+            "--binary",
+            "--",
+            "/dev/null",
+            f"./{relative}",
+            check=False,
+        )
+        if untracked_diff.returncode not in {0, 1}:
+            detail = untracked_diff.stderr.strip() or "no output"
+            fail(f"cannot capture untracked diff for {relative!r}: {detail}")
+        chunks.append(untracked_diff.stdout)
+    patch = "".join(chunks)
+    truncated = len(patch) > MAX_DIFF_CHARS
+    if truncated:
+        patch = patch[:MAX_DIFF_CHARS] + "\n[... diff truncated ...]\n"
+    if len(status) > 16_000:
+        status = status[:16_000] + "\n[... status truncated ...]\n"
+    return {
+        "taskId": task_id,
+        "available": True,
+        "baseRev": base_rev,
+        "head": head,
+        "status": status,
+        "patch": patch,
+        "truncated": truncated,
+        "reason": None,
+    }
+
+
+def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
+    data = object_exact(
+        brief,
+        {
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "taskId",
+            "attempt",
+            "diagnosis",
+        },
+        "steer brief",
+    )
+    campaign = required_string(data.get("campaign"), "campaign")
+    if not COMPONENT.fullmatch(campaign):
+        fail("campaign is not a safe component")
+    repository = required_string(data.get("repository"), "repository")
+    if not REPOSITORY.fullmatch(repository):
+        fail("repository must use owner/name form")
+    config = repo_config(data.get("repositoryConfig"))
+    issue = campaign_issue(data.get("issue"))
+    task_id = required_string(data.get("taskId"), "taskId")
+    if not TASK_ID.fullmatch(task_id):
+        fail("taskId is not safe")
+    attempt = data.get("attempt")
+    if attempt not in {1, 2}:
+        fail("attempt must equal 1 or 2")
+    existing, _ = forge_campaign_state(
+        repository, config, campaign, issue["number"]
+    )
+    task_receipts = [receipt for receipt in existing if receipt["taskId"] == task_id]
+    if any(receipt["attempt"] == attempt for receipt in task_receipts):
+        receipt = next(
+            receipt for receipt in task_receipts if receipt["attempt"] == attempt
+        )
+        return {
+            "taskId": task_id,
+            "attempt": attempt,
+            "comment": receipt["comment"],
+            "blocked": attempt == 2,
+            "posted": False,
+            "redacted": False,
+        }
+    expected_attempt = len(task_receipts) + 1
+    if attempt != expected_attempt:
+        fail(
+            f"task {task_id!r} diagnosis attempt {attempt} is not next after "
+            f"{len(task_receipts)} forge receipts"
+        )
+    diagnosis = required_text(
+        data.get("diagnosis"), "diagnosis", MAX_DIAGNOSIS_CHARS
+    )
+    diagnosis, redacted = redact_public_text(diagnosis)
+    diagnosis = bound_public_diagnosis(diagnosis)
+    marker = diagnosis_marker(campaign, issue["number"], task_id, attempt)
+    body = f"{marker}\n\n{diagnosis_heading(task_id, attempt)}\n\n{diagnosis}"
+    if config["forge"] == "github":
+        posted = run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                issue["number"],
+                "--repo",
+                repository,
+                "--body",
+                body,
+            ]
+        )
+        comment = required_string(
+            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
+            "machine diagnosis comment URL",
+        )
+    else:
+        ref = (
+            f"{local_state_prefix(campaign, issue['number'])}/diagnosis/"
+            f"{task_id}/{attempt}"
+        )
+        created, _ = write_local_blob(
+            config,
+            ref,
+            {
+                "schemaVersion": 1,
+                "kind": "diagnosis",
+                "campaign": campaign,
+                "issueNumber": issue["number"],
+                "taskId": task_id,
+                "attempt": attempt,
+                "diagnosis": diagnosis,
+                "redaction": PUBLIC_REDACTION,
+            },
+        )
+        if not created:
+            fail(f"local forge diagnosis {ref!r} appeared concurrently")
+        comment = f"local://{repository}/{ref}"
+    return {
+        "taskId": task_id,
+        "attempt": attempt,
+        "comment": comment,
+        "blocked": attempt == 2,
+        "posted": True,
+        "redacted": redacted,
+    }
+
+
+def compact_summary(value: str, maximum: int = 64) -> str:
+    compact = re.sub(r"\s+", " ", value).strip()
+    return compact if len(compact) <= maximum else compact[: maximum - 3] + "..."
+
+
+def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
+    forge_native = isinstance(brief.get("worklist"), dict)
+    if forge_native:
+        data = object_exact(
+            brief,
+            {"repository", "issue", "worklist"},
+            "escalate brief",
+        )
+    else:
+        data = object_exact(
+            brief,
+            {
+                "campaign",
+                "repository",
+                "repositoryConfig",
+                "issue",
+                "worklist",
+                "maxTasks",
+                "maxParallel",
+            },
+            "escalate brief",
+        )
+    reconciliation = action_reconcile(data)
+    if reconciliation["complete"] or not reconciliation["quiescent"]:
+        fail("campaign escalation requires an incomplete empty frontier")
+    if reconciliation["escalation"] is not None:
+        return {
+            "posted": False,
+            "comment": reconciliation["escalation"],
+            "diagnosisCount": len(reconciliation["diagnoses"]),
+        }
+    campaign = required_string(reconciliation.get("campaign"), "campaign")
+    repository = reconciliation["repository"]
+    issue = campaign_issue(data.get("issue"))
+    config_value = (
+        reconciliation["config"]["repositoryConfig"]
+        if forge_native
+        else data.get("repositoryConfig")
+    )
+    config = repo_config(config_value)
+    direct = [
+        fact["taskId"]
+        for fact in reconciliation["blocked"]
+        if fact["taskId"] in fact["blockedBy"]
+    ]
+    lines = [
+        escalation_marker(campaign, issue["number"]),
+        "",
+        "### Spec-build escalation: frontier quiescent",
+        "",
+        "The worklist is incomplete and no unblocked task is dispatchable.",
+        "Tally stopped only after each directly blocked task failed twice with machine steering.",
+        "",
+        f"Directly blocked tasks: {', '.join(f'`{task_id}`' for task_id in direct)}",
+        f"Blocked worklist tasks (including descendants): {len(reconciliation['blocked'])}",
+        "",
+        "Accumulated machine diagnoses:",
+    ]
+    lines.extend(
+        f"- `{item['taskId']}` attempt {item['attempt']}: "
+        f"{compact_summary(item['diagnosis'])}"
+        for item in reconciliation["diagnoses"]
+    )
+    body = "\n".join(lines)
+    if len(body) > 60_000:
+        fail("machine escalation exceeds the bounded GitHub comment size")
+    if config["forge"] == "github":
+        posted = run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                issue["number"],
+                "--repo",
+                repository,
+                "--body",
+                body,
+            ]
+        )
+        comment = required_string(
+            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
+            "machine escalation comment URL",
+        )
+    else:
+        ref = f"{local_state_prefix(campaign, issue['number'])}/escalation"
+        created, _ = write_local_blob(
+            config,
+            ref,
+            {
+                "schemaVersion": 1,
+                "kind": "escalation",
+                "campaign": campaign,
+                "issueNumber": issue["number"],
+                "body": body,
+            },
+        )
+        if not created:
+            fail(f"local forge escalation {ref!r} appeared concurrently")
+        comment = f"local://{repository}/{ref}"
+    return {
+        "posted": True,
+        "comment": comment,
+        "diagnosisCount": len(reconciliation["diagnoses"]),
+    }
+
+
+def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
+    data = object_exact(
+        brief,
+        {
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "runId",
+            "reconcileCommand",
+        },
+        "continue brief",
+    )
+    campaign = required_string(data.get("campaign"), "campaign")
+    if not COMPONENT.fullmatch(campaign):
+        fail("campaign is not a safe component")
+    repository = required_string(data.get("repository"), "repository")
+    if not REPOSITORY.fullmatch(repository):
+        fail("repository must use owner/name form")
+    config = repo_config(data.get("repositoryConfig"))
+    issue = campaign_issue(data.get("issue"))
+    run_id = required_string(data.get("runId"), "runId", 512)
+    command = required_string(data.get("reconcileCommand"), "reconcileCommand", 300)
+    if not command.startswith("/"):
+        fail("reconcileCommand must be an explicit slash command")
+    if config["forge"] == "github":
+        run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                issue["number"],
+                "--repo",
+                repository,
+                "--body",
+                command,
+            ]
+        )
+        created = True
+    else:
+        run_key = hashlib.sha256(run_id.encode()).hexdigest()[:24]
+        ref = f"{local_state_prefix(campaign, issue['number'])}/continuation/{run_key}"
+        created, receipt = write_local_blob(
+            config,
+            ref,
+            {
+                "schemaVersion": 1,
+                "kind": "continuation",
+                "campaign": campaign,
+                "issueNumber": issue["number"],
+                "runId": run_id,
+                "command": command,
+            },
+        )
+        expected = {
+            "schemaVersion": 1,
+            "kind": "continuation",
+            "campaign": campaign,
+            "issueNumber": issue["number"],
+            "runId": run_id,
+            "command": command,
+        }
+        if receipt != expected:
+            fail(f"local forge continuation {ref!r} disagrees with this pass")
+    return {"command": command, "posted": created}
 
 
 def safe_slug(value: str, maximum: int) -> str:
@@ -2625,23 +3368,6 @@ def github_checkpoint_progress_comment(
                 body,
             ]
         )
-    reconcile_command = required_string(
-        data.get("reconcileCommand"), "reconcileCommand", 300
-    )
-    if not reconcile_command.startswith("/"):
-        fail("reconcileCommand must be an explicit slash command")
-    run(
-        [
-            "gh",
-            "issue",
-            "comment",
-            issue["number"],
-            "--repo",
-            repository,
-            "--body",
-            reconcile_command,
-        ]
-    )
 
 
 def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
@@ -2652,7 +3378,6 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
             "repository",
             "repositoryConfig",
             "issue",
-            "reconcileCommand",
             "task",
             "source",
             "workspace",
@@ -2811,44 +3536,6 @@ def github_progress_comment(
                 body,
             ]
         )
-def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
-    data = object_exact(
-        brief,
-        {
-            "campaign",
-            "repository",
-            "repositoryConfig",
-            "issue",
-            "runId",
-            "reconcileCommand",
-        },
-        "continue brief",
-    )
-    required_string(data.get("campaign"), "campaign")
-    repository = required_string(data.get("repository"), "repository")
-    config = repo_config(data.get("repositoryConfig"))
-    if config["forge"] != "github":
-        fail("continue is only valid for a GitHub-backed campaign")
-    issue = campaign_issue(data.get("issue"))
-    required_string(data.get("runId"), "runId", 512)
-    reconcile_command = required_string(data.get("reconcileCommand"), "reconcileCommand", 300)
-    if not reconcile_command.startswith("/"):
-        fail("reconcileCommand must be an explicit slash command")
-    run(
-        [
-            "gh",
-            "issue",
-            "comment",
-            issue["number"],
-            "--repo",
-            repository,
-            "--body",
-            reconcile_command,
-        ]
-    )
-    return {"command": reconcile_command, "posted": True}
-
-
 def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
     data, config, worktree = publication_identity(brief, "merge")
     integration = object_exact(
@@ -2905,6 +3592,10 @@ def main() -> int:
             "worklist",
             "sweep",
             "reconcile",
+            "diff",
+            "steer",
+            "escalate",
+            "continue",
             "preflight",
             "prep",
             "cleanup",
@@ -2914,7 +3605,6 @@ def main() -> int:
             "publish",
             "rebase",
             "merge",
-            "continue",
         ),
     )
     arguments = parser.parse_args()
@@ -2923,6 +3613,10 @@ def main() -> int:
         "worklist": action_worklist,
         "sweep": action_sweep,
         "reconcile": action_reconcile,
+        "diff": action_diff,
+        "steer": action_steer,
+        "escalate": action_escalate,
+        "continue": action_continue,
         "preflight": action_preflight,
         "prep": action_prep,
         "ownership": action_ownership,
@@ -2932,7 +3626,6 @@ def main() -> int:
         "publish": action_publish,
         "rebase": action_rebase,
         "merge": action_merge,
-        "continue": action_continue,
     }
     emit(actions[arguments.action](brief))
     return 0
