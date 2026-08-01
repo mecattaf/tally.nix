@@ -60,6 +60,12 @@ def argv(value: Any, context: str) -> list[str]:
     return result
 
 
+def positive_integer(value: Any, context: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        fail(f"{context} must be a positive integer")
+    return value
+
+
 def load_brief() -> dict[str, Any]:
     path_text = os.environ.get("TALLY_BRIEF")
     if not path_text:
@@ -379,10 +385,11 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
 
 def path_glob_matches(path: str, pattern: str) -> bool:
     """Match one repository-relative path with the campaign glob contract."""
-    path_parts = path.split("/")
-    pattern_parts = pattern.split("/")
+    path_parts = path.casefold().split("/")
+    folded_pattern = pattern.casefold()
+    pattern_parts = folded_pattern.split("/")
     if len(pattern_parts) == 1:
-        return fnmatch.fnmatchcase(path_parts[-1], pattern)
+        return fnmatch.fnmatchcase(path_parts[-1], folded_pattern)
 
     memo: dict[tuple[int, int], bool] = {}
 
@@ -408,25 +415,78 @@ def path_glob_matches(path: str, pattern: str) -> bool:
     return match(0, 0)
 
 
+def normalize_forbid_paths_gate(value: Any, context: str) -> dict[str, Any]:
+    gate = object_exact(value, {"kind", "id", "forbidPaths", "runtimeMaxSec"}, context)
+    if gate.get("kind") != "forbidPaths":
+        fail(f"{context}.kind must equal forbidPaths")
+    gate_id = required_string(gate.get("id"), f"{context}.id", 80)
+    if not COMPONENT.fullmatch(gate_id):
+        fail(f"{context}.id is not a safe component")
+    patterns = string_list(gate.get("forbidPaths"), f"{context}.forbidPaths", nonempty=True)
+    if len(patterns) > 128:
+        fail(f"{context}.forbidPaths exceeds 128 patterns")
+    if len(patterns) != len(set(patterns)):
+        fail(f"{context}.forbidPaths contains duplicates")
+    for index, pattern in enumerate(patterns):
+        components = pattern.split("/")
+        if len(pattern) > 1024:
+            fail(f"{context}.forbidPaths[{index}] exceeds 1024 characters")
+        if (
+            pattern.startswith("/")
+            or ".." in components
+            or any("**" in component and component != "**" for component in components)
+        ):
+            fail(
+                f"{context}.forbidPaths[{index}] must be a repository-relative glob "
+                "without '..' and may use '**' only as a complete path component"
+            )
+    positive_integer(gate.get("runtimeMaxSec"), f"{context}.runtimeMaxSec")
+    return {"kind": "forbidPaths", "id": gate_id, "forbidPaths": patterns}
+
+
+def changed_paths_in_history(worktree: Path, base_rev: str, head: str) -> list[str]:
+    changed = git(
+        worktree,
+        "log",
+        "-m",
+        "--format=",
+        "--name-only",
+        "--no-renames",
+        "--diff-filter=ACMRTUXB",
+        "-z",
+        f"{base_rev}..{head}",
+        "--",
+    ).stdout
+    return sorted({path for path in changed.split("\0") if path})
+
+
+def evaluate_forbid_paths(
+    worktree: Path, base_rev: str, head: str, gate_id: str, patterns: list[str]
+) -> int:
+    changed_paths = changed_paths_in_history(worktree, base_rev, head)
+    violations: list[tuple[str, list[str]]] = []
+    for path in changed_paths:
+        matched = [pattern for pattern in patterns if path_glob_matches(path, pattern)]
+        if matched:
+            violations.append((path, matched))
+    if violations:
+        preview = "; ".join(
+            f"{json.dumps(path)} (matched {', '.join(json.dumps(pattern) for pattern in matched)})"
+            for path, matched in violations[:20]
+        )
+        if len(violations) > 20:
+            preview += f"; and {len(violations) - 20} more"
+        fail(
+            f"forbidPaths gate {gate_id!r} rejected {len(violations)} changed path(s): {preview}"
+        )
+    return len(changed_paths)
+
+
 def action_constraint(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(brief, {"gate", "workspace"}, "constraint brief")
-    gate = object_exact(data.get("gate"), {"id", "forbidPaths"}, "constraint gate")
-    gate_id = required_string(gate.get("id"), "constraint gate.id", 80)
-    if not COMPONENT.fullmatch(gate_id):
-        fail("constraint gate.id is not a safe component")
-    patterns = string_list(gate.get("forbidPaths"), "constraint gate.forbidPaths", nonempty=True)
-    if len(patterns) > 128:
-        fail("constraint gate.forbidPaths exceeds 128 patterns")
-    if len(patterns) != len(set(patterns)):
-        fail("constraint gate.forbidPaths contains duplicates")
-    for index, pattern in enumerate(patterns):
-        if len(pattern) > 1024:
-            fail(f"constraint gate.forbidPaths[{index}] exceeds 1024 characters")
-        if pattern.startswith("/") or ".." in pattern.split("/"):
-            fail(
-                f"constraint gate.forbidPaths[{index}] must be a repository-relative glob "
-                "without '..'"
-            )
+    gate = normalize_forbid_paths_gate(data.get("gate"), "constraint gate")
+    gate_id = gate["id"]
+    patterns = gate["forbidPaths"]
 
     workspace = object_exact(
         data.get("workspace"), {"taskId", "baseRev", "branch", "worktreePath"}, "workspace"
@@ -446,38 +506,65 @@ def action_constraint(brief: dict[str, Any]) -> dict[str, Any]:
     if git(worktree, "merge-base", "--is-ancestor", base_rev, head, check=False).returncode != 0:
         fail("task head is not descended from its prepared base revision")
 
-    changed = git(
-        worktree,
-        "diff",
-        "--name-only",
-        "--diff-filter=ACMRTUXB",
-        "-z",
-        base_rev,
-        head,
-        "--",
-    ).stdout
-    changed_paths = sorted(path for path in changed.split("\0") if path)
-    violations: list[tuple[str, list[str]]] = []
-    for path in changed_paths:
-        matched = [pattern for pattern in patterns if path_glob_matches(path, pattern)]
-        if matched:
-            violations.append((path, matched))
-    if violations:
-        preview = "; ".join(
-            f"{json.dumps(path)} (matched {', '.join(json.dumps(pattern) for pattern in matched)})"
-            for path, matched in violations[:20]
-        )
-        if len(violations) > 20:
-            preview += f"; and {len(violations) - 20} more"
-        fail(
-            f"forbidPaths gate {gate_id!r} rejected {len(violations)} changed path(s): {preview}"
-        )
+    checked_paths = evaluate_forbid_paths(worktree, base_rev, head, gate_id, patterns)
     return {
         "gateId": gate_id,
-        "gateType": "forbidPaths",
+        "kind": "forbidPaths",
         "patterns": patterns,
-        "checkedPaths": len(changed_paths),
+        "checkedPaths": checked_paths,
+        "baseRev": base_rev,
+        "head": head,
     }
+
+
+def normalize_constraint_results(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        fail("publish constraints must be an array")
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, candidate in enumerate(value):
+        context = f"publish constraints[{index}]"
+        receipt = object_exact(
+            candidate,
+            {"gateId", "kind", "patterns", "checkedPaths", "baseRev", "head"},
+            context,
+        )
+        gate = normalize_forbid_paths_gate(
+            {
+                "kind": receipt.get("kind"),
+                "id": receipt.get("gateId"),
+                "forbidPaths": receipt.get("patterns"),
+                "runtimeMaxSec": 1,
+            },
+            context,
+        )
+        if gate["id"] in seen:
+            fail(f"publish constraints repeats gateId {gate['id']!r}")
+        seen.add(gate["id"])
+        checked_paths = receipt.get("checkedPaths")
+        if (
+            not isinstance(checked_paths, int)
+            or isinstance(checked_paths, bool)
+            or checked_paths < 0
+        ):
+            fail(f"{context}.checkedPaths must be a non-negative integer")
+        base_rev = required_string(receipt.get("baseRev"), f"{context}.baseRev")
+        head = required_string(receipt.get("head"), f"{context}.head")
+        if not re.fullmatch(r"[0-9a-f]{40,64}", base_rev):
+            fail(f"{context}.baseRev must be a full Git object ID")
+        if not re.fullmatch(r"[0-9a-f]{40,64}", head):
+            fail(f"{context}.head must be a full Git object ID")
+        results.append(
+            {
+                "gateId": gate["id"],
+                "kind": gate["kind"],
+                "patterns": gate["forbidPaths"],
+                "checkedPaths": checked_paths,
+                "baseRev": base_rev,
+                "head": head,
+            }
+        )
+    return results
 
 
 def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, Any], dict[str, Any], Path]:
@@ -493,6 +580,8 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
     }
     if action == "merge":
         allowed.add("publication")
+    if action == "publish":
+        allowed.add("constraints")
     data = object_exact(brief, allowed, f"{action} brief")
     config = repo_config(data.get("repositoryConfig"))
     workspace = object_exact(
@@ -567,6 +656,7 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
 
 def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
     data, config, worktree = publication_identity(brief, "publish")
+    constraints = normalize_constraint_results(data.get("constraints"))
     workspace = data["workspace"]
     task_id = required_string(workspace.get("taskId"), "workspace.taskId")
     branch = required_string(workspace.get("branch"), "workspace.branch")
@@ -582,6 +672,24 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         fail("agent produced no commit relative to the prepared base")
     if git(worktree, "merge-base", "--is-ancestor", base_rev, head, check=False).returncode != 0:
         fail("task head is not descended from its prepared base revision")
+    for constraint in constraints:
+        if constraint["baseRev"] != base_rev:
+            fail(
+                f"forbidPaths gate {constraint['gateId']!r} was witnessed against base "
+                f"{constraint['baseRev']}, expected {base_rev}"
+            )
+        checked_paths = evaluate_forbid_paths(
+            worktree,
+            base_rev,
+            head,
+            constraint["gateId"],
+            constraint["patterns"],
+        )
+        if constraint["head"] == head and constraint["checkedPaths"] != checked_paths:
+            fail(
+                f"forbidPaths gate {constraint['gateId']!r} receipt counted "
+                f"{constraint['checkedPaths']} paths at {head}, publication counted {checked_paths}"
+            )
     git(worktree, "push", "--set-upstream", config["remote"], f"HEAD:refs/heads/{branch}")
     if config["forge"] == "github":
         pull_request = github_pull_request(data, config, worktree, head)

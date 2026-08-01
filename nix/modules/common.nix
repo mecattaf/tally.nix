@@ -1811,6 +1811,14 @@ let
   mkCampaignGateType = types.submodule (
     { config, name, ... }: {
       options = {
+        kind = mkOption {
+          type = types.enum [
+            "command"
+            "forbidPaths"
+          ];
+          example = "command";
+          description = "Explicit gate implementation discriminator.";
+        };
         id = mkOption {
           type = types.str;
           example = "tests";
@@ -1826,8 +1834,8 @@ let
           ];
           description = ''
             Base-safe direct argv executed before the first agent dispatch for
-            a command gate. Required with argv and unavailable with
-            forbidPaths. Declare the actual host and toolchain probe; do not
+            a command gate. Required when kind = "command" and unavailable
+            when kind = "forbidPaths". Declare the actual host and toolchain probe; do not
             make the post-change merge criterion pretend that unbuilt output
             exists.
           '';
@@ -1842,8 +1850,8 @@ let
           ];
           description = ''
             Direct argv executed in each task worktree after the agent exits
-            successfully. Requires preflightArgv and is mutually exclusive
-            with forbidPaths.
+            successfully. Required when kind = "command" and unavailable when
+            kind = "forbidPaths".
           '';
         };
         forbidPaths = mkOption {
@@ -1857,15 +1865,20 @@ let
           ];
           description = ''
             Repository-relative path globs forbidden in the committed task
-            diff. A slashless glob matches a basename at any depth; slashful
-            globs are rooted at the repository. Mutually exclusive with argv.
+            branch history. A slashless glob matches a basename at any depth;
+            slashful globs are rooted at the repository. Required when kind =
+            "forbidPaths" and unavailable when kind = "command".
           '';
         };
         runtimeMaxSec = mkOption {
           type = types.ints.positive;
           default = 900;
           example = 300;
-          description = "Process deadline shared by the base preflight and each post-change gate invocation.";
+          description = ''
+            Gate deadline. Command gates share it between the base preflight
+            and each post-change invocation; constraint gates use it for the
+            packaged driver invocation.
+          '';
         };
         _tallyAssertions = internalAssertionsOption;
       };
@@ -1877,9 +1890,19 @@ let
         }
         {
           assertion =
-            (config.argv != null && config.preflightArgv != null && config.forbidPaths == null)
-            || (config.argv == null && config.preflightArgv == null && config.forbidPaths != null);
-          message = "tally campaign gate ${name} must be either a command with preflightArgv and argv or a forbidPaths constraint";
+            (
+              config.kind == "command"
+              && config.argv != null
+              && config.preflightArgv != null
+              && config.forbidPaths == null
+            )
+            || (
+              config.kind == "forbidPaths"
+              && config.argv == null
+              && config.preflightArgv == null
+              && config.forbidPaths != null
+            );
+          message = "tally campaign gate ${name} fields must agree with kind: command requires preflightArgv and argv; forbidPaths requires only forbidPaths";
         }
         {
           assertion =
@@ -1916,9 +1939,12 @@ let
                 && !(lib.hasPrefix "/" pattern)
                 && !(builtins.elem ".." (lib.splitString "/" pattern))
                 && !(lib.hasInfix "\u0000" pattern)
+                && lib.all (component: !(lib.hasInfix "**" component) || component == "**") (
+                  lib.splitString "/" pattern
+                )
               ) config.forbidPaths
             );
-          message = "tally campaign gate ${name} forbidPaths must contain 1-128 unique relative globs without '..' or NUL bytes";
+          message = "tally campaign gate ${name} forbidPaths must contain 1-128 unique relative globs without '..' or NUL bytes and use '**' only as a complete path component";
         }
       ];
     }
@@ -1993,6 +2019,7 @@ let
           default = [ ];
           example = [
             {
+              kind = "command";
               id = "tests";
               preflightArgv = [
                 "sh"
@@ -2465,6 +2492,7 @@ let
           repositories."mecattaf/crm".checkout = "/srv/spec-repositories/crm";
           gates = [
             {
+              kind = "forbidPaths";
               id = "no-db-artifacts";
               forbidPaths = [
                 "*.db"
@@ -2474,6 +2502,7 @@ let
               ];
             }
             {
+              kind = "command";
               id = "tests";
               preflightArgv = [
                 "sh"
@@ -2873,22 +2902,21 @@ let
   renderCampaignGates = map (
     gate:
     {
-      inherit (gate) id;
+      inherit (gate) kind id runtimeMaxSec;
     }
-    // optionalAttrs (gate.argv != null) {
+    // optionalAttrs (gate.kind == "command") {
       inherit (gate)
         preflightArgv
         argv
-        runtimeMaxSec
         ;
     }
-    // optionalAttrs (gate.forbidPaths != null) { inherit (gate) forbidPaths; }
+    // optionalAttrs (gate.kind == "forbidPaths") { inherit (gate) forbidPaths; }
   );
 
   campaignMaxNodes =
     campaign:
     1
-    + builtins.length (builtins.filter (gate: gate.argv != null) campaign.gates)
+    + builtins.length (builtins.filter (gate: gate.kind == "command") campaign.gates)
     + campaign.maxTasks * (4 + builtins.length campaign.gates);
 
   mkCampaignArgs = cfg: name: campaign: repository: issueNumber: issueUrl: runId: {

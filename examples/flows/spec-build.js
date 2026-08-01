@@ -94,8 +94,9 @@ export const meta = {
           oneOf: [
             {
               type: "object",
-              required: ["id", "preflightArgv", "argv", "runtimeMaxSec"],
+              required: ["kind", "id", "preflightArgv", "argv", "runtimeMaxSec"],
               properties: {
+                kind: { const: "command" },
                 id: { type: "string", pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" },
                 preflightArgv: {
                   type: "array",
@@ -113,8 +114,9 @@ export const meta = {
             },
             {
               type: "object",
-              required: ["id", "forbidPaths"],
+              required: ["kind", "id", "forbidPaths", "runtimeMaxSec"],
               properties: {
+                kind: { const: "forbidPaths" },
                 id: { type: "string", pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" },
                 forbidPaths: {
                   type: "array",
@@ -122,7 +124,8 @@ export const meta = {
                   maxItems: 128,
                   uniqueItems: true,
                   items: { type: "string", minLength: 1, maxLength: 1024 }
-                }
+                },
+                runtimeMaxSec: { type: "integer", minimum: 1 }
               },
               additionalProperties: false
             }
@@ -246,6 +249,26 @@ const workspaceSchema = {
   additionalProperties: false
 };
 
+const constraintSchema = {
+  type: "object",
+  required: ["gateId", "kind", "patterns", "checkedPaths", "baseRev", "head"],
+  properties: {
+    gateId: { type: "string", pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" },
+    kind: { const: "forbidPaths" },
+    patterns: {
+      type: "array",
+      minItems: 1,
+      maxItems: 128,
+      uniqueItems: true,
+      items: { type: "string", minLength: 1, maxLength: 1024 }
+    },
+    checkedPaths: { type: "integer", minimum: 0 },
+    baseRev: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
+    head: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
+  },
+  additionalProperties: false
+};
+
 const publicationSchema = {
   type: "object",
   required: ["taskId", "branch", "head", "pullRequest"],
@@ -270,13 +293,22 @@ const mergeSchema = {
   additionalProperties: false
 };
 
-function driverNode(action, brief, key, label, resultSchema, workspace, taskRef) {
+function driverNode(
+  action,
+  brief,
+  key,
+  label,
+  resultSchema,
+  workspace,
+  taskRef,
+  runtimeMaxSec = args.driverRuntimeMaxSec
+) {
   const spec = {
     argv: [args.driver, action],
     adapter: "spec-build-driver",
     pools: ["campaign-control"],
     priority: "low",
-    runtimeMaxSec: args.driverRuntimeMaxSec,
+    runtimeMaxSec,
     evidence: ["exit:0"],
     brief,
     key,
@@ -369,7 +401,7 @@ function workspaceFor(prepared) {
     // depend on files the agent has not built yet, so it remains gate.argv.
     if (merged.length === 0) {
       for (const gate of args.gates) {
-        if (!gate.argv) {
+        if (gate.kind !== "command") {
           continue;
         }
         await sh(gate.preflightArgv, {
@@ -426,9 +458,10 @@ function workspaceFor(prepared) {
     }
     await job(agentSpec);
 
+    const constraintResults = [];
     for (const gate of args.gates) {
       const key = `gate-${task.id}-${gate.id}`;
-      if (gate.argv) {
+      if (gate.kind === "command") {
         await sh(gate.argv, {
           pools: ["campaign-control"],
           priority: "low",
@@ -441,7 +474,7 @@ function workspaceFor(prepared) {
           taskRef
         });
       } else {
-        await driverNode(
+        const constraint = await driverNode(
           "constraint",
           {
             gate,
@@ -449,10 +482,12 @@ function workspaceFor(prepared) {
           },
           key,
           key,
-          null,
+          constraintSchema,
           workspace,
-          taskRef
+          taskRef,
+          gate.runtimeMaxSec
         );
+        constraintResults.push(constraint.result);
       }
     }
 
@@ -466,7 +501,8 @@ function workspaceFor(prepared) {
         runId: args.runId,
         workspaceRoot: args.workspaceRoot,
         task,
-        workspace: prepared.result
+        workspace: prepared.result,
+        constraints: constraintResults
       },
       `publish-${task.id}`,
       `publish-${task.id}`,

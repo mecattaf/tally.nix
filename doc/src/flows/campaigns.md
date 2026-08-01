@@ -55,16 +55,19 @@ services.tally = {
     agentSandboxPolicy = "workspace-write";
     gates = [
       {
+        kind = "forbidPaths";
         id = "no-db-artifacts";
         forbidPaths = [ "*.db" "*.db-wal" "*.db-shm" "*.sqlite*" ];
       }
       {
+        kind = "command";
         id = "tests";
         preflightArgv = [ "nix" "develop" "--command" "cargo" "--version" ];
         argv = [ "nix" "develop" "--command" "cargo" "test" "--workspace" ];
         runtimeMaxSec = 900;
       }
       {
+        kind = "command";
         id = "format";
         preflightArgv = [ "nix" "develop" "--command" "cargo" "fmt" "--version" ];
         argv = [ "nix" "develop" "--command" "cargo" "fmt" "--all" "--check" ];
@@ -85,30 +88,47 @@ another campaign run. Set it to `true` only when the trusted person posting the
 campaign mention is also the account authenticated by `gh`, as in the
 single-account example above. `allowedActors` still applies independently.
 
-Every gate sets an `id` and exactly one implementation: `argv` for a command, or
-`forbidPaths` for the built-in diff constraint. Gate commands are direct argv,
-not shell strings. Use `sh -c` explicitly only when shell syntax is actually
-part of project policy. `agentArgv` normally stays at its default: a fixed
+Every gate sets an `id`, an explicit `kind`, and the fields for that kind:
+`kind = "command"` requires `preflightArgv` and `argv`, while `kind =
+"forbidPaths"` requires `forbidPaths`. Gate commands are direct argv, not shell
+strings. Use `sh -c` explicitly only when shell syntax is actually part of
+project policy. `agentArgv` normally stays at its default: a fixed
 instruction telling the adapter to read the structured brief at `TALLY_BRIEF`.
 It can be overridden for a fixture or a purpose-built adapter executable, but
 the campaign never interpolates task prose into argv. Command gates also run as
-the accept-time preflight described below; diff constraints begin after the
-agent has produced a committed task diff.
+the accept-time preflight described below; history constraints begin after the
+agent has produced committed task work.
 
-`forbidPaths` is evaluated against committed, non-deleted paths changed from the
-task's prepared base revision through its current `HEAD`. Deletions are ignored,
-so a task may remove a forbidden artifact that was already tracked. Matching is
-case-sensitive over repository-relative POSIX paths. A pattern without `/`,
-such as `*.db`, matches a basename at any depth. A pattern with `/` is rooted at
-the repository; `*` and `?` stay within one path component and `**` spans zero
-or more components. Patterns are bounded, unique, relative, and may not contain
-`..`.
+`forbidPaths` is evaluated against the union of committed, non-deleted paths
+changed by every branch commit reachable from the current `HEAD` but not from
+the task's prepared base revision. A later deletion does not erase an earlier
+forbidden artifact from this history-scoped check. Deletions of artifacts that
+were already tracked in the prepared base are ignored, so a task may remove
+legacy debris. If a task commits a forbidden artifact, remediation must rewrite
+or squash the task branch so the offending commit is no longer reachable;
+adding a cleanup commit is intentionally still red.
 
-The constraint uses one Git diff and in-memory glob matching in the packaged
-driver. It is still an ordinary `campaign-control` node with `exit:0` evidence,
-a stable `gate-<task>-<id>` key, and a canonical witness. A match therefore
-fails the node and stops publication exactly like a nonzero argv gate; it is not
-an operator audit after the merge.
+Matching folds case over repository-relative POSIX paths, so `*.db` also rejects
+`build/TRANSIENT.DB`. A pattern without `/` matches a basename at any depth. A
+pattern with `/` is rooted at the repository; `*` and `?` stay within one path
+component and `**` spans zero or more complete components. Because zero is
+included, `build/**` also matches a tracked file literally named `build`.
+`**` must be a complete component: write `src/**/*.db`; `src/**.db` is rejected
+as ambiguous. Patterns are bounded, unique, relative, and may not contain `..`.
+
+The constraint uses one Git history query and in-memory glob matching in the
+packaged driver. It is still an ordinary `campaign-control` node with `exit:0`
+evidence, its declared `runtimeMaxSec`, a stable `gate-<task>-<id>` key, and a
+canonical witness. Its schema-validated result records the prepared base and
+the exact checked head. Publication re-evaluates every constraint against the
+clean head it is about to push, so a passed stable node cannot be reused for a
+later unexamined commit. A match therefore fails the node—or the exact-head
+publication recheck—and stops publication exactly like a nonzero argv gate; it
+is not an operator audit after the merge.
+
+This mechanism constrains task branches advanced by this campaign. It does not
+turn the same rule into a repository-wide GitHub branch protection for unrelated
+pull requests.
 
 The campaign runner follows the same rule. Its complete structured flow
 arguments travel in the producer enqueue's content-addressed brief and are read
@@ -183,8 +203,8 @@ configuration rejects duplicates, and direct `tally flow run` arguments are
 validated before the worklist node is admitted.
 
 `forbidPaths` gates are not preflighted because the unmodified base has no task
-diff to constrain. They begin in their declared position in the post-agent gate
-sequence.
+history to constrain. They begin in their declared position in the post-agent
+gate sequence and use their own `runtimeMaxSec` for the packaged driver node.
 
 ## The per-task brief contract
 
@@ -296,10 +316,12 @@ After a non-passing node:
    `tally queue retry <agent-task-uuid>`; its new attempt reads the comments.
    For a red preflight caused by the host or base checkout, correct that defect
    and retry it with `tally queue retry <preflight-task-uuid>`. For a red
-   post-change deterministic gate, correct and commit the existing worktree,
-   then retry it with `tally queue retry <gate-task-uuid>`. A passing agent node
-   cannot be retried implicitly, and tally does not invent a repair attempt
-   after a red gate.
+   post-change command gate, correct and commit the existing worktree, then
+   retry it with `tally queue retry <gate-task-uuid>`. For a red `forbidPaths`
+   gate, rewrite or squash the branch so every offending commit is unreachable
+   from its head before retrying; a later deletion commit does not erase the
+   artifact from history. A passing agent node cannot be retried implicitly,
+   and tally does not invent a repair attempt after a red gate.
 4. Retry the failed runner job:
 
    ```console

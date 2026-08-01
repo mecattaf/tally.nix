@@ -2384,16 +2384,20 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 },
                 "gates": [
                     {
+                        "kind": "forbidPaths",
                         "id": "no-db-artifacts",
-                        "forbidPaths": ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"]
+                        "forbidPaths": ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"],
+                        "runtimeMaxSec": 1
                     },
                     {
+                        "kind": "command",
                         "id": "fixture-first",
                         "preflightArgv": first_preflight_argv.clone(),
                         "argv": first_gate_argv.clone(),
                         "runtimeMaxSec": 1
                     },
                     {
+                        "kind": "command",
                         "id": "fixture-second",
                         "preflightArgv": second_preflight_argv.clone(),
                         "argv": second_gate_argv.clone(),
@@ -2588,7 +2592,8 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             assert_eq!(constrained.status.code(), Some(1));
             assert_eq!(
                 flow_failure(&constrained)["error"]["code"],
-                "terminal-failure"
+                "result-schema-mismatch",
+                "a failed constraint has no passing structured result; its red node verdict remains authoritative"
             );
             let submitted = runner_events(&constrained, "node-submitted");
             assert_eq!(submitted.len(), 6);
@@ -2632,6 +2637,11 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 projected_constraint["job"]["unit"],
                 format!("tally-job-fixture-task-1-{failed_constraint}.service")
             );
+            assert_eq!(
+                projected_constraint["job"]["runtimeMaxSec"],
+                1,
+                "constraint gates must honor their own declared deadline"
+            );
             assert!(task_capture(&daemon_paths, &failed_constraint, "task-1")
                 .contains("build/transient.db"));
             assert_eq!(
@@ -2660,6 +2670,8 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 .expect("task-1 run directory is missing");
             let task_one_worktree = task_one_run.join("task-1");
             assert!(task_one_worktree.join("build/transient.db").is_file());
+            let clean_task_one_head =
+                fixture_git(&task_one_worktree, &["rev-parse", "HEAD^"]);
             fixture_git(&task_one_worktree, &["rm", "build/transient.db"]);
             fixture_git(
                 &task_one_worktree,
@@ -2682,11 +2694,56 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 Duration::from_secs(20),
                 client.call(
                     "queue.await_job",
-                    Some(json!({"task_uuid": failed_constraint, "attempt": 2})),
+                    Some(json!({"task_uuid": failed_constraint.clone(), "attempt": 2})),
                 ),
             )
             .await
             .expect("retried constraint timed out")
+            .unwrap();
+            assert_eq!(
+                retried["verdict"], "failed",
+                "deleting an artifact later must not erase it from branch-history policy"
+            );
+            assert!(task_capture(&daemon_paths, &failed_constraint, "task-1")
+                .contains("build/transient.db"));
+
+            let task_one_branch =
+                fixture_git(&task_one_worktree, &["branch", "--show-current"]);
+            fixture_git(
+                &task_one_worktree,
+                &["switch", "--detach", clean_task_one_head.as_str()],
+            );
+            fixture_git(
+                &task_one_worktree,
+                &[
+                    "branch",
+                    "--force",
+                    task_one_branch.as_str(),
+                    clean_task_one_head.as_str(),
+                ],
+            );
+            fixture_git(
+                &task_one_worktree,
+                &["switch", task_one_branch.as_str()],
+            );
+
+            let retry = client
+                .call(
+                    "queue.retry",
+                    Some(json!({"task_uuid": failed_constraint.clone()})),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry["attempt"], 3);
+            let retried = tokio::time::timeout(
+                Duration::from_secs(20),
+                client.call(
+                    "queue.await_job",
+                    Some(json!({"task_uuid": failed_constraint, "attempt": 3})),
+                ),
+            )
+            .await
+            .expect("history-clean constraint retry timed out")
             .unwrap();
             assert_eq!(retried["verdict"], "pass");
 
@@ -2748,6 +2805,17 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 "a red post-change gate must stop before publish, merge, and task-2 prep"
             );
 
+            fs::write(
+                task_one_worktree.join("build/LATE.SQLite"),
+                "late forbidden artifact\n",
+            )
+            .unwrap();
+            fixture_git(&task_one_worktree, &["add", "build/LATE.SQLite"]);
+            fixture_git(
+                &task_one_worktree,
+                &["commit", "-m", "fixture: mutate head after constraint"],
+            );
+
             let retry = client
                 .call(
                     "queue.retry",
@@ -2765,6 +2833,101 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             )
             .await
             .expect("retried post-change gate timed out")
+            .unwrap();
+            assert_eq!(retried["verdict"], "pass");
+
+            let stale_publication = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN,
+                &arguments,
+                20,
+            )
+            .spawn()
+            .unwrap();
+            let stale_publication = runner_output(stale_publication).await;
+            assert_eq!(stale_publication.status.code(), Some(1));
+            assert_eq!(
+                flow_failure(&stale_publication)["error"]["code"],
+                "result-schema-mismatch",
+                "failed publication has no successful publication result"
+            );
+            let submitted = runner_events(&stale_publication, "node-submitted");
+            assert_eq!(submitted.len(), 9);
+            assert!(submitted[..7]
+                .iter()
+                .all(|event| event["disposition"] == "reused"));
+            assert!(submitted[7..]
+                .iter()
+                .all(|event| event["disposition"] == "created"));
+
+            let stale_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 9).await;
+            let mut failed_publication = None;
+            for item in &stale_items {
+                let terminal = client
+                    .call(
+                        "queue.await_job",
+                        Some(json!({"task_uuid": item["anchor"]})),
+                    )
+                    .await
+                    .unwrap();
+                if terminal["verdict"] == "failed" {
+                    assert!(
+                        failed_publication.is_none(),
+                        "only publication's exact-head constraint recheck may fail"
+                    );
+                    assert_eq!(
+                        item["orchestration"]["nodeLabel"],
+                        "publish-task-1"
+                    );
+                    failed_publication = terminal["task_uuid"].as_str().map(str::to_owned);
+                }
+            }
+            let failed_publication = failed_publication
+                .expect("publication reused a constraint verdict from a different head");
+            assert!(task_capture(&daemon_paths, &failed_publication, "task-1")
+                .contains("build/LATE.SQLite"));
+            assert_eq!(
+                fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
+                "1",
+                "a stale constraint receipt must stop publication"
+            );
+
+            fixture_git(
+                &task_one_worktree,
+                &["switch", "--detach", clean_task_one_head.as_str()],
+            );
+            fixture_git(
+                &task_one_worktree,
+                &[
+                    "branch",
+                    "--force",
+                    task_one_branch.as_str(),
+                    clean_task_one_head.as_str(),
+                ],
+            );
+            fixture_git(
+                &task_one_worktree,
+                &["switch", task_one_branch.as_str()],
+            );
+            let retry = client
+                .call(
+                    "queue.retry",
+                    Some(json!({"task_uuid": failed_publication.clone()})),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry["attempt"], 2);
+            let retried = tokio::time::timeout(
+                Duration::from_secs(20),
+                client.call(
+                    "queue.await_job",
+                    Some(json!({"task_uuid": failed_publication, "attempt": 2})),
+                ),
+            )
+            .await
+            .expect("history-clean publication retry timed out")
             .unwrap();
             assert_eq!(retried["verdict"], "pass");
 
@@ -2787,10 +2950,10 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             );
             let submitted = runner_events(&replay, "node-submitted");
             assert_eq!(submitted.len(), 17);
-            assert!(submitted[..7]
+            assert!(submitted[..9]
                 .iter()
                 .all(|event| event["disposition"] == "reused"));
-            assert!(submitted[7..]
+            assert!(submitted[9..]
                 .iter()
                 .all(|event| event["disposition"] == "created"));
             assert!(submitted[0].get("taskRef").is_none());
@@ -2811,17 +2974,31 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 fixture_git(&checkout, &["show", "origin/main:build/two.txt"]),
                 "two"
             );
+            let contains_forbidden_path = |tree: &str| {
+                tree.lines().any(|path| {
+                    let basename = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+                    basename.ends_with(".db")
+                        || basename.ends_with(".db-wal")
+                        || basename.ends_with(".db-shm")
+                        || basename.contains(".sqlite")
+                })
+            };
             assert!(
-                !fixture_git(&checkout, &["ls-tree", "-r", "--name-only", "origin/main"])
-                    .lines()
-                    .any(|path| {
-                        let basename = path.rsplit('/').next().unwrap_or(path);
-                        basename.ends_with(".db")
-                            || basename.ends_with(".db-wal")
-                            || basename.ends_with(".db-shm")
-                            || basename.contains(".sqlite")
-                    })
+                !contains_forbidden_path(&fixture_git(
+                    &checkout,
+                    &["ls-tree", "-r", "--name-only", "origin/main"]
+                )),
+                "the merged tree contains a forbidden artifact"
             );
+            for commit in fixture_git(&checkout, &["rev-list", "origin/main"]).lines() {
+                assert!(
+                    !contains_forbidden_path(&fixture_git(
+                        &checkout,
+                        &["ls-tree", "-r", "--name-only", commit]
+                    )),
+                    "main-reachable commit {commit} contains a forbidden artifact"
+                );
+            }
             let first_parent = fixture_git(
                 &checkout,
                 &["rev-list", "--first-parent", "--reverse", "origin/main"],
