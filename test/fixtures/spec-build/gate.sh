@@ -2,15 +2,19 @@
 set -eu
 
 control=$1
-task=${CAMPAIGN_TASK_ID:?CAMPAIGN_TASK_ID is required}
+gate=$2
+task=${CAMPAIGN_TASK_ID:-preflight}
 
-if [ "$task" = task-1 ] && [ ! -e "$control/failed-once" ]; then
-  : >"$control/failed-once"
-  printf '%s\n' 'fixture gate fails once before any publish or later-task prep' >&2
+if [ "$task" = preflight ] && [ "$gate" = first ] && [ ! -e "$control/preflight-failed-once" ]; then
+  : >"$control/preflight-failed-once"
+  printf '%s\n' 'fixture preflight gate fails once before any agent dispatch' >&2
   exit 1
 fi
 
 case "$task" in
+  preflight)
+    test ! -e build/one.txt
+    ;;
   task-1)
     test "$(cat build/one.txt)" = one
     ;;
@@ -24,4 +28,4 @@ case "$task" in
     ;;
 esac
 
-printf '%s\n' "$task" >>"$control/gate-order.log"
+printf '%s:%s\n' "$task" "$gate" >>"$control/gate-order.log"

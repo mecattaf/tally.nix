@@ -1909,7 +1909,11 @@ let
               ];
             }
           ];
-          description = "Ordered direct-argv gates run for every task; the first red gate stops the campaign.";
+          description = ''
+            Ordered direct-argv gates preflight once on the fetched base before
+            the first agent dispatch, then run for every task; the first red
+            gate stops the campaign.
+          '';
         };
         agent = mkOption {
           type = types.str;
@@ -2755,7 +2759,9 @@ let
     inherit (gate) id argv;
   });
 
-  campaignMaxNodes = campaign: 1 + campaign.maxTasks * (4 + builtins.length campaign.gates);
+  campaignMaxNodes =
+    campaign:
+    1 + builtins.length campaign.gates + campaign.maxTasks * (4 + builtins.length campaign.gates);
 
   mkCampaignArgs = cfg: name: campaign: repository: issueNumber: issueUrl: runId: {
     campaign = name;
