@@ -873,6 +873,8 @@ fn log_matches(record: &LogRecord, filter: &LogFilter, since: Option<DateTime<Ut
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CompletedEntry {
     pub task_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<TaskRef>,
     pub gpu_seconds: Option<f64>,
     pub verdict: Verdict,
     pub session_ref: Option<String>,
@@ -884,6 +886,8 @@ pub struct CompletedEntry {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InFlightEntry {
     pub task_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<TaskRef>,
     pub session_ref: Option<String>,
     pub state: String,
     pub last_event_at: Option<String>,
@@ -1000,6 +1004,7 @@ pub fn query_standup(
             }
             let entry = CompletedEntry {
                 task_uuid: job.output.task_uuid,
+                task_ref: job.output.task_ref,
                 gpu_seconds: job.output.gpu_seconds,
                 verdict,
                 session_ref: job.output.session_ref,
@@ -1025,6 +1030,7 @@ pub fn query_standup(
             };
             let entry = CompletedEntry {
                 task_uuid: job.output.task_uuid,
+                task_ref: job.output.task_ref,
                 gpu_seconds: job.output.gpu_seconds,
                 verdict,
                 session_ref: job.output.session_ref,
@@ -1043,6 +1049,7 @@ pub fn query_standup(
         {
             in_flight.push(InFlightEntry {
                 task_uuid: job.output.task_uuid,
+                task_ref: job.output.task_ref,
                 session_ref: job.output.session_ref,
                 state: job.output.state,
                 last_event_at: job.output.last_event_at,
@@ -1501,6 +1508,43 @@ mod tests {
         assert_eq!(digest.completed[0].gh_origin, Some(origin.clone()));
         assert_eq!(digest.in_flight.len(), 1);
         assert_eq!(digest.in_flight[0].gh_origin, Some(origin));
+    }
+
+    #[test]
+    fn standup_projects_task_ref_for_completed_and_in_flight_rows() {
+        let orchestration = Orchestration::new(serde_json::json!({
+            "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+            "taskRef": "crm/t07"
+        }))
+        .unwrap();
+        let mut completed = row("completed", "drive");
+        completed.orchestration = Some(orchestration.clone());
+        let mut running = row("running", "drive");
+        running.orchestration = Some(orchestration);
+
+        let digest = query_standup(
+            &[completed, running],
+            &[],
+            &[witness(
+                Some("completed"),
+                Verdict::Pass,
+                LaborClass::Fresh,
+                1,
+            )],
+            &StandupOptions {
+                since: None,
+                since_realtime_us: None,
+                until: "2026-07-19T13:00:00Z".to_owned(),
+                source: None,
+            },
+        );
+        let expected = TaskRef::new("crm/t07").unwrap();
+        assert_eq!(digest.completed[0].task_ref, Some(expected.clone()));
+        assert_eq!(digest.in_flight[0].task_ref, Some(expected));
+
+        let encoded = serde_json::to_value(digest).unwrap();
+        assert_eq!(encoded["completed"][0]["taskRef"], "crm/t07");
+        assert_eq!(encoded["inFlight"][0]["taskRef"], "crm/t07");
     }
 
     #[test]

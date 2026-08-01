@@ -727,3 +727,79 @@ pub(crate) fn state_name(state: JobState) -> &'static str {
         JobState::Completed => "completed",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::witness::{build_record, ChainHead};
+
+    #[test]
+    fn recovered_smoke_receipt_reads_task_ref_qualified_archived_stderr() {
+        let temp = tempfile::tempdir().unwrap();
+        let task_uuid = Uuid::parse_str("00000000-0000-4000-8000-000000000007").unwrap();
+        let archive = temp
+            .path()
+            .join("capture/archive")
+            .join("00000000-0000-4000-8000-000000000007.t07");
+        std::fs::create_dir_all(&archive).unwrap();
+        let stderr = archive.join("attempt-0000000001-epoch-00000000000000000007.err");
+        std::fs::write(&stderr, b"archived taskRef failure\n").unwrap();
+
+        let orchestration = Orchestration::new(serde_json::json!({
+            "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+            "taskRef": "crm/t07"
+        }))
+        .unwrap();
+        let record = build_record(
+            WitnessBody {
+                task_uuid: Some(task_uuid.to_string()),
+                transition_timestamp: "2026-08-01T08:00:00.000Z".to_owned(),
+                verdict: Verdict::Failed,
+                exit_code: 1,
+                artifact_content_hash: None,
+                store_paths: None,
+                drv: None,
+                gpu_seconds: None,
+                wall_clock: 1.0,
+                attempt: 1,
+                lease_epoch: 7,
+                dedup_key: None,
+                payload_hash: None,
+                brief_hash: None,
+                origin: AdmissionOrigin::direct(EnqueueSource::Orchestrator),
+                orchestration: Some(orchestration),
+                labor_class: LaborClass::Recovered,
+                trace_ref: None,
+                pools: vec!["slot".to_owned()],
+                executor: None,
+                host_id: None,
+                charge: None,
+                model: None,
+                evidence_class: Some(serde_json::json!({"kind": "adapter-smoke"})),
+                manifest_hash: None,
+                completion: None,
+                result_revision: None,
+                authorship: None,
+                authorship_sessions: None,
+            },
+            &ChainHead::default(),
+        )
+        .unwrap();
+
+        let result = job_result_from_witness(&record, &Executor::new(temp.path(), "/bin/true"));
+        assert_eq!(
+            result.task_ref.as_ref().map(TaskRef::as_str),
+            Some("crm/t07")
+        );
+        assert_eq!(
+            result.stderr_excerpt,
+            Some(crate::executor::CaptureExcerpt {
+                text: "archived taskRef failure\n".to_owned(),
+                truncated: false,
+            })
+        );
+        let encoded = result.value();
+        assert_eq!(encoded["taskRef"], "crm/t07");
+        assert_eq!(encoded["stderr_excerpt"], "archived taskRef failure\n");
+    }
+}

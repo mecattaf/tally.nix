@@ -1168,6 +1168,15 @@ mod tests {
     }
 
     #[test]
+    fn flow_and_kernel_use_the_same_task_ref_type() {
+        let flow_task_ref = tally_flow::TaskRef::new("crm/t07").unwrap();
+        let kernel_task_ref: tally_core::provenance::TaskRef = flow_task_ref.clone();
+        assert_eq!(kernel_task_ref.campaign(), "crm");
+        assert_eq!(kernel_task_ref.task_id(), "t07");
+        assert_eq!(flow_task_ref, kernel_task_ref);
+    }
+
+    #[test]
     fn live_payload_is_full_mode_orchestrator_work_with_captured_ancestry() {
         let mut submission = submission();
         submission.orchestration.prompt_revision = Some(

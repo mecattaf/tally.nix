@@ -103,6 +103,11 @@ authorized.
 
 ### Fixed
 
+- Completed campaign task-reference observability in `query trace` records and
+  generations and in every `query standup` bucket; task-ref-qualified archived
+  captures are now regression-tested through retry trace lookup and recovered
+  stderr receipts. Core and flow also share one wire `TaskRef` type, preventing
+  validator drift from becoming a flow-runner protocol failure.
 - Moved generated flow and campaign arguments out of runner argv and into the
   daemon's content-addressed structured-brief transport. Runners now read those
   arguments through `TALLY_BRIEF`, verify them against `TALLY_BRIEF_HASH`, and

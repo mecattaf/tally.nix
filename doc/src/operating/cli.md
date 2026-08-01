@@ -343,7 +343,8 @@ $ tally query standup --since 2026-07-27T00:00:00Z
 
 The RPC `query.render` supports an additional `scope` field, but the current CLI does not expose
 it and always requests the default `all` scope. Likewise, the RPC stand-up method supports a
-`source` filter that the CLI does not expose.
+`source` filter that the CLI does not expose. Every completed, in-flight, gate-failed, or
+cancelled stand-up entry includes `taskRef` when the job belongs to a campaign task.
 
 ### Watch
 

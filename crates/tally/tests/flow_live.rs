@@ -268,7 +268,7 @@ fn install_fake_systemd_run(root: &Path, state_dir: &Path) -> std::path::PathBuf
                 "  esac\n",
                 "done\n",
                 "test -n \"$unit\" -a -n \"$attempt\" -a -n \"$lease_epoch\" || exit 90\n",
-                "uuid=\"${{unit#tally-job-}}\"\n",
+                "uuid=\"${{unit#${{unit%????????-????-????-????-????????????}}}}\"\n",
                 "record='{}/unit-exit/'\"$uuid\"'.json'\n",
                 "mkdir -p '{}/unit-exit'\n",
                 "printf '{{\"schemaVersion\":2,\"unit\":\"%s.service\",\"invocationId\":\"fake-systemd-run\",\"attempt\":%s,\"leaseEpoch\":%s,\"serviceResult\":\"success\",\"exitCode\":\"exited\",\"exitStatus\":\"0\"}}' \"$unit\" \"$attempt\" \"$lease_epoch\" > \"$record\"\n",
@@ -435,6 +435,24 @@ export const meta = {
 
 (async () => sh(["/bin/sh", "-c", "exit 0"], {
   pools: ["alpha"], evidence: ["exit:0"], label: "github-child"
+}))()
+"#
+}
+
+fn task_ref_one_node_source() -> &'static str {
+    r#"
+export const meta = {
+  name: "task-ref-fake-systemd",
+  description: "taskRef-qualified fake systemd execution",
+  pools: ["alpha"],
+  argsSchema: { type: "object", additionalProperties: false },
+  selectors: [],
+  maxNodes: 1
+};
+
+(async () => sh(["/bin/sh", "-c", "exit 0"], {
+  pools: ["alpha"], evidence: ["exit:0"], label: "task-ref-child",
+  taskRef: "crm/t07"
 }))()
 "#
 }
@@ -1450,7 +1468,7 @@ async fn credentialed_pool_replays_the_same_flow_as_reused() {
             let config_path = temp.path().join("config.json");
             fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
             let script = temp.path().join("credential-replay.js");
-            fs::write(&script, one_node_source()).unwrap();
+            fs::write(&script, task_ref_one_node_source()).unwrap();
             let systemd_run = install_fake_systemd_run(temp.path(), &daemon_paths.state_dir);
             let daemon = start_daemon_with_systemd_run(&daemon_paths, config, systemd_run).await;
 
@@ -1504,6 +1522,7 @@ async fn credentialed_pool_replays_the_same_flow_as_reused() {
             assert_eq!(submitted.len(), 1);
             assert_eq!(submitted[0]["disposition"], "reused");
             assert_eq!(submitted[0]["ordinal"], 0);
+            assert_eq!(submitted[0]["taskRef"], "crm/t07");
             assert_eq!(
                 submitted[0]["dedupKey"],
                 format!("flow:{CREDENTIAL_REPLAY_RUN}:0")
@@ -1512,6 +1531,7 @@ async fn credentialed_pool_replays_the_same_flow_as_reused() {
             assert_eq!(terminal.len(), 1);
             assert_eq!(terminal[0]["disposition"], "reused");
             assert_eq!(terminal[0]["verdict"], "pass");
+            assert_eq!(terminal[0]["taskRef"], "crm/t07");
             assert_eq!(terminal[0]["taskUuid"], submitted[0]["taskUuid"]);
 
             let events = read_acknowledged_events(&daemon_paths.events_dir()).unwrap();
@@ -1523,6 +1543,14 @@ async fn credentialed_pool_replays_the_same_flow_as_reused() {
             let client = rpc(&daemon_paths.socket).await;
             let items = flow_items(&client, CREDENTIAL_REPLAY_RUN).await;
             assert_eq!(items.len(), 1);
+            assert_eq!(items[0]["taskRef"], "crm/t07");
+            assert_eq!(
+                items[0]["unit"],
+                format!(
+                    "tally-job-crm-t07-{}.service",
+                    items[0]["taskUuid"].as_str().unwrap()
+                )
+            );
             assert_eq!(
                 items[0]["dedupKey"],
                 format!("flow:{CREDENTIAL_REPLAY_RUN}:0")

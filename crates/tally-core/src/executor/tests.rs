@@ -1412,9 +1412,16 @@ fn wave_5_red_case_two_attempt_provider_captures_are_distinct_and_queryable() {
 
     let temp = tempfile::tempdir().unwrap();
     let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
-    let request = request();
+    let mut request = request();
+    let task_ref = crate::provenance::TaskRef::new("crm/t07").unwrap();
+    request.identity.task_ref = Some(task_ref.clone());
     let paths = executor.prepare_paths(&request.identity).unwrap();
     std::fs::write(&paths.stdout, b"{\"attempt\":1,\"message\":\"first\"}\n").unwrap();
+    std::fs::write(&paths.stderr, b"first failure stderr\n").unwrap();
+    assert_eq!(
+        executor.persist_failure_stderr(&paths).unwrap(),
+        paths.failure_stderr
+    );
     write_capture_generation(
         &paths.capture_generation,
         CaptureGeneration {
@@ -1425,6 +1432,36 @@ fn wave_5_red_case_two_attempt_provider_captures_are_distinct_and_queryable() {
     .unwrap();
 
     let second = executor.prepare_paths(&request.identity).unwrap();
+    let task_uuid = request.identity.task_uuid.unwrap().to_string();
+    let archive = temp
+        .path()
+        .join("capture/archive")
+        .join(format!("{task_uuid}.t07"));
+    let archived_stdout = archive.join("attempt-0000000001-epoch-00000000000000000007.out");
+    let archived_adapter_stderr =
+        archive.join("attempt-0000000001-epoch-00000000000000000007.adapter.err");
+    let archived_failure_stderr = archive.join("attempt-0000000001-epoch-00000000000000000007.err");
+    assert_eq!(
+        std::fs::read(&archived_stdout).unwrap(),
+        b"{\"attempt\":1,\"message\":\"first\"}\n"
+    );
+    assert_eq!(
+        std::fs::read(&archived_adapter_stderr).unwrap(),
+        b"first failure stderr\n"
+    );
+    assert_eq!(
+        std::fs::read(&archived_failure_stderr).unwrap(),
+        b"first failure stderr\n"
+    );
+    let retained = executor
+        .retained_capture_paths(&request.identity, 1, 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.stdout, archived_stdout);
+    assert_eq!(retained.stderr, archived_adapter_stderr);
+    assert_eq!(retained.failure_stderr, Some(archived_failure_stderr));
+    assert!(!retained.current);
+
     std::fs::write(&second.stdout, b"{\"attempt\":2,\"message\":\"second\"}\n").unwrap();
     write_capture_generation(
         &second.capture_generation,
@@ -1435,12 +1472,11 @@ fn wave_5_red_case_two_attempt_provider_captures_are_distinct_and_queryable() {
     )
     .unwrap();
 
-    let task_uuid = request.identity.task_uuid.unwrap().to_string();
     let job_id = request.identity.job_id.to_string();
     let lanes = [
         TraceLane {
             task_uuid: task_uuid.clone(),
-            task_ref: None,
+            task_ref: Some(task_ref.clone()),
             job_id: Some(job_id.clone()),
             attempt: 1,
             lease_epoch: 7,
@@ -1451,7 +1487,7 @@ fn wave_5_red_case_two_attempt_provider_captures_are_distinct_and_queryable() {
         },
         TraceLane {
             task_uuid: task_uuid.clone(),
-            task_ref: None,
+            task_ref: Some(task_ref.clone()),
             job_id: Some(job_id),
             attempt: 2,
             lease_epoch: 8,
@@ -1511,6 +1547,10 @@ fn wave_5_red_case_two_attempt_provider_captures_are_distinct_and_queryable() {
             (2, 8, TraceCapability::Available)
         ]
     );
+    assert!(result
+        .generations
+        .iter()
+        .all(|generation| generation.task_ref.as_ref() == Some(&task_ref)));
     assert_eq!(
         result
             .items
@@ -1522,6 +1562,21 @@ fn wave_5_red_case_two_attempt_provider_captures_are_distinct_and_queryable() {
             (2, "{\"attempt\":2,\"message\":\"second\"}")
         ]
     );
+    assert!(result
+        .items
+        .iter()
+        .all(|record| record.task_ref.as_ref() == Some(&task_ref)));
+    let encoded = serde_json::to_value(result).unwrap();
+    assert!(encoded["generations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|generation| generation["taskRef"] == "crm/t07"));
+    assert!(encoded["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|record| record["taskRef"] == "crm/t07"));
 }
 
 #[test]
