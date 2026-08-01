@@ -108,6 +108,11 @@ authorized.
   arguments through `TALLY_BRIEF`, keeping job queries, transient-unit status,
   and process argv bounded independently of campaign input size; manual flow
   invocations can also use an absolute `--args-path` JSON file.
+- Failed lifecycle records, `tally query log`, terminal waits, flow-node
+  failures, and GitHub producer evidence now carry the final bounded 2 KiB of
+  captured stderr. Raw adapter stderr is retained as `.adapter.err`, while the
+  conventional `.err` capture is materialized only for failed jobs, so routine
+  adapter chatter is no longer a false failure signal.
 - Allowed a campaign to opt into self-posted GitHub mentions with
   `services.tally.campaigns.<name>.allowSelfTriggered`, while preserving the
   loop-breaking `false` default for campaigns that run under a bot identity.

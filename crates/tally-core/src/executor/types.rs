@@ -139,7 +139,13 @@ pub struct ExecutionRequest {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecutionPaths {
     pub stdout: PathBuf,
+    /// The adapter's raw stderr stream. This remains available for declared
+    /// scrapes and traces, but uses an explicit `.adapter.err` suffix so it is
+    /// not mistaken for a terminal failure signal.
     pub stderr: PathBuf,
+    /// Present only after a terminal failure. This is the operator-facing
+    /// `<uuid>.err` capture used by external monitors and failure diagnostics.
+    pub failure_stderr: PathBuf,
     pub exit_record: PathBuf,
     pub capture_generation: PathBuf,
 }
@@ -147,7 +153,10 @@ pub struct ExecutionPaths {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetainedCapturePaths {
     pub stdout: PathBuf,
+    /// Raw adapter stderr retained for scrape/trace reconstruction.
     pub stderr: PathBuf,
+    /// Failure-only stderr capture, when this generation failed.
+    pub failure_stderr: Option<PathBuf>,
     pub current: bool,
 }
 

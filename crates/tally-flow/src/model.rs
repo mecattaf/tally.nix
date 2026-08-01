@@ -188,6 +188,10 @@ pub struct NodeResult {
     pub verdict: Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_excerpt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stderr_truncated: Option<bool>,
     pub witness_seq: u64,
     pub disposition: Disposition,
     #[serde(default, skip_serializing_if = "Option::is_none")]

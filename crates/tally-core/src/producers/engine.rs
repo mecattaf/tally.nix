@@ -669,9 +669,10 @@ impl<'a> ProducerEngine<'a> {
         self.validate_gh_origin(origin)?;
         let assisted_by = evidence.as_ref().and_then(assisted_by_from_evidence);
         let execution_passed = matches!(verdict, Verdict::Pass | Verdict::Reused);
-        let evidence = (config.post_evidence && execution_passed)
-            .then_some(evidence)
-            .flatten();
+        // A terminal failure receipt is at least as operationally important as
+        // a passing receipt. The evidence envelope carries the bounded stderr
+        // tail when one was captured; close policy remains pass-only below.
+        let evidence = config.post_evidence.then_some(evidence).flatten();
         let gate_summary = config
             .post_gate_summary
             .then(|| completion.as_ref().map(|facts| facts.gates.clone()))

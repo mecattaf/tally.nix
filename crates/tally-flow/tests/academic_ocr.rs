@@ -109,6 +109,8 @@ impl FlowClient for StubProtocolClient {
             task_ref: task_ref.clone(),
             verdict: Verdict::Pass,
             exit_code: Some(0),
+            stderr_excerpt: None,
+            stderr_truncated: None,
             witness_seq: u64::try_from(index + 1).expect("test ordinal fits u64"),
             disposition: Disposition::Created,
             result: Some(result),

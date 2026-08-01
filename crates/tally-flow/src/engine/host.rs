@@ -286,6 +286,12 @@ impl HostShared {
         if let Some(task_ref) = &result.task_ref {
             event["taskRef"] = Value::String(task_ref.as_str().to_owned());
         }
+        if let Some(stderr) = &result.stderr_excerpt {
+            event["stderrExcerpt"] = Value::String(stderr.clone());
+        }
+        if let Some(truncated) = result.stderr_truncated {
+            event["stderrTruncated"] = Value::Bool(truncated);
+        }
         if let Some(error) = &result.error {
             event["errorCode"] = Value::String(error.code.clone());
         }

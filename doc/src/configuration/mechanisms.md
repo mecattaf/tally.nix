@@ -177,6 +177,11 @@ switches are [`postReceipt`](core-options.md#servicestallyproducersnamepostrecei
 close. Gate summaries and acceptance-based closure require an enqueue
 `gateManifest`.
 
+When `postEvidence` is enabled, every terminal verdict posts an idempotent
+evidence comment. A failed receipt includes the bounded captured-stderr tail
+and never closes solely because it was posted; pass and acceptance closure
+policies remain separate.
+
 Pass-based closure is allowed only when the evidence comment is also enabled:
 
 ```text

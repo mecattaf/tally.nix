@@ -24,6 +24,27 @@ the shipped implementation; placeholders vary with the job.
 | Declared culmination is absent | `cannot read gate manifest PATH: ...` in `completion.gates.manifestError` | The job did not write the declared file on its execution host. |
 | Remote work appears hung | `tally: remote executor "NAME" transport is unavailable; retaining leases and retrying: ...` | SSH or the fixed worker helper is unavailable after dispatch. |
 
+## A job failed
+
+Start with the lifecycle projection; failed events carry the final bounded
+2 KiB of captured stderr directly:
+
+```console
+$ tally query log --task <task-uuid> --event failed \
+    | jq '.items[] | {exitCode, stderrTail, stderrTruncated}'
+```
+
+`stderrTruncated: true` means earlier bytes were omitted. If the tail is not
+enough, inspect `<stateDir>/capture/<task-uuid>.err`, which is materialized only
+for a failed generation. The byte-authoritative raw adapter stream is
+`<task-uuid>.adapter.err`; it exists on successful jobs too and may contain
+routine runtime chatter, so non-empty `.adapter.err` is not a failure signal.
+
+For a campaign admitted by a GitHub producer with `postEvidence`, the failure
+receipt contains the same bounded tail. A flow runner's structured terminal
+error also embeds its failed child's tail, making the campaign issue the first
+diagnostic surface rather than a pointer to hidden state.
+
 ## A job never admits
 
 Inspect the job and every requested pool:

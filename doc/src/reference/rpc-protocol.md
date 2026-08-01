@@ -268,11 +268,12 @@ positive. Its terminal result is:
  attempt, lease_epoch, witness_seq, completion?, stderr_excerpt?, stderr_truncated?}
 ```
 
-The two stderr fields are present only for a failed job carrying the witnessed
-`evidenceClass.kind = "adapter-smoke"` diagnostic marker. `stderr_excerpt` is
-the lossy UTF-8 rendering of at most the final 8 KiB of its retained stderr;
+The two stderr fields are present for every failed job whose capture is
+available. `stderr_excerpt` is the lossy UTF-8 rendering of at most the final
+2 KiB of its retained stderr, including any omission marker;
 `stderr_truncated` says whether earlier bytes were omitted. The retained
-capture remains the byte-authoritative source.
+`.err` capture remains byte-authoritative. Successful jobs retain raw adapter
+stderr separately as `.adapter.err` and do not materialize `.err`.
 
 For an active job the waiter is memory-resident. For a completed job the daemon reconstructs the
 answer from the verified witness ledger, including after restart. A client connection and its
@@ -341,7 +342,9 @@ no row — `attached`, and full-mode `reused` and `terminal` — are reported by
 
 `query.log` filters by `task`, `flowRun`, `attempt`, `session`, lifecycle `event`, `source`,
 `since`, and `until`. Lifecycle items expose `taskRef` when their durable row/witness did. A lifecycle event carries no orchestration capsule, so `flowRun` is resolved
-to the run's task UUIDs through the durable rows and the witness chain. `query.trace` requires `task` and optionally selects `attempt`. Both return collection
+to the run's task UUIDs through the durable rows and the witness chain. A `failed` lifecycle item
+includes `stderrTail` and `stderrTruncated`, bounded as described for terminal waits above.
+`query.trace` requires `task` and optionally selects `attempt`. Both return collection
 envelopes; trace also includes a `generations` array describing capture capability, completeness,
 retained range, byte count, truncation, and redaction provenance.
 

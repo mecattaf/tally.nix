@@ -139,11 +139,17 @@ makes that one-real-execution check a first-class verb that surfaces the
 captured stderr — the incident's root cause was invisible in the journal and
 lifecycle stream, and only present in the capture files.
 
+Follow-up #249 closes that diagnostic gap: every failed lifecycle event and
+GitHub failure receipt now carries a bounded stderr tail. Raw adapter chatter
+is retained as `.adapter.err`; the failure-only `.err` path is absent on
+healthy jobs.
+
 ## Secondary observations worth keeping
 
-- **Stream captures are the diagnosis.** Journal + lifecycle gave verdict
-  and timing; only `capture/<task>.err` held the actionable error. Operator
-  reflex: on any sub-second adapter failure, read the capture first.
+- **Stream captures were the diagnosis.** At incident time, journal + lifecycle
+  gave verdict and timing while only `capture/<task>.err` held the actionable
+  error. Current operator reflex: read the lifecycle `stderrTail` first, then
+  the retained failure capture when the tail is insufficient.
 - **The producer behaved exactly as designed** — poll, narrow, receipt,
   dispatch with correct placeholder expansion, idempotent event identity.
   Intake needed zero fixes. The at-mention mechanism is keeper

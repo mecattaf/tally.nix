@@ -29,7 +29,7 @@ mod tests {
         EmitOutcome, GhCliIntake, GhObservation, ProducerConfig, ProducerEngine,
         ReachabilityTransition,
     };
-    use crate::recovery::RecoveryPlan;
+    use crate::recovery::{RecoveryPlan, RecoveryRow};
     use crate::taskdb::{
         GhContextSnapshot, GhItemState, GhItemType, GhOrigin, WorkspaceMetadata,
         GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
@@ -1877,6 +1877,8 @@ mod tests {
             session_ref: row.session_ref.clone(),
             unit: Some(format!("tally-job-{}.service", row.uuid)),
             exit_code: terminal.then_some(if event == TallyEvent::Completed { 0 } else { 1 }),
+            stderr_tail: None,
+            stderr_truncated: None,
             gpu_seconds: terminal.then_some(0.0),
             artifact_hash: (event == TallyEvent::Completed)
                 .then(|| format!("sha256:{}", "a".repeat(64))),
@@ -2135,6 +2137,83 @@ mod tests {
             lease_epoch_fences: Vec::new(),
             advisory_return_attestations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn recovery_replays_a_terminal_github_failure_with_its_stderr_tail() {
+        let temp = tempdir().unwrap();
+        let executor = direct_executor(&temp.path().join("state"));
+        let uuid = Uuid::new_v4();
+        let mut row = durable_row(uuid, "gh:github:recovered-failure", 1);
+        row.source = EnqueueSource::Gh;
+        row.gh_origin = Some(gh_test_origin("recovered-failure", GhItemType::Issue));
+        row.orchestration = Some(
+            Orchestration::new(json!({
+                "flowRunId": "00000000-0000-4000-8000-000000000249",
+                "taskRef": "crm/t07"
+            }))
+            .unwrap(),
+        );
+        let identity = ExecutionIdentity {
+            job_id: uuid,
+            task_uuid: Some(uuid),
+            task_ref: row
+                .orchestration
+                .as_ref()
+                .and_then(Orchestration::task_ref),
+        };
+        let paths = executor.paths(&identity);
+        assert!(paths.stderr.ends_with(format!("{uuid}.t07.adapter.err")));
+        assert!(paths.failure_stderr.ends_with(format!("{uuid}.t07.err")));
+        fs::create_dir_all(paths.stderr.parent().unwrap()).unwrap();
+        fs::create_dir_all(paths.capture_generation.parent().unwrap()).unwrap();
+        fs::write(&paths.stderr, b"recovered actionable stderr\n").unwrap();
+        executor.persist_failure_stderr(&paths).unwrap();
+        fs::write(
+            &paths.capture_generation,
+            br#"{"attempt":1,"leaseEpoch":1}"#,
+        )
+        .unwrap();
+
+        let mut ledger = WitnessLedger::open(temp.path().join("witness.jsonl")).unwrap();
+        let record = append_fixture_witness(
+            &mut ledger,
+            &row,
+            "2026-08-01T00:00:00.000Z",
+            Verdict::Failed,
+            1,
+            1,
+            1,
+        );
+        let mut plan = empty_plan();
+        plan.rows.push(RecoveryRow {
+            row,
+            state: RecoveryRowState::Completed,
+            labor_class: LaborClass::Fresh,
+            guardrail_depth: 0,
+        });
+
+        let recovered = startup::recovery_gh_completions(
+            &plan,
+            std::slice::from_ref(&record),
+            &executor,
+        )
+        .unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].result.verdict, Verdict::Failed);
+        assert_eq!(
+            recovered[0]
+                .result
+                .stderr_excerpt
+                .as_ref()
+                .map(|excerpt| excerpt.text.as_str()),
+            Some("recovered actionable stderr\n")
+        );
+
+        plan.rows[0].state = RecoveryRowState::Pending;
+        assert!(startup::recovery_gh_completions(&plan, &[record], &executor)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -3330,6 +3409,7 @@ mod tests {
                 daemon.handler.drain_post_ack_tasks().await;
 
                 assert_eq!(fs::read(&calls).unwrap(), b"xxxx");
+                let requests_path = requests.clone();
                 let requests = fs::read_to_string(&requests)
                     .unwrap()
                     .lines()
@@ -3365,9 +3445,39 @@ mod tests {
                 let mut failed = result;
                 failed.witness_seq = 10;
                 failed.verdict = Verdict::Failed;
+                failed.exit_code = 1;
+                failed.stderr_excerpt = Some(crate::executor::CaptureExcerpt {
+                    text: "child process failed: actionable detail\n".to_owned(),
+                    truncated: false,
+                });
                 daemon.handler.complete_gh_post_ack(row, failed);
                 daemon.handler.drain_post_ack_tasks().await;
-                assert_eq!(fs::read(calls).unwrap(), b"xxxx");
+                assert_eq!(fs::read(calls).unwrap(), b"xxxxxx");
+                let requests = fs::read_to_string(requests_path)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                let failure_comment = requests
+                    .iter()
+                    .rev()
+                    .find(|request| {
+                        request["query"]
+                            .as_str()
+                            .unwrap()
+                            .contains("TallyCompletionComment")
+                    })
+                    .unwrap();
+                let body = failure_comment["variables"]["body"].as_str().unwrap();
+                let (_, remainder) = body.split_once('\n').unwrap();
+                let (encoded, _) = remainder.split_once("\n\n").unwrap();
+                let receipt: Value = serde_json::from_str(encoded).unwrap();
+                assert_eq!(receipt["evidence"]["verdict"], "failed");
+                assert_eq!(
+                    receipt["evidence"]["stderrTail"],
+                    "child process failed: actionable detail\n"
+                );
+                assert_eq!(receipt["evidence"]["stderrTruncated"], false);
             })
             .await;
     }

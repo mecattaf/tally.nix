@@ -53,17 +53,19 @@ state directory, plus the declared workspace. Use it only for trusted programs.
 - its declared workspace, plus the repository paths required when Git AI is
   enabled;
 - the `unit-exit` directory used by the `ExecStopPost` recorder;
-- only the current execution's stdout and stderr capture files;
+- only the current execution's stdout and raw adapter-stderr capture files;
 - the exec-attestation ledger when that wrapper is enabled;
 - the current GitHub context file, when present;
 - the declared gate-manifest path, when present; and
 - the adapter's
   [`extraWritablePaths`](core-options.md#servicestallyadaptersnameextrawritablepaths).
 
-systemd opens the capture files, the `ExecStopPost` recorder atomically replaces
-the exit record, the exec-attestation wrapper appends the ledger, and the job
-may write its declared gate manifest. A cooperative yield hook does not need a
-state-directory write grant: it calls the daemon over `TALLY_SOCKET`.
+systemd opens `<uuid>.out` and `<uuid>.adapter.err`; after a failed terminal
+verdict, the daemon creates the failure-only `<uuid>.err` copy outside the job
+unit. The `ExecStopPost` recorder atomically replaces the exit record, the
+exec-attestation wrapper appends the ledger, and the job may write its declared
+gate manifest. A cooperative yield hook does not need a state-directory write
+grant: it calls the daemon over `TALLY_SOCKET`.
 
 Every extra writable path must be absolute, contain no systemd `%` specifier,
 already exist when the job starts, and be writable by the daemon user. Grant the

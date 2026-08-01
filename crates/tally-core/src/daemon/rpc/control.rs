@@ -646,29 +646,7 @@ fn job_result_from_witness(record: &WitnessRecord, executor: &Executor) -> JobRe
         .task_uuid
         .clone()
         .expect("durable wait reconstruction selected a task witness");
-    let stderr_excerpt = if is_adapter_smoke(record.evidence_class.as_ref())
-        && !matches!(
-            record.verdict,
-            Verdict::Pass | Verdict::Reused | Verdict::Substituted
-        ) {
-        Uuid::parse_str(&stable).ok().and_then(|uuid| {
-            let identity = ExecutionIdentity {
-                job_id: uuid,
-                task_uuid: Some(uuid),
-                task_ref: record
-                    .orchestration
-                    .as_ref()
-                    .and_then(Orchestration::task_ref),
-            };
-            executor
-                .retained_capture_paths(&identity, record.attempt, record.lease_epoch)
-                .ok()
-                .flatten()
-                .and_then(|paths| crate::executor::read_capture_excerpt(&paths.stderr).ok())
-        })
-    } else {
-        None
-    };
+    let stderr_excerpt = retained_failure_stderr_excerpt(record, executor);
     JobResult {
         task_uuid: Some(stable.clone()),
         task_ref: record

@@ -103,6 +103,10 @@ impl DaemonHandler {
                 evidence["completion"] = serde_json::to_value(completion)
                     .expect("semantic completion always serializes");
             }
+            if let Some(stderr) = &result.stderr_excerpt {
+                evidence["stderrTail"] = Value::String(stderr.text.clone());
+                evidence["stderrTruncated"] = Value::Bool(stderr.truncated);
+            }
             let mut retry_delay = Duration::from_secs(1);
             loop {
                 let registry = registry.clone();
@@ -755,6 +759,8 @@ fn execution_event(job: &Job, event: TallyEvent) -> EmitEvent {
         session_ref: job.row.session_ref.clone(),
         unit: Some(job.identity().unit_name()),
         exit_code: None,
+        stderr_tail: None,
+        stderr_truncated: None,
         gpu_seconds: None,
         artifact_hash: None,
         evidence: None,
@@ -1014,6 +1020,8 @@ fn evidence_event(job: &Job, check: &CheckOutcome) -> EmitEvent {
         session_ref: job.row.session_ref.clone(),
         unit: Some(job.identity().unit_name()),
         exit_code: None,
+        stderr_tail: None,
+        stderr_truncated: None,
         gpu_seconds: None,
         artifact_hash: None,
         evidence: Some(check.spec.clone()),
@@ -1029,12 +1037,7 @@ fn evidence_event(job: &Job, check: &CheckOutcome) -> EmitEvent {
 
 pub(super) fn completed_event(job: &Job, result: &JobResult, evidence: String) -> EmitEvent {
     EmitEvent {
-        event: match (result.verdict, result.artifact_content_hash.is_some()) {
-            (Verdict::Preempted, _) => TallyEvent::Preempted,
-            (Verdict::Pass | Verdict::Reused, true) => TallyEvent::Completed,
-            (Verdict::Pass | Verdict::Reused, false) => TallyEvent::WitnessEmitted,
-            _ => TallyEvent::Failed,
-        },
+        event: terminal_lifecycle_event(result.verdict, result.artifact_content_hash.is_some()),
         task_uuid: job.stable_key(),
         task_ref: job.task_ref(),
         class: job.row.priority,
@@ -1044,6 +1047,14 @@ pub(super) fn completed_event(job: &Job, result: &JobResult, evidence: String) -
         session_ref: job.row.session_ref.clone(),
         unit: Some(job.identity().unit_name()),
         exit_code: Some(result.exit_code),
+        stderr_tail: result
+            .stderr_excerpt
+            .as_ref()
+            .map(|excerpt| excerpt.text.clone()),
+        stderr_truncated: result
+            .stderr_excerpt
+            .as_ref()
+            .map(|excerpt| excerpt.truncated),
         gpu_seconds: Some(0.0),
         artifact_hash: result.artifact_content_hash.clone(),
         evidence: Some(evidence),

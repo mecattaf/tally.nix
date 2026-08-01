@@ -115,10 +115,11 @@ not answer quality. A missing declared projection is a diagnostic failure even
 when the process exited zero.
 
 The normal job verdict determines the ordinary CLI exit class. On a failed
-verdict, smoke prints the bounded tail of the retained stderr capture before
-the final error line. An empty capture is stated explicitly. This is the
-important difference from treating a bare adapter exit code as sufficient
-diagnosis.
+verdict, smoke prints the final 2 KiB of the retained stderr capture before the
+final error line. An empty capture is stated explicitly. The same tail is
+available for every failed job through `queue await-job` and `query log`, not
+only smoke jobs. Raw adapter stderr lives in `.adapter.err`; the failure-only
+`.err` file is absent on success.
 
 ## Enqueue
 
@@ -316,6 +317,10 @@ $ tally query trace --task TASK-UUID --attempt 2 --limit 100
 supports `--cursor`. `query trace` also supports page cursors. Proof is not just a witness
 lookup: it reports whether a witness is expected, returns the canonical record when present,
 separates advisory attestations, and includes ledger verification state.
+
+Each `failed` log item includes the bounded `stderrTail` and a
+`stderrTruncated` boolean. Start there before constructing a capture path by
+hand.
 
 `query log --flow-run` restricts the lifecycle stream to one run's nodes. A lifecycle event
 carries no orchestration capsule, so the run's task UUIDs are resolved from the durable rows and

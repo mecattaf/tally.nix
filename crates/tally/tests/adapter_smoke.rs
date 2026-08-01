@@ -25,6 +25,7 @@ mod shell_program;
 
 const PRE_OUTPUT_FAILURE: &str =
     "Not inside a trusted directory and --skip-git-repo-check was not specified.";
+const HEALTHY_ADAPTER_NOISE: &str = "Reading additional input from stdin...";
 
 struct AbsentUnitProbe;
 
@@ -62,7 +63,11 @@ fn smoke_config(root: &Path) -> Config {
     let structured = root.join("structured-adapter");
     shell_program::install(
         &structured,
-        "#!/bin/sh\nprintf '%s\\n' 'TALLY_SESSION=smoke-session' 'TALLY_FINAL_MESSAGE=ok'\n",
+        concat!(
+            "#!/bin/sh\n",
+            "printf '%s\\n' 'TALLY_SESSION=smoke-session' 'TALLY_FINAL_MESSAGE=ok'\n",
+            "printf '%s\\n' 'Reading additional input from stdin...' >&2\n",
+        ),
     );
     let failing = root.join("pre-output-failure-adapter");
     shell_program::install(
@@ -223,6 +228,20 @@ async fn smoke_runs_real_jobs_parses_declared_captures_and_surfaces_pre_output_s
             assert_eq!(structured["captureStatus"], "verified");
             assert_eq!(structured["captures"]["sessionRef"], "smoke-session");
             assert_eq!(structured["captures"]["finalMessage"], "ok");
+            let structured_task_uuid = structured["taskUuid"].as_str().unwrap();
+            let structured_raw_stderr = paths
+                .state_dir
+                .join("capture")
+                .join(format!("{structured_task_uuid}.adapter.err"));
+            let structured_failure_stderr = paths
+                .state_dir
+                .join("capture")
+                .join(format!("{structured_task_uuid}.err"));
+            assert_eq!(
+                std::fs::read_to_string(structured_raw_stderr).unwrap(),
+                format!("{HEALTHY_ADAPTER_NOISE}\n")
+            );
+            assert!(!structured_failure_stderr.exists());
 
             let failure = run_tally(
                 &config_path,
@@ -253,6 +272,43 @@ async fn smoke_runs_real_jobs_parses_declared_captures_and_surfaces_pre_output_s
             );
 
             let task_uuid = failure_json["taskUuid"].as_str().unwrap();
+            let raw_stderr = paths
+                .state_dir
+                .join("capture")
+                .join(format!("{task_uuid}.adapter.err"));
+            let persisted_stderr = paths
+                .state_dir
+                .join("capture")
+                .join(format!("{task_uuid}.err"));
+            for capture in [raw_stderr, persisted_stderr] {
+                assert_eq!(
+                    std::fs::read_to_string(capture).unwrap(),
+                    format!("{PRE_OUTPUT_FAILURE}\n")
+                );
+            }
+
+            let log = run_tally(
+                &config_path,
+                &paths.socket,
+                &["query", "log", "--task", task_uuid],
+            )
+            .await;
+            assert_eq!(
+                log.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&log.stderr)
+            );
+            let log = parse_stdout(&log);
+            let failed = log["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["event"] == "failed")
+                .unwrap();
+            assert_eq!(failed["stderrTail"], format!("{PRE_OUTPUT_FAILURE}\n"));
+            assert_eq!(failed["stderrTruncated"], false);
+
             let reconstructed = run_tally(
                 &config_path,
                 &paths.socket,

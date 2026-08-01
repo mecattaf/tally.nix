@@ -298,17 +298,12 @@ impl Daemon {
             &finished.outcome,
             Some(Ok(outcome)) if outcome.captures_available
         );
-        let smoke_stderr_excerpt = is_adapter_smoke(job.row.evidence_class.as_ref())
-            .then(|| {
-                finished
-                    .outcome
-                    .as_ref()
-                    .and_then(|outcome| outcome.as_ref().ok())
-                    .and_then(|outcome| {
-                        crate::executor::read_capture_excerpt(&outcome.paths.stderr).ok()
-                    })
-            })
-            .flatten();
+        let capture_paths = finished
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.as_ref().ok())
+            .map(|outcome| outcome.paths.clone())
+            .unwrap_or_else(|| self.handler.executor.paths(&job.identity()));
         let effective_gate_manifest = effective_gate_manifest(&self.handler.executor, &job)?;
         let (result_revision, authorship, authorship_sessions) = match &finished.outcome {
             Some(Ok(outcome)) => (
@@ -430,11 +425,55 @@ impl Daemon {
                 }
             };
         let computed_verdict = canonical_verdict(evidence_verdict, semantic_completion.as_ref());
-        let stderr_excerpt = if !matches!(
-            computed_verdict,
-            Verdict::Pass | Verdict::Reused | Verdict::Substituted
-        ) {
-            smoke_stderr_excerpt
+        let stderr_excerpt = if terminal_lifecycle_event(computed_verdict, artifact_hash.is_some())
+            == TallyEvent::Failed
+        {
+            let executor = self.handler.executor.clone();
+            let stable = job.stable_key();
+            let identity = job.identity();
+            let attempt = finished.attempt;
+            let lease_epoch = finished.lease_epoch;
+            tokio::task::spawn_blocking(move || {
+                match executor.capture_generation_matches(&identity, attempt, lease_epoch) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        eprintln!(
+                            "tally: failure stderr for {stable} has no matching capture generation"
+                        );
+                        return None;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "tally: could not validate failure stderr generation for {stable}: {error}"
+                        );
+                        return None;
+                    }
+                }
+                let failure_path = match executor.persist_failure_stderr(&capture_paths) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        eprintln!("tally: could not persist failure stderr for {stable}: {error}");
+                        capture_paths.stderr
+                    }
+                };
+                match crate::executor::read_capture_excerpt(&failure_path) {
+                    Ok(excerpt) => Some(excerpt),
+                    Err(error) => {
+                        eprintln!(
+                            "tally: could not read failure stderr tail for {stable}: {error}"
+                        );
+                        None
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!(
+                    "tally: failure stderr worker failed for {}: {error}",
+                    job.stable_key()
+                );
+                None
+            })
         } else {
             None
         };

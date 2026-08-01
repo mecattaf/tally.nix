@@ -1,6 +1,7 @@
 use super::*;
 
-pub const CAPTURE_EXCERPT_MAX_BYTES: usize = 8 * 1024;
+pub const CAPTURE_EXCERPT_MAX_BYTES: usize = 2 * 1024;
+const CAPTURE_EXCERPT_TRUNCATION_MARKER: &str = "[... earlier captured stderr omitted ...]\n";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureExcerpt {
@@ -44,14 +45,39 @@ impl Executor {
     ) -> Result<Option<RetainedCapturePaths>, ExecutorError> {
         if self.capture_generation_matches(identity, attempt, lease_epoch)? {
             let paths = self.paths(identity);
+            let stderr = if paths.stderr.exists() {
+                paths.stderr
+            } else {
+                // Captures written before the adapter/failure split used
+                // `<uuid>.err` for the raw stream. Keep them queryable.
+                paths.failure_stderr.clone()
+            };
             return Ok(Some(RetainedCapturePaths {
                 stdout: paths.stdout,
-                stderr: paths.stderr,
+                stderr,
+                failure_stderr: paths
+                    .failure_stderr
+                    .exists()
+                    .then_some(paths.failure_stderr),
                 current: true,
             }));
         }
-        let paths = self.archived_capture_paths(identity, attempt, lease_epoch);
-        if paths.stdout.exists() || paths.stderr.exists() {
+        let mut paths = self.archived_capture_paths(identity, attempt, lease_epoch);
+        paths.failure_stderr = paths.failure_stderr.filter(|path| path.exists());
+        if paths.stdout.exists()
+            || paths.stderr.exists()
+            || paths
+                .failure_stderr
+                .as_ref()
+                .is_some_and(|path| path.exists())
+        {
+            if !paths.stderr.exists() {
+                // The earliest archives also used `.err` for the raw stream.
+                paths.stderr = paths
+                    .failure_stderr
+                    .clone()
+                    .expect("an existing legacy stderr path was checked");
+            }
             Ok(Some(paths))
         } else {
             Ok(None)
@@ -71,7 +97,8 @@ impl Executor {
         let stem = format!("attempt-{attempt:010}-epoch-{lease_epoch:020}");
         RetainedCapturePaths {
             stdout: directory.join(format!("{stem}.out")),
-            stderr: directory.join(format!("{stem}.err")),
+            stderr: directory.join(format!("{stem}.adapter.err")),
+            failure_stderr: Some(directory.join(format!("{stem}.err"))),
             current: false,
         }
     }
@@ -81,11 +108,13 @@ impl Executor {
         identity: &ExecutionIdentity,
     ) -> Result<(), ExecutorError> {
         let current = self.paths(identity);
-        for path in [
-            &current.stdout,
-            &current.stderr,
-            &current.capture_generation,
-        ] {
+        let raw_stderr = if current.stderr.exists() {
+            &current.stderr
+        } else {
+            // Compatibility with generations created before `.adapter.err`.
+            &current.failure_stderr
+        };
+        for path in [&current.stdout, raw_stderr, &current.capture_generation] {
             let metadata = match std::fs::symlink_metadata(path) {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -109,7 +138,7 @@ impl Executor {
         create_private_directory(archive_directory)?;
         for (source, destination) in [
             (&current.stdout, &archived.stdout),
-            (&current.stderr, &archived.stderr),
+            (raw_stderr, &archived.stderr),
         ] {
             match std::fs::symlink_metadata(destination) {
                 Ok(metadata) => {
@@ -129,6 +158,29 @@ impl Executor {
                 Err(source_error) => return Err(io_error(destination, source_error)),
             }
         }
+        if current.failure_stderr.exists() && current.failure_stderr != *raw_stderr {
+            let destination = archived
+                .failure_stderr
+                .as_ref()
+                .expect("archive paths always include a failure destination");
+            match std::fs::symlink_metadata(destination) {
+                Ok(metadata) => {
+                    if !metadata.file_type().is_file()
+                        || metadata.nlink() != 1
+                        || metadata.permissions().mode() & 0o077 != 0
+                    {
+                        return Err(ExecutorError::InvalidRequest(format!(
+                            "attempt failure capture archive {} is not a private regular file",
+                            destination.display()
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    copy_private_file_exclusive(&current.failure_stderr, destination)?;
+                }
+                Err(source_error) => return Err(io_error(destination, source_error)),
+            }
+        }
         sync_directory(archive_directory)?;
         std::fs::remove_file(&current.capture_generation)
             .map_err(|source| io_error(&current.capture_generation, source))?;
@@ -138,7 +190,7 @@ impl Executor {
                 .parent()
                 .expect("capture generation always has a parent"),
         )?;
-        for source in [&current.stdout, &current.stderr] {
+        for source in [&current.stdout, &current.stderr, &current.failure_stderr] {
             match std::fs::remove_file(source) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -152,6 +204,40 @@ impl Executor {
                 .expect("capture stream always has a parent"),
         )?;
         Ok(())
+    }
+
+    /// Materialize the operator-facing `.err` capture for a failed terminal
+    /// generation. Raw adapter stderr stays under `.adapter.err` so configured
+    /// scrapes and traces retain their byte-authoritative source.
+    pub fn persist_failure_stderr(&self, paths: &ExecutionPaths) -> Result<PathBuf, ExecutorError> {
+        if paths.failure_stderr.exists() {
+            ensure_private_file(&paths.failure_stderr)?;
+            return Ok(paths.failure_stderr.clone());
+        }
+        copy_private_file_exclusive(&paths.stderr, &paths.failure_stderr)?;
+        Ok(paths.failure_stderr.clone())
+    }
+
+    /// Move a capture written by a pre-split in-flight unit to the raw adapter
+    /// path before scraping or classifying its terminal result. `rename` keeps
+    /// the transition crash-atomic: a healthy adopted job must not retain the
+    /// legacy `.err` name and look failed after an upgrade.
+    pub(super) fn normalize_legacy_stderr_capture(
+        &self,
+        paths: &ExecutionPaths,
+    ) -> Result<(), ExecutorError> {
+        if paths.stderr.exists() || !paths.failure_stderr.exists() {
+            return Ok(());
+        }
+        ensure_private_file(&paths.failure_stderr)?;
+        std::fs::rename(&paths.failure_stderr, &paths.stderr)
+            .map_err(|source| io_error(&paths.stderr, source))?;
+        sync_directory(
+            paths
+                .stderr
+                .parent()
+                .expect("capture stream always has a parent"),
+        )
     }
 }
 
@@ -182,11 +268,28 @@ pub fn read_capture_excerpt(path: &Path) -> Result<CaptureExcerpt, ExecutorError
     file.take(max)
         .read_to_end(&mut bytes)
         .map_err(|source| io_error(path, source))?;
-    let truncated = start > 0;
-    let mut text = String::from_utf8_lossy(&bytes).into_owned();
-    if truncated {
-        text.insert_str(0, "[... earlier captured stderr omitted ...]\n");
+    let mut truncated = start > 0;
+    let mut text = String::from_utf8_lossy(&bytes).replace('\0', "�");
+    let plain_limit = if truncated {
+        CAPTURE_EXCERPT_MAX_BYTES - CAPTURE_EXCERPT_TRUNCATION_MARKER.len()
+    } else {
+        CAPTURE_EXCERPT_MAX_BYTES
+    };
+    if text.len() > plain_limit {
+        truncated = true;
     }
+    if truncated {
+        let tail_limit = CAPTURE_EXCERPT_MAX_BYTES - CAPTURE_EXCERPT_TRUNCATION_MARKER.len();
+        if text.len() > tail_limit {
+            let mut start = text.len() - tail_limit;
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
+            text.drain(..start);
+        }
+        text.insert_str(0, CAPTURE_EXCERPT_TRUNCATION_MARKER);
+    }
+    debug_assert!(text.len() <= CAPTURE_EXCERPT_MAX_BYTES);
     Ok(CaptureExcerpt { text, truncated })
 }
 
