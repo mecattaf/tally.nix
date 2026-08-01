@@ -642,12 +642,14 @@ class GitHubForgeTests(unittest.TestCase):
                 "tasks": [
                     {
                         "id": "task-1",
+                        "kind": "implementation",
                         "issue": 8,
                         "dependencies": [],
                         "conflictDomains": ["src/one"],
                     },
                     {
                         "id": "task-2",
+                        "kind": "implementation",
                         "issue": 9,
                         "dependencies": ["task-1"],
                         "conflictDomains": ["src/two"],
@@ -709,10 +711,27 @@ class GitHubForgeTests(unittest.TestCase):
                 ],
                 "calls": [],
             }
+            _, references, normalized_manifest = DRIVER.forge_manifest(manifest)
+            graph_digest = DRIVER.canonical_sha256(
+                {
+                    "manifest": normalized_manifest,
+                    "tasks": [
+                        {
+                            "number": reference["issue"],
+                            "title": state["subIssues"][index]["title"],
+                            "body": state["subIssues"][index]["body"],
+                        }
+                        for index, reference in enumerate(references)
+                    ],
+                }
+            )
             reconcile_brief = {
                 "repository": "acme/spec",
                 "issue": issue(),
-                "worklist": {"kind": "github-issue"},
+                "worklist": {
+                    "kind": "github-issue",
+                    "graphDigest": graph_digest,
+                },
             }
             with FakeGitHub(root, state) as github:
                 result = DRIVER.action_reconcile(reconcile_brief)
