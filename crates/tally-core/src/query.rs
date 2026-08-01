@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::completion::{GateSummaryStatus, SemanticCompletion};
 use crate::journal::{JournalEntry, TallyEvent};
-use crate::provenance::Orchestration;
+use crate::provenance::{Orchestration, TaskRef};
 use crate::taskdb::{GhOrigin, RelatedTrigger, TaskRow, WorkspaceMetadata};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
@@ -328,6 +328,8 @@ pub fn query_pools(pool_facts: &[PoolHeadroomFact]) -> Result<PoolsView, QueryEr
 pub struct JobProjection {
     pub anchor: String,
     pub task_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<TaskRef>,
     pub description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub argv: Option<Vec<String>>,
@@ -403,6 +405,7 @@ fn project_job_details(
                 output: JobProjection {
                     anchor: row.task_uuid.clone(),
                     task_uuid: Some(row.task_uuid.clone()),
+                    task_ref: row.orchestration.as_ref().and_then(Orchestration::task_ref),
                     description: Some(row.description.clone()),
                     argv: Some(row.argv.clone()),
                     brief_hash: row.brief_hash.clone(),
@@ -441,6 +444,7 @@ fn project_job_details(
             output: JobProjection {
                 anchor: anchor.clone(),
                 task_uuid: Some(anchor),
+                task_ref: entry.fields.task_ref.clone(),
                 description: None,
                 argv: None,
                 brief_hash: None,
@@ -482,6 +486,7 @@ fn project_job_details(
         }
         if job.last_realtime_us <= entry.realtime_us {
             job.output.state = entry.fields.event.to_string();
+            job.output.task_ref = entry.fields.task_ref.clone().or(job.output.task_ref.take());
             job.output.pools = entry.fields.pools.clone().or(job.output.pools.take());
             job.output.executor = entry.fields.executor.clone().or(job.output.executor.take());
             if job.output.source.is_none() {
@@ -505,6 +510,10 @@ fn project_job_details(
             output: JobProjection {
                 anchor: anchor.clone(),
                 task_uuid: record.task_uuid.clone(),
+                task_ref: record
+                    .orchestration
+                    .as_ref()
+                    .and_then(Orchestration::task_ref),
                 description: None,
                 argv: None,
                 brief_hash: record.brief_hash.clone(),
@@ -552,6 +561,11 @@ fn project_job_details(
             .orchestration
             .clone()
             .or(job.output.orchestration.take());
+        job.output.task_ref = record
+            .orchestration
+            .as_ref()
+            .and_then(Orchestration::task_ref)
+            .or(job.output.task_ref.take());
         job.output.session_ref = record.trace_ref.clone().or(job.output.session_ref.take());
         job.output.model = record.model.clone().or(job.output.model.take());
         job.output.state = "terminal".to_owned();
@@ -1144,6 +1158,7 @@ mod tests {
             EmitEvent {
                 event,
                 task_uuid: task.to_owned(),
+                task_ref: None,
                 class: Priority::High,
                 source: EnqueueSource::Manual,
                 message: None,

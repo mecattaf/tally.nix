@@ -103,8 +103,10 @@ impl FlowClient for StubProtocolClient {
             action => panic!("unexpected stub action {action:?}"),
         };
         let task_uuid = format!("ocr-stub-{index}");
+        let task_ref = submission.orchestration.task_ref.clone();
         let terminal = NodeResult {
             task_uuid: task_uuid.clone(),
+            task_ref: task_ref.clone(),
             verdict: Verdict::Pass,
             exit_code: Some(0),
             witness_seq: u64::try_from(index + 1).expect("test ordinal fits u64"),
@@ -119,6 +121,7 @@ impl FlowClient for StubProtocolClient {
             schema_version: 1,
             disposition: Disposition::Created,
             task_uuid,
+            task_ref,
             payload_hash,
             attempt: 1,
             terminal: Some(terminal),

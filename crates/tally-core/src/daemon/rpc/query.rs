@@ -372,7 +372,7 @@ impl DaemonHandler {
                         live_state: state_name(job.state).to_owned(),
                         attempt: job.row.attempt,
                         lease_epoch: job.row.lease_epoch,
-                        unit: format!("tally-job-{}.service", job.stable_key()),
+                        unit: job.identity().unit_name(),
                         labor_class: job.labor_class,
                     })
                     .collect::<Vec<_>>(),
@@ -700,6 +700,10 @@ fn trace_lanes(
             (detail.task_uuid.clone(), detail.attempt, detail.lease_epoch),
             TraceLane {
                 task_uuid: detail.task_uuid.clone(),
+                task_ref: detail
+                    .orchestration
+                    .as_ref()
+                    .and_then(Orchestration::task_ref),
                 job_id: None,
                 attempt: detail.attempt,
                 lease_epoch: detail.lease_epoch,
@@ -718,6 +722,7 @@ fn trace_lanes(
         let key = (record.fields.task_uuid.clone(), attempt, lease_epoch);
         let lane = lanes.entry(key).or_insert_with(|| TraceLane {
             task_uuid: record.fields.task_uuid.clone(),
+            task_ref: record.fields.task_ref.clone(),
             job_id: record.fields.job_id.clone(),
             attempt,
             lease_epoch,
@@ -732,6 +737,9 @@ fn trace_lanes(
         });
         if record.fields.job_id.is_some() {
             lane.job_id.clone_from(&record.fields.job_id);
+        }
+        if record.fields.task_ref.is_some() {
+            lane.task_ref.clone_from(&record.fields.task_ref);
         }
         if record.fields.agent.is_some() {
             lane.adapter = record.fields.agent.clone().unwrap();

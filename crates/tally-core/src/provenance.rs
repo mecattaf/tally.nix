@@ -3,6 +3,88 @@ use serde_json::Value;
 use taskchampion::Uuid;
 
 pub const DEFAULT_FLOW_MAX_NODES: u64 = 1_000;
+pub const MAX_TASK_REF_COMPONENT_BYTES: usize = 80;
+
+/// A stable operator-facing task name scoped by its campaign, for example
+/// `crm/t07`. The durable UUID remains the execution identity; this reference
+/// is additive orchestration provenance used to make operational surfaces
+/// human-readable.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaskRef(String);
+
+impl TaskRef {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        let (campaign, task_id) = value
+            .split_once('/')
+            .ok_or_else(|| "taskRef must be formatted as <campaign>/<task-id>".to_owned())?;
+        if task_id.contains('/') {
+            return Err("taskRef must contain exactly one slash".to_owned());
+        }
+        validate_task_ref_component(campaign, "campaign")?;
+        validate_task_ref_component(task_id, "task id")?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn campaign(&self) -> &str {
+        self.0
+            .split_once('/')
+            .expect("validated taskRef always contains a slash")
+            .0
+    }
+
+    pub fn task_id(&self) -> &str {
+        self.0
+            .split_once('/')
+            .expect("validated taskRef always contains a slash")
+            .1
+    }
+}
+
+fn validate_task_ref_component(value: &str, label: &str) -> Result<(), String> {
+    if !value
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        || value.len() > MAX_TASK_REF_COMPONENT_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+    {
+        return Err(format!(
+            "taskRef {label} must start with an ASCII letter, digit, or '_' and contain at most {MAX_TASK_REF_COMPONENT_BYTES} ASCII letters, digits, '_', '.', or '-'"
+        ));
+    }
+    Ok(())
+}
+
+impl std::fmt::Display for TaskRef {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for TaskRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
 
 /// An orchestration capsule is intentionally opaque apart from the admission
 /// fields the kernel owns. Keeping the original `Value` preserves
@@ -70,6 +152,12 @@ impl Orchestration {
                     .to_owned(),
             );
         }
+        if let Some(task_ref) = object.get("taskRef") {
+            let task_ref = task_ref
+                .as_str()
+                .ok_or_else(|| "orchestration taskRef must be a string when set".to_owned())?;
+            TaskRef::new(task_ref.to_owned()).map_err(|error| format!("orchestration {error}"))?;
+        }
         Ok(())
     }
 
@@ -86,6 +174,13 @@ impl Orchestration {
 
     pub fn node_ordinal(&self) -> Option<u64> {
         self.0.get("nodeOrdinal").and_then(Value::as_u64)
+    }
+
+    pub fn task_ref(&self) -> Option<TaskRef> {
+        self.0.get("taskRef").and_then(Value::as_str).map(|value| {
+            TaskRef::new(value.to_owned())
+                .expect("validated orchestration always carries a valid taskRef")
+        })
     }
 
     pub fn effective_max_nodes(&self) -> u64 {
@@ -175,5 +270,33 @@ mod tests {
         );
         let capsule: Orchestration = serde_json::from_str(raw).unwrap();
         assert_eq!(serde_json::to_string(&capsule).unwrap(), raw);
+    }
+
+    #[test]
+    fn task_ref_is_a_validated_scalar_and_remains_opaque_provenance() {
+        let raw = r#"{"flowRunId":"018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321","taskRef":"crm/t07"}"#;
+        let capsule: Orchestration = serde_json::from_str(raw).unwrap();
+        let task_ref = capsule.task_ref().unwrap();
+        assert_eq!(task_ref.as_str(), "crm/t07");
+        assert_eq!(task_ref.campaign(), "crm");
+        assert_eq!(task_ref.task_id(), "t07");
+        assert_eq!(serde_json::to_string(&capsule).unwrap(), raw);
+
+        for invalid in [
+            "crm",
+            "crm/t07/extra",
+            "crm/task id",
+            "/t07",
+            "crm/",
+            ".crm/t07",
+            "crm/-t07",
+        ] {
+            assert!(TaskRef::new(invalid).is_err(), "accepted {invalid:?}");
+        }
+        assert!(Orchestration::new(serde_json::json!({
+            "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+            "taskRef": {"campaign": "crm", "id": "t07"}
+        }))
+        .is_err());
     }
 }

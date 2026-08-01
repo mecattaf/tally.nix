@@ -430,9 +430,12 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
         return required_string(candidates[0].get("url"), "existing pull request URL")
     task = data["task"]
     issue = data["issue"]
+    campaign = required_string(data.get("campaign"), "campaign")
+    task_ref = f"{campaign}/{task['id']}"
     body = (
         f"Spec-build campaign progress for {repository}#{issue['number']}.\n\n"
         f"Task `{task['id']}`: {task['title']}\n\n"
+        f"Task ref: `{task_ref}`\n\n"
         f"Witnessed gates are the merge criterion. Campaign issue: {issue['url']}\n"
         f"Head: `{head}`"
     )
@@ -586,7 +589,9 @@ def github_progress_comment(
     body = (
         f"{marker}\n"
         f"Campaign task `{task_id}` ({task_title}) merged via "
-        f"{publication['pullRequest']}.\n\nMerge commit: `{merge_commit}`"
+        f"{publication['pullRequest']}.\n\n"
+        f"Task ref: `{campaign}/{task_id}`\n\n"
+        f"Merge commit: `{merge_commit}`"
     )
     run(
         [

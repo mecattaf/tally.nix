@@ -169,7 +169,7 @@ canonicalized into ascending order and duplicates are rejected.
 | `source` | source enum; default `manual` | `manual`, `orchestrator`, `calendar`, `events-dir`, `gh`, `build-effect`, or `pool-reachability`. |
 | `dedupKey` | string, optional | Submission identity key. |
 | `submission` | `{"mode":"full"}`, optional | Selects full disposition semantics. Absence is legacy mode; there are no other mode values. |
-| `orchestration` | object, optional | Opaque flow capsule. `flowRunId` must be a UUID; `maxNodes`, when present, is positive; `nodeOrdinal`, when present, is a non-negative integer. |
+| `orchestration` | object, optional | Opaque flow capsule. `flowRunId` must be a UUID; `maxNodes`, when present, is positive; `nodeOrdinal`, when present, is a non-negative integer. Optional `taskRef` is a validated `<campaign>/<task-id>` scalar. |
 | `parent` | UUID string, optional | Durable parent task. |
 | `evidence` | string array; default `[]` | Canonical evidence specifications. |
 | `drv` | object, optional | `{drvPath, outputs:[{name,path}, ...]}` for derivation-aware admission. |
@@ -228,7 +228,7 @@ Attached results add both `task_uuid` and `taskUuid`, `status`, `dedup_key`, `pa
 
 ```text
 verdict, exit_code, artifact_content_hash, store_paths, storePaths, drv,
-witness_lsn, witnessSeq, lease_epoch, completion, recordedLabel,
+witness_lsn, witnessSeq, lease_epoch, completion, taskRef, recordedLabel,
 recordedOrchestration
 ```
 
@@ -237,9 +237,9 @@ read the camelCase version when both are present, but tolerate either documented
 
 `queue.retry` keeps the task UUID, increments `attempt`, and returns
 `{schemaVersion:1, retried:true, task_uuid, taskUuid, job_id, barrier, state, status, attempt,
-payloadHash?}`. Only a terminal non-pass job with a governing witness can be retried.
+payloadHash?, taskRef?}`. Only a terminal non-pass job with a governing witness can be retried.
 
-`queue.cancel` returns `{ok:true, affected, task_uuid, was, lease_epoch, already_terminal?}`.
+`queue.cancel` returns `{ok:true, affected, task_uuid, taskRef?, was, lease_epoch, already_terminal?}`.
 A running job is unaffected unless `force` is true. Paused and queued jobs can be cancelled
 without `force`. The flow-run form returns `{ok:true, affected, flow_run_id, flowRunId, results}`
 and force-cancels every nonterminal child carrying that `flowRunId`; it does not inherit the
@@ -264,7 +264,7 @@ snapshots all then-active jobs, not only jobs admitted by that one call.
 positive. Its terminal result is:
 
 ```text
-{task_uuid, job_id, verdict, exit_code, artifact_content_hash,
+{task_uuid, taskRef?, job_id, verdict, exit_code, artifact_content_hash,
  attempt, lease_epoch, witness_seq, completion?, stderr_excerpt?, stderr_truncated?}
 ```
 
@@ -331,7 +331,7 @@ adapter, source, origin, parent, flowRun, session, since, until, limit, cursor
 
 `since` and `until` are RFC 3339 timestamps. `terminalVerdict` is one of the witness verdicts.
 `flowRun` matches `orchestration.flowRunId`, which is how `tally query jobs --flow-run ID` groups
-a run's nodes. Each job summary includes its durable identity and admission fields, live and
+a run's nodes. Each job summary includes its durable identity, optional top-level `taskRef`, and admission fields, live and
 terminal state, parent/children, provenance with authority labels, evidence, timestamps,
 resource use, artifact/witness facts, authorship when present, and trace availability. Two of the
 admission fields are `dedupKey`, the node's submission identity, and `disposition`, which is
@@ -340,7 +340,7 @@ no row — `attached`, and full-mode `reused` and `terminal` — are reported by
 `node-submitted` and `node-terminal` lifecycle events instead.
 
 `query.log` filters by `task`, `flowRun`, `attempt`, `session`, lifecycle `event`, `source`,
-`since`, and `until`. A lifecycle event carries no orchestration capsule, so `flowRun` is resolved
+`since`, and `until`. Lifecycle items expose `taskRef` when their durable row/witness did. A lifecycle event carries no orchestration capsule, so `flowRun` is resolved
 to the run's task UUIDs through the durable rows and the witness chain. `query.trace` requires `task` and optionally selects `attempt`. Both return collection
 envelopes; trace also includes a `generations` array describing capture capability, completeness,
 retained range, byte count, truncation, and redaction provenance.

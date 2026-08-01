@@ -38,10 +38,10 @@ Every flow node records four hashes:
   credentials, and the structured brief hash.
 
 Admission metadata is deliberately outside the work payload hash. That includes
-the lookup key itself, priority, label, and orchestration fields such as
-`scriptHash`, `argsHash`, `catalogHash`, `maxNodes`, prompt/skill revision, and
-selection; `resultSchema` is also excluded because it is a runner-side projection
-check. The first three orchestration hashes are nevertheless run identity: every
+the lookup key itself, priority, label, human `taskRef`, and orchestration fields
+such as `scriptHash`, `argsHash`, `catalogHash`, `maxNodes`, prompt/skill revision,
+and selection; `resultSchema` is also excluded because it is a runner-side
+projection check. The first three orchestration hashes are nevertheless run identity: every
 later invocation of the same `flowRunId` must match them before work can reuse,
 attach, or be created. The startup history scan and the admission response both
 enforce this, closing the race between two concurrent runners.

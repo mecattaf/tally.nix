@@ -6,6 +6,63 @@ use serde_json::Value;
 
 use crate::{FlowError, SourceLocation};
 
+const MAX_TASK_REF_COMPONENT_BYTES: usize = 80;
+
+/// A campaign-scoped human task identifier such as `crm/t07`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskRef(String);
+
+impl TaskRef {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        let (campaign, task_id) = value
+            .split_once('/')
+            .ok_or_else(|| "taskRef must be formatted as <campaign>/<task-id>".to_owned())?;
+        if task_id.contains('/') {
+            return Err("taskRef must contain exactly one slash".to_owned());
+        }
+        for (label, component) in [("campaign", campaign), ("task id", task_id)] {
+            if !component
+                .as_bytes()
+                .first()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                || component.len() > MAX_TASK_REF_COMPONENT_BYTES
+                || !component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+            {
+                return Err(format!(
+                    "taskRef {label} must start with an ASCII letter, digit, or '_' and contain at most {MAX_TASK_REF_COMPONENT_BYTES} ASCII letters, digits, '_', '.', or '-'"
+                ));
+            }
+        }
+        Ok(Self(value))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Serialize for TaskRef {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for TaskRef {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Self::new(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Disposition {
@@ -126,6 +183,8 @@ pub struct NodeFailure {
 #[serde(rename_all = "camelCase")]
 pub struct NodeResult {
     pub task_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<TaskRef>,
     pub verdict: Verdict,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
@@ -145,6 +204,8 @@ pub struct Admission {
     pub schema_version: u32,
     pub disposition: Disposition,
     pub task_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<TaskRef>,
     pub payload_hash: String,
     pub attempt: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,6 +272,7 @@ mod tests {
             key: Some("node".to_owned()),
             dedup_key: Some("dedup".to_owned()),
             label: Some("label".to_owned()),
+            task_ref: Some(TaskRef::new("crm/t07").unwrap()),
             env: BTreeMap::from([("SAFE".to_owned(), "yes".to_owned())]),
             approval_policy: Some("on-request".to_owned()),
             sandbox_policy: Some("workspace-write".to_owned()),
@@ -256,6 +318,7 @@ mod tests {
                 "key",
                 "dedupKey",
                 "label",
+                "taskRef",
                 "env",
                 "approvalPolicy",
                 "sandboxPolicy",
@@ -279,6 +342,7 @@ mod tests {
                 "key",
                 "dedupKey",
                 "label",
+                "taskRef",
                 "env",
                 "approvalPolicy",
                 "sandboxPolicy",
@@ -364,6 +428,8 @@ pub struct Orchestration {
     pub node_ordinal: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<TaskRef>,
     pub max_nodes: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_revision: Option<String>,
@@ -741,6 +807,12 @@ define_node_spec! {
         json: "label", job: true, sugar: true,
         wire: NodeWireProjection::Excluded("label is carried by orchestration.nodeLabel"),
         canonical: NodeCanonicalProjection::Excluded("label is orchestration diagnostic metadata")
+    },
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    task_ref: Option<TaskRef> => {
+        json: "taskRef", job: true, sugar: true,
+        wire: NodeWireProjection::Excluded("taskRef is carried by orchestration.taskRef"),
+        canonical: NodeCanonicalProjection::Excluded("taskRef is orchestration diagnostic metadata")
     },
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     env: BTreeMap<String, String> => {

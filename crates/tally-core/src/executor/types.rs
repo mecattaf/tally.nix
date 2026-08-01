@@ -4,8 +4,9 @@ pub const CAPTURE_DIRECTORY: &str = "capture";
 pub const CAPTURE_ARCHIVE_DIRECTORY: &str = "capture/archive";
 pub const UNIT_EXIT_DIRECTORY: &str = "unit-exit";
 pub const UNIT_EXIT_SCHEMA_VERSION: u32 = 2;
-pub(super) const OPTIONAL_TALLY_ENVIRONMENT: [&str; 13] = [
+pub(super) const OPTIONAL_TALLY_ENVIRONMENT: [&str; 14] = [
     "TALLY_TASK_UUID",
+    "TALLY_TASK_REF",
     "TALLY_PARENT",
     "TALLY_NO_ENQUEUE",
     "TALLY_CREDENTIALS",
@@ -42,11 +43,38 @@ pub(super) static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 pub struct ExecutionIdentity {
     pub job_id: Uuid,
     pub task_uuid: Option<Uuid>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<TaskRef>,
 }
 
 impl ExecutionIdentity {
     pub fn unit_uuid(&self) -> &Uuid {
         self.task_uuid.as_ref().unwrap_or(&self.job_id)
+    }
+
+    pub fn unit_stem(&self) -> String {
+        self.task_ref.as_ref().map_or_else(
+            || format!("tally-job-{}", self.unit_uuid()),
+            |task_ref| {
+                format!(
+                    "tally-job-{}-{}-{}",
+                    task_ref.campaign(),
+                    task_ref.task_id(),
+                    self.unit_uuid()
+                )
+            },
+        )
+    }
+
+    pub fn unit_name(&self) -> String {
+        format!("{}.service", self.unit_stem())
+    }
+
+    pub fn capture_stem(&self) -> String {
+        self.task_ref.as_ref().map_or_else(
+            || self.unit_uuid().to_string(),
+            |task_ref| format!("{}.{}", self.unit_uuid(), task_ref.task_id()),
+        )
     }
 }
 

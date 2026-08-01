@@ -8,6 +8,7 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::config::Priority;
+use crate::provenance::TaskRef;
 use crate::taskdb::EnqueueSource;
 use crate::witness::LaborClass;
 
@@ -128,6 +129,7 @@ pub const TALLY_FIELD_MATRIX: &[(&str, FieldRequirement)] = &[
     ("SYSLOG_IDENTIFIER", FieldRequirement::Always),
     ("TALLY_EVENT", FieldRequirement::Always),
     ("TALLY_TASK_UUID", FieldRequirement::Always),
+    ("TALLY_TASK_REF", FieldRequirement::Conditional),
     ("TALLY_CLASS", FieldRequirement::Always),
     ("TALLY_SOURCE", FieldRequirement::Always),
     ("MESSAGE", FieldRequirement::Always),
@@ -179,6 +181,12 @@ pub struct TallyFields {
     pub event: TallyEvent,
     #[serde(rename = "TALLY_TASK_UUID")]
     pub task_uuid: String,
+    #[serde(
+        rename = "TALLY_TASK_REF",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub task_ref: Option<TaskRef>,
     #[serde(rename = "TALLY_CLASS")]
     pub class: Priority,
     #[serde(rename = "TALLY_SOURCE")]
@@ -232,6 +240,7 @@ pub struct TallyFields {
 pub struct EmitEvent {
     pub event: TallyEvent,
     pub task_uuid: String,
+    pub task_ref: Option<TaskRef>,
     pub class: Priority,
     pub source: EnqueueSource,
     pub message: Option<String>,
@@ -256,6 +265,7 @@ impl EmitEvent {
         Self {
             event: TallyEvent::Enqueued,
             task_uuid: task_uuid.into(),
+            task_ref: None,
             class,
             source,
             message: None,
@@ -285,6 +295,7 @@ impl EmitEvent {
             syslog_identifier: JOURNAL_IDENTIFIER.to_owned(),
             event: self.event,
             task_uuid: self.task_uuid,
+            task_ref: self.task_ref,
             class: self.class,
             source: self.source,
             message,
@@ -310,6 +321,9 @@ impl EmitEvent {
 
 fn synthesize_message(event: &EmitEvent) -> String {
     let mut parts = vec![event.event.to_string(), event.task_uuid.clone()];
+    if let Some(task_ref) = &event.task_ref {
+        parts.push(format!("taskRef={task_ref}"));
+    }
     match event.event {
         TallyEvent::Completed | TallyEvent::Failed => {
             if let Some(exit_code) = event.exit_code {
@@ -374,6 +388,7 @@ fn field_present(fields: &TallyFields, name: &str) -> bool {
         "SYSLOG_IDENTIFIER" => !fields.syslog_identifier.is_empty(),
         "TALLY_EVENT" | "TALLY_CLASS" | "TALLY_SOURCE" => true,
         "TALLY_TASK_UUID" => !fields.task_uuid.is_empty(),
+        "TALLY_TASK_REF" => fields.task_ref.is_some(),
         "MESSAGE" => !fields.message.is_empty(),
         "TALLY_AGENT" => fields
             .agent
@@ -483,6 +498,9 @@ fn string_fields(fields: &TallyFields) -> Vec<(&'static str, &str)> {
         ("TALLY_TASK_UUID", fields.task_uuid.as_str()),
         ("MESSAGE", fields.message.as_str()),
     ];
+    if let Some(task_ref) = &fields.task_ref {
+        values.push(("TALLY_TASK_REF", task_ref.as_str()));
+    }
     for (name, value) in [
         ("TALLY_AGENT", fields.agent.as_deref()),
         ("TALLY_SESSION_REF", fields.session_ref.as_deref()),
@@ -671,6 +689,9 @@ fn native_fields(fields: &TallyFields) -> Result<Vec<(&'static str, String)>, Jo
         ("TALLY_SOURCE", enum_json_string(fields.source)?),
         ("MESSAGE", fields.message.clone()),
     ];
+    if let Some(task_ref) = &fields.task_ref {
+        values.push(("TALLY_TASK_REF", task_ref.to_string()));
+    }
     push_optional(&mut values, "TALLY_AGENT", fields.agent.as_deref());
     push_optional(
         &mut values,
@@ -859,6 +880,7 @@ mod tests {
         EmitEvent {
             event,
             task_uuid: "task-abc".to_owned(),
+            task_ref: None,
             class: Priority::High,
             source: EnqueueSource::Manual,
             message: None,
@@ -952,6 +974,7 @@ mod tests {
         let value = serde_json::to_value(fields).unwrap();
         for optional in [
             "TALLY_AGENT",
+            "TALLY_TASK_REF",
             "TALLY_SESSION_REF",
             "TALLY_JOB_ID",
             "TALLY_PARENT",
@@ -965,6 +988,21 @@ mod tests {
         assert_eq!(tally_agent_label("codex").unwrap(), "codex");
         assert_eq!(adapter_from_tally_agent("cc").unwrap(), "claude-code");
         assert!(tally_agent_label("bad\nlabel").is_err());
+    }
+
+    #[test]
+    fn task_ref_is_present_in_structured_native_and_human_lifecycle_records() {
+        let mut event = EmitEvent::enqueued("uuid-1", Priority::Low, EnqueueSource::Orchestrator);
+        event.task_ref = Some(TaskRef::new("crm/t07").unwrap());
+        let fields = event.into_fields().unwrap();
+
+        assert_eq!(fields.message, "enqueued uuid-1 taskRef=crm/t07");
+        assert_eq!(
+            serde_json::to_value(&fields).unwrap()["TALLY_TASK_REF"],
+            "crm/t07"
+        );
+        let native = String::from_utf8(encode_native_record(&fields).unwrap()).unwrap();
+        assert!(native.lines().any(|line| line == "TALLY_TASK_REF=crm/t07"));
     }
 
     #[test]

@@ -103,6 +103,7 @@ The first argument must be a JSON-serializable object. Its public fields are:
 | `key` | Optional flow-local author key, rendered as `flow:<run-id>:k:<key>`. It must be unique in one evaluation. |
 | `dedupKey` | Optional raw, potentially cross-run key. It is mutually exclusive with `key`; use it only when cross-run identity is intentional. |
 | `label` | Optional human-readable node label stored in orchestration provenance. |
+| `taskRef` | Optional campaign-scoped human task reference in `<campaign>/<task-id>` form, for example `crm/t07`. It is stored in orchestration provenance and excluded from `payloadHash`. Each component starts with an ASCII letter, digit, or `_`, and contains at most 80 ASCII letters, digits, `_`, `.`, or `-`. |
 | `env` | Optional string map. Names beginning `TALLY_` and `CREDENTIALS_DIRECTORY` are reserved. |
 | `approvalPolicy`, `sandboxPolicy` | Optional non-empty named policies. The selected adapter must declare each name in its closed launch-policy map; the host normalizes both into `adapterOptions`. |
 | `resultSchema` | Optional valid JSON Schema for the projected result. It is checked by the runner after terminal acknowledgement. |

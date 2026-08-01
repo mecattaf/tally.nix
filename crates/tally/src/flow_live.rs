@@ -10,7 +10,7 @@ use tally_core::query::QUERY_PROTOCOL_VERSION;
 use tally_core::taskdb::RelatedTrigger;
 use tally_flow::{
     Admission, ClientError, Disposition, FlowClient, FlowFuture, FlowSubmission, LifecycleSink,
-    NodeFailure, NodeResult, RunInspection, Verdict,
+    NodeFailure, NodeResult, RunInspection, TaskRef, Verdict,
 };
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -606,6 +606,7 @@ fn parse_admission(value: &Value) -> Result<Admission, ClientError> {
         schema_version,
         disposition,
         task_uuid,
+        task_ref: parse_task_ref(value)?,
         payload_hash,
         attempt,
         terminal,
@@ -752,6 +753,7 @@ fn parse_node_result(value: &Value, disposition: Disposition) -> Result<NodeResu
         })?;
     Ok(NodeResult {
         task_uuid,
+        task_ref: parse_task_ref(value)?,
         verdict,
         exit_code,
         witness_seq,
@@ -760,6 +762,16 @@ fn parse_node_result(value: &Value, disposition: Disposition) -> Result<NodeResu
         gates,
         error,
     })
+}
+
+fn parse_task_ref(value: &Value) -> Result<Option<TaskRef>, ClientError> {
+    optional_str(value, &["taskRef"])
+        .map(|task_ref| {
+            TaskRef::new(task_ref.to_owned()).map_err(|error| {
+                protocol_error(format!("response contains an invalid taskRef: {error}"))
+            })
+        })
+        .transpose()
 }
 
 fn projected_result(value: &Value) -> Option<Value> {
@@ -1045,6 +1057,7 @@ mod tests {
                 key: None,
                 dedup_key: None,
                 label: Some("first".to_owned()),
+                task_ref: Some(TaskRef::new("crm/t07").unwrap()),
                 env: Default::default(),
                 approval_policy: None,
                 sandbox_policy: None,
@@ -1063,6 +1076,7 @@ mod tests {
                 catalog_hash: None,
                 node_ordinal: 0,
                 node_label: Some("first".to_owned()),
+                task_ref: Some(TaskRef::new("crm/t07").unwrap()),
                 max_nodes: 10,
                 prompt_revision: None,
                 skill_revision: None,
@@ -1099,15 +1113,18 @@ mod tests {
         ) -> FlowFuture<'a, Result<Admission, ClientError>> {
             let payload_hash = submission.payload_hash.clone();
             let label = submission.spec.label.clone();
+            let task_ref = submission.orchestration.task_ref.clone();
             self.submission.replace(Some(submission));
             Box::pin(std::future::ready(Ok(Admission {
                 schema_version: 1,
                 disposition: Disposition::Created,
                 task_uuid: "00000000-0000-4000-8000-000000000073".to_owned(),
+                task_ref: task_ref.clone(),
                 payload_hash,
                 attempt: 1,
                 terminal: Some(NodeResult {
                     task_uuid: "00000000-0000-4000-8000-000000000073".to_owned(),
+                    task_ref,
                     verdict: Verdict::Pass,
                     exit_code: Some(0),
                     witness_seq: 1,
@@ -1161,6 +1178,7 @@ mod tests {
         assert_eq!(payload["callerJobToken"], "ab".repeat(32));
         assert_eq!(payload["orchestration"]["nodeOrdinal"], 0);
         assert_eq!(payload["orchestration"]["argsHash"], "sha256:args");
+        assert_eq!(payload["orchestration"]["taskRef"], "crm/t07");
         assert!(payload["orchestration"]["catalogHash"].is_null());
         assert_eq!(
             payload["orchestration"]["promptRevision"],
@@ -1622,6 +1640,7 @@ export const meta = {
             "schemaVersion": 1,
             "disposition": "substituted",
             "taskUuid": "35c1f3a2-0ec5-53bf-8019-62ac60ca5bb0",
+            "taskRef": "crm/t07",
             "payloadHash": "sha256:payload",
             "attempt": 1,
             "verdict": "substituted",
@@ -1630,7 +1649,9 @@ export const meta = {
         }))
         .unwrap();
         assert_eq!(admission.disposition, Disposition::Substituted);
+        assert_eq!(admission.task_ref.unwrap().as_str(), "crm/t07");
         let terminal = admission.terminal.unwrap();
+        assert_eq!(terminal.task_ref.unwrap().as_str(), "crm/t07");
         assert_eq!(terminal.verdict, Verdict::Substituted);
         assert!(terminal.verdict.is_pass());
         assert_eq!(terminal.disposition, Disposition::Substituted);
@@ -2009,6 +2030,7 @@ export const meta = {
         );
         let mut result = NodeResult {
             task_uuid: task_uuid.to_owned(),
+            task_ref: None,
             verdict: Verdict::Pass,
             exit_code: Some(0),
             witness_seq: 1,

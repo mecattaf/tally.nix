@@ -17,7 +17,7 @@ That distinction is the recovery contract:
 | State before the restart | What happens after the restart |
 |---|---|
 | A queued job | Its acknowledged enqueue event rebuilds the row and the lease request is presented again. |
-| A running local job | tally probes `tally-job-<uuid>.service`. A matching attempt, lease epoch, and systemd invocation ID are adopted; the argv is not run twice. |
+| A running local job | tally probes `tally-job-<uuid>.service`, or `tally-job-<campaign>-<task-id>-<uuid>.service` when the row carries `taskRef`. A matching attempt, lease epoch, and systemd invocation ID are adopted; the argv is not run twice. |
 | A running remote job | The coordinator repeatedly sends the same bounded `Probe`/`Adopt` operation to the named SSH executor. Its logical leases remain held while transport state is unknown. |
 | A terminal job | The canonical witness reconstructs `queue.await_job` and that job's deterministic `barrier:<task>:<attempt>` result without re-execution. |
 | A runtime-exceeded job eligible for automatic bounded requeue | The first witness is retained, a durable retry advances the same task UUID, and existing stale-attempt waiters resolve to the new current attempt up to `maxAttempts`. |

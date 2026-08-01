@@ -495,6 +495,7 @@ impl Daemon {
             )?;
             let result = JobResult {
                 task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
+                task_ref: job.task_ref(),
                 job_id: job.job_id.to_string(),
                 verdict,
                 exit_code,

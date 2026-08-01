@@ -903,20 +903,18 @@ fn flow_failure(output: &std::process::Output) -> Value {
 }
 
 fn capture(paths: &DaemonPaths, task_uuid: &str) -> String {
-    let stdout = fs::read_to_string(
-        paths
-            .state_dir
-            .join("capture")
-            .join(format!("{task_uuid}.out")),
-    )
-    .unwrap_or_default();
-    let stderr = fs::read_to_string(
-        paths
-            .state_dir
-            .join("capture")
-            .join(format!("{task_uuid}.err")),
-    )
-    .unwrap_or_default();
+    capture_stem(paths, task_uuid)
+}
+
+fn task_capture(paths: &DaemonPaths, task_uuid: &str, task_id: &str) -> String {
+    capture_stem(paths, &format!("{task_uuid}.{task_id}"))
+}
+
+fn capture_stem(paths: &DaemonPaths, stem: &str) -> String {
+    let stdout = fs::read_to_string(paths.state_dir.join("capture").join(format!("{stem}.out")))
+        .unwrap_or_default();
+    let stderr = fs::read_to_string(paths.state_dir.join("capture").join(format!("{stem}.err")))
+        .unwrap_or_default();
     format!("stdout:\n{stdout}\nstderr:\n{stderr}")
 }
 
@@ -2432,6 +2430,10 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 3,
                 "a red preflight must admit only worklist, prep, and that preflight gate"
             );
+            assert!(first_items[0].get("taskRef").is_none());
+            assert!(first_items[1..]
+                .iter()
+                .all(|item| item["taskRef"] == "fixture/task-1"));
             let mut failed_preflight = None;
             for item in &first_items {
                 let terminal = client
@@ -2458,6 +2460,15 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 .call("query.job", Some(json!({"id": failed_preflight.clone()})))
                 .await
                 .unwrap();
+            assert_eq!(projected_preflight["job"]["taskRef"], "fixture/task-1");
+            assert_eq!(
+                projected_preflight["job"]["unit"],
+                format!("tally-job-fixture-task-1-{failed_preflight}.service")
+            );
+            let failed_preflight_capture = daemon_paths
+                .state_dir
+                .join(format!("capture/{failed_preflight}.task-1.err"));
+            assert!(failed_preflight_capture.is_file());
             assert_eq!(
                 projected_preflight["job"]["argv"],
                 json!(first_preflight_argv),
@@ -2468,9 +2479,11 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 "preflight-gate-fixture-first"
             );
             assert_eq!(projected_preflight["job"]["runtimeMaxSec"], 1);
-            assert!(capture(&daemon_paths, &failed_preflight).contains(
-                "fixture preflight exceeds its bounded deadline before any agent dispatch"
-            ));
+            assert!(
+                task_capture(&daemon_paths, &failed_preflight, "task-1").contains(
+                    "fixture preflight exceeds its bounded deadline before any agent dispatch"
+                )
+            );
             assert!(!control.join("agent-order.log").exists());
             assert!(!control.join("policy-order.log").exists());
             assert!(!control.join("preflight-order.log").exists());
@@ -2552,7 +2565,7 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 "gate-task-1-fixture-first"
             );
             assert_eq!(projected_gate["job"]["runtimeMaxSec"], 1);
-            assert!(capture(&daemon_paths, &failed_gate)
+            assert!(task_capture(&daemon_paths, &failed_gate, "task-1")
                 .contains("fixture post-change gate fails once before publish"));
             assert_eq!(
                 fs::read_to_string(control.join("agent-order.log")).unwrap(),
@@ -2618,6 +2631,13 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             assert!(submitted[6..]
                 .iter()
                 .all(|event| event["disposition"] == "created"));
+            assert!(submitted[0].get("taskRef").is_none());
+            assert!(submitted[1..=8]
+                .iter()
+                .all(|event| event["taskRef"] == "fixture/task-1"));
+            assert!(submitted[9..]
+                .iter()
+                .all(|event| event["taskRef"] == "fixture/task-2"));
             assert_eq!(flow_items(&client, SPEC_BUILD_RUN).await.len(), 15);
 
             fixture_git(&checkout, &["fetch", "origin", "main"]);

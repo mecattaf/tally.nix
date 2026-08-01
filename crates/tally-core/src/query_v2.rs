@@ -7,7 +7,7 @@ use thiserror::Error;
 
 use crate::history::{LifecycleRecord, LifecycleSnapshot, RetentionMetadata};
 use crate::journal::TallyEvent;
-use crate::provenance::Orchestration;
+use crate::provenance::{Orchestration, TaskRef};
 use crate::query::{
     GhOriginProjection, HeadroomSignal, RowStatus, QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
 };
@@ -277,6 +277,8 @@ impl RowDisposition {
 pub struct JobSummary {
     pub anchor: String,
     pub task_uuid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<TaskRef>,
     pub live_job_id: Option<String>,
     pub description: Option<String>,
     pub argv: Vec<String>,
@@ -567,6 +569,8 @@ pub struct LifecycleEventProjection {
     pub timestamp: String,
     pub event: TallyEvent,
     pub task_uuid: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_ref: Option<TaskRef>,
     pub attempt: Option<u32>,
     pub lease_epoch: Option<u64>,
     pub adapter: Option<String>,
@@ -1029,6 +1033,15 @@ fn build_summary(
     JobSummary {
         anchor: anchor.to_owned(),
         task_uuid: has_durable_task.then(|| anchor.to_owned()),
+        task_ref: latest_witness
+            .and_then(|record| record.orchestration.as_ref())
+            .and_then(Orchestration::task_ref)
+            .or_else(|| {
+                detail
+                    .and_then(|detail| detail.orchestration.as_ref())
+                    .and_then(Orchestration::task_ref)
+            })
+            .or_else(|| current_event.and_then(|event| event.fields.task_ref.clone())),
         live_job_id: live
             .map(|live| live.job_id.clone())
             .or_else(|| current_event.and_then(|event| event.fields.job_id.clone()))
@@ -1365,6 +1378,7 @@ fn lifecycle_projection(record: &LifecycleRecord) -> LifecycleEventProjection {
         timestamp: record.observed_at.clone(),
         event: record.fields.event,
         task_uuid: record.fields.task_uuid.clone(),
+        task_ref: record.fields.task_ref.clone(),
         attempt: record.fields.attempt,
         lease_epoch: record.fields.lease_epoch,
         adapter: record.fields.agent.clone(),
@@ -1406,6 +1420,10 @@ fn witness_lifecycle_projection(record: &WitnessRecord) -> LifecycleEventProject
             .task_uuid
             .clone()
             .unwrap_or_else(|| format!("witness:{}", record.seq)),
+        task_ref: record
+            .orchestration
+            .as_ref()
+            .and_then(Orchestration::task_ref),
         attempt: Some(record.attempt),
         lease_epoch: Some(record.lease_epoch),
         adapter: None,
@@ -1695,6 +1713,7 @@ mod tests {
         let fields = EmitEvent {
             event,
             task_uuid: "00000000-0000-4000-8000-000000000024".to_owned(),
+            task_ref: None,
             class: Priority::High,
             source: EnqueueSource::Manual,
             message: Some(format!("fixture {event}")),

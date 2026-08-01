@@ -307,7 +307,7 @@ mod tests {
                         detail: "unexpected remote operation".to_owned(),
                     });
                 };
-                let unit = format!("tally-job-{}.service", request.identity.unit_uuid());
+                let unit = request.identity.unit_name();
                 let evidence =
                     parse_evidence_specs(&evidence).map_err(|error| RemoteTransportError {
                         detail: error.to_string(),
@@ -374,7 +374,7 @@ mod tests {
                 calls.lock().unwrap().push(request.clone());
                 let result = match request {
                     RemoteExecutorRequest::Probe { identity, .. } => {
-                        let unit = format!("tally-job-{}.service", identity.unit_uuid());
+                        let unit = identity.unit_name();
                         RemoteExecutorResult::Fact(LocalUnitFact {
                             unit,
                             loaded: true,
@@ -402,7 +402,7 @@ mod tests {
                                 detail: error.to_string(),
                             }
                         })?;
-                        let unit = format!("tally-job-{}.service", request.identity.unit_uuid());
+                        let unit = request.identity.unit_name();
                         RemoteExecutorResult::Completion(Box::new(RemoteCompletion {
                             unit: unit.clone(),
                             record: UnitExitRecord {
@@ -1869,6 +1869,7 @@ mod tests {
         let fields = EmitEvent {
             event,
             task_uuid: row.uuid.to_string(),
+            task_ref: None,
             class: row.priority,
             source: row.source,
             message: Some(format!("fixture {event} attempt={attempt}")),
@@ -2217,6 +2218,7 @@ mod tests {
         let projection = |witness_seq: Option<u64>| JobProjection {
             anchor: "job-1".to_owned(),
             task_uuid: Some("job-1".to_owned()),
+            task_ref: None,
             description: None,
             argv: None,
             brief_hash: None,
@@ -3099,6 +3101,7 @@ mod tests {
                 let identity = ExecutionIdentity {
                     job_id: row.uuid,
                     task_uuid: Some(row.uuid),
+                    task_ref: None,
                 };
                 write_exit_record(
                     &executor.paths(&identity).exit_record,
@@ -3306,6 +3309,7 @@ mod tests {
                 row.gh_origin = Some(gh_test_origin("item-1", GhItemType::Issue));
                 let result = JobResult {
                     task_uuid: Some(row.uuid.to_string()),
+                    task_ref: None,
                     job_id: row.uuid.to_string(),
                     verdict: Verdict::Pass,
                     exit_code: 0,
@@ -5088,6 +5092,7 @@ mod tests {
         let capture_paths = executor.paths(&ExecutionIdentity {
             job_id: row.uuid,
             task_uuid: Some(row.uuid),
+            task_ref: None,
         });
         fs::create_dir_all(capture_paths.stdout.parent().unwrap()).unwrap();
         fs::create_dir_all(capture_paths.capture_generation.parent().unwrap()).unwrap();
@@ -5254,6 +5259,7 @@ mod tests {
             unit: executor.unit_name(&ExecutionIdentity {
                 job_id: advisory_row.uuid,
                 task_uuid: Some(advisory_row.uuid),
+                task_ref: None,
             }),
             invocation_id: "attempt-2-invocation".to_owned(),
             attempt: 2,
@@ -5877,11 +5883,16 @@ mod tests {
                         "priority": "high",
                         "adapter": "shell",
                         "source": "manual",
-                        "evidence": ["exit:0"]
+                        "evidence": ["exit:0"],
+                        "orchestration": {
+                            "flowRunId": "00000000-0000-4000-8000-000000000260",
+                            "taskRef": "crm/t07"
+                        }
                     })))
                     .await
                     .unwrap();
                 assert_eq!(admitted["state"], "running");
+                assert_eq!(admitted["taskRef"], "crm/t07");
 
                 tokio::time::timeout(Duration::from_secs(1), async {
                     while calls.load(Ordering::SeqCst) < 2 {
@@ -5913,6 +5924,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(result["verdict"], "pass");
+                assert_eq!(result["taskRef"], "crm/t07");
                 assert_eq!(
                     daemon
                         .handler
@@ -5953,6 +5965,13 @@ mod tests {
                 let task_uuid = Uuid::new_v4();
                 let mut row = durable_row(task_uuid, "restart-remote", 1);
                 row.executor = Some("worker".to_owned());
+                row.orchestration = Some(
+                    Orchestration::new(json!({
+                        "flowRunId": "00000000-0000-4000-8000-000000000260",
+                        "taskRef": "crm/t07"
+                    }))
+                    .unwrap(),
+                );
                 write_enqueue_event_atomic(
                     &paths.events_dir(),
                     &DurableEnqueueEvent::new(row).unwrap(),
@@ -6005,6 +6024,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
                 assert_eq!(result["verdict"], "pass");
+                assert_eq!(result["taskRef"], "crm/t07");
                 shutdown_tx.send(true).unwrap();
                 daemon_task.await.unwrap().unwrap();
 
@@ -6014,6 +6034,10 @@ mod tests {
                 match &calls[1] {
                     RemoteExecutorRequest::Adopt { request, .. } => {
                         assert_eq!(request.attempt, 1);
+                        assert_eq!(
+                            request.identity.task_ref.as_ref().map(TaskRef::as_str),
+                            Some("crm/t07")
+                        );
                         assert_eq!(
                             request.lease_epoch, 1,
                             "re-adoption must target the exact pre-switch execution generation"
@@ -8157,7 +8181,7 @@ mod tests {
                     &[
                         "sh",
                         "-c",
-                        "test -n \"$TALLY_BRIEF\" && test -f \"$TALLY_BRIEF\"",
+                        "test -n \"$TALLY_BRIEF\" && test -f \"$TALLY_BRIEF\" && test \"$TALLY_TASK_REF\" = crm/t07",
                     ],
                     ["exit:0".to_owned()],
                 );
@@ -8169,6 +8193,7 @@ mod tests {
                     "scriptHash": "sha256-script-generation",
                     "nodeOrdinal": 0,
                     "nodeLabel": "verify-brief",
+                    "taskRef": "crm/t07",
                     "maxNodes": 1,
                     "selection": {
                         "selector": "pooled-fast",
@@ -8180,6 +8205,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(created["disposition"], "created");
+                assert_eq!(created["taskRef"], "crm/t07");
                 let task_uuid = Uuid::parse_str(created["task_uuid"].as_str().unwrap()).unwrap();
                 assert_eq!(task_uuid.get_version_num(), 7);
                 let brief_hash = created["payloadHash"]
@@ -8188,6 +8214,12 @@ mod tests {
                     .to_owned();
                 let terminal = fs1_wait(&client, &created).await;
                 assert_eq!(terminal["verdict"], "pass");
+                assert_eq!(terminal["taskRef"], "crm/t07");
+                assert!(paths
+                    .state_dir
+                    .join("capture")
+                    .join(format!("{task_uuid}.t07.out"))
+                    .is_file());
 
                 let events = read_acknowledged_events(&paths.events_dir()).unwrap();
                 assert_eq!(events.len(), 1);
@@ -8222,6 +8254,10 @@ mod tests {
                     witness[0].orchestration.as_ref().unwrap().as_value()["nodeLabel"],
                     "verify-brief"
                 );
+                assert_eq!(
+                    witness[0].orchestration.as_ref().unwrap().as_value()["taskRef"],
+                    "crm/t07"
+                );
 
                 let grouped = client
                     .call("query.jobs", Some(json!({"flowRun": flow_run_id.clone()})))
@@ -8236,14 +8272,31 @@ mod tests {
                     grouped["items"][0]["orchestration"]["flowRunId"],
                     flow_run_id
                 );
+                assert_eq!(grouped["items"][0]["taskRef"], "crm/t07");
+                assert_eq!(
+                    grouped["items"][0]["unit"],
+                    format!("tally-job-crm-t07-{task_uuid}.service")
+                );
                 assert_eq!(
                     grouped["items"][0]["argv"],
                     json!([
                         "sh",
                         "-c",
-                        "test -n \"$TALLY_BRIEF\" && test -f \"$TALLY_BRIEF\""
+                        "test -n \"$TALLY_BRIEF\" && test -f \"$TALLY_BRIEF\" && test \"$TALLY_TASK_REF\" = crm/t07"
                     ])
                 );
+                let lifecycle = client
+                    .call(
+                        "query.log",
+                        Some(json!({"task": task_uuid.to_string(), "limit": 100})),
+                    )
+                    .await
+                    .unwrap();
+                assert!(lifecycle["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|event| event["taskRef"] == "crm/t07"));
                 let unrelated = client
                     .call(
                         "query.jobs",
@@ -8260,6 +8313,7 @@ mod tests {
                 assert_eq!(reused["disposition"], "reused");
                 assert_eq!(reused["task_uuid"], created["task_uuid"]);
                 assert_eq!(reused["payloadHash"], created["payloadHash"]);
+                assert_eq!(reused["taskRef"], "crm/t07");
 
                 let mut changed_key = payload.clone();
                 changed_key["dedupKey"] = json!("flow:brief-round-trip:changed-key");
@@ -8271,6 +8325,7 @@ mod tests {
                 match changed_key_error {
                     WireIoError::Rpc(WireErrorCode::DedupKeyConflict, _, Some(data)) => {
                         assert_eq!(data["existingTaskUuid"], created["task_uuid"]);
+                        assert_eq!(data["existingTaskRef"], "crm/t07");
                         assert_eq!(
                             data["existingOrchestration"]["nodeOrdinal"],
                             payload["orchestration"]["nodeOrdinal"]

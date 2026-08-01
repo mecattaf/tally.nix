@@ -18,6 +18,9 @@ and it remains stable across attempts even when a live systemd job ID changes.
 If all you have is the live job ID, `query job` accepts that too and resolves
 the task anchor.
 
+Campaign nodes additionally expose an optional human `taskRef`, such as
+`crm/t07`. It is diagnostic provenance, not a replacement for the UUID.
+
 ```console
 $ tally query jobs --state running --limit 100
 $ tally query jobs --state queued --pool worker-gpu
@@ -45,7 +48,7 @@ nodes without matching descriptions or argv:
 $ tally query jobs --flow-run <flow-run-uuid>
 ```
 
-Each item exposes `orchestration.flowRunId`, the node ordinal, the orchestration
+Each item exposes top-level `taskRef` when present, `orchestration.flowRunId`, the node ordinal, the orchestration
 `scriptHash`, `argsHash`, and `catalogHash`, pool, executor, parent task, live
 state, and terminal facts. The runner itself is the parent row and is not one of
 the orchestrated child items unless it also carries that capsule.
@@ -75,8 +78,8 @@ The flow runner writes one JSON object per line. Alongside `log`,
 
 | Event | Emitted | Carries |
 |---|---|---|
-| `node-submitted` | When the daemon answers the node's enqueue | `ordinal`, `dedupKey`, `label`, `disposition`, `taskUuid`, `payloadHash`, `attempt` |
-| `node-terminal` | When the node's terminal result is observed | `ordinal`, `dedupKey`, `disposition`, `taskUuid`, `verdict`, `witnessSeq`, `exitCode`, `errorCode` |
+| `node-submitted` | When the daemon answers the node's enqueue | `ordinal`, `dedupKey`, `label`, `taskRef`, `disposition`, `taskUuid`, `payloadHash`, `attempt` |
+| `node-terminal` | When the node's terminal result is observed | `ordinal`, `dedupKey`, `taskRef`, `disposition`, `taskUuid`, `verdict`, `witnessSeq`, `exitCode`, `errorCode` |
 
 Unlike `log`, these are never suppressed on replay: a replayed prefix reporting
 `reused` is the fact an operator needs to see. `node-submitted` follows admission
@@ -169,6 +172,11 @@ unsupported, or truncated. A running remote trace can honestly report
 `remote-live-trace-unavailable`; it is never presented as an empty successful
 trace.
 
+For a campaign node, every journal/lifecycle record carries
+`TALLY_TASK_REF=crm/t07`, its `MESSAGE` includes `taskRef=crm/t07`, and the
+`query log` projection exposes `taskRef: "crm/t07"`. The same value is exported
+to the child as `TALLY_TASK_REF`.
+
 Query reads at most 16 MiB from one capture generation. Larger local capture
 files remain on disk, but the trace reports
 `query-read-truncated-at-16777216-bytes`. Remote capture transfer is also
@@ -203,8 +211,8 @@ snapshot, then start a new watch. Do not pretend the stream was continuous.
 | Witness and attestation ledgers | `~/.local/share/tally/` | `/var/lib/tally/data/` | Append-only |
 | Lifecycle history and watch log | same data directory | same data directory | Lifecycle is unbounded; watch keeps 4,096 records |
 | Enqueue events, captures, unit exits, meters | `~/.local/state/tally/` | `/var/lib/tally/state/` | No general automatic pruning |
-| Current stdout/stderr | `<stateDir>/capture/<uuid>.out` and `.err` | same layout | Accumulates |
-| Older attempt captures | `<stateDir>/capture/archive/<uuid>/` | same layout | Accumulates |
+| Current stdout/stderr | Ordinary: `<stateDir>/capture/<uuid>.out` and `.err`; task-ref node: `<uuid>.<task-id>.out` and `.err` | same layout | Accumulates |
+| Older attempt captures | Ordinary: `<stateDir>/capture/archive/<uuid>/`; task-ref node: `archive/<uuid>.<task-id>/` | same layout | Accumulates |
 | Worker-side remote state | configured executor `stateDir` | configured executor `stateDir` | Accumulates on the worker |
 
 These files are private implementation storage. Prefer the query API: it

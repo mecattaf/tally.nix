@@ -266,6 +266,9 @@ pub(super) fn execution_environment(
     if let Some(task_uuid) = &request.identity.task_uuid {
         environment.push(("TALLY_TASK_UUID".to_owned(), task_uuid.to_string()));
     }
+    if let Some(task_ref) = &request.identity.task_ref {
+        environment.push(("TALLY_TASK_REF".to_owned(), task_ref.to_string()));
+    }
     if let Some(parent) = &request.parent {
         environment.push(("TALLY_PARENT".to_owned(), parent.to_string()));
     }
@@ -394,33 +397,36 @@ pub(super) fn environment_to_unset(request: &ExecutionRequest) -> Vec<&'static s
     if request.identity.task_uuid.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[0]);
     }
-    if request.parent.is_none() {
+    if request.identity.task_ref.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[1]);
     }
-    if !request.no_enqueue {
+    if request.parent.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[2]);
     }
-    if request.credentials.is_empty() {
+    if !request.no_enqueue {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[3]);
+    }
+    if request.credentials.is_empty() {
+        names.push(OPTIONAL_TALLY_ENVIRONMENT[4]);
         names.push("CREDENTIALS_DIRECTORY");
     }
     if request.yield_hook.is_none() {
-        names.push(OPTIONAL_TALLY_ENVIRONMENT[4]);
-    }
-    if request.tally_socket.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[5]);
     }
-    if request.job_token.is_none() {
+    if request.tally_socket.is_none() {
         names.push(OPTIONAL_TALLY_ENVIRONMENT[6]);
     }
+    if request.job_token.is_none() {
+        names.push(OPTIONAL_TALLY_ENVIRONMENT[7]);
+    }
     if request.workspace.is_none() {
-        names.extend(OPTIONAL_TALLY_ENVIRONMENT[7..11].iter().copied());
+        names.extend(OPTIONAL_TALLY_ENVIRONMENT[8..12].iter().copied());
     }
     if request.brief_path.is_none() {
-        names.push(OPTIONAL_TALLY_ENVIRONMENT[11]);
+        names.push(OPTIONAL_TALLY_ENVIRONMENT[12]);
     }
     if request.gate_manifest.is_none() {
-        names.push(OPTIONAL_TALLY_ENVIRONMENT[12]);
+        names.push(OPTIONAL_TALLY_ENVIRONMENT[13]);
     }
     if request.git_ai.is_none() {
         names.push("GIT_AI_CUSTOM_ATTRIBUTES");
