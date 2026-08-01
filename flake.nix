@@ -4055,6 +4055,21 @@
                 fi
                 touch "$out"
               '';
+          campaign-timer-doc-drift =
+            pkgs.runCommand "tally-campaign-timer-doc-drift" { nativeBuildInputs = [ pkgs.ripgrep ]; }
+              ''
+                # tally-campaign-poll.timer ships, so the campaign docs must
+                # not carry the unscoped claim that no periodic campaign timer
+                # exists. Module-declared campaigns continue via their own
+                # /tally reconcile comment and forge-native ones via the timer;
+                # a blanket denial is true of neither path.
+                if rg -n 'there is no periodic campaign timer' \
+                  ${./doc/src/flows/campaigns.md}; then
+                  echo "campaigns.md contradicts the shipped tally-campaign-poll.timer" >&2
+                  exit 1
+                fi
+                touch "$out"
+              '';
           spec-build-conflict-domains =
             pkgs.runCommand "tally-spec-build-conflict-domains"
               {

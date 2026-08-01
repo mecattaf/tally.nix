@@ -146,6 +146,14 @@ authorized.
 
 ### Fixed
 
+- Reconciled the campaign documentation with the shipped
+  `tally-campaign-poll.timer`. The flows guide claimed outright that no
+  periodic campaign timer exists, which was true only of module-declared
+  campaigns; those continue through their own `/tally reconcile <name>`
+  comment, while forge-native armed campaigns post no continuation comment and
+  depend on the timer. The guide now names both mechanisms, states that
+  campaigns are Home Manager only and that the NixOS module renders no campaign
+  surface at all, and a check keeps the contradiction from returning.
 - Stopped campaign passes from starving their own failure diagnosis. The
   per-lane node budget counted only the success path, but `maxNodes` counts
   cumulative rows, so a lane that failed at merge overran it on the diff,
