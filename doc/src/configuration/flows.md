@@ -37,11 +37,14 @@ The scheduled producer receives the resolved store path. The flow runtime
 hashes the content and refuses to let one flow-run identity observe two script
 generations.
 
-`args` is serialized once into the generated producer's direct argv. Put values
-known at generation time there: executable paths, repositories, bounded input
-lists, and fixed policy. The checker evaluates those exact JSON bytes against
-the literal `meta.argsSchema`. Flow code should derive work from `args`,
-literals, metadata, and witnessed prior results rather than ambient state.
+`args` is serialized once into the generated producer's structured brief. The
+daemon content-addresses those JSON bytes, materializes them as a private file,
+and gives the runner only the `TALLY_BRIEF` path. The runner's durable argv
+therefore stays small even when the input is large. Put values known at
+generation time there: executable paths, repositories, bounded input lists,
+and fixed policy. The checker evaluates the same JSON against the literal
+`meta.argsSchema`. Flow code should derive work from `args`, literals,
+metadata, and witnessed prior results rather than ambient state.
 
 `extraEnv` is for non-reserved process settings, not another argument or secret
 channel. `credentials` supplies opaque files through the systemd credential
@@ -55,11 +58,13 @@ When `onCalendar` is non-null, Home Manager generates a calendar producer named
 equivalent of:
 
 ```text
-tally flow run <script> --args <json> --max-nodes <maxNodes> [--catalog <path>]
+tally flow run <script> --args-from-brief --max-nodes <maxNodes> [--catalog <path>]
 ```
 
 The producer uses the `shell` adapter and always requests the reserved `flow`
-pool. When `workloadMutex` is non-null, it requests that one pool as well. It
+pool. Its enqueue carries `args` in the structured `brief` field rather than in
+`argv`; `--args-from-brief` makes that transport choice explicit. When
+`workloadMutex` is non-null, the producer requests that one pool as well. It
 copies `priority`, `dedupKey`, `runtimeMaxSec`, `evidence`, `extraEnv`, and
 `credentials` from the flow entry. There is no extra catalog environment
 variable: a non-null `catalog` becomes the explicit `--catalog` flag.
@@ -187,7 +192,8 @@ The pipeline is:
    `windowed-consumption` predicate.
 5. Reject reserved `flow` or `build` in `meta.pools`.
 6. Compare a literal `meta.maxNodes` with the configured `maxNodes`.
-7. Run `tally --config <rendered-json> flow check <script> --args <configured-json>`.
+7. Write the configured JSON to a store file and run
+   `tally --config <rendered-json> flow check <script> --args-path <store-path>`.
 8. If `catalog` is non-null, run
    `tally --config <rendered-json> flow check <script> --catalog <store-path>`;
    otherwise reject any declared selector.

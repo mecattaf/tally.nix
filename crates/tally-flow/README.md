@@ -79,8 +79,8 @@ prompt also changes the structured brief and therefore reaches the existing
 The executable exposes:
 
 ```text
-tally flow check SCRIPT [--args JSON] [--catalog PATH]
-tally flow run SCRIPT --args JSON --max-nodes N [--catalog PATH] [--flow-run-id ID]
+tally flow check SCRIPT [--args JSON | --args-path PATH] [--catalog PATH]
+tally flow run SCRIPT [--args JSON | --args-path PATH | --args-from-brief] --max-nodes N [--catalog PATH] [--flow-run-id ID]
 ```
 
 The executable binds `FlowClient` to one multiplexed daemon connection. Every

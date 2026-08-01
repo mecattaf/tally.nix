@@ -143,6 +143,9 @@ pub struct ProducerEnqueue {
     pub adapter_options: AdapterJobOptions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_manifest: Option<GateManifestSpec>,
+    /// Structured job input materialized by the daemon and exposed as TALLY_BRIEF.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief: Option<Value>,
     #[serde(
         rename = "pool",
         serialize_with = "crate::poolset::serialize",
@@ -208,6 +211,20 @@ impl ProducerEnqueue {
                 Ok::<PathBuf, ProducerError>(rendered)
             })
             .transpose()?;
+        let brief = self
+            .brief
+            .as_ref()
+            .map(|brief| render_origin_value(brief, github))
+            .transpose()?;
+        if let Some(brief) = &brief {
+            let rendered_bytes = serde_json::to_vec(brief)?.len() as u64;
+            if rendered_bytes > crate::brief::MAX_BRIEF_BYTES {
+                return Err(ProducerError::InvalidObservation(format!(
+                    "rendered producer brief exceeds {} bytes",
+                    crate::brief::MAX_BRIEF_BYTES
+                )));
+            }
+        }
         Ok(EnqueuePayload {
             invocation: None,
             argv: Some(argv),
@@ -220,7 +237,7 @@ impl ProducerEnqueue {
             adapter_options: (!self.adapter_options.is_default())
                 .then(|| self.adapter_options.clone()),
             gate_manifest: self.gate_manifest.clone(),
-            brief: None,
+            brief,
             brief_path: None,
             resume_from: None,
             source: Some(source),

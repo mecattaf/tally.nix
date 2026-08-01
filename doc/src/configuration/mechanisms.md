@@ -150,6 +150,7 @@ semantics.
 | [`workspace`](core-options.md#servicestallyproducersnameenqueueworkspace) | Optional durable repository, base revision, branch, and worktree metadata. |
 | [`adapterOptions`](core-options.md#servicestallyproducersnameenqueueadapteroptions) | Per-job environment, pre-prompt argv, approval, sandbox, model, and effort requests, each constrained by the adapter. |
 | [`gateManifest`](core-options.md#servicestallyproducersnameenqueuegatemanifest) | Optional completion-artifact path, required gate IDs, and acceptance policy. |
+| [`brief`](core-options.md#servicestallyproducersnameenqueuebrief) | Optional structured JSON input, content-addressed and exposed to the job as a private file through `TALLY_BRIEF`; GitHub origin placeholders are resolved recursively without placing the result in argv. |
 | [`pool`](core-options.md#servicestallyproducersnameenqueuepool) | Non-empty, duplicate-free atomic set of named pools; a singleton string is accepted for compatibility. |
 | [`executor`](core-options.md#servicestallyproducersnameenqueueexecutor) | Optional named remote target; an unset value executes on the coordinator. |
 | [`priority`](core-options.md#servicestallyproducersnameenqueuepriority) | Admission priority of this job. |

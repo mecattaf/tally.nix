@@ -94,6 +94,11 @@ authorized.
 
 ### Fixed
 
+- Moved generated flow and campaign arguments out of runner argv and into the
+  daemon's content-addressed structured-brief transport. Runners now read those
+  arguments through `TALLY_BRIEF`, keeping job queries, transient-unit status,
+  and process argv bounded independently of campaign input size; manual flow
+  invocations can also use an absolute `--args-path` JSON file.
 - Allowed a campaign to opt into self-posted GitHub mentions with
   `services.tally.campaigns.<name>.allowSelfTriggered`, while preserving the
   loop-breaking `false` default for campaigns that run under a bot identity.

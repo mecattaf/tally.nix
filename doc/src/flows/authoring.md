@@ -72,8 +72,9 @@ runner lease or consumption estimate in JavaScript.
 Prefer thick Nix data and thin JavaScript control. Values known while building the
 host generation belong in `services.tally.flows.<name>.args`: roster-independent
 paths, program paths, repositories, fixed policy, and bounded input lists. The
-module serializes the attributes to JSON and validates them against
-`meta.argsSchema` before activation.
+module serializes the attributes to JSON, validates them against
+`meta.argsSchema` before activation, and delivers them to a scheduled runner as
+a content-addressed brief file rather than a literal argv item.
 
 The script should route that data and prior `NodeResult` values. It should not
 discover configuration by reading a clock, environment variable, directory, or
@@ -132,6 +133,10 @@ The implementation is narrower than the option tree suggests:
 - A generated runner always requests `flow` and additionally requests its one
   configured `workloadMutex`, if any. The removed `budgetPool` option never
   added a runner or child lease and is now rejected during configuration.
+- A generated runner reads its configured arguments from the private file named
+  by `TALLY_BRIEF`; its argv contains only `--args-from-brief` and stable control
+  flags. Manual checks and runs may use inline `--args` or an absolute
+  `--args-path` JSON file.
 
 For an unscheduled run, supply a UUID explicitly unless tally is launching the
 runner as a parent job:
@@ -147,9 +152,10 @@ The explicit flag wins when present. Otherwise the runner takes `flowRunId` from
 its inherited `TALLY_TASK_UUID`; a job-launched runner requires that UUID and
 `TALLY_JOB_ID` together and uses them for child ancestry. Having neither identity
 source is `flow-run-id-missing` (exit 2); a malformed or half-present inherited
-identity also exits 2. After capturing identity, the CLI retains `TALLY_SOCKET`
-but removes other inherited `TALLY_*` variables before executing the script, so
-child tools cannot mistake the runner's identity for their own.
+identity also exits 2. After capturing identity and any requested `TALLY_BRIEF`
+path, the CLI retains `TALLY_SOCKET` but removes other inherited `TALLY_*`
+variables before executing the script, so child tools cannot mistake the
+runner's identity for their own.
 
 ## Learn from the shipped flows
 

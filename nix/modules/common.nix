@@ -598,6 +598,18 @@ let
             policy passed with this enqueue.
           '';
         };
+        brief = mkOption {
+          type = types.raw;
+          default = null;
+          example = {
+            subject = "\${gh.url}";
+          };
+          description = ''
+            Optional structured JSON input. The daemon content-addresses it,
+            materializes it outside argv, and exposes its path as TALLY_BRIEF.
+            GitHub enqueue values may use documented origin placeholders.
+          '';
+        };
         pool = mkOption {
           type = types.coercedTo types.str (pool: [ pool ]) (types.listOf types.str);
           default = [ ];
@@ -2526,6 +2538,7 @@ let
       workspace = renderWorkspace enqueue.workspace;
       adapterOptions = renderAdapterJobOptions enqueue.adapterOptions;
       gateManifest = renderGateManifest enqueue.gateManifest;
+      inherit (enqueue) brief;
       pool = if builtins.length pools == 1 then builtins.head pools else pools;
       credentials = mapAttrs (_: toString) enqueue.credentials;
     };
@@ -2757,8 +2770,7 @@ let
         "flow"
         "run"
         (storePathWithContext flow.script)
-        "--args"
-        (builtins.toJSON flow.args)
+        "--args-from-brief"
         "--max-nodes"
         (toString flow.maxNodes)
       ]
@@ -2767,6 +2779,7 @@ let
         (storePathWithContext flow.catalog)
       ];
       adapter = "shell";
+      brief = flow.args;
       adapterOptions.environment = flow.extraEnv;
       pool = [ "flow" ] ++ lib.optional (flow.workloadMutex != null) flow.workloadMutex;
       inherit (flow)
@@ -2880,12 +2893,12 @@ let
           "flow"
           "run"
           (storePathWithContext specBuildFlow)
-          "--args"
-          (builtins.toJSON runtimeArgs)
+          "--args-from-brief"
           "--max-nodes"
           (toString (campaignMaxNodes campaign))
         ];
         adapter = "shell";
+        brief = runtimeArgs;
         pool = [
           "flow"
           campaign.pool.name
@@ -3260,7 +3273,7 @@ let
             fi
 
             ${lib.getExe cfg.package} --config ${rendered} flow check ${script} \
-              --args "$(cat ${args})" >/dev/null
+              --args-path ${lib.escapeShellArg "${args}"} >/dev/null
 
             selector_count="$(jq -r '(.selectors // []) | length' "$meta")"
             ${catalogCheck}
