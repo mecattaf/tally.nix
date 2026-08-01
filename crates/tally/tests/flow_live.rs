@@ -1053,8 +1053,12 @@ async fn fs5_live_acceptance_matrix() {
             // onto every child without turning that child into a GitHub job.
             let producer_events = temp.path().join("producer-events");
             let producer_state = temp.path().join("producer-state");
-            let producer =
-                ProducerEngine::new(&config.producers, producer_events.clone(), &producer_state);
+            let producer = ProducerEngine::new(
+                &config.producers,
+                producer_events.clone(),
+                &producer_state,
+                &paths.data_dir,
+            );
             let observation = github_flow_observation();
             let emitted = match producer
                 .emit_gh("github-flow", &observation, chrono::Utc::now())

@@ -2073,6 +2073,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "libc",
  "serde_json",
  "tally-client",
  "tally-core",

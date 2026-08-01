@@ -46,6 +46,8 @@ let
     producer
     "--state-dir"
     (toString cfg.stateDir)
+    "--data-dir"
+    (toString cfg.dataDir)
   ];
 
   mkDispatchProgram =
@@ -348,7 +350,7 @@ in
   config = lib.mkMerge [
     {
       services.tally.adapters = common.adapterDefaults;
-      services.tally.producers = common.mkFlowProducers cfg.flows;
+      services.tally.producers = common.mkFlowProducers cfg cfg.flows;
       home.activation.tallyCleanRemovedProducers = lib.hm.dag.entryAfter [ "writeBoundary" ] ''
         ${cleanupProgram}/bin/tally-clean-removed-producers
       '';
@@ -472,7 +474,7 @@ in
 
         tally-retention = lib.mkIf cfg.retention.enable {
           Unit = {
-            Description = "prune expired tally GC roots, capture archives, and ingress event files";
+            Description = "prune expired tally GC roots, briefs, capture archives, and ingress event files";
             After = [ "tally-daemon.service" ];
             Requires = [ "tally-daemon.service" ];
           };

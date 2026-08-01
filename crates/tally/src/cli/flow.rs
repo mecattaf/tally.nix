@@ -1,4 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::fs::OpenOptionsExt;
 
 use tally_core::config::{FlowRegistration, PoolPredicate};
 use tally_flow::validate_flow_pool_predicates;
@@ -11,6 +14,7 @@ pub(super) struct InheritedFlowEnvironment {
     pub(super) job_id: Option<String>,
     pub(super) job_token: Option<String>,
     pub(super) brief_path: Option<PathBuf>,
+    pub(super) brief_hash: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -32,6 +36,7 @@ impl InvocationEnvironment {
             job_id: std::env::var("TALLY_JOB_ID").ok(),
             job_token: std::env::var("TALLY_JOB_TOKEN").ok(),
             brief_path: std::env::var_os("TALLY_BRIEF").map(PathBuf::from),
+            brief_hash: std::env::var("TALLY_BRIEF_HASH").ok(),
         });
         Self {
             rpc_timeout: std::env::var_os(RPC_TIMEOUT_ENV),
@@ -146,6 +151,7 @@ pub(super) async fn run_flow(
                 job_id: inherited_job_id,
                 job_token: inherited_job_token,
                 brief_path,
+                brief_hash,
             } = inherited;
             let flow_args = match (args.args, args.args_path, args.args_from_brief) {
                 (Some(args), None, false) => args,
@@ -153,7 +159,9 @@ pub(super) async fn run_flow(
                 (None, None, true) => {
                     let path = brief_path
                         .ok_or_else(|| invalid("--args-from-brief requires TALLY_BRIEF"))?;
-                    load_flow_args(&path)?
+                    let hash = brief_hash
+                        .ok_or_else(|| invalid("--args-from-brief requires TALLY_BRIEF_HASH"))?;
+                    load_verified_flow_args(&path, &hash)?
                 }
                 (None, None, false) => json!({}),
                 _ => unreachable!("clap rejects conflicting flow args inputs"),
@@ -276,9 +284,51 @@ pub(super) async fn run_flow(
 }
 
 fn load_flow_args(path: &Path) -> Result<Value> {
-    tally_core::brief::PreparedBrief::from_path(path)
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
+        .open(path)
+        .with_context(|| format!("cannot open flow arguments {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect flow arguments {}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(invalid(format!(
+            "flow arguments {} are not a regular file",
+            path.display()
+        )));
+    }
+    if metadata.len() > tally_core::brief::MAX_BRIEF_BYTES {
+        return Err(invalid(format!(
+            "flow arguments {} exceed the {}-byte input limit",
+            path.display(),
+            tally_core::brief::MAX_BRIEF_BYTES
+        )));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(tally_core::brief::MAX_BRIEF_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read flow arguments {}", path.display()))?;
+    if bytes.len() as u64 > tally_core::brief::MAX_BRIEF_BYTES {
+        return Err(invalid(format!(
+            "flow arguments {} grew beyond the {}-byte input limit",
+            path.display(),
+            tally_core::brief::MAX_BRIEF_BYTES
+        )));
+    }
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("flow arguments {} are not valid JSON", path.display()))
+}
+
+fn load_verified_flow_args(path: &Path, hash: &str) -> Result<Value> {
+    tally_core::brief::read_verified(path, hash)
         .map(|prepared| prepared.document().clone())
-        .with_context(|| format!("cannot read flow arguments from {}", path.display()))
+        .with_context(|| {
+            format!(
+                "cannot verify flow arguments {} against TALLY_BRIEF_HASH",
+                path.display()
+            )
+        })
 }
 
 fn matching_workload_mutex<'a>(

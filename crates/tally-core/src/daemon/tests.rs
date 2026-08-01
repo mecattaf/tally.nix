@@ -2899,7 +2899,12 @@ mod tests {
                 daemon.finish_job(child_finished).await.unwrap();
                 daemon.handler.drain_post_ack_tasks().await;
 
-                let engine = ProducerEngine::new(&registry, paths.events_dir(), &paths.state_dir);
+                let engine = ProducerEngine::new(
+                    &registry,
+                    paths.events_dir(),
+                    &paths.state_dir,
+                    &paths.data_dir,
+                );
                 let lost = engine
                     .observe_reachability("health", false, Utc::now())
                     .unwrap();
@@ -3196,8 +3201,12 @@ mod tests {
                     },
                 )
                 .unwrap();
-                let engine =
-                    ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir);
+                let engine = ProducerEngine::new(
+                    &config.producers,
+                    paths.events_dir(),
+                    &paths.state_dir,
+                    &paths.data_dir,
+                );
                 let lost = engine
                     .observe_reachability("health", false, Utc::now())
                     .unwrap();
@@ -3295,8 +3304,12 @@ mod tests {
                     }
                 }))
                 .unwrap();
-                let engine =
-                    ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir);
+                let engine = ProducerEngine::new(
+                    &config.producers,
+                    paths.events_dir(),
+                    &paths.state_dir,
+                    &paths.data_dir,
+                );
                 let lost = engine
                     .observe_reachability("health", false, Utc::now())
                     .unwrap();
@@ -3532,8 +3545,12 @@ mod tests {
                 .unwrap();
                 config.validate().unwrap();
                 let now = Utc::now();
-                let engine =
-                    ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir);
+                let engine = ProducerEngine::new(
+                    &config.producers,
+                    paths.events_dir(),
+                    &paths.state_dir,
+                    &paths.data_dir,
+                );
                 engine.emit_calendar("daily", now).unwrap();
                 engine
                     .emit_gh(
@@ -3779,8 +3796,12 @@ mod tests {
                         "esac\n",
                     ),
                 );
-                let engine =
-                    ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir);
+                let engine = ProducerEngine::new(
+                    &config.producers,
+                    paths.events_dir(),
+                    &paths.state_dir,
+                    &paths.data_dir,
+                );
                 let outcomes = engine
                     .poll_gh("github", &GhCliIntake::with_program(&gh), Utc::now())
                     .unwrap();

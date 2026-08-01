@@ -92,8 +92,12 @@ impl Daemon {
             }
         }
         let units = collect_local_unit_facts(&executor, &durable).await?;
-        let producer_engine =
-            ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir);
+        let producer_engine = ProducerEngine::new(
+            &config.producers,
+            paths.events_dir(),
+            &paths.state_dir,
+            &paths.data_dir,
+        );
         let confirmed_pool_returns = producer_engine
             .confirmed_pool_returns()
             .map_err(|error| DaemonError::Invalid(error.to_string()))?
@@ -250,12 +254,16 @@ impl Daemon {
             Utc::now(),
         )?;
         let initial_gh_completions = recovery_gh_completions(&plan, &completed_witness, &executor)?;
-        let initial_lost_pools =
-            ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir)
-                .confirmed_pool_losses()
-                .map_err(|error| DaemonError::Invalid(error.to_string()))?
-                .into_iter()
-                .collect::<Vec<_>>();
+        let initial_lost_pools = ProducerEngine::new(
+            &config.producers,
+            paths.events_dir(),
+            &paths.state_dir,
+            &paths.data_dir,
+        )
+        .confirmed_pool_losses()
+        .map_err(|error| DaemonError::Invalid(error.to_string()))?
+        .into_iter()
+        .collect::<Vec<_>>();
         let query_rows = recovery_query_rows(&plan);
         let query_details = recovery_query_details(&plan);
         let rows = plan
@@ -1210,14 +1218,27 @@ pub(super) fn validate_recovery_briefs(
     plan: &crate::recovery::RecoveryPlan,
     data_dir: &Path,
 ) -> Result<(), DaemonError> {
-    let hashes = plan
-        .rows
-        .iter()
-        .filter_map(|recovery| recovery.row.brief_hash.as_deref())
-        .collect::<BTreeSet<_>>();
-    for hash in hashes {
+    let mut hashes = BTreeMap::<&str, bool>::new();
+    for recovery in &plan.rows {
+        let Some(hash) = recovery.row.brief_hash.as_deref() else {
+            continue;
+        };
+        let required = !matches!(
+            recovery.state,
+            crate::recovery::RecoveryRowState::Completed
+                | crate::recovery::RecoveryRowState::Deleted
+        );
+        hashes
+            .entry(hash)
+            .and_modify(|existing| *existing |= required)
+            .or_insert(required);
+    }
+    for (hash, required) in hashes {
         let path = brief::content_path(data_dir, hash)
             .map_err(|error| DaemonError::Invalid(error.to_string()))?;
+        if !required && !path.exists() {
+            continue;
+        }
         brief::read_verified(&path, hash)
             .map_err(|error| DaemonError::Invalid(error.to_string()))?;
     }

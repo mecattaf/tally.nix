@@ -4,7 +4,7 @@ pub const CAPTURE_DIRECTORY: &str = "capture";
 pub const CAPTURE_ARCHIVE_DIRECTORY: &str = "capture/archive";
 pub const UNIT_EXIT_DIRECTORY: &str = "unit-exit";
 pub const UNIT_EXIT_SCHEMA_VERSION: u32 = 2;
-pub(super) const OPTIONAL_TALLY_ENVIRONMENT: [&str; 14] = [
+pub(super) const OPTIONAL_TALLY_ENVIRONMENT: [&str; 15] = [
     "TALLY_TASK_UUID",
     "TALLY_TASK_REF",
     "TALLY_PARENT",
@@ -18,6 +18,7 @@ pub(super) const OPTIONAL_TALLY_ENVIRONMENT: [&str; 14] = [
     "TALLY_WORKSPACE_BRANCH",
     "TALLY_WORKSPACE_PATH",
     "TALLY_BRIEF",
+    "TALLY_BRIEF_HASH",
     "TALLY_GATE_MANIFEST",
 ];
 pub(super) const GH_TALLY_ENVIRONMENT: [&str; 11] = [

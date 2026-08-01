@@ -1372,7 +1372,7 @@
                 { config, ... }:
                 {
                   config.services.tally.adapters = moduleCommon.adapterDefaults;
-                  config.services.tally.producers = moduleCommon.mkFlowProducers config.services.tally.flows;
+                  config.services.tally.producers = moduleCommon.mkFlowProducers config.services.tally config.services.tally.flows;
                 }
               )
             ];
@@ -3153,6 +3153,8 @@
             ];
           pkgs.runCommand "tally-module-contract" { nativeBuildInputs = [ pkgs.jq ]; } ''
             grep -F -- '__producer-dispatch' ${homeServiceExec "tally-producer-daily"}
+            grep -F -- '--data-dir' ${homeServiceExec "tally-producer-daily"}
+            grep -F -- '${toString stockHome.config.services.tally.dataDir}' ${homeServiceExec "tally-producer-daily"}
             grep -F -- '"kind":"calendar"' ${homeServiceExec "tally-producer-daily"}
             grep -F -- 'XDG_RUNTIME_DIR' ${homeServiceExec "tally-producer-daily"}
             if grep -F -- '%t/tally/tally.sock' ${homeServiceExec "tally-producer-daily"}; then
@@ -3164,7 +3166,7 @@
             grep -F -- 'systemctl --user stop "$unit"' ${homeServiceExec "tally-clean-removed-producers"}
             grep -F -- 'witness append --ledger "$ledger" --payload "$payload"' \
               ${tallyWitnessEmit}/bin/tally-witness-emit
-            jq -e '
+            jq -e --arg tally ${tally}/bin/tally '
               .maxFrameBytes == 33554432 and
               .agingThresholdSec == 900 and
               .enqueue.depthCap == 3 and
@@ -3192,7 +3194,7 @@
               .pools["claude-window"].capacity == 8 and
               .producers["flow-fixture"].kind == "calendar" and
               .producers["flow-fixture"].onCalendar == "daily" and
-              .producers["flow-fixture"].enqueue.argv[0:3] == ["tally", "flow", "run"] and
+              .producers["flow-fixture"].enqueue.argv[0:3] == [$tally, "flow", "run"] and
               .producers["flow-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "1000"] and
               .producers["flow-fixture"].enqueue.argv[7] == "--catalog" and
               .producers["flow-fixture"].enqueue.brief == {"task":"ship"} and
@@ -3431,8 +3433,10 @@
                 ' "$TMPDIR/constraint-pass.json" >/dev/null
 
                 default_event='{"kind":"gh","source":"search","repo":"acme/spec","number":6,"htmlUrl":"https://github.com/acme/spec/issues/6","itemType":"issue","nodeId":"I-campaign-6","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-6","commentId":"comment-6","triggerTimestamp":"2026-07-31T08:59:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["campaign"],"assignees":[],"triggeringComment":{"id":"comment-6","author":"operator","body":"@tally build"}}}'
+                mkdir -p "$TMPDIR/data"
                 default_dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
                   __producer-dispatch campaign-defaulted --state-dir "$TMPDIR/state" \
+                  --data-dir "$TMPDIR/data" \
                   --event "$default_event")"
                 test "$(printf '%s' "$default_dispatch" | jq -r '.filtered.reason')" = \
                   self-trigger-disabled
@@ -3440,10 +3444,13 @@
                 event='{"kind":"gh","source":"search","repo":"acme/spec","number":7,"htmlUrl":"https://github.com/acme/spec/issues/7","itemType":"issue","nodeId":"I-campaign-7","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-7","commentId":"comment-7","triggerTimestamp":"2026-07-31T09:00:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["spec-campaign"],"assignees":[],"triggeringComment":{"id":"comment-7","author":"operator","body":"@tally build"}}}'
                 dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
                   __producer-dispatch campaign-fixture --state-dir "$TMPDIR/state" \
+                  --data-dir "$TMPDIR/data" \
                   --event "$event")"
                 payload="$(printf '%s' "$dispatch" | jq -r '.emitted')"
                 runtime_args="$(jq -r '.briefPath' "$payload")"
                 test -f "$runtime_args"
+                test "$(dirname "$(dirname "$runtime_args")")" = "$TMPDIR/data"
+                test ! -e "$TMPDIR/state/briefs"
                 jq -e '
                   .campaign == "fixture" and
                   .repository == "acme/spec" and
@@ -3823,15 +3830,17 @@
                 test "$(jq -r '.producers | keys | join(",")' ${producerConfig})" = 'daily,drop,effects,github,github-flow,health'
                 test "$(jq -r '[.producers[] | select(has("pool") or has("priority") or has("adapter"))] | length' ${producerConfig})" = 0
                 producer_state="$PWD/state"
-                daily="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch daily --state-dir "$producer_state" --event '{"kind":"calendar"}')"
+                producer_data="$PWD/data"
+                mkdir -p "$producer_data"
+                daily="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch daily --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"calendar"}')"
                 test "$(printf '%s' "$daily" | jq -r 'keys[0]')" = emitted
                 own_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":21,"htmlUrl":"https://github.com/agency-agency/spec/issues/21","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"tally-bot","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-42","commentId":"comment-42","triggerTimestamp":"2026-07-20T12:30:00Z","context":{"schemaVersion":2,"title":"Self-authored issue","body":"untrusted $(must-not-run)","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-42","author":"tally-bot","body":"/tally run"}}}'
-                own="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event "$own_event")"
+                own="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --data-dir "$producer_data" --event "$own_event")"
                 test "$(printf '%s' "$own" | jq -r 'keys[0]')" = emitted
                 own_path="$(printf '%s' "$own" | jq -r '.emitted')"
                 jq -e '.argv == ["gh-job"] and .noEnqueue == true' "$own_path" >/dev/null
                 flow_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":61,"htmlUrl":"https://github.com/agency-agency/spec/issues/61","itemType":"issue","nodeId":"I-flow-61","itemAuthor":"flow-author","triggerActor":"tally-bot","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"notification-61","commentId":"comment-61","triggerTimestamp":"2026-07-26T12:30:00Z","context":{"schemaVersion":2,"title":"Pooled review","body":"untrusted $(must-not-run)","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-61","author":"tally-bot","body":"/pooled-review"}}}'
-                flow="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github-flow --state-dir "$producer_state" --event "$flow_event")"
+                flow="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github-flow --state-dir "$producer_state" --data-dir "$producer_data" --event "$flow_event")"
                 test "$(printf '%s' "$flow" | jq -r 'keys[0]')" = emitted
                 flow_path="$(printf '%s' "$flow" | jq -r '.emitted')"
                 flow_args="$(jq -r '.briefPath' "$flow_path")"
@@ -3855,10 +3864,12 @@
                   "subject": "https://github.com/agency-agency/spec/issues/61",
                   "minimumValid": 2
                 }' "$flow_args" >/dev/null
-                flow_duplicate="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github-flow --state-dir "$producer_state" --event "$flow_event")"
+                test "$(dirname "$(dirname "$flow_args")")" = "$producer_data"
+                test ! -e "$producer_state/briefs"
+                flow_duplicate="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github-flow --state-dir "$producer_state" --data-dir "$producer_data" --event "$flow_event")"
                 test "$(printf '%s' "$flow_duplicate" | jq -r '.')" = duplicate
                 rejected_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":21,"htmlUrl":"https://github.com/agency-agency/spec/issues/21","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"untrusted-user","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-43","commentId":"comment-43","triggerTimestamp":"2026-07-20T12:31:00Z","context":{"schemaVersion":2,"title":"Self-authored issue","body":"untrusted","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-43","author":"untrusted-user","body":"/tally run"}}}'
-                rejected="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --event "$rejected_event")"
+                rejected="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --data-dir "$producer_data" --event "$rejected_event")"
                 test "$(printf '%s' "$rejected" | jq -r '.filtered.reason')" = trigger-actor-not-allowed
                 effect="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"
                 test "$(printf '%s' "$effect" | jq -r '.[0] | keys[0]')" = emitted

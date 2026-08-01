@@ -670,6 +670,7 @@ fn calendar_emits_a_direct_payload_with_strftime_dedup_and_credentials() {
         &registry,
         temp.path().join("events"),
         temp.path().join("state"),
+        temp.path(),
     );
     let EmitOutcome::Emitted(path) = engine.emit_calendar("daily", fixed_now()).unwrap() else {
         panic!("calendar did not emit")
@@ -687,6 +688,8 @@ fn calendar_emits_a_direct_payload_with_strftime_dedup_and_credentials() {
         PathBuf::from("/run/credentials/calendar-token")
     );
     let brief_path = payload.brief_path.as_ref().unwrap();
+    assert!(brief_path.starts_with(temp.path().join("briefs")));
+    assert!(!temp.path().join("state/briefs").exists());
     assert_eq!(
         crate::brief::PreparedBrief::from_path(brief_path)
             .unwrap()
@@ -709,14 +712,14 @@ fn github_origin_templates_render_into_literal_fields_without_a_shell() {
         "${gh.headSha}".to_owned(),
         format!("$(touch {})", marker.display()),
     ];
-    let campaign_issue = "campaign issue body ".repeat(60_000);
-    assert!(campaign_issue.len() > MAX_INGRESS_BYTES as usize);
+    let large_campaign_config = "repository and gate configuration ".repeat(40_000);
+    assert!(large_campaign_config.len() > MAX_INGRESS_BYTES as usize);
     github.enqueue.brief = Some(serde_json::json!({
         "issue": {
             "url": "${gh.url}",
             "number": "${gh.number}",
-            "body": campaign_issue,
         },
+        "configPayload": large_campaign_config,
         "runId": "${gh.eventId}",
     }));
     github.enqueue.cwd = Some(PathBuf::from("/worktrees/${repoName}"));
@@ -732,6 +735,7 @@ fn github_origin_templates_render_into_literal_fields_without_a_shell() {
         &registry,
         temp.path().join("events"),
         temp.path().join("state"),
+        temp.path(),
     );
     let observation = gh_observation("PR_template", "author", "contributor");
     let EmitOutcome::Emitted(path) = engine.emit_gh("github", &observation, fixed_now()).unwrap()
@@ -753,10 +757,11 @@ fn github_origin_templates_render_into_literal_fields_without_a_shell() {
     assert!(argv.iter().all(|argument| argument.len() < 64 * 1024));
     assert!(argv
         .iter()
-        .all(|argument| !argument.contains("campaign issue body")));
+        .all(|argument| !argument.contains("repository and gate configuration")));
     assert!(payload.brief.is_none());
     let brief_path = payload.brief_path.as_ref().unwrap();
-    assert!(brief_path.starts_with(temp.path().join("state/briefs")));
+    assert!(brief_path.starts_with(temp.path().join("briefs")));
+    assert!(!temp.path().join("state/briefs").exists());
     let prepared = crate::brief::PreparedBrief::from_path(brief_path).unwrap();
     assert_eq!(
         prepared.document(),
@@ -764,8 +769,8 @@ fn github_origin_templates_render_into_literal_fields_without_a_shell() {
             "issue": {
                 "url": "https://github.com/acme/widgets/pull/128",
                 "number": "128",
-                "body": campaign_issue,
             },
+            "configPayload": large_campaign_config,
             "runId": "thread-128",
         })
     );
@@ -803,12 +808,48 @@ fn github_origin_templates_render_into_literal_fields_without_a_shell() {
         &registry,
         temp.path().join("missing-events"),
         temp.path().join("missing-state"),
+        temp.path(),
     );
     let error = missing_engine
         .emit_gh("github", &issue, fixed_now())
         .unwrap_err()
         .to_string();
     assert!(error.contains("gh.headSha"), "{error}");
+}
+
+#[test]
+fn rendered_producer_brief_enforces_the_canonical_size_limit() {
+    let temp = tempdir().unwrap();
+    let mut registry = registry(&temp.path().join("effects.jsonl"));
+    let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+        unreachable!()
+    };
+    github.enqueue.brief = Some(serde_json::json!({
+        // The template itself is small enough to configure, but rendering a
+        // bounded 4 KiB origin field repeatedly crosses MAX_BRIEF_BYTES.
+        "expanded": "${gh.triggerValue}".repeat(5_000),
+    }));
+    validate_registry(
+        &registry,
+        &BTreeSet::from(["slot".to_owned()]),
+        &BTreeSet::from(["shell".to_owned()]),
+        &BTreeSet::new(),
+    )
+    .unwrap();
+    let engine = ProducerEngine::new(
+        &registry,
+        temp.path().join("events"),
+        temp.path().join("state"),
+        temp.path(),
+    );
+    let mut observation = gh_observation("PR_large_render", "author", "contributor");
+    observation.trigger_value = Some("x".repeat(MAX_GH_ORIGIN_FIELD_BYTES));
+    let error = engine
+        .emit_gh("github", &observation, fixed_now())
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("rendered producer brief exceeds"), "{error}");
+    assert!(!temp.path().join("briefs").exists());
 }
 
 struct RecordingMutation {
@@ -883,6 +924,7 @@ fn github_gate_failure_and_not_run_remain_open_and_never_mutate_wins() {
         &registry,
         temp.path().join("events"),
         temp.path().join("state"),
+        temp.path(),
     );
 
     for completion in [
@@ -930,6 +972,7 @@ fn github_gate_failure_and_not_run_remain_open_and_never_mutate_wins() {
         &inert_registry,
         temp.path().join("inert-events"),
         temp.path().join("inert-state"),
+        temp.path(),
     );
     let mut inert_sink = RecordingMutation::default();
     assert!(!inert_engine
@@ -956,6 +999,7 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
         &registry,
         temp.path().join("events"),
         temp.path().join("state"),
+        temp.path(),
     );
     let external = gh_observation("PR_kwABC128", "issue-author", "contributor");
     let EmitOutcome::Emitted(path) = engine.emit_gh("github", &external, fixed_now()).unwrap()
@@ -1059,6 +1103,7 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
         &comment_only_registry,
         temp.path().join("comment-only-events"),
         temp.path().join("comment-only-state"),
+        temp.path(),
     );
     let mut comment_only_sink = RecordingMutation::default();
     assert!(comment_only_engine
@@ -1208,6 +1253,7 @@ fn github_self_trigger_policy_authorizes_the_trigger_actor_with_a_reasoned_rejec
         &registry,
         temp.path().join("events"),
         temp.path().join("state"),
+        temp.path(),
     );
 
     let allowed = gh_observation("I_self_authored", "tally-bot", "tally-bot");
@@ -1314,6 +1360,7 @@ fn github_issue_21_repo_label_and_state_scope_admits_only_the_exact_match() {
         &registry,
         temp.path().join("events"),
         temp.path().join("state"),
+        temp.path(),
     );
 
     let mut matching = gh_command_observation("issue-21-comment", "contributor");
@@ -1364,6 +1411,7 @@ fn github_issue_21_repo_label_and_state_scope_admits_only_the_exact_match() {
         &unscoped_registry,
         temp.path().join("unscoped-events"),
         temp.path().join("unscoped-state"),
+        temp.path(),
     );
     assert_eq!(
         unscoped_engine
@@ -1431,7 +1479,7 @@ fn github_comment_receipts_ack_one_accept_one_duplicate_and_a_later_job() {
     github.allowed_actors = vec!["contributor".to_owned()];
     let events = temp.path().join("events");
     let state = temp.path().join("state");
-    let engine = ProducerEngine::new(&registry, &events, &state);
+    let engine = ProducerEngine::new(&registry, &events, &state, temp.path());
     let first_observation = gh_command_observation("comment-1", "contributor");
     let mut acknowledgements = RecordingAcknowledgements::default();
 
@@ -1539,6 +1587,7 @@ fn github_event_receipt_rejects_a_mutated_value_under_the_same_identity() {
         &registry,
         temp.path().join("events"),
         temp.path().join("state"),
+        temp.path(),
     );
     let mut observation = gh_command_observation("event-1", "maintainer");
     observation.trigger_kind = "assignment".to_owned();
@@ -1580,7 +1629,7 @@ fn github_unauthorized_command_records_rule_acknowledges_and_never_enqueues() {
     github.allowed_actors = vec!["maintainer".to_owned()];
     let events = temp.path().join("events");
     let state = temp.path().join("state");
-    let engine = ProducerEngine::new(&registry, &events, &state);
+    let engine = ProducerEngine::new(&registry, &events, &state, temp.path());
     let observation = gh_command_observation("unauthorized-comment", "outsider");
     let mut acknowledgements = RecordingAcknowledgements::default();
 
@@ -1718,7 +1767,7 @@ fn github_cli_poll_requires_exact_trigger_actor_and_deduplicates_event_ids() {
             ),
         );
     let intake = GhCliIntake::with_program(&gh);
-    let engine = ProducerEngine::new(&registry, &events, &state);
+    let engine = ProducerEngine::new(&registry, &events, &state, temp.path());
     let first = engine.poll_gh("github", &intake, fixed_now()).unwrap();
     assert_eq!(
         first
@@ -1794,14 +1843,16 @@ fn github_cli_poll_requires_exact_trigger_actor_and_deduplicates_event_ids() {
         unreachable!()
     };
     disabled.enable = false;
-    assert!(ProducerEngine::new(&disabled_registry, &events, &state)
-        .poll_gh(
-            "github",
-            &GhCliIntake::with_program(temp.path().join("absent-gh")),
-            fixed_now(),
-        )
-        .unwrap()
-        .is_empty());
+    assert!(
+        ProducerEngine::new(&disabled_registry, &events, &state, temp.path())
+            .poll_gh(
+                "github",
+                &GhCliIntake::with_program(temp.path().join("absent-gh")),
+                fixed_now(),
+            )
+            .unwrap()
+            .is_empty()
+    );
 
     let malformed_gh = temp.path().join("malformed-gh-intake");
     crate::test_support::install_shell_program(
@@ -1844,7 +1895,7 @@ fn build_effect_is_atomic_single_flight_per_store_path() {
             let barrier = barrier.clone();
             handles.push(scope.spawn(move || {
                 barrier.wait();
-                ProducerEngine::new(&registry, events, state)
+                ProducerEngine::new(&registry, events, state.clone(), state)
                     .emit_build_effect("effects", Path::new(STORE_A), fixed_now())
                     .unwrap()
             }));
@@ -1887,12 +1938,12 @@ fn build_effect_is_atomic_single_flight_per_store_path() {
     assert_eq!(claims.len(), 1);
     archive_ingress_claim(&events, &claims[0], true).unwrap();
     assert_eq!(
-        ProducerEngine::new(&registry, &events, &state)
+        ProducerEngine::new(&registry, &events, &state, temp.path())
             .emit_build_effect("effects", Path::new(STORE_A), fixed_now())
             .unwrap(),
         EmitOutcome::Duplicate
     );
-    assert!(ProducerEngine::new(&registry, &events, &state)
+    assert!(ProducerEngine::new(&registry, &events, &state, temp.path())
         .emit_build_effect("effects", Path::new(STORE_B), fixed_now())
         .is_ok());
 }
@@ -1938,7 +1989,7 @@ fn fleet_conformance_network_blip_and_true_vanish_are_distinguished_by_hysteresi
     let registry = registry(&temp.path().join("effects.jsonl"));
     let events = temp.path().join("events");
     let state = temp.path().join("state");
-    let engine = ProducerEngine::new(&registry, &events, &state);
+    let engine = ProducerEngine::new(&registry, &events, &state, temp.path());
 
     let blip = engine
         .observe_reachability("health", false, fixed_now())
@@ -2038,7 +2089,7 @@ fn fleet_conformance_network_blip_and_true_vanish_are_distinguished_by_hysteresi
         .acknowledge_reachability_transition("health", returned.generation)
         .unwrap();
 
-    let reopened = ProducerEngine::new(&registry, &events, &state);
+    let reopened = ProducerEngine::new(&registry, &events, &state, temp.path());
     let stable = reopened
         .observe_reachability("health", true, fixed_now())
         .unwrap();
@@ -2052,7 +2103,7 @@ fn fleet_conformance_network_blip_and_true_vanish_are_distinguished_by_hysteresi
         unreachable!()
     };
     rebound.probe_pool = "different-slot".to_owned();
-    let rebound = ProducerEngine::new(&rebound_registry, &events, &state);
+    let rebound = ProducerEngine::new(&rebound_registry, &events, &state, temp.path());
     assert!(rebound
         .confirmed_pool_returns()
         .unwrap_err()

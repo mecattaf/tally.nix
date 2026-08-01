@@ -84,6 +84,7 @@ impl DaemonHandler {
                 &context.config.producers,
                 context.paths.events_dir(),
                 &context.paths.state_dir,
+                &context.paths.data_dir,
             );
             let pool = engine
                 .validate_reachability_transition(

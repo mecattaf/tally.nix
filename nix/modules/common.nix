@@ -605,9 +605,10 @@ let
             subject = "\${gh.url}";
           };
           description = ''
-            Optional structured JSON input. The daemon content-addresses it,
-            materializes it outside argv, and exposes its path as TALLY_BRIEF.
-            GitHub enqueue values may use documented origin placeholders.
+            Optional structured JSON input. The producer materializes it in the
+            daemon's content-addressed store outside argv; jobs receive its path
+            and identity as TALLY_BRIEF and TALLY_BRIEF_HASH. GitHub enqueue
+            values may use documented origin placeholders.
           '';
         };
         pool = mkOption {
@@ -2363,8 +2364,9 @@ let
         default = { };
         description = ''
           Age-based Nix GC-root retention with a live-witness floor, plus the
-          state-directory envelope for capture archives and ingress event files.
-          One sweep, one timer, one lock.
+          content-addressed brief replay window and state-directory envelope for
+          capture archives and ingress event files. One sweep and one timer;
+          GC-root and brief-store locks close their respective admission races.
         '';
       };
       attestations = mkOption {
@@ -2822,13 +2824,13 @@ let
     journald = { inherit (cfg.journald) native; };
   };
 
-  mkFlowProducer = name: flow: {
+  mkFlowProducer = cfg: name: flow: {
     kind = "calendar";
     inherit (flow) onCalendar;
     credentials = { };
     enqueue = {
       argv = [
-        "tally"
+        (lib.getExe cfg.package)
         "flow"
         "run"
         (storePathWithContext flow.script)
@@ -2856,8 +2858,8 @@ let
   };
 
   mkFlowProducers =
-    flows:
-    lib.mapAttrs' (name: flow: lib.nameValuePair "flow-${name}" (mkFlowProducer name flow)) (
+    cfg: flows:
+    lib.mapAttrs' (name: flow: lib.nameValuePair "flow-${name}" (mkFlowProducer cfg name flow)) (
       filterAttrs (_: flow: flow.onCalendar != null) flows
     );
 

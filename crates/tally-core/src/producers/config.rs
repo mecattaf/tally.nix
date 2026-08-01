@@ -143,7 +143,8 @@ pub struct ProducerEnqueue {
     pub adapter_options: AdapterJobOptions,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_manifest: Option<GateManifestSpec>,
-    /// Structured job input materialized by the daemon and exposed as TALLY_BRIEF.
+    /// Structured job input materialized in the daemon brief store and exposed
+    /// as TALLY_BRIEF plus TALLY_BRIEF_HASH.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brief: Option<Value>,
     #[serde(

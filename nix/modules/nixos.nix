@@ -227,7 +227,7 @@ in
       };
 
       systemd.services.tally-retention = lib.mkIf cfg.retention.enable {
-        description = "prune expired tally GC roots, capture archives, and ingress event files";
+        description = "prune expired tally GC roots, briefs, capture archives, and ingress event files";
         after = [ "tally-daemon.service" ];
         requires = [ "tally-daemon.service" ];
         serviceConfig = {

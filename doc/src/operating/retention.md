@@ -1,12 +1,21 @@
 # Retention and growth
 
-tally has artifact garbage collection now, but only for Nix store evidence. It
-does not have a general retention engine.
+tally has targeted retention for Nix store evidence, structured brief bytes,
+capture archives, and producer ingress. It does not have a general artifact
+retention engine.
 
 `store:<path>` evidence and `drv()` records receive Nix GC roots. The Home
 Manager and NixOS timers drop expired roots and invoke Nix garbage collection.
-Ordinary `artifact:<path>` files, captures, lifecycle observations, enqueue
-events, and the ledgers are outside that mechanism.
+Ordinary `artifact:<path>` files, lifecycle observations, durable enqueue rows,
+and the ledgers are outside the Nix-root mechanism.
+
+Structured briefs have one canonical copy under `<dataDir>/briefs`. Producers
+write there directly; daemon admission verifies and reuses that file. The GC
+horizon retains bytes referenced by an unwitnessed attempt or a recent witness,
+then prunes unreferenced and older-terminal bytes while preserving `briefHash`
+in durable rows and witnesses. The same sweep ages out legacy duplicate/orphan
+copies under `<stateDir>/briefs`. Admission and GC share a brief-store lock, so
+the live-row snapshot cannot race a new producer or daemon admission.
 
 ## The managed path: Nix store evidence
 
@@ -66,15 +75,17 @@ by default.
 The GC command:
 
 1. parses the systemd-style horizon;
-2. takes the exclusive GC-root lock;
-3. verifies the complete witness chain;
-4. builds a live set from every witness whose `transitionTimestamp` is at or
+2. takes the exclusive brief-store lock and then the GC-root lock;
+3. verifies the complete witness chain and acknowledged durable rows;
+4. builds live sets for structured briefs and every store path whose witness
+   `transitionTimestamp` is at or
    after `now - horizon`;
 5. on a mutating run, re-registers every live root and stops before pruning if
    one cannot be secured;
-6. removes an expired witness's root only when its target is absent from the
-   live set; and
-7. with `--collect`, runs `nix store gc`.
+6. removes expired brief bytes and an expired witness's root only when absent
+   from the corresponding live set; and
+7. prunes configured state-directory archives/ingress and, with `--collect`,
+   runs `nix store gc`.
 
 The witness ledger is never rewritten. A recent witness therefore forms a
 liveness floor even when an older witness names the same path.
@@ -155,6 +166,7 @@ The current storage story is intentionally uneven:
 | `attestations.jsonl` | Append-only, unbounded | Preserve if advisory history matters; it is a separate chain from verdicts. |
 | `lifecycle.jsonl` | Explicit policy string `unbounded` | No supported compaction command exists. Do not hand-edit it. |
 | `changes.jsonl` | Latest 4,096 change records | Automatic; invalid or foreign contents reset to an empty feed at startup, and slow readers receive `cursor-expired`. |
+| `<dataDir>/briefs` | Live attempts plus witnesses inside `retention.horizon`; hashes remain durable after bytes expire | Automatic through `tally gc`; enqueue fresh work when an expired failed job can no longer be retried. |
 | Current and archived captures | `.out` and raw `.adapter.err` accumulate per generation; failed generations also have `.err`; query reads at most 16 MiB | Do not remove active-generation files. Archiving old captures sacrifices trace and scrape reconstruction. |
 | Worker `stateDir` | Captures, launch markers, exit records, and execution attestations accumulate | Preserve live/ambiguous generations. No worker-side GC is shipped. |
 | Ordinary `artifact:<path>` files | Owned by the workload; no tally GC root | Apply a workload-specific policy only after accepting the reuse and audit consequences below. |

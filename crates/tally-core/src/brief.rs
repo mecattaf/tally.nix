@@ -4,14 +4,60 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use fs2::FileExt;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const BRIEF_DIRECTORY: &str = "briefs";
+pub const BRIEF_LOCK_FILE: &str = ".briefs.lock";
 pub const MAX_BRIEF_BYTES: u64 = 16 * 1024 * 1024;
 
 static TEMPORARY_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// Coordinates admission and collection of the content-addressed brief store.
+///
+/// Producers and the daemon hold a shared lock from materialization through
+/// durable admission. Retention holds the exclusive lock while it computes the
+/// referenced set and removes unreferenced content, so neither side can act on
+/// a stale view.
+pub struct BriefStoreLock {
+    _file: File,
+}
+
+pub fn acquire_shared(root: &Path) -> Result<BriefStoreLock, BriefError> {
+    acquire_store_lock(root, false)
+}
+
+pub fn acquire_exclusive(root: &Path) -> Result<BriefStoreLock, BriefError> {
+    acquire_store_lock(root, true)
+}
+
+fn acquire_store_lock(root: &Path, exclusive: bool) -> Result<BriefStoreLock, BriefError> {
+    let metadata = std::fs::symlink_metadata(root).map_err(|source| io_error(root, source))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(BriefError::Invalid(format!(
+            "brief storage root {} is not a real directory",
+            root.display()
+        )));
+    }
+    let path = root.join(BRIEF_LOCK_FILE);
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+        .map_err(|source| io_error(&path, source))?;
+    if exclusive {
+        FileExt::lock_exclusive(&file).map_err(|source| io_error(&path, source))?;
+    } else {
+        FileExt::lock_shared(&file).map_err(|source| io_error(&path, source))?;
+    }
+    Ok(BriefStoreLock { _file: file })
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedBrief {

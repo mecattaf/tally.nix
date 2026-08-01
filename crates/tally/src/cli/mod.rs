@@ -287,10 +287,19 @@ fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Resul
     let intake = GhCliIntake::default();
     let now = Utc::now();
     let result = match command {
-        ProducerCommand::Preview { name, state_dir } => {
+        ProducerCommand::Preview {
+            name,
+            state_dir,
+            data_dir,
+        } => {
             let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
-            let engine =
-                ProducerEngine::new(&config.producers, state_dir.join("events"), &state_dir);
+            let data_dir = data_dir.map_or_else(default_data_dir, Ok)?;
+            let engine = ProducerEngine::new(
+                &config.producers,
+                state_dir.join("events"),
+                &state_dir,
+                &data_dir,
+            );
             serde_json::to_value(engine.preview_gh(&name, &intake, now)?)?
         }
         ProducerCommand::Poll {
@@ -298,13 +307,19 @@ fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Resul
             once,
             no_enqueue,
             state_dir,
+            data_dir,
         } => {
             if !once {
                 return Err(invalid("producer poll currently requires --once"));
             }
             let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
-            let engine =
-                ProducerEngine::new(&config.producers, state_dir.join("events"), &state_dir);
+            let data_dir = data_dir.map_or_else(default_data_dir, Ok)?;
+            let engine = ProducerEngine::new(
+                &config.producers,
+                state_dir.join("events"),
+                &state_dir,
+                &data_dir,
+            );
             if no_enqueue {
                 serde_json::to_value(engine.preview_gh(&name, &intake, now)?)?
             } else {
@@ -321,10 +336,16 @@ fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Resul
             name,
             item,
             state_dir,
+            data_dir,
         } => {
             let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
-            let engine =
-                ProducerEngine::new(&config.producers, state_dir.join("events"), &state_dir);
+            let data_dir = data_dir.map_or_else(default_data_dir, Ok)?;
+            let engine = ProducerEngine::new(
+                &config.producers,
+                state_dir.join("events"),
+                &state_dir,
+                &data_dir,
+            );
             serde_json::to_value(engine.explain_gh(&name, &intake, &item, now)?)?
         }
         ProducerCommand::Test {
@@ -335,6 +356,7 @@ fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Resul
             no_enqueue,
             promote,
             state_dir,
+            data_dir,
         } => {
             let dry_run = no_enqueue || !promote;
             let state_dir = if promote {
@@ -344,8 +366,20 @@ fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Resul
                     std::env::temp_dir().join(format!("tally-producer-test-{}", std::process::id()))
                 })
             };
-            let engine =
-                ProducerEngine::new(&config.producers, state_dir.join("events"), &state_dir);
+            let data_dir = if promote {
+                data_dir.map_or_else(default_data_dir, Ok)?
+            } else {
+                data_dir.unwrap_or_else(|| state_dir.join("diagnostic-data"))
+            };
+            std::fs::create_dir_all(&data_dir).with_context(|| {
+                format!("cannot create producer brief root {}", data_dir.display())
+            })?;
+            let engine = ProducerEngine::new(
+                &config.producers,
+                state_dir.join("events"),
+                &state_dir,
+                &data_dir,
+            );
             let observation = engine.diagnostic_gh_observation(
                 &name,
                 &intake,
@@ -382,8 +416,11 @@ async fn run_producer_dispatch(
     let event: ProducerObservation = serde_json::from_str(&args.event)
         .context("--event must be a producer observation JSON object")?;
     let state_dir = args.state_dir.map_or_else(default_state_dir, Ok)?;
+    // Compatibility for direct calls to this hidden command; generated units
+    // always pass the daemon data directory explicitly.
+    let data_dir = args.data_dir.unwrap_or_else(|| state_dir.clone());
     let events_dir = state_dir.join("events");
-    let engine = ProducerEngine::new(&config.producers, &events_dir, &state_dir);
+    let engine = ProducerEngine::new(&config.producers, &events_dir, &state_dir, &data_dir);
     let expected_kind = match &event {
         ProducerObservation::Calendar => "calendar",
         ProducerObservation::EventsDir => "events-dir",

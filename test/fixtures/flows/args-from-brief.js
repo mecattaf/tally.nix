@@ -4,14 +4,14 @@ export const meta = {
   pools: [],
   argsSchema: {
     type: "object",
-    required: ["marker", "body"],
+    required: ["marker", "configBlob"],
     properties: {
       marker: { type: "string", minLength: 1 },
-      body: { type: "string", minLength: 1 }
+      configBlob: { type: "string", minLength: 1 }
     },
     additionalProperties: false
   },
   maxNodes: 1
 };
 
-({ marker: args.marker, bodyBytes: args.body.length });
+({ marker: args.marker, configBytes: args.configBlob.length });

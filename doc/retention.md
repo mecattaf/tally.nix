@@ -5,9 +5,11 @@ named by those records alive forever. Store evidence has an age-based retention 
 witness-liveness floor: a path referenced by any witness inside the configured horizon remains
 rooted even when an older witness also references it.
 
-This policy applies only to `store:<path>` evidence and derivation references. It does not delete
-or rewrite `witness.jsonl`, lifecycle observations, captures, event history, or ordinary
-`artifact:<path>` files. Those stores have their own growth and operating policies.
+The Nix-root portion of this policy applies only to `store:<path>` evidence and derivation
+references. The same sweep also owns structured brief bytes, capture archives, and consumed
+producer ingress. It does not delete or rewrite `witness.jsonl`, lifecycle observations, durable
+enqueue rows, or ordinary `artifact:<path>` files. Those stores have their own growth and
+operating policies.
 
 ## What happens when a witness is appended
 
@@ -28,6 +30,25 @@ At startup, the daemon verifies the ledger and retries registration for witnesse
 retention horizon. Witness append/registration and garbage collection share a lock, so collection
 cannot take a stale live-set snapshot while a new witness is being committed.
 
+## Structured brief bytes
+
+Every admitted brief has one canonical copy under `<dataDir>/briefs/<sha256>.json`. Producers
+write directly into that store and publish only the path in ingress; the daemon verifies and
+reuses the same content-addressed file instead of making a second copy under `stateDir`.
+
+The retention horizon is also the replay window for those bytes. `tally gc` retains a brief when
+an acknowledged durable row has an unwitnessed current attempt, or when a witness carrying that
+`briefHash` falls inside `now - horizon`. It removes unreferenced and older-terminal brief bytes;
+the durable row and witness keep the hash, so identity and proof remain intact. Retrying a failed
+job after its brief bytes have expired is rejected explicitly and the work must be enqueued fresh.
+
+Brief admission holds a shared brief-store lock from materialization through durable publication.
+GC takes the exclusive side before reading the witness and row sets, preventing collection from
+acting on a stale snapshot. The sweep also recognizes the legacy `<stateDir>/briefs` location
+created by tally 0.1.0 after #250: live/recent files and files younger than the horizon stay, while
+older duplicates and orphans are removed. New producer dispatches write no state-directory copy.
+`--skip-state-dir` skips brief collection because the durable row live set is unavailable.
+
 ## Scheduled retention
 
 The Home Manager module exposes exactly these options:
@@ -46,7 +67,7 @@ When enabled, a user timer runs:
 $ tally gc --horizon 30d --collect
 ```
 
-The roots directory is fixed by `dataDir`; it is not separately configurable. The command first
+The roots and canonical brief directories are fixed by `dataDir`; they are not separately configurable. The command first
 verifies the complete witness chain. If verification fails, it leaves every root untouched and
 does not collect the store. Otherwise it computes the set of paths referenced by witnesses whose
 `transitionTimestamp` is at or after `now - horizon`. On a mutating run it retries those live root

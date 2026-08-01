@@ -38,9 +38,10 @@ hashes the content and refuses to let one flow-run identity observe two script
 generations.
 
 `args` is serialized once into the generated producer's structured brief. The
-daemon content-addresses those JSON bytes, materializes them as a private file,
-and gives the runner only the `TALLY_BRIEF` path. The runner's durable argv
-therefore stays small even when the input is large. Put values known at
+producer materializes those JSON bytes directly in the daemon's
+content-addressed brief store, and the executor gives the runner
+`TALLY_BRIEF` plus `TALLY_BRIEF_HASH`. The runner verifies the file before
+evaluation, and its durable argv therefore stays small even when the input is large. Put values known at
 generation time there: executable paths, repositories, bounded input lists,
 and fixed policy. The checker evaluates the same JSON against the literal
 `meta.argsSchema`. Flow code should derive work from `args`, literals,
