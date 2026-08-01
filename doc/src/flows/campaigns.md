@@ -39,8 +39,15 @@ when a corpus is frozen.
 
 ## Arm an ad-hoc issue campaign
 
-The Home Manager module installs the generic campaign pools, packaged flow and
-driver, and `tally-campaign-poll.timer` once. The timer only scans locally armed
+Campaigns are a Home Manager feature on both deployment paths. The Home Manager
+module installs the generic campaign pools, packaged flow and driver, and
+`tally-campaign-poll.timer` once. The NixOS module deploys only the daemon and
+asserts that `services.tally.campaigns` is empty, so it renders no campaign
+pools, no spec-build flow, no driver adapter, and no poll timer; a campaign
+armed against a NixOS-only host would have nothing to dispatch into. Run
+campaigns from the Home Manager module.
+
+The timer only scans locally armed
 issue locators; an empty registry performs no work. Forge-native campaigns post
 no continuation comment, so this timer is what carries a campaign from one pass
 to the next. It scans every `services.tally.campaignPoll.interval` (60s by
@@ -775,10 +782,15 @@ are safe because the campaign mutex serializes passes and each pass re-derives
 the same forge facts before dispatch.
 
 Each pass contains at most one bounded frontier, so the fixed 24-hour evaluator
-budget no longer measures the whole campaign. Mention and pass-continuation
-events are the shipped campaign triggers; there is no periodic campaign timer.
-A pass that merges, checkpoints, or diagnoses a failure posts and verifies its
-own next-pass command. If the pass process dies before producing that durable
+budget no longer measures the whole campaign. For a module-declared campaign,
+mention and pass-continuation events are the shipped triggers and no periodic
+timer is involved: a pass that merges, checkpoints, or diagnoses a failure posts
+and verifies its own `/tally reconcile <name>` command, and the campaign's own
+producer triggers the next pass on that comment. A forge-native armed campaign
+is the other case — it posts no continuation comment, so
+[`tally-campaign-poll.timer`](#arm-an-ad-hoc-issue-campaign) is its continuation
+mechanism instead. Each path has exactly one, and they are not
+interchangeable. If the pass process dies before producing that durable
 outcome, wait for any admitted children to settle and post a fresh mention.
 Stable remote task branches preserve published work; merged PRs preserve
 implementation completion, checkpoint refs preserve successful automated
