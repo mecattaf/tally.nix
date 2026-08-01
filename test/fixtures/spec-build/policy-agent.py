@@ -33,6 +33,9 @@ output.mkdir(exist_ok=True)
 
 if task == "task-1":
     (output / "one.txt").write_text("one\n", encoding="utf-8")
+    # The integration test removes this committed artifact after the built-in
+    # forbidPaths gate proves that it blocks publication.
+    (output / "transient.db").write_text("not a database\n", encoding="utf-8")
 elif task == "task-2":
     if (output / "one.txt").read_text(encoding="utf-8") != "one\n":
         raise SystemExit("task 2 did not start from task 1's merged result")

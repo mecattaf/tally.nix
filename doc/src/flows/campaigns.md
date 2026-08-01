@@ -55,6 +55,10 @@ services.tally = {
     agentSandboxPolicy = "workspace-write";
     gates = [
       {
+        id = "no-db-artifacts";
+        forbidPaths = [ "*.db" "*.db-wal" "*.db-shm" "*.sqlite*" ];
+      }
+      {
         id = "tests";
         preflightArgv = [ "nix" "develop" "--command" "cargo" "--version" ];
         argv = [ "nix" "develop" "--command" "cargo" "test" "--workspace" ];
@@ -81,11 +85,30 @@ another campaign run. Set it to `true` only when the trusted person posting the
 campaign mention is also the account authenticated by `gh`, as in the
 single-account example above. `allowedActors` still applies independently.
 
-Gate commands are direct argv, not shell strings. Use `sh -c` explicitly only
-when shell syntax is actually part of project policy. `agentArgv` normally stays
-at its default: a fixed instruction telling the adapter to read the structured
-brief at `TALLY_BRIEF`. It can be overridden for a fixture or a purpose-built
-adapter executable, but the campaign never interpolates task prose into argv.
+Every gate sets an `id` and exactly one implementation: `argv` for a command, or
+`forbidPaths` for the built-in diff constraint. Gate commands are direct argv,
+not shell strings. Use `sh -c` explicitly only when shell syntax is actually
+part of project policy. `agentArgv` normally stays at its default: a fixed
+instruction telling the adapter to read the structured brief at `TALLY_BRIEF`.
+It can be overridden for a fixture or a purpose-built adapter executable, but
+the campaign never interpolates task prose into argv. Command gates also run as
+the accept-time preflight described below; diff constraints begin after the
+agent has produced a committed task diff.
+
+`forbidPaths` is evaluated against committed, non-deleted paths changed from the
+task's prepared base revision through its current `HEAD`. Deletions are ignored,
+so a task may remove a forbidden artifact that was already tracked. Matching is
+case-sensitive over repository-relative POSIX paths. A pattern without `/`,
+such as `*.db`, matches a basename at any depth. A pattern with `/` is rooted at
+the repository; `*` and `?` stay within one path component and `**` spans zero
+or more components. Patterns are bounded, unique, relative, and may not contain
+`..`.
+
+The constraint uses one Git diff and in-memory glob matching in the packaged
+driver. It is still an ordinary `campaign-control` node with `exit:0` evidence,
+a stable `gate-<task>-<id>` key, and a canonical witness. A match therefore
+fails the node and stops publication exactly like a nonzero argv gate; it is not
+an operator audit after the merge.
 
 The campaign runner follows the same rule. Its complete structured flow
 arguments travel in the producer enqueue's content-addressed brief and are read
@@ -111,7 +134,7 @@ One enabled attrset expands to all of the following:
 | `<pool.name>` | A capacity-1 mutex held by the runner process. |
 | `campaign-agent` | A capacity-1 `slot` pool for implementation agents. |
 | `campaign-control` | A small `cpu-slot` pool for worklist, Git, GitHub, and gate nodes. |
-| `spec-build-driver` | The packaged deterministic policy driver used for worklist, prep, publish, and merge projections. |
+| `spec-build-driver` | The packaged deterministic policy driver used for worklist, prep, built-in constraints, publish, and merge projections. |
 
 The producer posts its receipt and witnessed evidence, and each merge posts one
 idempotently marked progress comment. It does not close the campaign issue on
@@ -128,8 +151,8 @@ $ tally adapter smoke codex
 That command is the activation check introduced by issue #233; campaign
 rendering does not depend on its implementation.
 
-An accepted campaign then performs its own gate preflight. Every gate declares
-two direct argvs deliberately:
+An accepted campaign then performs its own command-gate preflight. Every command
+gate declares two direct argvs deliberately:
 
 - `preflightArgv` is a base-safe activation probe. It must succeed before the
   first agent dispatch and should exercise the actual compiler, linker, daemon,
@@ -154,6 +177,10 @@ and witnessed node are the failure receipt rather than an agent cycle spent
 discovering the same broken host. Gate IDs must be unique; declarative Nix
 configuration rejects duplicates, and direct `tally flow run` arguments are
 validated before the worklist node is admitted.
+
+`forbidPaths` gates are not preflighted because the unmodified base has no task
+diff to constrain. They begin in their declared position in the post-agent gate
+sequence.
 
 ## The per-task brief contract
 
@@ -223,7 +250,7 @@ For every witnessed task, `spec-build` executes this chain serially:
 
 ```text
 validate worklist -> fetch current remote main -> prepare task 1 worktree
-  -> run configured gate preflights on that base -> agent -> configured gates
+  -> run command-gate preflights on that base -> agent -> configured gates
   -> push branch -> open/reuse PR -> merge -> fetch current main for next task
 ```
 
@@ -242,9 +269,9 @@ The merge is witnessed before the next prep node is submitted. Consequently,
 task 2 is prepared from a remote base that already contains task 1's merge;
 declaring a dependency is not merely descriptive.
 
-The first non-passing preflight, agent, gate, publish, or merge node stops
-JavaScript evaluation. No later gate, pull request, merge, or task prep is
-admitted.
+The first non-passing command preflight, agent, command gate, constraint gate,
+publish, or merge node stops JavaScript evaluation. No later gate, pull request,
+merge, or task prep is admitted.
 
 ## Failure, steering, and replay
 

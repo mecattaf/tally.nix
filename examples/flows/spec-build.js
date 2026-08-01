@@ -91,31 +91,50 @@ export const meta = {
         maxItems: 16,
         uniqueItems: true,
         items: {
-          type: "object",
-          required: ["id", "preflightArgv", "argv", "runtimeMaxSec"],
-          properties: {
-            id: { type: "string", pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" },
-            preflightArgv: {
-              type: "array",
-              minItems: 1,
-              items: { type: "string" }
+          oneOf: [
+            {
+              type: "object",
+              required: ["id", "preflightArgv", "argv", "runtimeMaxSec"],
+              properties: {
+                id: { type: "string", pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" },
+                preflightArgv: {
+                  type: "array",
+                  minItems: 1,
+                  items: { type: "string" }
+                },
+                argv: {
+                  type: "array",
+                  minItems: 1,
+                  items: { type: "string" }
+                },
+                runtimeMaxSec: { type: "integer", minimum: 1 }
+              },
+              additionalProperties: false
             },
-            argv: {
-              type: "array",
-              minItems: 1,
-              items: { type: "string" }
-            },
-            runtimeMaxSec: { type: "integer", minimum: 1 }
-          },
-          additionalProperties: false
+            {
+              type: "object",
+              required: ["id", "forbidPaths"],
+              properties: {
+                id: { type: "string", pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" },
+                forbidPaths: {
+                  type: "array",
+                  minItems: 1,
+                  maxItems: 128,
+                  uniqueItems: true,
+                  items: { type: "string", minLength: 1, maxLength: 1024 }
+                }
+              },
+              additionalProperties: false
+            }
+          ]
         }
       }
     },
     additionalProperties: false
   },
   // A campaign is bounded by maxTasks <= 128 and gates <= 16. Its node budget
-  // includes one worklist node, one base preflight per gate, and every
-  // per-task prep/agent/gates/publish/merge chain.
+  // includes the worklist, one base preflight per command gate, and every
+  // per-task prep/agent/gates/publish/merge chain; 4096 remains above it.
   iterationCap: 4096,
   selectors: []
 };
@@ -261,9 +280,11 @@ function driverNode(action, brief, key, label, resultSchema, workspace, taskRef)
     evidence: ["exit:0"],
     brief,
     key,
-    label,
-    resultSchema
+    label
   };
+  if (resultSchema !== null) {
+    spec.resultSchema = resultSchema;
+  }
   if (taskRef !== null) {
     spec.taskRef = taskRef;
   }
@@ -348,6 +369,9 @@ function workspaceFor(prepared) {
     // depend on files the agent has not built yet, so it remains gate.argv.
     if (merged.length === 0) {
       for (const gate of args.gates) {
+        if (!gate.argv) {
+          continue;
+        }
         await sh(gate.preflightArgv, {
           pools: ["campaign-control"],
           priority: "low",
@@ -403,17 +427,33 @@ function workspaceFor(prepared) {
     await job(agentSpec);
 
     for (const gate of args.gates) {
-      await sh(gate.argv, {
-        pools: ["campaign-control"],
-        priority: "low",
-        workspace,
-        env: { CAMPAIGN_TASK_ID: task.id },
-        runtimeMaxSec: gate.runtimeMaxSec,
-        evidence: ["exit:0"],
-        key: `gate-${task.id}-${gate.id}`,
-        label: `gate-${task.id}-${gate.id}`,
-        taskRef
-      });
+      const key = `gate-${task.id}-${gate.id}`;
+      if (gate.argv) {
+        await sh(gate.argv, {
+          pools: ["campaign-control"],
+          priority: "low",
+          workspace,
+          env: { CAMPAIGN_TASK_ID: task.id },
+          runtimeMaxSec: gate.runtimeMaxSec,
+          evidence: ["exit:0"],
+          key,
+          label: key,
+          taskRef
+        });
+      } else {
+        await driverNode(
+          "constraint",
+          {
+            gate,
+            workspace: prepared.result
+          },
+          key,
+          key,
+          null,
+          workspace,
+          taskRef
+        );
+      }
     }
 
     const publication = await driverNode(

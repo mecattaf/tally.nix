@@ -2352,6 +2352,10 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 },
                 "gates": [
                     {
+                        "id": "no-db-artifacts",
+                        "forbidPaths": ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"]
+                    },
+                    {
                         "id": "fixture-first",
                         "preflightArgv": first_preflight_argv.clone(),
                         "argv": first_gate_argv.clone(),
@@ -2367,7 +2371,7 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             });
 
             let mut duplicate_arguments = arguments.clone();
-            duplicate_arguments["gates"][1]["id"] = json!("fixture-first");
+            duplicate_arguments["gates"][2]["id"] = json!("fixture-first");
             let duplicate = runner(
                 &config_path,
                 &daemon_paths.socket,
@@ -2514,6 +2518,122 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             .unwrap();
             assert_eq!(retried["verdict"], "pass");
 
+            let constrained = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN,
+                &arguments,
+                20,
+            )
+            .spawn()
+            .unwrap();
+            let constrained = runner_output(constrained).await;
+            assert_eq!(constrained.status.code(), Some(1));
+            assert_eq!(
+                flow_failure(&constrained)["error"]["code"],
+                "terminal-failure"
+            );
+            let submitted = runner_events(&constrained, "node-submitted");
+            assert_eq!(submitted.len(), 6);
+            assert!(submitted[..3]
+                .iter()
+                .all(|event| event["disposition"] == "reused"));
+            assert!(submitted[3..]
+                .iter()
+                .all(|event| event["disposition"] == "created"));
+
+            let constrained_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 6).await;
+            let mut failed_constraint = None;
+            for item in &constrained_items {
+                let terminal = client
+                    .call(
+                        "queue.await_job",
+                        Some(json!({"task_uuid": item["anchor"]})),
+                    )
+                    .await
+                    .unwrap();
+                if terminal["verdict"] == "failed" {
+                    assert!(
+                        failed_constraint.is_none(),
+                        "only the forbidden-path constraint may fail"
+                    );
+                    assert_eq!(
+                        item["orchestration"]["nodeLabel"],
+                        "gate-task-1-no-db-artifacts"
+                    );
+                    failed_constraint = terminal["task_uuid"].as_str().map(str::to_owned);
+                }
+            }
+            let failed_constraint =
+                failed_constraint.expect("the forbidden-path constraint did not fail");
+            let projected_constraint = client
+                .call("query.job", Some(json!({"id": failed_constraint.clone()})))
+                .await
+                .unwrap();
+            assert_eq!(projected_constraint["job"]["taskRef"], "fixture/task-1");
+            assert_eq!(
+                projected_constraint["job"]["unit"],
+                format!("tally-job-fixture-task-1-{failed_constraint}.service")
+            );
+            assert!(task_capture(&daemon_paths, &failed_constraint, "task-1")
+                .contains("build/transient.db"));
+            assert_eq!(
+                fs::read_to_string(control.join("agent-order.log")).unwrap(),
+                "task-1\n"
+            );
+            assert_eq!(
+                fs::read_to_string(control.join("policy-order.log")).unwrap(),
+                "task-1:on-request:workspace-write\n"
+            );
+            assert_eq!(
+                fs::read_to_string(control.join("preflight-order.log")).unwrap(),
+                "preflight:task-1:first\npreflight:task-1:second\n"
+            );
+            assert!(!control.join("gate-order.log").exists());
+            assert_eq!(
+                fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
+                "1",
+                "the constraint must stop publication, merge, and task-2 prep"
+            );
+
+            let task_one_run = fs::read_dir(workspace_root.join("spec"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.is_dir())
+                .expect("task-1 run directory is missing");
+            let task_one_worktree = task_one_run.join("task-1");
+            assert!(task_one_worktree.join("build/transient.db").is_file());
+            fixture_git(&task_one_worktree, &["rm", "build/transient.db"]);
+            fixture_git(
+                &task_one_worktree,
+                &[
+                    "commit",
+                    "-m",
+                    "fixture: remove forbidden database artifact",
+                ],
+            );
+
+            let retry = client
+                .call(
+                    "queue.retry",
+                    Some(json!({"task_uuid": failed_constraint.clone()})),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry["attempt"], 2);
+            let retried = tokio::time::timeout(
+                Duration::from_secs(20),
+                client.call(
+                    "queue.await_job",
+                    Some(json!({"task_uuid": failed_constraint, "attempt": 2})),
+                ),
+            )
+            .await
+            .expect("retried constraint timed out")
+            .unwrap();
+            assert_eq!(retried["verdict"], "pass");
+
             let post_change_failure = runner(
                 &config_path,
                 &daemon_paths.socket,
@@ -2531,15 +2651,13 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 "terminal-failure"
             );
             let submitted = runner_events(&post_change_failure, "node-submitted");
-            assert_eq!(submitted.len(), 6);
-            assert!(submitted[..3]
+            assert_eq!(submitted.len(), 7);
+            assert!(submitted[..6]
                 .iter()
                 .all(|event| event["disposition"] == "reused"));
-            assert!(submitted[3..]
-                .iter()
-                .all(|event| event["disposition"] == "created"));
+            assert_eq!(submitted[6]["disposition"], "created");
 
-            let post_change_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 6).await;
+            let post_change_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 7).await;
             let mut failed_gate = None;
             for item in &post_change_items {
                 let terminal = client
@@ -2567,18 +2685,6 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             assert_eq!(projected_gate["job"]["runtimeMaxSec"], 1);
             assert!(task_capture(&daemon_paths, &failed_gate, "task-1")
                 .contains("fixture post-change gate fails once before publish"));
-            assert_eq!(
-                fs::read_to_string(control.join("agent-order.log")).unwrap(),
-                "task-1\n"
-            );
-            assert_eq!(
-                fs::read_to_string(control.join("policy-order.log")).unwrap(),
-                "task-1:on-request:workspace-write\n"
-            );
-            assert_eq!(
-                fs::read_to_string(control.join("preflight-order.log")).unwrap(),
-                "preflight:task-1:first\npreflight:task-1:second\n"
-            );
             assert!(!control.join("gate-order.log").exists());
             assert_eq!(
                 fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
@@ -2624,21 +2730,21 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 String::from_utf8_lossy(&replay.stderr)
             );
             let submitted = runner_events(&replay, "node-submitted");
-            assert_eq!(submitted.len(), 15);
-            assert!(submitted[..6]
+            assert_eq!(submitted.len(), 17);
+            assert!(submitted[..7]
                 .iter()
                 .all(|event| event["disposition"] == "reused"));
-            assert!(submitted[6..]
+            assert!(submitted[7..]
                 .iter()
                 .all(|event| event["disposition"] == "created"));
             assert!(submitted[0].get("taskRef").is_none());
-            assert!(submitted[1..=8]
+            assert!(submitted[1..=9]
                 .iter()
                 .all(|event| event["taskRef"] == "fixture/task-1"));
-            assert!(submitted[9..]
+            assert!(submitted[10..]
                 .iter()
                 .all(|event| event["taskRef"] == "fixture/task-2"));
-            assert_eq!(flow_items(&client, SPEC_BUILD_RUN).await.len(), 15);
+            assert_eq!(flow_items(&client, SPEC_BUILD_RUN).await.len(), 17);
 
             fixture_git(&checkout, &["fetch", "origin", "main"]);
             assert_eq!(
@@ -2648,6 +2754,17 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             assert_eq!(
                 fixture_git(&checkout, &["show", "origin/main:build/two.txt"]),
                 "two"
+            );
+            assert!(
+                !fixture_git(&checkout, &["ls-tree", "-r", "--name-only", "origin/main"])
+                    .lines()
+                    .any(|path| {
+                        let basename = path.rsplit('/').next().unwrap_or(path);
+                        basename.ends_with(".db")
+                            || basename.ends_with(".db-wal")
+                            || basename.ends_with(".db-shm")
+                            || basename.contains(".sqlite")
+                    })
             );
             let first_parent = fixture_git(
                 &checkout,
