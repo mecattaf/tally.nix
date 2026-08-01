@@ -116,7 +116,7 @@ use crate::producers::{
     acknowledged_ingress_ids, archive_ingress_claim, claim_ingress_files, read_ingress_payload,
     GhCliMutationSink, IngressOutcome, ProducerEngine, ReachabilityTransition,
 };
-use crate::provenance::{Orchestration, DEFAULT_FLOW_MAX_NODES};
+use crate::provenance::{Orchestration, TaskRef, DEFAULT_FLOW_MAX_NODES};
 use crate::query::{
     query_pools, query_render, query_standup, query_status, JobProjection, PoolHeadroomFact,
     RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
@@ -370,6 +370,7 @@ pub const FSYNC_BEFORE_ACK_STAGES: &[AckStage] = &[
 #[derive(Debug, Clone, PartialEq)]
 pub struct JobResult {
     pub task_uuid: Option<String>,
+    pub task_ref: Option<TaskRef>,
     pub job_id: String,
     pub verdict: Verdict,
     pub exit_code: i32,
@@ -394,6 +395,9 @@ impl JobResult {
             "lease_epoch": self.lease_epoch,
             "witness_seq": self.witness_seq,
         });
+        if let Some(task_ref) = &self.task_ref {
+            value["taskRef"] = Value::String(task_ref.to_string());
+        }
         if let Some(completion) = &self.completion {
             value["completion"] =
                 serde_json::to_value(completion).expect("semantic completion always serializes");
@@ -447,7 +451,15 @@ impl Job {
         ExecutionIdentity {
             job_id: self.job_id,
             task_uuid: self.task_uuid,
+            task_ref: self.task_ref(),
         }
+    }
+
+    fn task_ref(&self) -> Option<TaskRef> {
+        self.row
+            .orchestration
+            .as_ref()
+            .and_then(Orchestration::task_ref)
     }
 }
 

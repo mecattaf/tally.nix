@@ -210,6 +210,13 @@ its own task, assigned workspace, campaign issue locator, and a bounded mission.
 It is explicitly told not to read another task from the worklist and not to
 push, open a pull request, or merge. Those are separate deterministic nodes.
 
+Every task-specific node also carries the campaign-scoped reference
+`<campaign>/<task-id>` (for example `crm/customer-model`). It is additive
+provenance: the UUID remains the durable identity, while `taskRef` appears in
+node receipts, lifecycle and query output, `TALLY_TASK_REF`, unit names, and
+capture names. The worklist discovery node has no task ID and therefore no
+`taskRef`.
+
 ## Ordering and merge criterion
 
 For every witnessed task, `spec-build` executes this chain serially:
@@ -226,6 +233,8 @@ and post-change gates will use. The argv differs only where the operator has
 explicitly separated a base-safe `preflightArgv` from the post-change `argv`;
 environment, workspace, host, and deadline do not drift. Replays reuse passing
 preflight witnesses and do not silently rerun or skip a recorded red result.
+Because it validates task 1's prepared workspace, each preflight node carries
+task 1's `taskRef`.
 
 The agent must leave a clean worktree with at least one commit descended from
 the prepared base. Publication refuses dirty, empty, or non-descendant work.
@@ -246,7 +255,8 @@ and never changes a running node's immutable brief.
 After a non-passing node:
 
 1. Inspect the campaign receipt/evidence and locate the failed node, for example
-   with `tally query log --flow-run <runner-task-uuid>`.
+   with `tally query log --flow-run <runner-task-uuid>`. Task-specific records
+   expose `taskRef`, so the worklist ID is visible without a UUID lookup.
 2. Add the steering decision to the campaign issue.
 3. Correct the failed frontier. Retry a failed agent node with
    `tally queue retry <agent-task-uuid>`; its new attempt reads the comments.

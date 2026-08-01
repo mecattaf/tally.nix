@@ -67,7 +67,7 @@ impl Executor {
         let directory = self
             .state_dir
             .join(CAPTURE_ARCHIVE_DIRECTORY)
-            .join(identity.unit_uuid().to_string());
+            .join(identity.capture_stem());
         let stem = format!("attempt-{attempt:010}-epoch-{lease_epoch:020}");
         RetainedCapturePaths {
             stdout: directory.join(format!("{stem}.out")),

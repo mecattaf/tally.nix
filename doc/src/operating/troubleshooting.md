@@ -299,7 +299,7 @@ When a gate manifest is declared, tally exports its execution-host path as
 path under:
 
 ```text
-<stateDir>/capture/<unit-uuid>.attempt-<N>.gates.json
+<stateDir>/capture/<unit-uuid>[.<task-id>].attempt-<N>.gates.json
 ```
 
 If the file is absent after execution, query shows:

@@ -13,6 +13,11 @@ authorized.
   probe executes once on the fetched base, with the same task environment and a
   bounded deadline, before the first agent dispatch; a witnessed
   `preflight-gate-<id>` records failure or timeout.
+- Added campaign-scoped human task references (`crm/t07`) to flow provenance,
+  admission and terminal receipts, lifecycle/journal records, query output,
+  transient unit names, and capture filenames. Campaign diagnostics now retain
+  the stable worklist ID alongside the durable task UUID across retries,
+  recovery, and remote execution.
 - Added flow-node `approvalPolicy` and `sandboxPolicy` fields plus campaign
   `agentApprovalPolicy`/`agentSandboxPolicy` options. Spec-build implementation
   agents now default to Codex's writable `workspace-write` + `on-request`

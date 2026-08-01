@@ -8,7 +8,9 @@ user manager or to one named SSH target.
 ## Local systemd execution
 
 The production daemon creates a deterministic transient unit named from the
-task UUID (or internal job UUID when no task UUID exists). Its `systemd-run`
+task UUID (or internal job UUID when no task UUID exists). A row carrying
+`taskRef = crm/t07` uses `tally-job-crm-t07-<uuid>.service`; a row without one
+keeps `tally-job-<uuid>.service`. Its `systemd-run`
 argv includes `--user`, `--wait`, `--collect`, literal environment and working
 directory, resource/hardening properties, capture paths, credentials, and the
 workload after `--`.

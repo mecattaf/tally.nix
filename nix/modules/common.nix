@@ -3058,8 +3058,8 @@ let
       ]) cfg.executors)
       (mapAttrsToList (name: campaign: [
         {
-          assertion = validComponent name;
-          message = "tally campaign name ${name} is not a safe unit/file component";
+          assertion = validComponent name && builtins.stringLength name <= 80;
+          message = "tally campaign name ${name} must be a safe unit/file component of at most 80 bytes";
         }
         campaign._tallyAssertions
         {

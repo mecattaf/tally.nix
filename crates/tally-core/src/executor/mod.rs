@@ -29,6 +29,7 @@ use crate::config::{ExecutionTargetConfig, Priority, SshExecutorConfig};
 use crate::evidence::{parse_evidence_specs, run_evidence_gate, GateResult, RunOutcome};
 use crate::exec_attestation::{ExecAttestationContext, EXEC_ATTESTATION_LEDGER};
 use crate::git_ai::{self, GitAiExecution};
+use crate::provenance::TaskRef;
 use crate::taskdb::{GhOrigin, WorkspaceMetadata};
 use crate::witness::{Authorship, AuthorshipSession};
 
@@ -229,24 +230,25 @@ impl Executor {
     }
 
     pub fn unit_stem(&self, identity: &ExecutionIdentity) -> String {
-        format!("tally-job-{}", identity.unit_uuid())
+        identity.unit_stem()
     }
 
     pub fn unit_name(&self, identity: &ExecutionIdentity) -> String {
-        format!("{}.service", self.unit_stem(identity))
+        identity.unit_name()
     }
 
     pub fn paths(&self, identity: &ExecutionIdentity) -> ExecutionPaths {
         let uuid = identity.unit_uuid();
+        let capture_stem = identity.capture_stem();
         ExecutionPaths {
             stdout: self
                 .state_dir
                 .join(CAPTURE_DIRECTORY)
-                .join(format!("{uuid}.out")),
+                .join(format!("{capture_stem}.out")),
             stderr: self
                 .state_dir
                 .join(CAPTURE_DIRECTORY)
-                .join(format!("{uuid}.err")),
+                .join(format!("{capture_stem}.err")),
             exit_record: self
                 .state_dir
                 .join(UNIT_EXIT_DIRECTORY)
@@ -271,7 +273,7 @@ impl Executor {
         Ok(GateManifestSpec {
             path: state_dir.join(CAPTURE_DIRECTORY).join(format!(
                 "{}.attempt-{attempt}.gates.json",
-                identity.unit_uuid()
+                identity.capture_stem()
             )),
             required_gate_ids: Vec::new(),
             acceptance_policy: AcceptancePolicy::Manual,

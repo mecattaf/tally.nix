@@ -13,6 +13,17 @@ use crate::executor::{
 use crate::taskdb::{read_acknowledged_events, DurableEnqueueEvent, RowSeed, TaskDbError};
 use crate::witness::{read_verified_records, LaborClass, Verdict, WitnessError, WitnessRecord};
 
+fn row_execution_identity(row: &RowSeed) -> ExecutionIdentity {
+    ExecutionIdentity {
+        job_id: row.uuid,
+        task_uuid: Some(row.uuid),
+        task_ref: row
+            .orchestration
+            .as_ref()
+            .and_then(crate::provenance::Orchestration::task_ref),
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum RecoveryError {
     #[error("task database source error: {0}")]
@@ -136,10 +147,7 @@ pub async fn collect_local_unit_facts(
     let mut facts = BTreeMap::new();
     for event in &durable.events {
         let uuid = event.row.uuid;
-        let identity = ExecutionIdentity {
-            job_id: uuid,
-            task_uuid: Some(uuid),
-        };
+        let identity = row_execution_identity(&event.row);
         // A non-retryable witness is already the canonical proof that this
         // remote generation terminated. Probing it again cannot affect the
         // recovery plan, but it would make every historical worker a startup
@@ -175,6 +183,7 @@ pub fn collect_rowless_unit_fact(
         .inspect_identity(&ExecutionIdentity {
             job_id: job_uuid,
             task_uuid: None,
+            task_ref: None,
         })
         .map_err(RecoveryError::from)
 }
@@ -612,7 +621,12 @@ fn validate_unit_fact(
     fact: &LocalUnitFact,
     current_epoch: u64,
 ) -> Result<(), RecoveryError> {
-    validate_unit_fact_for_uuid(row.uuid, fact, current_epoch)
+    validate_unit_fact_named(
+        row.uuid,
+        row_execution_identity(row).unit_name(),
+        fact,
+        current_epoch,
+    )
 }
 
 fn validate_unit_fact_for_uuid(
@@ -620,7 +634,20 @@ fn validate_unit_fact_for_uuid(
     fact: &LocalUnitFact,
     current_epoch: u64,
 ) -> Result<(), RecoveryError> {
-    let expected_unit = format!("tally-job-{uuid}.service");
+    validate_unit_fact_named(
+        uuid,
+        format!("tally-job-{uuid}.service"),
+        fact,
+        current_epoch,
+    )
+}
+
+fn validate_unit_fact_named(
+    uuid: Uuid,
+    expected_unit: String,
+    fact: &LocalUnitFact,
+    current_epoch: u64,
+) -> Result<(), RecoveryError> {
     if fact.unit != expected_unit {
         return Err(RecoveryError::InvalidFacts(format!(
             "unit fact {:?} does not match durable row {}",
@@ -1138,7 +1165,7 @@ mod tests {
     }
 
     fn unit_name(row: &RowSeed) -> String {
-        format!("tally-job-{}.service", row.uuid)
+        row_execution_identity(row).unit_name()
     }
 
     fn exit_fact(row: &RowSeed, attempt: u32, lease_epoch: u64, loaded: bool) -> LocalUnitFact {

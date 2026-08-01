@@ -612,6 +612,11 @@ pub(crate) async fn reconcile_pool_loss_intents(
         let identity = ExecutionIdentity {
             job_id: intent.row.uuid,
             task_uuid: Some(intent.row.uuid),
+            task_ref: intent
+                .row
+                .orchestration
+                .as_ref()
+                .and_then(Orchestration::task_ref),
         };
         executor
             .reclaim_identity_exact_on(

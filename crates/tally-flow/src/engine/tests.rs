@@ -2,7 +2,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, VecDeque};
 
 use super::*;
-use crate::{Admission, CatalogMember, ClientError, FlowFuture, RunInspection, Verdict};
+use crate::{Admission, CatalogMember, ClientError, FlowFuture, RunInspection, TaskRef, Verdict};
 
 #[derive(Clone)]
 struct Reply {
@@ -130,8 +130,10 @@ impl FlowClient for MockClient {
             .task_uuid
             .clone()
             .unwrap_or_else(|| format!("task-{index}"));
+        let task_ref = submission.orchestration.task_ref.clone();
         let terminal = NodeResult {
             task_uuid: task_uuid.clone(),
+            task_ref: task_ref.clone(),
             verdict: reply.verdict,
             exit_code: Some(if reply.verdict.is_pass() { 0 } else { 1 }),
             witness_seq: reply.witness_seq,
@@ -162,6 +164,7 @@ impl FlowClient for MockClient {
             schema_version: 1,
             disposition: reply.disposition,
             task_uuid,
+            task_ref,
             payload_hash,
             attempt: 0,
             terminal: inline,
@@ -205,6 +208,7 @@ struct DurableNode {
     task_uuid: String,
     payload_hash: String,
     label: Option<String>,
+    task_ref: Option<TaskRef>,
     script_hash: String,
     args_hash: String,
     catalog_hash: Option<String>,
@@ -233,6 +237,7 @@ impl BudgetContinuationClient {
     fn terminal(node: &DurableNode, disposition: Disposition) -> NodeResult {
         NodeResult {
             task_uuid: node.task_uuid.clone(),
+            task_ref: node.task_ref.clone(),
             verdict: Verdict::Pass,
             exit_code: Some(0),
             witness_seq: node.ordinal + 1,
@@ -283,6 +288,7 @@ impl FlowClient for BudgetContinuationClient {
                 schema_version: 1,
                 disposition,
                 task_uuid: node.task_uuid.clone(),
+                task_ref: node.task_ref.clone(),
                 payload_hash: node.payload_hash.clone(),
                 attempt: 0,
                 terminal: node
@@ -298,6 +304,7 @@ impl FlowClient for BudgetContinuationClient {
                 task_uuid: format!("task-{ordinal}"),
                 payload_hash: submission.payload_hash.clone(),
                 label: submission.spec.label.clone(),
+                task_ref: submission.spec.task_ref.clone(),
                 script_hash: submission.orchestration.script_hash.clone(),
                 args_hash: submission.orchestration.args_hash.clone(),
                 catalog_hash: submission.orchestration.catalog_hash.clone(),
@@ -311,6 +318,7 @@ impl FlowClient for BudgetContinuationClient {
                 schema_version: 1,
                 disposition: Disposition::Created,
                 task_uuid: node.task_uuid.clone(),
+                task_ref: node.task_ref.clone(),
                 payload_hash: node.payload_hash.clone(),
                 attempt: 0,
                 terminal: None,
@@ -417,6 +425,43 @@ fn parallel_repeats_an_identical_ordinal_stream_three_times() {
         streams[0].0,
         ["flow:run-1:0", "flow:run-1:1", "flow:run-1:2"]
     );
+}
+
+#[test]
+fn task_ref_becomes_orchestration_and_self_describes_both_lifecycle_events() {
+    let source = format!(
+        "{}\n(async () => sh(['ship'], {{pools: ['cpu'], taskRef: 'crm/t07'}}))()",
+        meta(&["cpu"], &[])
+    );
+    let client = MockClient::new(Vec::new());
+    let (_, sink) = run(&source, client.clone()).unwrap();
+    let submissions = client.submissions.borrow();
+    assert_eq!(
+        submissions[0]
+            .orchestration
+            .task_ref
+            .as_ref()
+            .map(TaskRef::as_str),
+        Some("crm/t07")
+    );
+    assert_eq!(
+        serde_json::to_value(&submissions[0].orchestration).unwrap()["taskRef"],
+        "crm/t07"
+    );
+    let node_events = sink
+        .events()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event["type"].as_str(),
+                Some("node-submitted" | "node-terminal")
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(node_events.len(), 2);
+    assert!(node_events
+        .iter()
+        .all(|event| event["taskRef"] == "crm/t07"));
 }
 
 #[test]
@@ -815,7 +860,7 @@ fn local_unknown_options_use_the_shared_node_field_error_shape() {
         error.message,
         "unknown local() option \"resultShema\", expected one of argv, adapter, pools, executor, \
          priority, runtimeMaxSec, evidence, evidenceClass, manifestHash, workspace, brief, key, \
-         dedupKey, label, env, approvalPolicy, sandboxPolicy, resultSchema, member"
+         dedupKey, label, taskRef, env, approvalPolicy, sandboxPolicy, resultSchema, member"
     );
     assert_eq!(error.details["field"], "resultShema");
 }

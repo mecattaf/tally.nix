@@ -27,7 +27,8 @@ pub use model::{
     Derivation, DerivationOutput, Disposition, FlowEnqueueFieldDisposition, FlowEnqueueFieldParity,
     FlowSubmission, NodeCanonicalProjection, NodeFailure, NodeResult, NodeSpec,
     NodeSpecFieldContract, NodeSpecSurface, NodeWireProjection, Orchestration, RunInspection,
-    RunReport, SelectionProvenance, Verdict, FLOW_ENQUEUE_FIELD_PARITY, NODE_SPEC_FIELD_CONTRACT,
+    RunReport, SelectionProvenance, TaskRef, Verdict, FLOW_ENQUEUE_FIELD_PARITY,
+    NODE_SPEC_FIELD_CONTRACT,
 };
 
 /// The one prompt-delivery argument used by every agent adapter sugar.

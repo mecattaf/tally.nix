@@ -309,6 +309,7 @@ impl DaemonHandler {
             "status": state_name(job.state),
             "attempt": next_attempt,
         });
+        insert_task_ref(&mut response, row.orchestration.as_ref());
         if let Some(payload_hash) = row.payload_hash {
             response["payloadHash"] = Value::String(payload_hash);
         }
@@ -762,6 +763,7 @@ impl DaemonHandler {
                     "attempt": 1,
                     "lease_epoch": 1,
                 });
+                insert_task_ref(&mut response, row.orchestration.as_ref());
                 if let Some(payload_hash) = &row.payload_hash {
                     response["payloadHash"] = Value::String(payload_hash.clone());
                 }
@@ -1039,6 +1041,7 @@ impl DaemonHandler {
                     };
                     let result = JobResult {
                         task_uuid: task_uuid.map(|uuid| uuid.to_string()),
+                        task_ref: row.orchestration.as_ref().and_then(Orchestration::task_ref),
                         job_id: job_id.to_string(),
                         verdict: Verdict::Reused,
                         exit_code: 0,
@@ -1072,7 +1075,7 @@ impl DaemonHandler {
                     self.complete_gh_post_ack(job.row.clone(), result.clone());
                     self.emit_post_ack(enqueued_event(&job));
                     self.emit_post_ack(completed_event(&job, &result, evidence));
-                    return Ok(json!({
+                    let mut response = json!({
                         "schemaVersion": 1,
                         "disposition": "reused",
                         "task_uuid": task_uuid.map(|uuid| uuid.to_string()),
@@ -1086,7 +1089,9 @@ impl DaemonHandler {
                         "store_paths": dedup.store_paths,
                         "storePaths": dedup.store_paths,
                         "witness_lsn": dedup.matched_witness_seq,
-                    }));
+                    });
+                    insert_task_ref(&mut response, row.orchestration.as_ref());
+                    return Ok(response);
                 }
             }
         }
@@ -1245,6 +1250,7 @@ impl DaemonHandler {
             "barrier": barrier,
             "state": state_name(job.state),
         });
+        insert_task_ref(&mut response, row.orchestration.as_ref());
         if full_mode {
             response["payloadHash"] = Value::String(
                 row.payload_hash
@@ -1442,6 +1448,16 @@ fn orchestration_node_label(orchestration: Option<&Orchestration>) -> Option<&st
         .and_then(Value::as_str)
 }
 
+fn orchestration_task_ref(orchestration: Option<&Orchestration>) -> Option<TaskRef> {
+    orchestration.and_then(Orchestration::task_ref)
+}
+
+fn insert_task_ref(response: &mut Value, orchestration: Option<&Orchestration>) {
+    if let Some(task_ref) = orchestration_task_ref(orchestration) {
+        response["taskRef"] = Value::String(task_ref.to_string());
+    }
+}
+
 fn dedup_conflict(
     dedup_key: &str,
     payload_hash: &str,
@@ -1459,6 +1475,7 @@ fn dedup_conflict(
             if let Some(label) = orchestration_node_label(candidate.orchestration.as_ref()) {
                 value["nodeLabel"] = Value::String(label.to_owned());
             }
+            insert_task_ref(&mut value, candidate.orchestration.as_ref());
             value
         })
         .collect::<Vec<_>>();
@@ -1485,6 +1502,9 @@ fn dedup_conflict(
             });
         if let Some(label) = orchestration_node_label(candidate.orchestration.as_ref()) {
             data["existingLabel"] = Value::String(label.to_owned());
+        }
+        if let Some(task_ref) = orchestration_task_ref(candidate.orchestration.as_ref()) {
+            data["existingTaskRef"] = Value::String(task_ref.to_string());
         }
     }
     WireError {
@@ -1555,6 +1575,7 @@ fn full_live_disposition(
     if let Some(orchestration) = &job.row.orchestration {
         response["recordedOrchestration"] = orchestration.as_value().clone();
     }
+    insert_task_ref(&mut response, job.row.orchestration.as_ref());
     Ok(Some(response))
 }
 
@@ -1603,6 +1624,7 @@ fn full_terminal_response(
     if let Some(orchestration) = &record.orchestration {
         response["recordedOrchestration"] = orchestration.as_value().clone();
     }
+    insert_task_ref(&mut response, record.orchestration.as_ref());
     Ok(response)
 }
 

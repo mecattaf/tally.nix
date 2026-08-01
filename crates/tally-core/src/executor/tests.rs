@@ -16,6 +16,7 @@ fn request() -> ExecutionRequest {
         identity: ExecutionIdentity {
             job_id: uuid("00000000-0000-4000-8000-000000000001"),
             task_uuid: Some(uuid("00000000-0000-4000-8000-000000000002")),
+            task_ref: None,
         },
         parent: Some(uuid("00000000-0000-4000-8000-000000000003")),
         pools: vec!["gpu".to_owned()],
@@ -596,6 +597,39 @@ fn systemd_argv_is_direct_stable_and_complete() {
     for forbidden in ["DeviceMemoryMax", "Delegate=", "dmem", "servingSlice"] {
         assert!(!joined.contains(forbidden));
     }
+}
+
+#[test]
+fn campaign_task_ref_names_the_unit_captures_gate_and_child_environment() {
+    let mut request = request();
+    request.identity.task_ref = Some(TaskRef::new("crm/t07").unwrap());
+    let executor = executor(Path::new("/state"));
+    let uuid = request.identity.unit_uuid();
+
+    assert_eq!(
+        executor.unit_name(&request.identity),
+        format!("tally-job-crm-t07-{uuid}.service")
+    );
+    let paths = executor.paths(&request.identity);
+    assert_eq!(
+        paths.stdout,
+        PathBuf::from(format!("/state/capture/{uuid}.t07.out"))
+    );
+    assert_eq!(
+        paths.stderr,
+        PathBuf::from(format!("/state/capture/{uuid}.t07.err"))
+    );
+    assert_eq!(
+        executor
+            .default_gate_manifest_on(None, &request.identity, request.attempt)
+            .unwrap()
+            .path,
+        PathBuf::from(format!("/state/capture/{uuid}.t07.attempt-1.gates.json"))
+    );
+
+    let args = strings(&executor.build_systemd_argv(&request).unwrap());
+    assert!(args.contains(&format!("tally-job-crm-t07-{uuid}")));
+    assert!(args.contains(&"TALLY_TASK_REF=crm/t07".to_owned()));
 }
 
 #[test]
@@ -1349,6 +1383,7 @@ fn wave_5_red_case_two_attempt_provider_captures_are_distinct_and_queryable() {
     let lanes = [
         TraceLane {
             task_uuid: task_uuid.clone(),
+            task_ref: None,
             job_id: Some(job_id.clone()),
             attempt: 1,
             lease_epoch: 7,
@@ -1359,6 +1394,7 @@ fn wave_5_red_case_two_attempt_provider_captures_are_distinct_and_queryable() {
         },
         TraceLane {
             task_uuid: task_uuid.clone(),
+            task_ref: None,
             job_id: Some(job_id),
             attempt: 2,
             lease_epoch: 8,
@@ -2302,6 +2338,7 @@ fn fixture_request(pool: &str) -> ExecutionRequest {
         identity: ExecutionIdentity {
             job_id: Uuid::new_v4(),
             task_uuid: None,
+            task_ref: None,
         },
         parent: None,
         pools: vec![pool.to_owned()],

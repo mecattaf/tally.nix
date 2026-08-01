@@ -433,23 +433,27 @@ impl DaemonHandler {
         let job = find_job(&context, task_uuid)?.clone();
         let was = state_name(job.state);
         if job.state == JobState::Completed {
-            return Ok(json!({
+            let mut response = json!({
                 "ok": true,
                 "affected": 0,
                 "task_uuid": job.task_uuid.map(|uuid| uuid.to_string()),
                 "was": was,
                 "lease_epoch": job.row.lease_epoch,
                 "already_terminal": true,
-            }));
+            });
+            insert_job_task_ref(&mut response, &job);
+            return Ok(response);
         }
         if job.state == JobState::Running && !force {
-            return Ok(json!({
+            let mut response = json!({
                 "ok": true,
                 "affected": 0,
                 "task_uuid": job.task_uuid.map(|uuid| uuid.to_string()),
                 "was": was,
                 "lease_epoch": job.row.lease_epoch,
-            }));
+            });
+            insert_job_task_ref(&mut response, &job);
+            return Ok(response);
         }
         let scrape_capture = if job.state == JobState::Running {
             let identity = job.identity();
@@ -498,13 +502,15 @@ impl DaemonHandler {
         if let Some(work) = work {
             self.complete_terminal_post_ack(work);
         }
-        Ok(json!({
+        let mut response = json!({
             "ok": true,
             "affected": 1,
             "task_uuid": job.task_uuid.map(|uuid| uuid.to_string()),
             "was": was,
             "lease_epoch": job.row.lease_epoch,
-        }))
+        });
+        insert_job_task_ref(&mut response, &job);
+        Ok(response)
     }
 
     pub(crate) async fn acquire(&self, params: Option<Value>) -> Result<Value, WireError> {
@@ -649,6 +655,10 @@ fn job_result_from_witness(record: &WitnessRecord, executor: &Executor) -> JobRe
             let identity = ExecutionIdentity {
                 job_id: uuid,
                 task_uuid: Some(uuid),
+                task_ref: record
+                    .orchestration
+                    .as_ref()
+                    .and_then(Orchestration::task_ref),
             };
             executor
                 .retained_capture_paths(&identity, record.attempt, record.lease_epoch)
@@ -661,6 +671,10 @@ fn job_result_from_witness(record: &WitnessRecord, executor: &Executor) -> JobRe
     };
     JobResult {
         task_uuid: Some(stable.clone()),
+        task_ref: record
+            .orchestration
+            .as_ref()
+            .and_then(Orchestration::task_ref),
         job_id: stable,
         verdict: record.verdict,
         exit_code: record.exit_code,
@@ -700,6 +714,12 @@ pub(crate) fn find_job<'a>(context: &'a Context, presented: &str) -> Result<&'a 
         .get(presented)
         .and_then(|job_id| context.jobs.get(job_id))
         .ok_or_else(|| WireError::not_found(format!("job {presented} was not found")))
+}
+
+fn insert_job_task_ref(response: &mut Value, job: &Job) {
+    if let Some(task_ref) = job.task_ref() {
+        response["taskRef"] = Value::String(task_ref.to_string());
+    }
 }
 
 pub(crate) fn lease_request(job: &Job, unit: String) -> LeaseRequest {

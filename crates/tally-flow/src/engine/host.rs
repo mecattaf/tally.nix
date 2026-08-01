@@ -258,6 +258,9 @@ impl HostShared {
         if let Some(label) = label {
             event["label"] = Value::String(label.to_owned());
         }
+        if let Some(task_ref) = &admission.task_ref {
+            event["taskRef"] = Value::String(task_ref.as_str().to_owned());
+        }
         self.sink.emit(event)
     }
 
@@ -279,6 +282,9 @@ impl HostShared {
         });
         if let Some(exit_code) = result.exit_code {
             event["exitCode"] = Value::from(exit_code);
+        }
+        if let Some(task_ref) = &result.task_ref {
+            event["taskRef"] = Value::String(task_ref.as_str().to_owned());
         }
         if let Some(error) = &result.error {
             event["errorCode"] = Value::String(error.code.clone());
@@ -453,6 +459,7 @@ impl HostShared {
             catalog_hash: self.catalog_hash.clone(),
             node_ordinal: ordinal,
             node_label: spec.label.clone(),
+            task_ref: spec.task_ref.clone(),
             max_nodes: self.effective_max_nodes,
             prompt_revision: revisions.prompt_revision,
             skill_revision: revisions.skill_revision,

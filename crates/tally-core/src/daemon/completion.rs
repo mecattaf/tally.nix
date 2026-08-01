@@ -96,6 +96,9 @@ impl DaemonHandler {
                 "adapter": row.adapter,
                 "model": result.model,
             });
+            if let Some(task_ref) = &result.task_ref {
+                evidence["taskRef"] = Value::String(task_ref.to_string());
+            }
             if let Some(completion) = &result.completion {
                 evidence["completion"] = serde_json::to_value(completion)
                     .expect("semantic completion always serializes");
@@ -506,27 +509,29 @@ impl DaemonHandler {
                 return;
             }
         };
-        let change_payload = json!({
+        let mut change_payload = json!({
             "taskUuid": fields.task_uuid,
             "attempt": fields.attempt,
             "leaseEpoch": fields.lease_epoch,
             "event": fields.event,
             "lifecycleCursor": lifecycle.cursor,
         });
+        if let Some(task_ref) = &fields.task_ref {
+            change_payload["taskRef"] = Value::String(task_ref.to_string());
+        }
+        let mut job_change_payload = json!({
+            "taskUuid": fields.task_uuid,
+            "attempt": fields.attempt,
+            "leaseEpoch": fields.lease_epoch,
+            "reason": fields.event,
+        });
+        if let Some(task_ref) = &fields.task_ref {
+            job_change_payload["taskRef"] = Value::String(task_ref.to_string());
+        }
         let mut changes = self.changes.borrow_mut();
         let mut append_change = |kind, payload| changes.append_now(kind, payload);
         let changed = append_change(ChangeKind::Lifecycle, change_payload.clone())
-            .and_then(|_| {
-                append_change(
-                    ChangeKind::Job,
-                    json!({
-                        "taskUuid": fields.task_uuid,
-                        "attempt": fields.attempt,
-                        "leaseEpoch": fields.lease_epoch,
-                        "reason": fields.event,
-                    }),
-                )
-            })
+            .and_then(|_| append_change(ChangeKind::Job, job_change_payload))
             .and_then(|_| {
                 if matches!(
                     fields.event,
@@ -617,6 +622,9 @@ pub(super) fn execution_request(
                 .and_then(Value::as_u64)
             {
                 attributes.insert("nodeOrdinal".to_owned(), node_ordinal.to_string());
+            }
+            if let Some(task_ref) = orchestration.task_ref() {
+                attributes.insert("taskRef".to_owned(), task_ref.to_string());
             }
         }
         GitAiExecution {
@@ -721,9 +729,10 @@ pub(super) fn execution_fact_for_termination(termination: &ExecutionTermination)
 
 pub(super) fn enqueued_event(job: &Job) -> EmitEvent {
     let mut event = EmitEvent::enqueued(job.stable_key(), job.row.priority, job.row.source);
+    event.task_ref = job.task_ref();
     event.agent = Some(job.row.adapter.clone());
     event.session_ref.clone_from(&job.row.session_ref);
-    event.unit = Some(format!("tally-job-{}.service", job.stable_key()));
+    event.unit = Some(job.identity().unit_name());
     event.attempt = Some(job.row.attempt);
     event.lease_epoch = Some(job.row.lease_epoch);
     event.labor_class = Some(job.labor_class);
@@ -738,12 +747,13 @@ fn execution_event(job: &Job, event: TallyEvent) -> EmitEvent {
     EmitEvent {
         event,
         task_uuid: job.stable_key(),
+        task_ref: job.task_ref(),
         class: job.row.priority,
         source: job.row.source,
         message: None,
         agent: Some(job.row.adapter.clone()),
         session_ref: job.row.session_ref.clone(),
-        unit: Some(format!("tally-job-{}.service", job.stable_key())),
+        unit: Some(job.identity().unit_name()),
         exit_code: None,
         gpu_seconds: None,
         artifact_hash: None,
@@ -920,6 +930,7 @@ pub(super) fn finalize_forced_locked(
     let record = append_context_witness(context, forced_witness(&job, verdict, host_id))?;
     let result = JobResult {
         task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
+        task_ref: job.task_ref(),
         job_id: job.job_id.to_string(),
         verdict,
         exit_code: if verdict == Verdict::Cancelled { 0 } else { 1 },
@@ -995,12 +1006,13 @@ fn evidence_event(job: &Job, check: &CheckOutcome) -> EmitEvent {
             TallyEvent::EvidenceFail
         },
         task_uuid: job.stable_key(),
+        task_ref: job.task_ref(),
         class: job.row.priority,
         source: job.row.source,
         message: Some(check.reason.clone()),
         agent: Some(job.row.adapter.clone()),
         session_ref: job.row.session_ref.clone(),
-        unit: Some(format!("tally-job-{}.service", job.stable_key())),
+        unit: Some(job.identity().unit_name()),
         exit_code: None,
         gpu_seconds: None,
         artifact_hash: None,
@@ -1024,12 +1036,13 @@ pub(super) fn completed_event(job: &Job, result: &JobResult, evidence: String) -
             _ => TallyEvent::Failed,
         },
         task_uuid: job.stable_key(),
+        task_ref: job.task_ref(),
         class: job.row.priority,
         source: job.row.source,
         message: None,
         agent: Some(job.row.adapter.clone()),
         session_ref: job.row.session_ref.clone(),
-        unit: Some(format!("tally-job-{}.service", job.stable_key())),
+        unit: Some(job.identity().unit_name()),
         exit_code: Some(result.exit_code),
         gpu_seconds: Some(0.0),
         artifact_hash: result.artifact_content_hash.clone(),

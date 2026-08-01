@@ -12,6 +12,7 @@ use thiserror::Error;
 
 use crate::adapters::{AdapterConfig, ScrapeStream, TraceFraming};
 use crate::executor::{encode_base64, ExecutionIdentity, Executor};
+use crate::provenance::TaskRef;
 use crate::query::{QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION};
 use crate::query_v2::{FactAuthority, QuerySnapshotMetadata, SourcedValue, TraceAvailability};
 
@@ -21,6 +22,7 @@ const TRACE_READ_TRUNCATION: &str = "query-read-truncated-at-16777216-bytes";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceLane {
     pub task_uuid: String,
+    pub task_ref: Option<TaskRef>,
     pub job_id: Option<String>,
     pub attempt: u32,
     pub lease_epoch: u64,
@@ -38,7 +40,11 @@ impl TraceLane {
             .as_deref()
             .and_then(|job| Uuid::parse_str(job).ok())
             .or(task_uuid)?;
-        Some(ExecutionIdentity { job_id, task_uuid })
+        Some(ExecutionIdentity {
+            job_id,
+            task_uuid,
+            task_ref: self.task_ref.clone(),
+        })
     }
 }
 
@@ -584,6 +590,7 @@ mod tests {
         let identity = ExecutionIdentity {
             job_id: id,
             task_uuid: Some(id),
+            task_ref: None,
         };
         let paths = executor.paths(&identity);
         std::fs::create_dir_all(paths.stdout.parent().unwrap()).unwrap();
@@ -611,6 +618,7 @@ mod tests {
         )]);
         let lane = TraceLane {
             task_uuid: id.to_string(),
+            task_ref: None,
             job_id: Some(id.to_string()),
             attempt: 1,
             lease_epoch: 7,
@@ -664,6 +672,7 @@ mod tests {
             let identity = ExecutionIdentity {
                 job_id: id,
                 task_uuid: Some(id),
+                task_ref: None,
             };
             let paths = executor.paths(&identity);
             std::fs::create_dir_all(paths.stdout.parent().unwrap()).unwrap();
@@ -687,6 +696,7 @@ mod tests {
             )]);
             let lane = TraceLane {
                 task_uuid: id.to_string(),
+                task_ref: None,
                 job_id: Some(id.to_string()),
                 attempt: 1,
                 lease_epoch: 7,
@@ -792,6 +802,7 @@ mod tests {
         ] {
             let lane = TraceLane {
                 task_uuid: task.clone(),
+                task_ref: None,
                 job_id: Some(task.clone()),
                 attempt: 1,
                 lease_epoch: 7,

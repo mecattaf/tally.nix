@@ -60,6 +60,7 @@ fn request(argv: Vec<String>) -> ExecutionRequest {
         identity: ExecutionIdentity {
             job_id: Uuid::new_v4(),
             task_uuid: Some(Uuid::new_v4()),
+            task_ref: None,
         },
         parent: Some(Uuid::new_v4()),
         pools: vec!["worker-live".to_owned()],

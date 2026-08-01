@@ -125,7 +125,7 @@ A node admitted by the shipped flow runner carries this capsule through the dura
 the canonical witness:
 
 ```text
-flowName, flowRunId, scriptHash, argsHash, catalogHash, nodeOrdinal, nodeLabel?, maxNodes,
+flowName, flowRunId, scriptHash, argsHash, catalogHash, nodeOrdinal, nodeLabel?, taskRef?, maxNodes,
 promptRevision?, skillRevision?, selection?
 ```
 
@@ -136,10 +136,14 @@ for that `flowRunId`. If any recorded identity differs from the current script, 
 catalog, it stops with the corresponding `*-changed-mid-run` code (CLI exit 20) before admitting
 more work. The witness capsule therefore ties a proved node to all three generation-pinned
 inputs that produced its ordinal. Prompt and skill revisions perform the same role for resolved
-agent inputs when those revisions are known.
+agent inputs when those revisions are known. `taskRef`, when present, is the
+validated campaign-scoped human reference `<campaign>/<task-id>`; it remains
+outside payload identity but is covered by the witness record hash as part of
+the preserved capsule.
 
 This guarantee belongs to the flow-runner path, not to a strong kernel schema for the opaque
-capsule. The kernel requires a UUID `flowRunId`, validates a positive optional `maxNodes`, and
+capsule. The kernel requires a UUID `flowRunId`, validates a positive optional `maxNodes` and
+the optional `taskRef` form, and
 validates a non-negative optional `nodeOrdinal` and the optional prompt/skill revision shapes;
 it otherwise preserves object members verbatim. A generic RPC client can submit a thinner
 capsule, so consumers should not assume these runner identity hashes exist on non-flow records.

@@ -25,7 +25,11 @@ export const meta = {
       "gates"
     ],
     properties: {
-      campaign: { type: "string", pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" },
+      campaign: {
+        type: "string",
+        maxLength: 80,
+        pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+      },
       repository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
       issue: {
         type: "object",
@@ -247,7 +251,7 @@ const mergeSchema = {
   additionalProperties: false
 };
 
-function driverNode(action, brief, key, label, resultSchema, workspace) {
+function driverNode(action, brief, key, label, resultSchema, workspace, taskRef) {
   const spec = {
     argv: [args.driver, action],
     adapter: "spec-build-driver",
@@ -260,6 +264,9 @@ function driverNode(action, brief, key, label, resultSchema, workspace) {
     label,
     resultSchema
   };
+  if (taskRef !== null) {
+    spec.taskRef = taskRef;
+  }
   if (workspace !== null) {
     spec.workspace = workspace;
   }
@@ -306,6 +313,7 @@ function workspaceFor(prepared) {
     "worklist",
     "spec-build-worklist",
     worklistSchema,
+    null,
     null
   );
   const worklist = worklistNode.result;
@@ -314,6 +322,7 @@ function workspaceFor(prepared) {
   // Serial by construction. The merge for task N is witnessed before prep for
   // task N+1 is even submitted, so the next base revision is current main.
   for (const task of worklist.tasks) {
+    const taskRef = `${args.campaign}/${task.id}`;
     const prepared = await driverNode(
       "prep",
       {
@@ -328,7 +337,8 @@ function workspaceFor(prepared) {
       `prep-${task.id}`,
       `prep-${task.id}`,
       workspaceSchema,
-      null
+      null,
+      taskRef
     );
     const workspace = workspaceFor(prepared.result);
 
@@ -346,7 +356,8 @@ function workspaceFor(prepared) {
           runtimeMaxSec: gate.runtimeMaxSec,
           evidence: ["exit:0"],
           key: `preflight-gate-${gate.id}`,
-          label: `preflight-gate-${gate.id}`
+          label: `preflight-gate-${gate.id}`,
+          taskRef
         });
       }
     }
@@ -377,7 +388,8 @@ function workspaceFor(prepared) {
         }
       },
       key: `agent-${task.id}`,
-      label: `agent-${task.id}`
+      label: `agent-${task.id}`,
+      taskRef
     };
     if (args.agent.runtimeMaxSec !== null) {
       agentSpec.runtimeMaxSec = args.agent.runtimeMaxSec;
@@ -399,7 +411,8 @@ function workspaceFor(prepared) {
         runtimeMaxSec: gate.runtimeMaxSec,
         evidence: ["exit:0"],
         key: `gate-${task.id}-${gate.id}`,
-        label: `gate-${task.id}-${gate.id}`
+        label: `gate-${task.id}-${gate.id}`,
+        taskRef
       });
     }
 
@@ -418,7 +431,8 @@ function workspaceFor(prepared) {
       `publish-${task.id}`,
       `publish-${task.id}`,
       publicationSchema,
-      workspace
+      workspace,
+      taskRef
     );
 
     const merge = await driverNode(
@@ -437,7 +451,8 @@ function workspaceFor(prepared) {
       `merge-${task.id}`,
       `merge-${task.id}`,
       mergeSchema,
-      null
+      null,
+      taskRef
     );
     merged.push(merge.result);
   }

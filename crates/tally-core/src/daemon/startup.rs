@@ -548,6 +548,10 @@ pub(super) fn recovery_gh_completions(
             row: rows[&task_uuid].clone(),
             result: JobResult {
                 task_uuid: Some(task_uuid.to_string()),
+                task_ref: record
+                    .orchestration
+                    .as_ref()
+                    .and_then(Orchestration::task_ref),
                 job_id: task_uuid.to_string(),
                 verdict: record.verdict,
                 exit_code: record.exit_code,
@@ -760,6 +764,11 @@ pub(super) fn hydrate_completed_adapter_metadata(
         let identity = ExecutionIdentity {
             job_id: recovery.row.uuid,
             task_uuid: Some(recovery.row.uuid),
+            task_ref: recovery
+                .row
+                .orchestration
+                .as_ref()
+                .and_then(Orchestration::task_ref),
         };
         match executor.capture_generation_matches(
             &identity,
@@ -943,6 +952,7 @@ pub(super) fn reconcile_retained_adapter_attestations(
         let identity = ExecutionIdentity {
             job_id: task_uuid,
             task_uuid: Some(task_uuid),
+            task_ref: row.orchestration.as_ref().and_then(Orchestration::task_ref),
         };
         match executor.capture_generation_matches(&identity, record.attempt, record.lease_epoch) {
             Ok(true) => {}
@@ -1530,6 +1540,7 @@ pub(super) fn recovery_adapter_invocation(
             let identity = ExecutionIdentity {
                 job_id: row.uuid,
                 task_uuid: Some(row.uuid),
+                task_ref: row.orchestration.as_ref().and_then(Orchestration::task_ref),
             };
             let checkpoint = verified_adapter_attestation_captures(
                 attestations,
