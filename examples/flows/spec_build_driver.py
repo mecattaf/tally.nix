@@ -175,14 +175,51 @@ def normalize_conflict_domains(value: Any, context: str, *, required: bool) -> l
     return normalized
 
 
+def normalize_dependencies(value: Any, context: str, prior_ids: set[str]) -> list[str]:
+    dependencies = string_list(value, f"{context}.dependencies")
+    if len(dependencies) != len(set(dependencies)):
+        fail(f"{context}.dependencies contains duplicates")
+    missing = [dependency for dependency in dependencies if dependency not in prior_ids]
+    if missing:
+        fail(
+            f"{context}.dependencies must reference earlier tasks; unavailable: {', '.join(missing)}"
+        )
+    return dependencies
+
+
 def normalize_task(
     value: Any, index: int, prior_ids: set[str], *, require_conflict_domains: bool
 ) -> dict[str, Any]:
     context = f"tasks[{index}]"
+    if not isinstance(value, dict):
+        fail(f"{context} must be an object")
+    kind = value.get("kind")
+    if kind == "checkpoint":
+        task = object_exact(
+            value,
+            {"id", "kind", "title", "argv", "runtimeMaxSec", "dependencies"},
+            context,
+        )
+        identifier = required_string(task.get("id"), f"{context}.id", 80)
+        if not TASK_ID.fullmatch(identifier):
+            fail(f"{context}.id must match {TASK_ID.pattern}")
+        return {
+            "id": identifier,
+            "kind": "checkpoint",
+            "title": required_string(task.get("title"), f"{context}.title", 300),
+            "argv": argv(task.get("argv"), f"{context}.argv"),
+            "runtimeMaxSec": positive_integer(
+                task.get("runtimeMaxSec"), f"{context}.runtimeMaxSec"
+            ),
+            "dependencies": normalize_dependencies(task.get("dependencies"), context, prior_ids),
+        }
+    if kind != "implementation":
+        fail(f"{context}.kind must equal implementation or checkpoint")
     task = object_exact(
         value,
         {
             "id",
+            "kind",
             "title",
             "goal",
             "deliveredBehaviors",
@@ -199,16 +236,9 @@ def normalize_task(
     read_first = object_exact(
         task.get("readFirst"), {"specSections", "styleReferences"}, f"{context}.readFirst"
     )
-    dependencies = string_list(task.get("dependencies"), f"{context}.dependencies")
-    if len(dependencies) != len(set(dependencies)):
-        fail(f"{context}.dependencies contains duplicates")
-    missing = [dependency for dependency in dependencies if dependency not in prior_ids]
-    if missing:
-        fail(
-            f"{context}.dependencies must reference earlier tasks; unavailable: {', '.join(missing)}"
-        )
     return {
         "id": identifier,
+        "kind": "implementation",
         "title": required_string(task.get("title"), f"{context}.title", 300),
         "goal": required_string(task.get("goal"), f"{context}.goal", 12000),
         "deliveredBehaviors": string_list(
@@ -225,7 +255,7 @@ def normalize_task(
         "acceptanceCriteria": normalize_acceptance(
             task.get("acceptanceCriteria"), f"{context}.acceptanceCriteria"
         ),
-        "dependencies": dependencies,
+        "dependencies": normalize_dependencies(task.get("dependencies"), context, prior_ids),
         "conflictDomains": normalize_conflict_domains(
             task.get("conflictDomains"),
             f"{context}.conflictDomains",
@@ -324,6 +354,36 @@ def pull_request_marker(campaign: str, issue_number: str, task_id: str) -> str:
     )
 
 
+def checkpoint_ref(
+    campaign: str, issue_number: str, task_id: str, source_sha256: str
+) -> str:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_sha256):
+        fail("worklist source digest is not a lowercase SHA-256 identity")
+    digest = source_sha256.removeprefix("sha256:")
+    readable = re.sub(r"[^a-z0-9]+", "-", campaign.casefold()).strip("-")
+    readable = (readable or "campaign")[:24].rstrip("-") or "campaign"
+    campaign_identity = hashlib.sha256(campaign.encode()).hexdigest()[:12]
+    return (
+        "refs/tags/tally/spec-build/v1/"
+        f"{readable}-{campaign_identity}-issue-{issue_number}/{task_id}-{digest}"
+    )
+
+
+def remote_ref_oid(checkout: Path, remote: str, reference: str) -> str | None:
+    listed = git(checkout, "ls-remote", "--refs", remote, reference)
+    lines = [line for line in listed.stdout.splitlines() if line]
+    if not lines:
+        return None
+    if len(lines) != 1:
+        fail(f"remote ref lookup for {reference!r} returned {len(lines)} rows")
+    fields = lines[0].split("\t")
+    if len(fields) != 2 or fields[1] != reference or not re.fullmatch(
+        r"[0-9a-f]{40,64}", fields[0]
+    ):
+        fail(f"remote ref lookup for {reference!r} returned malformed output")
+    return fields[0]
+
+
 def merged_github_tasks(
     repository: str,
     campaign: str,
@@ -356,6 +416,8 @@ def merged_github_tasks(
     facts: list[dict[str, str]] = []
     claimed_urls: set[str] = set()
     for task in tasks:
+        if task["kind"] != "implementation":
+            continue
         marker = pull_request_marker(campaign, issue_number, task["id"])
         branch = stable_publish_branch(campaign, issue_number, task["id"])
         legacy_campaign = f"Spec-build campaign progress for {repository}#{issue_number}."
@@ -460,6 +522,8 @@ def merged_local_tasks(
     base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
     facts: list[dict[str, str]] = []
     for task in tasks:
+        if task["kind"] != "implementation":
+            continue
         branch = stable_publish_branch(campaign, issue_number, task["id"])
         remote_ref = f"refs/remotes/{remote}/{branch}"
         if git(checkout, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode:
@@ -477,6 +541,44 @@ def merged_local_tasks(
     return facts
 
 
+def completed_checkpoint_tasks(
+    config: dict[str, Any],
+    campaign: str,
+    issue_number: str,
+    tasks: list[dict[str, Any]],
+    source: dict[str, str],
+    merged_ids: set[str],
+) -> list[dict[str, str]]:
+    checkpoints = [task for task in tasks if task["kind"] == "checkpoint"]
+    if not checkpoints:
+        return []
+    checkout: Path = config["checkout"]
+    remote = config["remote"]
+    git(checkout, "fetch", "--prune", "--no-tags", remote)
+    base_ref = f"{remote}/{config['baseBranch']}"
+    base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
+    facts: list[dict[str, str]] = []
+    completed_ids = set(merged_ids)
+    for task in checkpoints:
+        if not all(dependency in completed_ids for dependency in task["dependencies"]):
+            continue
+        reference = checkpoint_ref(
+            campaign, issue_number, task["id"], source["sha256"]
+        )
+        target = remote_ref_oid(checkout, remote, reference)
+        if target is None:
+            continue
+        git(checkout, "fetch", "--no-tags", remote, reference)
+        fetched = git(checkout, "rev-parse", "--verify", "FETCH_HEAD^{commit}").stdout.strip()
+        if fetched != target or git(checkout, "cat-file", "-t", target).stdout.strip() != "commit":
+            fail(f"checkpoint ref {reference!r} must point directly to a commit")
+        if git(checkout, "merge-base", "--is-ancestor", target, base_rev, check=False).returncode:
+            continue
+        facts.append({"taskId": task["id"], "ref": reference, "revision": target})
+        completed_ids.add(task["id"])
+    return facts
+
+
 def domains_overlap(left: str, right: str) -> bool:
     left_parts = Path(left).parts
     right_parts = Path(right).parts
@@ -488,8 +590,8 @@ def task_conflicts(task: dict[str, Any], selected: list[dict[str, Any]]) -> bool
     return any(
         domains_overlap(left, right)
         for other in selected
-        for left in task["conflictDomains"]
-        for right in other["conflictDomains"]
+        for left in task.get("conflictDomains", [])
+        for right in other.get("conflictDomains", [])
     )
 
 
@@ -538,12 +640,20 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             issue["number"],
             worklist["tasks"],
         )
-    merged_ids = {fact["taskId"] for fact in merged}
-    remaining = [task for task in worklist["tasks"] if task["id"] not in merged_ids]
+    checkpoints = completed_checkpoint_tasks(
+        config,
+        campaign,
+        issue["number"],
+        worklist["tasks"],
+        worklist["source"],
+        {fact["taskId"] for fact in merged},
+    )
+    completed_ids = {fact["taskId"] for fact in merged + checkpoints}
+    remaining = [task for task in worklist["tasks"] if task["id"] not in completed_ids]
     ready = [
         task
         for task in remaining
-        if all(dependency in merged_ids for dependency in task["dependencies"])
+        if all(dependency in completed_ids for dependency in task["dependencies"])
     ]
     max_parallel = data["maxParallel"]
     frontier: list[dict[str, Any]] = []
@@ -558,6 +668,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         "source": worklist["source"],
         "tasks": worklist["tasks"],
         "merged": merged,
+        "checkpoints": checkpoints,
         "remaining": [task["id"] for task in remaining],
         "frontier": frontier,
         "complete": not remaining,
@@ -589,6 +700,9 @@ def prep_identity(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
     task_id = required_string(task.get("id"), "task.id")
     if not TASK_ID.fullmatch(task_id):
         fail("task.id is not safe")
+    task_kind = task.get("kind")
+    if task_kind not in {"implementation", "checkpoint"}:
+        fail("task.kind must equal implementation or checkpoint")
     campaign = required_string(data.get("campaign"), "campaign")
     repository = required_string(data.get("repository"), "repository")
     issue = campaign_issue(data.get("issue"))
@@ -603,6 +717,7 @@ def prep_identity(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
         "issueNumber": issue["number"],
         "runId": run_id,
         "taskId": task_id,
+        "taskKind": task_kind,
         "workspaceRoot": workspace_root,
     }
     return data, config, identity
@@ -644,6 +759,7 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
             "repository": identity["repository"],
             "runId": identity["runId"],
             "taskId": identity["taskId"],
+            "taskKind": identity["taskKind"],
             "branch": branch,
             "publishBranch": publish_branch,
             "worktreePath": str(worktree),
@@ -664,7 +780,7 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     base_ref = f"{remote}/{base_branch}"
     base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
     publish_ref = f"refs/remotes/{remote}/{publish_branch}"
-    published = git(
+    published = identity["taskKind"] == "implementation" and git(
         checkout,
         "show-ref",
         "--verify",
@@ -691,6 +807,7 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
         "repository": identity["repository"],
         "runId": identity["runId"],
         "taskId": identity["taskId"],
+        "taskKind": identity["taskKind"],
         "baseRev": base_rev,
         "branch": branch,
         "publishBranch": publish_branch,
@@ -1471,6 +1588,153 @@ def merge_github(
     return merge_commit
 
 
+def github_checkpoint_progress_comment(
+    data: dict[str, Any], reference: str, revision: str, source_sha256: str
+) -> None:
+    repository = required_string(data.get("repository"), "repository")
+    campaign = required_string(data.get("campaign"), "campaign")
+    issue = campaign_issue(data.get("issue"))
+    task = data["task"]
+    task_id = task["id"]
+    marker = (
+        "<!-- tally:spec-build:v1 "
+        f"campaign={campaign} issue={issue['number']} checkpoint={task_id} "
+        f"source={source_sha256} passed -->"
+    )
+    comments = run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            f"repos/{repository}/issues/{issue['number']}/comments?per_page=100",
+            "--jq",
+            ".[].body",
+        ]
+    ).stdout
+    if marker not in comments:
+        body = (
+            f"{marker}\n"
+            f"Automated checkpoint `{task_id}` ({task['title']}) passed at `{revision}`.\n\n"
+            f"Task ref: `{campaign}/{task_id}`\n\n"
+            f"Completion ref: `{reference}`"
+        )
+        run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                issue["number"],
+                "--repo",
+                repository,
+                "--body",
+                body,
+            ]
+        )
+    reconcile_command = required_string(
+        data.get("reconcileCommand"), "reconcileCommand", 300
+    )
+    if not reconcile_command.startswith("/"):
+        fail("reconcileCommand must be an explicit slash command")
+    run(
+        [
+            "gh",
+            "issue",
+            "comment",
+            issue["number"],
+            "--repo",
+            repository,
+            "--body",
+            reconcile_command,
+        ]
+    )
+
+
+def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
+    data = object_exact(
+        brief,
+        {
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "reconcileCommand",
+            "task",
+            "source",
+            "workspace",
+        },
+        "checkpoint brief",
+    )
+    campaign = required_string(data.get("campaign"), "campaign")
+    if not COMPONENT.fullmatch(campaign):
+        fail("campaign is not a safe component")
+    repository = required_string(data.get("repository"), "repository")
+    if not REPOSITORY.fullmatch(repository):
+        fail("repository must use owner/name form")
+    issue = campaign_issue(data.get("issue"))
+    config = repo_config(data.get("repositoryConfig"))
+    task = object_exact(
+        data.get("task"),
+        {"id", "kind", "title", "argv", "runtimeMaxSec", "dependencies"},
+        "checkpoint task",
+    )
+    task_id = required_string(task.get("id"), "checkpoint task.id", 80)
+    if not TASK_ID.fullmatch(task_id) or task.get("kind") != "checkpoint":
+        fail("checkpoint task must carry a safe id and kind checkpoint")
+    required_string(task.get("title"), "checkpoint task.title", 300)
+    argv(task.get("argv"), "checkpoint task.argv")
+    positive_integer(task.get("runtimeMaxSec"), "checkpoint task.runtimeMaxSec")
+    string_list(task.get("dependencies"), "checkpoint task.dependencies")
+    source = object_exact(data.get("source"), {"path", "sha256"}, "source")
+    required_string(source.get("path"), "source.path")
+    source_sha256 = required_string(source.get("sha256"), "source.sha256")
+    workspace = object_exact(
+        data.get("workspace"),
+        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
+        "workspace",
+    )
+    if workspace.get("taskId") != task_id:
+        fail("checkpoint task.id does not match workspace.taskId")
+    base_rev = required_string(workspace.get("baseRev"), "workspace.baseRev")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", base_rev):
+        fail("workspace.baseRev must be a full Git object ID")
+    branch = required_string(workspace.get("branch"), "workspace.branch")
+    required_string(workspace.get("publishBranch"), "workspace.publishBranch")
+    worktree = Path(required_string(workspace.get("worktreePath"), "workspace.worktreePath"))
+    if not worktree.is_absolute() or not worktree.is_dir():
+        fail("workspace.worktreePath must be an absolute existing directory")
+    if git(worktree, "branch", "--show-current").stdout.strip() != branch:
+        fail("checkpoint worktree changed branches during validation")
+    if git(worktree, "rev-parse", "HEAD^{commit}").stdout.strip() != base_rev:
+        fail("checkpoint command changed HEAD instead of validating the prepared base")
+    if git(worktree, "status", "--porcelain", "--untracked-files=no").stdout:
+        fail("checkpoint command changed tracked files instead of validating the prepared base")
+
+    checkout: Path = config["checkout"]
+    remote = config["remote"]
+    git(checkout, "fetch", "--prune", "--no-tags", remote)
+    current_base = git(
+        checkout,
+        "rev-parse",
+        "--verify",
+        f"{remote}/{config['baseBranch']}^{{commit}}",
+    ).stdout.strip()
+    if current_base != base_rev:
+        fail("remote base moved after the checkpoint command was witnessed")
+    reference = checkpoint_ref(campaign, issue["number"], task_id, source_sha256)
+    existing = remote_ref_oid(worktree, remote, reference)
+    if existing != base_rev:
+        push_arguments = ["push"]
+        if existing is not None:
+            push_arguments.append(f"--force-with-lease={reference}:{existing}")
+        push_arguments.extend([remote, f"{base_rev}:{reference}"])
+        git(worktree, *push_arguments)
+    if remote_ref_oid(worktree, remote, reference) != base_rev:
+        fail("checkpoint completion ref did not expose the witnessed base revision")
+    if config["forge"] == "github":
+        github_checkpoint_progress_comment(data, reference, base_rev, source_sha256)
+    return {"taskId": task_id, "ref": reference, "revision": base_rev}
+
+
 def github_progress_comment(
     data: dict[str, Any], integration: dict[str, Any], merge_commit: str
 ) -> None:
@@ -1578,6 +1842,7 @@ def main() -> int:
             "prep",
             "cleanup",
             "constraint",
+            "checkpoint",
             "publish",
             "rebase",
             "merge",
@@ -1591,6 +1856,7 @@ def main() -> int:
         "preflight": action_preflight,
         "prep": action_prep,
         "constraint": action_constraint,
+        "checkpoint": action_checkpoint,
         "cleanup": action_cleanup,
         "publish": action_publish,
         "rebase": action_rebase,
