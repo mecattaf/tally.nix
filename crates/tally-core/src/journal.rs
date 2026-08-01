@@ -139,6 +139,8 @@ pub const TALLY_FIELD_MATRIX: &[(&str, FieldRequirement)] = &[
     ("TALLY_UNIT", FieldRequirement::AtStart),
     ("TALLY_SESSION_REF", FieldRequirement::Conditional),
     ("TALLY_EXIT_CODE", FieldRequirement::AtCompletedOrFailed),
+    ("TALLY_STDERR_TAIL", FieldRequirement::Conditional),
+    ("TALLY_STDERR_TRUNCATED", FieldRequirement::Conditional),
     ("TALLY_GPU_SECONDS", FieldRequirement::AtCompletedOrFailed),
     ("TALLY_LABOR_CLASS", FieldRequirement::AtCompletedOrFailed),
     ("TALLY_ARTIFACT_HASH", FieldRequirement::AtCompleted),
@@ -201,6 +203,18 @@ pub struct TallyFields {
     pub unit: Option<String>,
     #[serde(rename = "TALLY_EXIT_CODE", skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
+    #[serde(
+        rename = "TALLY_STDERR_TAIL",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stderr_tail: Option<String>,
+    #[serde(
+        rename = "TALLY_STDERR_TRUNCATED",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub stderr_truncated: Option<bool>,
     #[serde(rename = "TALLY_GPU_SECONDS", skip_serializing_if = "Option::is_none")]
     pub gpu_seconds: Option<f64>,
     #[serde(
@@ -248,6 +262,8 @@ pub struct EmitEvent {
     pub session_ref: Option<String>,
     pub unit: Option<String>,
     pub exit_code: Option<i32>,
+    pub stderr_tail: Option<String>,
+    pub stderr_truncated: Option<bool>,
     pub gpu_seconds: Option<f64>,
     pub artifact_hash: Option<String>,
     pub evidence: Option<String>,
@@ -273,6 +289,8 @@ impl EmitEvent {
             session_ref: None,
             unit: None,
             exit_code: None,
+            stderr_tail: None,
+            stderr_truncated: None,
             gpu_seconds: None,
             artifact_hash: None,
             evidence: None,
@@ -303,6 +321,8 @@ impl EmitEvent {
             session_ref: self.session_ref,
             unit: self.unit,
             exit_code: self.exit_code,
+            stderr_tail: self.stderr_tail,
+            stderr_truncated: self.stderr_truncated,
             gpu_seconds: self.gpu_seconds,
             artifact_hash: self.artifact_hash,
             evidence: self.evidence,
@@ -403,6 +423,8 @@ fn field_present(fields: &TallyFields, name: &str) -> bool {
             .as_deref()
             .is_some_and(|value| !value.is_empty()),
         "TALLY_EXIT_CODE" => fields.exit_code.is_some(),
+        "TALLY_STDERR_TAIL" => fields.stderr_tail.is_some(),
+        "TALLY_STDERR_TRUNCATED" => fields.stderr_truncated.is_some(),
         "TALLY_GPU_SECONDS" => fields.gpu_seconds.is_some(),
         "TALLY_ARTIFACT_HASH" => fields
             .artifact_hash
@@ -460,7 +482,7 @@ pub fn validate_fields(fields: &TallyFields) -> Result<(), JournalError> {
         if value.contains('\0') {
             return Err(JournalError::Invalid(format!("{name} contains a NUL byte")));
         }
-        if name != "MESSAGE" && value.chars().any(char::is_control) {
+        if !matches!(name, "MESSAGE" | "TALLY_STDERR_TAIL") && value.chars().any(char::is_control) {
             return Err(JournalError::Invalid(format!(
                 "{name} contains a control character"
             )));
@@ -470,6 +492,27 @@ pub fn validate_fields(fields: &TallyFields) -> Result<(), JournalError> {
         return Err(JournalError::Invalid(
             "TALLY_EXIT_CODE must be non-negative".to_owned(),
         ));
+    }
+    match (&fields.stderr_tail, fields.stderr_truncated) {
+        (Some(tail), Some(_)) => {
+            if fields.event != TallyEvent::Failed {
+                return Err(JournalError::Invalid(
+                    "TALLY_STDERR_TAIL is valid only on failed events".to_owned(),
+                ));
+            }
+            if tail.len() > crate::executor::CAPTURE_EXCERPT_MAX_BYTES {
+                return Err(JournalError::Invalid(format!(
+                    "TALLY_STDERR_TAIL exceeds {} bytes",
+                    crate::executor::CAPTURE_EXCERPT_MAX_BYTES
+                )));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(JournalError::Invalid(
+                "TALLY_STDERR_TAIL and TALLY_STDERR_TRUNCATED must appear together".to_owned(),
+            ));
+        }
     }
     if fields
         .gpu_seconds
@@ -505,6 +548,7 @@ fn string_fields(fields: &TallyFields) -> Vec<(&'static str, &str)> {
         ("TALLY_AGENT", fields.agent.as_deref()),
         ("TALLY_SESSION_REF", fields.session_ref.as_deref()),
         ("TALLY_UNIT", fields.unit.as_deref()),
+        ("TALLY_STDERR_TAIL", fields.stderr_tail.as_deref()),
         ("TALLY_ARTIFACT_HASH", fields.artifact_hash.as_deref()),
         ("TALLY_EVIDENCE", fields.evidence.as_deref()),
         ("TALLY_JOB_ID", fields.job_id.as_deref()),
@@ -702,6 +746,14 @@ fn native_fields(fields: &TallyFields) -> Result<Vec<(&'static str, String)>, Jo
     if let Some(value) = fields.exit_code {
         values.push(("TALLY_EXIT_CODE", value.to_string()));
     }
+    push_optional(
+        &mut values,
+        "TALLY_STDERR_TAIL",
+        fields.stderr_tail.as_deref(),
+    );
+    if let Some(value) = fields.stderr_truncated {
+        values.push(("TALLY_STDERR_TRUNCATED", value.to_string()));
+    }
     if let Some(value) = fields.gpu_seconds {
         values.push(("TALLY_GPU_SECONDS", value.to_string()));
     }
@@ -851,6 +903,14 @@ fn hydrate_fields(source: &Map<String, Value>) -> Result<TallyFields, JournalErr
             }
         }
     }
+    if let Some(value) = normalized.get("TALLY_STDERR_TRUNCATED").cloned() {
+        if let Some(value) = value.as_str() {
+            let value = value.parse::<bool>().map_err(|_| {
+                JournalError::Invalid("TALLY_STDERR_TRUNCATED is not a boolean".to_owned())
+            })?;
+            normalized.insert("TALLY_STDERR_TRUNCATED".to_owned(), Value::Bool(value));
+        }
+    }
     serde_json::from_value(Value::Object(normalized)).map_err(JournalError::Json)
 }
 
@@ -888,6 +948,8 @@ mod tests {
             session_ref: Some("session-1".to_owned()),
             unit: Some("tally-job-task-abc.service".to_owned()),
             exit_code: Some(0),
+            stderr_tail: (event == TallyEvent::Failed).then(|| "failure detail\n".to_owned()),
+            stderr_truncated: (event == TallyEvent::Failed).then_some(false),
             gpu_seconds: Some(12.5),
             artifact_hash: Some("sha256:deadbeef".to_owned()),
             evidence: Some("pass artifact:/out/result".to_owned()),
@@ -1043,6 +1105,19 @@ mod tests {
         let mut event = EmitEvent::enqueued("task", Priority::Low, EnqueueSource::Manual);
         event.pools = Some(vec!["bad\npool".to_owned()]);
         assert!(event.into_fields().is_err());
+
+        let mut event = full_event(TallyEvent::Completed);
+        event.stderr_tail = Some("only failures may carry this".to_owned());
+        event.stderr_truncated = Some(false);
+        assert!(event.into_fields().is_err());
+
+        let mut event = full_event(TallyEvent::Failed);
+        event.stderr_truncated = None;
+        assert!(event.into_fields().is_err());
+
+        let mut event = full_event(TallyEvent::Failed);
+        event.stderr_tail = Some("x".repeat(crate::executor::CAPTURE_EXCERPT_MAX_BYTES + 1));
+        assert!(event.into_fields().is_err());
     }
 
     #[test]
@@ -1085,6 +1160,17 @@ mod tests {
         let length_start = index + marker.len();
         let length = u64::from_le_bytes(packet[length_start..length_start + 8].try_into().unwrap());
         assert_eq!(length, "line one\nline two".len() as u64);
+
+        let packet =
+            encode_native_record(&full_event(TallyEvent::Failed).into_fields().unwrap()).unwrap();
+        let marker = b"TALLY_STDERR_TAIL\n";
+        let index = packet
+            .windows(marker.len())
+            .position(|window| window == marker)
+            .unwrap();
+        let length_start = index + marker.len();
+        let length = u64::from_le_bytes(packet[length_start..length_start + 8].try_into().unwrap());
+        assert_eq!(length, "failure detail\n".len() as u64);
     }
 
     #[test]

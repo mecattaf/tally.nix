@@ -281,9 +281,12 @@ and never changes a running node's immutable brief.
 
 After a non-passing node:
 
-1. Inspect the campaign receipt/evidence and locate the failed node, for example
-   with `tally query log --flow-run <runner-task-uuid>`. Task-specific records
-   expose `taskRef`, so the worklist ID is visible without a UUID lookup.
+1. Inspect the campaign receipt/evidence. A failed runner receipt includes its
+   bounded stderr tail; for a node terminal failure, the structured flow error
+   carries the failed child and that child's captured tail. Locate the full
+   lifecycle with `tally query log --flow-run <runner-task-uuid>` when needed.
+   Task-specific records expose `taskRef`, so the worklist ID is visible
+   without a UUID lookup.
 2. Add the steering decision to the campaign issue.
 3. Correct the failed frontier. Retry a failed agent node with
    `tally queue retry <agent-task-uuid>`; its new attempt reads the comments.

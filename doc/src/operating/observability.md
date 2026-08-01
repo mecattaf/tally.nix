@@ -177,6 +177,11 @@ For a campaign node, every journal/lifecycle record carries
 `query log` projection exposes `taskRef: "crm/t07"`. The same value is exported
 to the child as `TALLY_TASK_REF`.
 
+A `failed` log item carries `stderrTail` and `stderrTruncated`. The tail is a
+lossy UTF-8 rendering bounded to 2 KiB including the omission marker; it is a
+diagnostic projection, not evidence. Read it first. Inspect the retained raw
+capture only when the bounded tail is insufficient.
+
 Query reads at most 16 MiB from one capture generation. Larger local capture
 files remain on disk, but the trace reports
 `query-read-truncated-at-16777216-bytes`. Remote capture transfer is also
@@ -211,11 +216,14 @@ snapshot, then start a new watch. Do not pretend the stream was continuous.
 | Witness and attestation ledgers | `~/.local/share/tally/` | `/var/lib/tally/data/` | Append-only |
 | Lifecycle history and watch log | same data directory | same data directory | Lifecycle is unbounded; watch keeps 4,096 records |
 | Enqueue events, captures, unit exits, meters | `~/.local/state/tally/` | `/var/lib/tally/state/` | No general automatic pruning |
-| Current stdout/stderr | Ordinary: `<stateDir>/capture/<uuid>.out` and `.err`; task-ref node: `<uuid>.<task-id>.out` and `.err` | same layout | Accumulates |
-| Older attempt captures | Ordinary: `<stateDir>/capture/archive/<uuid>/`; task-ref node: `archive/<uuid>.<task-id>/` | same layout | Accumulates |
+| Current stdout/raw adapter stderr | Ordinary: `<stateDir>/capture/<uuid>.out` and `.adapter.err`; task-ref node: `<uuid>.<task-id>.out` and `.adapter.err` | same layout | Accumulates |
+| Failure-only stderr | Ordinary: `<stateDir>/capture/<uuid>.err`; task-ref node: `<uuid>.<task-id>.err`; only present after `failed` | same layout | Accumulates |
+| Older attempt captures | Ordinary: `<stateDir>/capture/archive/<uuid>/`; task-ref node: `archive/<uuid>.<task-id>/`; each retains the same stream distinction | same layout | Accumulates |
 | Worker-side remote state | configured executor `stateDir` | configured executor `stateDir` | Accumulates on the worker |
 
-These files are private implementation storage. Prefer the query API: it
-validates authority, attempt identity, bounds, and pagination that a direct file
-read would have to reconstruct. Capacity planning and the one managed GC path
-are covered in [Retention and growth](retention.md).
+`.adapter.err` may contain benign adapter-runtime chatter on a healthy job;
+`.err` is the failure signal. These files are private implementation storage.
+Prefer the query API: it validates authority, attempt identity, bounds, and
+pagination that a direct file read would have to reconstruct. Capacity planning
+and the one managed GC path are covered in
+[Retention and growth](retention.md).

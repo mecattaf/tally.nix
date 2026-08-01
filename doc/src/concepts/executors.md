@@ -51,6 +51,21 @@ worker-local paths are evaluated there. The reply returns bounded stdout and
 stderr captures plus the terminal evidence facts. tally does not copy the
 workspace or declared artifact/store contents between hosts.
 
+## Capture streams and failure diagnostics
+
+Every generation writes stdout to `<uuid>.out` and the adapter's raw stderr to
+`<uuid>.adapter.err`. The raw stream remains byte-authoritative for configured
+stderr scrapes and provider traces; routine harness chatter can therefore be
+retained without looking like a failure.
+
+When the canonical terminal lifecycle event is `failed`, the coordinator also
+materializes `<uuid>.err` and reads at most its final 2 KiB. That tail is copied
+into the failed lifecycle record and terminal result. Earlier bytes are marked
+as omitted. A successful job has no `<uuid>.err`, so external monitors may use
+that filename as a failure-only signal. Older generations use the same suffixes
+under `capture/archive/<uuid>/`; pre-split `.err` captures remain readable for
+compatibility.
+
 ## Recovery keeps execution singular
 
 Leases remain in the coordinator while a job runs remotely. If SSH disappears,

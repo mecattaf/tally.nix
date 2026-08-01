@@ -133,6 +133,8 @@ impl FlowClient for TestClient {
             task_ref: task_ref.clone(),
             verdict: reply.verdict,
             exit_code: Some(i32::from(!reply.verdict.is_pass())),
+            stderr_excerpt: None,
+            stderr_truncated: None,
             witness_seq: u64::try_from(index + 1).expect("test ordinal fits u64"),
             disposition: reply.disposition,
             result: reply.result,

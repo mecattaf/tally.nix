@@ -72,9 +72,9 @@ the runner unit's liveness. Do not build monitors on `tally query log
 success: any watcher must fire on every terminal state, including "runner gone
 with work remaining."
 
-Known noise: a codex node writes "Reading additional input from stdin..." to its
-capture `.err` while healthy. Non-empty `.err` alone is not failure.
-DEBT: separate adapter noise from failure stderr (#249).
+Known adapter noise such as "Reading additional input from stdin..." is retained
+in `.adapter.err`. The conventional `.err` path is materialized only after a
+failed terminal verdict, so it is a valid failure signal.
 
 A healthy campaign gets zero intervention. Do not comment, do not steer, do not
 "check in" on the agents. Wall-clock alone is never a reason to interfere.
@@ -85,8 +85,10 @@ The campaign must keep working unless it is genuinely blocked or done. There are
 no approval pauses, no "phase done, awaiting operator" states, and Claude must
 never introduce one.
 
-1. On any failed node, read `~/.local/state/tally/capture/<task-uuid>.err`
-   first; the lifecycle stream does not carry the real error. DEBT: #249.
+1. On any failed node, read the bounded `stderrTail` in `tally query log` or the
+   campaign failure receipt first. Read
+   `~/.local/state/tally/capture/<task-uuid>.err` only when the tail is
+   truncated or insufficient; `.adapter.err` is the raw adapter stream.
 2. Transient (network, quota, wall-clock budget) → re-trigger. Until forge-state
    re-entrancy ships, know the replay rules: config or tally changes void the
    witnessed prefix (args/script hash) and require a fresh mention; never retry

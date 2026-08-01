@@ -1417,6 +1417,7 @@ mod tests {
         let paths = ExecutionPaths {
             stdout,
             stderr,
+            failure_stderr: temp.path().join("job.failure.err"),
             exit_record: PathBuf::from("unused"),
             capture_generation: PathBuf::from("unused"),
         };

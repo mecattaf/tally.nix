@@ -249,7 +249,7 @@ impl Daemon {
             &completed_witness,
             Utc::now(),
         )?;
-        let initial_gh_completions = recovery_gh_completions(&plan, &completed_witness)?;
+        let initial_gh_completions = recovery_gh_completions(&plan, &completed_witness, &executor)?;
         let initial_lost_pools =
             ProducerEngine::new(&config.producers, paths.events_dir(), &paths.state_dir)
                 .confirmed_pool_losses()
@@ -513,16 +513,32 @@ pub(super) fn facts_witness(
 pub(super) fn recovery_gh_completions(
     plan: &crate::recovery::RecoveryPlan,
     records: &[crate::witness::WitnessRecord],
+    executor: &Executor,
 ) -> Result<Vec<GhTerminalWork>, DaemonError> {
     let rows = plan
         .rows
         .iter()
-        .filter(|row| row.row.gh_origin.is_some())
+        .filter(|row| {
+            row.row.gh_origin.is_some()
+                && matches!(
+                    row.state,
+                    RecoveryRowState::Completed | RecoveryRowState::Deleted
+                )
+        })
         .map(|row| (row.row.uuid, row.row.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut latest = BTreeMap::<Uuid, &crate::witness::WitnessRecord>::new();
     for record in records {
-        if !matches!(record.verdict, Verdict::Pass | Verdict::Reused) {
+        if !matches!(
+            record.verdict,
+            Verdict::Pass
+                | Verdict::Reused
+                | Verdict::CleanExitNoArtifact
+                | Verdict::Failed
+                | Verdict::Cancelled
+                | Verdict::PoolVanished
+                | Verdict::RuntimeExceeded
+        ) {
             continue;
         }
         let Some(task_uuid) = record.task_uuid.as_deref() else {
@@ -530,7 +546,7 @@ pub(super) fn recovery_gh_completions(
         };
         let task_uuid = Uuid::parse_str(task_uuid).map_err(|_| {
             DaemonError::Invalid(format!(
-                "successful GitHub witness {} has invalid task UUID {task_uuid:?}",
+                "terminal GitHub witness {} has invalid task UUID {task_uuid:?}",
                 record.seq
             ))
         })?;
@@ -561,7 +577,7 @@ pub(super) fn recovery_gh_completions(
                 witness_seq: record.seq,
                 model: record.model.clone(),
                 completion: record.completion.clone(),
-                stderr_excerpt: None,
+                stderr_excerpt: retained_failure_stderr_excerpt(record, executor),
             },
         })
         .collect())

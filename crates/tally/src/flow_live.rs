@@ -734,6 +734,9 @@ fn parse_node_result(value: &Value, disposition: Disposition) -> Result<NodeResu
     let task_uuid = required_str(value, &["taskUuid", "task_uuid"])?.to_owned();
     let verdict = parse_verdict(required_str(value, &["verdict"])?)?;
     let exit_code = optional_i32(value, &["exitCode", "exit_code"])?;
+    let stderr_excerpt =
+        optional_str(value, &["stderrExcerpt", "stderr_excerpt"]).map(str::to_owned);
+    let stderr_truncated = optional_bool(value, &["stderrTruncated", "stderr_truncated"])?;
     let witness_seq = required_u64(value, &["witnessSeq", "witness_seq", "witness_lsn"])?;
     let completion = value.get("completion");
     let gates = value
@@ -756,6 +759,8 @@ fn parse_node_result(value: &Value, disposition: Disposition) -> Result<NodeResu
         task_ref: parse_task_ref(value)?,
         verdict,
         exit_code,
+        stderr_excerpt,
+        stderr_truncated,
         witness_seq,
         disposition,
         result,
@@ -996,6 +1001,16 @@ fn optional_i32(value: &Value, names: &[&str]) -> Result<Option<i32>, ClientErro
         .map_err(|_| protocol_error(format!("response field {} exceeds i32", names[0])))
 }
 
+fn optional_bool(value: &Value, names: &[&str]) -> Result<Option<bool>, ClientError> {
+    let Some(value) = names.iter().find_map(|name| value.get(*name)) else {
+        return Ok(None);
+    };
+    value
+        .as_bool()
+        .map(Some)
+        .ok_or_else(|| protocol_error(format!("response field {} is not a boolean", names[0])))
+}
+
 fn protocol_error(message: impl Into<String>) -> ClientError {
     ClientError::new("flow-protocol-invalid", message)
 }
@@ -1127,6 +1142,8 @@ mod tests {
                     task_ref,
                     verdict: Verdict::Pass,
                     exit_code: Some(0),
+                    stderr_excerpt: None,
+                    stderr_truncated: None,
                     witness_seq: 1,
                     disposition: Disposition::Created,
                     result: Some(json!({"ok": true})),
@@ -1866,12 +1883,16 @@ export const meta = {
                 "task_uuid": "00000000-0000-4000-8000-000000000049",
                 "verdict": "pass",
                 "exit_code": 0,
+                "stderr_excerpt": "captured detail\n",
+                "stderr_truncated": false,
                 "witness_seq": 8
             }),
             Disposition::Created,
         )
         .unwrap();
         assert_eq!(awaited.witness_seq, 8);
+        assert_eq!(awaited.stderr_excerpt.as_deref(), Some("captured detail\n"));
+        assert_eq!(awaited.stderr_truncated, Some(false));
     }
 
     #[test]
@@ -2033,6 +2054,8 @@ export const meta = {
             task_ref: None,
             verdict: Verdict::Pass,
             exit_code: Some(0),
+            stderr_excerpt: None,
+            stderr_truncated: None,
             witness_seq: 1,
             disposition: Disposition::Created,
             result: None,

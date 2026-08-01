@@ -585,6 +585,8 @@ pub struct LifecycleEventProjection {
     pub job_id: Option<String>,
     pub parent_task_uuid: Option<String>,
     pub exit_code: Option<i32>,
+    pub stderr_tail: Option<String>,
+    pub stderr_truncated: Option<bool>,
     pub labor_class: Option<LaborClass>,
     pub evidence_result: Option<EvidenceResult>,
     pub evidence_spec: Option<String>,
@@ -1388,6 +1390,8 @@ fn lifecycle_projection(record: &LifecycleRecord) -> LifecycleEventProjection {
         job_id: record.fields.job_id.clone(),
         parent_task_uuid: record.fields.parent.clone(),
         exit_code: record.fields.exit_code,
+        stderr_tail: record.fields.stderr_tail.clone(),
+        stderr_truncated: record.fields.stderr_truncated,
         labor_class: record.fields.labor_class,
         evidence_result: record
             .fields
@@ -1433,6 +1437,8 @@ fn witness_lifecycle_projection(record: &WitnessRecord) -> LifecycleEventProject
         job_id: None,
         parent_task_uuid: None,
         exit_code: Some(record.exit_code),
+        stderr_tail: None,
+        stderr_truncated: None,
         labor_class: Some(record.labor_class),
         evidence_result: None,
         evidence_spec: None,
@@ -1721,6 +1727,9 @@ mod tests {
             session_ref: Some("scraped-session".to_owned()),
             unit: Some("tally-job-fixture.service".to_owned()),
             exit_code: terminal.then_some(if event == TallyEvent::Completed { 0 } else { 1 }),
+            stderr_tail: (event == TallyEvent::Failed)
+                .then(|| "actionable lifecycle failure\n".to_owned()),
+            stderr_truncated: (event == TallyEvent::Failed).then_some(false),
             gpu_seconds: terminal.then_some(1.0),
             artifact_hash: (event == TallyEvent::Completed)
                 .then(|| format!("sha256:{}", "a".repeat(64))),
@@ -1911,6 +1920,34 @@ mod tests {
         assert_eq!(missing.status, ProofStatus::ProofMissing);
         assert!(missing.witness_expected);
         assert!(missing.witness_record.is_none());
+    }
+
+    #[test]
+    fn lifecycle_log_projects_the_failed_stderr_tail() {
+        let mut history = history();
+        history.records = vec![lifecycle_record(
+            1,
+            TallyEvent::Failed,
+            1,
+            7,
+            "historical-job-24",
+        )];
+        let log = query_lifecycle_log(
+            &[detail(RowStatus::Completed)],
+            &history,
+            &[],
+            &LifecycleLogFilter {
+                task: Some("00000000-0000-4000-8000-000000000024".to_owned()),
+                ..LifecycleLogFilter::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(log.items.len(), 1);
+        assert_eq!(
+            log.items[0].stderr_tail.as_deref(),
+            Some("actionable lifecycle failure\n")
+        );
+        assert_eq!(log.items[0].stderr_truncated, Some(false));
     }
 
     #[test]

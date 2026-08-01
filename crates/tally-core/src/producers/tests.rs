@@ -1012,9 +1012,25 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
     );
 
     let mut mutations = RecordingMutation::default();
-    assert!(!engine
-        .complete_gh(&origin, Verdict::Failed, None, &mut mutations,)
+    assert!(engine
+        .complete_gh(
+            &origin,
+            Verdict::Failed,
+            Some(serde_json::json!({
+                "witnessSeq": 3,
+                "stderrTail": "actionable failure\n",
+                "stderrTruncated": false,
+            })),
+            &mut mutations,
+        )
         .unwrap());
+    assert_eq!(mutations.comments.len(), 1);
+    assert!(mutations.closes.is_empty());
+    assert!(mutations.item_open);
+    assert_eq!(
+        mutations.comments[0].evidence.as_ref().unwrap()["stderrTail"],
+        "actionable failure\n"
+    );
     assert!(engine
         .complete_gh(
             &origin,
@@ -1023,14 +1039,14 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
             &mut mutations,
         )
         .unwrap());
-    assert_eq!(mutations.comments.len(), 1);
+    assert_eq!(mutations.comments.len(), 2);
     assert_eq!(mutations.closes.len(), 1);
     assert!(!mutations.item_open);
-    assert_eq!(mutations.comments[0].state, "COMPLETED");
-    assert_eq!(mutations.comments[0].source, "notifications");
-    assert_eq!(mutations.comments[0].item_id, "PR_kwABC128");
+    assert_eq!(mutations.comments[1].state, "COMPLETED");
+    assert_eq!(mutations.comments[1].source, "notifications");
+    assert_eq!(mutations.comments[1].item_id, "PR_kwABC128");
     assert_eq!(
-        mutations.comments[0].evidence.as_ref().unwrap()["witnessSeq"],
+        mutations.comments[1].evidence.as_ref().unwrap()["witnessSeq"],
         4
     );
 

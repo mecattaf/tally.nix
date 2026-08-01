@@ -2421,7 +2421,31 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             .unwrap();
             let first = runner_output(first).await;
             assert_eq!(first.status.code(), Some(1));
-            assert_eq!(flow_failure(&first)["error"]["code"], "terminal-failure");
+            let failure = flow_failure(&first);
+            assert_eq!(failure["error"]["code"], "terminal-failure");
+            assert_eq!(
+                failure["error"]["details"]["node"]["stderrExcerpt"],
+                "fixture preflight exceeds its bounded deadline before any agent dispatch\n"
+            );
+            assert_eq!(
+                failure["error"]["details"]["node"]["stderrTruncated"],
+                false
+            );
+            assert!(
+                String::from_utf8_lossy(&first.stderr).contains(
+                    "fixture preflight exceeds its bounded deadline before any agent dispatch"
+                ),
+                "runner stderr omitted the child diagnostic: {}",
+                String::from_utf8_lossy(&first.stderr)
+            );
+            let terminal = runner_events(&first, "node-terminal")
+                .into_iter()
+                .find(|event| event["verdict"] == "runtime-exceeded")
+                .expect("runner omitted the failed node-terminal event");
+            assert_eq!(
+                terminal["stderrExcerpt"],
+                "fixture preflight exceeds its bounded deadline before any agent dispatch\n"
+            );
             assert!(
                 !control.join("policy-error.log").exists(),
                 "{}",

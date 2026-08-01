@@ -317,10 +317,12 @@ impl Executor {
                 record.validate(&observed.unit)?;
                 if record.attempt == request.attempt && record.lease_epoch == request.lease_epoch {
                     let termination = classify_termination(&record)?;
+                    let paths = self.paths(&request.identity);
+                    self.normalize_legacy_stderr_capture(&paths)?;
                     return Ok(ExecutionOutcome {
                         unit: observed.unit,
                         backend: ExecutionBackend::Adopted,
-                        paths: self.paths(&request.identity),
+                        paths,
                         record,
                         termination,
                         evidence_gate: None,
@@ -579,10 +581,12 @@ impl Executor {
                         });
                     }
                     let termination = classify_termination(&record)?;
+                    let paths = self.paths(&request.identity);
+                    self.normalize_legacy_stderr_capture(&paths)?;
                     return Ok(ExecutionOutcome {
                         unit: observed.unit,
                         backend: ExecutionBackend::Adopted,
-                        paths: self.paths(&request.identity),
+                        paths,
                         record,
                         termination,
                         evidence_gate: None,
@@ -952,6 +956,11 @@ impl Executor {
         create_private_directory(exits)?;
         create_private_file(&paths.stdout)?;
         create_private_file(&paths.stderr)?;
+        match std::fs::remove_file(&paths.failure_stderr) {
+            Ok(()) => sync_directory(capture)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&paths.failure_stderr, source)),
+        }
         match std::fs::remove_file(&paths.exit_record) {
             Ok(()) => sync_directory(exits)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}

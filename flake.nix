@@ -1922,7 +1922,7 @@
             expected_writable_paths = {
               "/srv/tally/state/unit-exit",
               f"/srv/tally/state/capture/{hardened_task}.out",
-              f"/srv/tally/state/capture/{hardened_task}.err",
+              f"/srv/tally/state/capture/{hardened_task}.adapter.err",
               "/srv/tally/state/exec-attestations.jsonl",
               "/srv/tally/production-agent",
             }

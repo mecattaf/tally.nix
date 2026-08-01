@@ -152,6 +152,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
                     &ExecutionPaths {
                         stdout,
                         stderr,
+                        failure_stderr: PathBuf::from("unused"),
                         exit_record: PathBuf::from("unused"),
                         capture_generation: PathBuf::from("unused"),
                     },

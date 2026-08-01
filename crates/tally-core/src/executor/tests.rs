@@ -559,7 +559,7 @@ fn systemd_argv_is_direct_stable_and_complete() {
         "MemoryMax=1073741824",
         "RuntimeMaxSec=30s",
         "StandardOutput=append:/state tree/capture/00000000-0000-4000-8000-000000000002.out",
-        "StandardError=append:/state tree/capture/00000000-0000-4000-8000-000000000002.err",
+        "StandardError=append:/state tree/capture/00000000-0000-4000-8000-000000000002.adapter.err",
         "LoadCredential=alpha:/run/keys/alpha",
         "LoadCredential=zeta:/run/keys/zeta",
     ] {
@@ -617,6 +617,10 @@ fn campaign_task_ref_names_the_unit_captures_gate_and_child_environment() {
     );
     assert_eq!(
         paths.stderr,
+        PathBuf::from(format!("/state/capture/{uuid}.t07.adapter.err"))
+    );
+    assert_eq!(
+        paths.failure_stderr,
         PathBuf::from(format!("/state/capture/{uuid}.t07.err"))
     );
     assert_eq!(
@@ -715,7 +719,7 @@ fn hardening_preset_names_stamp_only_the_normative_property_bundles() {
             "ProtectSystem=strict",
             "NoNewPrivileges=yes",
             "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
-            "ReadWritePaths=\"/work tree\" \"/state tree/unit-exit\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.out\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.err\"",
+            "ReadWritePaths=\"/work tree\" \"/state tree/unit-exit\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.out\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.adapter.err\"",
         ]
     );
 
@@ -741,7 +745,7 @@ fn hardening_preset_names_stamp_only_the_normative_property_bundles() {
             "SystemCallFilter=@system-service",
             "CapabilityBoundingSet=",
             "ProtectProc=invisible",
-            "ReadWritePaths=\"/work tree\" \"/state tree/unit-exit\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.out\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.err\"",
+            "ReadWritePaths=\"/work tree\" \"/state tree/unit-exit\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.out\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.adapter.err\"",
         ]
     );
 
@@ -784,7 +788,7 @@ fn strict_writes_are_scoped_to_declared_execution_paths() {
         .clone();
     assert_eq!(
         writable,
-        "ReadWritePaths=\"/state tree/unit-exit\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.out\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.err\" \"/state tree/exec-attestations.jsonl\" \"/state tree/github-context/00000000-0000-4000-8000-000000000002.json\" \"/state tree/capture/gates.json\" \"/home/agent/.codex\""
+        "ReadWritePaths=\"/state tree/unit-exit\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.out\" \"/state tree/capture/00000000-0000-4000-8000-000000000002.adapter.err\" \"/state tree/exec-attestations.jsonl\" \"/state tree/github-context/00000000-0000-4000-8000-000000000002.json\" \"/state tree/capture/gates.json\" \"/home/agent/.codex\""
     );
 
     strict.extra_writable_paths = vec![PathBuf::from("relative/path")];
@@ -1220,6 +1224,7 @@ fn capture_files_truncate_and_exit_record_is_atomic_and_private() {
     let paths = executor.prepare_paths(&request.identity).unwrap();
     assert_eq!(std::fs::read(&paths.stdout).unwrap(), b"");
     assert_eq!(std::fs::read(&paths.stderr).unwrap(), b"");
+    assert!(!paths.failure_stderr.exists());
     assert_eq!(
         std::fs::metadata(&paths.stdout)
             .unwrap()
@@ -1273,8 +1278,19 @@ fn failure_capture_excerpt_is_a_bounded_private_tail() {
     let paths = executor.prepare_paths(&request.identity).unwrap();
 
     std::fs::write(&paths.stderr, b"short failure\n").unwrap();
+    let failure_path = executor.persist_failure_stderr(&paths).unwrap();
+    assert_eq!(failure_path, paths.failure_stderr);
+    assert_eq!(std::fs::read(&failure_path).unwrap(), b"short failure\n");
     assert_eq!(
-        read_capture_excerpt(&paths.stderr).unwrap(),
+        std::fs::metadata(&failure_path)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert_eq!(
+        read_capture_excerpt(&failure_path).unwrap(),
         CaptureExcerpt {
             text: "short failure\n".to_owned(),
             truncated: false,
@@ -1286,6 +1302,7 @@ fn failure_capture_excerpt_is_a_bounded_private_tail() {
     std::fs::write(&paths.stderr, long).unwrap();
     let excerpt = read_capture_excerpt(&paths.stderr).unwrap();
     assert!(excerpt.truncated);
+    assert!(excerpt.text.len() <= CAPTURE_EXCERPT_MAX_BYTES);
     assert!(excerpt
         .text
         .starts_with("[... earlier captured stderr omitted ...]\n"));
@@ -1294,6 +1311,43 @@ fn failure_capture_excerpt_is_a_bounded_private_tail() {
     let linked = temp.path().join("linked-capture");
     std::fs::hard_link(&paths.stderr, &linked).unwrap();
     assert!(read_capture_excerpt(&paths.stderr).is_err());
+}
+
+#[test]
+fn raw_and_failure_stderr_archive_as_distinct_generation_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    let request = request();
+    let paths = executor.prepare_paths(&request.identity).unwrap();
+    std::fs::write(&paths.stderr, b"adapter chatter\nactionable failure\n").unwrap();
+    executor.persist_failure_stderr(&paths).unwrap();
+    write_capture_generation(
+        &paths.capture_generation,
+        CaptureGeneration {
+            attempt: request.attempt,
+            lease_epoch: request.lease_epoch,
+        },
+    )
+    .unwrap();
+
+    let retry = executor.prepare_paths(&request.identity).unwrap();
+    assert!(!retry.failure_stderr.exists());
+    let archived = executor
+        .retained_capture_paths(&request.identity, request.attempt, request.lease_epoch)
+        .unwrap()
+        .unwrap();
+    assert!(!archived.current);
+    assert!(archived
+        .stderr
+        .ends_with("attempt-0000000001-epoch-00000000000000000007.adapter.err"));
+    let archived_failure = archived.failure_stderr.unwrap();
+    assert!(archived_failure.ends_with("attempt-0000000001-epoch-00000000000000000007.err"));
+    for path in [archived.stderr, archived_failure] {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            b"adapter chatter\nactionable failure\n"
+        );
+    }
 }
 
 #[test]
@@ -1570,6 +1624,8 @@ async fn matching_durable_exit_is_adopted_without_reexecution() {
     let base = executor(temp.path());
     let paths = base.prepare_paths(&request.identity).unwrap();
     std::fs::write(&paths.stdout, b"completed-once").unwrap();
+    std::fs::remove_file(&paths.stderr).unwrap();
+    std::fs::write(&paths.failure_stderr, b"legacy adapter stderr").unwrap();
     let unit = base.unit_name(&request.identity);
     let record = UnitExitRecord {
         schema_version: UNIT_EXIT_SCHEMA_VERSION,
@@ -1596,6 +1652,11 @@ async fn matching_durable_exit_is_adopted_without_reexecution() {
     assert_eq!(outcome.backend, ExecutionBackend::Adopted);
     assert_eq!(outcome.record, record);
     assert_eq!(std::fs::read(&paths.stdout).unwrap(), b"completed-once");
+    assert_eq!(
+        std::fs::read(&paths.stderr).unwrap(),
+        b"legacy adapter stderr"
+    );
+    assert!(!paths.failure_stderr.exists());
 }
 
 #[tokio::test]

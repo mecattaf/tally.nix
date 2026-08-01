@@ -410,11 +410,38 @@ impl JobResult {
     }
 }
 
-fn is_adapter_smoke(evidence_class: Option<&Value>) -> bool {
-    evidence_class
-        .and_then(|value| value.get("kind"))
-        .and_then(Value::as_str)
-        == Some("adapter-smoke")
+const fn terminal_lifecycle_event(verdict: Verdict, has_artifact: bool) -> TallyEvent {
+    match (verdict, has_artifact) {
+        (Verdict::Preempted, _) => TallyEvent::Preempted,
+        (Verdict::Pass | Verdict::Reused, true) => TallyEvent::Completed,
+        (Verdict::Pass | Verdict::Reused, false) => TallyEvent::WitnessEmitted,
+        _ => TallyEvent::Failed,
+    }
+}
+
+fn retained_failure_stderr_excerpt(
+    record: &WitnessRecord,
+    executor: &Executor,
+) -> Option<crate::executor::CaptureExcerpt> {
+    if terminal_lifecycle_event(record.verdict, record.artifact_content_hash.is_some())
+        != TallyEvent::Failed
+    {
+        return None;
+    }
+    let uuid = Uuid::parse_str(record.task_uuid.as_deref()?).ok()?;
+    let identity = ExecutionIdentity {
+        job_id: uuid,
+        task_uuid: Some(uuid),
+        task_ref: record
+            .orchestration
+            .as_ref()
+            .and_then(Orchestration::task_ref),
+    };
+    let paths = executor
+        .retained_capture_paths(&identity, record.attempt, record.lease_epoch)
+        .ok()??;
+    let failure = paths.failure_stderr.as_ref().unwrap_or(&paths.stderr);
+    crate::executor::read_capture_excerpt(failure).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

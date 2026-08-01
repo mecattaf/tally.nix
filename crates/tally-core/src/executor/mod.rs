@@ -248,6 +248,10 @@ impl Executor {
             stderr: self
                 .state_dir
                 .join(CAPTURE_DIRECTORY)
+                .join(format!("{capture_stem}.adapter.err")),
+            failure_stderr: self
+                .state_dir
+                .join(CAPTURE_DIRECTORY)
                 .join(format!("{capture_stem}.err")),
             exit_record: self
                 .state_dir

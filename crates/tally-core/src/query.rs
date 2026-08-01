@@ -1166,6 +1166,8 @@ mod tests {
                 session_ref: None,
                 unit: Some(format!("tally-job-{task}.service")),
                 exit_code: Some(if event == TallyEvent::Failed { 1 } else { 0 }),
+                stderr_tail: None,
+                stderr_truncated: None,
                 gpu_seconds: Some(4.0),
                 artifact_hash: Some("sha256:artifact".to_owned()),
                 evidence: Some("exit:0".to_owned()),

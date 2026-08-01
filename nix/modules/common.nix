@@ -1168,7 +1168,7 @@ let
           type = types.bool;
           default = false;
           example = true;
-          description = "Post an idempotent evidence comment after a passing or reused verdict.";
+          description = "Post an idempotent evidence comment after any terminal verdict, including the bounded stderr tail on failure.";
         };
         postGateSummary = mkOption {
           type = types.bool;
