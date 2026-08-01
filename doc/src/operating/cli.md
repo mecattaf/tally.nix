@@ -348,6 +348,7 @@ $ tally query status
 $ tally query status --pool build
 $ tally query storage
 $ tally query run RUN-UUID
+$ tally query run RUN-UUID --status blocked
 $ tally query run RUN-UUID --json
 $ tally query proof --task TASK-UUID --attempt 2
 $ tally query proof --flow-run RUN-UUID
@@ -359,9 +360,14 @@ $ tally query trace --task TASK-UUID --attempt 2 --limit 100
 ```
 
 `query run` prints the flow state and a per-task table. A spec-build pass shows every
-`campaign/task-id` as done, running, blocked, or pending. Its current-node section includes
-elapsed time and the remaining `runtimeMaxSec` budget; its failure section prints the retained
-failure capture path and bounded stderr tail. `--json` emits the same compact projection as a
+`campaign/task-id` as done, running, blocked, or pending; `--status <state>` narrows that table
+to one of those states while the summary counts stay whole-run, which is how a 128-task campaign
+board stays readable. A flow with no reconciled task table reaches `complete` once every one of
+its nodes holds a passing terminal verdict. Its current-node section includes elapsed time and
+the remaining `runtimeMaxSec` budget, negative when a node has run past that budget; its failure
+section prints the retained failure capture path — or `<not retained>` when none exists — and
+the bounded stderr tail with its indentation intact. Terminal escape sequences written by an
+adapter are stripped from every human rendering. `--json` emits the same compact projection as a
 structured object.
 
 `query log` prints terse human transition lines by default. Evidence observations and the

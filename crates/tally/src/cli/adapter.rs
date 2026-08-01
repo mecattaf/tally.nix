@@ -1,3 +1,4 @@
+use super::text::sanitize_line;
 use super::*;
 
 const SMOKE_RUNTIME_MAX_SEC: u64 = 5 * 60;
@@ -327,9 +328,10 @@ fn print_captured_stderr(adapter: &str, terminal: &Value) {
     match excerpt {
         Some(excerpt) => {
             eprintln!("adapter smoke {adapter:?} captured stderr:");
-            eprint!("{excerpt}");
-            if !excerpt.ends_with('\n') {
-                eprintln!();
+            // The excerpt is whatever the adapter wrote; printing it verbatim
+            // hands control of the operator's terminal to a failing job.
+            for line in excerpt.lines() {
+                eprintln!("{}", sanitize_line(line));
             }
         }
         None => eprintln!("adapter smoke {adapter:?} captured stderr was empty"),

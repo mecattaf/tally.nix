@@ -663,14 +663,16 @@ Escalation is a state transition, not the first failure: it occurs only when the
 worklist is incomplete and the recomputed unblocked frontier is empty. The
 driver posts one marked escalation containing compact summaries of all machine
 diagnoses and never posts it again for that campaign issue. Start investigation
-with `tally query run <runner-task-uuid>`: its task table identifies the blocked
-campaign task and failed stage, and its failure section carries the retained
-capture path and bounded stderr tail. Use `tally query log --flow-run
-<runner-task-uuid>` only when transition or provenance history is needed. A
-public campaign receipt is absent by default; it includes failure metadata only
-with `postFailureEvidence` and a conservatively redacted tail only with the
-additional `postFailureStderr` opt-in. Task-specific records retain `taskRef`,
-so the worklist ID is visible without a UUID lookup.
+with `tally query run <runner-task-uuid>`, adding `--status blocked` on a large
+worklist: its task table identifies the blocked campaign task and failed stage,
+and its failure section carries the retained capture path — reading
+`<not retained>` when no capture was kept, so an absent pointer is never
+confused with an unresolved one — and the bounded stderr tail. Use
+`tally query log --flow-run <runner-task-uuid>` only when transition or
+provenance history is needed. A public campaign receipt is absent by default; it
+includes failure metadata only with `postFailureEvidence` and a conservatively
+redacted tail only with the additional `postFailureStderr` opt-in. Task-specific
+records retain `taskRef`, so the worklist ID is visible without a UUID lookup.
 
 An operator can then repair and merge a marked task PR or otherwise resolve the
 forge state before posting a fresh mention. Preflight remains outside this

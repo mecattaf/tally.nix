@@ -8797,7 +8797,10 @@ mod tests {
                     .unwrap();
                 assert_eq!(run["flowRunId"], flow_run_id);
                 assert_eq!(run["flowName"], "brief-round-trip");
-                assert_eq!(run["state"], "idle");
+                // A finished non-spec-build run has no reconciled task table,
+                // so its state comes from the node verdicts rather than the
+                // task counts.
+                assert_eq!(run["state"], "complete");
                 assert!(run["tasks"].as_array().unwrap().is_empty());
                 let unrelated = client
                     .call(
