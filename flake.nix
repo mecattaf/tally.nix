@@ -3470,6 +3470,7 @@
                   .adapters["spec-build-driver"].scrape.finalMessage.pattern == "^TALLY_FINAL_MESSAGE=(.*)$" and
                   .flows.fixture.workloadMutex == "fixture-campaign" and
                   (.flows.fixture.script | endswith("spec-build.js")) and
+                  $fixtureArgs.tally == "${tally}/bin/tally" and
                   $fixtureArgs.agent.approvalPolicy == null and
                   $fixtureArgs.agent.sandboxPolicy == null and
                   $fixtureArgs.gates[0].kind == "command" and
@@ -3871,6 +3872,7 @@
                   .maxTasks == 7 and
                   .maxParallel == 3 and
                   .reconcileCommand == "/tally reconcile fixture" and
+                  .tally == "${tally}/bin/tally" and
                   .repositories["acme/spec"].baseBranch == "main" and
                   .repositories["acme/spec"].forge == "github" and
                   .agent.adapter == "shell" and
