@@ -1151,7 +1151,7 @@ let
           type = types.listOf types.str;
           default = [ ];
           example = [ "trusted-maintainer" ];
-          description = "Optional trigger-actor allowlist; an empty list preserves unrestricted external actors.";
+          description = "Optional external trigger-actor allowlist; authenticated self triggers are governed separately by allowSelfTriggered.";
         };
         pollIntervalSec = mkOption {
           type = types.ints.positive;
@@ -2001,17 +2001,17 @@ let
           default = false;
           example = true;
           description = ''
-            Explicitly allow a campaign mention whose actor is the
-            authenticated GitHub identity. Leave this disabled when the
-            campaign runs under a bot identity so self-posted output cannot
-            start another run.
+            Explicitly allow the operator-facing campaign mention when its
+            actor is the authenticated GitHub identity. The exact
+            merge-continuation command uses a separate producer that always
+            permits authenticated self-triggering.
           '';
         };
         allowedActors = mkOption {
           type = types.listOf types.str;
           default = [ ];
           example = [ "trusted-maintainer" ];
-          description = "Optional trigger-actor allowlist inherited by the rendered GitHub producer.";
+          description = "Optional external trigger-actor allowlist inherited by both rendered GitHub producers.";
         };
         pollIntervalSec = mkOption {
           type = types.ints.positive;
@@ -3067,18 +3067,19 @@ let
 
   campaignReconcileCommand = name: "/tally reconcile ${name}";
 
-  # Reconcile, optional pristine-base preflight prep/gates/cleanup, and one
-  # frontier's worst-case implementation lanes: prep, agent, initial gates,
-  # publication, rebase check, optional re-gates, and merge. A checkpoint lane
-  # is smaller (prep, direct validation, durable fact, cleanup). This is a pass
-  # bound, not the complete worklist size.
+  # Sweep, reconcile, an optional one-per-pass continuation, optional
+  # pristine-base preflight prep/gates/cleanup, and one frontier's worst-case
+  # implementation lanes: prep, agent, initial gates, publication, rebase
+  # check, optional re-gates, merge, and cleanup. A checkpoint lane is smaller
+  # (prep, direct validation, durable fact, cleanup). This is a pass bound, not
+  # the complete worklist size.
   campaignMaxNodes =
     campaign:
     let
       commandGateCount = builtins.length (builtins.filter (gate: gate.kind == "command") campaign.gates);
       preflightNodes = if commandGateCount == 0 then 0 else 2 + commandGateCount;
     in
-    1 + preflightNodes + campaign.maxParallel * (5 + 2 * builtins.length campaign.gates);
+    3 + preflightNodes + campaign.maxParallel * (6 + 2 * builtins.length campaign.gates);
 
   mkCampaignArgs = cfg: name: campaign: repository: issueNumber: issueUrl: runId: {
     campaign = name;
@@ -3194,9 +3195,9 @@ let
         }
       ];
       triggers.commandComments = [ (campaignReconcileCommand name) ];
-      # A merge node posts this finite, event-id-deduplicated command itself.
-      # Permit that authenticated self actor without widening the campaign's
-      # operator allowlist.
+      # One pass-level node posts this finite, event-id-deduplicated command.
+      # Authenticated self-trigger permission is separate from the external
+      # actor allowlist, so an operator-only list cannot silence continuation.
       allowSelfTriggered = true;
       inherit (campaign) allowedActors pollIntervalSec;
       postReceipt = false;
@@ -3234,6 +3235,9 @@ let
     cfg:
     let
       enabled = filterAttrs (_: campaign: campaign.enable) cfg.campaigns;
+      requiredParallelism = lib.foldl' (capacity: campaign: lib.max capacity campaign.maxParallel) 1 (
+        builtins.attrValues enabled
+      );
       requiredFanout = lib.foldl' (capacity: campaign: lib.max capacity (campaignMaxNodes campaign)) 64 (
         builtins.attrValues enabled
       );
@@ -3265,17 +3269,13 @@ let
         // optionalAttrs (enabled != { }) {
           campaign-control = {
             resource = lib.mkDefault "cpu-slot";
-            capacity = lib.mkDefault 4;
+            capacity = lib.mkDefault requiredParallelism;
             enforce = lib.mkDefault "cooperative";
             hardPreempt = lib.mkDefault false;
           };
           campaign-agent = {
             resource = lib.mkDefault "slot";
-            capacity = lib.mkDefault (
-              lib.foldl' (capacity: campaign: lib.max capacity campaign.maxParallel) 1 (
-                builtins.attrValues enabled
-              )
-            );
+            capacity = lib.mkDefault requiredParallelism;
             enforce = lib.mkDefault "cooperative";
             hardPreempt = lib.mkDefault false;
           };
@@ -3445,11 +3445,35 @@ let
           assertion =
             !campaign.enable
             || (
+              builtins.hasAttr "campaign-${name}-reconcile" cfg.producers
+              && cfg.producers."campaign-${name}-reconcile".enable
+              && cfg.producers."campaign-${name}-reconcile".kind == "gh"
+              && cfg.producers."campaign-${name}-reconcile".allowSelfTriggered
+              &&
+                builtins.elem (campaignReconcileCommand name)
+                  cfg.producers."campaign-${name}-reconcile".triggers.commandComments
+            );
+          message = "tally campaign ${name} continuation producer must stay enabled for its exact command and allow authenticated self triggers";
+        }
+        {
+          assertion =
+            !campaign.enable
+            || (
               builtins.hasAttr "campaign-agent" cfg.pools
               && cfg.pools."campaign-agent".resource == "slot"
               && cfg.pools."campaign-agent".capacity >= campaign.maxParallel
             );
           message = "tally campaign ${name} requires campaign-agent slot capacity >= maxParallel ${toString campaign.maxParallel}";
+        }
+        {
+          assertion =
+            !campaign.enable
+            || (
+              builtins.hasAttr "campaign-control" cfg.pools
+              && cfg.pools."campaign-control".resource == "cpu-slot"
+              && cfg.pools."campaign-control".capacity >= campaign.maxParallel
+            );
+          message = "tally campaign ${name} requires campaign-control cpu-slot capacity >= maxParallel ${toString campaign.maxParallel}";
         }
         {
           assertion =

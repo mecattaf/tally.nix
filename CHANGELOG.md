@@ -33,11 +33,14 @@ authorized.
   reconcile passes over marked merged pull requests. Campaigns now select a
   dependency-ready, conflict-disjoint frontier up to `maxParallel`, execute its
   task lanes concurrently, rebase and re-gate changed heads before serialized
-  merges, and enqueue the next pass through an exact self-posted GitHub command;
-  fresh mentions safely recover failed or redeployed passes without replaying an
-  old flow-run identity. Non-empty task `conflictDomains` now also constrain the
-  committed diff at initial publication and after rebase, so an under-declared
-  task is rejected before its remote branch can move.
+  merges, and enqueue at most one next pass through an exact self-posted GitHub
+  command; fresh mentions safely recover failed, zero-merge, interrupted, or
+  redeployed passes. Parallel campaign flows explicitly reject a replayed
+  flow-run identity and direct recovery to a fresh mention. Campaigns ship merge
+  and mention triggers, not a periodic campaign timer. Non-empty task
+  `conflictDomains` now also constrain the committed diff at initial publication
+  and after rebase, so an under-declared task is rejected before its remote
+  branch can move.
 - Added flow-node `approvalPolicy` and `sandboxPolicy` fields plus campaign
   `agentApprovalPolicy`/`agentSandboxPolicy` options. Spec-build implementation
   agents now default to Codex's writable `workspace-write` + `on-request`
@@ -153,9 +156,9 @@ authorized.
   directly into `<dataDir>/briefs`, admission and GC share a lock, and the
   existing retention horizon preserves live/recent job inputs while pruning
   orphaned, older-terminal, and legacy duplicate files under `stateDir`.
-- Allowed a campaign to opt into self-posted GitHub mentions with
+- Allowed a campaign to opt into self-posted operator-facing GitHub mentions with
   `services.tally.campaigns.<name>.allowSelfTriggered`, while preserving the
-  loop-breaking `false` default for campaigns that run under a bot identity.
+  loop-breaking `false` default on that broad mention producer.
 - Made jobs without an explicit working directory execute from
   `workspace.worktreePath`, so flow-submitted agent nodes start inside their
   prepared worktrees across systemd and direct-spawn execution.

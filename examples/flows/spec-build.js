@@ -289,7 +289,8 @@ const reconcileSchema = {
     "checkpoints",
     "remaining",
     "frontier",
-    "complete"
+    "complete",
+    "warnings"
   ],
   properties: {
     schemaVersion: { const: 1 },
@@ -305,7 +306,19 @@ const reconcileSchema = {
     checkpoints: { type: "array", items: checkpointFactSchema },
     remaining: { type: "array", items: taskIdSchema },
     frontier: { type: "array", maxItems: 128, items: taskSchema },
-    complete: { type: "boolean" }
+    complete: { type: "boolean" },
+    warnings: stringList
+  },
+  additionalProperties: false
+};
+
+const sweepSchema = {
+  type: "object",
+  required: ["currentRunHash", "cleaned", "warnings"],
+  properties: {
+    currentRunHash: { type: "string", pattern: "^[0-9a-f]{12}$" },
+    cleaned: stringList,
+    warnings: stringList
   },
   additionalProperties: false
 };
@@ -403,6 +416,16 @@ const mergeSchema = {
   additionalProperties: false
 };
 
+const continuationSchema = {
+  type: "object",
+  required: ["command", "posted"],
+  properties: {
+    command: { type: "string", pattern: "^/[^\\r\\n]+$", maxLength: 300 },
+    posted: { const: true }
+  },
+  additionalProperties: false
+};
+
 function driverNode(
   action,
   brief,
@@ -465,6 +488,21 @@ function nodeFailure(task, stage, node) {
     verdict: node && node.verdict ? node.verdict : "flow-error",
     detail: bounded(node && node.error ? node.error : node, 2000)
   };
+}
+
+function cleanupBrief(repositoryConfig, taskId, workspace) {
+  const brief = {
+    campaign: args.campaign,
+    repository: args.repository,
+    repositoryConfig,
+    runId: args.runId,
+    workspaceRoot: args.workspaceRoot,
+    taskId
+  };
+  if (workspace !== null) {
+    brief.workspace = workspace;
+  }
+  return brief;
 }
 
 async function runGate(task, gate, workspace, prefix) {
@@ -540,6 +578,41 @@ async function runPreflightGate(task, gate, workspace) {
     throw error;
   }
 
+  // Producer admission holds the campaign's capacity-1 mutex. Once the prior
+  // pass and its admitted children have settled (the documented recovery
+  // rule), every other run namespace is stale and can be reclaimed before this
+  // pass creates a lane.
+  const sweepNode = await driverNode(
+    "sweep",
+    {
+      campaign: args.campaign,
+      repository: args.repository,
+      repositoryConfig,
+      runId: args.runId,
+      workspaceRoot: args.workspaceRoot
+    },
+    "sweep",
+    "spec-build-sweep",
+    sweepSchema,
+    null,
+    false,
+    null
+  );
+  if (sweepNode.disposition !== "created") {
+    const error = new Error(
+      `spec-build campaign ${args.campaign} requires a fresh flow-run identity; ` +
+        `the sweep node was ${sweepNode.disposition}`
+    );
+    error.name = "SpecBuildReplayError";
+    error.code = "campaign-replay-refused";
+    error.details = {
+      campaign: args.campaign,
+      disposition: sweepNode.disposition,
+      recovery: "post a fresh campaign mention"
+    };
+    throw error;
+  }
+
   const reconciliationNode = await driverNode(
     "reconcile",
     {
@@ -600,7 +673,7 @@ async function runPreflightGate(task, gate, workspace) {
       }
       await driverNode(
         "cleanup",
-        { repositoryConfig, workspace: preflight.result },
+        cleanupBrief(repositoryConfig, "campaign-preflight", preflight.result),
         "preflight-cleanup",
         "preflight-cleanup",
         cleanupSchema,
@@ -684,29 +757,21 @@ async function runPreflightGate(task, gate, workspace) {
             taskRef
           );
         }
-        await driverNode(
-          "cleanup",
-          { repositoryConfig, workspace: prepared.result },
-          `checkpoint-cleanup-${task.id}`,
-          `checkpoint-cleanup-${task.id}`,
-          cleanupSchema,
-          null,
-          false,
-          taskRef
-        );
         if (checkpoint.verdict !== "pass") {
           return {
             task,
+            prepared: prepared.result,
             failure: nodeFailure(task, "checkpoint", checkpoint)
           };
         }
         if (!nodePassed(recorded)) {
           return {
             task,
+            prepared: prepared.result,
             failure: nodeFailure(task, "checkpoint:record", recorded)
           };
         }
-        return { task, checkpoint: recorded.result };
+        return { task, prepared: prepared.result, checkpoint: recorded.result };
       }
 
       const agentSpec = {
@@ -873,7 +938,6 @@ async function runPreflightGate(task, gate, workspace) {
         repositoryConfig,
         issue: args.issue,
         runId: args.runId,
-        reconcileCommand: args.reconcileCommand,
         workspaceRoot: args.workspaceRoot,
         task,
         workspace: lane.prepared,
@@ -893,6 +957,64 @@ async function runPreflightGate(task, gate, workspace) {
     merged.push(merge.result);
   }
 
+  // Progress remains one comment per merged task, but only one exact command
+  // is posted for the pass. Its producer queues behind this pass's mutex.
+  if (merged.length > 0 && repositoryConfig.forge === "github") {
+    const continued = await driverNode(
+      "continue",
+      {
+        campaign: args.campaign,
+        repository: args.repository,
+        repositoryConfig,
+        issue: args.issue,
+        runId: args.runId,
+        reconcileCommand: args.reconcileCommand
+      },
+      "continue",
+      "spec-build-continue",
+      continuationSchema,
+      null,
+      true,
+      null
+    );
+    if (!nodePassed(continued)) {
+      failures.push(
+        nodeFailure(
+          { id: merged[merged.length - 1].taskId },
+          "continuation",
+          continued
+        )
+      );
+    }
+  }
+
+  const cleanupLanes = reconciliation.frontier.map(task => {
+    const lane = lanes.find(candidate => candidate.task.id === task.id);
+    return { task, prepared: lane && lane.prepared ? lane.prepared : null };
+  });
+  const cleanupOutcomes = await parallel(
+    cleanupLanes.map(lane => () => driverNode(
+      "cleanup",
+      cleanupBrief(repositoryConfig, lane.task.id, lane.prepared),
+      `cleanup-${lane.task.id}`,
+      `cleanup-${lane.task.id}`,
+      cleanupSchema,
+      null,
+      true,
+      `${args.campaign}/${lane.task.id}`
+    )),
+    { settle: true }
+  );
+  for (let index = 0; index < cleanupOutcomes.length; index += 1) {
+    const outcome = cleanupOutcomes[index];
+    const lane = cleanupLanes[index];
+    if (!outcome.ok) {
+      failures.push(nodeFailure(lane.task, "cleanup", outcome.error));
+    } else if (!nodePassed(outcome.value)) {
+      failures.push(nodeFailure(lane.task, "cleanup", outcome.value));
+    }
+  }
+
   return {
     campaign: args.campaign,
     repository: args.repository,
@@ -909,8 +1031,10 @@ async function runPreflightGate(task, gate, workspace) {
       merged: reconciliation.merged,
       checkpoints: reconciliation.checkpoints,
       remaining: reconciliation.remaining,
-      frontier: reconciliation.frontier.map(task => task.id)
+      frontier: reconciliation.frontier.map(task => task.id),
+      warnings: reconciliation.warnings
     },
+    maintenance: sweepNode.result,
     checkpoints,
     merged,
     failures

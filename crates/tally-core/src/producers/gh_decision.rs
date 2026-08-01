@@ -562,16 +562,20 @@ pub(super) fn gh_filter_reason(
     if !gh_trigger_matches(&config.triggers, observation) {
         return Some(GhFilterReason::TriggerNotConfigured);
     }
-    if !config.allowed_actors.is_empty()
+    let self_triggered = observation
+        .trigger_actor
+        .eq_ignore_ascii_case(&observation.self_actor);
+    if self_triggered && !config.allow_self_triggered {
+        return Some(GhFilterReason::SelfTriggerDisabled);
+    }
+    if !self_triggered
+        && !config.allowed_actors.is_empty()
         && !config
             .allowed_actors
             .iter()
             .any(|actor| actor.eq_ignore_ascii_case(&observation.trigger_actor))
     {
         return Some(GhFilterReason::TriggerActorNotAllowed);
-    }
-    if observation.trigger_actor == observation.self_actor && !config.allow_self_triggered {
-        return Some(GhFilterReason::SelfTriggerDisabled);
     }
     (config.actor_exclude != "self"
         && observation
