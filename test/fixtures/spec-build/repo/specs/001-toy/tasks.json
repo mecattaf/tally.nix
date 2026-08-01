@@ -63,7 +63,8 @@
         "task-1"
       ],
       "conflictDomains": [
-        "build/two.txt"
+        "build/two.txt",
+        "build/task-2-base.txt"
       ]
     },
     {

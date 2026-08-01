@@ -3661,7 +3661,10 @@
                     },
                     runId: "stale-publication",
                     workspaceRoot: $workspaceRoot,
-                    task: $worklist[0].tasks[0],
+                    task: ($worklist[0].tasks[0] | .conflictDomains = [
+                      "build/allowed.txt",
+                      "build/LATE.SQLite"
+                    ]),
                     workspace: {
                       taskId: "task-1",
                       baseRev: $base,
@@ -3858,6 +3861,19 @@
                 export HOME="$TMPDIR/home"
                 mkdir -p "$HOME"
                 ${pkgs.python3}/bin/python3 ${./test/agency_nightly_driver_test.py}
+                touch "$out"
+              '';
+          spec-build-conflict-domains =
+            pkgs.runCommand "tally-spec-build-conflict-domains"
+              {
+                nativeBuildInputs = [
+                  pkgs.git
+                  pkgs.python3
+                ];
+                SPEC_BUILD_DRIVER = ./examples/flows/spec_build_driver.py;
+              }
+              ''
+                ${pkgs.python3}/bin/python3 ${./test/spec_build_conflict_domains_test.py}
                 touch "$out"
               '';
           flow-dialect-reject-nonliteral-meta = flowNonliteralFailure;
