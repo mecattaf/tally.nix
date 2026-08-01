@@ -214,6 +214,13 @@ pub(super) struct AdapterSmokeArgs {
     /// commit descended from the seeded base and a clean worktree.
     #[arg(long)]
     pub(super) assert_commit: bool,
+    /// Directory the --assert-commit probe repository is created under; defaults
+    /// to adapter-smoke/ below the state directory. Name the campaign's
+    /// workspace root to probe where implementation nodes actually run. Never
+    /// the system temporary directory: a hardened adapter's transient unit gets
+    /// a private /tmp, and an agent sandbox may treat it as writable by default.
+    #[arg(long, value_name = "PATH", requires = "assert_commit")]
+    pub(super) probe_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]

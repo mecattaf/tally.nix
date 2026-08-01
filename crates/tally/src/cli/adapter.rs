@@ -9,6 +9,9 @@ const CAPTURE_PROJECTION_POLL: Duration = Duration::from_millis(100);
 const DEFAULT_SMOKE_PROMPT: &str = "Reply with the single word ok.";
 pub(super) const COMMIT_PROBE_FILE: &str = "tally-commit-probe.txt";
 pub(super) const COMMIT_PROBE_MESSAGE: &str = "tally commit probe";
+const COMMIT_PROBE_DIRECTORY: &str = "adapter-smoke";
+const COMMIT_PROBE_BRANCH: &str = "adapter-smoke-probe";
+const COMMIT_PROBE_REPO: &str = "tally/adapter-smoke";
 const COMMIT_PROBE_PROMPT: &str = concat!(
     "Create a file named tally-commit-probe.txt in the current directory whose ",
     "only contents are the word ok. Then stage it and commit it with the ",
@@ -83,7 +86,15 @@ async fn run_adapter_smoke(
         }
     }
     let pool = resolve_smoke_pool(&args.name, args.pool.as_deref(), &config.pools)?;
-    let probe = args.assert_commit.then(CommitProbe::seed).transpose()?;
+    let probe = if args.assert_commit {
+        let parent = match args.probe_root {
+            Some(root) => root,
+            None => CommitProbe::default_root()?,
+        };
+        Some(CommitProbe::seed(&parent)?)
+    } else {
+        None
+    };
     let cwd = match &probe {
         Some(probe) => probe.root.clone(),
         None => resolve_smoke_cwd(args.cwd)?,
@@ -122,7 +133,7 @@ async fn run_adapter_smoke(
         priority: Some(Priority::Medium),
         adapter: Some(args.name.clone()),
         cwd: Some(cwd.clone()),
-        workspace: None,
+        workspace: probe.as_ref().map(CommitProbe::workspace),
         adapter_options: (!adapter_options.is_default()).then_some(adapter_options),
         gate_manifest: None,
         brief: None,
@@ -252,15 +263,45 @@ async fn run_adapter_smoke(
 /// A throwaway git repository handed to one adapter run so the question
 /// "can this adapter commit under these policies?" is answered by the real
 /// binary's filesystem behaviour rather than by the argv tally meant to emit.
+///
+/// The repository is deliberately not in the system temporary directory. A
+/// hardened adapter's transient unit runs under `PrivateTmp=yes`, where a `/tmp`
+/// working directory does not exist inside the namespace and systemd kills the
+/// unit with an empty capture — a harness failure that reads exactly like a
+/// policy failure. An agent sandbox may also treat `$TMPDIR` and `/tmp` as
+/// default writable roots, which would let a confining policy pass a probe it
+/// should fail. The probe is carried as workspace metadata for the same reason a
+/// campaign implementation node is: that is what puts its worktree in the unit's
+/// `ReadWritePaths=` under every hardening tier, without weakening any of them.
 struct CommitProbe {
     root: PathBuf,
     base_rev: String,
 }
 
 impl CommitProbe {
-    fn seed() -> Result<Self> {
-        let root = std::env::temp_dir().join(format!(
-            "tally-commit-probe-{}-{}",
+    /// The probe root for a given state directory. Deriving it from the state
+    /// directory rather than from `std::env::temp_dir()` is the whole point: a
+    /// hardened adapter's transient unit gets a private `/tmp` it cannot chdir
+    /// into, and an agent sandbox may treat `$TMPDIR` as writable by default.
+    fn root_under(state_dir: &Path) -> PathBuf {
+        state_dir.join(COMMIT_PROBE_DIRECTORY)
+    }
+
+    fn default_root() -> Result<PathBuf> {
+        Ok(Self::root_under(&default_state_dir()?))
+    }
+
+    fn seed(parent: &Path) -> Result<Self> {
+        if !parent.is_absolute() {
+            return Err(invalid(format!(
+                "commit probe root must be an absolute path: {}",
+                parent.display()
+            )));
+        }
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("cannot create commit probe root {}", parent.display()))?;
+        let root = parent.join(format!(
+            "probe-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -275,7 +316,7 @@ impl CommitProbe {
         // Identity and signing are configured locally so the probe never
         // depends on, and never writes to, the operator's global git config.
         for argv in [
-            vec!["init", "--quiet"],
+            vec!["init", "--quiet", "--initial-branch", COMMIT_PROBE_BRANCH],
             vec!["config", "user.email", "adapter-smoke@localhost"],
             vec!["config", "user.name", "tally adapter smoke"],
             vec!["config", "commit.gpgsign", "false"],
@@ -286,6 +327,19 @@ impl CommitProbe {
         }
         let base_rev = git(&root, &["rev-parse", "HEAD"])?;
         Ok(Self { root, base_rev })
+    }
+
+    /// Workspace metadata naming this repository. A campaign implementation node
+    /// reaches its worktree through exactly this field, so declaring it is what
+    /// makes the probe writable under `ProtectSystem=strict` rather than an
+    /// exception carved for probes.
+    fn workspace(&self) -> WorkspaceMetadata {
+        WorkspaceMetadata {
+            repo: COMMIT_PROBE_REPO.to_owned(),
+            base_rev: self.base_rev.clone(),
+            branch: COMMIT_PROBE_BRANCH.to_owned(),
+            worktree_path: self.root.clone(),
+        }
     }
 
     fn not_checked(&self) -> Value {
@@ -574,6 +628,43 @@ mod tests {
             resolve_smoke_pool("shell", None, &pools(&["stock"])).unwrap(),
             "stock"
         );
+    }
+
+    #[test]
+    fn commit_probe_seeds_a_worktree_it_declares_as_its_workspace() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("adapter-smoke");
+        let probe = CommitProbe::seed(&root).unwrap();
+
+        // Seeding creates the probe root, not just the repository, so an
+        // operator may name a campaign workspace root that does not exist yet.
+        assert!(probe.root.starts_with(&root));
+        assert!(probe.root.join(".git").is_dir());
+
+        // The worktree is declared as workspace metadata. That declaration is
+        // the only per-job mechanism that puts a directory in a hardened
+        // transient unit's ReadWritePaths=, and it is the same one a campaign
+        // implementation node reaches its worktree through.
+        let workspace = probe.workspace();
+        assert_eq!(workspace.worktree_path, probe.root);
+        assert_eq!(workspace.base_rev, probe.base_rev);
+        assert_eq!(workspace.branch, COMMIT_PROBE_BRANCH);
+        workspace.validate().unwrap();
+
+        // A seeded probe has not committed anything yet.
+        assert_eq!(probe.evaluate().unwrap()["status"], "no-commit");
+
+        // The default root is derived from the state directory. It is never the
+        // system temporary directory: a hardened unit gets a private /tmp it
+        // cannot chdir into, and an agent sandbox may treat $TMPDIR as writable.
+        assert_eq!(
+            CommitProbe::root_under(Path::new("/var/lib/tally")),
+            Path::new("/var/lib/tally/adapter-smoke")
+        );
+
+        // A relative root would resolve against whatever directory the daemon
+        // happens to run in rather than the one the operator named.
+        assert!(CommitProbe::seed(Path::new("relative/probe")).is_err());
     }
 
     #[test]

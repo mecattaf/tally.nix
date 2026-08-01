@@ -155,7 +155,7 @@ because the point is a repository nothing else owns. The result is reported as
 `commitProbe` in the diagnostic:
 
 ```json
-{"status":"verified","repository":"/tmp/tally-commit-probe-...","baseRev":"...","headRev":"...","commits":1,"worktreeStatus":[]}
+{"status":"verified","repository":"/var/.../tally/adapter-smoke/probe-...","baseRev":"...","headRev":"...","commits":1,"worktreeStatus":[]}
 ```
 
 A verified probe deletes its repository; any other status (`no-commit`,
@@ -164,6 +164,22 @@ failed) exits nonzero and retains the repository as the evidence. This is the
 one-command pre-flight for a policy pairing: an agent that writes its files
 correctly and cannot reach git metadata to commit them reports `no-commit` here
 in seconds instead of failing publication after a full campaign node.
+
+`--probe-root PATH` names the directory the probe repository is created under.
+It defaults to `adapter-smoke/` below the state directory and is never the
+system temporary directory, for two independent reasons. A
+[hardened](../configuration/hardening.md) adapter's transient unit runs with
+`PrivateTmp=yes`, so a `/tmp` working directory does not exist inside its
+namespace and systemd kills the unit before the adapter binary runs — a harness
+failure whose empty capture reads exactly like a policy failure. And an agent
+sandbox may treat `$TMPDIR` and `/tmp` as default writable roots, which would
+let a confining policy pass a probe it should fail. Name the campaign's
+workspace root to probe where implementation nodes actually run.
+
+The probe repository is submitted as the job's workspace, which is how a
+campaign implementation node reaches its own worktree. That is what places it in
+the transient unit's `ReadWritePaths=`, so `--assert-commit` works unchanged
+under every `hardening` preset without relaxing any of them.
 
 `--pool` names one configured pool. Without it, the CLI uses the first
 configured conventional lane for the adapter:

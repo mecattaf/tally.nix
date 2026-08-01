@@ -213,12 +213,17 @@ async fn start_daemon(paths: &DaemonPaths, config: Config) -> RunningDaemon {
 }
 
 async fn run_tally(config: &Path, socket: &Path, args: &[&str]) -> std::process::Output {
+    // The commit probe defaults its repository to the state directory, so the
+    // suite pins XDG_STATE_HOME rather than seeding repositories into whatever
+    // home the developer or the gate happens to run under.
+    let state_home = config.parent().unwrap().join("xdg-state");
     Command::new(env!("CARGO_BIN_EXE_tally"))
         .arg("--config")
         .arg(config)
         .arg("--socket")
         .arg(socket)
         .args(args)
+        .env("XDG_STATE_HOME", &state_home)
         .env_remove("TALLY_JOB_ID")
         .env_remove("TALLY_JOB_TOKEN")
         .output()
@@ -279,8 +284,18 @@ async fn commit_probe_asserts_a_publishable_commit_under_the_named_policies() {
             assert_eq!(probe["commits"], 1);
             assert_ne!(probe["headRev"], probe["baseRev"]);
             assert_eq!(probe["worktreeStatus"].as_array().unwrap().len(), 0);
+            // The probe repository lives under the state directory, never under
+            // the system temporary directory: a hardened adapter's unit gets a
+            // private /tmp and could not chdir into one there, and an agent
+            // sandbox may treat $TMPDIR as writable by default.
+            let repository = PathBuf::from(probe["repository"].as_str().unwrap());
+            assert!(
+                repository.starts_with(temp.path().join("xdg-state").join("tally/adapter-smoke")),
+                "{}",
+                repository.display()
+            );
             // A verified probe leaves nothing behind.
-            assert!(!Path::new(probe["repository"].as_str().unwrap()).exists());
+            assert!(!repository.exists());
 
             // An adapter that writes its work and cannot commit is the shipped
             // defect, and it fails the probe rather than passing the smoke.

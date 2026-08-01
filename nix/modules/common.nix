@@ -194,18 +194,23 @@ let
         approvalPolicies = mkOption {
           type = types.attrsOf (types.listOf types.str);
           default = { };
+          # The published option reference is where a consumer copies from, so
+          # this example must be argv the target binary accepts. A codex-family
+          # agent takes its approval policy as a config override: the top-level
+          # --ask-for-approval flag is rejected by `codex exec`, which is the
+          # subcommand every agent adapter here invokes.
           example.never = [
-            "--ask-for-approval"
-            "never"
+            "-c"
+            "approval_policy=\"never\""
           ];
           description = "Named approval policies mapped to exact direct argv fragments.";
         };
         sandboxPolicies = mkOption {
           type = types.attrsOf (types.listOf types.str);
           default = { };
-          example.workspace-write = [
+          example.danger-full-access = [
             "--sandbox"
-            "workspace-write"
+            "danger-full-access"
           ];
           description = "Named sandbox policies mapped to exact direct argv fragments.";
         };
