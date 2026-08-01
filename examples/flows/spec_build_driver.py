@@ -157,7 +157,27 @@ def normalize_acceptance(value: Any, context: str) -> list[dict[str, Any]]:
     return result
 
 
-def normalize_task(value: Any, index: int, prior_ids: set[str]) -> dict[str, Any]:
+def normalize_conflict_domains(value: Any, context: str, *, required: bool) -> list[str]:
+    if value is None and not required:
+        return []
+    domains = string_list(value, context, nonempty=required)
+    if len(domains) != len(set(domains)):
+        fail(f"{context} contains duplicates")
+    normalized: list[str] = []
+    for index, domain in enumerate(domains):
+        path = Path(domain)
+        if path.is_absolute() or ".." in path.parts or domain.endswith("/"):
+            fail(f"{context}[{index}] must be a normalized relative path without '..'")
+        rendered = path.as_posix()
+        if rendered in {"", "."} or rendered != domain:
+            fail(f"{context}[{index}] must be a normalized relative path")
+        normalized.append(rendered)
+    return normalized
+
+
+def normalize_task(
+    value: Any, index: int, prior_ids: set[str], *, require_conflict_domains: bool
+) -> dict[str, Any]:
     context = f"tasks[{index}]"
     task = object_exact(
         value,
@@ -169,6 +189,7 @@ def normalize_task(value: Any, index: int, prior_ids: set[str]) -> dict[str, Any
             "readFirst",
             "acceptanceCriteria",
             "dependencies",
+            "conflictDomains",
         },
         context,
     )
@@ -205,12 +226,19 @@ def normalize_task(value: Any, index: int, prior_ids: set[str]) -> dict[str, Any
             task.get("acceptanceCriteria"), f"{context}.acceptanceCriteria"
         ),
         "dependencies": dependencies,
+        "conflictDomains": normalize_conflict_domains(
+            task.get("conflictDomains"),
+            f"{context}.conflictDomains",
+            required=require_conflict_domains,
+        ),
     }
 
 
 def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
-        brief, {"repository", "repositoryConfig", "worklist", "maxTasks"}, "worklist brief"
+        brief,
+        {"repository", "repositoryConfig", "worklist", "maxTasks", "maxParallel"},
+        "worklist brief",
     )
     repository = required_string(data.get("repository"), "repository")
     if not REPOSITORY.fullmatch(repository):
@@ -223,6 +251,15 @@ def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     max_tasks = data.get("maxTasks")
     if not isinstance(max_tasks, int) or isinstance(max_tasks, bool) or not 1 <= max_tasks <= 128:
         fail("maxTasks must be an integer from 1 through 128")
+    max_parallel = data.get("maxParallel", 1)
+    if (
+        not isinstance(max_parallel, int)
+        or isinstance(max_parallel, bool)
+        or not 1 <= max_parallel <= 128
+    ):
+        fail("maxParallel must be an integer from 1 through 128")
+    if max_parallel > max_tasks:
+        fail("maxParallel must not exceed maxTasks")
 
     checkout = config["checkout"]
     matches = sorted(Path(path) for path in glob.glob(str(checkout / pattern), recursive=False))
@@ -250,7 +287,12 @@ def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     tasks: list[dict[str, Any]] = []
     prior_ids: set[str] = set()
     for index, candidate in enumerate(candidates):
-        task = normalize_task(candidate, index, prior_ids)
+        task = normalize_task(
+            candidate,
+            index,
+            prior_ids,
+            require_conflict_domains=max_parallel > 1,
+        )
         if task["id"] in prior_ids:
             fail(f"worklist repeats task id {task['id']!r}")
         tasks.append(task)
@@ -263,6 +305,262 @@ def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
             "sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
         },
         "tasks": tasks,
+    }
+
+
+def campaign_issue(value: Any) -> dict[str, str]:
+    issue = object_exact(value, {"number", "url"}, "issue")
+    number = required_string(issue.get("number"), "issue.number")
+    if not number.isdigit() or number.startswith("0"):
+        fail("issue.number must be a positive decimal string")
+    url = required_string(issue.get("url"), "issue.url")
+    return {"number": number, "url": url}
+
+
+def pull_request_marker(campaign: str, issue_number: str, task_id: str) -> str:
+    return (
+        "<!-- tally:spec-build:v1 "
+        f"campaign={campaign} issue={issue_number} task={task_id} -->"
+    )
+
+
+def merged_github_tasks(
+    repository: str,
+    campaign: str,
+    issue_number: str,
+    base_branch: str,
+    tasks: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    fields = "url,body,baseRefName,headRefName,mergeCommit"
+    viewed = run(
+        [
+            "gh",
+            "pr",
+            "list",
+            "--repo",
+            repository,
+            "--state",
+            "merged",
+            "--limit",
+            "1000",
+            "--json",
+            fields,
+        ]
+    )
+    try:
+        candidates = json.loads(viewed.stdout)
+    except json.JSONDecodeError as error:
+        fail(f"gh pr list returned invalid JSON: {error}")
+    if not isinstance(candidates, list):
+        fail("gh pr list must return an array")
+    facts: list[dict[str, str]] = []
+    claimed_urls: set[str] = set()
+    for task in tasks:
+        marker = pull_request_marker(campaign, issue_number, task["id"])
+        branch = stable_publish_branch(campaign, issue_number, task["id"])
+        legacy_campaign = f"Spec-build campaign progress for {repository}#{issue_number}."
+        legacy_task = f"Task `{task['id']}`:"
+        matching = [
+            candidate
+            for candidate in candidates
+            if isinstance(candidate, dict)
+            and isinstance(candidate.get("body"), str)
+            and (
+                marker in candidate["body"]
+                or (
+                    legacy_campaign in candidate["body"]
+                    and legacy_task in candidate["body"]
+                )
+            )
+        ]
+        # The stable head ref remains a durable lookup key even after this
+        # campaign's PR ages out of the forge-wide recent-PR window.
+        if not matching:
+            by_branch = run(
+                [
+                    "gh",
+                    "pr",
+                    "list",
+                    "--repo",
+                    repository,
+                    "--head",
+                    branch,
+                    "--state",
+                    "merged",
+                    "--limit",
+                    "2",
+                    "--json",
+                    fields,
+                ]
+            )
+            try:
+                branch_candidates = json.loads(by_branch.stdout)
+            except json.JSONDecodeError as error:
+                fail(f"gh pr list for {branch!r} returned invalid JSON: {error}")
+            if not isinstance(branch_candidates, list):
+                fail(f"gh pr list for {branch!r} must return an array")
+            matching = [
+                candidate
+                for candidate in branch_candidates
+                if isinstance(candidate, dict)
+                and isinstance(candidate.get("body"), str)
+                and marker in candidate["body"]
+            ]
+        if len(matching) > 1:
+            fail(f"multiple merged pull requests claim campaign task {task['id']!r}")
+        if not matching:
+            continue
+        candidate = matching[0]
+        url = required_string(
+            candidate.get("url"), f"merged pull request for {task['id']} URL"
+        )
+        if url in claimed_urls:
+            fail(f"merged pull request {url} claims more than one campaign task")
+        claimed_urls.add(url)
+        if candidate.get("baseRefName") != base_branch:
+            fail(
+                f"merged pull request {url} targeted {candidate.get('baseRefName')!r}, "
+                f"expected campaign base {base_branch!r}"
+            )
+        if marker in candidate["body"] and candidate.get("headRefName") != branch:
+            fail(
+                f"merged pull request {url} used head {candidate.get('headRefName')!r}, "
+                f"expected stable task branch {branch!r}"
+            )
+        commit = candidate.get("mergeCommit") or {}
+        facts.append(
+            {
+                "taskId": task["id"],
+                "pullRequest": url,
+                "mergeCommit": required_string(
+                    commit.get("oid"), f"merged pull request for {task['id']} commit"
+                ),
+            }
+        )
+    return facts
+
+
+def stable_publish_branch(campaign: str, issue_number: str, task_id: str) -> str:
+    campaign_slug = safe_slug(campaign, 32)
+    return f"tally/{campaign_slug}-issue-{issue_number}/{task_id}"
+
+
+def merged_local_tasks(
+    repository: str,
+    config: dict[str, Any],
+    campaign: str,
+    issue_number: str,
+    tasks: list[dict[str, Any]],
+) -> list[dict[str, str]]:
+    checkout: Path = config["checkout"]
+    remote = config["remote"]
+    base_branch = config["baseBranch"]
+    git(checkout, "fetch", "--prune", remote)
+    base_ref = f"{remote}/{base_branch}"
+    base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
+    facts: list[dict[str, str]] = []
+    for task in tasks:
+        branch = stable_publish_branch(campaign, issue_number, task["id"])
+        remote_ref = f"refs/remotes/{remote}/{branch}"
+        if git(checkout, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode:
+            continue
+        head = git(checkout, "rev-parse", "--verify", f"{remote_ref}^{{commit}}").stdout.strip()
+        if git(checkout, "merge-base", "--is-ancestor", head, base_rev, check=False).returncode:
+            continue
+        facts.append(
+            {
+                "taskId": task["id"],
+                "pullRequest": f"local://{repository}/{branch}",
+                "mergeCommit": base_rev,
+            }
+        )
+    return facts
+
+
+def domains_overlap(left: str, right: str) -> bool:
+    left_parts = Path(left).parts
+    right_parts = Path(right).parts
+    width = min(len(left_parts), len(right_parts))
+    return left_parts[:width] == right_parts[:width]
+
+
+def task_conflicts(task: dict[str, Any], selected: list[dict[str, Any]]) -> bool:
+    return any(
+        domains_overlap(left, right)
+        for other in selected
+        for left in task["conflictDomains"]
+        for right in other["conflictDomains"]
+    )
+
+
+def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
+    data = object_exact(
+        brief,
+        {
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "worklist",
+            "maxTasks",
+            "maxParallel",
+        },
+        "reconcile brief",
+    )
+    campaign = required_string(data.get("campaign"), "campaign")
+    if not COMPONENT.fullmatch(campaign):
+        fail("campaign is not a safe component")
+    issue = campaign_issue(data.get("issue"))
+    worklist = action_worklist(
+        {
+            "repository": data.get("repository"),
+            "repositoryConfig": data.get("repositoryConfig"),
+            "worklist": data.get("worklist"),
+            "maxTasks": data.get("maxTasks"),
+            "maxParallel": data.get("maxParallel"),
+        }
+    )
+    repository = worklist["repository"]
+    config = repo_config(data.get("repositoryConfig"))
+    if config["forge"] == "github":
+        merged = merged_github_tasks(
+            repository,
+            campaign,
+            issue["number"],
+            config["baseBranch"],
+            worklist["tasks"],
+        )
+    else:
+        merged = merged_local_tasks(
+            repository,
+            config,
+            campaign,
+            issue["number"],
+            worklist["tasks"],
+        )
+    merged_ids = {fact["taskId"] for fact in merged}
+    remaining = [task for task in worklist["tasks"] if task["id"] not in merged_ids]
+    ready = [
+        task
+        for task in remaining
+        if all(dependency in merged_ids for dependency in task["dependencies"])
+    ]
+    max_parallel = data["maxParallel"]
+    frontier: list[dict[str, Any]] = []
+    for task in ready:
+        if len(frontier) == max_parallel:
+            break
+        if not task_conflicts(task, frontier):
+            frontier.append(task)
+    return {
+        "schemaVersion": 1,
+        "repository": repository,
+        "source": worklist["source"],
+        "tasks": worklist["tasks"],
+        "merged": merged,
+        "remaining": [task["id"] for task in remaining],
+        "frontier": frontier,
+        "complete": not remaining,
     }
 
 
@@ -293,6 +591,7 @@ def prep_identity(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
         fail("task.id is not safe")
     campaign = required_string(data.get("campaign"), "campaign")
     repository = required_string(data.get("repository"), "repository")
+    issue = campaign_issue(data.get("issue"))
     run_id = required_string(data.get("runId"), "runId", 512)
     workspace_root = Path(required_string(data.get("workspaceRoot"), "workspaceRoot"))
     if not workspace_root.is_absolute():
@@ -301,6 +600,7 @@ def prep_identity(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
     identity = {
         "campaign": campaign,
         "repository": repository,
+        "issueNumber": issue["number"],
         "runId": run_id,
         "taskId": task_id,
         "workspaceRoot": workspace_root,
@@ -328,7 +628,10 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     run_hash = hashlib.sha256(identity["runId"].encode()).hexdigest()[:12]
     campaign_slug = safe_slug(identity["campaign"], 24)
     repository_slug = safe_slug(identity["repository"].split("/", 1)[1], 40)
-    branch = f"tally/{campaign_slug}-{run_hash}/{identity['taskId']}"
+    branch = f"tally-work/{campaign_slug}-{run_hash}/{identity['taskId']}"
+    publish_branch = stable_publish_branch(
+        identity["campaign"], identity["issueNumber"], identity["taskId"]
+    )
     worktree = (
         identity["workspaceRoot"] / repository_slug / run_hash / identity["taskId"]
     ).resolve()
@@ -342,6 +645,7 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
             "runId": identity["runId"],
             "taskId": identity["taskId"],
             "branch": branch,
+            "publishBranch": publish_branch,
             "worktreePath": str(worktree),
         }
         if any(saved.get(key) != value for key, value in expected.items()):
@@ -352,18 +656,35 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
             "taskId": identity["taskId"],
             "baseRev": required_string(saved.get("baseRev"), "prep marker baseRev"),
             "branch": branch,
+            "publishBranch": publish_branch,
             "worktreePath": str(worktree),
         }
 
-    git(checkout, "fetch", "--prune", remote, base_branch)
+    git(checkout, "fetch", "--prune", remote)
     base_ref = f"{remote}/{base_branch}"
     base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
+    publish_ref = f"refs/remotes/{remote}/{publish_branch}"
+    published = git(
+        checkout,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        publish_ref,
+        check=False,
+    ).returncode == 0
+    if published:
+        start_rev = git(
+            checkout, "rev-parse", "--verify", f"{publish_ref}^{{commit}}"
+        ).stdout.strip()
+        base_rev = git(checkout, "merge-base", start_rev, base_rev).stdout.strip()
+    else:
+        start_rev = base_rev
     if git(checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
         fail(f"branch {branch!r} exists without its prep marker")
     if worktree.exists():
         fail(f"worktree path already exists without its prep marker: {worktree}")
     worktree.parent.mkdir(parents=True, exist_ok=True)
-    git(checkout, "worktree", "add", "--detach", str(worktree), base_rev)
+    git(checkout, "worktree", "add", "--detach", str(worktree), start_rev)
     git(worktree, "switch", "-c", branch)
     saved = {
         "campaign": identity["campaign"],
@@ -372,6 +693,7 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
         "taskId": identity["taskId"],
         "baseRev": base_rev,
         "branch": branch,
+        "publishBranch": publish_branch,
         "worktreePath": str(worktree),
     }
     write_atomic(marker, saved)
@@ -379,6 +701,103 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
         "taskId": identity["taskId"],
         "baseRev": base_rev,
         "branch": branch,
+        "publishBranch": publish_branch,
+        "worktreePath": str(worktree),
+    }
+
+
+def action_preflight(brief: dict[str, Any]) -> dict[str, Any]:
+    data = object_exact(
+        brief,
+        {
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "runId",
+            "workspaceRoot",
+        },
+        "preflight brief",
+    )
+    campaign = required_string(data.get("campaign"), "campaign")
+    if not COMPONENT.fullmatch(campaign):
+        fail("campaign is not a safe component")
+    repository = required_string(data.get("repository"), "repository")
+    if not REPOSITORY.fullmatch(repository):
+        fail("repository must use owner/name form")
+    campaign_issue(data.get("issue"))
+    run_id = required_string(data.get("runId"), "runId", 512)
+    workspace_root = Path(required_string(data.get("workspaceRoot"), "workspaceRoot"))
+    if not workspace_root.is_absolute():
+        fail("workspaceRoot must be absolute")
+    config = repo_config(data.get("repositoryConfig"))
+    checkout: Path = config["checkout"]
+    run_hash = hashlib.sha256(run_id.encode()).hexdigest()[:12]
+    campaign_slug = safe_slug(campaign, 24)
+    repository_slug = safe_slug(repository.split("/", 1)[1], 40)
+    task_id = "campaign-preflight"
+    branch = f"tally-work/{campaign_slug}-{run_hash}/_campaign-preflight"
+    worktree = (
+        workspace_root / repository_slug / run_hash / "_campaign-preflight"
+    ).resolve()
+    marker = workspace_root / ".state" / run_hash / "_campaign-preflight.json"
+
+    if marker.exists():
+        saved = json.loads(marker.read_text(encoding="utf-8"))
+        expected = {
+            "campaign": campaign,
+            "repository": repository,
+            "runId": run_id,
+            "taskId": task_id,
+            "branch": branch,
+            "publishBranch": branch,
+            "worktreePath": str(worktree),
+        }
+        if any(saved.get(key) != value for key, value in expected.items()):
+            fail(f"existing preflight marker {marker} does not match this pass")
+        if not worktree.is_dir():
+            fail(f"prepared preflight worktree {worktree} is missing")
+        return {
+            "taskId": task_id,
+            "baseRev": required_string(saved.get("baseRev"), "preflight marker baseRev"),
+            "branch": branch,
+            "publishBranch": branch,
+            "worktreePath": str(worktree),
+        }
+
+    git(checkout, "fetch", "--prune", config["remote"])
+    base_ref = f"{config['remote']}/{config['baseBranch']}"
+    base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
+    if git(
+        checkout,
+        "show-ref",
+        "--verify",
+        "--quiet",
+        f"refs/heads/{branch}",
+        check=False,
+    ).returncode == 0:
+        fail(f"preflight branch {branch!r} exists without its marker")
+    if worktree.exists():
+        fail(f"preflight worktree exists without its marker: {worktree}")
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    git(checkout, "worktree", "add", "--detach", str(worktree), base_rev)
+    git(worktree, "switch", "-c", branch)
+    saved = {
+        "campaign": campaign,
+        "repository": repository,
+        "runId": run_id,
+        "taskId": task_id,
+        "baseRev": base_rev,
+        "branch": branch,
+        "publishBranch": branch,
+        "worktreePath": str(worktree),
+    }
+    write_atomic(marker, saved)
+    return {
+        "taskId": task_id,
+        "baseRev": base_rev,
+        "branch": branch,
+        "publishBranch": branch,
         "worktreePath": str(worktree),
     }
 
@@ -517,17 +936,17 @@ def action_constraint(brief: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def normalize_constraint_results(value: Any) -> list[dict[str, Any]]:
+def normalize_constraint_results(value: Any, context: str) -> list[dict[str, Any]]:
     if not isinstance(value, list):
-        fail("publish constraints must be an array")
+        fail(f"{context} must be an array")
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
     for index, candidate in enumerate(value):
-        context = f"publish constraints[{index}]"
+        receipt_context = f"{context}[{index}]"
         receipt = object_exact(
             candidate,
             {"gateId", "kind", "patterns", "checkedPaths", "baseRev", "head"},
-            context,
+            receipt_context,
         )
         gate = normalize_forbid_paths_gate(
             {
@@ -536,10 +955,10 @@ def normalize_constraint_results(value: Any) -> list[dict[str, Any]]:
                 "forbidPaths": receipt.get("patterns"),
                 "runtimeMaxSec": 1,
             },
-            context,
+            receipt_context,
         )
         if gate["id"] in seen:
-            fail(f"publish constraints repeats gateId {gate['id']!r}")
+            fail(f"{context} repeats gateId {gate['id']!r}")
         seen.add(gate["id"])
         checked_paths = receipt.get("checkedPaths")
         if (
@@ -547,13 +966,13 @@ def normalize_constraint_results(value: Any) -> list[dict[str, Any]]:
             or isinstance(checked_paths, bool)
             or checked_paths < 0
         ):
-            fail(f"{context}.checkedPaths must be a non-negative integer")
-        base_rev = required_string(receipt.get("baseRev"), f"{context}.baseRev")
-        head = required_string(receipt.get("head"), f"{context}.head")
+            fail(f"{receipt_context}.checkedPaths must be a non-negative integer")
+        base_rev = required_string(receipt.get("baseRev"), f"{receipt_context}.baseRev")
+        head = required_string(receipt.get("head"), f"{receipt_context}.head")
         if not re.fullmatch(r"[0-9a-f]{40,64}", base_rev):
-            fail(f"{context}.baseRev must be a full Git object ID")
+            fail(f"{receipt_context}.baseRev must be a full Git object ID")
         if not re.fullmatch(r"[0-9a-f]{40,64}", head):
-            fail(f"{context}.head must be a full Git object ID")
+            fail(f"{receipt_context}.head must be a full Git object ID")
         results.append(
             {
                 "gateId": gate["id"],
@@ -567,6 +986,32 @@ def normalize_constraint_results(value: Any) -> list[dict[str, Any]]:
     return results
 
 
+def enforce_constraint_results(
+    worktree: Path,
+    base_rev: str,
+    head: str,
+    constraints: list[dict[str, Any]],
+) -> None:
+    for constraint in constraints:
+        if constraint["baseRev"] != base_rev:
+            fail(
+                f"forbidPaths gate {constraint['gateId']!r} was witnessed against base "
+                f"{constraint['baseRev']}, expected {base_rev}"
+            )
+        checked_paths = evaluate_forbid_paths(
+            worktree,
+            base_rev,
+            head,
+            constraint["gateId"],
+            constraint["patterns"],
+        )
+        if constraint["head"] == head and constraint["checkedPaths"] != checked_paths:
+            fail(
+                f"forbidPaths gate {constraint['gateId']!r} receipt counted "
+                f"{constraint['checkedPaths']} paths at {head}, publication counted {checked_paths}"
+            )
+
+
 def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, Any], dict[str, Any], Path]:
     allowed = {
         "campaign",
@@ -578,20 +1023,24 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
         "task",
         "workspace",
     }
-    if action == "merge":
-        allowed.add("publication")
+    if action == "rebase":
+        allowed.update({"publication", "constraints"})
     if action == "publish":
         allowed.add("constraints")
+    if action == "merge":
+        allowed.update({"integration", "reconcileCommand"})
     data = object_exact(brief, allowed, f"{action} brief")
     config = repo_config(data.get("repositoryConfig"))
     workspace = object_exact(
-        data.get("workspace"), {"taskId", "baseRev", "branch", "worktreePath"}, "workspace"
+        data.get("workspace"),
+        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
+        "workspace",
     )
     worktree = Path(required_string(workspace.get("worktreePath"), "workspace.worktreePath"))
     if not worktree.is_absolute():
         fail("workspace.worktreePath must be absolute")
-    if action == "publish" and not worktree.is_dir():
-        fail("workspace.worktreePath must be an existing directory for publication")
+    if action in {"publish", "rebase"} and not worktree.is_dir():
+        fail(f"workspace.worktreePath must be an existing directory for {action}")
     if worktree.exists():
         if not worktree.is_dir():
             fail("workspace.worktreePath exists but is not a directory")
@@ -602,7 +1051,12 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
 def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: Path, head: str) -> str:
     repository = required_string(data.get("repository"), "repository")
     workspace = data["workspace"]
-    branch = workspace["branch"]
+    branch = workspace["publishBranch"]
+    task = data["task"]
+    issue = campaign_issue(data.get("issue"))
+    marker = pull_request_marker(
+        required_string(data.get("campaign"), "campaign"), issue["number"], task["id"]
+    )
     existing = run(
         [
             "gh",
@@ -615,17 +1069,42 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
             "--state",
             "all",
             "--json",
-            "url,headRefName,state",
+            "url,body,baseRefName,headRefName,headRefOid,state",
         ]
     )
-    candidates = json.loads(existing.stdout)
+    try:
+        candidates = json.loads(existing.stdout)
+    except json.JSONDecodeError as error:
+        fail(f"gh pr list returned invalid JSON: {error}")
+    if not isinstance(candidates, list):
+        fail("gh pr list must return an array")
+    if len(candidates) > 1:
+        fail(f"multiple pull requests use stable task branch {branch!r}")
     if candidates:
-        return required_string(candidates[0].get("url"), "existing pull request URL")
-    task = data["task"]
-    issue = data["issue"]
+        candidate = candidates[0]
+        url = required_string(candidate.get("url"), "existing pull request URL")
+        if candidate.get("headRefName") != branch:
+            fail(f"pull request {url} does not use expected head branch {branch!r}")
+        if candidate.get("baseRefName") != config["baseBranch"]:
+            fail(
+                f"pull request {url} does not target expected base "
+                f"{config['baseBranch']!r}"
+            )
+        if candidate.get("headRefOid") != head:
+            fail(f"pull request {url} does not expose the just-published head")
+        body = candidate.get("body")
+        if not isinstance(body, str) or marker not in body:
+            fail(f"pull request {url} lacks this campaign task's identity marker")
+        state = candidate.get("state")
+        if state == "CLOSED":
+            run(["gh", "pr", "reopen", url, "--repo", repository])
+        elif state != "OPEN":
+            fail(f"pull request {url} is unexpectedly {state!r}")
+        return url
     campaign = required_string(data.get("campaign"), "campaign")
     task_ref = f"{campaign}/{task['id']}"
     body = (
+        f"{marker}\n"
         f"Spec-build campaign progress for {repository}#{issue['number']}.\n\n"
         f"Task `{task['id']}`: {task['title']}\n\n"
         f"Task ref: `{task_ref}`\n\n"
@@ -656,14 +1135,17 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
 
 def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
     data, config, worktree = publication_identity(brief, "publish")
-    constraints = normalize_constraint_results(data.get("constraints"))
+    constraints = normalize_constraint_results(data.get("constraints"), "publish constraints")
     workspace = data["workspace"]
     task_id = required_string(workspace.get("taskId"), "workspace.taskId")
-    branch = required_string(workspace.get("branch"), "workspace.branch")
+    local_branch = required_string(workspace.get("branch"), "workspace.branch")
+    publish_branch = required_string(
+        workspace.get("publishBranch"), "workspace.publishBranch"
+    )
     base_rev = required_string(workspace.get("baseRev"), "workspace.baseRev")
     actual_branch = git(worktree, "branch", "--show-current").stdout.strip()
-    if actual_branch != branch:
-        fail(f"worktree is on branch {actual_branch!r}, expected {branch!r}")
+    if actual_branch != local_branch:
+        fail(f"worktree is on branch {actual_branch!r}, expected {local_branch!r}")
     status = git(worktree, "status", "--porcelain").stdout
     if status:
         fail("agent left uncommitted changes; commit the task before publication")
@@ -672,34 +1154,103 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         fail("agent produced no commit relative to the prepared base")
     if git(worktree, "merge-base", "--is-ancestor", base_rev, head, check=False).returncode != 0:
         fail("task head is not descended from its prepared base revision")
-    for constraint in constraints:
-        if constraint["baseRev"] != base_rev:
-            fail(
-                f"forbidPaths gate {constraint['gateId']!r} was witnessed against base "
-                f"{constraint['baseRev']}, expected {base_rev}"
-            )
-        checked_paths = evaluate_forbid_paths(
-            worktree,
-            base_rev,
-            head,
-            constraint["gateId"],
-            constraint["patterns"],
-        )
-        if constraint["head"] == head and constraint["checkedPaths"] != checked_paths:
-            fail(
-                f"forbidPaths gate {constraint['gateId']!r} receipt counted "
-                f"{constraint['checkedPaths']} paths at {head}, publication counted {checked_paths}"
-            )
-    git(worktree, "push", "--set-upstream", config["remote"], f"HEAD:refs/heads/{branch}")
+    enforce_constraint_results(worktree, base_rev, head, constraints)
+    git(worktree, "push", config["remote"], f"HEAD:refs/heads/{publish_branch}")
     if config["forge"] == "github":
         pull_request = github_pull_request(data, config, worktree, head)
     else:
-        pull_request = f"local://{data['repository']}/{branch}"
+        pull_request = f"local://{data['repository']}/{publish_branch}"
     return {
         "taskId": task_id,
-        "branch": branch,
+        "branch": publish_branch,
         "head": head,
         "pullRequest": pull_request,
+    }
+
+
+def publication(value: Any, context: str = "publication") -> dict[str, str]:
+    item = object_exact(value, {"taskId", "branch", "head", "pullRequest"}, context)
+    task_id = required_string(item.get("taskId"), f"{context}.taskId")
+    if not TASK_ID.fullmatch(task_id):
+        fail(f"{context}.taskId is not safe")
+    return {
+        "taskId": task_id,
+        "branch": required_string(item.get("branch"), f"{context}.branch"),
+        "head": required_string(item.get("head"), f"{context}.head"),
+        "pullRequest": required_string(
+            item.get("pullRequest"), f"{context}.pullRequest"
+        ),
+    }
+
+
+def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
+    data, config, worktree = publication_identity(brief, "rebase")
+    published = publication(data.get("publication"))
+    constraints = normalize_constraint_results(data.get("constraints"), "rebase constraints")
+    workspace = data["workspace"]
+    if published["taskId"] != workspace["taskId"]:
+        fail("publication.taskId does not match workspace.taskId")
+    if published["branch"] != workspace["publishBranch"]:
+        fail("publication.branch does not match workspace.publishBranch")
+    local_head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    if local_head != published["head"]:
+        fail("worktree head changed after publication")
+    for constraint in constraints:
+        if constraint["baseRev"] != workspace["baseRev"]:
+            fail(
+                f"forbidPaths gate {constraint['gateId']!r} was witnessed against base "
+                f"{constraint['baseRev']}, expected prepared base {workspace['baseRev']}"
+            )
+
+    checkout: Path = config["checkout"]
+    remote = config["remote"]
+    git(checkout, "fetch", "--prune", remote)
+    base_ref = f"{remote}/{config['baseBranch']}"
+    branch_ref = f"{remote}/{published['branch']}"
+    base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
+    remote_head = git(
+        checkout, "rev-parse", "--verify", f"{branch_ref}^{{commit}}"
+    ).stdout.strip()
+    if remote_head != published["head"]:
+        fail("published branch moved before integration")
+
+    if git(worktree, "merge-base", "--is-ancestor", base_rev, local_head, check=False).returncode == 0:
+        return {
+            "taskId": published["taskId"],
+            "baseRev": base_rev,
+            "branch": published["branch"],
+            "head": local_head,
+            "pullRequest": published["pullRequest"],
+            "regate": False,
+        }
+
+    rebased = git(worktree, "rebase", base_rev, check=False)
+    if rebased.returncode != 0:
+        detail = rebased.stderr.strip() or rebased.stdout.strip() or "no output"
+        fail(f"cannot rebase task onto current base {base_rev}: {detail}")
+    rebased_head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    for constraint in constraints:
+        evaluate_forbid_paths(
+            worktree,
+            base_rev,
+            rebased_head,
+            constraint["gateId"],
+            constraint["patterns"],
+        )
+    git(
+        worktree,
+        "push",
+        f"--force-with-lease=refs/heads/{published['branch']}:{published['head']}",
+        remote,
+        f"HEAD:refs/heads/{published['branch']}",
+    )
+    return {
+        "taskId": published["taskId"],
+        "baseRev": base_rev,
+        "branch": published["branch"],
+        "head": rebased_head,
+        "pullRequest": published["pullRequest"],
+        "regate": True,
     }
 
 
@@ -708,42 +1259,129 @@ def cleanup_worktree(checkout: Path, worktree: Path, branch: str) -> None:
     git(checkout, "branch", "-D", branch, check=False)
 
 
+def action_cleanup(brief: dict[str, Any]) -> dict[str, Any]:
+    data = object_exact(brief, {"repositoryConfig", "workspace"}, "cleanup brief")
+    config = repo_config(data.get("repositoryConfig"))
+    workspace = object_exact(
+        data.get("workspace"),
+        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
+        "workspace",
+    )
+    task_id = required_string(workspace.get("taskId"), "workspace.taskId")
+    branch = required_string(workspace.get("branch"), "workspace.branch")
+    required_string(workspace.get("baseRev"), "workspace.baseRev")
+    required_string(workspace.get("publishBranch"), "workspace.publishBranch")
+    worktree = Path(required_string(workspace.get("worktreePath"), "workspace.worktreePath"))
+    if not worktree.is_absolute():
+        fail("workspace.worktreePath must be absolute")
+    if worktree.exists():
+        if not worktree.is_dir():
+            fail("workspace.worktreePath exists but is not a directory")
+        git(worktree, "rev-parse", "--git-dir")
+        actual_branch = git(worktree, "branch", "--show-current").stdout.strip()
+        if actual_branch != branch:
+            fail(f"cleanup worktree is on branch {actual_branch!r}, expected {branch!r}")
+        git(config["checkout"], "worktree", "remove", "--force", str(worktree))
+    git(config["checkout"], "branch", "-D", branch, check=False)
+    return {"taskId": task_id, "cleaned": True}
+
+
 def merge_local(
-    data: dict[str, Any], config: dict[str, Any], worktree: Path, publication: dict[str, Any]
+    data: dict[str, Any], config: dict[str, Any], worktree: Path, integration: dict[str, Any]
 ) -> str:
     checkout: Path = config["checkout"]
     remote_url = git(checkout, "remote", "get-url", config["remote"]).stdout.strip()
     workspace_root = Path(data["workspaceRoot"])
     workspace_root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="merge-", dir=workspace_root) as temporary:
-        integration = Path(temporary) / "repository"
-        run(["git", "clone", "--quiet", remote_url, str(integration)])
-        git(integration, "config", "user.name", "tally spec-build")
-        git(integration, "config", "user.email", "tally-spec-build@invalid")
-        git(integration, "fetch", "origin", config["baseBranch"], publication["branch"])
-        git(integration, "switch", "-C", config["baseBranch"], f"origin/{config['baseBranch']}")
+        integration_checkout = Path(temporary) / "repository"
+        run(["git", "clone", "--quiet", remote_url, str(integration_checkout)])
+        git(integration_checkout, "config", "user.name", "tally spec-build")
+        git(integration_checkout, "config", "user.email", "tally-spec-build@invalid")
         git(
-            integration,
+            integration_checkout,
+            "fetch",
+            "origin",
+            config["baseBranch"],
+            integration["branch"],
+        )
+        actual_base = git(
+            integration_checkout, "rev-parse", f"origin/{config['baseBranch']}"
+        ).stdout.strip()
+        actual_head = git(
+            integration_checkout, "rev-parse", f"origin/{integration['branch']}"
+        ).stdout.strip()
+        if actual_base != integration["baseRev"]:
+            fail("remote base moved after the rebased head was gated")
+        if actual_head != integration["head"]:
+            fail("published branch moved after the rebased head was gated")
+        git(integration_checkout, "switch", "-C", config["baseBranch"], actual_base)
+        git(
+            integration_checkout,
             "merge",
             "--no-ff",
             "--no-edit",
-            f"origin/{publication['branch']}",
+            f"origin/{integration['branch']}",
         )
-        merge_commit = git(integration, "rev-parse", "HEAD").stdout.strip()
-        git(integration, "push", "origin", f"HEAD:refs/heads/{config['baseBranch']}")
-    cleanup_worktree(checkout, worktree, publication["branch"])
+        merge_commit = git(integration_checkout, "rev-parse", "HEAD").stdout.strip()
+        git(
+            integration_checkout,
+            "push",
+            "origin",
+            f"HEAD:refs/heads/{config['baseBranch']}",
+        )
+    cleanup_worktree(checkout, worktree, data["workspace"]["branch"])
     return merge_commit
 
 
 def merge_github(
-    data: dict[str, Any], config: dict[str, Any], worktree: Path, publication: dict[str, Any]
+    data: dict[str, Any], config: dict[str, Any], worktree: Path, integration: dict[str, Any]
 ) -> str:
     repository = required_string(data.get("repository"), "repository")
-    url = required_string(publication.get("pullRequest"), "publication.pullRequest")
-    viewed = run(["gh", "pr", "view", url, "--repo", repository, "--json", "state,mergeCommit"])
+    url = required_string(integration.get("pullRequest"), "integration.pullRequest")
+    checkout: Path = config["checkout"]
+    git(checkout, "fetch", "--prune", config["remote"])
+    base_ref = f"{config['remote']}/{config['baseBranch']}"
+    branch_ref = f"{config['remote']}/{integration['branch']}"
+    current_base = git(checkout, "rev-parse", f"{base_ref}^{{commit}}").stdout.strip()
+    current_head = git(checkout, "rev-parse", f"{branch_ref}^{{commit}}").stdout.strip()
+    if current_base != integration["baseRev"]:
+        fail("remote base moved after the rebased head was gated")
+    if current_head != integration["head"]:
+        fail("published branch moved after the rebased head was gated")
+    viewed = run(
+        [
+            "gh",
+            "pr",
+            "view",
+            url,
+            "--repo",
+            repository,
+            "--json",
+            "state,mergeCommit,baseRefName,headRefName,headRefOid",
+        ]
+    )
     state = json.loads(viewed.stdout)
+    if state.get("baseRefName") != config["baseBranch"]:
+        fail(f"pull request {url} changed base branch before merge")
+    if state.get("headRefName") != integration["branch"]:
+        fail(f"pull request {url} changed head branch before merge")
+    if state.get("headRefOid") != integration["head"]:
+        fail(f"pull request {url} changed head commit before merge")
     if state.get("state") != "MERGED":
-        run(["gh", "pr", "merge", url, "--repo", repository, "--merge"])
+        run(
+            [
+                "gh",
+                "pr",
+                "merge",
+                url,
+                "--repo",
+                repository,
+                "--merge",
+                "--match-head-commit",
+                integration["head"],
+            ]
+        )
         viewed = run(
             ["gh", "pr", "view", url, "--repo", repository, "--json", "state,mergeCommit"]
         )
@@ -752,40 +1390,40 @@ def merge_github(
         fail(f"pull request {url} did not reach MERGED")
     merge_commit = (state.get("mergeCommit") or {}).get("oid")
     merge_commit = required_string(merge_commit, "pull request merge commit")
-    checkout: Path = config["checkout"]
-    git(checkout, "fetch", "--prune", config["remote"], config["baseBranch"])
+    git(checkout, "fetch", "--prune", config["remote"])
     if (
         git(
             checkout,
             "merge-base",
             "--is-ancestor",
-            publication["head"],
+            integration["head"],
             f"{config['remote']}/{config['baseBranch']}",
             check=False,
         ).returncode
         != 0
     ):
         fail("current remote base does not contain the merged task head")
-    github_progress_comment(data, publication, merge_commit)
-    cleanup_worktree(checkout, worktree, publication["branch"])
+    github_progress_comment(data, integration, merge_commit)
+    cleanup_worktree(checkout, worktree, data["workspace"]["branch"])
     return merge_commit
 
 
 def github_progress_comment(
-    data: dict[str, Any], publication: dict[str, Any], merge_commit: str
+    data: dict[str, Any], integration: dict[str, Any], merge_commit: str
 ) -> None:
     repository = required_string(data.get("repository"), "repository")
     campaign = required_string(data.get("campaign"), "campaign")
-    run_id = required_string(data.get("runId"), "runId", 512)
-    issue = object_exact(data.get("issue"), {"number", "url"}, "issue")
-    issue_number = required_string(issue.get("number"), "issue.number")
+    issue = campaign_issue(data.get("issue"))
+    issue_number = issue["number"]
     task = data.get("task")
     if not isinstance(task, dict):
         fail("task must be an object")
     task_id = required_string(task.get("id"), "task.id")
     task_title = required_string(task.get("title"), "task.title")
-    run_hash = hashlib.sha256(run_id.encode()).hexdigest()[:16]
-    marker = f"<!-- tally:spec-build:{campaign}:{run_hash}:{task_id}:merged -->"
+    marker = (
+        "<!-- tally:spec-build:v1 "
+        f"campaign={campaign} issue={issue_number} task={task_id} merged -->"
+    )
     comments = run(
         [
             "gh",
@@ -796,15 +1434,31 @@ def github_progress_comment(
             ".[].body",
         ]
     ).stdout
-    if marker in comments:
-        return
-    body = (
-        f"{marker}\n"
-        f"Campaign task `{task_id}` ({task_title}) merged via "
-        f"{publication['pullRequest']}.\n\n"
-        f"Task ref: `{campaign}/{task_id}`\n\n"
-        f"Merge commit: `{merge_commit}`"
+    if marker not in comments:
+        body = (
+            f"{marker}\n"
+            f"Campaign task `{task_id}` ({task_title}) merged via "
+            f"{integration['pullRequest']}.\n\n"
+            f"Task ref: `{campaign}/{task_id}`\n\n"
+            f"Merge commit: `{merge_commit}`"
+        )
+        run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                issue_number,
+                "--repo",
+                repository,
+                "--body",
+                body,
+            ]
+        )
+    reconcile_command = required_string(
+        data.get("reconcileCommand"), "reconcileCommand", 300
     )
+    if not reconcile_command.startswith("/"):
+        fail("reconcileCommand must be an explicit slash command")
     run(
         [
             "gh",
@@ -814,42 +1468,69 @@ def github_progress_comment(
             "--repo",
             repository,
             "--body",
-            body,
+            reconcile_command,
         ]
     )
 
 
 def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
     data, config, worktree = publication_identity(brief, "merge")
-    publication = object_exact(
-        data.get("publication"), {"taskId", "branch", "head", "pullRequest"}, "publication"
+    integration = object_exact(
+        data.get("integration"),
+        {"taskId", "baseRev", "branch", "head", "pullRequest", "regate"},
+        "integration",
     )
-    task_id = required_string(publication.get("taskId"), "publication.taskId")
-    branch = required_string(publication.get("branch"), "publication.branch")
-    head = required_string(publication.get("head"), "publication.head")
-    pull_request = required_string(publication.get("pullRequest"), "publication.pullRequest")
+    task_id = required_string(integration.get("taskId"), "integration.taskId")
+    required_string(integration.get("baseRev"), "integration.baseRev")
+    required_string(integration.get("branch"), "integration.branch")
+    head = required_string(integration.get("head"), "integration.head")
+    pull_request = required_string(integration.get("pullRequest"), "integration.pullRequest")
+    if not isinstance(integration.get("regate"), bool):
+        fail("integration.regate must be boolean")
+    if task_id != data["workspace"]["taskId"]:
+        fail("integration.taskId does not match workspace.taskId")
+    if integration["branch"] != data["workspace"]["publishBranch"]:
+        fail("integration.branch does not match workspace.publishBranch")
     if config["forge"] == "github":
-        merge_commit = merge_github(data, config, worktree, publication)
+        merge_commit = merge_github(data, config, worktree, integration)
     else:
-        merge_commit = merge_local(data, config, worktree, publication)
+        merge_commit = merge_local(data, config, worktree, integration)
     return {
         "taskId": task_id,
         "head": head,
         "mergeCommit": merge_commit,
         "pullRequest": pull_request,
+        "regated": integration["regate"],
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("worklist", "prep", "constraint", "publish", "merge"))
+    parser.add_argument(
+        "action",
+        choices=(
+            "worklist",
+            "reconcile",
+            "preflight",
+            "prep",
+            "cleanup",
+            "constraint",
+            "publish",
+            "rebase",
+            "merge",
+        ),
+    )
     arguments = parser.parse_args()
     brief = load_brief()
     actions = {
         "worklist": action_worklist,
+        "reconcile": action_reconcile,
+        "preflight": action_preflight,
         "prep": action_prep,
         "constraint": action_constraint,
+        "cleanup": action_cleanup,
         "publish": action_publish,
+        "rebase": action_rebase,
         "merge": action_merge,
     }
     emit(actions[arguments.action](brief))

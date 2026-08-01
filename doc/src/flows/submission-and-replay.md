@@ -183,8 +183,10 @@ flushed and may appear once per evaluation.
 The 24-hour evaluator budget deliberately remains fixed; it is not configurable
 through `meta` or `services.tally.flows.<name>`. Raising or removing it per
 registration would let a hung awaited node or transport hold an evaluator, its
-`flow` slot, and any process-scoped `workloadMutex` indefinitely. Long campaigns
-use witnessed replay as their checkpoint mechanism instead. Node
+`flow` slot, and any process-scoped `workloadMutex` indefinitely. Flows that
+need run-identity continuity use witnessed replay as their checkpoint mechanism.
+Forge-backed spec-build campaigns instead run bounded, fresh reconcile passes;
+their continuation state is the set of merged pull requests. Node
 `runtimeMaxSec`, the runner job's registration-level `runtimeMaxSec`, and the
 RPC call deadline remain separate bounds; changing one does not change the
 24-hour evaluation budget.

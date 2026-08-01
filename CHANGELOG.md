@@ -22,6 +22,13 @@ authorized.
   with `forbidPaths` globs over each task's committed pull-request diff. A
   forbidden path now becomes a cheap, witnessed, fail-fast gate failure before
   publication or merge instead of a post-merge operator audit.
+- Replaced spec-build's campaign-long serial runner with bounded stateless
+  reconcile passes over marked merged pull requests. Campaigns now select a
+  dependency-ready, conflict-disjoint frontier up to `maxParallel`, execute its
+  task lanes concurrently, rebase and re-gate changed heads before serialized
+  merges, and enqueue the next pass through an exact self-posted GitHub command;
+  fresh mentions safely recover failed or redeployed passes without replaying an
+  old flow-run identity.
 - Added flow-node `approvalPolicy` and `sandboxPolicy` fields plus campaign
   `agentApprovalPolicy`/`agentSandboxPolicy` options. Spec-build implementation
   agents now default to Codex's writable `workspace-write` + `on-request`

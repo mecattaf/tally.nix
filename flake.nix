@@ -1161,7 +1161,8 @@
                   postFailureEvidence = true;
                   postFailureStderr = true;
                   worklist = "specs/*/tasks.json";
-                  maxTasks = 3;
+                  maxTasks = 4;
+                  maxParallel = 3;
                   gates = [
                     {
                       kind = "command";
@@ -3389,6 +3390,7 @@
                 ${tally}/bin/tally --mode check-config --config "$checkedConfig" >/dev/null
                 jq -e '
                   .producers["campaign-fixture"].enqueue.brief as $fixtureArgs |
+                  .producers["campaign-fixture-reconcile"].enqueue.brief as $reconcileArgs |
                   .producers["campaign-defaulted"].enqueue.brief as $defaultedArgs |
                   .enqueue.fanoutCap == 64 and
                   .pools["fixture-campaign"].resource == "mutex" and
@@ -3396,7 +3398,7 @@
                   .pools["campaign-control"].resource == "cpu-slot" and
                   .pools["campaign-control"].capacity == 4 and
                   .pools["campaign-agent"].resource == "slot" and
-                  .pools["campaign-agent"].capacity == 1 and
+                  .pools["campaign-agent"].capacity == 3 and
                   .adapters["spec-build-driver"].scrape.finalMessage.mode == "regex" and
                   .adapters["spec-build-driver"].scrape.finalMessage.pattern == "^TALLY_FINAL_MESSAGE=(.*)$" and
                   .flows.fixture.workloadMutex == "fixture-campaign" and
@@ -3439,10 +3441,22 @@
                   .producers["campaign-fixture"].enqueue.argv[0:3] == [
                     "${tally}/bin/tally", "flow", "run"
                   ] and
-                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "20"] and
+                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "31"] and
+                  .producers["campaign-fixture-reconcile"].kind == "gh" and
+                  .producers["campaign-fixture-reconcile"].allowSelfTriggered == true and
+                  .producers["campaign-fixture-reconcile"].allowedActors == ["operator"] and
+                  .producers["campaign-fixture-reconcile"].postReceipt == false and
+                  .producers["campaign-fixture-reconcile"].postFailureEvidence == true and
+                  .producers["campaign-fixture-reconcile"].postFailureStderr == true and
+                  .producers["campaign-fixture-reconcile"].triggers.commandComments == ["/tally reconcile fixture"] and
+                  .producers["campaign-fixture-reconcile"].enqueue.pool == ["fixture-campaign", "flow"] and
+                  .producers["campaign-fixture-reconcile"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "31"] and
+                  $reconcileArgs.reconcileCommand == "/tally reconcile fixture" and
                   .producers["campaign-defaulted"].allowSelfTriggered == false
                   and .producers["campaign-defaulted"].postFailureEvidence == false
                   and .producers["campaign-defaulted"].postFailureStderr == false
+                  and .producers["campaign-defaulted-reconcile"].postFailureEvidence == false
+                  and .producers["campaign-defaulted-reconcile"].postFailureStderr == false
                 ' "$checkedConfig" >/dev/null
 
                 cp -R ${./test/fixtures/spec-build/repo} "$TMPDIR/spec"
@@ -3463,7 +3477,8 @@
                     forge: "local"
                   },
                   worklist: "specs/*/tasks.json",
-                  maxTasks: 3
+                  maxTasks: 4,
+                  maxParallel: 3
                 }' > "$TMPDIR/worklist-brief.json"
                 export TALLY_BRIEF="$TMPDIR/worklist-brief.json"
                 ${specBuildDriver}/bin/spec-build-driver worklist \
@@ -3473,11 +3488,12 @@
                   .repository == "acme/spec" and
                   .source.path == "specs/001-toy/tasks.json" and
                   (.source.sha256 | test("^sha256:[0-9a-f]{64}$")) and
-                  [.tasks[].id] == ["task-1", "task-2"] and
+                  [.tasks[].id] == ["task-1", "task-2", "task-3", "task-4"] and
                   all(.tasks[];
                     (.goal | length) > 0 and
                     (.deliveredBehaviors | length) > 0 and
                     (.readFirst.specSections | length) > 0 and
+                    (.conflictDomains | length) > 0 and
                     (.acceptanceCriteria | length) > 0 and
                     all(.acceptanceCriteria[]; (.argv | length) > 0)
                   ) and
@@ -3605,6 +3621,100 @@
                 grep -F "may use '**' only as a complete path component" \
                   "$TMPDIR/constraint-pattern-fail.err" >/dev/null
 
+                git -C "$TMPDIR/spec" switch --detach "$base_rev" >/dev/null
+                git -C "$TMPDIR/spec" switch -c publication-stale >/dev/null
+                mkdir -p "$TMPDIR/spec/build"
+                printf '%s\n' allowed > "$TMPDIR/spec/build/allowed.txt"
+                git -C "$TMPDIR/spec" add build/allowed.txt
+                git -C "$TMPDIR/spec" commit --quiet -m "fixture: clean publication head"
+                witnessed_head="$(git -C "$TMPDIR/spec" rev-parse HEAD)"
+                write_constraint_brief publication-stale \
+                  '["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"]'
+                ${specBuildDriver}/bin/spec-build-driver constraint \
+                  | sed 's/^TALLY_FINAL_MESSAGE=//' > "$TMPDIR/publication-constraint.json"
+
+                printf '%s\n' late > "$TMPDIR/spec/build/LATE.SQLite"
+                git -C "$TMPDIR/spec" add build/LATE.SQLite
+                git -C "$TMPDIR/spec" commit --quiet -m "fixture: mutate head after constraint"
+                git init --bare --quiet --initial-branch=main "$TMPDIR/publication-remote.git"
+                git -C "$TMPDIR/spec" remote add origin "$TMPDIR/publication-remote.git"
+                git -C "$TMPDIR/spec" push --quiet origin \
+                  "$base_rev:refs/heads/main"
+                jq -n \
+                  --arg base "$base_rev" \
+                  --arg checkout "$TMPDIR/spec" \
+                  --arg workspaceRoot "$TMPDIR/workspaces" \
+                  --slurpfile constraints "$TMPDIR/publication-constraint.json" \
+                  --slurpfile worklist worklist.json \
+                  '{
+                    campaign: "fixture",
+                    repository: "acme/spec",
+                    repositoryConfig: {
+                      checkout: $checkout,
+                      baseBranch: "main",
+                      remote: "origin",
+                      forge: "local"
+                    },
+                    issue: {
+                      number: "7",
+                      url: "https://github.com/acme/spec/issues/7"
+                    },
+                    runId: "stale-publication",
+                    workspaceRoot: $workspaceRoot,
+                    task: $worklist[0].tasks[0],
+                    workspace: {
+                      taskId: "task-1",
+                      baseRev: $base,
+                      branch: "publication-stale",
+                      publishBranch: "tally/spec-build/v1/fixture/7/task-1",
+                      worktreePath: $checkout
+                    },
+                    constraints: $constraints
+                  }' > "$TMPDIR/publication-brief.json"
+                export TALLY_BRIEF="$TMPDIR/publication-brief.json"
+                if ${specBuildDriver}/bin/spec-build-driver publish \
+                  > "$TMPDIR/publication-stale.out" \
+                  2> "$TMPDIR/publication-stale.err"; then
+                  echo "publication reused a constraint receipt from a stale head" >&2
+                  exit 1
+                fi
+                grep -F 'build/LATE.SQLite' "$TMPDIR/publication-stale.err" >/dev/null
+                if git -C "$TMPDIR/spec" ls-remote --exit-code origin \
+                  refs/heads/tally/spec-build/v1/fixture/7/task-1 >/dev/null 2>&1; then
+                  echo "stale constrained head reached the remote" >&2
+                  exit 1
+                fi
+
+                git -C "$TMPDIR/spec" switch --detach "$witnessed_head" >/dev/null
+                git -C "$TMPDIR/spec" branch --force publication-stale \
+                  "$witnessed_head" >/dev/null
+                git -C "$TMPDIR/spec" switch publication-stale >/dev/null
+                ${specBuildDriver}/bin/spec-build-driver publish \
+                  | sed 's/^TALLY_FINAL_MESSAGE=//' > "$TMPDIR/publication-pass.json"
+                jq -e --arg head "$witnessed_head" '
+                  .taskId == "task-1" and
+                  .head == $head and
+                  .branch == "tally/spec-build/v1/fixture/7/task-1"
+                ' "$TMPDIR/publication-pass.json" >/dev/null
+                test "$(git -C "$TMPDIR/spec" ls-remote origin \
+                  refs/heads/tally/spec-build/v1/fixture/7/task-1 | cut -f1)" = \
+                  "$witnessed_head"
+
+                worklistPath="$TMPDIR/spec/specs/001-toy/tasks.json"
+                jq 'del(.tasks[0].conflictDomains)' "$worklistPath" \
+                  > "$TMPDIR/missing-conflict-domains.json"
+                mv "$TMPDIR/missing-conflict-domains.json" "$worklistPath"
+                export TALLY_BRIEF="$TMPDIR/worklist-brief.json"
+                if ${specBuildDriver}/bin/spec-build-driver worklist \
+                  > /dev/null 2> "$TMPDIR/missing-conflict-domains.err"; then
+                  echo "parallel worklist without conflictDomains unexpectedly passed" >&2
+                  exit 1
+                fi
+                grep -F 'tasks[0].conflictDomains must be a non-empty array' \
+                  "$TMPDIR/missing-conflict-domains.err"
+                cp ${./test/fixtures/spec-build/repo/specs/001-toy/tasks.json} \
+                  "$worklistPath"
+
                 default_event='{"kind":"gh","source":"search","repo":"acme/spec","number":6,"htmlUrl":"https://github.com/acme/spec/issues/6","itemType":"issue","nodeId":"I-campaign-6","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-6","commentId":"comment-6","triggerTimestamp":"2026-07-31T08:59:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["campaign"],"assignees":[],"triggeringComment":{"id":"comment-6","author":"operator","body":"@tally build"}}}'
                 mkdir -p "$TMPDIR/data"
                 default_dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
@@ -3633,7 +3743,9 @@
                   } and
                   .runId == "comment-7" and
                   .worklist == "specs/*/tasks.json" and
-                  .maxTasks == 3 and
+                  .maxTasks == 4 and
+                  .maxParallel == 3 and
+                  .reconcileCommand == "/tally reconcile fixture" and
                   .repositories["acme/spec"].baseBranch == "main" and
                   .repositories["acme/spec"].forge == "github" and
                   .agent.adapter == "shell" and
@@ -3658,6 +3770,23 @@
                   ${./examples/flows/spec-build.js} --args-path "$runtime_args" >/dev/null
                 test "$(jq -r '.argv[3]' "$payload")" = \
                   "$(jq -r '.flows.fixture.script' "$checkedConfig")"
+
+                reconcile_event='{"kind":"gh","source":"search","repo":"acme/spec","number":7,"htmlUrl":"https://github.com/acme/spec/issues/7","itemType":"issue","nodeId":"I-campaign-7","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"command-comment","eventId":"comment-8","commentId":"comment-8","triggerTimestamp":"2026-07-31T09:01:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["spec-campaign"],"assignees":[],"triggeringComment":{"id":"comment-8","author":"operator","body":"/tally reconcile fixture"}}}'
+                reconcile_dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
+                  __producer-dispatch campaign-fixture-reconcile \
+                  --state-dir "$TMPDIR/state" --event "$reconcile_event")"
+                reconcile_payload="$(printf '%s' "$reconcile_dispatch" | jq -r '.emitted')"
+                reconcile_args="$(jq -r '.briefPath' "$reconcile_payload")"
+                test -f "$reconcile_args"
+                jq -e '
+                  .runId == "comment-8" and
+                  .reconcileCommand == "/tally reconcile fixture"
+                ' "$reconcile_args" >/dev/null
+                jq -e --arg args "$reconcile_args" '
+                  .briefPath == $args and
+                  (has("brief") | not) and
+                  .pool == ["fixture-campaign", "flow"]
+                ' "$reconcile_payload" >/dev/null
                 touch "$out"
               '';
           flow-dialect-accept =

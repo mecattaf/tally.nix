@@ -1994,7 +1994,7 @@ let
           type = types.str;
           default = "@tally build";
           example = "@tally build";
-          description = "Exact mention comment that starts one campaign run.";
+          description = "Exact mention comment that starts one bounded campaign reconcile pass.";
         };
         allowSelfTriggered = mkOption {
           type = types.bool;
@@ -2042,6 +2042,16 @@ let
           example = 24;
           description = "Maximum tasks accepted from the witnessed worklist.";
         };
+        maxParallel = mkOption {
+          type = types.ints.between 1 128;
+          default = 1;
+          example = 4;
+          description = ''
+            Maximum dependency-ready, conflict-disjoint tasks dispatched by
+            one stateless reconcile pass. Values above one require every
+            worklist task to declare non-empty conflictDomains.
+          '';
+        };
         gates = mkOption {
           type = types.listOf mkCampaignGateType;
           default = [ ];
@@ -2064,9 +2074,12 @@ let
           description = ''
             Ordered command or built-in constraint gates run for every task.
             Command gates declare separate base-safe preflightArgv and
-            post-change argv values with one deadline; forbidPaths constraints
-            begin after the agent creates a committed diff. The first red
-            invocation stops the campaign.
+            post-change argv values with one deadline. Their preflights run on
+            an isolated pristine fetched base before the first frontier agent.
+            forbidPaths constraints begin after the agent creates a committed
+            diff. Every post-change gate runs again after a base-changing
+            rebase; a failure blocks that task lane without starving successful
+            conflict-disjoint siblings.
           '';
         };
         agent = mkOption {
@@ -2127,22 +2140,23 @@ let
         driverRuntimeMaxSec = mkOption {
           type = types.ints.positive;
           default = 900;
-          description = "Process deadline for each deterministic worklist, prep, publish, or merge node.";
+          description = "Process deadline for each deterministic reconcile, prep, publish, rebase, or merge node.";
         };
         runtimeMaxSec = mkOption {
           type = types.nullOr types.ints.positive;
           default = null;
           example = 82800;
           description = ''
-            Optional runner deadline. Null leaves the fixed 24-hour evaluator
-            budget as the campaign continuation boundary.
+            Optional deadline for one bounded reconcile-pass runner. Null
+            leaves the fixed 24-hour evaluator budget as its safety boundary;
+            campaign continuation lives in merged forge state, not this run.
           '';
         };
         pool.name = mkOption {
           type = types.str;
           default = "campaign";
           example = "campaign";
-          description = "Capacity-1 mutex held by the runner for the whole campaign.";
+          description = "Capacity-1 mutex held for one bounded campaign reconcile pass.";
         };
         _tallyAssertions = internalAssertionsOption;
       };
@@ -2167,6 +2181,10 @@ let
         {
           assertion = !config.postFailureStderr || config.postFailureEvidence;
           message = "tally campaign ${name} postFailureStderr=true requires postFailureEvidence=true";
+        }
+        {
+          assertion = config.maxParallel <= config.maxTasks;
+          message = "tally campaign ${name} maxParallel must not exceed maxTasks";
         }
         {
           assertion =
@@ -2947,11 +2965,18 @@ let
     // optionalAttrs (gate.kind == "forbidPaths") { inherit (gate) forbidPaths; }
   );
 
+  campaignReconcileCommand = name: "/tally reconcile ${name}";
+
+  # Reconcile, optional pristine-base preflight prep/gates/cleanup, and one
+  # frontier's prep, agent, initial gates, publication, rebase check, optional
+  # re-gates, and merge. This is a pass bound, not the complete worklist size.
   campaignMaxNodes =
     campaign:
-    1
-    + builtins.length (builtins.filter (gate: gate.kind == "command") campaign.gates)
-    + campaign.maxTasks * (4 + builtins.length campaign.gates);
+    let
+      commandGateCount = builtins.length (builtins.filter (gate: gate.kind == "command") campaign.gates);
+      preflightNodes = if commandGateCount == 0 then 0 else 2 + commandGateCount;
+    in
+    1 + preflightNodes + campaign.maxParallel * (5 + 2 * builtins.length campaign.gates);
 
   mkCampaignArgs = cfg: name: campaign: repository: issueNumber: issueUrl: runId: {
     campaign = name;
@@ -2961,7 +2986,8 @@ let
       url = issueUrl;
     };
     repositories = renderCampaignRepositories campaign.repositories;
-    inherit (campaign) worklist maxTasks;
+    inherit (campaign) worklist maxTasks maxParallel;
+    reconcileCommand = campaignReconcileCommand name;
     workspaceRoot = "${toString cfg.stateDir}/campaigns/${name}";
     driver = "${specBuildDriver}/bin/spec-build-driver";
     inherit (campaign) driverRuntimeMaxSec;
@@ -3045,6 +3071,63 @@ let
       };
     };
 
+  mkCampaignReconcileProducer =
+    cfg: name: campaign:
+    let
+      runtimeArgs =
+        mkCampaignArgs cfg name campaign "\${gh.repo}" "\${gh.number}" "\${gh.url}"
+          "\${gh.eventId}";
+    in
+    {
+      kind = "gh";
+      enable = true;
+      sources = [
+        {
+          search = {
+            repositories = builtins.attrNames campaign.repositories;
+            labels = [ campaign.label ];
+            state = "open";
+            kinds = [ "issue" ];
+          };
+        }
+      ];
+      triggers.commandComments = [ (campaignReconcileCommand name) ];
+      # A merge node posts this finite, event-id-deduplicated command itself.
+      # Permit that authenticated self actor without widening the campaign's
+      # operator allowlist.
+      allowSelfTriggered = true;
+      inherit (campaign) allowedActors pollIntervalSec;
+      postReceipt = false;
+      postEvidence = true;
+      inherit (campaign) postFailureEvidence postFailureStderr;
+      postGateSummary = false;
+      requestReview = false;
+      closeOnAcceptance = false;
+      closeOnPass = false;
+      neverMutate = false;
+      enqueue = {
+        argv = [
+          (lib.getExe cfg.package)
+          "flow"
+          "run"
+          (storePathWithContext specBuildFlow)
+          "--args-from-brief"
+          "--max-nodes"
+          (toString (campaignMaxNodes campaign))
+        ];
+        adapter = "shell";
+        brief = runtimeArgs;
+        pool = [
+          "flow"
+          campaign.pool.name
+        ];
+        priority = "low";
+        runtimeMaxSec = campaign.runtimeMaxSec;
+        evidence = [ "exit:0" ];
+        noEnqueue = false;
+      };
+    };
+
   mkCampaignConfig =
     cfg:
     let
@@ -3067,9 +3150,14 @@ let
     {
       enqueue.fanoutCap = lib.mkDefault requiredFanout;
       flows = mapAttrs (name: campaign: mkCampaignFlow cfg name campaign) enabled;
-      producers = lib.mapAttrs' (
-        name: campaign: lib.nameValuePair "campaign-${name}" (mkCampaignProducer cfg name campaign)
-      ) enabled;
+      producers = lib.foldl' (
+        producers: name:
+        producers
+        // {
+          "campaign-${name}" = mkCampaignProducer cfg name enabled.${name};
+          "campaign-${name}-reconcile" = mkCampaignReconcileProducer cfg name enabled.${name};
+        }
+      ) { } (builtins.attrNames enabled);
       pools =
         mutexPools
         // optionalAttrs (enabled != { }) {
@@ -3081,7 +3169,11 @@ let
           };
           campaign-agent = {
             resource = lib.mkDefault "slot";
-            capacity = lib.mkDefault 1;
+            capacity = lib.mkDefault (
+              lib.foldl' (capacity: campaign: lib.max capacity campaign.maxParallel) 1 (
+                builtins.attrValues enabled
+              )
+            );
             enforce = lib.mkDefault "cooperative";
             hardPreempt = lib.mkDefault false;
           };
@@ -3228,6 +3320,16 @@ let
         {
           assertion = !campaign.enable || cfg.enqueue.fanoutCap >= campaignMaxNodes campaign;
           message = "tally campaign ${name} requires services.tally.enqueue.fanoutCap >= ${toString (campaignMaxNodes campaign)}";
+        }
+        {
+          assertion =
+            !campaign.enable
+            || (
+              builtins.hasAttr "campaign-agent" cfg.pools
+              && cfg.pools."campaign-agent".resource == "slot"
+              && cfg.pools."campaign-agent".capacity >= campaign.maxParallel
+            );
+          message = "tally campaign ${name} requires campaign-agent slot capacity >= maxParallel ${toString campaign.maxParallel}";
         }
         {
           assertion =

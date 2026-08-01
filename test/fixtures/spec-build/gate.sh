@@ -19,6 +19,12 @@ case "$task" in
     test "$(cat build/one.txt)" = one
     test "$(cat build/two.txt)" = two
     ;;
+  task-3)
+    test "$(cat build/three.txt)" = three
+    ;;
+  task-4)
+    test "$(cat build/four.txt)" = four
+    ;;
   *)
     printf 'unknown fixture task: %s\n' "$task" >&2
     exit 2
