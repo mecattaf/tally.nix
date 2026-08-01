@@ -548,10 +548,12 @@ def forge_agent(value: Any) -> dict[str, Any]:
     runtime = agent.get("runtimeMaxSec", 14_400)
     if runtime is not None:
         runtime = positive_integer(runtime, "campaign agent.runtimeMaxSec")
-    approval = agent.get("approvalPolicy", "on-request")
+    # A campaign node is unattended, so it never asks for an escalation, and its
+    # sandbox must reach git metadata or the implementation node cannot commit.
+    approval = agent.get("approvalPolicy", "never")
     if approval is not None:
         approval = required_string(approval, "campaign agent.approvalPolicy")
-    sandbox = agent.get("sandboxPolicy", "workspace-write")
+    sandbox = agent.get("sandboxPolicy", "danger-full-access")
     if sandbox is not None:
         sandbox = required_string(sandbox, "campaign agent.sandboxPolicy")
     # The diagnosis brief prohibits mutation, so its node does not inherit the

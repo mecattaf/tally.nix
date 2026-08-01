@@ -35,6 +35,8 @@ pub(super) enum Command {
     AdapterRender(AdapterRenderArgs),
     #[command(name = "__adapter-smoke-shell", hide = true)]
     AdapterSmokeShell,
+    #[command(name = "__adapter-smoke-commit", hide = true)]
+    AdapterSmokeCommit,
     #[command(name = "__producer-dispatch", hide = true)]
     ProducerDispatch(ProducerDispatchArgs),
     Enqueue(Box<EnqueueArgs>),
@@ -191,19 +193,27 @@ pub(super) enum AdapterCommand {
 pub(super) struct AdapterSmokeArgs {
     /// Configured adapter to execute.
     pub(super) name: String,
-    /// Execution working directory; defaults to the current directory.
-    #[arg(long, value_name = "PATH")]
+    /// Execution working directory; defaults to the current directory. Refused
+    /// with --assert-commit, which supplies its own throwaway repository.
+    #[arg(long, value_name = "PATH", conflicts_with = "assert_commit")]
     pub(super) cwd: Option<PathBuf>,
-    /// Minimal workload passed to agent adapters.
-    #[arg(
-        long,
-        default_value = "Reply with the single word ok.",
-        allow_hyphen_values = true
-    )]
-    pub(super) prompt: String,
+    /// Minimal workload passed to agent adapters. Defaults to a one-word reply,
+    /// or to a write-stage-commit workload under --assert-commit.
+    #[arg(long, allow_hyphen_values = true)]
+    pub(super) prompt: Option<String>,
     /// Admission pool; inferred only when a conventional lane is configured.
     #[arg(long)]
     pub(super) pool: Option<String>,
+    /// Named adapter sandbox policy to launch this smoke under.
+    #[arg(long, value_name = "NAME")]
+    pub(super) sandbox: Option<String>,
+    /// Named adapter approval policy to launch this smoke under.
+    #[arg(long, value_name = "NAME")]
+    pub(super) approval_policy: Option<String>,
+    /// Run the adapter in a throwaway git repository and require it to leave one
+    /// commit descended from the seeded base and a clean worktree.
+    #[arg(long)]
+    pub(super) assert_commit: bool,
 }
 
 #[derive(Debug, Subcommand)]

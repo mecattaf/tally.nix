@@ -182,10 +182,13 @@ fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
             command: AdapterCommand::Smoke(AdapterSmokeArgs {
                 name,
                 cwd: None,
-                prompt,
+                prompt: None,
                 pool: None,
+                sandbox: None,
+                approval_policy: None,
+                assert_commit: false,
             })
-        }) if name == "codex" && prompt == "Reply with the single word ok."
+        }) if name == "codex"
     ));
 
     let overridden = Opts::try_parse_from([
@@ -207,14 +210,57 @@ fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
             command: AdapterCommand::Smoke(AdapterSmokeArgs {
                 name,
                 cwd: Some(cwd),
-                prompt,
+                prompt: Some(prompt),
                 pool: Some(pool),
+                sandbox: None,
+                approval_policy: None,
+                assert_commit: false,
             })
         }) if name == "pi"
             && cwd == Path::new("worktree")
             && prompt == "-answer briefly"
             && pool == "agent-slot"
     ));
+
+    let probing = Opts::try_parse_from([
+        "tally",
+        "adapter",
+        "smoke",
+        "codex",
+        "--sandbox",
+        "danger-full-access",
+        "--approval-policy",
+        "never",
+        "--assert-commit",
+    ])
+    .unwrap();
+    assert!(matches!(
+        probing.command,
+        Some(Command::Adapter {
+            command: AdapterCommand::Smoke(AdapterSmokeArgs {
+                name,
+                cwd: None,
+                prompt: None,
+                pool: None,
+                sandbox: Some(sandbox),
+                approval_policy: Some(approval),
+                assert_commit: true,
+            })
+        }) if name == "codex" && sandbox == "danger-full-access" && approval == "never"
+    ));
+
+    // A throwaway repository is the probe's whole point; naming another
+    // directory would silently commit into it.
+    assert!(Opts::try_parse_from([
+        "tally",
+        "adapter",
+        "smoke",
+        "codex",
+        "--assert-commit",
+        "--cwd",
+        "worktree",
+    ])
+    .is_err());
 }
 
 #[test]

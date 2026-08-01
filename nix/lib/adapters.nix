@@ -247,22 +247,26 @@ let
           "-C"
           "%<cwd>%"
         ];
+        # `--ask-for-approval` is a top-level codex flag; `codex exec` rejects
+        # it outright, and this adapter's argv puts every policy fragment after
+        # the `exec` subcommand. The config override is the exec-local spelling
+        # of the same setting and is what the real binary accepts.
         approvalPolicies = {
           untrusted = [
-            "--ask-for-approval"
-            "untrusted"
+            "-c"
+            "approval_policy=\"untrusted\""
           ];
           on-failure = [
-            "--ask-for-approval"
-            "on-failure"
+            "-c"
+            "approval_policy=\"on-failure\""
           ];
           on-request = [
-            "--ask-for-approval"
-            "on-request"
+            "-c"
+            "approval_policy=\"on-request\""
           ];
           never = [
-            "--ask-for-approval"
-            "never"
+            "-c"
+            "approval_policy=\"never\""
           ];
         };
         sandboxPolicies = {
@@ -280,6 +284,14 @@ let
           ];
           dangerously-bypass = [ "--dangerously-bypass-approvals-and-sandbox" ];
         };
+        # Under workspace-write codex mounts the repository's git metadata
+        # read-only: the agent writes files and then fails at .git/index.lock,
+        # which is the one outcome where a spec-build implementation node does
+        # all of its work and still cannot publish it.
+        commitCapableSandboxPolicies = [
+          "danger-full-access"
+          "dangerously-bypass"
+        ];
       };
       extraConfig.modelFlag = "--model";
     };

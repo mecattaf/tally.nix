@@ -8,6 +8,19 @@ authorized.
 
 ### Added
 
+- Added `launch.commitCapableSandboxPolicies` to the adapter surface: the
+  subset of an adapter's sandbox policies under which its agent can create a
+  commit. Naming any other policy for a campaign implementation node is now
+  refused when the module is evaluated and again when the campaign is armed,
+  rather than mid-run after the agent has done all of its work.
+- Added `--sandbox`, `--approval-policy`, and `--assert-commit` to
+  `tally adapter smoke`. The probe seeds a throwaway git repository, runs the
+  real adapter binary in it under the named policies, and requires what
+  publication requires — a clean worktree and a commit descended from the
+  seeded base — reporting the outcome as `commitProbe` and retaining the
+  repository when it fails. This is the pre-flight that a fixture asserting the
+  argv tally intends to emit cannot be: it tests what the foreign CLI accepts
+  and what its sandbox mounts read-only.
 - Added automated `checkpoint` nodes to spec-build worklists. These
   dependency barriers run a declared deep-validation argv against the exact
   accumulated base, record a content-bound Git completion ref after a
@@ -146,6 +159,20 @@ authorized.
 
 ### Fixed
 
+- Fixed the shipped codex adapter's approval policies, which rendered
+  `--ask-for-approval` — a top-level codex flag that `codex exec` rejects
+  outright, so every campaign codex node died in three seconds, exit 2, before
+  the model ran. All four named policies now render the exec-local
+  `-c approval_policy="<name>"` override that the real binary accepts.
+- Fixed the campaign agent defaults, which paired an approval policy nobody
+  could grant with a sandbox that cannot commit. `agentSandboxPolicy` now
+  defaults to `danger-full-access` and `agentApprovalPolicy` to `never`: under
+  codex's `workspace-write` the repository's git metadata is read-only, so an
+  implementation agent wrote every file correctly and then failed at
+  `.git/index.lock` with nothing publishable, and an unattended node has nobody
+  to grant an escalation. The already-deployed consumer configuration —
+  `agentSandboxPolicy = "danger-full-access"` with `agentApprovalPolicy = null`
+  — keeps working unchanged.
 - Reconciled the campaign documentation with the shipped
   `tally-campaign-poll.timer`. The flows guide claimed outright that no
   periodic campaign timer exists, which was true only of module-declared

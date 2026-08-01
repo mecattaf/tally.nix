@@ -1752,6 +1752,41 @@
             }
           ];
         };
+        nonCommittingCampaignSchema = pkgs.lib.evalModules {
+          modules = [
+            {
+              options.services.tally = moduleCommon.mkOptions {
+                defaultPackage = tally;
+                defaultDataDir = "/tmp/tally-data";
+                defaultStateDir = "/tmp/tally-state";
+              };
+              # workspace-write is a declared codex sandbox policy, so nothing
+              # about the name is wrong; it is simply one the adapter says
+              # cannot commit, which an implementation node must.
+              config.services.tally = {
+                adapters = moduleCommon.adapterDefaults;
+                campaigns.writable-only = {
+                  enable = true;
+                  repositories."acme/spec".checkout = "/tmp/spec";
+                  gates = [
+                    {
+                      kind = "command";
+                      id = "content";
+                      preflightArgv = [ "/bin/true" ];
+                      argv = [ "/bin/true" ];
+                    }
+                  ];
+                  agentSandboxPolicy = "workspace-write";
+                };
+              };
+            }
+          ];
+        };
+        nonCommittingCampaignMessages = map (entry: entry.message) (
+          builtins.filter (entry: !entry.assertion) (
+            moduleCommon.mkAssertions nonCommittingCampaignSchema.config.services.tally
+          )
+        );
         invalidCampaignAssertions = builtins.filter (entry: !entry.assertion) (
           moduleCommon.mkAssertions invalidCampaignSchema.config.services.tally
         );
@@ -3120,6 +3155,9 @@
             value = homeServices.${name}.Service.ExecStart;
           in
           if builtins.isList value then builtins.head value else value;
+        campaignAssertionMessages = map (entry: entry.message) (
+          builtins.filter (entry: !entry.assertion) campaignHome.config.assertions
+        );
         campaignHomeServices = campaignHome.config.systemd.user.services;
         campaignHomeTimers = campaignHome.config.systemd.user.timers;
         campaignPollScript = campaignHomeServices.tally-campaign-poll.Service.ExecStart;
@@ -3522,6 +3560,10 @@
                   .pools["campaign-agent"].capacity == 4 and
                   .adapters["spec-build-driver"].scrape.finalMessage.mode == "regex" and
                   .adapters["spec-build-driver"].scrape.finalMessage.pattern == "^TALLY_FINAL_MESSAGE=(.*)$" and
+                  ([.adapters.codex.launch.approvalPolicies[][0]] | unique) == ["-c"] and
+                  .adapters.codex.launch.approvalPolicies.never == ["-c", "approval_policy=\"never\""] and
+                  ([.adapters.codex.launch.approvalPolicies[][]] | any(. == "--ask-for-approval") | not) and
+                  .adapters.codex.launch.commitCapableSandboxPolicies == ["danger-full-access", "dangerously-bypass"] and
                   .flows.fixture.workloadMutex == "fixture-campaign" and
                   (.flows.fixture.script | endswith("spec-build.js")) and
                   $fixtureArgs.tally == "${tally}/bin/tally" and
@@ -3538,8 +3580,8 @@
                   ($fixtureArgs.gates[1] | has("argv") | not) and
                   $fixtureArgs.gates[1].runtimeMaxSec == 11 and
                   $defaultedArgs.agent.adapter == "codex" and
-                  $defaultedArgs.agent.approvalPolicy == "on-request" and
-                  $defaultedArgs.agent.sandboxPolicy == "workspace-write" and
+                  $defaultedArgs.agent.approvalPolicy == "never" and
+                  $defaultedArgs.agent.sandboxPolicy == "danger-full-access" and
                   $defaultedArgs.agent.diagnosisSandboxPolicy == "read-only" and
                   .producers["campaign-fixture"].kind == "gh" and
                   .producers["campaign-fixture"].enable == true and
@@ -4271,6 +4313,18 @@
             ) invalidCampaignMessages;
             assert !invalidCampaignAttempt.success;
             pkgs.runCommand "tally-campaign-gates-rejected" { } ''
+              touch "$out"
+            '';
+          campaign-noncommitting-sandbox-rejected =
+            assert builtins.any (
+              message:
+              nixpkgs.lib.hasInfix "tally campaign writable-only agentSandboxPolicy must be one of adapter codex commitCapableSandboxPolicies" message
+            ) nonCommittingCampaignMessages;
+            # The shipped defaults are the counter-case: they must not appear.
+            assert builtins.all (
+              message: !nixpkgs.lib.hasInfix "commitCapableSandboxPolicies" message
+            ) campaignAssertionMessages;
+            pkgs.runCommand "tally-campaign-noncommitting-sandbox-rejected" { } ''
               touch "$out"
             '';
           forbidden-options-absent =

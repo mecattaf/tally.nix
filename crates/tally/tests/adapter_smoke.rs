@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde_json::Value;
-use tally_core::adapters::{AdapterConfig, ScrapeCapture, ScrapeMode, ScrapeStream};
+use tally_core::adapters::{
+    AdapterConfig, AdapterLaunchConfig, ScrapeCapture, ScrapeMode, ScrapeStream,
+};
 use tally_core::config::{
     CoResidencyPredicate, Config, JournaldConfig, PoolConfig, PoolPredicate, ResourceKind,
 };
@@ -112,9 +114,69 @@ fn smoke_config(root: &Path) -> Config {
                     ..AdapterConfig::default()
                 },
             ),
+            (
+                "committing".to_owned(),
+                policy_adapter(root, "committing-adapter", COMMITTING_AGENT),
+            ),
+            (
+                "writing-only".to_owned(),
+                policy_adapter(root, "writing-only-adapter", WRITING_ONLY_AGENT),
+            ),
         ]),
         journald: JournaldConfig { native: false },
         ..Config::default()
+    }
+}
+
+/// Asserts the launch argv it actually received, then does what a spec-build
+/// implementation node must do: write, stage, and commit.
+const COMMITTING_AGENT: &str = concat!(
+    "#!/bin/sh\n",
+    "set -eu\n",
+    "if [ \"$1\" != '-c' ] || [ \"$2\" != 'approval_policy=\"never\"' ] \\\n",
+    "  || [ \"$3\" != '--sandbox' ] || [ \"$4\" != 'full' ] || [ \"$5\" != '--' ]; then\n",
+    "  printf 'unexpected launch argv: %s\\n' \"$*\" >&2\n",
+    "  exit 3\n",
+    "fi\n",
+    "printf 'ok\\n' > tally-commit-probe.txt\n",
+    "git add --all\n",
+    "git commit --quiet --message 'tally commit probe'\n",
+    "printf 'done\\n'\n",
+);
+
+/// The exact shape of the shipped defect: the agent writes its work correctly
+/// and cannot reach git metadata to publish it.
+const WRITING_ONLY_AGENT: &str = concat!(
+    "#!/bin/sh\n",
+    "set -eu\n",
+    "printf 'ok\\n' > tally-commit-probe.txt\n",
+    "printf 'done\\n'\n",
+);
+
+fn policy_adapter(root: &Path, file: &str, body: &str) -> AdapterConfig {
+    let program = root.join(file);
+    shell_program::install(&program, body);
+    AdapterConfig {
+        argv: vec![program.display().to_string(), "--".to_owned()],
+        launch: AdapterLaunchConfig {
+            approval_policies: BTreeMap::from([(
+                "never".to_owned(),
+                vec!["-c".to_owned(), "approval_policy=\"never\"".to_owned()],
+            )]),
+            sandbox_policies: BTreeMap::from([
+                (
+                    "full".to_owned(),
+                    vec!["--sandbox".to_owned(), "full".to_owned()],
+                ),
+                (
+                    "confined".to_owned(),
+                    vec!["--sandbox".to_owned(), "confined".to_owned()],
+                ),
+            ]),
+            commit_capable_sandbox_policies: BTreeSet::from(["full".to_owned()]),
+            ..AdapterLaunchConfig::default()
+        },
+        ..AdapterConfig::default()
     }
 }
 
@@ -172,6 +234,101 @@ fn parse_stdout(output: &std::process::Output) -> Value {
             String::from_utf8_lossy(&output.stderr)
         )
     })
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn commit_probe_asserts_a_publishable_commit_under_the_named_policies() {
+    LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = daemon_paths(temp.path());
+            let config = smoke_config(temp.path());
+            let config_path = temp.path().join("config.json");
+            std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let daemon = start_daemon(&paths, config).await;
+
+            let probe_argv = |adapter: &'static str| {
+                vec![
+                    "adapter",
+                    "smoke",
+                    adapter,
+                    "--pool",
+                    "stock",
+                    "--approval-policy",
+                    "never",
+                    "--sandbox",
+                    "full",
+                    "--assert-commit",
+                ]
+            };
+
+            // An adapter that commits under these policies passes, and the
+            // fixture only reaches its commit if the flags it was launched with
+            // are the ones the operator named.
+            let committing =
+                run_tally(&config_path, &paths.socket, &probe_argv("committing")).await;
+            assert_eq!(
+                committing.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&committing.stderr)
+            );
+            let committing = parse_stdout(&committing);
+            let probe = &committing["commitProbe"];
+            assert_eq!(probe["status"], "verified");
+            assert_eq!(probe["commits"], 1);
+            assert_ne!(probe["headRev"], probe["baseRev"]);
+            assert_eq!(probe["worktreeStatus"].as_array().unwrap().len(), 0);
+            // A verified probe leaves nothing behind.
+            assert!(!Path::new(probe["repository"].as_str().unwrap()).exists());
+
+            // An adapter that writes its work and cannot commit is the shipped
+            // defect, and it fails the probe rather than passing the smoke.
+            let writing_only =
+                run_tally(&config_path, &paths.socket, &probe_argv("writing-only")).await;
+            let stderr = String::from_utf8_lossy(&writing_only.stderr).into_owned();
+            assert_eq!(writing_only.status.code(), Some(1), "{stderr}");
+            assert!(stderr.contains("left no publishable commit"), "{stderr}");
+            let writing_only = parse_stdout(&writing_only);
+            let probe = &writing_only["commitProbe"];
+            assert_eq!(probe["status"], "no-commit");
+            assert_eq!(probe["commits"], 0);
+            assert_eq!(probe["headRev"], probe["baseRev"]);
+            // A failed probe is retained as the evidence, with the work in it.
+            let retained = PathBuf::from(probe["repository"].as_str().unwrap());
+            assert_eq!(
+                std::fs::read_to_string(retained.join("tally-commit-probe.txt")).unwrap(),
+                "ok\n"
+            );
+            std::fs::remove_dir_all(&retained).unwrap();
+
+            // A policy name the adapter never declared would render no argv at
+            // all, so it is refused before any job is admitted.
+            let undeclared = run_tally(
+                &config_path,
+                &paths.socket,
+                &[
+                    "adapter",
+                    "smoke",
+                    "committing",
+                    "--pool",
+                    "stock",
+                    "--sandbox",
+                    "danger-full-access",
+                ],
+            )
+            .await;
+            let stderr = String::from_utf8_lossy(&undeclared.stderr).into_owned();
+            assert_eq!(undeclared.status.code(), Some(2), "{stderr}");
+            assert!(
+                stderr.contains("declares no sandbox policy \"danger-full-access\""),
+                "{stderr}"
+            );
+            assert!(stderr.contains("confined, full"), "{stderr}");
+
+            daemon.stop().await;
+        })
+        .await;
 }
 
 #[tokio::test(flavor = "current_thread")]

@@ -236,6 +236,7 @@ job-supplied policy out of free-form argv:
 | [`cwdArgv`](core-options.md#servicestallyadaptersnamelaunchcwdargv) | Optional argv template that must contain `%<cwd>%`. |
 | [`approvalPolicies`](core-options.md#servicestallyadaptersnamelaunchapprovalpolicies) | Map from allowed policy names to exact argv fragments. |
 | [`sandboxPolicies`](core-options.md#servicestallyadaptersnamelaunchsandboxpolicies) | Map from allowed sandbox names to exact argv fragments. |
+| [`commitCapableSandboxPolicies`](core-options.md#servicestallyadaptersnamelaunchcommitcapablesandboxpolicies) | Subset of `sandboxPolicies` under which this adapter's agent can create a commit. Declaring it makes a campaign whose implementation node cannot commit an evaluation-time refusal. |
 | [`model.argv`](core-options.md#servicestallyadaptersnamelaunchmodelargv) and [`model.allowedValues`](core-options.md#servicestallyadaptersnamelaunchmodelallowedvalues) | Template containing `%<value>%` plus the closed set of accepted model values. |
 | [`effort.argv`](core-options.md#servicestallyadaptersnamelauncheffortargv) and [`effort.allowedValues`](core-options.md#servicestallyadaptersnamelauncheffortallowedvalues) | Template containing `%<value>%` plus the closed set of accepted effort values. |
 

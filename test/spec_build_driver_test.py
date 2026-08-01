@@ -859,8 +859,8 @@ class GitHubForgeTests(unittest.TestCase):
                     "argv": ["read the admitted brief"],
                     "priority": "low",
                     "runtimeMaxSec": 900,
-                    "approvalPolicy": "on-request",
-                    "sandboxPolicy": "workspace-write",
+                    "approvalPolicy": "never",
+                    "sandboxPolicy": "danger-full-access",
                 },
                 "gates": [
                     {

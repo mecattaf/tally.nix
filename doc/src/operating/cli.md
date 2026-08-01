@@ -118,6 +118,8 @@ $ tally adapter smoke shell
 $ tally adapter smoke codex --cwd /work/project
 $ tally adapter smoke claude-code --pool claude-window \
     --prompt 'Reply with the single word ok.'
+$ tally adapter smoke codex --sandbox danger-full-access \
+    --approval-policy never --assert-commit
 ```
 
 Every invocation is keyless, so it creates a new execution rather than reusing
@@ -137,6 +139,31 @@ adapter into a free-form command runner.
 When omitted it defaults to the invoking process's current directory. Run an
 agent smoke from a suitable repository, or pass its worktree explicitly, when
 the harness enforces a trusted-working-directory precondition.
+
+`--sandbox NAME` and `--approval-policy NAME` launch the smoke under named
+policies from the adapter's `launch.sandboxPolicies` and
+`launch.approvalPolicies` maps. A name the adapter never declared would render
+no argv at all and silently smoke the adapter's own defaults, so it is refused
+before any job is admitted.
+
+`--assert-commit` answers the question a fixture cannot: whether this adapter,
+under these policies, can do what a campaign implementation node must. It seeds
+a throwaway git repository, runs the adapter in it with a write-stage-commit
+workload, and then requires exactly what publication requires — a clean worktree
+and at least one commit descended from the seeded base. It refuses `--cwd`,
+because the point is a repository nothing else owns. The result is reported as
+`commitProbe` in the diagnostic:
+
+```json
+{"status":"verified","repository":"/tmp/tally-commit-probe-...","baseRev":"...","headRev":"...","commits":1,"worktreeStatus":[]}
+```
+
+A verified probe deletes its repository; any other status (`no-commit`,
+`dirty-worktree`, `unrelated-history`, or `not-checked` when the adapter itself
+failed) exits nonzero and retains the repository as the evidence. This is the
+one-command pre-flight for a policy pairing: an agent that writes its files
+correctly and cannot reach git metadata to commit them reports `no-commit` here
+in seconds instead of failing publication after a full campaign node.
 
 `--pool` names one configured pool. Without it, the CLI uses the first
 configured conventional lane for the adapter:
