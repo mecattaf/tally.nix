@@ -355,17 +355,26 @@ class PublicationConflictDomainTests(unittest.TestCase):
                 "constraints": [],
             }
         )
-        with self.assertRaisesRegex(driver.DriverError, r'"internal/cli/root\.go"'):
+        with self.assertRaisesRegex(
+            driver.DriverError,
+            rf'"internal/cli/root\.go".*exact published head {published_head} was abandoned',
+        ):
             driver.action_rebase(brief)
 
-        self.assertEqual(
-            git(
-                "--git-dir",
-                str(self.remote),
-                "rev-parse",
-                f"refs/heads/{self.publish_branch}",
-            ),
-            published_head,
+        self.assertNotEqual(
+            subprocess.run(
+                [
+                    "git",
+                    "--git-dir",
+                    str(self.remote),
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{self.publish_branch}",
+                ],
+                check=False,
+            ).returncode,
+            0,
         )
 
     def test_rebase_fast_path_rechecks_and_witnesses_ownership(self) -> None:

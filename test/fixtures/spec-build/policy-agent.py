@@ -39,6 +39,12 @@ if task in {"task-1", "task-3"}:
     else:
         raise SystemExit(f"frontier peer {peer} was not dispatched in parallel")
 
+hold = control / f"hold-{task}"
+if hold.exists():
+    (control / f"holding-{task}").touch()
+    while hold.exists():
+        time.sleep(0.02)
+
 output = worktree / "build"
 output.mkdir(exist_ok=True)
 

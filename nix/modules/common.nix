@@ -3127,6 +3127,7 @@ let
     inherit (campaign) worklist maxTasks maxParallel;
     reconcileCommand = campaignReconcileCommand name;
     workspaceRoot = "${toString cfg.stateDir}/campaigns/${name}";
+    tally = lib.getExe cfg.package;
     driver = "${specBuildDriver}/bin/spec-build-driver";
     inherit (campaign) driverRuntimeMaxSec;
     agent = {

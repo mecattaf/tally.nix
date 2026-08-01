@@ -17,6 +17,7 @@ export const meta = {
       "runId",
       "worklist",
       "workspaceRoot",
+      "tally",
       "driver",
       "driverRuntimeMaxSec"
     ],
@@ -67,6 +68,7 @@ export const meta = {
       maxParallel: { type: "integer", minimum: 1, maximum: 128 },
       reconcileCommand: { type: "string", pattern: "^/[^\\r\\n]+$", maxLength: 300 },
       workspaceRoot: { type: "string", pattern: "^/" },
+      tally: { type: "string", pattern: "^/" },
       driver: { type: "string", pattern: "^/" },
       driverRuntimeMaxSec: { type: "integer", minimum: 1 },
       agent: {
@@ -426,10 +428,50 @@ const reconcileSchema = {
 
 const sweepSchema = {
   type: "object",
-  required: ["currentRunHash", "cleaned", "warnings"],
+  required: ["currentRunHash", "blockingJobs", "cleaned", "liveRuns", "warnings"],
   properties: {
     currentRunHash: { type: "string", pattern: "^[0-9a-f]{12}$" },
+    blockingJobs: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["anchor", "flowRunId", "liveState", "taskRef"],
+        properties: {
+          anchor: { type: "string", minLength: 1 },
+          flowRunId: { type: "string", minLength: 1 },
+          liveState: { enum: ["paused", "queued", "running"] },
+          taskRef: { type: "string", minLength: 1 }
+        },
+        additionalProperties: false
+      }
+    },
     cleaned: stringList,
+    liveRuns: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["runHash", "flowRunId", "jobs"],
+        properties: {
+          runHash: { type: "string", pattern: "^[0-9a-f]{12}$" },
+          flowRunId: { type: "string", minLength: 1 },
+          jobs: {
+            type: "array",
+            minItems: 1,
+            items: {
+              type: "object",
+              required: ["anchor", "liveState", "taskRef"],
+              properties: {
+                anchor: { type: "string", minLength: 1 },
+                liveState: { enum: ["paused", "queued", "running"] },
+                taskRef: { type: ["string", "null"] }
+              },
+              additionalProperties: false
+            }
+          }
+        },
+        additionalProperties: false
+      }
+    },
     warnings: stringList
   },
   additionalProperties: false
@@ -713,10 +755,12 @@ async function runPreflightGate(task, gate, workspace) {
 }
 
 async function sweepCampaign(repositoryConfig) {
-  // Producer admission holds the campaign's capacity-1 mutex. Once the prior
-  // pass and its admitted children have settled (the documented recovery
-  // rule), every other run namespace is stale and can be reclaimed before this
-  // pass creates a lane.
+  // Producer admission holds the campaign's capacity-1 mutex only for the
+  // runner process. The sweep registers this pass's run hash against its
+  // daemon flow identity and proves that every older flow has no live child
+  // before reclaiming its namespace. A killed runner may release the mutex
+  // before an admitted child settles, so prose or process liveness is not a
+  // deletion proof.
   const sweepNode = await driverNode(
     "sweep",
     {
@@ -724,7 +768,8 @@ async function sweepCampaign(repositoryConfig) {
       repository: args.repository,
       repositoryConfig,
       runId: args.runId,
-      workspaceRoot: args.workspaceRoot
+      workspaceRoot: args.workspaceRoot,
+      tally: args.tally
     },
     "sweep",
     "spec-build-sweep",
@@ -733,7 +778,7 @@ async function sweepCampaign(repositoryConfig) {
     false,
     null
   );
-  if (sweepNode.disposition !== "created") {
+  if (sweepNode.disposition === "reused") {
     const error = new Error(
       `spec-build campaign ${effective.campaign} requires a fresh flow-run identity; ` +
         `the sweep node was ${sweepNode.disposition}`
@@ -748,6 +793,22 @@ async function sweepCampaign(repositoryConfig) {
     throw error;
   }
   return sweepNode;
+}
+
+function sweepDeferral(sweepNode) {
+  if (sweepNode.result.blockingJobs.length === 0 && sweepNode.result.liveRuns.length === 0) {
+    return null;
+  }
+  return {
+    campaign: effective.campaign,
+    repository: args.repository,
+    issue: args.issue,
+    state: "deferred-live-jobs",
+    maintenance: sweepNode.result,
+    checkpoints: [],
+    merged: [],
+    failures: []
+  };
 }
 
 (async () => {
@@ -783,6 +844,10 @@ async function sweepCampaign(repositoryConfig) {
       throw error;
     }
     sweepNode = await sweepCampaign(effective.repositoryConfig);
+    const deferred = sweepDeferral(sweepNode);
+    if (deferred !== null) {
+      return deferred;
+    }
   }
   const reconcileBrief = forgeNative
     ? {
@@ -799,7 +864,6 @@ async function sweepCampaign(repositoryConfig) {
         maxTasks: args.maxTasks,
         maxParallel: args.maxParallel
       };
-
   const reconciliationNode = await driverNode(
     "reconcile",
     reconcileBrief,
@@ -833,6 +897,10 @@ async function sweepCampaign(repositoryConfig) {
   }
   if (forgeNative) {
     sweepNode = await sweepCampaign(repositoryConfig);
+    const deferred = sweepDeferral(sweepNode);
+    if (deferred !== null) {
+      return deferred;
+    }
   }
   const domainsRequired = effective.maxParallel > 1;
 

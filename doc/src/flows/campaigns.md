@@ -305,11 +305,22 @@ One enabled attrset expands to all of the following:
 
 The producer posts its receipt and witnessed evidence. Each merge posts an
 idempotently marked progress comment. After the pass finishes its integration
-sequence, one separate node posts the exact continuation command. Each passed
+sequence, one separate node posts the exact continuation command with three
+bounded attempts and verifies that the issue's comment count for that exact
+command advanced. Each passed
 checkpoint posts its own idempotently marked checkpoint progress plus that
 command. The next poll admits a fresh pass behind the campaign mutex. Neither
 producer closes the campaign issue; it remains the durable steering channel
 across passes.
+
+The two shared campaign pools are global resource pools, not reservations per
+campaign. Their generated capacity is the largest individual `maxParallel`,
+which guarantees that no one configured campaign is internally capped while
+still allowing concurrent campaigns to contend through tally's ordinary
+priority and lease policy. Summing every campaign would silently overcommit the
+host by default. An operator who wants aggregate cross-campaign concurrency may
+set a larger explicit pool capacity; the per-campaign lower-bound assertions
+still apply.
 
 Before admitting the first real run after deployment, verify the selected
 implementation adapter on that host:
@@ -470,8 +481,16 @@ node receipts, lifecycle and query output, `TALLY_TASK_REF`, unit names, and
 capture names. The worklist discovery node has no task ID and therefore no
 `taskRef`.
 
-The pass first sweeps run-local lanes left by older, no-longer-live pass
-identities. Its reconcile node then parses, normalizes, schema-validates, and
+The pass first records its run hash against the sweep node's daemon flow-run
+identity. Before deleting any older namespace, it queries the daemon for every
+job in that older flow. A paused, queued, or running child protects the entire
+run namespace and makes the new pass return `deferred-live-jobs` before
+reconciliation. This includes a still-running prep node that has not created or
+attached workspace metadata yet. A legacy or malformed lane without a validated
+run-to-flow record is left as a safe leak with a witnessed warning; absence of
+proof is never interpreted as proof of death. Once an older flow has no live
+jobs, the sweep may reclaim its worktrees, local branches, task markers, and
+pass record. Its reconcile node then parses, normalizes, schema-validates, and
 witnesses this artifact together with its relative path and SHA-256 digest. The
 same node queries merged pull requests carrying tally's exact campaign/task
 marker and validates the expected checkpoint refs, subtracts both sets of
@@ -499,6 +518,8 @@ a stateless completion fact, not a saved runner heap or a mutable checkbox.
 One invocation is one bounded reconcile pass:
 
 ```text
+sweep old run namespaces only after the daemon proves they have no live jobs
+if any old flow still has a paused, queued, or running child: return deferred
 implemented = marked merged PRs
 checkpointed = valid content-bound checkpoint refs
 completed = implemented + checkpointed
@@ -552,7 +573,8 @@ refuses dirty, empty, non-descendant, or newly unowned work.
 Each task has a stable remote branch across passes and a run-local worktree lane,
 so a dead runner cannot make a later pass share a writable directory with an
 old child. Pass-exit cleanup reclaims every prepared lane, including failures;
-the next pass's sweep covers a process that died before cleanup.
+the next pass's daemon-backed sweep defers while an old child is live and covers
+a process that died before cleanup only after every admitted child settles.
 
 Publications may finish in parallel, but integration follows deterministic
 frontier order. Before each merge the driver fetches current base. If the
@@ -617,16 +639,26 @@ subtracts the same forge facts before dispatch.
 
 Each pass contains at most one bounded frontier, so the fixed 24-hour evaluator
 budget no longer measures the whole campaign. Merge and mention events are the
-shipped campaign triggers; there is no periodic campaign timer. If a pass
-process dies or merges nothing, wait for any admitted children to settle and
-post a fresh mention. Stable remote task branches preserve published work;
+declarative recurring-campaign triggers; that surface has no periodic campaign
+timer. Armed forge-native issue campaigns instead use the revision poll timer
+described above. If a recurring pass process dies or merges nothing, wait for
+any admitted children to settle and post a fresh mention. Stable remote task
+branches preserve published work;
 merged PRs preserve implementation completion, and checkpoint refs preserve
-successful automated barriers. Generic flows that truly require one run
+successful automated barriers. A calendar producer is not an implicit campaign
+timer: its payload is static, while one campaign may discover open labeled
+issues across several repositories and requires the dynamic repository, issue
+number, URL, and forge event identity supplied by GitHub intake. Blind calendar
+dispatch would therefore need a separate issue-discovery and fan-out mechanism.
+The shipped continuation instead uses a bounded read-after-write retry; the
+operator mention remains the explicit recovery event for runner death or a pass
+that advances nothing. Generic flows that truly require one run
 identity still use [submission identity and replay](submission-and-replay.md).
-Spec-build deliberately refuses a replayed flow-run ID after its first node:
-frontier branches execute concurrently and do not promise the same ordinal
-interleaving. Recovery must use a fresh mention and therefore a fresh forge
-event ID.
+Spec-build deliberately refuses a flow-run ID once its sweep node would be
+`reused`: frontier branches execute concurrently and do not promise the same
+ordinal interleaving. Reattaching to the still-live first sweep is safe because
+no frontier has yet been derived. Recovery after a completed sweep must use a
+fresh mention and therefore a fresh forge event ID.
 
 ## Starting recurring automation
 

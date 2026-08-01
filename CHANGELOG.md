@@ -47,9 +47,10 @@ authorized.
   merges, and enqueue at most one next pass through an exact self-posted GitHub
   command; fresh mentions safely recover failed, zero-merge, interrupted, or
   redeployed passes. Parallel campaign flows explicitly reject a replayed
-  flow-run identity and direct recovery to a fresh mention. Campaigns ship merge
-  and mention triggers, not a periodic campaign timer. Non-empty task
-  `conflictDomains` now also constrain the
+  flow-run identity and direct recovery to a fresh mention. Declarative recurring
+  campaigns ship merge and mention triggers rather than a calendar producer;
+  armed forge-native issue campaigns are covered by their revision poll timer.
+  Non-empty task `conflictDomains` now also constrain the
   full committed path history at an early post-agent check, initial publication,
   and after rebase, so a transient or net-deleted under-declared path is rejected
   before its remote branch can move. Ownership comparisons are case-folded,
@@ -137,6 +138,13 @@ authorized.
 
 ### Fixed
 
+- Made campaign sweeping daemon-liveness-backed instead of process-assumed:
+  every run hash is bound to its flow-run identity, an older paused, queued, or
+  running child defers the new pass before reconciliation, and legacy lanes
+  without that proof leak safely. Rebase abandonment receipts now name the
+  recoverable published head, post-rebase policy failures abandon it with the
+  same exact lease, completed-sweep replay refusal is limited to `reused`, and
+  the single continuation comment is retried and read-after-write verified.
 - Completed campaign task-reference observability in `query trace` records and
   generations and in every `query standup` bucket; task-ref-qualified archived
   captures are now regression-tested through retry trace lookup and recovered
