@@ -209,6 +209,17 @@ let
           ];
           description = "Named sandbox policies mapped to exact direct argv fragments.";
         };
+        commitCapableSandboxPolicies = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "danger-full-access" ];
+          description = ''
+            Subset of sandboxPolicies under which this adapter's agent can
+            create a git commit. Leave empty to declare nothing; declare it to
+            make a campaign whose implementation node cannot commit a refusal
+            at evaluation time rather than a failure mid-run.
+          '';
+        };
         model = mkOption {
           type = types.nullOr (mkAdapterValueOverrideType "model");
           default = null;
@@ -237,6 +248,10 @@ let
           assertion = policy != "";
           message = "tally adapter sandboxPolicies contains an empty policy name";
         }) config.sandboxPolicies)
+        (map (policy: {
+          assertion = builtins.hasAttr policy config.sandboxPolicies;
+          message = "tally adapter commitCapableSandboxPolicies names ${policy}, which sandboxPolicies does not declare";
+        }) config.commitCapableSandboxPolicies)
         (if config.model == null then [ ] else config.model._tallyAssertions)
         (if config.effort == null then [ ] else config.effort._tallyAssertions)
       ];
@@ -2113,24 +2128,28 @@ let
         };
         agentApprovalPolicy = mkOption {
           type = types.nullOr types.str;
-          default = "on-request";
-          example = "never";
+          default = "never";
+          example = "on-failure";
           description = ''
             Named adapter approval policy for implementation and diagnosis
-            nodes. The default pairs with workspace-write so an implementation
-            agent may request an adapter-supported escalation. Set null only
+            nodes. A campaign node runs unattended, so there is nobody to grant
+            an escalation and the default declines to ask for one. Set null only
             when the selected adapter declares no approval policies.
           '';
         };
         agentSandboxPolicy = mkOption {
           type = types.nullOr types.str;
-          default = "workspace-write";
+          default = "danger-full-access";
           example = "read-only";
           description = ''
-            Named adapter sandbox policy for implementation nodes. The writable
-            default matches the implementation node's obligation to create
-            commits. Set null only when the selected adapter declares no
-            sandbox policies.
+            Named adapter sandbox policy for implementation nodes. An
+            implementation node's obligation is a commit, and the default is the
+            weakest shipped policy under which the codex adapter can reach git
+            metadata to make one; a merely writable sandbox lets the agent do
+            all of its work and then fail at publication. Names outside the
+            adapter's commitCapableSandboxPolicies are refused here rather than
+            mid-run. Set null only when the selected adapter declares no sandbox
+            policies.
           '';
         };
         agentDiagnosisSandboxPolicy = mkOption {
@@ -2954,6 +2973,7 @@ let
       cwdArgv
       approvalPolicies
       sandboxPolicies
+      commitCapableSandboxPolicies
       ;
     model = renderAdapterValueOverride launch.model;
     effort = renderAdapterValueOverride launch.effort;
@@ -3533,6 +3553,29 @@ let
                   cfg.adapters.${campaign.agent}.launch.sandboxPolicies
             );
           message = "tally campaign ${name} agentSandboxPolicy is not declared by adapter ${campaign.agent}";
+        }
+        {
+          # An implementation node that cannot commit fails at publication after
+          # doing all of its work. When the adapter has declared which of its
+          # sandbox policies reach git metadata, that is knowable here.
+          assertion =
+            !campaign.enable
+            || !(builtins.hasAttr campaign.agent cfg.adapters)
+            || cfg.adapters.${campaign.agent}.launch.commitCapableSandboxPolicies == [ ]
+            || (
+              campaign.agentSandboxPolicy != null
+              &&
+                builtins.elem campaign.agentSandboxPolicy
+                  cfg.adapters.${campaign.agent}.launch.commitCapableSandboxPolicies
+            );
+          message = "tally campaign ${name} agentSandboxPolicy must be one of adapter ${campaign.agent} commitCapableSandboxPolicies (${
+            lib.concatStringsSep ", " (
+              if builtins.hasAttr campaign.agent cfg.adapters then
+                cfg.adapters.${campaign.agent}.launch.commitCapableSandboxPolicies
+              else
+                [ ]
+            )
+          }); an implementation node must be able to commit";
         }
         {
           assertion =

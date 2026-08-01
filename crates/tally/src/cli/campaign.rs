@@ -8,6 +8,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use tally_core::adapters::AdapterConfig;
 use tally_core::config::ResourceKind;
 
 const CAMPAIGN_SCHEMA_VERSION: u32 = 1;
@@ -21,8 +22,8 @@ const DEFAULT_DRIVER_RUNTIME_MAX_SEC: u64 = 900;
 const DEFAULT_AGENT_RUNTIME_MAX_SEC: u64 = 14_400;
 const DEFAULT_RUNNER_POOL: &str = "campaign";
 const DEFAULT_AGENT_PRIORITY: &str = "low";
-const DEFAULT_AGENT_APPROVAL_POLICY: &str = "on-request";
-const DEFAULT_AGENT_SANDBOX_POLICY: &str = "workspace-write";
+const DEFAULT_AGENT_APPROVAL_POLICY: &str = "never";
+const DEFAULT_AGENT_SANDBOX_POLICY: &str = "danger-full-access";
 const BRIEF_SENTINEL: &str = "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.";
 const REGISTRY_SCHEMA_VERSION: u32 = 2;
 const SYSTEM_COMMENT_PREFIX: &str = "<!-- tally:spec-build:";
@@ -1047,6 +1048,43 @@ fn github_repository_from_remote(value: &str) -> Option<String> {
     parse_repository(path).ok()
 }
 
+/// Arming is the last moment before a campaign spends real agent time, so a
+/// policy pairing the adapter cannot honour is refused here rather than three
+/// seconds into the first implementation node.
+fn validate_agent_policies(agent: &CampaignAgent, adapter: &AdapterConfig) -> Result<()> {
+    if let Some(policy) = &agent.approval_policy {
+        if !adapter.launch.approval_policies.contains_key(policy) {
+            return Err(invalid(format!(
+                "campaign agent approvalPolicy {policy:?} is not authorized by adapter {:?}",
+                agent.adapter
+            )));
+        }
+    }
+    if let Some(policy) = &agent.sandbox_policy {
+        if !adapter.launch.sandbox_policies.contains_key(policy) {
+            return Err(invalid(format!(
+                "campaign agent sandboxPolicy {policy:?} is not authorized by adapter {:?}",
+                agent.adapter
+            )));
+        }
+    }
+    // The implementation node's whole obligation is a commit. When the adapter
+    // has said which of its sandbox policies reach git metadata, that pairing is
+    // knowable before any agent time is spent.
+    if !adapter
+        .launch
+        .permits_commit(agent.sandbox_policy.as_deref())
+    {
+        return Err(invalid(format!(
+            "campaign agent sandboxPolicy {:?} cannot create a commit under adapter {:?}; choose one of: {}",
+            agent.sandbox_policy.as_deref().unwrap_or("<adapter default>"),
+            agent.adapter,
+            adapter.launch.commit_capable_names()
+        )));
+    }
+    Ok(())
+}
+
 fn validate_host(
     graph: &CampaignGraph,
     config_path: Option<&Path>,
@@ -1092,23 +1130,10 @@ fn validate_host(
             )));
         }
     }
-    let adapter = &config.adapters[&graph.manifest.agent.adapter];
-    if let Some(policy) = &graph.manifest.agent.approval_policy {
-        if !adapter.launch.approval_policies.contains_key(policy) {
-            return Err(invalid(format!(
-                "campaign agent approvalPolicy {policy:?} is not authorized by adapter {:?}",
-                graph.manifest.agent.adapter
-            )));
-        }
-    }
-    if let Some(policy) = &graph.manifest.agent.sandbox_policy {
-        if !adapter.launch.sandbox_policies.contains_key(policy) {
-            return Err(invalid(format!(
-                "campaign agent sandboxPolicy {policy:?} is not authorized by adapter {:?}",
-                graph.manifest.agent.adapter
-            )));
-        }
-    }
+    validate_agent_policies(
+        &graph.manifest.agent,
+        &config.adapters[&graph.manifest.agent.adapter],
+    )?;
     if !flow.is_file() || !driver.is_file() {
         return Err(invalid(
             "campaign flow and driver assets must be regular files",
@@ -3062,5 +3087,92 @@ mod tests {
             loaded.approved_graph_digest,
             registration.approved_graph_digest
         );
+    }
+
+    fn codex_shaped_adapter(commit_capable: &[&str]) -> AdapterConfig {
+        AdapterConfig {
+            argv: vec![
+                "codex".to_owned(),
+                "exec".to_owned(),
+                "--json".to_owned(),
+                "--".to_owned(),
+            ],
+            launch: tally_core::adapters::AdapterLaunchConfig {
+                approval_policies: BTreeMap::from([(
+                    "never".to_owned(),
+                    vec!["-c".to_owned(), "approval_policy=\"never\"".to_owned()],
+                )]),
+                sandbox_policies: BTreeMap::from([
+                    (
+                        "workspace-write".to_owned(),
+                        vec!["--sandbox".to_owned(), "workspace-write".to_owned()],
+                    ),
+                    (
+                        "danger-full-access".to_owned(),
+                        vec!["--sandbox".to_owned(), "danger-full-access".to_owned()],
+                    ),
+                ]),
+                commit_capable_sandbox_policies: commit_capable
+                    .iter()
+                    .map(|policy| (*policy).to_owned())
+                    .collect(),
+                ..tally_core::adapters::AdapterLaunchConfig::default()
+            },
+            ..AdapterConfig::default()
+        }
+    }
+
+    fn agent_with(sandbox: Option<&str>) -> CampaignAgent {
+        CampaignAgent {
+            adapter: "codex".to_owned(),
+            argv: default_agent_argv(),
+            priority: default_agent_priority(),
+            runtime_max_sec: default_agent_runtime_max_sec(),
+            approval_policy: default_agent_approval_policy(),
+            sandbox_policy: sandbox.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn campaign_defaults_are_a_pairing_a_codex_agent_can_commit_under() {
+        let adapter = codex_shaped_adapter(&["danger-full-access"]);
+        // The shipped module defaults, unmodified.
+        let defaults = agent_with(Some(DEFAULT_AGENT_SANDBOX_POLICY));
+        assert_eq!(defaults.approval_policy.as_deref(), Some("never"));
+        validate_agent_policies(&defaults, &adapter).unwrap();
+
+        // The estate workaround already deployed by the consumer: both values
+        // explicit, approval disabled outright.
+        let workaround = CampaignAgent {
+            approval_policy: None,
+            ..agent_with(Some("danger-full-access"))
+        };
+        validate_agent_policies(&workaround, &adapter).unwrap();
+    }
+
+    #[test]
+    fn a_sandbox_that_cannot_commit_is_refused_at_arm_time() {
+        let adapter = codex_shaped_adapter(&["danger-full-access"]);
+        for sandbox in [Some("workspace-write"), None] {
+            let error = validate_agent_policies(&agent_with(sandbox), &adapter)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("cannot create a commit"), "{error}");
+            assert!(error.contains("danger-full-access"), "{error}");
+        }
+
+        // An adapter that declares no commit capability is not second-guessed.
+        let silent = codex_shaped_adapter(&[]);
+        validate_agent_policies(&agent_with(Some("workspace-write")), &silent).unwrap();
+        validate_agent_policies(&agent_with(None), &silent).unwrap();
+    }
+
+    #[test]
+    fn an_undeclared_policy_name_is_still_refused_at_arm_time() {
+        let adapter = codex_shaped_adapter(&["danger-full-access"]);
+        let error = validate_agent_policies(&agent_with(Some("read-only")), &adapter)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("is not authorized by adapter"), "{error}");
     }
 }

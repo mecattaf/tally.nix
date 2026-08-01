@@ -104,10 +104,50 @@ pub struct AdapterLaunchConfig {
     pub approval_policies: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     pub sandbox_policies: BTreeMap<String, Vec<String>>,
+    /// Subset of `sandbox_policies` under which the adapter's agent can create
+    /// a commit. An adapter that leaves this empty declares nothing, and a
+    /// caller with a commit obligation cannot be held to anything. An adapter
+    /// that declares it makes "this policy can write but not commit" a
+    /// refusable configuration instead of a three-second campaign failure.
+    #[serde(default)]
+    pub commit_capable_sandbox_policies: BTreeSet<String>,
     #[serde(default)]
     pub model: Option<AdapterValueOverride>,
     #[serde(default)]
     pub effort: Option<AdapterValueOverride>,
+}
+
+impl AdapterLaunchConfig {
+    /// Whether the adapter says anything at all about which sandbox policies
+    /// permit a commit. Silence is not consent and not refusal: a caller with a
+    /// commit obligation may only refuse an adapter that has spoken.
+    #[must_use]
+    pub fn declares_commit_capability(&self) -> bool {
+        !self.commit_capable_sandbox_policies.is_empty()
+    }
+
+    /// Whether `policy` may be used by a node whose obligation is a commit. An
+    /// adapter that declares nothing answers yes to everything; an adapter that
+    /// declares a set answers no to the adapter default (`None`) as well,
+    /// because an unnamed policy is exactly what shipped a non-committing
+    /// sandbox into a campaign.
+    #[must_use]
+    pub fn permits_commit(&self, policy: Option<&str>) -> bool {
+        if !self.declares_commit_capability() {
+            return true;
+        }
+        policy.is_some_and(|policy| self.commit_capable_sandbox_policies.contains(policy))
+    }
+
+    /// Comma-separated commit-capable policy names, for refusal messages.
+    #[must_use]
+    pub fn commit_capable_names(&self) -> String {
+        self.commit_capable_sandbox_policies
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -763,6 +803,16 @@ fn validate_launch_config(adapter: &str, launch: &AdapterLaunchConfig) -> Result
                 );
             }
             validate_argv(adapter, &format!("launch.{field}.{policy}"), argv, true)?;
+        }
+    }
+    for policy in &launch.commit_capable_sandbox_policies {
+        if !launch.sandbox_policies.contains_key(policy) {
+            return invalid_config(
+                adapter,
+                format!(
+                    "launch.commitCapableSandboxPolicies names {policy:?}, which launch.sandboxPolicies does not declare"
+                ),
+            );
         }
     }
     for (field, option) in [
@@ -1576,6 +1626,7 @@ mod tests {
                 cwd_argv: Some(vec!["-C".to_owned(), "%<cwd>%".to_owned()]),
                 approval_policies: BTreeMap::from([("never".to_owned(), Vec::new())]),
                 sandbox_policies: BTreeMap::from([("danger-full-access".to_owned(), Vec::new())]),
+                commit_capable_sandbox_policies: BTreeSet::from(["danger-full-access".to_owned()]),
                 model: Some(AdapterValueOverride {
                     argv: vec!["--model".to_owned(), "%<value>%".to_owned()],
                     allowed_values: vec!["gpt-5-codex".to_owned()],
@@ -1680,5 +1731,65 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("not authorized"));
+    }
+
+    #[test]
+    fn commit_capability_is_declared_against_real_sandbox_policies() {
+        let launch = |commit_capable: &[&str]| AdapterLaunchConfig {
+            sandbox_policies: BTreeMap::from([
+                (
+                    "workspace-write".to_owned(),
+                    vec!["--sandbox".to_owned(), "workspace-write".to_owned()],
+                ),
+                (
+                    "danger-full-access".to_owned(),
+                    vec!["--sandbox".to_owned(), "danger-full-access".to_owned()],
+                ),
+            ]),
+            commit_capable_sandbox_policies: commit_capable
+                .iter()
+                .map(|policy| (*policy).to_owned())
+                .collect(),
+            ..AdapterLaunchConfig::default()
+        };
+
+        // An adapter that declares nothing cannot refuse anything.
+        let silent = launch(&[]);
+        assert!(!silent.declares_commit_capability());
+        assert!(silent.permits_commit(None));
+        assert!(silent.permits_commit(Some("workspace-write")));
+
+        // An adapter that has spoken refuses the writable-but-not-committing
+        // policy, and refuses the unnamed adapter default with it.
+        let declared = launch(&["danger-full-access"]);
+        assert!(declared.declares_commit_capability());
+        assert!(declared.permits_commit(Some("danger-full-access")));
+        assert!(!declared.permits_commit(Some("workspace-write")));
+        assert!(!declared.permits_commit(None));
+        assert_eq!(declared.commit_capable_names(), "danger-full-access");
+
+        let adapters = BTreeMap::from([(
+            "declared".to_owned(),
+            AdapterConfig {
+                argv: vec!["agent".to_owned(), "--".to_owned()],
+                launch: declared,
+                ..AdapterConfig::default()
+            },
+        )]);
+        engine(&adapters).validate_all().unwrap();
+
+        let dangling = BTreeMap::from([(
+            "dangling".to_owned(),
+            AdapterConfig {
+                argv: vec!["agent".to_owned(), "--".to_owned()],
+                launch: launch(&["read-only"]),
+                ..AdapterConfig::default()
+            },
+        )]);
+        assert!(engine(&dangling)
+            .validate_all()
+            .unwrap_err()
+            .to_string()
+            .contains("commitCapableSandboxPolicies"));
     }
 }

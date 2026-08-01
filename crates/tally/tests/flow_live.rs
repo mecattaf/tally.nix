@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -2340,18 +2340,21 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     launch: AdapterLaunchConfig {
                         cwd_argv: Some(vec!["-C".to_owned(), "%<cwd>%".to_owned()]),
                         approval_policies: BTreeMap::from([(
-                            "on-request".to_owned(),
-                            vec!["--ask-for-approval".to_owned(), "on-request".to_owned()],
+                            "never".to_owned(),
+                            vec!["-c".to_owned(), "approval_policy=\"never\"".to_owned()],
                         )]),
                         sandbox_policies: BTreeMap::from([
                             (
-                                "workspace-write".to_owned(),
-                                vec!["--sandbox".to_owned(), "workspace-write".to_owned()],
+                                "danger-full-access".to_owned(),
+                                vec!["--sandbox".to_owned(), "danger-full-access".to_owned()],
                             ),
                             (
                                 "read-only".to_owned(),
                                 vec!["--sandbox".to_owned(), "read-only".to_owned()],
                             ),
+                        ]),
+                        commit_capable_sandbox_policies: BTreeSet::from([
+                            "danger-full-access".to_owned()
                         ]),
                         ..AdapterLaunchConfig::default()
                     },
@@ -2422,8 +2425,8 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                         "argv": [BRIEF_SENTINEL],
                         "priority": priority,
                         "runtimeMaxSec": 30,
-                        "approvalPolicy": "on-request",
-                        "sandboxPolicy": "workspace-write",
+                        "approvalPolicy": "never",
+                        "sandboxPolicy": "danger-full-access",
                         "diagnosisSandboxPolicy": "read-only"
                     },
                     "gates": [
@@ -3607,9 +3610,9 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             );
             assert!(policies.iter().all(|line| {
                 if line.starts_with("diagnosis:") {
-                    line.ends_with(":on-request:read-only")
+                    line.ends_with(":approval_policy=\"never\":read-only")
                 } else {
-                    line.ends_with(":on-request:workspace-write")
+                    line.ends_with(":approval_policy=\"never\":danger-full-access")
                 }
             }));
 

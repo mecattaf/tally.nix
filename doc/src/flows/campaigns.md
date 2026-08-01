@@ -83,8 +83,8 @@ that hand-maintained copy. Start from one JSON worklist:
       ],
       "priority": "low",
       "runtimeMaxSec": 14400,
-      "approvalPolicy": "on-request",
-      "sandboxPolicy": "workspace-write",
+      "approvalPolicy": "never",
+      "sandboxPolicy": "danger-full-access",
       "diagnosisSandboxPolicy": "read-only"
     },
     "gates": [
@@ -239,9 +239,10 @@ services.tally = {
 
     agent = "codex";
     # These are the defaults. Keep them explicit here to show that the
-    # implementation node is writable and may request bounded escalation.
-    agentApprovalPolicy = "on-request";
-    agentSandboxPolicy = "workspace-write";
+    # implementation node can reach git metadata and asks nobody for
+    # permission, and that the diagnosis node cannot write at all.
+    agentApprovalPolicy = "never";
+    agentSandboxPolicy = "danger-full-access";
     agentDiagnosisSandboxPolicy = "read-only";
     gates = [
       {
@@ -344,16 +345,27 @@ transient-unit status output. GitHub issue bodies are not campaign flow args:
 they remain in the separate `TALLY_GH_CONTEXT` file before and after this
 transport for recurring campaigns.
 
-An implementation node defaults to `agentSandboxPolicy = "workspace-write"`
-because its contract requires a commit, paired with
-`agentApprovalPolicy = "on-request"` so the adapter can surface a request to go
-beyond that boundary. A diagnosis node's brief prohibits mutation, so it does
-not inherit that writable policy: `agentDiagnosisSandboxPolicy` defaults to
-`"read-only"` and holds the node to its stated obligation. Every configured name
-must exist in the selected adapter's launch maps; deployment fails early
-otherwise. Set `agentSandboxPolicy = "read-only"` when a deliberately non-writing
-campaign agent needs that constraint. Set any of these options to `null` only for
-an adapter such as the shell fixture that declares no corresponding policy map.
+An implementation node defaults to `agentSandboxPolicy = "danger-full-access"`
+because its contract requires a commit and a merely writable sandbox is not
+enough to produce one: under codex's `workspace-write` the repository's git
+metadata is mounted read-only, so the agent writes every file correctly and then
+fails at `.git/index.lock` — all of the work done, none of it publishable. An
+adapter states which of its sandbox policies can commit in
+`launch.commitCapableSandboxPolicies`; naming any other policy for an
+implementation node is refused at evaluation time and again when the campaign is
+armed, rather than three seconds into the first node. Prove the pairing against
+the real binary with `tally adapter smoke <adapter> --sandbox <policy>
+--assert-commit` before deploying it.
+
+The default `agentApprovalPolicy = "never"` follows from the same unattendedness:
+a campaign node runs with nobody present to grant an escalation, so asking for
+one can only stall. A diagnosis node's brief prohibits mutation, so it does not
+inherit the implementation node's policy: `agentDiagnosisSandboxPolicy` defaults
+to `"read-only"` and holds the node to its stated obligation, and commit
+capability is not required of it. Every configured name must exist in the
+selected adapter's launch maps; deployment fails early otherwise. Set any of
+these options to `null` only for an adapter such as the shell fixture that
+declares no corresponding policy map.
 
 One enabled attrset expands to all of the following:
 

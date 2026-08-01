@@ -196,6 +196,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             println!("ok");
             Ok(())
         }
+        Some(Command::AdapterSmokeCommit) => run_adapter_smoke_commit(),
         Some(Command::ProducerDispatch(args)) => {
             run_producer_dispatch(opts.config, &socket, args).await
         }
