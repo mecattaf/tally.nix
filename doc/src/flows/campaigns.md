@@ -179,12 +179,16 @@ read/modify/write operations are file-locked against timer and re-arm races.
 `tally campaign list` inspects registrations, while `tally campaign poll --once`
 is the timer's bounded scan and `--wait` waits for newly admitted passes.
 
-The opt-in `test/campaign-github-e2e.sh` receipt exercises the final package
-against a real private GitHub repository: two dependent agent tasks, real PR
-creation and merge, revision markers, checkbox repair, next-pass polling,
-closeout, and registration pruning. It requires
-`TALLY_CAMPAIGN_E2E_CONFIRM=1` and deletes only the repository it creates (set
-`TALLY_CAMPAIGN_E2E_KEEP_REPO=1` to retain it for inspection).
+The opt-in `test/campaign-github-e2e.sh` receipt starts the final-package daemon
+on a private temporary socket and exercises that exact package against a real
+private GitHub repository: two dependent agent tasks, real PR creation and
+merge, revision markers, checkbox repair, next-pass polling, closeout, and
+registration pruning. It requires `TALLY_CAMPAIGN_E2E_CONFIRM=1` and attempts
+to delete only the repository it creates; when the GitHub token lacks deletion
+scope it archives the repository instead. Set `TALLY_CAMPAIGN_E2E_KEEP_REPO=1`
+to retain it for inspection. Set `TALLY_CAMPAIGN_E2E_DAEMON_MODE=host` to
+exercise an already deployed daemon whose protocol generation matches the
+package.
 
 ## Configure a recurring campaign
 

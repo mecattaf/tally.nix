@@ -950,6 +950,58 @@ class GitHubForgeTests(unittest.TestCase):
             )
             self.assertEqual(stale, [])
 
+    def test_issue_campaign_checkbox_repair_and_closeout_are_separate(self) -> None:
+        tasks = [
+            {
+                "id": "first",
+                "title": "First task",
+                "brief": {
+                    "issue": {
+                        "number": "2",
+                        "url": "https://github.com/acme/spec/issues/2",
+                    }
+                },
+            },
+            {
+                "id": "second",
+                "title": "Second task",
+                "brief": {
+                    "issue": {
+                        "number": "3",
+                        "url": "https://github.com/acme/spec/issues/3",
+                    }
+                },
+            },
+        ]
+        body = (
+            "operator prose\n"
+            f"{DRIVER.WORKLIST_BEGIN}\n\nold projection\n\n"
+            f"{DRIVER.WORKLIST_END}\n"
+        )
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(DRIVER, "run", return_value=completed) as run:
+            DRIVER.sync_issue_checkboxes("acme/spec", "1", body, tasks, {"first"})
+        edited = run.call_args.kwargs["input_text"]
+        self.assertIn("- [x] <!-- tally:campaign-task:v1 id=first -->", edited)
+        self.assertIn("- [ ] <!-- tally:campaign-task:v1 id=second -->", edited)
+        self.assertTrue(edited.startswith("operator prose\n"))
+
+        digest = "sha256:" + "a" * 64
+        with mock.patch.object(
+            DRIVER,
+            "github_json",
+            side_effect=[{"state": "open"}, {"state": "closed"}],
+        ), mock.patch.object(DRIVER, "run", return_value=completed) as run:
+            DRIVER.close_completed_issue_campaign(
+                "acme/spec", "1", {"sha256": digest}, tasks
+            )
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["gh", "issue", "close", "2", "--repo", "acme/spec"], commands)
+        self.assertNotIn(["gh", "issue", "close", "3", "--repo", "acme/spec"], commands)
+        self.assertIn(["gh", "issue", "close", "1", "--repo", "acme/spec"], commands)
+        comment = next(command for command in commands if command[:3] == ["gh", "issue", "comment"])
+        self.assertIn(digest, comment[-1])
+
 
 class LaneLifecycleTests(unittest.TestCase):
     def test_conflicting_published_head_is_aborted_abandoned_and_rebuilt(self) -> None:

@@ -1618,6 +1618,23 @@ def sync_issue_checkboxes(
             f"- [{state}] {TASK_MARKER_PREFIX}{task['id']} --> "
             f"#{task['brief']['issue']['number']} — {title}"
         )
+    lines.append("")
+    content = "\n".join(lines)
+    updated = body[:content_start] + content + body[end_index:]
+    if updated != body:
+        run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                issue_number,
+                "--repo",
+                repository,
+                "--body-file",
+                "-",
+            ],
+            input_text=updated,
+        )
 
 
 def close_completed_issue_campaign(
@@ -1674,23 +1691,6 @@ def close_completed_issue_campaign(
             ]
         )
     run(["gh", "issue", "close", issue_number, "--repo", repository])
-    lines.append("")
-    content = "\n".join(lines)
-    updated = body[:content_start] + content + body[end_index:]
-    if updated != body:
-        run(
-            [
-                "gh",
-                "issue",
-                "edit",
-                issue_number,
-                "--repo",
-                repository,
-                "--body-file",
-                "-",
-            ],
-            input_text=updated,
-        )
 
 
 def parallelism_warnings(

@@ -6,7 +6,7 @@ if [[ ${TALLY_CAMPAIGN_E2E_CONFIRM:-} != 1 ]]; then
   exit 2
 fi
 
-for program in gh git jq nix; do
+for program in gh git jq nix python3; do
   command -v "$program" >/dev/null || {
     echo "missing required program: $program" >&2
     exit 2
@@ -14,6 +14,11 @@ for program in gh git jq nix; do
 done
 
 root=$(git rev-parse --show-toplevel)
+agent="$root/test/fixtures/campaign-github-e2e-agent.py"
+[[ -f $agent ]] || {
+  echo "missing campaign GitHub e2e agent: $agent" >&2
+  exit 2
+}
 package=${TALLY_CAMPAIGN_E2E_PACKAGE:-}
 if [[ -z $package ]]; then
   package=$(nix build --no-link --print-out-paths "$root#tally")
@@ -25,27 +30,78 @@ tally="$package/bin/tally"
 }
 
 config=${TALLY_CAMPAIGN_E2E_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/tally/config.json}
-socket=${TALLY_CAMPAIGN_E2E_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/tally/tally.sock}
 pool=${TALLY_CAMPAIGN_E2E_POOL:-campaign}
 actor=$(gh api user --jq .login)
 stamp=$(date -u +%Y%m%d%H%M%S)
 repository="$actor/tally-campaign-e2e-$stamp-$$"
 scratch=$(mktemp -d -t tally-campaign-github-e2e.XXXXXXXX)
+daemon_mode=${TALLY_CAMPAIGN_E2E_DAEMON_MODE:-package}
+case $daemon_mode in
+package)
+  socket=${TALLY_CAMPAIGN_E2E_SOCKET:-$scratch/tally.sock}
+  ;;
+host)
+  socket=${TALLY_CAMPAIGN_E2E_SOCKET:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/tally/tally.sock}
+  ;;
+*)
+  echo "TALLY_CAMPAIGN_E2E_DAEMON_MODE must be package or host" >&2
+  exit 2
+  ;;
+esac
 checkout="$scratch/checkout"
 state_dir="$scratch/state"
 workspace_root="$scratch/workspaces"
 worklist="$scratch/worklist.json"
 created=0
+daemon_pid=
 
 cleanup() {
+  status=$?
+  set +e
+  if [[ -n $daemon_pid ]]; then
+    kill "$daemon_pid" >/dev/null 2>&1 || true
+    wait "$daemon_pid" >/dev/null 2>&1 || true
+  fi
+  if [[ $status != 0 && -f $scratch/daemon.log ]]; then
+    echo "final-package daemon tail after e2e failure:" >&2
+    tail -240 "$scratch/daemon.log" >&2
+  fi
   if [[ $created == 1 && ${TALLY_CAMPAIGN_E2E_KEEP_REPO:-0} != 1 ]]; then
-    gh repo delete "$repository" --yes >/dev/null 2>&1 || {
-      echo "warning: could not delete temporary repository $repository" >&2
-    }
+    if ! gh repo delete "$repository" --yes >/dev/null 2>&1; then
+      echo "warning: could not delete temporary repository $repository; archiving it instead" >&2
+      gh repo archive "$repository" --yes >/dev/null 2>&1 || {
+        echo "warning: could not archive temporary repository $repository" >&2
+      }
+    fi
   fi
   rm -rf -- "$scratch"
+  trap - EXIT
+  exit "$status"
 }
 trap cleanup EXIT
+
+if [[ $daemon_mode == package ]]; then
+  mkdir -p "$scratch/daemon-state" "$scratch/daemon-data"
+  "$tally" --config "$config" --socket "$socket" daemon run \
+    --cpu-weight 100 --memory-max-bytes 8589934592 \
+    --state-dir "$scratch/daemon-state" --data-dir "$scratch/daemon-data" \
+    >"$scratch/daemon.log" 2>&1 &
+  daemon_pid=$!
+  for _ in $(seq 1 100); do
+    [[ -S $socket ]] && break
+    if ! kill -0 "$daemon_pid" >/dev/null 2>&1; then
+      sed -n '1,240p' "$scratch/daemon.log" >&2
+      echo "final-package daemon exited before creating $socket" >&2
+      exit 1
+    fi
+    sleep 0.1
+  done
+  if [[ ! -S $socket ]]; then
+    sed -n '1,240p' "$scratch/daemon.log" >&2
+    echo "final-package daemon did not create $socket" >&2
+    exit 1
+  fi
+fi
 
 git init --quiet --initial-branch=main "$checkout"
 git -C "$checkout" config user.name "Tally Campaign E2E"
@@ -59,6 +115,8 @@ created=1
 jq -n \
   --arg checkout "$checkout" \
   --arg pool "$pool" \
+  --arg python "$(command -v python3)" \
+  --arg agent "$agent" \
   '{
     schemaVersion: 1,
     campaign: {
@@ -75,12 +133,12 @@ jq -n \
       runtimeMaxSec: 3600,
       pool: $pool,
       agent: {
-        adapter: "codex",
-        argv: ["Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set."],
+        adapter: "shell",
+        argv: [$python, $agent],
         priority: "low",
-        runtimeMaxSec: 1200,
-        approvalPolicy: "on-request",
-        sandboxPolicy: "workspace-write"
+        runtimeMaxSec: 120,
+        approvalPolicy: null,
+        sandboxPolicy: null
       },
       gates: [{
         kind: "command",
@@ -146,7 +204,8 @@ git -C "$checkout" show origin/main:two.txt | grep -qx two
 
 jq -n \
   --arg package "$package" \
+  --arg daemonMode "$daemon_mode" \
   --arg repository "$repository" \
   --arg issue "$issue_url" \
   --argjson pulls "$pulls" \
-  '{status:"pass", package:$package, repository:$repository, issue:$issue, mergedPullRequests:($pulls | map(.url))}'
+  '{status:"pass", package:$package, daemonMode:$daemonMode, repository:$repository, issue:$issue, mergedPullRequests:($pulls | map(.url))}'
