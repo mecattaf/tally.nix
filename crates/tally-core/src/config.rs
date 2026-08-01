@@ -272,7 +272,8 @@ pub struct RetentionConfig {
 
 pub const DEFAULT_STORAGE_WARNING_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 pub const DEFAULT_STORAGE_HARD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
-pub const DEFAULT_STORAGE_MINIMUM_FREE_BYTES: u64 = 256 * 1024 * 1024;
+pub const DEFAULT_STORAGE_WARNING_FREE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
+pub const DEFAULT_STORAGE_MINIMUM_FREE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 pub const DEFAULT_STORAGE_POLL_INTERVAL_SEC: u64 = 60;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,6 +283,8 @@ pub struct StorageBudgetConfig {
     pub warning_bytes: u64,
     #[serde(default = "default_storage_hard_bytes")]
     pub hard_bytes: u64,
+    #[serde(default = "default_storage_warning_free_bytes")]
+    pub warning_free_bytes: u64,
     #[serde(default = "default_storage_minimum_free_bytes")]
     pub minimum_free_bytes: u64,
 }
@@ -291,6 +294,7 @@ impl Default for StorageBudgetConfig {
         Self {
             warning_bytes: default_storage_warning_bytes(),
             hard_bytes: default_storage_hard_bytes(),
+            warning_free_bytes: default_storage_warning_free_bytes(),
             minimum_free_bytes: default_storage_minimum_free_bytes(),
         }
     }
@@ -475,6 +479,10 @@ const fn default_storage_hard_bytes() -> u64 {
     DEFAULT_STORAGE_HARD_BYTES
 }
 
+const fn default_storage_warning_free_bytes() -> u64 {
+    DEFAULT_STORAGE_WARNING_FREE_BYTES
+}
+
 const fn default_storage_minimum_free_bytes() -> u64 {
     DEFAULT_STORAGE_MINIMUM_FREE_BYTES
 }
@@ -595,7 +603,7 @@ pub enum ConfigError {
     #[error("storage pollIntervalSec must be positive")]
     InvalidStoragePollInterval,
     #[error(
-        "storage {store} budget requires 0 < warningBytes < hardBytes and minimumFreeBytes > 0"
+        "storage {store} budget requires 0 < warningBytes < hardBytes and 0 < minimumFreeBytes < warningFreeBytes"
     )]
     InvalidStorageBudget { store: &'static str },
     #[error("gitAi awaitTimeoutSec must be positive")]
@@ -664,6 +672,7 @@ impl Config {
             if budget.warning_bytes == 0
                 || budget.warning_bytes >= budget.hard_bytes
                 || budget.minimum_free_bytes == 0
+                || budget.minimum_free_bytes >= budget.warning_free_bytes
             {
                 return Err(ConfigError::InvalidStorageBudget { store });
             }
@@ -1024,11 +1033,15 @@ mod tests {
         );
         assert_eq!(
             defaults.storage.data_dir.minimum_free_bytes,
-            256 * 1024 * 1024
+            8 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            defaults.storage.data_dir.warning_free_bytes,
+            16 * 1024 * 1024 * 1024
         );
 
         let configured: Config = serde_json::from_str(
-            r#"{"pools":{},"storage":{"pollIntervalSec":5,"dataDir":{"warningBytes":10,"hardBytes":20,"minimumFreeBytes":2},"stateDir":{"warningBytes":30,"hardBytes":40,"minimumFreeBytes":3}}}"#,
+            r#"{"pools":{},"storage":{"pollIntervalSec":5,"dataDir":{"warningBytes":10,"hardBytes":20,"warningFreeBytes":4,"minimumFreeBytes":2},"stateDir":{"warningBytes":30,"hardBytes":40,"warningFreeBytes":5,"minimumFreeBytes":3}}}"#,
         )
         .unwrap();
         configured.validate().unwrap();
@@ -1038,6 +1051,7 @@ mod tests {
             r#"{"pools":{},"storage":{"dataDir":{"warningBytes":20,"hardBytes":20}}}"#,
             r#"{"pools":{},"storage":{"stateDir":{"warningBytes":40,"hardBytes":30}}}"#,
             r#"{"pools":{},"storage":{"dataDir":{"minimumFreeBytes":0}}}"#,
+            r#"{"pools":{},"storage":{"dataDir":{"minimumFreeBytes":10,"warningFreeBytes":10}}}"#,
             r#"{"pools":{},"storage":{"extra":1}}"#,
         ] {
             let result = serde_json::from_str::<Config>(invalid)

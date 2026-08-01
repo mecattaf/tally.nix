@@ -358,9 +358,10 @@ lookup: it reports whether a witness is expected, returns the canonical record w
 separates advisory attestations, and includes ledger verification state.
 
 `query storage` is the daemon's cached disk-pressure view. It reports both stores' allocated and
-apparent bytes, filesystem-available bytes, configured warning/hard/free-space levels,
+apparent bytes, filesystem-available bytes, configured size and free-space warning/hard levels,
 TaskChampion database/WAL/SHM sizes and operation high-water mark, and growth per canonical
-completion. `sampledAt` identifies the off-thread sample; the query itself never walks the stores.
+completion. `sampledAt` identifies the off-thread tree sample; `freeSpaceCheckedAt` identifies
+the latest periodic or admission-time `statvfs` check. The query itself never walks the stores.
 At a hard level, `intake.accepting` is false; existing work and this query remain usable.
 
 Each `failed` log item includes the bounded `stderrTail` and a

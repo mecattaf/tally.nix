@@ -114,16 +114,17 @@ the flow rather than a hidden data plane.
 ## State-store pressure and recovery
 
 The daemon samples `dataDir` and `stateDir` off-thread at the configured storage cadence. Each
-store has allocated-byte warning/hard limits and a `minimumFreeBytes` floor for the filesystem
-that contains it. Queries and enqueue use the cached sample while one periodic blocking-pool
-sample refreshes it, so intake never walks the trees. Hard size or free-space pressure refuses
-only new intake. A measurement failure uses the distinct `storage-monitor-unavailable` refusal.
+store has allocated-byte warning/hard limits plus `warningFreeBytes` and `minimumFreeBytes` for
+the filesystem that contains it. Queries use the cached tree sample. Every enqueue rechecks only
+the cheap filesystem-free value before deciding admission; it never walks either tree. Hard size
+or free-space pressure refuses only new intake. A measurement failure uses the distinct
+`storage-monitor-unavailable` refusal.
 
-Budget recovery is hysteretic (90% for size thresholds and the inverse boundary for the
-free-space floor), and warning/hard severity changes share one campaign-receipt episode until
-full recovery. `storage-metrics.json` is derived advisory state: invalid, foreign, inconsistent,
-or unsupported versions reset at startup while the durable warning log preserves the sequence
-high-water.
+The defaults warn below 16 GiB free and refuse below 8 GiB. Budget recovery is hysteretic (90%
+for size thresholds; a free-space threshold plus the larger of 10% or 1 GiB), and warning/hard
+severity changes share one campaign-receipt episode until full recovery. `storage-metrics.json`
+is derived advisory state: invalid, foreign, inconsistent, or unsupported versions reset at
+startup while the durable warning log preserves the sequence high-water.
 
 Hard pressure does not override retention policy. In particular, a recent
 `taskdata.pre-rebuild-*` rollback copy remains protected by the default 30-day projection archive

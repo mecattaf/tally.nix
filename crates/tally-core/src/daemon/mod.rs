@@ -575,10 +575,9 @@ struct StorageReceiptKey {
 }
 
 struct StorageRuntime {
-    monitor: Option<StorageMonitor>,
+    monitor: StorageMonitor,
     snapshot: StorageMetrics,
     poll_interval: Duration,
-    last_sample: Instant,
 }
 
 impl StorageRuntime {
@@ -586,13 +585,8 @@ impl StorageRuntime {
         Self {
             snapshot: monitor.query_snapshot(),
             poll_interval: monitor.poll_interval(),
-            monitor: Some(monitor),
-            last_sample: Instant::now(),
+            monitor,
         }
-    }
-
-    fn sample_due(&self) -> bool {
-        self.last_sample.elapsed() >= self.poll_interval
     }
 }
 
@@ -812,15 +806,32 @@ impl DaemonHandler {
         self.storage.borrow().snapshot.clone()
     }
 
-    async fn refresh_storage_if_due(&self) -> StorageMetrics {
-        if !self.storage.borrow().sample_due() {
-            return self.cached_storage();
+    fn refresh_storage_for_intake(&self) -> StorageMetrics {
+        let (snapshot, warnings, notices, refresh_error) = {
+            let mut storage = self.storage.borrow_mut();
+            let refresh_error = storage
+                .monitor
+                .refresh_free_space()
+                .err()
+                .map(|error| error.to_string());
+            let snapshot = storage.monitor.query_snapshot();
+            let warnings = storage.monitor.take_warnings();
+            let notices = storage.monitor.take_notices();
+            storage.snapshot = snapshot.clone();
+            (snapshot, warnings, notices, refresh_error)
+        };
+        if let Some(error) = refresh_error {
+            eprintln!(
+                "tally: live storage free-space check failed; new intake will be refused: {error}"
+            );
         }
-        let _refresh = self.storage_refresh.lock().await;
-        if !self.storage.borrow().sample_due() {
-            return self.cached_storage();
+        for notice in notices {
+            eprintln!("tally: {notice}");
         }
-        self.refresh_storage_locked().await
+        for warning in &warnings {
+            log_storage_warning(warning);
+        }
+        snapshot
     }
 
     async fn refresh_storage_now(&self) -> StorageMetrics {
@@ -830,43 +841,33 @@ impl DaemonHandler {
 
     async fn refresh_storage_locked(&self) -> StorageMetrics {
         let completion_count = self.context.read().await.witness.head().seq;
-        let monitor = {
-            let mut storage = self.storage.borrow_mut();
-            storage.monitor.take()
+        let request = {
+            self.storage
+                .borrow_mut()
+                .monitor
+                .sample_request(completion_count)
         };
-        let Some(mut monitor) = monitor else {
-            let error = "storage sampler is unavailable after its blocking worker stopped";
-            let snapshot = self.cached_storage().with_monitor_error(error);
-            self.storage.borrow_mut().snapshot = snapshot.clone();
-            eprintln!("tally: {error}; new intake will be refused");
-            return snapshot;
-        };
-
-        let sampled = tokio::task::spawn_blocking(move || {
-            let refresh_error = monitor
-                .refresh(completion_count)
-                .err()
-                .map(|error| error.to_string());
-            let snapshot = monitor.query_snapshot();
-            let warnings = monitor.take_warnings();
-            let notices = monitor.take_notices();
-            (monitor, snapshot, warnings, notices, refresh_error)
-        })
-        .await;
+        let sampled = tokio::task::spawn_blocking(move || request.run()).await;
         let (snapshot, warnings, notices, refresh_error) = match sampled {
-            Ok((monitor, snapshot, warnings, notices, refresh_error)) => {
+            Ok(measurement) => {
                 let mut storage = self.storage.borrow_mut();
-                storage.monitor = Some(monitor);
+                let refresh_error = storage
+                    .monitor
+                    .apply_measurement_result(measurement)
+                    .err()
+                    .map(|error| error.to_string());
+                let snapshot = storage.monitor.query_snapshot();
+                let warnings = storage.monitor.take_warnings();
+                let notices = storage.monitor.take_notices();
                 storage.snapshot = snapshot.clone();
-                storage.last_sample = Instant::now();
                 (snapshot, warnings, notices, refresh_error)
             }
             Err(error) => {
                 let message = format!("storage sampler blocking worker failed: {error}");
-                let snapshot = self.cached_storage().with_monitor_error(&message);
                 let mut storage = self.storage.borrow_mut();
+                storage.monitor.record_sample_worker_failure(&message);
+                let snapshot = storage.monitor.query_snapshot();
                 storage.snapshot = snapshot.clone();
-                storage.last_sample = Instant::now();
                 eprintln!("tally: {message}; new intake will be refused");
                 return snapshot;
             }

@@ -363,7 +363,9 @@ window-consumption counters and reset, utilization percentages, and the `GO`, `S
 signal.
 
 `query.storage` takes no parameters. It returns allocated and apparent bytes, file counts,
-warning and hard thresholds, and `ok`, `warning`, or `hard` level for `dataDir` and `stateDir`.
+allocated-size warning/hard thresholds, free-space warning/hard thresholds, and `ok`, `warning`,
+or `hard` level for `dataDir` and `stateDir`. `sampledAt` dates the cached tree/SQLite walk;
+`freeSpaceCheckedAt` dates the most recent periodic or per-intake filesystem-free probe.
 `taskchampion` reports the SQLite database, WAL, and shared-memory byte sizes, task count, and
 the `operations` AUTOINCREMENT high-water mark. `growthPerCompletion` is the signed byte and
 operation delta divided by the canonical witness-count delta since the prior completion sample;
