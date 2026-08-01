@@ -1370,14 +1370,14 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
 }
 
 #[test]
-fn github_self_trigger_policy_authorizes_the_trigger_actor_with_a_reasoned_rejection() {
+fn github_self_trigger_permission_is_separate_from_the_external_actor_allowlist() {
     let temp = tempdir().unwrap();
     let mut registry = registry(&temp.path().join("effects.jsonl"));
     let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
         unreachable!()
     };
     github.allow_self_triggered = true;
-    github.allowed_actors = vec!["tally-bot".to_owned()];
+    github.allowed_actors = vec!["operator".to_owned()];
     let engine = ProducerEngine::new(
         &registry,
         temp.path().join("events"),
@@ -1388,6 +1388,14 @@ fn github_self_trigger_policy_authorizes_the_trigger_actor_with_a_reasoned_rejec
     let allowed = gh_observation("I_self_authored", "tally-bot", "tally-bot");
     assert!(matches!(
         engine.emit_gh("github", &allowed, fixed_now()).unwrap(),
+        EmitOutcome::Emitted(_)
+    ));
+
+    let external_allowed = gh_observation("I_operator", "tally-bot", "operator");
+    assert!(matches!(
+        engine
+            .emit_gh("github", &external_allowed, fixed_now())
+            .unwrap(),
         EmitOutcome::Emitted(_)
     ));
 

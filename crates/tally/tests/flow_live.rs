@@ -826,16 +826,20 @@ async fn resume_all(client: &RpcClient) {
 }
 
 async fn flow_items(client: &RpcClient, flow_run_id: &str) -> Vec<Value> {
-    client
-        .call(
-            "query.jobs",
-            Some(json!({"flowRun": flow_run_id, "limit": 1000})),
-        )
-        .await
-        .unwrap()["items"]
-        .as_array()
-        .unwrap()
-        .clone()
+    let mut cursor: Option<String> = None;
+    let mut items = Vec::new();
+    loop {
+        let mut params = json!({"flowRun": flow_run_id, "limit": 1000});
+        if let Some(cursor) = cursor.as_ref() {
+            params["cursor"] = Value::String(cursor.clone());
+        }
+        let page = client.call("query.jobs", Some(params)).await.unwrap();
+        items.extend(page["items"].as_array().unwrap().iter().cloned());
+        cursor = page["nextCursor"].as_str().map(str::to_owned);
+        if cursor.is_none() {
+            return items;
+        }
+    }
 }
 
 async fn wait_for_flow_items(client: &RpcClient, flow_run_id: &str, expected: usize) -> Vec<Value> {
@@ -2499,14 +2503,16 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 fs::read_to_string(control.join("policy-error.log")).unwrap_or_default()
             );
 
-            let first_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 4).await;
+            let first_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 5).await;
             assert_eq!(
                 first_items.len(),
-                4,
-                "a red preflight must admit only reconcile, prep, gate, and cleanup"
+                5,
+                "a red preflight must admit only sweep, reconcile, prep, gate, and cleanup"
             );
-            assert!(first_items[0].get("taskRef").is_none());
-            assert!(first_items[1..]
+            assert!(first_items[..2]
+                .iter()
+                .all(|item| item.get("taskRef").is_none()));
+            assert!(first_items[2..]
                 .iter()
                 .all(|item| item["taskRef"] == "fixture/task-1"));
             let mut failed_preflight = None;
@@ -2605,21 +2611,50 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert!(control.join("started-task-1").exists());
             assert!(control.join("started-task-3").exists());
 
-            let second_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_2, 16).await;
-            assert!(second_items[0].get("taskRef").is_none());
+            let second_submitted = runner_events(&second, "node-submitted");
             assert_eq!(
-                second_items[1..]
+                second_submitted.len(),
+                19,
+                "unexpected second-pass nodes: {:?}",
+                second_submitted
+                    .iter()
+                    .map(|event| event["label"].as_str().unwrap_or("<missing>"))
+                    .collect::<Vec<_>>()
+            );
+            let second_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_2, 19).await;
+            assert_eq!(
+                second_items.len(),
+                19,
+                "unexpected durable second-pass nodes: {:?}",
+                json!({
+                    "durable": second_items
+                        .iter()
+                        .map(|item| {
+                            item["orchestration"]["nodeLabel"]
+                                .as_str()
+                                .unwrap_or("<missing>")
+                        })
+                        .collect::<Vec<_>>(),
+                    "submitted": second_submitted,
+                    "report": second_value,
+                })
+            );
+            assert!(second_items[..2]
+                .iter()
+                .all(|item| item.get("taskRef").is_none()));
+            assert_eq!(
+                second_items[2..]
                     .iter()
                     .filter(|item| item["taskRef"] == "fixture/task-1")
                     .count(),
-                7
+                8
             );
             assert_eq!(
-                second_items[1..]
+                second_items[2..]
                     .iter()
                     .filter(|item| item["taskRef"] == "fixture/task-3")
                     .count(),
-                8
+                9
             );
             let mut failed_constraint = None;
             for item in &second_items {
@@ -2663,6 +2698,19 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .is_some_and(|code| code != 0),
                 "the failed task must remain unmerged"
             );
+            assert!(
+                !fixture_git(&checkout, &["worktree", "list", "--porcelain"])
+                    .contains(workspace_root.to_str().unwrap()),
+                "pass exit must reclaim both the failed and merged frontier lanes"
+            );
+            assert!(
+                !workspace_root.join(".state").exists()
+                    || fs::read_dir(workspace_root.join(".state"))
+                        .unwrap()
+                        .next()
+                        .is_none(),
+                "pass exit left prep state behind"
+            );
 
             fs::write(control.join("constraint-cleared"), b"").unwrap();
 
@@ -2687,9 +2735,11 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(third_value["reconciled"]["frontier"], json!(["task-1"]));
             assert_eq!(third_value["merged"][0]["taskId"], "task-1");
             assert_eq!(third_value["failures"], json!([]));
-            let third_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_3, 9).await;
-            assert!(third_items[0].get("taskRef").is_none());
-            assert!(third_items[1..]
+            let third_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_3, 11).await;
+            assert!(third_items[..2]
+                .iter()
+                .all(|item| item.get("taskRef").is_none()));
+            assert!(third_items[2..]
                 .iter()
                 .all(|item| item["taskRef"] == "fixture/task-1"));
 
@@ -2708,7 +2758,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 &daemon_paths.socket,
                 &script,
                 SPEC_BUILD_RUN_4,
-                &arguments("timer-2026-08-01T12:00:00Z", "high"),
+                &arguments("fixture-comment-10", "high"),
                 32,
             )
             .spawn()
@@ -2733,31 +2783,35 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             );
             assert_eq!(fourth_value["failures"][0]["stage"], "checkpoint");
             let fourth_submitted = runner_events(&fourth, "node-submitted");
-            assert_eq!(fourth_submitted.len(), 12);
+            assert_eq!(fourth_submitted.len(), 14);
             assert!(fourth_submitted
                 .iter()
                 .all(|event| event["disposition"] == "created"));
-            assert!(fourth_submitted[0].get("taskRef").is_none());
+            assert!(fourth_submitted[..2]
+                .iter()
+                .all(|event| event.get("taskRef").is_none()));
             assert_eq!(
-                fourth_submitted[1..]
+                fourth_submitted[2..]
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/phase-one-checkpoint")
                     .count(),
                 3
             );
             assert_eq!(
-                fourth_submitted[1..]
+                fourth_submitted[2..]
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-4")
                     .count(),
-                8
+                9
             );
             assert!(fourth_submitted
                 .iter()
                 .any(|event| event["label"] == "checkpoint-phase-one-checkpoint"));
 
-            let fourth_items = flow_items(&client, SPEC_BUILD_RUN_4).await;
-            assert!(fourth_items[0].get("taskRef").is_none());
+            let fourth_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_4, 14).await;
+            assert!(fourth_items[..2]
+                .iter()
+                .all(|item| item.get("taskRef").is_none()));
             let failed_checkpoint = fourth_items
                 .iter()
                 .find(|item| {
@@ -2839,10 +2893,12 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .unwrap(),
                 checkpoint_revision
             );
-            let checkpoint_items = flow_items(&client, SPEC_BUILD_RUN_5).await;
-            assert_eq!(checkpoint_items.len(), 5);
-            assert!(checkpoint_items[0].get("taskRef").is_none());
-            assert!(checkpoint_items[1..]
+            let checkpoint_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_5, 6).await;
+            assert_eq!(checkpoint_items.len(), 6);
+            assert!(checkpoint_items[..2]
+                .iter()
+                .all(|item| item.get("taskRef").is_none()));
+            assert!(checkpoint_items[2..]
                 .iter()
                 .all(|item| item["taskRef"] == "fixture/phase-one-checkpoint"));
             assert!(checkpoint_items.iter().all(|item| {
@@ -2885,24 +2941,26 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(sixth_value["merged"][1]["regated"], true);
             assert_eq!(sixth_value["failures"], json!([]));
             let sixth_submitted = runner_events(&sixth, "node-submitted");
-            assert_eq!(sixth_submitted.len(), 20);
+            assert_eq!(sixth_submitted.len(), 23);
             assert!(sixth_submitted
                 .iter()
                 .all(|event| event["disposition"] == "created"));
-            assert!(sixth_submitted[0].get("taskRef").is_none());
+            assert!(sixth_submitted[..2]
+                .iter()
+                .all(|event| event.get("taskRef").is_none()));
             assert_eq!(
-                sixth_submitted[1..]
+                sixth_submitted[2..]
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-2")
                     .count(),
-                8
+                9
             );
             assert_eq!(
-                sixth_submitted[1..]
+                sixth_submitted[2..]
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-5")
                     .count(),
-                11
+                12
             );
             assert!(sixth_submitted
                 .iter()
@@ -2944,6 +3002,31 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 "the dependent task must be prepared from current checkpointed forge state"
             );
 
+            let replay = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_4,
+                &arguments("fixture-comment-10", "high"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let replay = runner_output(replay).await;
+            assert_eq!(replay.status.code(), Some(1));
+            let replay_failure = flow_failure(&replay);
+            assert_eq!(replay_failure["error"]["name"], "SpecBuildReplayError");
+            assert_eq!(replay_failure["error"]["code"], "campaign-replay-refused");
+            assert_eq!(
+                replay_failure["error"]["details"]["recovery"],
+                "post a fresh campaign mention"
+            );
+            let replayed = runner_events(&replay, "node-submitted");
+            assert_eq!(replayed.len(), 1);
+            assert_eq!(replayed[0]["label"], "spec-build-sweep");
+            assert_eq!(replayed[0]["disposition"], "reused");
+            assert_eq!(flow_items(&client, SPEC_BUILD_RUN_4).await.len(), 14);
+
             let complete = runner(
                 &config_path,
                 &daemon_paths.socket,
@@ -2978,9 +3061,15 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             );
             assert_eq!(complete_value["reconciled"]["remaining"], json!([]));
             assert_eq!(complete_value["reconciled"]["frontier"], json!([]));
-            let complete_items = flow_items(&client, SPEC_BUILD_RUN_7).await;
-            assert_eq!(complete_items.len(), 1);
-            assert!(complete_items[0].get("taskRef").is_none());
+            let complete_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_7, 2).await;
+            assert_eq!(complete_items.len(), 2);
+            assert!(complete_items
+                .iter()
+                .all(|item| item.get("taskRef").is_none()));
+            assert!(
+                !fixture_git(&checkout, &["worktree", "list", "--porcelain"])
+                    .contains(workspace_root.to_str().unwrap())
+            );
 
             let agent_order = fs::read_to_string(control.join("agent-order.log")).unwrap();
             let agents = agent_order.lines().collect::<Vec<_>>();

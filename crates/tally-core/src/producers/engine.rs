@@ -508,12 +508,16 @@ impl<'a> ProducerEngine<'a> {
                     origin.producer
                 )));
             }
-            let excluded = (!origin.allowed_actors.is_empty()
+            let self_triggered = origin
+                .trigger_actor
+                .eq_ignore_ascii_case(&origin.self_actor);
+            let excluded = (!self_triggered
+                && !origin.allowed_actors.is_empty()
                 && !origin
                     .allowed_actors
                     .iter()
                     .any(|actor| actor.eq_ignore_ascii_case(&origin.trigger_actor)))
-                || (origin.trigger_actor == origin.self_actor && !origin.allow_self_triggered)
+                || (self_triggered && !origin.allow_self_triggered)
                 || (origin.actor_exclude != "self"
                     && origin
                         .trigger_actor

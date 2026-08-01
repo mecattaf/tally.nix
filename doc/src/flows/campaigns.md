@@ -94,12 +94,12 @@ services.tally = {
 producer. Keep that loop-breaker when tally's authenticated GitHub identity is
 a bot. Set it to `true` only when the trusted person posting the campaign mention
 is also the account authenticated by `gh`, as in the single-account example
-above. `allowedActors` applies to both producers. The separately rendered
-merge-continuation producer matches only the exact continuation command and
-allows authenticated self-triggering, but retains that same actor allowlist.
-When `allowedActors` is non-empty, include the `gh` identity so its merge
-comments can start the next pass. One merged task therefore creates one
-deduplicated next-pass event without widening campaign admission.
+above. `allowedActors` filters external actors on both producers;
+`allowSelfTriggered` is the separate authorization for the authenticated `gh`
+identity and therefore does not require adding that identity to the external
+allowlist. The merge-continuation producer matches only the exact continuation
+command and always opts into authenticated self-triggering. A successful pass
+posts that command once, without widening external campaign admission.
 
 `postFailureEvidence` posts one comment for each failed attempt, so retries can
 accumulate several receipts. `postFailureStderr` requires it and adds only the
@@ -179,14 +179,16 @@ One enabled attrset expands to all of the following:
 | `producers.campaign-<name>-reconcile` | A GitHub search producer for the exact self-posted continuation command emitted after a merge. |
 | `<pool.name>` | A capacity-1 mutex held for one reconcile pass. |
 | `campaign-agent` | A counted `slot` pool whose rendered capacity is the largest enabled `maxParallel`. |
-| `campaign-control` | A small `cpu-slot` pool for reconciliation, Git, GitHub, and gate nodes. |
+| `campaign-control` | A `cpu-slot` pool for reconciliation, Git, GitHub, and gate nodes; its default capacity is the largest enabled `maxParallel`. |
 | `spec-build-driver` | The packaged deterministic policy driver used for reconcile, prep, built-in constraints, checkpoint recording, publish, rebase, and merge projections. |
 
-The producer posts its receipt and witnessed evidence. Each merge and each
-passed checkpoint posts an idempotently marked progress comment plus the exact
-continuation command; the next poll admits a fresh pass behind the campaign
-mutex. Neither producer closes the campaign issue. It remains the durable
-steering channel across passes.
+The producer posts its receipt and witnessed evidence. Each merge posts an
+idempotently marked progress comment. After the pass finishes its integration
+sequence, one separate node posts the exact continuation command. Each passed
+checkpoint posts its own idempotently marked checkpoint progress plus that
+command. The next poll admits a fresh pass behind the campaign mutex. Neither
+producer closes the campaign issue; it remains the durable steering channel
+across passes.
 
 Before admitting the first real run after deployment, verify the selected
 implementation adapter on that host:
@@ -330,15 +332,20 @@ node receipts, lifecycle and query output, `TALLY_TASK_REF`, unit names, and
 capture names. The worklist discovery node has no task ID and therefore no
 `taskRef`.
 
-The first node of every pass parses, normalizes, schema-validates, and witnesses
-this artifact together with its relative path and SHA-256 digest. The same node
-queries marked merged pull requests and validates the expected checkpoint refs,
-subtracts both sets of completed node IDs, applies `dependencies ⊆ completed`,
-and selects at most `maxParallel` conflict-disjoint nodes. Later nodes use only
-that witnessed result. The implementation node receives its one task, assigned
-workspace, campaign issue locator, and bounded mission. It is explicitly told
-not to read another task from the worklist and not to push, open a pull request,
-or merge. Those are separate deterministic nodes.
+The pass first sweeps run-local lanes left by older, no-longer-live pass
+identities. Its reconcile node then parses, normalizes, schema-validates, and
+witnesses this artifact together with its relative path and SHA-256 digest. The
+same node queries merged pull requests carrying tally's exact campaign/task
+marker and validates the expected checkpoint refs, subtracts both sets of
+completed node IDs, applies `dependencies ⊆ completed`, and selects at most
+`maxParallel` conflict-disjoint nodes. A pull-request proof must also target the
+configured base and use the stable task head branch. Unknown, retargeted, or
+otherwise unusable marked PRs are skipped with warnings in the witnessed
+result; multiple valid proofs for one task remain a hard ambiguity. Later nodes
+use only that witnessed result. An implementation node receives its one task,
+assigned workspace, campaign issue locator, and bounded mission. It is
+explicitly told not to read another task from the worklist and not to push,
+open a pull request, or merge. Those are separate deterministic nodes.
 
 A passed checkpoint is recorded as a lightweight Git tag below
 `refs/tags/tally/spec-build/v1/`. The expected ref includes the campaign, issue,
@@ -370,6 +377,8 @@ parallel(frontier):
     -> record content-bound completion ref -> clean up
 serial(successful publications): compare current base -> rebase if moved
   -> re-run each configured gate only on a changed rebased head -> merge
+if any task merged: post one continuation command for the pass
+clean every prepared task lane
 exit
 ```
 
@@ -400,7 +409,8 @@ The agent must leave a clean worktree with at least one commit descended from
 the prepared base. Publication refuses dirty, empty, or non-descendant work.
 Each task has a stable remote branch across passes and a run-local worktree lane,
 so a dead runner cannot make a later pass share a writable directory with an
-old child.
+old child. Pass-exit cleanup reclaims every prepared lane, including failures;
+the next pass's sweep covers a process that died before cleanup.
 
 Publications may finish in parallel, but integration follows deterministic
 frontier order. Before each merge the driver fetches current base. If the
@@ -410,6 +420,13 @@ gate on that new head, and merge refuses if either base or task branch moved
 again. Thus concurrent implementation does not weaken “witnessed gates are the
 merge criterion." A dependent task cannot enter any frontier until its
 prerequisite PR is observed merged by a later pass.
+
+If the published head conflicts with current base, the driver aborts the rebase
+and deletes only that exact leased remote head. Pass-exit cleanup removes the
+failed lane. The next reconcile attempt therefore prepares the task from
+current base and lets the agent redo it; it cannot resurrect the same
+unrebasable head indefinitely. A closed GitHub PR on the stable branch is
+reopened when the replacement head is published.
 
 A preflight failure stops the pass before any agent is admitted. Agent, task
 gate, checkpoint, publication, rebase, and merge failures are settled into the
@@ -454,12 +471,17 @@ mentions are safe because the campaign mutex serializes passes and each pass
 subtracts the same forge facts before dispatch.
 
 Each pass contains at most one bounded frontier, so the fixed 24-hour evaluator
-budget no longer measures the whole campaign. If a pass process dies, wait for
-any admitted children to settle and post a fresh mention. Stable remote task
-branches preserve published work; merged PRs preserve implementation
-completion, and checkpoint refs preserve successful automated barriers. Generic
-flows that truly require one run identity still use [submission identity and
-replay](submission-and-replay.md).
+budget no longer measures the whole campaign. Merge and mention events are the
+shipped campaign triggers; there is no periodic campaign timer. If a pass
+process dies or merges nothing, wait for any admitted children to settle and
+post a fresh mention. Stable remote task branches preserve published work;
+merged PRs preserve implementation completion, and checkpoint refs preserve
+successful automated barriers. Generic flows that truly require one run
+identity still use [submission identity and replay](submission-and-replay.md).
+Spec-build deliberately refuses a replayed flow-run ID after its first node:
+frontier branches execute concurrently and do not promise the same ordinal
+interleaving. Recovery must use a fresh mention and therefore a fresh forge
+event ID.
 
 ## Starting a new repository
 

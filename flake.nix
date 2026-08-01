@@ -3391,6 +3391,21 @@
           hardening-doc-drift = hardeningDocDrift;
           stock-home-activation = stockHome.activationPackage;
           module-layer = moduleContract;
+          spec-build-driver-tests =
+            pkgs.runCommand "tally-spec-build-driver-tests"
+              {
+                nativeBuildInputs = [
+                  pkgs.git
+                  pkgs.python3
+                ];
+              }
+              ''
+                export HOME="$TMPDIR/home"
+                mkdir -p "$HOME"
+                export SPEC_BUILD_DRIVER_SOURCE=${./examples/flows/spec_build_driver.py}
+                python3 ${./test/spec_build_driver_test.py}
+                touch "$out"
+              '';
           campaign-render =
             pkgs.runCommand "tally-campaign-render"
               {
@@ -3412,7 +3427,7 @@
                   .pools["fixture-campaign"].resource == "mutex" and
                   .pools["fixture-campaign"].capacity == 1 and
                   .pools["campaign-control"].resource == "cpu-slot" and
-                  .pools["campaign-control"].capacity == 4 and
+                  .pools["campaign-control"].capacity == 3 and
                   .pools["campaign-agent"].resource == "slot" and
                   .pools["campaign-agent"].capacity == 3 and
                   .adapters["spec-build-driver"].scrape.finalMessage.mode == "regex" and
@@ -3457,7 +3472,7 @@
                   .producers["campaign-fixture"].enqueue.argv[0:3] == [
                     "${tally}/bin/tally", "flow", "run"
                   ] and
-                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "31"] and
+                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "36"] and
                   .producers["campaign-fixture-reconcile"].kind == "gh" and
                   .producers["campaign-fixture-reconcile"].allowSelfTriggered == true and
                   .producers["campaign-fixture-reconcile"].allowedActors == ["operator"] and
@@ -3466,7 +3481,7 @@
                   .producers["campaign-fixture-reconcile"].postFailureStderr == true and
                   .producers["campaign-fixture-reconcile"].triggers.commandComments == ["/tally reconcile fixture"] and
                   .producers["campaign-fixture-reconcile"].enqueue.pool == ["fixture-campaign", "flow"] and
-                  .producers["campaign-fixture-reconcile"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "31"] and
+                  .producers["campaign-fixture-reconcile"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "36"] and
                   $reconcileArgs.reconcileCommand == "/tally reconcile fixture" and
                   .producers["campaign-defaulted"].allowSelfTriggered == false
                   and .producers["campaign-defaulted"].postFailureEvidence == false
@@ -3720,7 +3735,7 @@
                       taskId: "task-1",
                       baseRev: $base,
                       branch: "publication-stale",
-                      publishBranch: "tally/spec-build/v1/fixture/7/task-1",
+                      publishBranch: "tally/fixture-issue-7/task-1",
                       worktreePath: $checkout
                     },
                     constraints: $constraints
@@ -3734,7 +3749,7 @@
                 fi
                 grep -F 'build/LATE.SQLite' "$TMPDIR/publication-stale.err" >/dev/null
                 if git -C "$TMPDIR/spec" ls-remote --exit-code origin \
-                  refs/heads/tally/spec-build/v1/fixture/7/task-1 >/dev/null 2>&1; then
+                  refs/heads/tally/fixture-issue-7/task-1 >/dev/null 2>&1; then
                   echo "stale constrained head reached the remote" >&2
                   exit 1
                 fi
@@ -3748,10 +3763,10 @@
                 jq -e --arg head "$witnessed_head" '
                   .taskId == "task-1" and
                   .head == $head and
-                  .branch == "tally/spec-build/v1/fixture/7/task-1"
+                  .branch == "tally/fixture-issue-7/task-1"
                 ' "$TMPDIR/publication-pass.json" >/dev/null
                 test "$(git -C "$TMPDIR/spec" ls-remote origin \
-                  refs/heads/tally/spec-build/v1/fixture/7/task-1 | cut -f1)" = \
+                  refs/heads/tally/fixture-issue-7/task-1 | cut -f1)" = \
                   "$witnessed_head"
 
                 jq 'del(.tasks[0].conflictDomains)' "$worklistPath" \
@@ -3824,7 +3839,7 @@
                 test "$(jq -r '.argv[3]' "$payload")" = \
                   "$(jq -r '.flows.fixture.script' "$checkedConfig")"
 
-                reconcile_event='{"kind":"gh","source":"search","repo":"acme/spec","number":7,"htmlUrl":"https://github.com/acme/spec/issues/7","itemType":"issue","nodeId":"I-campaign-7","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"command-comment","eventId":"comment-8","commentId":"comment-8","triggerTimestamp":"2026-07-31T09:01:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["spec-campaign"],"assignees":[],"triggeringComment":{"id":"comment-8","author":"operator","body":"/tally reconcile fixture"}}}'
+                reconcile_event='{"kind":"gh","source":"search","repo":"acme/spec","number":7,"htmlUrl":"https://github.com/acme/spec/issues/7","itemType":"issue","nodeId":"I-campaign-7","itemAuthor":"operator","triggerActor":"tally-bot","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-8","commentId":"comment-8","triggerTimestamp":"2026-07-31T09:01:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["spec-campaign"],"assignees":[],"triggeringComment":{"id":"comment-8","author":"tally-bot","body":"/tally reconcile fixture"}}}'
                 reconcile_dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
                   __producer-dispatch campaign-fixture-reconcile \
                   --state-dir "$TMPDIR/state" --event "$reconcile_event")"
