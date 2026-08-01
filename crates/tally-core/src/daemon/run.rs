@@ -298,12 +298,6 @@ impl Daemon {
             &finished.outcome,
             Some(Ok(outcome)) if outcome.captures_available
         );
-        let capture_paths = finished
-            .outcome
-            .as_ref()
-            .and_then(|outcome| outcome.as_ref().ok())
-            .map(|outcome| outcome.paths.clone())
-            .unwrap_or_else(|| self.handler.executor.paths(&job.identity()));
         let effective_gate_manifest = effective_gate_manifest(&self.handler.executor, &job)?;
         let (result_revision, authorship, authorship_sessions) = match &finished.outcome {
             Some(Ok(outcome)) => (
@@ -434,34 +428,16 @@ impl Daemon {
             let attempt = finished.attempt;
             let lease_epoch = finished.lease_epoch;
             tokio::task::spawn_blocking(move || {
-                match executor.capture_generation_matches(&identity, attempt, lease_epoch) {
-                    Ok(true) => {}
-                    Ok(false) => {
+                match executor.persist_failure_stderr(&identity, attempt, lease_epoch) {
+                    Ok(Some(excerpt)) => Some(excerpt),
+                    Ok(None) => {
                         eprintln!(
                             "tally: failure stderr for {stable} has no matching capture generation"
                         );
-                        return None;
+                        None
                     }
-                    Err(error) => {
-                        eprintln!(
-                            "tally: could not validate failure stderr generation for {stable}: {error}"
-                        );
-                        return None;
-                    }
-                }
-                let failure_path = match executor.persist_failure_stderr(&capture_paths) {
-                    Ok(path) => path,
                     Err(error) => {
                         eprintln!("tally: could not persist failure stderr for {stable}: {error}");
-                        capture_paths.stderr
-                    }
-                };
-                match crate::executor::read_capture_excerpt(&failure_path) {
-                    Ok(excerpt) => Some(excerpt),
-                    Err(error) => {
-                        eprintln!(
-                            "tally: could not read failure stderr tail for {stable}: {error}"
-                        );
                         None
                     }
                 }

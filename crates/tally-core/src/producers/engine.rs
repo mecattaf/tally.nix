@@ -672,10 +672,26 @@ impl<'a> ProducerEngine<'a> {
         self.validate_gh_origin(origin)?;
         let assisted_by = evidence.as_ref().and_then(assisted_by_from_evidence);
         let execution_passed = matches!(verdict, Verdict::Pass | Verdict::Reused);
-        // A terminal failure receipt is at least as operationally important as
-        // a passing receipt. The evidence envelope carries the bounded stderr
-        // tail when one was captured; close policy remains pass-only below.
-        let evidence = config.post_evidence.then_some(evidence).flatten();
+        let execution_failed = matches!(
+            verdict,
+            Verdict::CleanExitNoArtifact
+                | Verdict::Failed
+                | Verdict::Cancelled
+                | Verdict::PoolVanished
+                | Verdict::RuntimeExceeded
+        );
+        // `postEvidence` predates failure receipts and remains a success-only
+        // switch. Failure publication is deliberately separate because its
+        // envelope originates in private process capture. Even an explicit
+        // stderr opt-in passes through the conservative public redactor here,
+        // at the last boundary before the mutation sink.
+        let evidence = if execution_passed && config.post_evidence {
+            public_evidence(evidence, false)
+        } else if execution_failed && config.post_failure_evidence {
+            public_evidence(evidence, config.post_failure_stderr)
+        } else {
+            None
+        };
         let gate_summary = config
             .post_gate_summary
             .then(|| completion.as_ref().map(|facts| facts.gates.clone()))
@@ -1061,6 +1077,177 @@ impl<'a> ProducerEngine<'a> {
             Ok(EmitOutcome::Duplicate)
         }
     }
+}
+
+const PUBLIC_STDERR_TRUNCATION_MARKER: &str = "[... earlier redacted stderr omitted ...]\n";
+const PUBLIC_STDERR_REDACTION: &str = "conservative-v1";
+
+fn public_evidence(evidence: Option<Value>, include_failure_stderr: bool) -> Option<Value> {
+    evidence.map(|mut evidence| {
+        let Value::Object(fields) = &mut evidence else {
+            return evidence;
+        };
+        let stderr = fields.remove("stderrTail");
+        let stderr_was_truncated = fields
+            .remove("stderrTruncated")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        // Refuse alternate internal spellings rather than allowing a future
+        // caller to bypass the one reviewed publication path.
+        fields.remove("stderr_excerpt");
+        fields.remove("stderr_truncated");
+        if include_failure_stderr {
+            if let Some(Value::String(stderr)) = stderr {
+                let (stderr, redacted, additionally_truncated) = redact_public_stderr(&stderr);
+                fields.insert("stderrTail".to_owned(), Value::String(stderr));
+                fields.insert(
+                    "stderrTruncated".to_owned(),
+                    Value::Bool(stderr_was_truncated || additionally_truncated),
+                );
+                fields.insert(
+                    "stderrRedaction".to_owned(),
+                    Value::String(PUBLIC_STDERR_REDACTION.to_owned()),
+                );
+                fields.insert("stderrRedacted".to_owned(), Value::Bool(redacted));
+            }
+        }
+        evidence
+    })
+}
+
+fn redact_public_stderr(stderr: &str) -> (String, bool, bool) {
+    let mut output = String::with_capacity(stderr.len());
+    let mut redacted = false;
+    let mut private_key_block = false;
+    for line in stderr.split_inclusive('\n') {
+        let lower = line.to_ascii_lowercase();
+        if lower.contains("-----begin ") && lower.contains("private key-----") {
+            private_key_block = true;
+        }
+        let sensitive_line = private_key_block || stderr_line_is_sensitive(&lower);
+        if sensitive_line {
+            output.push_str("[redacted sensitive stderr line]");
+            if line.ends_with('\n') {
+                output.push('\n');
+            }
+            redacted = true;
+        } else {
+            let (line, line_redacted) = redact_stderr_tokens(line);
+            output.push_str(&line);
+            redacted |= line_redacted;
+        }
+        if lower.contains("-----end ") && lower.contains("private key-----") {
+            private_key_block = false;
+        }
+    }
+    // `split_inclusive` yields no item for the empty string.
+    if stderr.is_empty() {
+        output.clear();
+    }
+    if output.len() <= crate::executor::CAPTURE_EXCERPT_MAX_BYTES {
+        return (output, redacted, false);
+    }
+    let tail_limit =
+        crate::executor::CAPTURE_EXCERPT_MAX_BYTES - PUBLIC_STDERR_TRUNCATION_MARKER.len();
+    let mut start = output.len() - tail_limit;
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    let mut bounded = String::with_capacity(crate::executor::CAPTURE_EXCERPT_MAX_BYTES);
+    bounded.push_str(PUBLIC_STDERR_TRUNCATION_MARKER);
+    bounded.push_str(&output[start..]);
+    (bounded, redacted, true)
+}
+
+fn stderr_line_is_sensitive(lower: &str) -> bool {
+    [
+        "authorization",
+        "bearer ",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "credential",
+        "api_key",
+        "api-key",
+        "apikey",
+        "private key",
+        "access key",
+        "access_key",
+        "secret_key",
+        "client_secret",
+        "client key",
+        "cookie",
+        "dsn=",
+        "session_id",
+        "sessionid",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
+fn redact_stderr_tokens(line: &str) -> (String, bool) {
+    let mut output = String::with_capacity(line.len());
+    let mut redacted = false;
+    for chunk in line.split_inclusive(char::is_whitespace) {
+        let content_len = chunk.trim_end_matches(char::is_whitespace).len();
+        let (content, spacing) = chunk.split_at(content_len);
+        if stderr_token_is_sensitive(content) {
+            output.push_str("[redacted-token]");
+            redacted = true;
+        } else {
+            output.push_str(content);
+        }
+        output.push_str(spacing);
+    }
+    (output, redacted)
+}
+
+fn stderr_token_is_sensitive(token: &str) -> bool {
+    let token = token.trim_matches(|character: char| {
+        matches!(
+            character,
+            '\'' | '"' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';'
+        )
+    });
+    let lower = token.to_ascii_lowercase();
+    if [
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "ghr_",
+        "github_pat_",
+        "sk-",
+        "xoxb-",
+        "xoxp-",
+        "xoxa-",
+        "xoxr-",
+    ]
+    .iter()
+    .any(|prefix| lower.contains(prefix))
+        || ((token.contains("AKIA") || token.contains("ASIA")) && token.len() >= 16)
+        || (token.contains("://") && (token.contains('@') || token.contains('?')))
+    {
+        return true;
+    }
+    let jwt_parts = token.split('.').collect::<Vec<_>>();
+    if jwt_parts.len() == 3 && jwt_parts.iter().all(|part| part.len() >= 8) {
+        return true;
+    }
+    if token.len() < 32 || !token.is_ascii() {
+        return false;
+    }
+    let has_lower = token.bytes().any(|byte| byte.is_ascii_lowercase());
+    let has_upper = token.bytes().any(|byte| byte.is_ascii_uppercase());
+    let has_digit = token.bytes().any(|byte| byte.is_ascii_digit());
+    if token.len() >= 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return true;
+    }
+    let token_like = token.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'_' | b'-' | b'=')
+    });
+    token_like && has_digit && ((has_lower && has_upper) || token.len() >= 40)
 }
 
 pub(super) fn stable_key(parts: &[&str]) -> String {

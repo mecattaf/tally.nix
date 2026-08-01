@@ -61,8 +61,8 @@ state directory, plus the declared workspace. Use it only for trusted programs.
   [`extraWritablePaths`](core-options.md#servicestallyadaptersnameextrawritablepaths).
 
 systemd opens `<uuid>.out` and `<uuid>.adapter.err`; after a failed terminal
-verdict, the daemon creates the failure-only `<uuid>.err` copy outside the job
-unit. The `ExecStopPost` recorder atomically replaces the exit record, the
+verdict, the daemon atomically creates the failure-only, bounded `<uuid>.err`
+diagnostic projection outside the job unit. The `ExecStopPost` recorder atomically replaces the exit record, the
 exec-attestation wrapper appends the ledger, and the job may write its declared
 gate manifest. A cooperative yield hook does not need a state-directory write
 grant: it calls the daemon over `TALLY_SOCKET`.

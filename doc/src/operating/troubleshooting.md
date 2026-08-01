@@ -35,15 +35,17 @@ $ tally query log --task <task-uuid> --event failed \
 ```
 
 `stderrTruncated: true` means earlier bytes were omitted. If the tail is not
-enough, inspect `<stateDir>/capture/<task-uuid>.err`, which is materialized only
-for a failed generation. The byte-authoritative raw adapter stream is
+enough, inspect `<stateDir>/capture/<task-uuid>.err`, an atomic UTF-8 diagnostic
+projection capped at 2 KiB and materialized only for a failed generation. The
+byte-authoritative raw adapter stream is
 `<task-uuid>.adapter.err`; it exists on successful jobs too and may contain
 routine runtime chatter, so non-empty `.adapter.err` is not a failure signal.
 
-For a campaign admitted by a GitHub producer with `postEvidence`, the failure
-receipt contains the same bounded tail. A flow runner's structured terminal
-error also embeds its failed child's tail, making the campaign issue the first
-diagnostic surface rather than a pointer to hidden state.
+`postEvidence` never publishes a failure. A campaign issue receives failure
+metadata only with explicit `postFailureEvidence`; it receives a conservatively
+redacted tail only when `postFailureStderr` is also enabled. Each failed retry
+has its own durable completion ID and therefore its own comment. A flow
+runner's local structured terminal error still embeds its failed child's tail.
 
 ## A job never admits
 

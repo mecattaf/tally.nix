@@ -10,6 +10,37 @@ pub struct CaptureExcerpt {
 }
 
 impl Executor {
+    pub(super) fn lock_capture(&self, identity: &ExecutionIdentity) -> Result<File, ExecutorError> {
+        let path = self
+            .state_dir
+            .join(UNIT_EXIT_DIRECTORY)
+            .join(format!("{}.capture.lock", identity.unit_uuid()));
+        let parent = path
+            .parent()
+            .expect("capture lock path always has a parent");
+        create_private_directory(parent)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .map_err(|source| io_error(&path, source))?;
+        let metadata = file.metadata().map_err(|source| io_error(&path, source))?;
+        if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+            return Err(ExecutorError::InvalidRequest(format!(
+                "capture lock {} is not a private regular file",
+                path.display()
+            )));
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .map_err(|source| io_error(&path, source))?;
+        file.lock_exclusive()
+            .map_err(|source| io_error(&path, source))?;
+        Ok(file)
+    }
+
     pub fn capture_generation_matches(
         &self,
         identity: &ExecutionIdentity,
@@ -206,16 +237,24 @@ impl Executor {
         Ok(())
     }
 
-    /// Materialize the operator-facing `.err` capture for a failed terminal
-    /// generation. Raw adapter stderr stays under `.adapter.err` so configured
-    /// scrapes and traces retain their byte-authoritative source.
-    pub fn persist_failure_stderr(&self, paths: &ExecutionPaths) -> Result<PathBuf, ExecutorError> {
-        if paths.failure_stderr.exists() {
-            ensure_private_file(&paths.failure_stderr)?;
-            return Ok(paths.failure_stderr.clone());
+    /// Materialize the operator-facing `.err` projection for an exactly
+    /// identified failed generation. The same lock guards retry preparation,
+    /// so a late terminal handler can neither inspect one generation and copy
+    /// another nor stamp a failure signal onto a newer healthy attempt.
+    pub fn persist_failure_stderr(
+        &self,
+        identity: &ExecutionIdentity,
+        attempt: u32,
+        lease_epoch: u64,
+    ) -> Result<Option<CaptureExcerpt>, ExecutorError> {
+        let _capture_lock = self.lock_capture(identity)?;
+        if !self.capture_generation_matches(identity, attempt, lease_epoch)? {
+            return Ok(None);
         }
-        copy_private_file_exclusive(&paths.stderr, &paths.failure_stderr)?;
-        Ok(paths.failure_stderr.clone())
+        let paths = self.paths(identity);
+        let excerpt = read_capture_excerpt(&paths.stderr)?;
+        replace_private_file(&paths.failure_stderr, excerpt.text.as_bytes())?;
+        Ok(Some(excerpt))
     }
 
     /// Move a capture written by a pre-split in-flight unit to the raw adapter
@@ -268,6 +307,13 @@ pub fn read_capture_excerpt(path: &Path) -> Result<CaptureExcerpt, ExecutorError
     file.take(max)
         .read_to_end(&mut bytes)
         .map_err(|source| io_error(path, source))?;
+    if start > 0 {
+        let partial_prefix = bytes
+            .iter()
+            .take_while(|byte| **byte & 0b1100_0000 == 0b1000_0000)
+            .count();
+        bytes.drain(..partial_prefix);
+    }
     let mut truncated = start > 0;
     let mut text = String::from_utf8_lossy(&bytes).replace('\0', "�");
     let plain_limit = if truncated {
@@ -289,7 +335,11 @@ pub fn read_capture_excerpt(path: &Path) -> Result<CaptureExcerpt, ExecutorError
         }
         text.insert_str(0, CAPTURE_EXCERPT_TRUNCATION_MARKER);
     }
-    debug_assert!(text.len() <= CAPTURE_EXCERPT_MAX_BYTES);
+    if text.len() > CAPTURE_EXCERPT_MAX_BYTES {
+        return Err(ExecutorError::InvalidRequest(format!(
+            "capture excerpt exceeded the {CAPTURE_EXCERPT_MAX_BYTES} byte bound"
+        )));
+    }
     Ok(CaptureExcerpt { text, truncated })
 }
 

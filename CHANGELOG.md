@@ -118,11 +118,21 @@ authorized.
   stay pinned to the configured tally package, keeping job queries,
   transient-unit status, and process argv bounded independently of campaign
   input size; manual flow invocations can also use an `--args-path` JSON file.
-- Failed lifecycle records, `tally query log`, terminal waits, flow-node
-  failures, and GitHub producer evidence now carry the final bounded 2 KiB of
-  captured stderr. Raw adapter stderr is retained as `.adapter.err`, while the
-  conventional `.err` capture is materialized only for failed jobs, so routine
-  adapter chatter is no longer a false failure signal.
+- Failed lifecycle records, `tally query log`, terminal waits, and flow-node
+  failures now carry the final bounded 2 KiB of captured stderr. Raw adapter
+  stderr is retained as `.adapter.err`, while the conventional `.err`
+  diagnostic projection is materialized only for failed jobs, so routine
+  adapter chatter is no longer a false failure signal. GitHub failure evidence
+  is governed by separate default-off publication controls described below.
+- Reconciled missing current-generation `.err` projections from failed
+  witnesses during startup, serialized projection creation against retry and
+  remote-capture replacement, classified substituted results as successful
+  lifecycle events, and avoided a replacement character when a byte-bounded
+  stderr tail starts inside a UTF-8 codepoint.
+- Restricted startup GitHub completion replay to durable rows already in
+  completed/deleted recovery states and to terminal verdicts, preventing
+  unrelated pending rows or nonterminal witnesses from being replayed as
+  completion mutations.
 - Made producer briefs single-copy and retention-owned: producers now write
   directly into `<dataDir>/briefs`, admission and GC share a lock, and the
   existing retention horizon preserves live/recent job inputs while pruning
@@ -153,6 +163,15 @@ authorized.
   legitimately valid, so the properties reported a false tamper miss on the seeds that selected it.
 
 ### Changed
+
+- Restored `postEvidence` to its original pass/reuse-only meaning. Operators
+  may opt into one idempotent public comment per failed attempt with
+  `postFailureEvidence`; retries therefore accumulate distinct failure
+  receipts only under that explicit policy.
+- Made failure-only `.err` files atomic UTF-8 diagnostic projections capped at
+  2 KiB instead of full byte-for-byte duplicates of `.adapter.err`. The raw
+  stream remains authoritative; coordinator attempt archives are pruned by the
+  existing `captureArchiveHorizon` policy (30 days by default).
 
 - Served the daemon's per-query row projections from Arc-shared snapshots rebuilt only after a
   mutation instead of deep-cloning every projection per query.
@@ -222,6 +241,12 @@ authorized.
   find or clean up the failed launch.
 
 ### Security
+
+- Stopped raw private process stderr from crossing the GitHub mutation boundary
+  through `postEvidence`. New `postFailureEvidence` and `postFailureStderr`
+  controls default to false for generic producers and campaigns; explicitly
+  published tails receive conservative secret redaction, and HTML-significant
+  JSON characters are escaped so evidence cannot inject a completion marker.
 
 - Disabled the executor's unhardened direct-process fallback by default; library consumers must
   opt into that compatibility path explicitly.

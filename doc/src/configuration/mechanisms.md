@@ -168,6 +168,8 @@ semantics.
 A `gh` producer separates intake from external side effects. The relevant
 switches are [`postReceipt`](core-options.md#servicestallyproducersnamepostreceipt),
 [`postEvidence`](core-options.md#servicestallyproducersnamepostevidence),
+[`postFailureEvidence`](core-options.md#servicestallyproducersnamepostfailureevidence),
+[`postFailureStderr`](core-options.md#servicestallyproducersnamepostfailurestderr),
 [`postGateSummary`](core-options.md#servicestallyproducersnamepostgatesummary),
 [`requestReview`](core-options.md#servicestallyproducersnamerequestreview),
 [`closeOnAcceptance`](core-options.md#servicestallyproducersnamecloseonacceptance),
@@ -177,10 +179,19 @@ switches are [`postReceipt`](core-options.md#servicestallyproducersnamepostrecei
 close. Gate summaries and acceptance-based closure require an enqueue
 `gateManifest`.
 
-When `postEvidence` is enabled, every terminal verdict posts an idempotent
-evidence comment. A failed receipt includes the bounded captured-stderr tail
-and never closes solely because it was posted; pass and acceptance closure
-policies remain separate.
+`postEvidence` posts only passing and reused evidence, preserving its original
+operator-facing meaning. Failure evidence is a separate public side effect and
+is disabled by default. `postFailureEvidence` explicitly posts one idempotent
+comment per failed attempt; `postFailureStderr` additionally includes the
+bounded tail after conservative secret redaction and requires
+`postFailureEvidence`. Redaction is defense in depth, not a guarantee that
+arbitrary application secrets can be recognized, so do not enable stderr
+publication merely for convenience. Failed receipts never close an item solely
+because they were posted; pass and acceptance closure policies remain separate.
+
+```text
+gh producer ${name} postFailureStderr=true requires postFailureEvidence=true
+```
 
 Pass-based closure is allowed only when the evidence comment is also enabled:
 

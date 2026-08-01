@@ -144,8 +144,9 @@ pub struct ExecutionPaths {
     /// scrapes and traces, but uses an explicit `.adapter.err` suffix so it is
     /// not mistaken for a terminal failure signal.
     pub stderr: PathBuf,
-    /// Present only after a terminal failure. This is the operator-facing
-    /// `<uuid>.err` capture used by external monitors and failure diagnostics.
+    /// Present only after a terminal failure. This is the operator-facing,
+    /// bounded UTF-8 `<uuid>.err` projection used by external monitors and
+    /// failure diagnostics; raw bytes remain in `.adapter.err`.
     pub failure_stderr: PathBuf,
     pub exit_record: PathBuf,
     pub capture_generation: PathBuf,

@@ -73,6 +73,11 @@ pub fn validate_registry(
                         "gh producer {name:?} closeOnPass=true requires postEvidence=true"
                     )));
                 }
+                if config.post_failure_stderr && !config.post_failure_evidence {
+                    return Err(ProducerError::InvalidConfig(format!(
+                        "gh producer {name:?} postFailureStderr=true requires postFailureEvidence=true"
+                    )));
+                }
                 if (config.post_gate_summary || config.close_on_acceptance)
                     && config.enqueue.gate_manifest.is_none()
                 {
