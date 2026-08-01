@@ -427,5 +427,6 @@ the log is `invalid_params`. Watch records are typed as `job`, `lifecycle`, `tra
 
 Every declared wire code, its current emission status, and CLI mapping is listed in
 [Exit codes and error taxonomy](errors.md). In particular, do not collapse
-`dedup-key-conflict`, `flow-node-cap`, `storage-budget-exceeded`, or `not_found` into a generic retry: each carries a
-different recovery decision.
+`dedup-key-conflict`, `flow-node-cap`, `storage-budget-exceeded`,
+`storage-monitor-unavailable`, or `not_found` into a generic retry: each carries a different
+recovery decision.

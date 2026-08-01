@@ -29,6 +29,15 @@ impl DaemonHandler {
             return;
         };
         for warning in warnings {
+            let receipt_key = StorageReceiptKey {
+                producer: origin.producer.clone(),
+                source: origin.source.clone(),
+                item_id: origin.node_id.clone(),
+                warning_sequence: warning.warning_sequence,
+            };
+            if !self.storage_receipts.borrow_mut().insert(receipt_key) {
+                continue;
+            }
             let warning = warning.clone();
             let handler = self.clone();
             let origin = origin.clone();

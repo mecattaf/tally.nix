@@ -37,7 +37,8 @@ The wire error object is:
 | `epoch_changed` | Declared transient lease-generation code used by the flow client's retry classification; current daemon lease errors are mapped differently and do not emit it. | 1 |
 | `dedup-key-conflict` | Full-mode dedup key already governs a different canonical payload. | 1 |
 | `flow-node-cap` | Admitting the node would exceed the capsule's run-scoped `maxNodes`. | 1 |
-| `storage-budget-exceeded` | A daemon-owned store crossed its hard budget, or the monitor cannot safely determine current usage. New intake is refused; admitted work and queries continue. | 1 |
+| `storage-budget-exceeded` | A daemon-owned store crossed its allocated-byte hard limit or its filesystem fell below `minimumFreeBytes`. New intake is refused; admitted work and queries continue. | 1 |
+| `storage-monitor-unavailable` | The cached monitor reports an I/O or state failure and cannot make a safe budget decision. New intake is refused; admitted work and queries continue. | 1 |
 
 The CLI mapping is intentionally narrow: only `invalid_params` and `not_found` get dedicated
 codes. All other RPC errors exit 1. A daemon socket that cannot be reached exits 3 before any
@@ -65,9 +66,11 @@ The singular compatibility fields appear only when exactly one candidate exists.
 
 These are semantic failures. Blindly retrying the same request will reproduce them.
 
-`storage-budget-exceeded` carries the active warning episodes and the complete `query.storage`
-snapshot in `data.storage`. Free space by applying the declared retention policy or raise the
-budget deliberately; do not blindly retry while `data.storage.intake.accepting` is false.
+`storage-budget-exceeded` carries the active warning episode and the complete cached
+`query.storage` snapshot in `data.storage`. Free space by applying the declared retention policy
+or raise the budget deliberately; do not blindly retry while `data.storage.intake.accepting` is
+false. `storage-monitor-unavailable` carries the same snapshot, with `monitorError` identifying
+why measurement failed. Repair that error rather than treating it as a crossed byte threshold.
 
 Public `tally enqueue --dedup-key KEY` requests use full submission mode by default, so a live
 same-key/different-payload collision reports `dedup-key-conflict` on stderr and exits 1.
@@ -170,6 +173,7 @@ The flow client translates notable RPC codes to flow codes before this exit mapp
 | `dedup-key-conflict` | `dedup-key-conflict` (or `replay-divergence` when same-run evidence proves that case) |
 | `flow-node-cap` | `flow-node-cap` |
 | `storage-budget-exceeded` | `storage-budget-exceeded` |
+| `storage-monitor-unavailable` | `storage-monitor-unavailable` |
 | `invalid_params`, `not_found` | `admission-denied` |
 | `frame_too_large` | `frame-too-large` |
 | `unsupported_protocol` | `unsupported-protocol` |

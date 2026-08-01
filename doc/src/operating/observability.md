@@ -20,9 +20,17 @@ $ tally query storage | jq '{intake, dataDir, stateDir, taskchampion, growthPerC
 ```
 
 The two store sizes use allocated filesystem blocks for budget decisions and also expose
-apparent bytes and file counts. `taskchampion` separates `databaseBytes`, `walBytes`, and
-`shmBytes`, then reports `taskCount` and the append-only SQLite `operationHighWater`. A projection
-read failure is visible as `readError`; total store budgets remain authoritative.
+apparent bytes and file counts. Each store reports `filesystemAvailableBytes` and its configured
+`minimumFreeBytes`; falling below that floor is hard pressure even when the store's own allocated
+bytes are small. `taskchampion` separates `databaseBytes`, `walBytes`, and `shmBytes`, then reports
+`taskCount` and the append-only SQLite `operationHighWater`. A projection read failure is visible
+as `readError`; the total-store and free-space decisions remain authoritative.
+
+Directory measurement is an off-thread, cached sample. `sampledAt` is the age boundary:
+`query storage`, `query status`, and every enqueue return that snapshot without walking either
+tree. The periodic sampler starts at most one single-flight refresh per
+`storage.pollIntervalSec`. The blocking walk does not occupy the daemon's current-thread runtime,
+accept loop, intake path, completion path, lease tick, or watchdog.
 
 `growthPerCompletion` compares samples across canonical witness-count boundaries. Signed byte
 rates make both growth and successful compaction visible. `query status` embeds the same object
@@ -30,10 +38,21 @@ under `storage`, so a future human-oriented status surface can consume it withou
 contract.
 
 Warning and hard transitions are fsynced to `<dataDir>/storage-warnings.jsonl` and emitted on the
-daemon's journal stream. GitHub campaign intake with evidence receipts enabled also gets one
-idempotent issue comment per warning episode. At a hard threshold, tally rejects only new enqueue
-and continuation requests with `storage-budget-exceeded`; admitted work, retry, cancel, pause,
-resume, and every query remain available.
+daemon's journal stream. A level recovers only after allocated bytes fall below 90% of the crossed
+threshold (or free bytes rise to the inverse recovery boundary). Warning-to-hard-to-warning
+changes stay in one episode until full recovery, so GitHub campaign intake with evidence receipts
+enabled gets at most one idempotent issue comment for that pressure episode.
+
+At a hard size or free-space threshold, tally rejects only new enqueue and continuation requests
+with `storage-budget-exceeded`; admitted work, retry, cancel, pause, resume, and every query remain
+available. If measurement itself fails, the same intake scope is refused with the distinct
+`storage-monitor-unavailable` code and `monitorError` explains the failure. Concurrent removal of
+a directory below either store is treated as a normal vanished entry, not a monitor outage.
+
+`<dataDir>/storage-metrics.json` is derived advisory state. Unsupported schema versions, foreign
+fields, malformed JSON, and inconsistent episode fields are ignored at startup, journaled, and
+replaced by a fresh sample. The durable warning log supplies the next episode sequence so a reset
+does not collide with an earlier campaign receipt.
 
 ## Find the task anchor
 

@@ -889,6 +889,7 @@ fn client_error(error: WireIoError) -> ClientError {
                 WireErrorCode::DedupKeyConflict => "dedup-key-conflict",
                 WireErrorCode::FlowNodeCap => "flow-node-cap",
                 WireErrorCode::StorageBudgetExceeded => "storage-budget-exceeded",
+                WireErrorCode::StorageMonitorUnavailable => "storage-monitor-unavailable",
                 WireErrorCode::InvalidParams | WireErrorCode::NotFound => "admission-denied",
                 WireErrorCode::FrameTooLarge => "frame-too-large",
                 WireErrorCode::UnsupportedProtocol => "unsupported-protocol",

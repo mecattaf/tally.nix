@@ -582,6 +582,7 @@ mod tests {
                 let budget = crate::config::StorageBudgetConfig {
                     warning_bytes: 1024 * 1024,
                     hard_bytes: 2 * 1024 * 1024,
+                    minimum_free_bytes: 1,
                 };
                 config.storage.data_dir = budget.clone();
                 config.storage.state_dir = budget;
@@ -612,6 +613,14 @@ mod tests {
 
                 fs::write(paths.data_dir.join("controlled-pressure"), vec![0_u8; 3 * 1024 * 1024])
                     .unwrap();
+                let cached = daemon
+                    .handler
+                    .query("query.storage", Some(json!({})))
+                    .await
+                    .unwrap();
+                assert_eq!(cached["dataDir"]["level"], "ok");
+                assert_eq!(cached["intake"]["accepting"], true);
+                daemon.handler.refresh_storage_now().await;
                 let storage = daemon
                     .handler
                     .query("query.storage", Some(json!({})))
@@ -647,6 +656,105 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(status["storage"]["intake"]["accepting"], false);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_sampling_uses_the_blocking_pool_without_stalling_the_local_runtime() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .storage
+                    .borrow_mut()
+                    .monitor
+                    .as_mut()
+                    .unwrap()
+                    .set_sample_delay(Duration::from_millis(200));
+
+                let handler = daemon.handler.clone();
+                let started = Instant::now();
+                let refresh = tokio::task::spawn_local(async move {
+                    handler.refresh_storage_now().await;
+                });
+                tokio::task::yield_now().await;
+                assert!(
+                    started.elapsed() < Duration::from_millis(100),
+                    "blocking storage walk stalled the current-thread runtime"
+                );
+                refresh.await.unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn enqueue_uses_the_cached_storage_snapshot_when_a_periodic_sample_is_due() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let due_since = Instant::now() - Duration::from_secs(120);
+                daemon.handler.storage.borrow_mut().last_sample = due_since;
+
+                daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+
+                assert_eq!(daemon.handler.storage.borrow().last_sample, due_since);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unavailable_storage_monitor_has_a_distinct_intake_error() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                {
+                    let mut storage = daemon.handler.storage.borrow_mut();
+                    storage.snapshot = storage
+                        .snapshot
+                        .clone()
+                        .with_monitor_error("test monitor outage");
+                }
+                let rows_before = daemon.handler.context.read().await.rows.len();
+                let refused = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap_err();
+                assert_eq!(refused.code, WireErrorCode::StorageMonitorUnavailable);
+                assert!(refused.message.contains("storage monitor is unavailable"));
+                assert_eq!(daemon.handler.context.read().await.rows.len(), rows_before);
             })
             .await;
     }

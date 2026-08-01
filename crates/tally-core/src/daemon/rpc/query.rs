@@ -60,7 +60,7 @@ impl DaemonHandler {
             #[serde(deny_unknown_fields)]
             struct Params {}
             let _: Params = decode_params(params)?;
-            return serde_json::to_value(self.refresh_storage().await).map_err(internal_wire);
+            return serde_json::to_value(self.cached_storage()).map_err(internal_wire);
         }
 
         // Paginated methods decode their parameters first: a continuation
@@ -147,7 +147,7 @@ impl DaemonHandler {
                 overlay_live_states(&mut view.jobs, &live_states);
                 let mut value = serde_json::to_value(view).map_err(internal_wire)?;
                 value["storage"] =
-                    serde_json::to_value(self.refresh_storage().await).map_err(internal_wire)?;
+                    serde_json::to_value(self.cached_storage()).map_err(internal_wire)?;
                 Ok(value)
             }
             "query.proof" => {

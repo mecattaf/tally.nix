@@ -86,11 +86,15 @@ impl Daemon {
         }
         let mut lease_tick = tokio::time::interval(LEASE_TICK);
         lease_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let storage_poll_interval = self.handler.storage.borrow().poll_interval();
-        let mut storage_tick = tokio::time::interval(storage_poll_interval);
+        let storage_poll_interval = self.handler.storage.borrow().poll_interval;
+        let mut storage_tick = tokio::time::interval_at(
+            tokio::time::Instant::now() + storage_poll_interval,
+            storage_poll_interval,
+        );
         storage_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut watchdog = self.notifier.watchdog_interval();
         let mut lease_ticks = JoinSet::new();
+        let mut storage_samples = JoinSet::new();
         let mut connections = JoinSet::new();
         let max_connections = self.handler.settings.max_connections;
         #[cfg(test)]
@@ -170,7 +174,17 @@ impl Daemon {
                         }
                         _ = storage_tick.tick() => {
                             self.handler.compact_lifecycle_if_needed().await;
-                            self.handler.refresh_storage().await;
+                            if storage_samples.is_empty() {
+                                let handler = self.handler.clone();
+                                storage_samples.spawn_local(async move {
+                                    handler.refresh_storage_if_due().await
+                                });
+                            }
+                        }
+                        Some(sampled) = storage_samples.join_next(), if !storage_samples.is_empty() => {
+                            if let Err(error) = sampled {
+                                eprintln!("tally: storage sampling task failed: {error}");
+                            }
                         }
                         Some(tick_result) = lease_ticks.join_next(), if !lease_ticks.is_empty() => {
                             match tick_result {
@@ -222,6 +236,11 @@ impl Daemon {
                 if result.is_ok() {
                     result = Err(error);
                 }
+            }
+        }
+        while let Some(sampled) = storage_samples.join_next().await {
+            if let Err(error) = sampled {
+                eprintln!("tally: storage sampling task failed during shutdown: {error}");
             }
         }
         connections.shutdown().await;

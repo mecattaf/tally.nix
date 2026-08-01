@@ -925,6 +925,12 @@ fn storage_warning_receipt_is_idempotent_and_never_closes_the_campaign_issue() {
         level: crate::storage::BudgetLevel::Hard,
         size_bytes: 200,
         threshold_bytes: 100,
+        pressures: vec![crate::storage::StoragePressure {
+            resource: crate::storage::StoragePressureResource::AllocatedBytes,
+            observed_bytes: 200,
+            threshold_bytes: 100,
+            recovery_bytes: 90,
+        }],
         message: "hard budget crossed".to_owned(),
     };
     let mut sink = RecordingMutation::default();

@@ -335,7 +335,7 @@ impl DaemonHandler {
         ingress_id: Option<String>,
         caller: CallerIdentity,
     ) -> Result<Value, WireError> {
-        let storage = self.refresh_storage().await;
+        let storage = self.cached_storage();
         let warning_origin = payload.gh_origin.clone().or_else(|| {
             payload
                 .origin
@@ -344,7 +344,7 @@ impl DaemonHandler {
         });
         self.post_storage_warning_receipts(warning_origin, &storage.active_warnings);
         if !storage.intake.accepting {
-            return Err(storage_budget_wire(&storage));
+            return Err(storage_intake_wire(&storage));
         }
         let inline_brief = payload.brief.take();
         let brief_source_path = payload.brief_path.take();

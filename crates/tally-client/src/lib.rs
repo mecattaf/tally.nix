@@ -135,6 +135,8 @@ pub enum WireErrorCode {
     FlowNodeCap,
     #[serde(rename = "storage-budget-exceeded")]
     StorageBudgetExceeded,
+    #[serde(rename = "storage-monitor-unavailable")]
+    StorageMonitorUnavailable,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

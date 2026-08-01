@@ -292,7 +292,7 @@ for types and defaults rather than copying values from another deployment.
 | [`retention.onCalendar`](core-options.md#servicestallyretentiononcalendar) | Collection schedule. |
 | [`retention.lifecycleMaxBytes`](core-options.md#servicestallyretentionlifecyclemaxbytes) / [`lifecycleHorizon`](core-options.md#servicestallyretentionlifecyclehorizon) | Byte trigger and protected recent window for lifecycle prefix compaction. |
 | [`retention.projectionArchiveHorizon`](core-options.md#servicestallyretentionprojectionarchivehorizon) | Age bound for immutable offline projection archives. |
-| [`storage.dataDir`](core-options.md#servicestallystoragedatadir) / [`storage.stateDir`](core-options.md#servicestallystoragestatedir) | Warning and hard allocated-byte budgets; hard crossings refuse only new intake. |
+| [`storage.dataDir`](core-options.md#servicestallystoragedatadir) / [`storage.stateDir`](core-options.md#servicestallystoragestatedir) | Warning/hard allocated-byte budgets plus a filesystem free-space floor; cached hard pressure refuses only new intake. |
 | [`attestations.exec.enable`](core-options.md#servicestallyattestationsexecenable) | Whether fresh and recovered executions receive advisory per-host attestation wrappers. |
 | [`gitAi.enable`](core-options.md#servicestallygitaienable) | Whether code-result revisions are bound to externally provisioned Git AI notes. tally.nix does not package `git-ai`. |
 | [`gitAi.mode`](core-options.md#servicestallygitaimode) | Whether a missing or invalid binding is advisory or result-failing. |
