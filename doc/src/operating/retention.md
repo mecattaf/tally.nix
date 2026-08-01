@@ -62,7 +62,16 @@ services.tally.retention = {
   eventsDoneHorizon = "180d";
   eventsRejectedHorizon = "30d";
   eventsRejectedMaxCount = 10000;
+  projectionArchiveHorizon = "30d";
+  lifecycleHorizon = "30d";
+  lifecycleMaxBytes = 268435456;
   onCalendar = "daily";
+};
+
+services.tally.storage = {
+  pollIntervalSec = 60;
+  dataDir = { warningBytes = 34359738368; hardBytes = 68719476736; };
+  stateDir = { warningBytes = 34359738368; hardBytes = 68719476736; };
 };
 ```
 
@@ -73,7 +82,8 @@ $ tally gc --horizon 30d --collect \
     --capture-archive-horizon 30d \
     --events-done-horizon 180d \
     --events-rejected-horizon 30d \
-    --events-rejected-max-count 10000
+    --events-rejected-max-count 10000 \
+    --projection-archive-horizon 30d
 ```
 
 The NixOS service runs the same command with its configured `--data-dir`
@@ -93,9 +103,17 @@ The GC command:
    one cannot be secured;
 6. removes expired brief bytes and an expired witness's root only when absent
    from the corresponding live set;
-7. prunes coordinator-side per-attempt capture archives and consumed/rejected
-   producer-event files according to their independent age/count policies; and
+7. prunes coordinator-side per-attempt capture archives, consumed/rejected
+   producer-event files, and immutable `taskdata.pre-rebuild-*` projection archives according to
+   their independent policies; and
 8. with `--collect`, runs `nix store gc`.
+
+The daemon separately checks `lifecycle.jsonl` at the storage poll cadence. Once it exceeds
+`lifecycleMaxBytes`, tally rewrites only the contiguous prefix older than `lifecycleHorizon` and
+records the exact truncation boundary. If every record is recent, the log remains above the byte
+trigger rather than discarding recent observability. `retention.enable = false` disables this
+automatic compaction as well as the timer. The offline `tally history compact` command remains an
+explicit maintenance path.
 
 The witness ledger is never rewritten. A recent witness therefore forms a
 liveness floor even when an older witness names the same path.
@@ -174,7 +192,7 @@ The current storage story is intentionally uneven:
 |---|---|---|
 | `witness.jsonl` | Append-only, unbounded | Never truncate; archive only as a complete, verified ledger during an explicit migration. |
 | `attestations.jsonl` | Append-only, unbounded | Preserve if advisory history matters; it is a separate chain from verdicts. |
-| `lifecycle.jsonl` | Unbounded until explicit offline `tally history compact` | Compact only with the daemon stopped and preserve the recorded truncation boundary. |
+| `lifecycle.jsonl` | Byte-triggered prefix compaction; defaults to 256 MiB while preserving the newest 30 days | Set `lifecycleMaxBytes` and `lifecycleHorizon`; offline `tally history compact` remains available with the daemon stopped. |
 | `changes.jsonl` | Latest 4,096 change records | Automatic; invalid or foreign contents reset to an empty feed at startup, and slow readers receive `cursor-expired`. |
 | `<dataDir>/briefs` | Live attempts plus witnesses inside `retention.horizon`; hashes remain durable after bytes expire | Automatic through `tally gc`; enqueue fresh work when an expired failed job can no longer be retried. |
 | Current captures | One `.out` and raw `.adapter.err` generation per task identity; a failed generation also has a bounded `.err` projection of at most 2 KiB | Do not remove active-generation files. `.adapter.err` is the sole byte-authoritative stderr stream. |
@@ -182,13 +200,17 @@ The current storage story is intentionally uneven:
 | Worker `stateDir` | Captures, launch markers, exit records, and execution attestations accumulate | Preserve live/ambiguous generations. No worker-side GC is shipped. |
 | Ordinary `artifact:<path>` files | Owned by the workload; no tally GC root | Apply a workload-specific policy only after accepting the reuse and audit consequences below. |
 | Producer events | Pending files are durable recovery inputs; consumed `events/done` defaults to 180 days, rejected files to 30 days/10,000 | Let `tally gc` prune only the managed done/rejected sets. |
+| Active TaskChampion projection | No compaction in this feature; `query storage` exposes DB/WAL/SHM bytes and operation high-water, and the store hard budget gates new intake | Use the explicit offline `tally view rebuild`; issue #252 owns rebuilding efficiency. |
+| `taskdata.pre-rebuild-*` archives | 30 days by default | Let `tally gc` prune only timestamp-valid immutable archive directories. |
 | Unit-exit state | Durable recovery input; no general pruner | Do not prune by age. |
 | In-memory barrier tracker | At most 64 unclaimed drain snapshots; connected waits scale with active calls, and disconnected waiters are evicted on the next tracker operation | Automatic and restart-local. |
 | In-memory parent guardrails | Terminal parents retire after their outstanding-child count reaches zero | Automatic; rebuilt from active durable rows. |
 
-Use ordinary filesystem accounting to locate growth:
+Use the daemon's self-metrics first, then ordinary filesystem accounting to locate individual
+files:
 
 ```console
+$ tally query storage
 $ du -sh "$XDG_DATA_HOME/tally" "$XDG_STATE_HOME/tally"
 $ du -sh "$XDG_STATE_HOME/tally"/capture/*
 ```

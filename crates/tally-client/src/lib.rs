@@ -133,6 +133,8 @@ pub enum WireErrorCode {
     DedupKeyConflict,
     #[serde(rename = "flow-node-cap")]
     FlowNodeCap,
+    #[serde(rename = "storage-budget-exceeded")]
+    StorageBudgetExceeded,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

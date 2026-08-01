@@ -654,6 +654,94 @@ impl<'a> ProducerEngine<'a> {
         Ok(true)
     }
 
+    /// Post one durable, idempotent campaign-issue receipt for a daemon
+    /// storage-budget episode. This deliberately does not reuse terminal
+    /// completion policy: a warning must never close the issue, request review,
+    /// or depend on failure-evidence publication.
+    pub fn post_storage_warning_once(
+        &self,
+        origin: &GhOrigin,
+        warning: &crate::storage::ActiveStorageWarning,
+        sink: &mut dyn GhMutationSink,
+    ) -> Result<bool, ProducerError> {
+        let ProducerConfig::Gh(config) = self.get(&origin.producer)? else {
+            return Err(self.kind_mismatch(&origin.producer, "gh"));
+        };
+        if !config.enable || config.never_mutate || !config.post_evidence {
+            return Ok(false);
+        }
+        self.validate_gh_origin(origin)?;
+        let completion_id = format!("storage-warning:{}", warning.warning_sequence);
+        let completed_dir = self.state_dir.join("producers/gh-storage-warnings");
+        create_dir_durable(&completed_dir)?;
+        let lock_path = completed_dir.join("mutations.lock");
+        let lock = open_private_rw(&lock_path)?;
+        lock.lock_exclusive().map_err(|source| ProducerError::Io {
+            path: lock_path.clone(),
+            source,
+        })?;
+        let marker_key = stable_key(&[
+            "gh-storage-warning",
+            &origin.producer,
+            &origin.source,
+            &origin.node_id,
+            &completion_id,
+        ]);
+        let marker_path = completed_dir.join(format!("{marker_key}.json"));
+        if path_lexists(&marker_path)? {
+            let marker: GhCompletionMarker =
+                serde_json::from_slice(&read_bounded_regular(&marker_path, 64 * 1024)?)?;
+            if marker.completion_id != completion_id
+                || marker.producer != origin.producer
+                || marker.source != origin.source
+                || marker.item_id != origin.node_id
+            {
+                return Err(ProducerError::InvalidObservation(format!(
+                    "GitHub storage-warning marker {} does not match its identity",
+                    marker_path.display()
+                )));
+            }
+            return Ok(false);
+        }
+        sink.post_evidence(&GhCompletedMutation {
+            producer: origin.producer.clone(),
+            source: origin.source.clone(),
+            item_id: origin.node_id.clone(),
+            completion_id: Some(completion_id.clone()),
+            state: "COMPLETED".to_owned(),
+            evidence: Some(serde_json::json!({
+                "schemaVersion": 1,
+                "kind": "storage-budget-warning",
+                "warningSequence": warning.warning_sequence,
+                "store": warning.store,
+                "level": warning.level,
+                "sizeBytes": warning.size_bytes,
+                "thresholdBytes": warning.threshold_bytes,
+                "message": warning.message,
+                "intakePolicy": "new-intake-refused-at-hard-limit; admitted-work-continues",
+            })),
+            gate_summary: None,
+            acceptance: None,
+            request_review: false,
+            assisted_by: None,
+        })
+        .map_err(ProducerError::Mutation)?;
+        write_json_atomic(
+            &marker_path,
+            &GhCompletionMarker {
+                completion_id,
+                producer: origin.producer.clone(),
+                source: origin.source.clone(),
+                item_id: origin.node_id.clone(),
+            },
+        )?;
+        FileExt::unlock(&lock).map_err(|source| ProducerError::Io {
+            path: lock_path,
+            source,
+        })?;
+        Ok(true)
+    }
+
     fn complete_gh_with_id(
         &self,
         origin: &GhOrigin,

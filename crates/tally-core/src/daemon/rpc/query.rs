@@ -55,6 +55,13 @@ impl DaemonHandler {
             ))
             .map_err(internal_wire);
         }
+        if method == "query.storage" {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Params {}
+            let _: Params = decode_params(params)?;
+            return serde_json::to_value(self.refresh_storage().await).map_err(internal_wire);
+        }
 
         // Paginated methods decode their parameters first: a continuation
         // cursor is served straight from the page cache without touching the
@@ -138,7 +145,10 @@ impl DaemonHandler {
                     query_status(&pools, params.pool.as_deref(), &rows, &journal, &witness)
                         .map_err(query_wire)?;
                 overlay_live_states(&mut view.jobs, &live_states);
-                serde_json::to_value(view).map_err(internal_wire)
+                let mut value = serde_json::to_value(view).map_err(internal_wire)?;
+                value["storage"] =
+                    serde_json::to_value(self.refresh_storage().await).map_err(internal_wire)?;
+                Ok(value)
             }
             "query.proof" => {
                 #[derive(Deserialize)]

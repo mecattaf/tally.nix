@@ -48,6 +48,7 @@ pub const RPC_METHODS: &[&str] = &[
     "query.jobs",
     "query.job",
     "query.status",
+    "query.storage",
     "query.log",
     "query.proof",
     "query.trace",
@@ -78,6 +79,7 @@ pub fn method_class(method: &str) -> Option<MethodClass> {
         | "query.jobs"
         | "query.job"
         | "query.status"
+        | "query.storage"
         | "query.log"
         | "query.proof"
         | "query.trace"

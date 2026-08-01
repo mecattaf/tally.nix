@@ -2436,6 +2436,35 @@ let
                 file first.
               '';
             };
+            projectionArchiveHorizon = mkOption {
+              type = types.str;
+              default = "30d";
+              example = "7d";
+              description = ''
+                Age after which immutable taskdata.pre-rebuild-* projection
+                archives are removed by the retention sweep. The active
+                TaskChampion projection is never compacted by this policy.
+              '';
+            };
+            lifecycleHorizon = mkOption {
+              type = types.str;
+              default = "30d";
+              example = "90d";
+              description = ''
+                Minimum lifecycle-log history retained when byte-triggered
+                online prefix compaction runs.
+              '';
+            };
+            lifecycleMaxBytes = mkOption {
+              type = types.ints.positive;
+              default = 268435456;
+              example = 67108864;
+              description = ''
+                Lifecycle-log size that triggers online prefix compaction.
+                Recent records inside lifecycleHorizon remain even if the log
+                stays above this size.
+              '';
+            };
           };
         };
         default = { };
@@ -2444,6 +2473,64 @@ let
           content-addressed brief replay window and state-directory envelope for
           capture archives and ingress event files. One sweep and one timer;
           GC-root and brief-store locks close their respective admission races.
+        '';
+      };
+      storage = mkOption {
+        type = types.submodule {
+          options = {
+            pollIntervalSec = mkOption {
+              type = types.ints.positive;
+              default = 60;
+              example = 15;
+              description = "Daemon-owned storage measurement cadence in seconds.";
+            };
+            dataDir = mkOption {
+              type = types.submodule {
+                options = {
+                  warningBytes = mkOption {
+                    type = types.ints.positive;
+                    default = 34359738368;
+                    example = 8589934592;
+                    description = "Allocated dataDir bytes that emit a durable warning.";
+                  };
+                  hardBytes = mkOption {
+                    type = types.ints.positive;
+                    default = 68719476736;
+                    example = 17179869184;
+                    description = "Allocated dataDir bytes that refuse new intake.";
+                  };
+                };
+              };
+              default = { };
+              description = "Budget for the witness, history, brief, and projection store.";
+            };
+            stateDir = mkOption {
+              type = types.submodule {
+                options = {
+                  warningBytes = mkOption {
+                    type = types.ints.positive;
+                    default = 34359738368;
+                    example = 8589934592;
+                    description = "Allocated stateDir bytes that emit a durable warning.";
+                  };
+                  hardBytes = mkOption {
+                    type = types.ints.positive;
+                    default = 68719476736;
+                    example = 17179869184;
+                    description = "Allocated stateDir bytes that refuse new intake.";
+                  };
+                };
+              };
+              default = { };
+              description = "Budget for enqueue events, captures, and producer state.";
+            };
+          };
+        };
+        default = { };
+        description = ''
+          Allocated-byte budgets for both daemon-owned stores. Warning crossings
+          are journaled and fsynced; hard crossings reject only new intake so
+          admitted work and observability remain available.
         '';
       };
       attestations = mkOption {
@@ -2884,7 +2971,19 @@ let
         eventsDoneHorizon
         eventsRejectedHorizon
         eventsRejectedMaxCount
+        projectionArchiveHorizon
+        lifecycleHorizon
+        lifecycleMaxBytes
         ;
+    };
+    storage = {
+      inherit (cfg.storage) pollIntervalSec;
+      dataDir = {
+        inherit (cfg.storage.dataDir) warningBytes hardBytes;
+      };
+      stateDir = {
+        inherit (cfg.storage.stateDir) warningBytes hardBytes;
+      };
     };
     attestations.exec = {
       inherit (cfg.attestations.exec) enable;
@@ -3237,6 +3336,8 @@ let
     cfg.retention.eventsRejectedHorizon
     "--events-rejected-max-count"
     (toString cfg.retention.eventsRejectedMaxCount)
+    "--projection-archive-horizon"
+    cfg.retention.projectionArchiveHorizon
   ];
 
   mkAssertions =
@@ -3261,6 +3362,22 @@ let
       {
         assertion = cfg.retention.eventsRejectedHorizon != "";
         message = "tally retention eventsRejectedHorizon must be non-empty";
+      }
+      {
+        assertion = cfg.retention.projectionArchiveHorizon != "";
+        message = "tally retention projectionArchiveHorizon must be non-empty";
+      }
+      {
+        assertion = cfg.retention.lifecycleHorizon != "";
+        message = "tally retention lifecycleHorizon must be non-empty";
+      }
+      {
+        assertion = cfg.storage.dataDir.warningBytes < cfg.storage.dataDir.hardBytes;
+        message = "tally storage.dataDir.warningBytes must be less than hardBytes";
+      }
+      {
+        assertion = cfg.storage.stateDir.warningBytes < cfg.storage.stateDir.hardBytes;
+        message = "tally storage.stateDir.warningBytes must be less than hardBytes";
       }
       (mapAttrsToList (name: pool: [
         {

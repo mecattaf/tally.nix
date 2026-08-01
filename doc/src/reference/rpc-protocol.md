@@ -131,6 +131,7 @@ The table between the markers is checked against the daemon's `RPC_METHODS` cons
 | `query.jobs` | Jobs filters plus `limit` and `cursor` | Paginated job collection |
 | `query.job` | `{id: string}` | Job detail |
 | `query.status` | `{pool?: string}` | Status view |
+| `query.storage` | `{}` | Daemon-owned storage metrics and intake state |
 | `query.log` | Lifecycle filters plus `limit` and `cursor` | Paginated lifecycle collection |
 | `query.proof` | `{task: string, attempt?: integer}` or `{flowRun: string}` | Proof view, or a proof collection for a flow run |
 | `query.trace` | `{task: string, attempt?: integer, limit?: integer, cursor?: string}` | Paginated trace view |
@@ -356,10 +357,19 @@ verbatim as `witnessRecord`; advisory attestations and their authority are separ
 request returns a collection envelope whose `items` hold one proof per node in node-ordinal
 order, and an unknown run is `unknown job`.
 
-`query.status` combines pool headroom and the legacy job projection. `query.pools` returns only
-headroom. A pool item includes capacity/held/queued counts, remaining capacity, optional
+`query.status` combines pool headroom, the legacy job projection, and the same `storage` object
+returned by `query.storage`. `query.pools` returns only headroom. A pool item includes capacity/held/queued counts, remaining capacity, optional
 window-consumption counters and reset, utilization percentages, and the `GO`, `SLOW`, or `STOP`
 signal.
+
+`query.storage` takes no parameters. It returns allocated and apparent bytes, file counts,
+warning and hard thresholds, and `ok`, `warning`, or `hard` level for `dataDir` and `stateDir`.
+`taskchampion` reports the SQLite database, WAL, and shared-memory byte sizes, task count, and
+the `operations` AUTOINCREMENT high-water mark. `growthPerCompletion` is the signed byte and
+operation delta divided by the canonical witness-count delta since the prior completion sample;
+it is absent until two completion boundaries have been observed. `intake.accepting=false` means
+only new `queue.enqueue`/`queue.continue` requests are refused. Already-admitted work, retries,
+cancellation, and all queries remain available.
 
 `query.producers` filters configured producers by exact `name` and/or `kind`. It returns their
 unit identity, schedule, rendered enqueue summaries, and observed runtime state. It is not
@@ -417,5 +427,5 @@ the log is `invalid_params`. Watch records are typed as `job`, `lifecycle`, `tra
 
 Every declared wire code, its current emission status, and CLI mapping is listed in
 [Exit codes and error taxonomy](errors.md). In particular, do not collapse
-`dedup-key-conflict`, `flow-node-cap`, or `not_found` into a generic retry: each carries a
+`dedup-key-conflict`, `flow-node-cap`, `storage-budget-exceeded`, or `not_found` into a generic retry: each carries a
 different recovery decision.

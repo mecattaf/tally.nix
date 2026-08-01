@@ -421,6 +421,12 @@ pub(super) struct GcArgs {
     #[arg(
         long,
         value_name = "DURATION",
+        default_value = tally_core::retention::DEFAULT_PROJECTION_ARCHIVE_MAX_AGE
+    )]
+    pub(super) projection_archive_horizon: String,
+    #[arg(
+        long,
+        value_name = "DURATION",
         default_value = tally_core::retention::DEFAULT_EVENTS_DONE_MAX_AGE
     )]
     pub(super) events_done_horizon: String,
@@ -733,6 +739,8 @@ pub(super) enum QueryCommand {
         #[arg(long)]
         pool: Option<String>,
     },
+    /// Show daemon-owned storage usage, budgets, projection metrics, and growth.
+    Storage,
     Log {
         #[arg(long)]
         task: Option<String>,

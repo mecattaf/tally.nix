@@ -86,6 +86,9 @@ impl Daemon {
         }
         let mut lease_tick = tokio::time::interval(LEASE_TICK);
         lease_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let storage_poll_interval = self.handler.storage.borrow().poll_interval();
+        let mut storage_tick = tokio::time::interval(storage_poll_interval);
+        storage_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut watchdog = self.notifier.watchdog_interval();
         let mut lease_ticks = JoinSet::new();
         let mut connections = JoinSet::new();
@@ -164,6 +167,10 @@ impl Daemon {
                                     Self::tick_leases(handler).await
                                 });
                             }
+                        }
+                        _ = storage_tick.tick() => {
+                            self.handler.compact_lifecycle_if_needed().await;
+                            self.handler.refresh_storage().await;
                         }
                         Some(tick_result) = lease_ticks.join_next(), if !lease_ticks.is_empty() => {
                             match tick_result {

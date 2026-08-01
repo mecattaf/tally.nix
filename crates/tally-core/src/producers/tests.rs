@@ -901,6 +901,48 @@ impl GhMutationSink for RecordingMutation {
     }
 }
 
+#[test]
+fn storage_warning_receipt_is_idempotent_and_never_closes_the_campaign_issue() {
+    let temp = tempdir().unwrap();
+    let registry = registry(&temp.path().join("effects.jsonl"));
+    let ProducerConfig::Gh(github) = registry.get("github").unwrap() else {
+        unreachable!()
+    };
+    let origin = gh_origin(
+        "github",
+        github,
+        &gh_observation("PR_storage", "author", "contributor"),
+    );
+    let engine = ProducerEngine::new(
+        &registry,
+        temp.path().join("events"),
+        temp.path().join("state"),
+        temp.path(),
+    );
+    let warning = crate::storage::ActiveStorageWarning {
+        warning_sequence: 7,
+        store: "dataDir".to_owned(),
+        level: crate::storage::BudgetLevel::Hard,
+        size_bytes: 200,
+        threshold_bytes: 100,
+        message: "hard budget crossed".to_owned(),
+    };
+    let mut sink = RecordingMutation::default();
+    assert!(engine
+        .post_storage_warning_once(&origin, &warning, &mut sink)
+        .unwrap());
+    assert!(!engine
+        .post_storage_warning_once(&origin, &warning, &mut sink)
+        .unwrap());
+    assert_eq!(sink.comments.len(), 1);
+    assert!(sink.closes.is_empty());
+    assert!(sink.item_open);
+    assert_eq!(
+        sink.comments[0].evidence.as_ref().unwrap()["kind"],
+        "storage-budget-warning"
+    );
+}
+
 fn semantic_completion(
     gate_status: GateSummaryStatus,
     acceptance_status: AcceptanceStatus,
