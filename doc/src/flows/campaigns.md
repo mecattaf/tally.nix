@@ -18,13 +18,15 @@ completion facts, and tally witnesses every observation and gate.
 Keep those roles separate:
 
 - **The selected container is the work source.** A recurring campaign reads its
-  versioned tasks artifact. An ad-hoc campaign reads the manifest and native
-  sub-issue bodies from its master issue graph on every pass.
+  versioned tasks artifact from the exact fetched remote-base commit. An ad-hoc
+  campaign reads the manifest and native sub-issue bodies from its master issue
+  graph on every pass.
 - **GitHub is intake, steering, state, and projection.** Manual `arm` is the
   explicit intent boundary for ad-hoc work; an exact mention is that boundary
-  for a recurring campaign. Merged implementation pull requests and
-  content-bound checkpoint tags are the completion facts read by every later
-  pass. Issue comments steer later agent attempts.
+  for a recurring campaign. Merged implementation pull requests and, for
+  recurring worklists, content-and-exact-base-bound checkpoint tags are the
+  completion facts read by every later pass. Issue comments steer later agent
+  attempts; receipts and evidence project each reconciliation.
 - **tally is the workflow engine.** It validates and witnesses the worklist,
   selects the dependency-ready frontier, creates isolated worktrees, runs
   deterministic gates and checkpoint commands, and serializes re-gated merges.
@@ -353,11 +355,13 @@ validated before the worklist node is admitted.
 history to constrain. They begin in their declared position in the post-agent
 gate sequence and use their own `runtimeMaxSec` for the packaged driver node.
 
-## The worklist node contract
+## The recurring worklist node contract
 
-`worklist` is a relative glob beneath the configured checkout. It must resolve
-to exactly one regular JSON file and may not contain `..`. The shipped driver
-accepts schema version 1:
+For a recurring campaign, `worklist` is a relative glob in the configured
+remote base tree. It must
+resolve to exactly one regular JSON blob and may not contain `..`. The shipped
+driver uses the checkout as a Git object store and worktree owner, not as the
+authority for uncommitted worklist bytes. It accepts schema version 1:
 
 ```json
 {
@@ -459,6 +463,15 @@ receives a structured `TALLY_BRIEF` containing its task, workspace, and prior
 machine diagnoses, so a retry can observe durable steering. Shell syntax is
 never implicit; declare `sh -c` when the checkpoint itself requires a shell.
 
+The checkpoint argv is versioned repository input, not a command selected from
+operator configuration. It runs on `campaign-control` with the same execution
+options as a Nix-declared command gate. Consequently, anyone authorized to
+merge the worklist into the protected base can select code that the campaign
+service account executes. This is the same repository-code trust class as a
+command gate running a repository test suite, but it removes the operator's
+per-command choice. Repository review and base protection—not worklist schema
+validation—are the authorization boundary.
+
 IDs are stable node components. Dependencies must name earlier nodes, which
 makes the array a validated topological order. Acceptance criteria are runnable,
 direct-argv instructions for implementation agents and reviewers; the
@@ -474,15 +487,19 @@ capture names. The worklist discovery node has no task ID and therefore no
 `taskRef`.
 
 The pass first sweeps run-local lanes left by older, no-longer-live pass
-identities. Its reconcile node then parses, normalizes, schema-validates, and
-witnesses this artifact together with its relative path and SHA-256 digest. The
-same node queries merged pull requests carrying tally's exact campaign/task
-marker, validates the expected checkpoint refs, and reads authenticated machine
-comments carrying tally's campaign/task markers. Merged implementation IDs plus
-valid checkpoint IDs are completed. A pull-request proof must also target the
-configured base and use the stable task head branch. Unknown, retargeted, or
-otherwise unusable marked PRs are skipped with warnings in the witnessed
-result; multiple valid proofs for one task remain a hard ambiguity.
+identities. Its reconcile node fetches the configured remote and reads the
+matching worklist blob from the exact remote base commit. Uncommitted files and
+the configured checkout's local `HEAD` are not worklist authority. It parses,
+normalizes, schema-validates, and witnesses the artifact together with its
+relative path, SHA-256 digest, and base revision. The same node queries merged
+pull requests carrying tally's exact campaign/task marker, validates the
+expected checkpoint refs, and reads authenticated machine comments carrying
+tally's campaign/task markers. Merged implementation IDs plus valid checkpoint
+IDs are completed. A pull-request proof must also target the configured base,
+use the stable task head branch, and have a merge commit contained in the
+witnessed base. Unknown, retargeted, or otherwise unusable marked PRs are
+skipped with warnings in the witnessed result; multiple valid proofs for one
+task remain a hard ambiguity.
 
 Two contiguous diagnosis receipts directly block only an incomplete node;
 blocking then propagates through its incomplete descendants. Reconciliation
@@ -499,11 +516,31 @@ nodes.
 
 A passed checkpoint is recorded as a lightweight Git tag below
 `refs/tags/tally/spec-build/v1/`. The expected ref includes the campaign, issue,
-checkpoint ID, and full worklist SHA-256, so changing the declared work graph or
-checkpoint argv requires a new pass. Reconciliation accepts the ref only when
-it points directly to a commit, its dependencies are already complete, and its
-tested revision is an ancestor of the current remote base. The ref is therefore
-a stateless completion fact, not a saved runner heap or a mutable checkbox.
+checkpoint ID, full worklist SHA-256, and exact tested base revision. Changing
+the declared work graph or advancing the base requires a new pass.
+Reconciliation accepts the ref only when it points directly to that named base
+commit and every dependency's merge or checkpoint revision is its ancestor.
+An older green tag never certifies a later base, even when the later commit is
+unrelated to the checkpoint's declared dependencies: checkpoints ask questions
+about the accumulated repository state, not only their dependency closure.
+
+Checkpoint refs are immutable and create-only; the driver never force-moves a
+receipt. A tag ruleset should allow the tally forge identity to create refs in
+this namespace while denying other identities creation and denying updates or
+deletion. If protection denies that identity creation, recording fails closed.
+The credential allowed to create these refs is itself a trusted completion
+authority—Git cannot prove that its holder ran the witnessed command. The
+direct-commit, exact-base, and dependency-ancestry checks reject malformed or
+inconsistent receipts; namespace protection keeps unrelated push identities
+from minting otherwise consistent ones.
+
+Old refs are retained as historical audit receipts. Worklist edits and base
+movement make them unreachable from the active completion calculation rather
+than deleting them. This deliberately preserves stateless recovery and works
+with update/delete-protected tags. When a campaign is permanently
+decommissioned, its campaign-and-issue namespace can be pruned under the
+repository's ordinary destructive-change procedure; there is no automatic
+campaign-lifetime inference or in-run tag garbage collection.
 
 ## Reconciliation, parallelism, and the merge criterion
 
@@ -511,7 +548,7 @@ One invocation is one bounded reconcile pass:
 
 ```text
 implemented = marked merged PRs
-checkpointed = valid content-bound checkpoint refs
+checkpointed = valid content-and-exact-base-bound checkpoint refs
 completed = implemented + checkpointed
 remaining = worklist - completed
 diagnoses = authenticated marked diagnosis comments (attempts 1 and 2)
@@ -530,7 +567,7 @@ parallel(frontier):
     -> each configured gate -> recheck ownership -> push stable task branch
     -> open/reuse PR
   checkpoint: prepare isolated worktree -> run checkpoint argv
-    -> record content-bound completion ref
+    -> record content-and-exact-base-bound completion ref
 serial(successful publications): compare current base -> rebase if moved
   -> re-run each configured gate only on a changed rebased head -> merge
 parallel(failed tasks): capture diff -> diagnosis agent -> marked steering comment
@@ -557,12 +594,17 @@ A checkpoint prepares the exact current remote base in its own worktree and
 runs its argv as an ordinary settled `campaign-control` node with `exit:0`
 evidence, the declared deadline, and the checkpoint's `taskRef`. On success the
 driver verifies that `HEAD` is still the prepared base, no tracked file changed,
-and the remote base did not move during validation. Only then does it publish
-the completion tag and an idempotent progress comment. The pass-wide
-continuation is posted after every lane settles. Ignored or untracked build
-outputs are allowed and removed with the worktree. There is no implementation agent,
-configured per-task gate sequence, publication branch, pull request, rebase, or
-merge for this node kind.
+and the prepared base still belongs to the current remote-base ancestry. It
+then publishes an immutable receipt for the exact revision that was tested and
+an idempotent progress comment. If the remote base advanced during validation,
+the receipt remains truthful historical evidence but is not complete for the
+next reconciliation; the checkpoint is prepared again on the newer base. A
+diverged or force-replaced base fails closed. The pass-wide continuation is
+posted after every lane settles, including after a checkpoint failure has
+published machine steering; checkpoint recording adds no second retry loop.
+Ignored or untracked build outputs are allowed and removed with the worktree.
+There is no implementation agent, configured per-task gate sequence,
+publication branch, pull request, rebase, or merge for this node kind.
 
 The agent must leave a clean worktree with at least one commit descended from
 the prepared base. Ownership validation then fails before the more expensive

@@ -307,10 +307,11 @@ const sourceSchema = {
   oneOf: [
     {
       type: "object",
-      required: ["path", "sha256"],
+      required: ["path", "sha256", "revision"],
       properties: {
         path: { type: "string", minLength: 1 },
-        sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" }
+        sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
+        revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
       },
       additionalProperties: false
     },

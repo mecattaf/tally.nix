@@ -13,6 +13,7 @@ import sys
 import tempfile
 import textwrap
 import unittest
+from unittest import mock
 
 
 SOURCE = Path(
@@ -211,11 +212,66 @@ class FakeGitHub:
         return json.loads(self.state_path.read_text(encoding="utf-8"))
 
 
+class ForgeNativeReconcileTests(unittest.TestCase):
+    def test_issue_worklist_accepts_a_revision_free_source_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root)
+            issue_task = {
+                "id": "task-1",
+                "kind": "implementation",
+                "title": "Task one",
+                "brief": {
+                    "issue": {
+                        "number": "8",
+                        "url": "https://github.com/acme/spec/issues/8",
+                    },
+                    "body": "Implement task one.",
+                },
+                "dependencies": [],
+                "conflictDomains": ["task-1"],
+            }
+            worklist = {
+                "schemaVersion": 1,
+                "repository": "acme/spec",
+                "source": {
+                    "kind": "github-issue",
+                    "url": "https://github.com/acme/spec/issues/7",
+                    "sha256": "sha256:" + "a" * 64,
+                },
+                "tasks": [issue_task],
+                "config": {
+                    "campaign": "fixture-native",
+                    "repositoryConfig": repository_config(checkout, "github"),
+                    "maxParallel": 1,
+                },
+                "masterBody": "fixture",
+            }
+            with (
+                mock.patch.object(DRIVER, "issue_graph_worklist", return_value=worklist),
+                mock.patch.object(DRIVER, "merged_github_tasks", return_value=([], [])) as merged,
+                mock.patch.object(DRIVER, "forge_campaign_state", return_value=([], None)),
+                mock.patch.object(DRIVER, "sync_issue_checkboxes"),
+            ):
+                result = DRIVER.action_reconcile(
+                    {
+                        "repository": "acme/spec",
+                        "issue": issue(),
+                        "worklist": {"kind": "github-issue"},
+                    }
+                )
+
+            self.assertEqual(result["source"], worklist["source"])
+            self.assertNotIn("revision", result["source"])
+            self.assertIsNone(merged.call_args.args[5])
+            self.assertEqual([item["id"] for item in result["frontier"]], ["task-1"])
+
+
 class GitHubForgeTests(unittest.TestCase):
     def test_reconcile_requires_exact_marker_and_degrades_unusable_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            checkout, _ = initialize_repository(root)
+            checkout, _ = initialize_repository(root, remote=True)
             worklist = checkout / "specs/campaign/tasks.json"
             worklist.parent.mkdir(parents=True)
             third_task = task("task-3", ["task-1"])
@@ -233,6 +289,10 @@ class GitHubForgeTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            git(checkout, "add", str(worklist.relative_to(checkout)))
+            git(checkout, "commit", "--quiet", "-m", "add worklist")
+            git(checkout, "push", "--quiet", "origin", "main")
+            base_rev = git(checkout, "rev-parse", "HEAD")
             task_1_marker = DRIVER.pull_request_marker("fixture", "7", "task-1")
             task_2_marker = DRIVER.pull_request_marker("fixture", "7", "task-2")
             state = {
@@ -242,7 +302,7 @@ class GitHubForgeTests(unittest.TestCase):
                         "body": task_1_marker,
                         "baseRefName": "main",
                         "headRefName": "tally/fixture-issue-7/task-1",
-                        "mergeCommit": {"oid": "a" * 40},
+                        "mergeCommit": {"oid": base_rev},
                     },
                     {
                         "url": "https://github.com/acme/spec/pull/2",
@@ -305,7 +365,7 @@ class GitHubForgeTests(unittest.TestCase):
                         "body": task_1_marker,
                         "baseRefName": "main",
                         "headRefName": "tally/fixture-issue-7/task-1",
-                        "mergeCommit": {"oid": "e" * 40},
+                        "mergeCommit": {"oid": base_rev},
                     }
                 )
                 github.state_path.write_text(json.dumps(ambiguous), encoding="utf-8")
@@ -325,7 +385,7 @@ class GitHubForgeTests(unittest.TestCase):
     def test_machine_receipts_trust_the_current_actor_and_escalate_once(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            checkout, _ = initialize_repository(root)
+            checkout, _ = initialize_repository(root, remote=True)
             worklist = checkout / "specs/campaign/tasks.json"
             worklist.parent.mkdir(parents=True)
             worklist.write_text(
@@ -337,6 +397,9 @@ class GitHubForgeTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            git(checkout, "add", str(worklist.relative_to(checkout)))
+            git(checkout, "commit", "--quiet", "-m", "add worklist")
+            git(checkout, "push", "--quiet", "origin", "main")
 
             def diagnosis_body(identifier: str, attempt: int, text: str) -> str:
                 return (
@@ -594,7 +657,10 @@ class GitHubForgeTests(unittest.TestCase):
                         "reconcileCommand": "/tally reconcile fixture",
                     }
                 )
-                self.assertEqual(continued, {"command": "/tally reconcile fixture", "posted": True})
+                self.assertEqual(
+                    continued,
+                    {"command": "/tally reconcile fixture", "posted": True},
+                )
                 final_state = github.state()
                 self.assertEqual(len(final_state["comments"]), 2)
                 self.assertIn("task=task-1 merged", final_state["comments"][0])

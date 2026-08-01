@@ -3002,6 +3002,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             let checkpoint_ref = checkpoint_value["checkpoints"][0]["ref"].as_str().unwrap();
             assert!(checkpoint_ref.starts_with("refs/tags/tally/spec-build/v1/fixture-"));
             assert!(checkpoint_ref.contains("-issue-7/phase-one-checkpoint-"));
+            assert!(checkpoint_ref.ends_with(checkpoint_revision));
             assert_eq!(
                 fixture_git(&checkout, &["ls-remote", "origin", checkpoint_ref])
                     .split_whitespace()
