@@ -442,6 +442,35 @@ const workspaceSchema = {
   additionalProperties: false
 };
 
+const ownershipSchema = {
+  type: "object",
+  required: [
+    "taskId",
+    "domainsRequired",
+    "conflictDomains",
+    "ownedPaths",
+    "baseRev",
+    "head"
+  ],
+  properties: {
+    taskId: taskIdSchema,
+    domainsRequired: { type: "boolean" },
+    conflictDomains: {
+      type: "array",
+      uniqueItems: true,
+      items: { type: "string", minLength: 1 }
+    },
+    ownedPaths: {
+      type: "array",
+      uniqueItems: true,
+      items: { type: "string", minLength: 1 }
+    },
+    baseRev: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
+    head: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
+  },
+  additionalProperties: false
+};
+
 const constraintSchema = {
   type: "object",
   required: ["gateId", "kind", "patterns", "checkedPaths", "baseRev", "head"],
@@ -485,39 +514,50 @@ const checkpointCompletionSchema = {
 
 const publicationSchema = {
   type: "object",
-  required: ["taskId", "branch", "head", "pullRequest"],
+  required: ["taskId", "branch", "head", "pullRequest", "ownership"],
   properties: {
     taskId: taskIdSchema,
     branch: { type: "string", minLength: 1 },
     head: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
-    pullRequest: { type: "string", minLength: 1 }
+    pullRequest: { type: "string", minLength: 1 },
+    ownership: ownershipSchema
   },
   additionalProperties: false
 };
 
 const integrationSchema = {
   type: "object",
-  required: ["taskId", "baseRev", "branch", "head", "pullRequest", "regate"],
+  required: [
+    "taskId",
+    "baseRev",
+    "branch",
+    "head",
+    "pullRequest",
+    "regate",
+    "ownership"
+  ],
   properties: {
     taskId: taskIdSchema,
     baseRev: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
     branch: { type: "string", minLength: 1 },
     head: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
     pullRequest: { type: "string", minLength: 1 },
-    regate: { type: "boolean" }
+    regate: { type: "boolean" },
+    ownership: ownershipSchema
   },
   additionalProperties: false
 };
 
 const mergeSchema = {
   type: "object",
-  required: ["taskId", "head", "mergeCommit", "pullRequest", "regated"],
+  required: ["taskId", "head", "mergeCommit", "pullRequest", "regated", "ownership"],
   properties: {
     taskId: taskIdSchema,
     head: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
     mergeCommit: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
     pullRequest: { type: "string", minLength: 1 },
-    regated: { type: "boolean" }
+    regated: { type: "boolean" },
+    ownership: ownershipSchema
   },
   additionalProperties: false
 };
@@ -788,6 +828,8 @@ async function sweepCampaign(repositoryConfig) {
   if (forgeNative) {
     sweepNode = await sweepCampaign(repositoryConfig);
   }
+  const domainsRequired = effective.maxParallel > 1;
+
   // A merged campaign PR is the durable proof that an earlier pass cleared
   // admission. Until that first merge exists, every fresh pass gates a
   // separate pristine-base lane and cleans it before any agent can start.
@@ -939,8 +981,8 @@ async function sweepCampaign(repositoryConfig) {
         brief: {
           schemaVersion: 1,
           mission: task.brief
-            ? `Implement only forge task ${task.id}: ${task.title}. The exact operator-authored task brief is task.brief.body below. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task issue; deterministic campaign nodes own those operations. Read the master campaign issue comments for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`
-            : `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task from the worklist; deterministic campaign nodes own those operations. Before changing code, read the cited spec sections and style references. Read the campaign issue comments for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
+            ? `Implement only forge task ${task.id}: ${task.title}. The exact operator-authored task brief is task.brief.body below. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task issue; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Read the master campaign issue comments for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`
+            : `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task from the worklist; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Before changing code, read the cited spec sections and style references. Read the campaign issue comments for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
           campaign: {
             name: effective.campaign,
             repository: args.repository,
@@ -974,6 +1016,28 @@ async function sweepCampaign(repositoryConfig) {
         return { task, prepared: prepared.result, failure: nodeFailure(task, "agent", agent) };
       }
 
+      const ownership = await driverNode(
+        "ownership",
+        {
+          task,
+          domainsRequired,
+          workspace: prepared.result
+        },
+        `ownership-${task.id}`,
+        `ownership-${task.id}`,
+        ownershipSchema,
+        workspace,
+        true,
+        taskRef
+      );
+      if (!nodePassed(ownership)) {
+        return {
+          task,
+          prepared: prepared.result,
+          failure: nodeFailure(task, "ownership", ownership)
+        };
+      }
+
       const constraintResults = [];
       for (const gate of effective.gates) {
         const gated = await runGate(task, gate, workspace, "gate");
@@ -999,6 +1063,7 @@ async function sweepCampaign(repositoryConfig) {
           runId: args.runId,
           workspaceRoot: args.workspaceRoot,
           task,
+          domainsRequired,
           workspace: prepared.result,
           constraints: constraintResults
         },
@@ -1055,6 +1120,7 @@ async function sweepCampaign(repositoryConfig) {
         runId: args.runId,
         workspaceRoot: args.workspaceRoot,
         task,
+        domainsRequired,
         workspace: lane.prepared,
         publication: lane.publication,
         constraints: lane.constraints

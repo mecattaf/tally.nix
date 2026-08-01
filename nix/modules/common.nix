@@ -3082,17 +3082,17 @@ let
 
   # Sweep, reconcile, an optional one-per-pass continuation, optional
   # pristine-base preflight prep/gates/cleanup, and one frontier's worst-case
-  # implementation lanes: prep, agent, initial gates, publication, rebase
-  # check, optional re-gates, merge, and cleanup. A checkpoint lane is smaller
-  # (prep, direct validation, durable fact, cleanup). This is a pass bound, not
-  # the complete worklist size.
+  # implementation lanes: prep, agent, ownership check, initial gates,
+  # publication, rebase check, optional re-gates, merge, and cleanup. A
+  # checkpoint lane is smaller (prep, direct validation, durable fact, cleanup).
+  # This is a pass bound, not the complete worklist size.
   campaignMaxNodes =
     campaign:
     let
       commandGateCount = builtins.length (builtins.filter (gate: gate.kind == "command") campaign.gates);
       preflightNodes = if commandGateCount == 0 then 0 else 2 + commandGateCount;
     in
-    3 + preflightNodes + campaign.maxParallel * (6 + 2 * builtins.length campaign.gates);
+    3 + preflightNodes + campaign.maxParallel * (7 + 2 * builtins.length campaign.gates);
 
   mkCampaignArgs = cfg: name: campaign: repository: issueNumber: issueUrl: runId: {
     campaign = name;

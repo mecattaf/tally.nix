@@ -301,7 +301,7 @@ One enabled attrset expands to all of the following:
 | `<pool.name>` | A capacity-1 mutex held for one reconcile pass. |
 | `campaign-agent` | A counted `slot` pool with baseline capacity four, raised when an enabled recurring campaign has a larger `maxParallel`. |
 | `campaign-control` | A `cpu-slot` pool for reconciliation, Git, GitHub, and gate nodes, with the same baseline and recurring-campaign scaling. |
-| `spec-build-driver` | The packaged deterministic policy driver used for reconcile, prep, built-in constraints, checkpoint recording, publish, rebase, and merge projections. |
+| `spec-build-driver` | The packaged deterministic policy driver used for reconcile, prep, ownership checks, built-in constraints, checkpoint recording, publish, rebase, and merge projections. |
 
 The producer posts its receipt and witnessed evidence. Each merge posts an
 idempotently marked progress comment. After the pass finishes its integration
@@ -422,15 +422,32 @@ array when parallelism is enabled. Entries are normalized relative file or
 directory paths without `..`. Equal paths and ancestor/descendant paths overlap,
 so `src/domain` conflicts with `src/domain/customer.rs`. A reconcile pass
 greedily selects ready nodes in worklist order while keeping selected
-implementation domains disjoint.
+implementation domains disjoint. Comparisons fold case for portable behavior:
+`Docs` also conflicts
+with `docs/guide.md`, even when the coordinator's checkout is case-sensitive.
+Case-only duplicate declarations are rejected.
 
-A non-empty declaration is also an enforced ownership boundary. Before pushing
-a task branch, the driver compares every path in its committed base-to-head diff
-with the task's domains using that same component-prefix rule. An unowned add,
-edit, deletion, type change, or either side of a rename fails publication before
-the remote branch or pull request can move. A base-changing rebase repeats the
-check against the rewritten exact head before force-push. Serial tasks that omit
-the optional field keep their unrestricted existing behavior.
+A non-empty declaration is also an enforced ownership boundary. Immediately
+after the agent exits, before project gates run, a dedicated driver node compares
+the union of paths touched by every task commit with the task's domains using
+that same case-folded component-prefix rule. A later deletion cannot hide a
+transient unowned path. Adds, edits, deletions, type changes, and both sides of a
+rename are included. Publication repeats the check against the clean exact head
+before the remote branch or pull request can move, and a base-changing rebase
+repeats it before force-push. The flow carries whether domains are required into
+each enforcing node, so an empty parallel declaration cannot turn enforcement
+off. Serial tasks that omit the optional field keep their unrestricted existing
+behavior.
+
+Ownership results witness the requirement flag, declared domains, full sorted
+owned-path set, base revision, and head. This makes both under-declaration and
+unused broad declarations visible in receipts. When enough tasks are ready but
+overlapping declarations underfill `maxParallel`, reconciliation emits a
+diagnostic naming the blocked tasks and representative overlaps. Shared files
+such as changelogs and lockfiles therefore serialize their declaring tasks by
+design. There is no append-only exemption: Git still has to reconcile concurrent
+content edits, so campaigns that need parallelism should assign those updates to
+a dependent consolidation task instead of declaring unsafe sharing.
 
 A `checkpoint` node has exactly `id`, `kind`, `title`, `argv`,
 `runtimeMaxSec`, and `dependencies`. Its direct argv is the deeper validation:
@@ -465,8 +482,9 @@ otherwise unusable marked PRs are skipped with warnings in the witnessed
 result; multiple valid proofs for one task remain a hard ambiguity. Later nodes
 use only that witnessed result. An implementation node receives its one task,
 assigned workspace, campaign issue locator, and bounded mission. It is
-explicitly told not to read another task from the worklist and not to push,
-open a pull request, or merge. Those are separate deterministic nodes.
+explicitly told not to read another task from the worklist, to keep every commit
+inside its enforced domains, and not to push, open a pull request, or merge.
+Those are separate deterministic nodes.
 
 A passed checkpoint is recorded as a lightweight Git tag below
 `refs/tags/tally/spec-build/v1/`. The expected ref includes the campaign, issue,
@@ -492,8 +510,9 @@ if implemented is empty, an implementation is in the frontier, and command gates
   prepare an isolated worktree at current remote main
   -> run each command gate.preflightArgv -> clean up the preflight lane
 parallel(frontier):
-  implementation: prepare isolated worktree -> agent -> each configured gate
-    -> push stable task branch -> open/reuse PR
+  implementation: prepare isolated worktree -> agent -> witness ownership
+    -> each configured gate -> recheck ownership -> push stable task branch
+    -> open/reuse PR
   checkpoint: prepare isolated worktree -> run checkpoint argv
     -> record content-bound completion ref -> clean up
 serial(successful publications): compare current base -> rebase if moved
@@ -527,7 +546,9 @@ configured per-task gate sequence, publication branch, pull request, rebase, or
 merge for this node kind.
 
 The agent must leave a clean worktree with at least one commit descended from
-the prepared base. Publication refuses dirty, empty, or non-descendant work.
+the prepared base. Ownership validation then fails before the more expensive
+project gates if any commit touched an undeclared path. Publication independently
+refuses dirty, empty, non-descendant, or newly unowned work.
 Each task has a stable remote branch across passes and a run-local worktree lane,
 so a dead runner cannot make a later pass share a writable directory with an
 old child. Pass-exit cleanup reclaims every prepared lane, including failures;
@@ -549,9 +570,10 @@ current base and lets the agent redo it; it cannot resurrect the same
 unrebasable head indefinitely. A closed GitHub PR on the stable branch is
 reopened when the replacement head is published.
 
-A preflight failure stops the pass before any agent is admitted. Agent, task
-gate, checkpoint, publication, rebase, and merge failures are settled into the
-pass report. A failed checkpoint publishes no completion ref, so the ordinary
+A preflight failure stops the pass before any agent is admitted. Agent,
+ownership, task gate, checkpoint, publication, rebase, and merge failures are
+settled into the pass report. A failed checkpoint publishes no completion ref,
+so the ordinary
 dependency test leaves only its DAG descendants unready; independent frontier
 nodes continue and successful implementation siblings still publish and merge.
 There is no `awaiting operator` state or human approval transition. A failed

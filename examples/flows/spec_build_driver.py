@@ -66,6 +66,19 @@ def required_body(value: Any, context: str, maximum: int) -> str:
     return value
 
 
+def required_bool(value: Any, context: str) -> bool:
+    if not isinstance(value, bool):
+        fail(f"{context} must be boolean")
+    return value
+
+
+def full_git_oid(value: Any, context: str) -> str:
+    oid = required_string(value, context)
+    if not GIT_OID.fullmatch(oid):
+        fail(f"{context} must be a full Git object ID")
+    return oid
+
+
 def string_list(value: Any, context: str, *, nonempty: bool = False) -> list[str]:
     if not isinstance(value, list) or (nonempty and not value):
         fail(f"{context} must be {'a non-empty' if nonempty else 'an'} array")
@@ -182,7 +195,7 @@ def normalize_conflict_domains(value: Any, context: str, *, required: bool) -> l
     if value is None and not required:
         return []
     domains = string_list(value, context, nonempty=required)
-    if len(domains) != len(set(domains)):
+    if len(domains) != len({domain.casefold() for domain in domains}):
         fail(f"{context} contains duplicates")
     normalized: list[str] = []
     for index, domain in enumerate(domains):
@@ -206,6 +219,22 @@ def normalize_dependencies(value: Any, context: str, prior_ids: set[str]) -> lis
             f"{context}.dependencies must reference earlier tasks; unavailable: {', '.join(missing)}"
         )
     return dependencies
+
+
+def normalize_owned_paths(value: Any, context: str) -> list[str]:
+    paths = string_list(value, context)
+    if len(paths) != len(set(paths)):
+        fail(f"{context} contains duplicates")
+    normalized: list[str] = []
+    for index, candidate in enumerate(paths):
+        path = Path(candidate)
+        if path.is_absolute() or ".." in path.parts or candidate.endswith("/"):
+            fail(f"{context}[{index}] must be a normalized relative path without '..'")
+        rendered = path.as_posix()
+        if rendered in {"", "."} or rendered != candidate:
+            fail(f"{context}[{index}] must be a normalized relative path")
+        normalized.append(rendered)
+    return normalized
 
 
 def normalize_task(
@@ -982,8 +1011,8 @@ def completed_checkpoint_tasks(
 
 
 def domains_overlap(left: str, right: str) -> bool:
-    left_parts = Path(left).parts
-    right_parts = Path(right).parts
+    left_parts = tuple(part.casefold() for part in Path(left).parts)
+    right_parts = tuple(part.casefold() for part in Path(right).parts)
     width = min(len(left_parts), len(right_parts))
     return left_parts[:width] == right_parts[:width]
 
@@ -1040,6 +1069,43 @@ def sync_issue_checkboxes(
             ],
             input_text=updated,
         )
+
+
+def parallelism_warnings(
+    ready: list[dict[str, Any]], frontier: list[dict[str, Any]], max_parallel: int
+) -> list[str]:
+    """Explain a ready frontier that conflict domains, rather than demand, underfill."""
+    if len(ready) < max_parallel or len(frontier) >= max_parallel:
+        return []
+    selected_ids = {task["id"] for task in frontier}
+    blocked = [task for task in ready if task["id"] not in selected_ids]
+    examples: list[str] = []
+    for task in blocked:
+        found = False
+        for other in frontier:
+            for left in task.get("conflictDomains", []):
+                for right in other.get("conflictDomains", []):
+                    if domains_overlap(left, right):
+                        examples.append(
+                            f"{task['id']}:{json.dumps(left)} overlaps "
+                            f"{other['id']}:{json.dumps(right)}"
+                        )
+                        found = True
+                        break
+                if found:
+                    break
+            if found:
+                break
+        if len(examples) == 8:
+            break
+    blocked_ids = ", ".join(task["id"] for task in blocked[:12])
+    if len(blocked) > 12:
+        blocked_ids += f", and {len(blocked) - 12} more"
+    detail = "; ".join(examples) if examples else "no overlap example available"
+    return [
+        f"conflictDomains limited this ready frontier to {len(frontier)} of requested "
+        f"maxParallel {max_parallel}; blocked tasks: {blocked_ids}; overlaps: {detail}"
+    ]
 
 
 def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
@@ -1129,6 +1195,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             worklist["tasks"],
             merged_ids,
         )
+    warnings.extend(parallelism_warnings(ready, frontier, max_parallel))
     result = {
         "schemaVersion": 1,
         "repository": repository,
@@ -1676,7 +1743,12 @@ def normalize_forbid_paths_gate(value: Any, context: str) -> dict[str, Any]:
     return {"kind": "forbidPaths", "id": gate_id, "forbidPaths": patterns}
 
 
-def changed_paths_in_history(worktree: Path, base_rev: str, head: str) -> list[str]:
+def changed_paths_in_history(
+    worktree: Path, base_rev: str, head: str, *, include_deletions: bool = False
+) -> list[str]:
+    base_rev = full_git_oid(base_rev, "base revision")
+    head = full_git_oid(head, "head revision")
+    diff_filter = "ACDMTUXB" if include_deletions else "ACMTUXB"
     changed = git(
         worktree,
         "log",
@@ -1684,28 +1756,50 @@ def changed_paths_in_history(worktree: Path, base_rev: str, head: str) -> list[s
         "--format=",
         "--name-only",
         "--no-renames",
-        "--diff-filter=ACMRTUXB",
+        f"--diff-filter={diff_filter}",
         "-z",
+        "--end-of-options",
         f"{base_rev}..{head}",
         "--",
     ).stdout
     return sorted({path for path in changed.split("\0") if path})
 
 
-def changed_paths_in_diff(worktree: Path, base_rev: str, head: str) -> list[str]:
-    """Return every path affected by the committed base-to-head task diff."""
-    changed = git(
-        worktree,
-        "diff",
-        "--name-only",
-        "--no-renames",
-        "--diff-filter=ACDMRTUXB",
-        "-z",
-        base_rev,
-        head,
-        "--",
-    ).stdout
-    return sorted({path for path in changed.split("\0") if path})
+def normalize_ownership_receipt(value: Any, context: str) -> dict[str, Any]:
+    receipt = object_exact(
+        value,
+        {
+            "taskId",
+            "domainsRequired",
+            "conflictDomains",
+            "ownedPaths",
+            "baseRev",
+            "head",
+        },
+        context,
+    )
+    task_id = required_string(receipt.get("taskId"), f"{context}.taskId")
+    if not TASK_ID.fullmatch(task_id):
+        fail(f"{context}.taskId is not safe")
+    domains_required = required_bool(
+        receipt.get("domainsRequired"), f"{context}.domainsRequired"
+    )
+    domains = normalize_conflict_domains(
+        receipt.get("conflictDomains"),
+        f"{context}.conflictDomains",
+        required=domains_required,
+    )
+    owned_paths = normalize_owned_paths(receipt.get("ownedPaths"), f"{context}.ownedPaths")
+    if owned_paths != sorted(owned_paths):
+        fail(f"{context}.ownedPaths must be sorted")
+    return {
+        "taskId": task_id,
+        "domainsRequired": domains_required,
+        "conflictDomains": domains,
+        "ownedPaths": owned_paths,
+        "baseRev": full_git_oid(receipt.get("baseRev"), f"{context}.baseRev"),
+        "head": full_git_oid(receipt.get("head"), f"{context}.head"),
+    }
 
 
 def enforce_conflict_domains(
@@ -1714,7 +1808,8 @@ def enforce_conflict_domains(
     head: str,
     task: Any,
     expected_task_id: str,
-) -> int:
+    domains_required: bool,
+) -> dict[str, Any]:
     if not isinstance(task, dict):
         fail("task must be an object")
     task_id = required_string(task.get("id"), "task.id")
@@ -1722,20 +1817,26 @@ def enforce_conflict_domains(
         fail("task.id is not safe")
     if task_id != expected_task_id:
         fail("task.id does not match workspace.taskId")
+    domains_required = required_bool(domains_required, "domainsRequired")
     domains = normalize_conflict_domains(
-        task.get("conflictDomains"), "task.conflictDomains", required=False
+        task.get("conflictDomains"),
+        "task.conflictDomains",
+        required=domains_required,
     )
-    # Serial campaigns may omit conflictDomains. A non-empty declaration is an
-    # ownership contract, and parallel worklists are guaranteed to have one.
-    if not domains:
-        return 0
-
-    changed_paths = changed_paths_in_diff(worktree, base_rev, head)
-    outside = [
-        path
-        for path in changed_paths
-        if not any(domains_overlap(path, domain) for domain in domains)
-    ]
+    base_rev = full_git_oid(base_rev, "base revision")
+    head = full_git_oid(head, "head revision")
+    changed_paths = changed_paths_in_history(
+        worktree, base_rev, head, include_deletions=True
+    )
+    outside = (
+        [
+            path
+            for path in changed_paths
+            if not any(domains_overlap(path, domain) for domain in domains)
+        ]
+        if domains
+        else []
+    )
     if outside:
         preview = ", ".join(json.dumps(path) for path in outside[:20])
         if len(outside) > 20:
@@ -1745,7 +1846,53 @@ def enforce_conflict_domains(
             f"task {task_id!r} changed {len(outside)} path(s) outside its declared "
             f"conflictDomains: {preview}; declared domains: {declared}"
         )
-    return len(changed_paths)
+    return {
+        "taskId": task_id,
+        "domainsRequired": domains_required,
+        "conflictDomains": domains,
+        "ownedPaths": changed_paths,
+        "baseRev": base_rev,
+        "head": head,
+    }
+
+
+def action_ownership(brief: dict[str, Any]) -> dict[str, Any]:
+    data = object_exact(
+        brief, {"task", "domainsRequired", "workspace"}, "ownership brief"
+    )
+    workspace = object_exact(
+        data.get("workspace"),
+        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
+        "workspace",
+    )
+    task_id = required_string(workspace.get("taskId"), "workspace.taskId")
+    if not TASK_ID.fullmatch(task_id):
+        fail("workspace.taskId is not safe")
+    base_rev = full_git_oid(workspace.get("baseRev"), "workspace.baseRev")
+    branch = required_string(workspace.get("branch"), "workspace.branch")
+    required_string(workspace.get("publishBranch"), "workspace.publishBranch")
+    worktree = Path(required_string(workspace.get("worktreePath"), "workspace.worktreePath"))
+    if not worktree.is_absolute() or not worktree.is_dir():
+        fail("workspace.worktreePath must be an absolute existing directory")
+    git(worktree, "rev-parse", "--git-dir")
+    actual_branch = git(worktree, "branch", "--show-current").stdout.strip()
+    if actual_branch != branch:
+        fail(f"worktree is on branch {actual_branch!r}, expected {branch!r}")
+    if git(worktree, "status", "--porcelain").stdout:
+        fail("agent left uncommitted changes; commit the task before ownership validation")
+    head = git(worktree, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
+    if head == base_rev:
+        fail("agent produced no commit relative to the prepared base")
+    if git(worktree, "merge-base", "--is-ancestor", base_rev, head, check=False).returncode:
+        fail("task head is not descended from its prepared base revision")
+    return enforce_conflict_domains(
+        worktree,
+        base_rev,
+        head,
+        data.get("task"),
+        task_id,
+        data.get("domainsRequired"),
+    )
 
 
 def evaluate_forbid_paths(
@@ -1893,9 +2040,9 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
         "workspace",
     }
     if action == "rebase":
-        allowed.update({"publication", "constraints"})
+        allowed.update({"publication", "constraints", "domainsRequired"})
     if action == "publish":
-        allowed.add("constraints")
+        allowed.update({"constraints", "domainsRequired"})
     if action == "merge":
         allowed.add("integration")
     data = object_exact(brief, allowed, f"{action} brief")
@@ -1905,6 +2052,7 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
         {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
         "workspace",
     )
+    full_git_oid(workspace.get("baseRev"), "workspace.baseRev")
     worktree = Path(required_string(workspace.get("worktreePath"), "workspace.worktreePath"))
     if not worktree.is_absolute():
         fail("workspace.worktreePath must be absolute")
@@ -2028,7 +2176,14 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         fail("agent produced no commit relative to the prepared base")
     if git(worktree, "merge-base", "--is-ancestor", base_rev, head, check=False).returncode != 0:
         fail("task head is not descended from its prepared base revision")
-    enforce_conflict_domains(worktree, base_rev, head, data.get("task"), task_id)
+    ownership = enforce_conflict_domains(
+        worktree,
+        base_rev,
+        head,
+        data.get("task"),
+        task_id,
+        data.get("domainsRequired"),
+    )
     enforce_constraint_results(worktree, base_rev, head, constraints)
     git(worktree, "push", config["remote"], f"HEAD:refs/heads/{publish_branch}")
     if config["forge"] == "github":
@@ -2040,21 +2195,31 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         "branch": publish_branch,
         "head": head,
         "pullRequest": pull_request,
+        "ownership": ownership,
     }
 
 
-def publication(value: Any, context: str = "publication") -> dict[str, str]:
-    item = object_exact(value, {"taskId", "branch", "head", "pullRequest"}, context)
+def publication(value: Any, context: str = "publication") -> dict[str, Any]:
+    item = object_exact(
+        value, {"taskId", "branch", "head", "pullRequest", "ownership"}, context
+    )
     task_id = required_string(item.get("taskId"), f"{context}.taskId")
     if not TASK_ID.fullmatch(task_id):
         fail(f"{context}.taskId is not safe")
+    head = full_git_oid(item.get("head"), f"{context}.head")
+    ownership = normalize_ownership_receipt(item.get("ownership"), f"{context}.ownership")
+    if ownership["taskId"] != task_id:
+        fail(f"{context}.ownership.taskId does not match {context}.taskId")
+    if ownership["head"] != head:
+        fail(f"{context}.ownership.head does not match {context}.head")
     return {
         "taskId": task_id,
         "branch": required_string(item.get("branch"), f"{context}.branch"),
-        "head": required_string(item.get("head"), f"{context}.head"),
+        "head": head,
         "pullRequest": required_string(
             item.get("pullRequest"), f"{context}.pullRequest"
         ),
+        "ownership": ownership,
     }
 
 
@@ -2063,10 +2228,15 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
     published = publication(data.get("publication"))
     constraints = normalize_constraint_results(data.get("constraints"), "rebase constraints")
     workspace = data["workspace"]
+    domains_required = required_bool(data.get("domainsRequired"), "domainsRequired")
     if published["taskId"] != workspace["taskId"]:
         fail("publication.taskId does not match workspace.taskId")
     if published["branch"] != workspace["publishBranch"]:
         fail("publication.branch does not match workspace.publishBranch")
+    if published["ownership"]["baseRev"] != workspace["baseRev"]:
+        fail("publication.ownership.baseRev does not match workspace.baseRev")
+    if published["ownership"]["domainsRequired"] != domains_required:
+        fail("publication.ownership.domainsRequired does not match domainsRequired")
     local_head = git(worktree, "rev-parse", "HEAD").stdout.strip()
     if local_head != published["head"]:
         fail("worktree head changed after publication")
@@ -2090,8 +2260,13 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
         fail("published branch moved before integration")
 
     if git(worktree, "merge-base", "--is-ancestor", base_rev, local_head, check=False).returncode == 0:
-        enforce_conflict_domains(
-            worktree, base_rev, local_head, data.get("task"), published["taskId"]
+        ownership = enforce_conflict_domains(
+            worktree,
+            base_rev,
+            local_head,
+            data.get("task"),
+            published["taskId"],
+            domains_required,
         )
         return {
             "taskId": published["taskId"],
@@ -2100,6 +2275,7 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
             "head": local_head,
             "pullRequest": published["pullRequest"],
             "regate": False,
+            "ownership": ownership,
         }
 
     rebased = git(worktree, "rebase", base_rev, check=False)
@@ -2135,8 +2311,13 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
             "pass can rebuild the task from current base"
         )
     rebased_head = git(worktree, "rev-parse", "HEAD").stdout.strip()
-    enforce_conflict_domains(
-        worktree, base_rev, rebased_head, data.get("task"), published["taskId"]
+    ownership = enforce_conflict_domains(
+        worktree,
+        base_rev,
+        rebased_head,
+        data.get("task"),
+        published["taskId"],
+        domains_required,
     )
     for constraint in constraints:
         evaluate_forbid_paths(
@@ -2160,6 +2341,7 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
         "head": rebased_head,
         "pullRequest": published["pullRequest"],
         "regate": True,
+        "ownership": ownership,
     }
 
 
@@ -2670,16 +2852,32 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
     data, config, worktree = publication_identity(brief, "merge")
     integration = object_exact(
         data.get("integration"),
-        {"taskId", "baseRev", "branch", "head", "pullRequest", "regate"},
+        {
+            "taskId",
+            "baseRev",
+            "branch",
+            "head",
+            "pullRequest",
+            "regate",
+            "ownership",
+        },
         "integration",
     )
     task_id = required_string(integration.get("taskId"), "integration.taskId")
-    required_string(integration.get("baseRev"), "integration.baseRev")
+    base_rev = full_git_oid(integration.get("baseRev"), "integration.baseRev")
     required_string(integration.get("branch"), "integration.branch")
-    head = required_string(integration.get("head"), "integration.head")
+    head = full_git_oid(integration.get("head"), "integration.head")
     pull_request = required_string(integration.get("pullRequest"), "integration.pullRequest")
-    if not isinstance(integration.get("regate"), bool):
-        fail("integration.regate must be boolean")
+    required_bool(integration.get("regate"), "integration.regate")
+    ownership = normalize_ownership_receipt(
+        integration.get("ownership"), "integration.ownership"
+    )
+    if ownership["taskId"] != task_id:
+        fail("integration.ownership.taskId does not match integration.taskId")
+    if ownership["baseRev"] != base_rev:
+        fail("integration.ownership.baseRev does not match integration.baseRev")
+    if ownership["head"] != head:
+        fail("integration.ownership.head does not match integration.head")
     if task_id != data["workspace"]["taskId"]:
         fail("integration.taskId does not match workspace.taskId")
     if integration["branch"] != data["workspace"]["publishBranch"]:
@@ -2694,6 +2892,7 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
         "mergeCommit": merge_commit,
         "pullRequest": pull_request,
         "regated": integration["regate"],
+        "ownership": ownership,
     }
 
 
@@ -2708,6 +2907,7 @@ def main() -> int:
             "preflight",
             "prep",
             "cleanup",
+            "ownership",
             "constraint",
             "checkpoint",
             "publish",
@@ -2724,6 +2924,7 @@ def main() -> int:
         "reconcile": action_reconcile,
         "preflight": action_preflight,
         "prep": action_prep,
+        "ownership": action_ownership,
         "constraint": action_constraint,
         "checkpoint": action_checkpoint,
         "cleanup": action_cleanup,

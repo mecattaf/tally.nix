@@ -3486,7 +3486,7 @@
                   .producers["campaign-fixture"].enqueue.argv[0:3] == [
                     "${tally}/bin/tally", "flow", "run"
                   ] and
-                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "36"] and
+                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "39"] and
                   .producers["campaign-fixture-reconcile"].kind == "gh" and
                   .producers["campaign-fixture-reconcile"].allowSelfTriggered == true and
                   .producers["campaign-fixture-reconcile"].allowedActors == ["operator"] and
@@ -3495,7 +3495,7 @@
                   .producers["campaign-fixture-reconcile"].postFailureStderr == true and
                   .producers["campaign-fixture-reconcile"].triggers.commandComments == ["/tally reconcile fixture"] and
                   .producers["campaign-fixture-reconcile"].enqueue.pool == ["fixture-campaign", "flow"] and
-                  .producers["campaign-fixture-reconcile"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "36"] and
+                  .producers["campaign-fixture-reconcile"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "39"] and
                   $reconcileArgs.reconcileCommand == "/tally reconcile fixture" and
                   .producers["campaign-defaulted"].allowSelfTriggered == false
                   and .producers["campaign-defaulted"].postFailureEvidence == false
@@ -3745,6 +3745,7 @@
                       "build/allowed.txt",
                       "build/LATE.SQLite"
                     ]),
+                    domainsRequired: true,
                     workspace: {
                       taskId: "task-1",
                       baseRev: $base,
@@ -3777,7 +3778,14 @@
                 jq -e --arg head "$witnessed_head" '
                   .taskId == "task-1" and
                   .head == $head and
-                  .branch == "tally/fixture-issue-7/task-1"
+                  .branch == "tally/fixture-issue-7/task-1" and
+                  .ownership.domainsRequired == true and
+                  .ownership.conflictDomains == [
+                    "build/allowed.txt",
+                    "build/LATE.SQLite"
+                  ] and
+                  .ownership.ownedPaths == ["build/allowed.txt"] and
+                  .ownership.head == $head
                 ' "$TMPDIR/publication-pass.json" >/dev/null
                 test "$(git -C "$TMPDIR/spec" ls-remote origin \
                   refs/heads/tally/fixture-issue-7/task-1 | cut -f1)" = \
