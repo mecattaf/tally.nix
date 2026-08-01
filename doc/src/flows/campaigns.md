@@ -281,6 +281,14 @@ paths without `..`. Equal paths and ancestor/descendant paths overlap, so
 selects ready tasks in worklist order while keeping the selected domains
 disjoint.
 
+A non-empty declaration is also an enforced ownership boundary. Before pushing
+a task branch, the driver compares every path in its committed base-to-head diff
+with the task's domains using that same component-prefix rule. An unowned add,
+edit, deletion, type change, or either side of a rename fails publication before
+the remote branch or pull request can move. A base-changing rebase repeats the
+check against the rewritten exact head before force-push. Serial tasks that omit
+the optional field keep their unrestricted existing behavior.
+
 IDs are stable task components. Dependencies must name earlier tasks, which
 makes the array a validated topological order. Acceptance criteria are runnable,
 direct-argv instructions for the agent and reviewers; the campaign's configured

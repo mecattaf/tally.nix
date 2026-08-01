@@ -28,7 +28,9 @@ authorized.
   task lanes concurrently, rebase and re-gate changed heads before serialized
   merges, and enqueue the next pass through an exact self-posted GitHub command;
   fresh mentions safely recover failed or redeployed passes without replaying an
-  old flow-run identity.
+  old flow-run identity. Non-empty task `conflictDomains` now also constrain the
+  committed diff at initial publication and after rebase, so an under-declared
+  task is rejected before its remote branch can move.
 - Added flow-node `approvalPolicy` and `sandboxPolicy` fields plus campaign
   `agentApprovalPolicy`/`agentSandboxPolicy` options. Spec-build implementation
   agents now default to Codex's writable `workspace-write` + `on-request`

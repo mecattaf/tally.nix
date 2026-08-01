@@ -879,6 +879,62 @@ def changed_paths_in_history(worktree: Path, base_rev: str, head: str) -> list[s
     return sorted({path for path in changed.split("\0") if path})
 
 
+def changed_paths_in_diff(worktree: Path, base_rev: str, head: str) -> list[str]:
+    """Return every path affected by the committed base-to-head task diff."""
+    changed = git(
+        worktree,
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--diff-filter=ACDMRTUXB",
+        "-z",
+        base_rev,
+        head,
+        "--",
+    ).stdout
+    return sorted({path for path in changed.split("\0") if path})
+
+
+def enforce_conflict_domains(
+    worktree: Path,
+    base_rev: str,
+    head: str,
+    task: Any,
+    expected_task_id: str,
+) -> int:
+    if not isinstance(task, dict):
+        fail("task must be an object")
+    task_id = required_string(task.get("id"), "task.id")
+    if not TASK_ID.fullmatch(task_id):
+        fail("task.id is not safe")
+    if task_id != expected_task_id:
+        fail("task.id does not match workspace.taskId")
+    domains = normalize_conflict_domains(
+        task.get("conflictDomains"), "task.conflictDomains", required=False
+    )
+    # Serial campaigns may omit conflictDomains. A non-empty declaration is an
+    # ownership contract, and parallel worklists are guaranteed to have one.
+    if not domains:
+        return 0
+
+    changed_paths = changed_paths_in_diff(worktree, base_rev, head)
+    outside = [
+        path
+        for path in changed_paths
+        if not any(domains_overlap(path, domain) for domain in domains)
+    ]
+    if outside:
+        preview = ", ".join(json.dumps(path) for path in outside[:20])
+        if len(outside) > 20:
+            preview += f", and {len(outside) - 20} more"
+        declared = ", ".join(json.dumps(domain) for domain in domains)
+        fail(
+            f"task {task_id!r} changed {len(outside)} path(s) outside its declared "
+            f"conflictDomains: {preview}; declared domains: {declared}"
+        )
+    return len(changed_paths)
+
+
 def evaluate_forbid_paths(
     worktree: Path, base_rev: str, head: str, gate_id: str, patterns: list[str]
 ) -> int:
@@ -1154,6 +1210,7 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         fail("agent produced no commit relative to the prepared base")
     if git(worktree, "merge-base", "--is-ancestor", base_rev, head, check=False).returncode != 0:
         fail("task head is not descended from its prepared base revision")
+    enforce_conflict_domains(worktree, base_rev, head, data.get("task"), task_id)
     enforce_constraint_results(worktree, base_rev, head, constraints)
     git(worktree, "push", config["remote"], f"HEAD:refs/heads/{publish_branch}")
     if config["forge"] == "github":
@@ -1215,6 +1272,9 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
         fail("published branch moved before integration")
 
     if git(worktree, "merge-base", "--is-ancestor", base_rev, local_head, check=False).returncode == 0:
+        enforce_conflict_domains(
+            worktree, base_rev, local_head, data.get("task"), published["taskId"]
+        )
         return {
             "taskId": published["taskId"],
             "baseRev": base_rev,
@@ -1229,6 +1289,9 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
         detail = rebased.stderr.strip() or rebased.stdout.strip() or "no output"
         fail(f"cannot rebase task onto current base {base_rev}: {detail}")
     rebased_head = git(worktree, "rev-parse", "HEAD").stdout.strip()
+    enforce_conflict_domains(
+        worktree, base_rev, rebased_head, data.get("task"), published["taskId"]
+    )
     for constraint in constraints:
         evaluate_forbid_paths(
             worktree,
