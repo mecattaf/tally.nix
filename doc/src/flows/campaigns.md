@@ -41,7 +41,13 @@ when a corpus is frozen.
 
 The Home Manager module installs the generic campaign pools, packaged flow and
 driver, and `tally-campaign-poll.timer` once. The timer only scans locally armed
-issue locators; an empty registry performs no work. The GitHub CLI identity used
+issue locators; an empty registry performs no work. Forge-native campaigns post
+no continuation comment, so this timer is what carries a campaign from one pass
+to the next. It scans every `services.tally.campaignPoll.interval` (60s by
+default). A scan holds the registry lock exclusively across its forge
+round-trips, which blocks an interactive `tally campaign arm`, `disarm`, or
+`list` for its duration; `services.tally.campaignPoll.timeout` caps that hold.
+The GitHub CLI identity used
 by the user service must be able to read the campaign issue graph and, for a
 GitHub target repository, push, open, and merge pull requests.
 

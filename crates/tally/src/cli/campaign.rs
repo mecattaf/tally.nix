@@ -1321,8 +1321,13 @@ fn max_flow_nodes(manifest: &CampaignManifest) -> u32 {
     };
     // Sweep, reconcile, one possible continuation, and each worst-case
     // implementation lane: prep, agent, ownership, gates, publish, rebase,
-    // optional re-gates, merge, and cleanup. Checkpoint lanes are smaller.
-    (3 + preflight + manifest.max_parallel * (7 + 2 * manifest.gates.len())) as u32
+    // optional re-gates, merge, then the failure path's diff, diagnosis, and
+    // steering, and finally cleanup. A lane that fails at merge is the
+    // expensive one, not a lane that merges: maxNodes counts cumulative rows,
+    // so finished nodes never return budget. Budgeting the success path alone
+    // starves failure steering exactly when it is needed. Checkpoint lanes are
+    // smaller.
+    (3 + preflight + manifest.max_parallel * (10 + 2 * manifest.gates.len())) as u32
 }
 
 async fn dispatch_campaign(
@@ -2924,7 +2929,50 @@ mod tests {
             ]),
         );
         let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
-        assert_eq!(max_flow_nodes(&manifest), 39);
+        assert_eq!(max_flow_nodes(&manifest), 48);
+    }
+
+    #[test]
+    fn flow_node_bound_covers_lanes_that_fail_at_merge() {
+        // A lane that fails at merge spends every success-path node and then
+        // diff, diagnosis, and steering on top. maxNodes counts cumulative
+        // rows, so the budget must hold all of them at once.
+        const PASS_MAINTENANCE: usize = 3;
+        const LANE_SUCCESS_PATH: usize = 7;
+        const LANE_FAILURE_PATH: usize = 3;
+
+        for max_parallel in 1..=4 {
+            for gate_count in 0..=3 {
+                let mut value = manifest_value_for_test(json!([]));
+                let object = value.as_object_mut().unwrap();
+                object.insert("maxParallel".into(), json!(max_parallel));
+                object.insert(
+                    "gates".into(),
+                    Value::Array(
+                        (0..gate_count)
+                            .map(|index| {
+                                json!({
+                                    "kind": "forbidPaths",
+                                    "id": format!("no-databases-{index}"),
+                                    "forbidPaths": ["*.db"]
+                                })
+                            })
+                            .collect(),
+                    ),
+                );
+                let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+
+                // No command gates here, so preflight costs nothing.
+                let worst_case = PASS_MAINTENANCE
+                    + max_parallel * (LANE_SUCCESS_PATH + LANE_FAILURE_PATH + 2 * gate_count);
+                assert!(
+                    max_flow_nodes(&manifest) as usize >= worst_case,
+                    "maxParallel {max_parallel} with {gate_count} gates budgets {} nodes \
+                     but a frontier failing at merge needs {worst_case}",
+                    max_flow_nodes(&manifest)
+                );
+            }
+        }
     }
 
     #[test]

@@ -2691,6 +2691,48 @@ let
           them alongside producers and flows.
         '';
       };
+      campaignPoll = mkOption {
+        type = types.submodule {
+          options = {
+            enable = mkOption {
+              type = types.bool;
+              default = true;
+              description = ''
+                Install the timer that reconciles locally armed forge-native
+                campaigns. This timer is the continuation mechanism for
+                forge-native campaigns: they post no continuation comment, so
+                disabling it makes every pass after the first one manual.
+              '';
+            };
+            interval = mkOption {
+              type = types.str;
+              default = "60s";
+              example = "5min";
+              description = ''
+                Systemd timespan between poll scans. Each scan is bounded and
+                cheap when nothing has changed, so short intervals are
+                affordable; raise it to reduce forge API traffic.
+              '';
+            };
+            timeout = mkOption {
+              type = types.str;
+              default = "90s";
+              example = "5min";
+              description = ''
+                Hard bound on one scan. The scan holds the registry lock
+                exclusively across its forge round-trips, which blocks
+                interactive `tally campaign arm`, `disarm`, and `list`; this
+                timeout caps how long a wedged forge call can hold it.
+              '';
+            };
+          };
+        };
+        default = { };
+        description = ''
+          Scheduling for the forge-native campaign poll. Only the Home Manager
+          module renders the unit.
+        '';
+      };
       flows = mkOption {
         type = types.attrsOf mkFlowType;
         default = { };
