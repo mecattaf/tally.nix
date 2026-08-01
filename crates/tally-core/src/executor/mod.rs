@@ -14,11 +14,11 @@ use std::time::Duration;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-pub use taskchampion::Uuid;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::watch;
+pub use uuid::Uuid;
 
 use crate::adapters::AdapterHardening;
 use crate::brief::{self, PreparedBrief};

@@ -59,10 +59,6 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: WitnessCommand,
     },
-    View {
-        #[command(subcommand)]
-        command: ViewCommand,
-    },
     Attest {
         #[command(subcommand)]
         command: AttestCommand,
@@ -542,12 +538,6 @@ pub(super) struct GcArgs {
     #[arg(
         long,
         value_name = "DURATION",
-        default_value = tally_core::retention::DEFAULT_PROJECTION_ARCHIVE_MAX_AGE
-    )]
-    pub(super) projection_archive_horizon: String,
-    #[arg(
-        long,
-        value_name = "DURATION",
         default_value = tally_core::retention::DEFAULT_EVENTS_DONE_MAX_AGE
     )]
     pub(super) events_done_horizon: String,
@@ -563,19 +553,6 @@ pub(super) struct GcArgs {
         default_value_t = tally_core::retention::DEFAULT_EVENTS_REJECTED_MAX_COUNT
     )]
     pub(super) events_rejected_max_count: usize,
-}
-
-#[derive(Debug, Subcommand)]
-pub(super) enum ViewCommand {
-    Rebuild(ViewRebuildArgs),
-}
-
-#[derive(Debug, Args)]
-pub(super) struct ViewRebuildArgs {
-    #[arg(long, value_name = "DIR")]
-    pub(super) data_dir: Option<PathBuf>,
-    #[arg(long)]
-    pub(super) yes: bool,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -868,7 +845,7 @@ pub(super) enum QueryCommand {
         #[arg(long)]
         pool: Option<String>,
     },
-    /// Show daemon-owned storage usage, budgets, projection metrics, and growth.
+    /// Show daemon-owned storage usage, budgets, and growth.
     Storage,
     Log {
         #[arg(long)]

@@ -4,21 +4,18 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use chrono::{SecondsFormat, Utc};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::config::{StorageBudgetConfig, StorageConfig};
-use crate::taskdb::TASKDATA_DIRECTORY;
 
 pub const STORAGE_STATE_FILE: &str = "storage-metrics.json";
 pub const STORAGE_WARNING_FILE: &str = "storage-warnings.jsonl";
 pub const STORAGE_RECOVERY_PERCENT: u64 = 90;
 pub const STORAGE_FREE_RECOVERY_MIN_BYTES: u64 = 1024 * 1024 * 1024;
-const STORAGE_METRICS_SCHEMA_VERSION: u32 = 2;
+const STORAGE_METRICS_SCHEMA_VERSION: u32 = 3;
 const STORAGE_STATE_SCHEMA_VERSION: u32 = 2;
 const STORAGE_WARNING_SCHEMA_VERSION: u32 = 2;
-const TASKCHAMPION_DB: &str = "taskchampion.sqlite3";
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -76,21 +73,6 @@ pub struct StoreMetrics {
     pub level: BudgetLevel,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TaskchampionMetrics {
-    pub database_bytes: u64,
-    pub wal_bytes: u64,
-    pub shm_bytes: u64,
-    pub total_bytes: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub task_count: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub operation_high_water: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub read_error: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IntakeStatus {
@@ -105,9 +87,6 @@ pub struct GrowthPerCompletion {
     pub completion_delta: u64,
     pub data_dir_bytes: i64,
     pub state_dir_bytes: i64,
-    pub taskchampion_bytes: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub taskchampion_operations: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,7 +111,6 @@ pub struct StorageMetrics {
     pub intake: IntakeStatus,
     pub data_dir: StoreMetrics,
     pub state_dir: StoreMetrics,
-    pub taskchampion: TaskchampionMetrics,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub growth_per_completion: Option<GrowthPerCompletion>,
     pub active_warnings: Vec<ActiveStorageWarning>,
@@ -171,8 +149,6 @@ struct StoragePoint {
     completion_count: u64,
     data_dir_bytes: u64,
     state_dir_bytes: u64,
-    taskchampion_bytes: u64,
-    taskchampion_operations: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -226,7 +202,6 @@ pub(crate) struct StorageMeasurement {
     state_usage: DirectoryUsage,
     data_available: u64,
     state_available: u64,
-    taskchampion: TaskchampionMetrics,
 }
 
 struct PressureEvaluation {
@@ -252,7 +227,6 @@ impl StorageSampleRequest {
         let state_usage = directory_usage(&self.state_dir)?;
         let data_available = filesystem_available(&self.data_dir)?;
         let state_available = filesystem_available(&self.state_dir)?;
-        let taskchampion = taskchampion_metrics(&self.data_dir);
         Ok(StorageMeasurement {
             sampled_at,
             completion_count: self.completion_count,
@@ -260,7 +234,6 @@ impl StorageSampleRequest {
             state_usage,
             data_available,
             state_available,
-            taskchampion,
         })
     }
 }
@@ -434,15 +407,12 @@ impl StorageMonitor {
             state_usage,
             data_available,
             state_available,
-            taskchampion,
         } = measurement;
         let point = StoragePoint {
             sampled_at: sampled_at.clone(),
             completion_count,
             data_dir_bytes: data_usage.allocated,
             state_dir_bytes: state_usage.allocated,
-            taskchampion_bytes: taskchampion.total_bytes,
-            taskchampion_operations: taskchampion.operation_high_water,
         };
 
         let previous = self.state.as_ref().and_then(|state| {
@@ -491,7 +461,6 @@ impl StorageMonitor {
                 &self.config.state_dir,
                 evaluation.state_decision.level,
             ),
-            taskchampion,
             growth_per_completion: previous
                 .as_ref()
                 .and_then(|previous| growth(previous, &point)),
@@ -991,7 +960,6 @@ fn unavailable_snapshot(
         intake: unavailable_intake(error),
         data_dir: empty_store(&config.data_dir),
         state_dir: empty_store(&config.state_dir),
-        taskchampion: TaskchampionMetrics::default(),
         growth_per_completion: None,
         active_warnings: Vec::new(),
         monitor_error: Some(error.to_owned()),
@@ -1131,15 +1099,6 @@ fn growth(previous: &StoragePoint, current: &StoragePoint) -> Option<GrowthPerCo
         completion_delta: delta,
         data_dir_bytes: rate(previous.data_dir_bytes, current.data_dir_bytes, delta),
         state_dir_bytes: rate(previous.state_dir_bytes, current.state_dir_bytes, delta),
-        taskchampion_bytes: rate(
-            previous.taskchampion_bytes,
-            current.taskchampion_bytes,
-            delta,
-        ),
-        taskchampion_operations: previous
-            .taskchampion_operations
-            .zip(current.taskchampion_operations)
-            .map(|(before, after)| rate(before, after, delta)),
     })
 }
 
@@ -1203,56 +1162,6 @@ fn filesystem_available(path: &Path) -> Result<u64, StorageError> {
             Err(source) => return Err(io_error(candidate, source)),
         }
     }
-}
-
-fn file_len(path: &Path) -> u64 {
-    std::fs::metadata(path).map_or(0, |metadata| metadata.len())
-}
-
-fn taskchampion_metrics(data_dir: &Path) -> TaskchampionMetrics {
-    let taskdata = data_dir.join(TASKDATA_DIRECTORY);
-    let database = taskdata.join(TASKCHAMPION_DB);
-    let database_bytes = file_len(&database);
-    let wal_bytes = file_len(&taskdata.join(format!("{TASKCHAMPION_DB}-wal")));
-    let shm_bytes = file_len(&taskdata.join(format!("{TASKCHAMPION_DB}-shm")));
-    let mut metrics = TaskchampionMetrics {
-        database_bytes,
-        wal_bytes,
-        shm_bytes,
-        total_bytes: database_bytes
-            .saturating_add(wal_bytes)
-            .saturating_add(shm_bytes),
-        ..TaskchampionMetrics::default()
-    };
-    if database_bytes == 0 {
-        return metrics;
-    }
-    let result = (|| -> rusqlite::Result<(u64, u64)> {
-        let connection = Connection::open_with_flags(
-            &database,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        connection.busy_timeout(std::time::Duration::from_millis(250))?;
-        let tasks: u64 =
-            connection.query_row("SELECT count(*) FROM tasks", [], |row| row.get(0))?;
-        let high_water = connection
-            .query_row(
-                "SELECT seq FROM sqlite_sequence WHERE name = 'operations'",
-                [],
-                |row| row.get::<_, u64>(0),
-            )
-            .optional()?
-            .unwrap_or(0);
-        Ok((tasks, high_water))
-    })();
-    match result {
-        Ok((tasks, high_water)) => {
-            metrics.task_count = Some(tasks);
-            metrics.operation_high_water = Some(high_water);
-        }
-        Err(error) => metrics.read_error = Some(error.to_string()),
-    }
-    metrics
 }
 
 fn append_warning(data_dir: &Path, warning: &StorageWarningRecord) -> Result<(), StorageError> {
@@ -1628,31 +1537,5 @@ mod tests {
         let vanished = root.path().join("vanished");
         assert_eq!(directory_usage(&vanished).unwrap().allocated, 0);
         assert!(filesystem_available(&vanished).unwrap() > 0);
-    }
-
-    #[test]
-    fn reads_taskchampion_sizes_counts_and_operation_high_water() {
-        let root = TempDir::new().unwrap();
-        let taskdata = root.path().join(TASKDATA_DIRECTORY);
-        std::fs::create_dir_all(&taskdata).unwrap();
-        let database = taskdata.join(TASKCHAMPION_DB);
-        let connection = Connection::open(&database).unwrap();
-        connection
-            .execute_batch(
-                "CREATE TABLE tasks (uuid STRING PRIMARY KEY, data STRING);\n\
-                 CREATE TABLE operations (id INTEGER PRIMARY KEY AUTOINCREMENT, data STRING);\n\
-                 INSERT INTO tasks VALUES ('one', '{}');\n\
-                 INSERT INTO operations (data) VALUES ('one'), ('two');\n\
-                 DELETE FROM operations;",
-            )
-            .unwrap();
-        drop(connection);
-        std::fs::write(taskdata.join(format!("{TASKCHAMPION_DB}-wal")), b"wal").unwrap();
-
-        let metrics = taskchampion_metrics(root.path());
-        assert_eq!(metrics.task_count, Some(1));
-        assert_eq!(metrics.operation_high_water, Some(2));
-        assert!(metrics.database_bytes > 0);
-        assert_eq!(metrics.wal_bytes, 3);
     }
 }

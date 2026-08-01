@@ -16,18 +16,17 @@ wins for canonical verdict and usage. Querying does not mutate a job.
 Use the daemon's measured view before workload-side free-space guards:
 
 ```console
-$ tally query storage | jq '{intake, dataDir, stateDir, taskchampion, growthPerCompletion}'
+$ tally query storage | jq '{intake, dataDir, stateDir, growthPerCompletion}'
 ```
 
 The two store sizes use allocated filesystem blocks for budget decisions and also expose
 apparent bytes and file counts. Each store reports `filesystemAvailableBytes`,
 `warningFreeBytes`, and `minimumFreeBytes`; falling below the first emits an early warning and
 falling below the second is hard pressure even when the store's own allocated bytes are small.
-`taskchampion` separates `databaseBytes`, `walBytes`, and `shmBytes`, then reports `taskCount` and
-the append-only SQLite `operationHighWater`. A projection read failure is visible as `readError`;
-the total-store and free-space decisions remain authoritative.
+`schemaVersion` is 3: the former `taskchampion` section was removed with the TaskChampion
+projection and no placeholder replaces it.
 
-Directory measurement is an off-thread, cached sample. `sampledAt` is the tree/SQLite age
+Directory measurement is an off-thread, cached sample. `sampledAt` is the tree-walk age
 boundary; `freeSpaceCheckedAt` is the latest cheap filesystem probe. `query storage` and
 `query status` return the cache without filesystem work. Every enqueue performs only `statvfs`,
 updates the free-space fields and pressure state, and never walks either tree. The periodic timer

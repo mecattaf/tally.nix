@@ -12,14 +12,11 @@ case "$scenario" in
   fanout-guardrail)
     exec "${BASH:-bash}" "$scenario_dir/fanout-guardrail.sh"
     ;;
-  slow-sqlite)
-    exec "${BASH:-bash}" "$scenario_dir/slow-sqlite.sh"
-    ;;
   pool-vanished/return)
     exec "${BASH:-bash}" "$scenario_dir/pool-vanished-return.sh"
     ;;
   *)
-    printf 'usage: %s {fleet-conformance|fanout-guardrail|slow-sqlite|pool-vanished/return}\n' "$0" >&2
+    printf 'usage: %s {fleet-conformance|fanout-guardrail|pool-vanished/return}\n' "$0" >&2
     exit 2
     ;;
 esac

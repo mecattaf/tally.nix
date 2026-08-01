@@ -103,26 +103,6 @@ impl DaemonHandler {
 
     pub(super) fn complete_terminal_post_ack(&self, work: TerminalWork) {
         self.revoke_job_token(&work.job);
-        if self.commits.send(CommitCommand::Rebuild).is_err() {
-            eprintln!("tally: post-ack replica worker stopped before terminal projection");
-        }
-        let status = if work.result.verdict == Verdict::Cancelled {
-            Status::Deleted
-        } else {
-            Status::Completed
-        };
-        if work.job.task_uuid.is_some()
-            && self
-                .commits
-                .send(CommitCommand::Upsert {
-                    row: Box::new(work.job.row.clone()),
-                    status,
-                    labor_class: work.job.labor_class,
-                })
-                .is_err()
-        {
-            eprintln!("tally: post-ack replica worker stopped before terminal row projection");
-        }
         self.complete_gh_post_ack(work.job.row.clone(), work.result.clone());
         for check in &work.evidence_checks {
             self.emit_post_ack(evidence_event(&work.job, check));
@@ -378,22 +358,6 @@ impl DaemonHandler {
                         detail.final_message.clone_from(&enriched.row.final_message);
                     }
                 }
-            }
-            if enriched.task_uuid.is_some()
-                && handler
-                    .commits
-                    .send(CommitCommand::Upsert {
-                        row: Box::new(enriched.row.clone()),
-                        status: if result.verdict == Verdict::Cancelled {
-                            Status::Deleted
-                        } else {
-                            Status::Completed
-                        },
-                        labor_class: enriched.labor_class,
-                    })
-                    .is_err()
-            {
-                eprintln!("tally: post-ack replica worker stopped before scrape projection");
             }
             handler.emit_post_ack(completed_event(&enriched, &result, evidence));
         });

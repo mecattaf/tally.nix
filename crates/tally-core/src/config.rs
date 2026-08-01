@@ -262,8 +262,6 @@ pub struct RetentionConfig {
     pub events_rejected_horizon: String,
     #[serde(default = "default_events_rejected_max_count")]
     pub events_rejected_max_count: usize,
-    #[serde(default = "default_projection_archive_horizon")]
-    pub projection_archive_horizon: String,
     #[serde(default = "default_lifecycle_horizon")]
     pub lifecycle_horizon: String,
     #[serde(default = "default_lifecycle_max_bytes")]
@@ -331,7 +329,6 @@ impl Default for RetentionConfig {
             events_done_horizon: default_events_done_horizon(),
             events_rejected_horizon: default_events_rejected_horizon(),
             events_rejected_max_count: default_events_rejected_max_count(),
-            projection_archive_horizon: default_projection_archive_horizon(),
             lifecycle_horizon: default_lifecycle_horizon(),
             lifecycle_max_bytes: default_lifecycle_max_bytes(),
         }
@@ -457,10 +454,6 @@ fn default_events_rejected_horizon() -> String {
 
 const fn default_events_rejected_max_count() -> usize {
     crate::retention::DEFAULT_EVENTS_REJECTED_MAX_COUNT
-}
-
-fn default_projection_archive_horizon() -> String {
-    crate::retention::DEFAULT_PROJECTION_ARCHIVE_MAX_AGE.to_owned()
 }
 
 fn default_lifecycle_horizon() -> String {
@@ -648,7 +641,6 @@ impl Config {
             &self.retention.capture_archive_horizon,
             &self.retention.events_done_horizon,
             &self.retention.events_rejected_horizon,
-            &self.retention.projection_archive_horizon,
             &self.retention.lifecycle_horizon,
         ] {
             crate::retention::parse_horizon(horizon)
@@ -1007,7 +999,6 @@ mod tests {
             r#"{"pools":{},"retention":{"captureArchiveHorizon":"never"}}"#,
             r#"{"pools":{},"retention":{"eventsDoneHorizon":""}}"#,
             r#"{"pools":{},"retention":{"eventsRejectedHorizon":"1fortnight"}}"#,
-            r#"{"pools":{},"retention":{"projectionArchiveHorizon":"never"}}"#,
             r#"{"pools":{},"retention":{"lifecycleHorizon":""}}"#,
             r#"{"pools":{},"retention":{"lifecycleMaxBytes":0}}"#,
         ] {

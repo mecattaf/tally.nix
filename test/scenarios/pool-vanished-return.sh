@@ -15,7 +15,6 @@ require_command jq
 require_command nix
 require_command ssh
 require_command scp
-require_command sqlite3
 
 ssh_options=(
   -o BatchMode=yes
@@ -247,9 +246,6 @@ jq -s -e --arg uuid "$task_uuid" '
   $records[1].labor_class == "recovered"
 ' "$root/data/witness.jsonl" >/dev/null \
   || scenario_fail "witness chain does not prove pool loss and exact-row recovery"
-row_count="$(sqlite3 "$root/data/taskdata/taskchampion.sqlite3" \
-  "SELECT count(*) FROM tasks WHERE uuid = '$task_uuid';")"
-[[ "$row_count" -eq 1 ]] || scenario_fail "TaskChampion contains a replacement or missing row"
 
 printf 'PASS pool-vanished/return: worker=%s boot=%s task=%s verdicts=pool-vanished,pass attempts=1,2\n' \
   "$worker" "$old_boot_id->$new_boot_id" "$task_uuid"

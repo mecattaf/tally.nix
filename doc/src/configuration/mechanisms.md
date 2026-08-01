@@ -291,7 +291,6 @@ for types and defaults rather than copying values from another deployment.
 | [`retention.horizon`](core-options.md#servicestallyretentionhorizon) | Systemd timespan used as the witness-liveness retention floor. |
 | [`retention.onCalendar`](core-options.md#servicestallyretentiononcalendar) | Collection schedule. |
 | [`retention.lifecycleMaxBytes`](core-options.md#servicestallyretentionlifecyclemaxbytes) / [`lifecycleHorizon`](core-options.md#servicestallyretentionlifecyclehorizon) | Byte trigger and protected recent window for lifecycle prefix compaction. |
-| [`retention.projectionArchiveHorizon`](core-options.md#servicestallyretentionprojectionarchivehorizon) | Age bound for immutable offline projection archives. |
 | [`storage.dataDir`](core-options.md#servicestallystoragedatadir) / [`storage.stateDir`](core-options.md#servicestallystoragestatedir) | Warning/hard allocated-byte budgets plus warning/hard filesystem free-space thresholds; intake probes free space live and hard pressure refuses only new work. |
 | [`attestations.exec.enable`](core-options.md#servicestallyattestationsexecenable) | Whether fresh and recovered executions receive advisory per-host attestation wrappers. |
 | [`gitAi.enable`](core-options.md#servicestallygitaienable) | Whether code-result revisions are bound to externally provisioned Git AI notes. tally.nix does not package `git-ai`. |
@@ -299,7 +298,7 @@ for types and defaults rather than copying values from another deployment.
 | [`gitAi.awaitTimeoutSec`](core-options.md#servicestallygitaiawaittimeoutsec) | Settlement-barrier timeout. |
 | [`gitAi.globalAwaitOk`](core-options.md#servicestallygitaiglobalawaitok) | Explicit permission for the process-global barrier on an isolated execution host. |
 | [`journald.native`](core-options.md#servicestallyjournaldnative) | Native journal datagrams versus JSON stdout records. |
-| [`dataDir`](core-options.md#servicestallydatadir) | Durable witness, attestation, and rebuildable TaskChampion data. Preserve it across restarts. |
+| [`dataDir`](core-options.md#servicestallydatadir) | Durable witness, attestation, brief, and lifecycle data. Preserve it across restarts. |
 | [`stateDir`](core-options.md#servicestallystatedir) | Mutable events, captures, exit records, lease epochs, and producer state. Preserve it for recovery. |
 | [`package`](core-options.md#servicestallypackage) | The tally daemon/CLI build used both to validate and run this configuration. |
 | [`installTallydSymlink`](core-options.md#servicestallyinstalltallydsymlink) | Whether the installed package exposes the compatibility `tallyd` argv-zero alias alongside `tally`. |

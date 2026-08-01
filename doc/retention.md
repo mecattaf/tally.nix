@@ -126,17 +126,17 @@ severity changes share one campaign-receipt episode until full recovery. `storag
 is derived advisory state: invalid, foreign, inconsistent, or unsupported versions reset at
 startup while the durable warning log preserves the sequence high-water.
 
-Hard pressure does not override retention policy. In particular, a recent
-`taskdata.pre-rebuild-*` rollback copy remains protected by the default 30-day projection archive
-horizon. After inspecting the dry-run, an operator who accepts retiring all such rollback copies
-can run:
+Hard pressure does not override retention policy. Deleting the TaskChampion projection left any
+existing `taskdata/` directory and its `taskdata.pre-rebuild-*` archives inert: no retention lane
+sweeps them, but they still count against the data-store byte budget. Removing them is a manual
+operator action:
 
 ```console
-$ tally gc --horizon 30d --projection-archive-horizon 0s --skip-state-dir --dry-run
-$ tally gc --horizon 30d --projection-archive-horizon 0s --skip-state-dir
+$ rm -rf /var/lib/tally/data/taskdata /var/lib/tally/data/taskdata.pre-rebuild-*
 ```
 
-These commands omit `--collect`, so they do not launch host-wide Nix GC. Symlink targets such as
+`tally gc` omits `--collect` by default, so an ordinary sweep does not launch host-wide Nix GC.
+Symlink targets such as
 GC-root-pinned Nix closures are not charged to the directory byte budget, and campaign
 `workspaceRoot` trees are workload-owned. Monitor those external lanes separately; the
 free-space floor covers them only when they share the tally store's filesystem.

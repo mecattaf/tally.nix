@@ -373,19 +373,6 @@ impl DaemonHandler {
         ));
         drop(context);
 
-        for row in &represented_rows {
-            if self
-                .commits
-                .send(CommitCommand::Upsert {
-                    row: Box::new(row.clone()),
-                    status: Status::Pending,
-                    labor_class: LaborClass::Recovered,
-                })
-                .is_err()
-            {
-                eprintln!("tally: post-ack replica worker stopped before pool-return projection");
-            }
-        }
         for job in launches {
             self.spawn_execution(job);
         }

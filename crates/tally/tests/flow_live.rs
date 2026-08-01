@@ -7,7 +7,6 @@ use std::process::Command as StdCommand;
 use std::process::Stdio;
 use std::time::Duration;
 
-use chrono::Utc;
 use serde_json::{json, Value};
 use tally_client::RpcClient;
 use tally_core::adapters::{
@@ -30,7 +29,6 @@ use tally_core::taskdb::{
     read_acknowledged_events, related_trigger_from_gh_origin, EnqueueSource, GhContextSnapshot,
     GhItemState, GhItemType, GhTriggeringComment, GH_CONTEXT_SCHEMA_VERSION,
 };
-use tally_core::view::rebuild_taskchampion_view;
 use tally_core::wire::EnqueuePayload;
 use tally_core::witness::{read_verified_attestations, read_verified_records};
 use tally_flow::BRIEF_SENTINEL;
@@ -1800,14 +1798,6 @@ async fn structured_result_is_observed_after_terminal_ack_and_replayed_after_res
             );
             daemon.stop().await;
 
-            let rebuilt = rebuild_taskchampion_view(
-                &daemon_paths.state_dir,
-                &daemon_paths.data_dir,
-                Utc::now(),
-            )
-            .await
-            .unwrap();
-            assert_eq!(rebuilt.rows, 1);
             let capture_dir = daemon_paths.state_dir.join("capture");
             if capture_dir.exists() {
                 fs::remove_dir_all(capture_dir).unwrap();

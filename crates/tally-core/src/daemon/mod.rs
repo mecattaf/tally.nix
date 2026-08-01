@@ -1,7 +1,6 @@
 mod barriers;
 mod completion;
 mod notify;
-mod replica;
 mod rpc;
 mod run;
 mod startup;
@@ -28,7 +27,6 @@ use completion::{
     substituted_witness, GhTerminalWork, TerminalWork,
 };
 pub(crate) use notify::watchdog_tick;
-pub(crate) use replica::{spawn_commit_worker, CommitCommand, ReplicaCommitter, TaskDbCommitter};
 use rpc::control::{find_job, lease_request, lease_wire, state_name};
 #[cfg(test)]
 use rpc::producer::{pool_loss_intent_directory, read_pool_loss_intent, write_pool_loss_intent};
@@ -67,10 +65,7 @@ use std::os::unix::net::UnixDatagram;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::rc::Rc;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{SecondsFormat, Utc};
@@ -78,7 +73,6 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use taskchampion::Status;
 use thiserror::Error;
 use tokio::net::UnixListener;
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
@@ -139,7 +133,7 @@ use crate::storage::{StorageError, StorageMetrics, StorageMonitor, StorageWarnin
 use crate::taskdb::{
     admits_durable_row, migrate_acknowledged_events, read_acknowledged_events,
     update_enqueue_event_atomic, write_enqueue_event_atomic, AdmissionInput, AdmissionOrigin,
-    DurableEnqueueEvent, DurableRetry, EnqueueSource, RowSeed, TaskDb, TaskDbError,
+    DurableEnqueueEvent, DurableRetry, EnqueueSource, RowSeed, TaskDbError,
 };
 use crate::trace::{query_trace, trace_availability, TraceError, TraceLane};
 use crate::watch::{ChangeError, ChangeKind, ChangeStore};
@@ -337,8 +331,6 @@ pub enum DaemonError {
     Executor(#[from] ExecutorError),
     #[error("adapter error: {0}")]
     Adapter(#[from] AdapterError),
-    #[error("post-ack replica worker stopped")]
-    CommitWorkerStopped,
     #[error("sd_notify failed: {0}")]
     Notify(String),
 }
@@ -542,7 +534,6 @@ struct DaemonHandler {
     settings: DaemonSettings,
     executor: Executor,
     completion: mpsc::UnboundedSender<ExecutionFinished>,
-    commits: mpsc::UnboundedSender<CommitCommand>,
     journal: JournalEmitter,
     history: Rc<RefCell<LifecycleStore>>,
     changes: Rc<RefCell<ChangeStore>>,
@@ -920,8 +911,6 @@ pub struct Daemon {
     handler: DaemonHandler,
     completion_rx: mpsc::UnboundedReceiver<ExecutionFinished>,
     fatal_rx: mpsc::UnboundedReceiver<DaemonError>,
-    commit_rx: Option<mpsc::UnboundedReceiver<CommitCommand>>,
-    committer: Option<Box<dyn ReplicaCommitter>>,
     notifier: SystemdNotifier,
     initial_jobs: Vec<Job>,
     initial_gh_completions: Vec<GhTerminalWork>,

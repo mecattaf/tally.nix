@@ -383,11 +383,11 @@ signal.
 
 `query.storage` takes no parameters. It returns allocated and apparent bytes, file counts,
 allocated-size warning/hard thresholds, free-space warning/hard thresholds, and `ok`, `warning`,
-or `hard` level for `dataDir` and `stateDir`. `sampledAt` dates the cached tree/SQLite walk;
+or `hard` level for `dataDir` and `stateDir`. `sampledAt` dates the cached tree walk;
 `freeSpaceCheckedAt` dates the most recent periodic or per-intake filesystem-free probe.
-`taskchampion` reports the SQLite database, WAL, and shared-memory byte sizes, task count, and
-the `operations` AUTOINCREMENT high-water mark. `growthPerCompletion` is the signed byte and
-operation delta divided by the canonical witness-count delta since the prior completion sample;
+`schemaVersion` is 3; version 2's `taskchampion` section was removed outright with the
+TaskChampion projection rather than being emitted as nulls. `growthPerCompletion` is the signed
+byte delta divided by the canonical witness-count delta since the prior completion sample;
 it is absent until two completion boundaries have been observed. `intake.accepting=false` means
 only new `queue.enqueue`/`queue.continue` requests are refused. Already-admitted work, retries,
 cancellation, and all queries remain available.

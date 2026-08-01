@@ -2298,7 +2298,7 @@ let
           type = types.path;
           default = defaultDataDir;
           example = "/var/lib/tally/data";
-          description = "Durable witness, attestation, and rebuildable TaskChampion data.";
+          description = "Durable witness, attestation, brief, and lifecycle data.";
         }
         // optionalAttrs (defaultDataDirText != null) {
           defaultText = defaultDataDirText;
@@ -2454,16 +2454,6 @@ let
                 Maximum retained files under events/rejected. Whichever of this
                 bound and eventsRejectedHorizon is exceeded first prunes, oldest
                 file first.
-              '';
-            };
-            projectionArchiveHorizon = mkOption {
-              type = types.str;
-              default = "30d";
-              example = "7d";
-              description = ''
-                Age after which immutable taskdata.pre-rebuild-* projection
-                archives are removed by the retention sweep. The active
-                TaskChampion projection is never compacted by this policy.
               '';
             };
             lifecycleHorizon = mkOption {
@@ -3058,7 +3048,6 @@ let
         eventsDoneHorizon
         eventsRejectedHorizon
         eventsRejectedMaxCount
-        projectionArchiveHorizon
         lifecycleHorizon
         lifecycleMaxBytes
         ;
@@ -3453,8 +3442,6 @@ let
     cfg.retention.eventsRejectedHorizon
     "--events-rejected-max-count"
     (toString cfg.retention.eventsRejectedMaxCount)
-    "--projection-archive-horizon"
-    cfg.retention.projectionArchiveHorizon
   ];
 
   mkAssertions =
@@ -3479,10 +3466,6 @@ let
       {
         assertion = cfg.retention.eventsRejectedHorizon != "";
         message = "tally retention eventsRejectedHorizon must be non-empty";
-      }
-      {
-        assertion = cfg.retention.projectionArchiveHorizon != "";
-        message = "tally retention projectionArchiveHorizon must be non-empty";
       }
       {
         assertion = cfg.retention.lifecycleHorizon != "";

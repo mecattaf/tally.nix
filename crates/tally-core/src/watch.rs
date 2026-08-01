@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use taskchampion::Uuid;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::query::{QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION};
 

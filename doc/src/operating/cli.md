@@ -54,7 +54,6 @@ assertions.
 | `adapter` | Execute a minimal live adapter diagnostic. | Smoke result JSON. |
 | `campaign` | Project, arm, poll, or inspect forge-native campaigns. | Projection, admission, or registry JSON. |
 | `witness` | Verify/compare chains, verify authorship, or append an advisory observation. | Text or JSON. |
-| `view` | Rebuild the derived TaskChampion view. | Rebuild report JSON. |
 | `attest` | Run a child through the advisory execution-attestation wrapper. | Child output; child's exit. |
 | `lease` | Acquire, release, or inspect an explicit reservation. | Lease JSON. |
 | `daemon` | Run the daemon or drain event ingress. | Long-running process or drain JSON. |
@@ -391,8 +390,7 @@ separates advisory attestations, and includes ledger verification state.
 
 `query storage` is the daemon's cached disk-pressure view. It reports both stores' allocated and
 apparent bytes, filesystem-available bytes, configured size and free-space warning/hard levels,
-TaskChampion database/WAL/SHM sizes and operation high-water mark, and growth per canonical
-completion. `sampledAt` identifies the off-thread tree sample; `freeSpaceCheckedAt` identifies
+and growth per canonical completion. `sampledAt` identifies the off-thread tree sample; `freeSpaceCheckedAt` identifies
 the latest periodic or admission-time `statvfs` check. The query itself never walks the stores.
 At a hard level, `intake.accepting` is false; existing work and this query remain usable.
 
@@ -633,15 +631,6 @@ The horizon accepts systemd-like components such as `30d`, `1h 30min`, or `1.5h`
 `--dry-run` reports without changing roots. Without `--collect`, an applying run reconciles and
 prunes tally's witness GC roots but does not invoke Nix store collection. `--data-dir` must be
 absolute.
-
-Rebuild the disposable TaskChampion projection from durable facts:
-
-```console
-$ tally view rebuild --data-dir /var/lib/tally/data --yes
-```
-
-Without `--yes`, an existing view prompts on stderr and reads confirmation from stdin. The
-canonical witness and durable ingress facts are not rewritten.
 
 Run a command through the advisory execution wrapper:
 

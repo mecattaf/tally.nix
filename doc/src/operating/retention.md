@@ -62,7 +62,6 @@ services.tally.retention = {
   eventsDoneHorizon = "180d";
   eventsRejectedHorizon = "30d";
   eventsRejectedMaxCount = 10000;
-  projectionArchiveHorizon = "30d";
   lifecycleHorizon = "30d";
   lifecycleMaxBytes = 268435456;
   onCalendar = "daily";
@@ -90,8 +89,8 @@ early, durable warning threshold. Size these from observed `growthPerCompletion`
 the current store size. The gap from warning to hard should cover at least the maximum
 completion growth possible during `storage.pollIntervalSec`, plus every already-admitted job
 that may still finish after intake closes and an operator-response margin. The 16 GiB/8 GiB
-defaults replace the former 256 MiB floor, which represented only a few pathological projection
-updates. Lower them only when the largest admitted wave and measured write amplification fit
+defaults replace the former 256 MiB floor, which represented only a few pathological replica
+rewrites. Lower them only when the largest admitted wave and measured write amplification fit
 comfortably below the replacement floor.
 
 The timer runs this command:
@@ -101,8 +100,7 @@ $ tally gc --horizon 30d --collect \
     --capture-archive-horizon 30d \
     --events-done-horizon 180d \
     --events-rejected-horizon 30d \
-    --events-rejected-max-count 10000 \
-    --projection-archive-horizon 30d
+    --events-rejected-max-count 10000
 ```
 
 The NixOS service runs the same command with its configured `--data-dir`
@@ -122,9 +120,8 @@ The GC command:
    one cannot be secured;
 6. removes expired brief bytes and an expired witness's root only when absent
    from the corresponding live set;
-7. prunes coordinator-side per-attempt capture archives, consumed/rejected
-   producer-event files, and immutable `taskdata.pre-rebuild-*` projection archives according to
-   their independent policies; and
+7. prunes coordinator-side per-attempt capture archives and consumed/rejected
+   producer-event files according to their independent policies; and
 8. with `--collect`, runs `nix store gc`.
 
 The daemon separately checks `lifecycle.jsonl` at the storage poll cadence. Once it exceeds
@@ -219,32 +216,29 @@ The current storage story is intentionally uneven:
 | Worker `stateDir` | Captures, launch markers, exit records, and execution attestations accumulate | Preserve live/ambiguous generations. No worker-side GC is shipped. |
 | Ordinary `artifact:<path>` files | Owned by the workload; no tally GC root | Apply a workload-specific policy only after accepting the reuse and audit consequences below. |
 | Producer events | Pending files are durable recovery inputs; consumed `events/done` defaults to 180 days, rejected files to 30 days/10,000 | Let `tally gc` prune only the managed done/rejected sets. |
-| Active TaskChampion projection | No compaction in this feature; `query storage` exposes DB/WAL/SHM bytes and operation high-water, and the store hard budget gates new intake | Use the explicit offline `tally view rebuild`; issue #252 owns rebuilding efficiency. |
-| `taskdata.pre-rebuild-*` archives | 30 days by default | Let `tally gc` prune only timestamp-valid immutable archive directories. |
+| Inert `taskdata/` and `taskdata.pre-rebuild-*` directories | Left in place by the TaskChampion delete; no pruner reads or writes them | Nothing depends on them. Delete them by hand to reclaim the space. |
 | Unit-exit state | Durable recovery input; no general pruner | Do not prune by age. |
 | In-memory barrier tracker | At most 64 unclaimed drain snapshots; connected waits scale with active calls, and disconnected waiters are evicted on the next tracker operation | Automatic and restart-local. |
 | In-memory parent guardrails | Terminal parents retire after their outstanding-child count reaches zero | Automatic; rebuilt from active durable rows. |
 
-### Recover from a hard projection-archive crossing
+### Reclaim an inert TaskChampion projection
 
 Hard pressure never launches GC implicitly. Retention horizons are evidence policy, and the
 timer's `--collect` action is host-wide; a daemon must not silently shorten either policy merely
 to admit another job.
 
-An offline `tally view rebuild` deliberately leaves the former projection as a fresh
-`taskdata.pre-rebuild-*` archive. If active projection plus that rollback copy crosses the data
-budget, the default 30-day archive horizon will keep intake refused. Inspect the bounded archive
-pass, explicitly accept losing those rollback copies, then run it without `--dry-run`:
+Deleting the TaskChampion projection left any existing `<dataDir>/taskdata/` directory and its
+`taskdata.pre-rebuild-*` archives on disk and inert. Nothing reads or writes them, no retention
+lane sweeps them, and they still count against the data-store allocated-byte budget — on the
+#252 incident host that inert tree is where the 270 GiB actually sits. Removing them is a manual
+operator action:
 
 ```console
-$ tally gc --horizon 30d --projection-archive-horizon 0s --skip-state-dir --dry-run
-$ tally gc --horizon 30d --projection-archive-horizon 0s --skip-state-dir
+$ du -sh /var/lib/tally/data/taskdata /var/lib/tally/data/taskdata.pre-rebuild-*
+$ rm -rf /var/lib/tally/data/taskdata /var/lib/tally/data/taskdata.pre-rebuild-*
 ```
 
-Omitting `--collect` prevents this recovery pass from running host-wide Nix GC. It still applies
-the chosen witness-root horizon, so use the configured `retention.horizon` in place of `30d`.
-Only timestamp-valid, plain-tree projection archives are eligible; the active `taskdata`
-directory is never touched. The cached allocated-byte view records recovery on its next
+The cached allocated-byte view records recovery on its next
 single-flight sample (within `storage.pollIntervalSec` after the previous sample completes). The
 free-space axis is rechecked on the next intake as well as on that sample; restart the daemon only
 if an immediate fresh tree measurement is operationally necessary.

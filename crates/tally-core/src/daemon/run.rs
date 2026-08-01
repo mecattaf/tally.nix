@@ -37,26 +37,6 @@ impl Daemon {
                     return Err(DaemonError::Notify(error.to_string()));
                 }
             };
-        let committer = self
-            .committer
-            .take()
-            .ok_or(DaemonError::CommitWorkerStopped)?;
-        let commit_rx = self
-            .commit_rx
-            .take()
-            .ok_or(DaemonError::CommitWorkerStopped)?;
-        let worker_lock =
-            self._state_lock.file().try_clone().map_err(|error| {
-                DaemonError::Invalid(format!("cannot clone daemon lock: {error}"))
-            })?;
-        let commit_worker = match spawn_commit_worker(committer, commit_rx, worker_lock) {
-            Ok(worker) => worker,
-            Err(error) => {
-                drop(self.listener);
-                let _ = std::fs::remove_file(&socket_path);
-                return Err(error);
-            }
-        };
         let mut startup_error = None;
         for pool in std::mem::take(&mut self.initial_lost_pools) {
             if let Err(error) = self.handler.apply_pool_loss(&pool).await {
@@ -255,7 +235,7 @@ impl Daemon {
         let _ = self.execution_shutdown.send(true);
         // Advisory scrape attestations are outside the terminal fsync barrier,
         // but they still belong to this daemon lifetime. Join them while the
-        // state lock and replica writer are both exclusively owned.
+        // state lock is still exclusively owned.
         self.handler.drain_post_ack_tasks().await;
         let socket = self.handler.context.read().await.paths.socket.clone();
         drop(self.listener);
@@ -266,30 +246,6 @@ impl Daemon {
                 if result.is_ok() {
                     result = Err(io_error(&socket, source));
                 }
-            }
-        }
-        commit_worker.stopping.store(true, Ordering::Release);
-        let commit_shutdown = self
-            .handler
-            .commits
-            .send(CommitCommand::Shutdown)
-            .map_err(|_| DaemonError::CommitWorkerStopped);
-        // Once the socket and watchdog are down, shutdown may wait for a stuck
-        // post-ack commit, but it must never detach a live SQLite writer.
-        let commit_join = tokio::task::spawn_blocking(move || commit_worker.thread.join())
-            .await
-            .map_err(|error| {
-                DaemonError::Invalid(format!("replica worker join task failed: {error}"))
-            })?
-            .map_err(|_| DaemonError::Invalid("replica worker panicked".to_owned()));
-        if let Err(error) = commit_shutdown {
-            if result.is_ok() {
-                result = Err(error);
-            }
-        }
-        if let Err(error) = commit_join {
-            if result.is_ok() {
-                result = Err(error);
             }
         }
         // flock ownership follows the open-file description across fork. CLOEXEC

@@ -230,7 +230,6 @@
           nativeCheckInputs = [
             pkgs.git
             pkgs.python3
-            pkgs.taskwarrior3
           ];
           nativeBuildInputs = [ pkgs.makeWrapper ];
           postInstall = ''
@@ -3141,7 +3140,6 @@
               eventsDoneHorizon = "180d";
               eventsRejectedHorizon = "30d";
               eventsRejectedMaxCount = 10000;
-              projectionArchiveHorizon = "30d";
               lifecycleHorizon = "30d";
               lifecycleMaxBytes = 268435456;
             };
@@ -3174,7 +3172,7 @@
           assert homeTimers.tally-retention.Timer.OnCalendar == "daily";
           assert pkgs.lib.hasInfix "gc --horizon 30d --collect" (homeServiceExec "tally-retention");
           assert pkgs.lib.hasInfix
-            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000 --projection-archive-horizon 30d"
+            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000"
             (homeServiceExec "tally-retention");
           # Forge-native campaigns post no continuation comment, so this timer
           # is the only thing that carries a campaign past its first pass.
@@ -3347,7 +3345,7 @@
               .enqueue.depthCap == 3 and
               .enqueue.fanoutCap == 64 and
               .lease.yieldGraceSec == 20 and
-              .retention == {"enable":true,"horizon":"30d","onCalendar":"daily","captureArchiveHorizon":"30d","eventsDoneHorizon":"180d","eventsRejectedHorizon":"30d","eventsRejectedMaxCount":10000,"projectionArchiveHorizon":"30d","lifecycleHorizon":"30d","lifecycleMaxBytes":268435456} and
+              .retention == {"enable":true,"horizon":"30d","onCalendar":"daily","captureArchiveHorizon":"30d","eventsDoneHorizon":"180d","eventsRejectedHorizon":"30d","eventsRejectedMaxCount":10000,"lifecycleHorizon":"30d","lifecycleMaxBytes":268435456} and
               .storage == {"pollIntervalSec":60,"dataDir":{"warningBytes":34359738368,"hardBytes":68719476736,"warningFreeBytes":17179869184,"minimumFreeBytes":8589934592},"stateDir":{"warningBytes":34359738368,"hardBytes":68719476736,"warningFreeBytes":17179869184,"minimumFreeBytes":8589934592}} and
               .attestations == {"exec":{"enable":true}} and
               .gitAi == {"enable":false,"mode":"advisory","awaitTimeoutSec":60,"globalAwaitOk":false} and
@@ -4475,8 +4473,6 @@
             mdbook-linkcheck2
             rustc
             rustfmt
-            sqlite
-            taskwarrior3
           ];
         };
         formatter = pkgs.nixfmt-rfc-style;

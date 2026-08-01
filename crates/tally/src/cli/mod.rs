@@ -45,7 +45,7 @@ use tally_core::producers::{
 };
 use tally_core::provenance::Orchestration;
 use tally_core::recovery::RecoveryPolicy;
-use tally_core::taskdb::{EnqueueSource, RelatedTrigger, WorkspaceMetadata, TASKDATA_DIRECTORY};
+use tally_core::taskdb::{EnqueueSource, RelatedTrigger, WorkspaceMetadata};
 use tally_core::wire::{EnqueuePayload, SubmissionMode, SubmissionOptions};
 use tally_core::witness::{
     append_attestation, read_verified_attestations, read_verified_records, GENESIS_PREV_HASH,
@@ -261,7 +261,6 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
         }
         Some(Command::Witness { command }) => run_witness(command),
         Some(Command::History { command }) => run_history(command),
-        Some(Command::View { command }) => run_view(command).await,
         Some(Command::Attest { command }) => run_attest(command),
         Some(Command::Lease { command }) => {
             run_lease(&socket, opts.config.as_deref(), rpc_timeout, command).await
@@ -933,9 +932,6 @@ fn run_gc(args: GcArgs) -> Result<()> {
             state_dir: state_dir.as_deref(),
             horizon_text: &args.horizon,
             state_retention,
-            projection_archive_max_age: tally_core::retention::parse_horizon(
-                &args.projection_archive_horizon,
-            )?,
             now: Utc::now(),
             dry_run: args.dry_run,
             collect: args.collect,
@@ -944,41 +940,4 @@ fn run_gc(args: GcArgs) -> Result<()> {
     )?;
     println!("{}", serde_json::to_string(&report)?);
     Ok(())
-}
-
-async fn run_view(command: ViewCommand) -> Result<()> {
-    match command {
-        ViewCommand::Rebuild(args) => {
-            let state_dir = default_state_dir()?;
-            let data_dir = args.data_dir.map_or_else(default_data_dir, Ok)?;
-            if !state_dir.is_absolute() {
-                return Err(invalid("the tally state directory must be absolute"));
-            }
-            if !data_dir.is_absolute() {
-                return Err(invalid("--data-dir must be absolute"));
-            }
-
-            let taskdata_dir = data_dir.join(TASKDATA_DIRECTORY);
-            if !args.yes && std::fs::symlink_metadata(&taskdata_dir).is_ok() {
-                eprint!(
-                    "tally: archive {} and rebuild the TaskChampion view from durable facts? [y/N] ",
-                    taskdata_dir.display()
-                );
-                std::io::stderr().flush()?;
-                let mut answer = String::new();
-                std::io::stdin().read_line(&mut answer)?;
-                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                    return Err(invalid(
-                        "view rebuild cancelled; pass --yes to confirm non-interactively",
-                    ));
-                }
-            }
-
-            let report =
-                tally_core::view::rebuild_taskchampion_view(&state_dir, &data_dir, Utc::now())
-                    .await?;
-            println!("{}", serde_json::to_string(&report)?);
-            Ok(())
-        }
-    }
 }

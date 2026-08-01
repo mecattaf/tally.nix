@@ -11,6 +11,7 @@ impl DaemonLockGuard {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn file(&self) -> &File {
         &self.file
     }
@@ -148,36 +149,6 @@ impl Daemon {
         hydrate_adopted_adapter_metadata(&mut plan, &mut attestations)?;
         hydrate_represent_adapter_metadata(&mut plan, &config, &executor, &mut attestations)?;
 
-        let mut db = TaskDb::open(&paths.data_dir).await?;
-        db.rebuild_from_recovery_plan(&plan).await?;
-        let adapter_metadata = plan
-            .rows
-            .iter()
-            .filter(|recovery| {
-                recovery.row.session_ref.is_some()
-                    || recovery.row.model.is_some()
-                    || recovery.row.final_message.is_some()
-            })
-            .map(|recovery| {
-                let status = match recovery.state {
-                    RecoveryRowState::Pending => Status::Pending,
-                    RecoveryRowState::Deleted => Status::Deleted,
-                    RecoveryRowState::Completed
-                    | RecoveryRowState::AdoptedRunning
-                    | RecoveryRowState::AwaitingReconciliation => Status::Completed,
-                };
-                (
-                    recovery.row.uuid,
-                    (recovery.row.clone(), status, recovery.labor_class),
-                )
-            })
-            .collect();
-        let committer: Box<dyn ReplicaCommitter> = Box::new(TaskDbCommitter {
-            db,
-            events_dir: paths.events_dir(),
-            witness_path: witness_path.clone(),
-            adapter_metadata,
-        });
         let storage_data_dir = paths.data_dir.clone();
         let storage_state_dir = paths.state_dir.clone();
         let storage_config = config.storage.clone();
@@ -202,7 +173,6 @@ impl Daemon {
             host_id,
             epoch,
             plan,
-            committer,
             state_lock,
             storage,
             attestations,
@@ -214,45 +184,6 @@ impl Daemon {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[cfg(test)]
-    pub(super) fn build(
-        config: Config,
-        paths: DaemonPaths,
-        settings: DaemonSettings,
-        executor: Executor,
-        epoch: u64,
-        plan: crate::recovery::RecoveryPlan,
-        committer: Box<dyn ReplicaCommitter>,
-    ) -> Result<Self, DaemonError> {
-        let state_lock = DaemonLockGuard::acquire(&paths.state_dir)?;
-        let host_id = current_host_id()?;
-        let attestations = SharedAttestations::new(paths.attestations_path());
-        let witness_ledger = WitnessLedger::open(paths.witness_path())?;
-        let witness_records = facts_witness(&plan, &paths)?;
-        let storage = StorageMonitor::open(
-            &paths.data_dir,
-            &paths.state_dir,
-            config.storage.clone(),
-            witness_ledger.head().seq,
-        );
-        Self::build_locked(
-            config,
-            paths,
-            settings,
-            executor,
-            host_id,
-            epoch,
-            plan,
-            committer,
-            state_lock,
-            storage,
-            attestations,
-            witness_ledger,
-            witness_records,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     fn build_locked(
         config: Config,
         paths: DaemonPaths,
@@ -261,7 +192,6 @@ impl Daemon {
         host_id: String,
         epoch: u64,
         plan: crate::recovery::RecoveryPlan,
-        committer: Box<dyn ReplicaCommitter>,
         state_lock: DaemonLockGuard,
         mut storage: StorageMonitor,
         mut attestations: SharedAttestations,
@@ -350,7 +280,6 @@ impl Daemon {
             UnixListener::bind(&paths.socket).map_err(|source| io_error(&paths.socket, source))?;
         let (completion_tx, completion_rx) = mpsc::unbounded_channel();
         let (fatal_tx, fatal_rx) = mpsc::unbounded_channel();
-        let (commit_tx, commit_rx) = mpsc::unbounded_channel();
         let (execution_shutdown, execution_shutdown_rx) = watch::channel(false);
         let (execution_cancel, _) = broadcast::channel(64);
         let post_ack_tasks = Rc::new(RefCell::new(Vec::new()));
@@ -400,7 +329,6 @@ impl Daemon {
             settings,
             executor,
             completion: completion_tx,
-            commits: commit_tx,
             journal: JournalEmitter::from_config(&config.journald),
             history: Rc::new(RefCell::new(LifecycleStore::open(&paths.data_dir)?)),
             changes: Rc::new(RefCell::new(changes)),
@@ -429,8 +357,6 @@ impl Daemon {
             handler,
             completion_rx,
             fatal_rx,
-            commit_rx: Some(commit_rx),
-            committer: Some(committer),
             notifier,
             initial_jobs,
             initial_gh_completions,
@@ -544,20 +470,6 @@ pub(super) fn acquire_daemon_lock(state_dir: &Path) -> Result<File, DaemonError>
         }
     })?;
     Ok(file)
-}
-
-#[cfg(test)]
-pub(super) fn facts_witness(
-    _plan: &crate::recovery::RecoveryPlan,
-    paths: &DaemonPaths,
-) -> Result<Vec<crate::witness::WitnessRecord>, DaemonError> {
-    let (report, records) = crate::witness::read_verified_records(&paths.witness_path())?;
-    if !report.ok {
-        return Err(DaemonError::Invalid(
-            "witness verification failed".to_owned(),
-        ));
-    }
-    Ok(records)
 }
 
 pub(super) fn recovery_gh_completions(

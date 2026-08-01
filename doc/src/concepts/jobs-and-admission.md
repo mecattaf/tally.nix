@@ -80,9 +80,8 @@ containment story.
 The acknowledgement boundary is durable. The enqueue event is written and
 acknowledged before the caller is told that a new job exists. A lease grant is
 also fsynced before execution is launched, and terminal waiters are released
-only after the witness record is fsynced. TaskChampion projection, journal
-events, adapter scraping, and other derived observations happen outside those
-acknowledgement barriers.
+only after the witness record is fsynced. Journal events, adapter scraping,
+and other derived observations happen outside those acknowledgement barriers.
 
 ## The execution environment is constructed
 
