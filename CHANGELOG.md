@@ -44,9 +44,13 @@ authorized.
   redeployed passes. Parallel campaign flows explicitly reject a replayed
   flow-run identity and direct recovery to a fresh mention. Campaigns ship merge
   and mention triggers, not a periodic campaign timer. Non-empty task
-  `conflictDomains` now also constrain the committed diff at initial publication
-  and after rebase, so an under-declared task is rejected before its remote
-  branch can move.
+  `conflictDomains` now also constrain the
+  full committed path history at an early post-agent check, initial publication,
+  and after rebase, so a transient or net-deleted under-declared path is rejected
+  before its remote branch can move. Ownership comparisons are case-folded,
+  parallel briefs cannot disable required domains with an empty array, receipts
+  expose declared domains and owned paths, and underfilled ready frontiers name
+  representative domain collisions.
 - Added flow-node `approvalPolicy` and `sandboxPolicy` fields plus campaign
   `agentApprovalPolicy`/`agentSandboxPolicy` options. Spec-build implementation
   agents now default to Codex's writable `workspace-write` + `on-request`

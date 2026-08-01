@@ -193,11 +193,17 @@ class GitHubForgeTests(unittest.TestCase):
             checkout, _ = initialize_repository(root)
             worklist = checkout / "specs/campaign/tasks.json"
             worklist.parent.mkdir(parents=True)
+            third_task = task("task-3", ["task-1"])
+            third_task["conflictDomains"] = ["task-2"]
             worklist.write_text(
                 json.dumps(
                     {
                         "schemaVersion": 1,
-                        "tasks": [task("task-1"), task("task-2", ["task-1"])],
+                        "tasks": [
+                            task("task-1"),
+                            task("task-2", ["task-1"]),
+                            third_task,
+                        ],
                     }
                 ),
                 encoding="utf-8",
@@ -250,15 +256,22 @@ class GitHubForgeTests(unittest.TestCase):
                         "repositoryConfig": repository_config(checkout, "github"),
                         "issue": issue(),
                         "worklist": "specs/*/tasks.json",
-                        "maxTasks": 2,
+                        "maxTasks": 3,
                         "maxParallel": 2,
                     }
                 )
                 self.assertEqual([fact["taskId"] for fact in result["merged"]], ["task-1"])
-                self.assertEqual(result["remaining"], ["task-2"])
+                self.assertEqual(result["remaining"], ["task-2", "task-3"])
                 self.assertEqual([item["id"] for item in result["frontier"]], ["task-2"])
                 self.assertTrue(any("pull/3" in warning for warning in result["warnings"]))
                 self.assertTrue(any("no task" in warning for warning in result["warnings"]))
+                self.assertTrue(
+                    any(
+                        "conflictDomains limited this ready frontier"
+                        in warning
+                        for warning in result["warnings"]
+                    )
+                )
 
                 ambiguous = github.state()
                 ambiguous["merged"].append(
@@ -279,7 +292,7 @@ class GitHubForgeTests(unittest.TestCase):
                             "repositoryConfig": repository_config(checkout, "github"),
                             "issue": issue(),
                             "worklist": "specs/*/tasks.json",
-                            "maxTasks": 2,
+                            "maxTasks": 3,
                             "maxParallel": 2,
                         }
                     )
@@ -365,6 +378,7 @@ class LaneLifecycleTests(unittest.TestCase):
             git(checkout, "push", "--quiet", "origin", "main")
 
             old_brief = prep_brief(checkout, workspace_root, "old-pass")
+            old_brief["task"]["conflictDomains"] = ["root.go"]
             prepared = DRIVER.action_prep(old_brief)
             self.assertEqual(
                 git(Path(prepared["worktreePath"]), "rev-parse", "HEAD"),
@@ -372,12 +386,21 @@ class LaneLifecycleTests(unittest.TestCase):
             )
             rebase_brief = {
                 **old_brief,
+                "domainsRequired": True,
                 "workspace": prepared,
                 "publication": {
                     "taskId": "task-1",
                     "branch": stable_branch,
                     "head": published_head,
                     "pullRequest": "local://acme/spec/task-1",
+                    "ownership": {
+                        "taskId": "task-1",
+                        "domainsRequired": True,
+                        "conflictDomains": ["root.go"],
+                        "ownedPaths": ["root.go"],
+                        "baseRev": prepared["baseRev"],
+                        "head": published_head,
+                    },
                 },
                 "constraints": [],
             }
