@@ -2929,6 +2929,9 @@ mod tests {
             ]),
         );
         let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        // The Nix module computes this budget independently in
+        // campaignMaxNodes. Its fixture campaign has this exact shape and is
+        // asserted to be 48 too; change one side and the other must follow.
         assert_eq!(max_flow_nodes(&manifest), 48);
     }
 

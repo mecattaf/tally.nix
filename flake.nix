@@ -3185,6 +3185,13 @@
           assert campaignHomeServices.tally-campaign-poll.Service.TimeoutStartSec == "2min";
           assert !(pollDisabledHome.config.systemd.user.timers ? tally-campaign-poll);
           assert !(pollDisabledHome.config.systemd.user.services ? tally-campaign-poll);
+          # campaignMaxNodes and the CLI's max_flow_nodes are two independent
+          # implementations of one budget, and nothing else makes them agree.
+          # The fixture campaign has the shape the CLI unit test uses --
+          # maxParallel 3, two gates, one of them a command gate -- so both
+          # sides must land on 48. Drift on either side breaks a test rather
+          # than silently capping a run below its own worst case.
+          assert campaignHome.config.services.tally.flows.fixture.maxNodes == 48;
           assert systemServices ? tally-drain;
           assert systemTimers ? tally-drain;
           assert systemTimers.tally-drain.timerConfig.OnActiveSec == "1s";
