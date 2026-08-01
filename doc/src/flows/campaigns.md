@@ -19,14 +19,16 @@ Keep those roles separate:
 
 - **The selected container is the work source.** A recurring campaign reads its
   versioned tasks artifact from the exact fetched remote-base commit. An ad-hoc
-  campaign reads the manifest and native sub-issue bodies from its master issue
-  graph on every pass.
+  campaign executes only the exact manifest and native sub-issue bodies admitted
+  by its most recent local `arm`, while each pass separately witnesses the live
+  remote-base revision.
 - **GitHub is intake, steering, state, and projection.** Manual `arm` is the
   explicit intent boundary for ad-hoc work; an exact mention is that boundary
-  for a recurring campaign. Merged implementation pull requests and, for
-  recurring worklists, content-and-exact-base-bound checkpoint tags are the
-  completion facts read by every later pass. Issue comments steer later agent
-  attempts; receipts and evidence project each reconciliation.
+  for a recurring campaign. Merged implementation pull requests and
+  content-and-exact-base-bound checkpoint tags are the completion facts read by
+  every later pass. Only snapshotted comments authored by locally allowed actors
+  steer an ad-hoc agent attempt; receipts and evidence project each
+  reconciliation.
 - **tally is the workflow engine.** It validates and witnesses the worklist,
   selects the dependency-ready frontier, creates isolated worktrees, runs
   deterministic gates and checkpoint commands, and serializes re-gated merges.
@@ -84,6 +86,7 @@ that hand-maintained copy. Start from one JSON worklist:
   "tasks": [
     {
       "id": "customer-model",
+      "kind": "implementation",
       "title": "Implement the customer model",
       "body": "## Goal\n\nImplement the frozen customer contract.\n\n## Acceptance\n\n- The focused model tests pass.",
       "dependencies": [],
@@ -108,9 +111,13 @@ marker-delimited manifest and worklist sections. A task may supply an existing
 positive `issue` number; otherwise projection creates one. `--campaign-config`
 accepts the campaign object in a separate file.
 
-The embedded manifest owns configuration and only task references (`id`, issue
-number, dependencies, and conflict domains). The full human brief is always the
-sub-issue body. The manifest task set must exactly equal GitHub's native
+The embedded manifest owns configuration and typed task references. An
+`implementation` reference carries `id`, `kind`, issue number, dependencies,
+and conflict domains. A `checkpoint` reference carries `id`, `kind`, issue
+number, dependencies, direct `argv`, and a positive `runtimeMaxSec`; unsupported
+kinds fail closed rather than becoming implementation work. The full human
+brief or checkpoint description is always the sub-issue body. The manifest task
+set must exactly equal GitHub's native
 sub-issue set, task IDs form a topological order, and forge-native campaigns are
 bounded to 100 tasks by the native sub-issue API. Drift fails closed before
 admission. Directly authored sub-issues need no tally marker: their native
@@ -125,26 +132,59 @@ The master worklist is generated from those references:
 ```
 
 Those boxes are a projection, not mutable truth. At every reconcile the driver
-recomputes them from merged pull requests carrying the campaign/task identity
-marker. Closing a task issue or manually checking a box cannot complete a task;
-the next observed graph change restores the proof-derived state. A GitHub task
-PR includes `Closes #<sub-issue>` and a successful merge flips the box and
-updates the progress comment.
+recomputes them from revision-bound merged pull requests and content-bound
+checkpoint refs. Closing a task issue or manually checking a box cannot complete
+a task; the next reconcile restores the proof-derived state. A GitHub task PR
+includes `Closes #<sub-issue>` and a successful merge flips the box and updates
+the progress comment. Completion identity includes the admitted graph digest:
+editing a brief, gate, checkout, agent policy, or DAG after a merge cannot reuse
+the old PR as proof.
 
-`arm` validates the live issue graph, local checkout, configured pools and
-adapters, agent policy names, flow fanout bound, and packaged assets together.
-It then writes only the issue locator plus local mechanism paths beneath
-`$XDG_STATE_HOME/tally/campaigns/armed/` and admits a bounded pass. Policy, DAG,
-titles, and briefs are never copied into that registry. Re-arming the same URL
-forces a fresh retry; `--no-enqueue` registers after validation without starting
-one. `--wait` returns the terminal pass verdict. `tally campaign list` inspects
-registrations, while `tally campaign poll --once` is the timer's bounded scan.
+`arm` authenticates the current `gh` login, defaults the local allowlist to that
+login, and requires the master and every task issue to have an allowed author.
+Use repeatable `--allow-actor LOGIN` only after reviewing another actor's input;
+the authenticated login is always included. It also binds a GitHub campaign to
+the checkout's named `github.com` remote, validates configured pools and
+adapters, agent policy names, flow fanout bound, and packaged assets, and records
+the canonical executable graph SHA-256 beneath
+`$XDG_STATE_HOME/tally/campaigns/armed/`. GitHub does not expose a trustworthy
+body-editor identity, so the digest—not an inferred editor—is the continuing
+authority boundary.
 
-Edits to the master or task issues, merge-driven issue changes, and steering
-comments advance the issue graph revision. The poller submits a fresh pass
-behind the capacity-one `campaign` mutex. A closed master stays registered but
-is inert. This is desired state on the forge plus actual state in merged PRs;
-there is no campaign-long runner state to resume.
+The poller may refetch projection state and allowed-actor comments, but it
+refuses any changed executable graph until the operator inspects it and runs
+`arm` again. The reconciler independently refetches and recomputes that digest
+before executing. Checkbox/state/timestamp changes are observation signals, not
+executable changes. Agents receive a bounded authorized steering snapshot and
+are told not to refetch the public comment channel. Re-arming the same unchanged
+graph forces a fresh retry without invalidating matching completion facts;
+re-arming changed content creates new task revisions. `--no-enqueue` registers
+after validation without starting a pass, and `--wait` returns its terminal
+verdict.
+
+The default ad-hoc `workspaceRoot` is
+`$XDG_CACHE_HOME/tally/campaigns/workspaces` (or
+`~/.cache/tally/campaigns/workspaces`), outside tally's state/data byte budgets.
+Override it when those workload-owned lanes need a dedicated monitored volume.
+`forge: "local"` is rejected unless `--allow-test-local-forge` is supplied; it
+is a mechanism-test mode and has no autonomous continuation contract.
+
+Merge/checkpoint projection changes and allowed steering comments advance the
+observation revision, so the poller submits a fresh pass behind the capacity-one
+campaign mutex. When every task has durable proof, reconcile repairs all boxes,
+closes task issues, posts one digest-bound summary, and closes the master. The
+next poll prunes that registration. Operators can remove an open registration
+without changing forge state with `tally campaign disarm ISSUE-URL`; registry
+read/modify/write operations are file-locked against timer and re-arm races.
+`tally campaign list` inspects registrations, while `tally campaign poll --once`
+is the timer's bounded scan and `--wait` waits for newly admitted passes.
+
+The opt-in `test/campaign-github-e2e.sh` receipt exercises the final package
+against a real private GitHub repository: two dependent agent tasks, real PR
+creation and merge, revision markers, checkbox repair, next-pass polling,
+closeout, and registration pruning. It requires
+`TALLY_CAMPAIGN_E2E_CONFIRM=1` and deletes only the repository it creates (set
+`TALLY_CAMPAIGN_E2E_KEEP_REPO=1` to retain it for inspection).
 
 ## Configure a recurring campaign
 
@@ -667,15 +707,17 @@ its dependency descendants, so unrelated ready subtrees continue to advance.
 
 ## Failure, steering, and re-entry
 
-Use the campaign issue comments for human and machine steering. tally never
-changes a running node's immutable brief. After a task node fails, a separate
-diagnosis agent receives four explicit inputs: the failed node's bounded capture
-stderr, every gate output collected for the task, the exact task brief, and a
-bounded diff against its witnessed base. The diagnosis agent is told not to
-modify the repository or repeat secret-looking input. Only its concise output
-passes through conservative public redaction and becomes an authenticated,
-marked campaign comment; raw capture, gate output, brief, and diff remain private
-job inputs.
+Recurring campaigns use their authenticated issue comment channel for steering.
+An ad-hoc issue campaign instead snapshots only comments authored by its local
+`allowedActors`; the agent receives that bounded value in its immutable brief
+and does not reread the public channel. tally never changes a running node's
+immutable brief. After a task node fails, a separate diagnosis agent receives
+four explicit inputs: the failed node's bounded capture stderr, every gate
+output collected for the task, the exact task brief, and a bounded diff against
+its witnessed base. The diagnosis agent is told not to modify the repository or
+repeat secret-looking input. Only its concise output passes through conservative
+public redaction and becomes an authenticated, marked campaign comment; raw
+capture, gate output, brief, and diff remain private job inputs.
 
 The pass then posts the exact continuation command even when nothing merged.
 The next event has a fresh flow-run identity, re-reads forge state, and includes
@@ -697,6 +739,10 @@ with `postFailureEvidence` and a conservatively redacted tail only with the
 additional `postFailureStderr` opt-in. Task-specific records retain `taskRef`,
 so the worklist ID is visible without a UUID lookup.
 
+An operator may add a steering decision using an authorized actor; the ad-hoc
+poller observes that comment automatically. If executable campaign content
+changed, review it and explicitly re-arm instead.
+
 An operator can then repair and merge a marked task PR or otherwise resolve the
 forge state before posting a fresh mention. Preflight remains outside this
 task-attempt protocol because it proves campaign admission before any task agent
@@ -706,10 +752,11 @@ runs; repair its host or base defect and re-enter with the configured mention.
 $ gh issue comment ISSUE --repo OWNER/REPO --body '<configured mention>'
 ```
 
-That fresh event creates a fresh flow-run identity. The pass does not reuse or
-repair an old runner prefix: it observes merged PRs and checkpoint refs again,
-re-reads diagnosis and escalation comments, recomputes the whole frontier, and
-gives an eligible failed node a new isolated lane with current steering.
+That recurring event—or a new authorized ad-hoc observation—creates a fresh
+flow-run identity. The pass does not reuse or repair an old runner prefix: it
+observes merged PRs and checkpoint refs again, re-reads diagnosis and escalation
+comments plus authorized steering, recomputes the whole frontier, and gives an
+eligible failed node a new isolated lane with current steering.
 Changing campaign arguments or deploying a new content-addressed script between
 passes is ordinary generation change, not replay divergence. Duplicate mentions
 are safe because the campaign mutex serializes passes and each pass re-derives

@@ -470,12 +470,9 @@ fn require_authenticated_actor(registration: &CampaignRegistration) -> Result<()
 
 fn require_allowed_issue_authors(graph: &CampaignGraph, allowed: &[String]) -> Result<()> {
     let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
-    for (context, issue) in std::iter::once(("master", &graph.master)).chain(
-        graph
-            .tasks
-            .iter()
-            .map(|issue| ("task", issue)),
-    ) {
+    for (context, issue) in std::iter::once(("master", &graph.master))
+        .chain(graph.tasks.iter().map(|issue| ("task", issue)))
+    {
         let actor = issue.user.login.to_ascii_lowercase();
         if !allowed.contains(actor.as_str()) {
             bail!(
@@ -493,12 +490,8 @@ fn fetch_steering(locator: &IssueLocator, allowed: &[String]) -> Result<Vec<Valu
         "repos/{}/issues/{}/comments?per_page=100",
         locator.repository, locator.number
     );
-    let pages: Vec<Vec<GithubComment>> = gh_json(&os_arguments(&[
-        "api",
-        "--paginate",
-        "--slurp",
-        &endpoint,
-    ]))?;
+    let pages: Vec<Vec<GithubComment>> =
+        gh_json(&os_arguments(&["api", "--paginate", "--slurp", &endpoint]))?;
     let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut comments = Vec::new();
     for comment in pages.into_iter().flatten() {
@@ -525,7 +518,9 @@ fn fetch_steering(locator: &IssueLocator, allowed: &[String]) -> Result<Vec<Valu
         }));
     }
     if comments.len() > 1_000 {
-        return Err(invalid("campaign has more than 1000 approved steering comments"));
+        return Err(invalid(
+            "campaign has more than 1000 approved steering comments",
+        ));
     }
     Ok(comments)
 }
@@ -685,9 +680,10 @@ fn validate_manifest(manifest: &CampaignManifest) -> Result<()> {
                         task.id
                     )));
                 }
-                let argv = task.argv.as_ref().ok_or_else(|| {
-                    invalid(format!("checkpoint task {} requires argv", task.id))
-                })?;
+                let argv = task
+                    .argv
+                    .as_ref()
+                    .ok_or_else(|| invalid(format!("checkpoint task {} requires argv", task.id)))?;
                 validate_argv(argv, &format!("checkpoint task {} argv", task.id))?;
                 if !matches!(task.runtime_max_sec, Some(value) if value > 0) {
                     return Err(invalid(format!(
@@ -1163,8 +1159,8 @@ fn validate_host(
                 String::from_utf8_lossy(&remote.stderr).trim()
             );
         }
-        let remote = String::from_utf8(remote.stdout)
-            .context("campaign remote URL was not valid UTF-8")?;
+        let remote =
+            String::from_utf8(remote.stdout).context("campaign remote URL was not valid UTF-8")?;
         let bound = github_repository_from_remote(&remote).ok_or_else(|| {
             invalid("GitHub issue campaigns require an https or SSH github.com checkout remote")
         })?;
@@ -1251,7 +1247,12 @@ fn read_registration(path: &Path) -> Result<CampaignRegistration> {
         || !registration
             .approved_graph_digest
             .strip_prefix("sha256:")
-            .is_some_and(|value| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()))
+            .is_some_and(|value| {
+                value.len() == 64
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            })
         || !safe_github_login(&registration.authenticated_actor)
         || registration.allowed_actors.is_empty()
         || registration
@@ -1405,6 +1406,9 @@ async fn dispatch_campaign(
             "kind": "forge-native-campaign",
             "issue": &graph.locator.url,
             "revision": &revision,
+            "approvedBy": &registration.authenticated_actor,
+            "allowedActors": &registration.allowed_actors,
+            "graphDigest": &registration.approved_graph_digest,
         })),
         manifest_hash: Some(graph.executable_digest.clone()),
         consumption_estimate: None,
@@ -1473,9 +1477,10 @@ async fn run_campaign_arm(
     })?;
     let mut registration = CampaignRegistration {
         schema_version: REGISTRY_SCHEMA_VERSION,
-        registration_id: prior
-            .as_ref()
-            .map_or_else(|| uuid::Uuid::now_v7().to_string(), |value| value.registration_id.clone()),
+        registration_id: prior.as_ref().map_or_else(
+            || uuid::Uuid::now_v7().to_string(),
+            |value| value.registration_id.clone(),
+        ),
         issue_url: locator.url.clone(),
         repository: locator.repository.clone(),
         issue_number: locator.number,
@@ -1576,7 +1581,7 @@ async fn run_campaign_poll(
             if registration.last_observation.as_deref() == Some(&observation) {
                 return Ok((false, false));
             }
-            dispatch_campaign(
+            let result = dispatch_campaign(
                 socket,
                 config_path,
                 rpc_timeout,
@@ -1587,6 +1592,18 @@ async fn run_campaign_poll(
             )
             .await?;
             write_registration(&state_dir, &registration)?;
+            if args.wait {
+                let code = waited_exit_code(&result);
+                if code != 0 {
+                    return Err(anyhow::Error::new(ExitFailure {
+                        code,
+                        message: format!(
+                            "campaign reconcile pass for {} returned a non-zero verdict",
+                            registration.issue_url
+                        ),
+                    }));
+                }
+            }
             Ok::<_, anyhow::Error>((true, false))
         }
         .await;
@@ -1788,12 +1805,26 @@ fn project_tasks(document: &Value) -> Result<Vec<ProjectTask>> {
         }
         let allowed = match kind.as_str() {
             "implementation" => BTreeSet::from([
-                "id", "kind", "title", "body", "goal", "deliveredBehaviors",
-                "readFirst", "acceptanceCriteria", "issue", "dependencies",
+                "id",
+                "kind",
+                "title",
+                "body",
+                "goal",
+                "deliveredBehaviors",
+                "readFirst",
+                "acceptanceCriteria",
+                "issue",
+                "dependencies",
                 "conflictDomains",
             ]),
             "checkpoint" => BTreeSet::from([
-                "id", "kind", "title", "body", "issue", "dependencies", "argv",
+                "id",
+                "kind",
+                "title",
+                "body",
+                "issue",
+                "dependencies",
+                "argv",
                 "runtimeMaxSec",
             ]),
             _ => unreachable!(),
@@ -1858,7 +1889,9 @@ fn project_tasks(document: &Value) -> Result<Vec<ProjectTask>> {
                     .and_then(Value::as_u64)
                     .filter(|value| *value > 0)
                     .ok_or_else(|| {
-                        invalid(format!("{context}.runtimeMaxSec must be a positive integer"))
+                        invalid(format!(
+                            "{context}.runtimeMaxSec must be a positive integer"
+                        ))
                     })?,
             )
         } else {
@@ -2179,12 +2212,8 @@ fn merged_project_tasks(
     }))?;
     for task in &manifest.tasks {
         if task.kind == "checkpoint" {
-            let reference = checkpoint_reference(
-                &manifest.name,
-                issue_number,
-                &task.id,
-                &graph_digest,
-            )?;
+            let reference =
+                checkpoint_reference(&manifest.name, issue_number, &task.id, &graph_digest)?;
             if projected_checkpoint_complete(manifest, &reference)? {
                 merged.insert(task.id.clone());
             }
@@ -2198,12 +2227,7 @@ fn merged_project_tasks(
             "<!-- tally:spec-build:v2 campaign={} issue={} task={} revision={} -->",
             manifest.name, issue_number, task.id, revision
         );
-        let branch = stable_publish_branch(
-            &manifest.name,
-            issue_number,
-            &task.id,
-            Some(&revision),
-        );
+        let branch = stable_publish_branch(&manifest.name, issue_number, &task.id, Some(&revision));
         let mut matching = candidates
             .iter()
             .filter(|candidate| {
@@ -2305,30 +2329,24 @@ fn projected_checkpoint_complete(manifest: &CampaignManifest, reference: &str) -
         .filter(|(_, name)| *name == reference)
         .map(|(target, _)| target)
         .filter(|target| {
-            (40..=64).contains(&target.len())
-                && target.bytes().all(|byte| byte.is_ascii_hexdigit())
+            (40..=64).contains(&target.len()) && target.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
-        .ok_or_else(|| invalid(format!("checkpoint ref {reference} returned malformed output")))?;
-    let fetched_base = git(&[
-        "fetch",
-        "--prune",
-        "--no-tags",
-        &manifest.repository.remote,
-    ])?;
+        .ok_or_else(|| {
+            invalid(format!(
+                "checkpoint ref {reference} returned malformed output"
+            ))
+        })?;
+    let fetched_base = git(&["fetch", "--prune", "--no-tags", &manifest.repository.remote])?;
     if !fetched_base.status.success() {
         bail!("cannot refresh campaign base while projecting checkpoint state");
     }
-    let fetched_tag = git(&[
-        "fetch",
-        "--no-tags",
-        &manifest.repository.remote,
-        reference,
-    ])?;
+    let fetched_tag = git(&["fetch", "--no-tags", &manifest.repository.remote, reference])?;
     if !fetched_tag.status.success() {
         bail!("cannot fetch checkpoint ref {reference}");
     }
     let object_type = git(&["cat-file", "-t", target])?;
-    if !object_type.status.success() || String::from_utf8_lossy(&object_type.stdout).trim() != "commit"
+    if !object_type.status.success()
+        || String::from_utf8_lossy(&object_type.stdout).trim() != "commit"
     {
         return Ok(false);
     }
@@ -2945,5 +2963,48 @@ mod tests {
         assert!(validate_argv(&["true".into(), "".into()], "argv").is_err());
         assert!(validate_argv(&["true".into(), "line\nbreak".into()], "argv").is_err());
         validate_argv(&["true".into(), "--flag".into()], "argv").unwrap();
+    }
+
+    #[test]
+    fn canonical_digest_matches_the_driver_contract() {
+        let value = json!({"z": [1, "é"], "a": {"b": true, "a": null}});
+        assert_eq!(
+            sha256_json(&value).unwrap(),
+            "sha256:356741b14061aca3cb3e9abc01fe332af042dfcd59d81c56ee9fb57832dc6429"
+        );
+    }
+
+    #[test]
+    fn registration_v2_round_trips_local_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path();
+        let authenticated = "operator".to_owned();
+        let registration = CampaignRegistration {
+            schema_version: REGISTRY_SCHEMA_VERSION,
+            registration_id: uuid::Uuid::now_v7().to_string(),
+            issue_url: "https://github.com/acme/widgets/issues/42".to_owned(),
+            repository: "acme/widgets".to_owned(),
+            issue_number: 42,
+            armed_at: "2026-08-01T00:00:00Z".to_owned(),
+            arm_serial: 1,
+            approved_graph_digest: format!("sha256:{}", "a".repeat(64)),
+            authenticated_actor: authenticated.clone(),
+            allowed_actors: normalize_allowed_actors(&["Reviewer".into()], &authenticated).unwrap(),
+            allow_test_local_forge: false,
+            last_observation: None,
+            flow: PathBuf::from("/nix/store/flow.js"),
+            driver: PathBuf::from("/nix/store/driver"),
+            workspace_root: PathBuf::from("/srv/tally-campaigns"),
+        };
+        let _lock = RegistryLock::acquire(state_dir, true).unwrap();
+        write_registration(state_dir, &registration).unwrap();
+        let loaded =
+            read_registration(&registration_path(state_dir, &registration.issue_url)).unwrap();
+        assert_eq!(loaded.registration_id, registration.registration_id);
+        assert_eq!(loaded.allowed_actors, ["operator", "reviewer"]);
+        assert_eq!(
+            loaded.approved_graph_digest,
+            registration.approved_graph_digest
+        );
     }
 }

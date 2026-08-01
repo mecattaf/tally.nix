@@ -222,6 +222,15 @@ authorized.
   JSON modes collapse journal/evidence/witness echoes, while `--provenance`
   restores the uncollapsed source stream.
 
+- Hardened forge-native campaign admission: arming now binds the authenticated
+  GitHub identity, allowed issue/comment actors, checkout repository, immutable
+  registration identity, and canonical executable graph digest. Polling refuses
+  executable revisions until explicit re-arm; agents receive filtered steering
+  snapshots; PR/checkpoint completion is source-revision-bound; issue-native
+  checkpoints remain typed end to end; completed masters close and are pruned;
+  and `campaign disarm` removes a locked local registration. Ad-hoc workspaces
+  now default outside tally's state/data budgets, and `forge: "local"` is an
+  explicit test-only mode.
 - Restored `postEvidence` to its original pass/reuse-only meaning. Operators
   may opt into one idempotent public comment per failed attempt with
   `postFailureEvidence`; retries therefore accumulate distinct failure

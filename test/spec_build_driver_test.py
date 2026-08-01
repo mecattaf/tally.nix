@@ -113,15 +113,21 @@ def sweep_brief(
     workspace_root: Path,
     run_id: str,
     tally: Path,
+    *,
+    campaign: str = "fixture",
+    campaign_identity: str | None = None,
 ) -> dict[str, object]:
-    return {
-        "campaign": "fixture",
+    brief: dict[str, object] = {
+        "campaign": campaign,
         "repository": "acme/spec",
         "repositoryConfig": repository_config(checkout),
         "runId": run_id,
         "workspaceRoot": str(workspace_root),
         "tally": str(tally),
     }
+    if campaign_identity is not None:
+        brief["campaignIdentity"] = campaign_identity
+    return brief
 
 
 class FakeGitHub:
@@ -828,6 +834,122 @@ class GitHubForgeTests(unittest.TestCase):
                 )
                 sleep.assert_called_once_with(1)
 
+    def test_issue_graph_digest_is_admitted_and_preserves_checkpoint_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout, _ = initialize_repository(Path(temporary))
+            manifest = {
+                "schemaVersion": 1,
+                "name": "fixture",
+                "repository": repository_config(checkout, "github"),
+                "maxParallel": 1,
+                "agent": {},
+                "gates": [
+                    {
+                        "kind": "command",
+                        "id": "tests",
+                        "preflightArgv": ["true"],
+                        "argv": ["true"],
+                    }
+                ],
+                "tasks": [
+                    {
+                        "id": "build",
+                        "kind": "implementation",
+                        "issue": 8,
+                        "dependencies": [],
+                        "conflictDomains": [],
+                    },
+                    {
+                        "id": "verify",
+                        "kind": "checkpoint",
+                        "issue": 9,
+                        "dependencies": ["build"],
+                        "argv": ["true"],
+                        "runtimeMaxSec": 30,
+                    },
+                ],
+            }
+            _, references, normalized = DRIVER.forge_manifest(manifest)
+            issues = [
+                {
+                    "number": 8,
+                    "title": "Build",
+                    "body": "Implement the admitted change.",
+                    "state": "open",
+                    "html_url": "https://github.com/acme/spec/issues/8",
+                },
+                {
+                    "number": 9,
+                    "title": "Verify",
+                    "body": "Run the admitted automated barrier.",
+                    "state": "open",
+                    "html_url": "https://github.com/acme/spec/issues/9",
+                },
+            ]
+            source = {
+                "manifest": normalized,
+                "tasks": [
+                    {
+                        "number": reference["issue"],
+                        "title": issues[index]["title"],
+                        "body": issues[index]["body"],
+                    }
+                    for index, reference in enumerate(references)
+                ],
+            }
+            digest = DRIVER.canonical_sha256(source)
+            master = {
+                "number": 7,
+                "state": "open",
+                "html_url": "https://github.com/acme/spec/issues/7",
+                "body": (
+                    f"{DRIVER.CAMPAIGN_BEGIN}\n```json\n"
+                    f"{json.dumps(manifest)}\n```\n{DRIVER.CAMPAIGN_END}\n"
+                ),
+            }
+            brief = {
+                "repository": "acme/spec",
+                "issue": issue(),
+                "worklist": {"kind": "github-issue", "graphDigest": digest},
+            }
+            with mock.patch.object(DRIVER, "github_json", side_effect=[master, issues]):
+                worklist = DRIVER.issue_graph_worklist(brief)
+            self.assertEqual([task["kind"] for task in worklist["tasks"]], ["implementation", "checkpoint"])
+            self.assertEqual(worklist["tasks"][1]["argv"], ["true"])
+            self.assertRegex(worklist["tasks"][0]["revision"], r"^sha256:[0-9a-f]{64}$")
+
+            changed = [dict(candidate) for candidate in issues]
+            changed[0]["body"] = "Edited after arm."
+            with mock.patch.object(DRIVER, "github_json", side_effect=[master, changed]):
+                with self.assertRaisesRegex(DRIVER.DriverError, "explicitly re-arm"):
+                    DRIVER.issue_graph_worklist(brief)
+
+    def test_merged_pr_completion_is_bound_to_task_revision(self) -> None:
+        revision = "sha256:" + "1" * 64
+        task_value = {"id": "task-1", "kind": "implementation", "revision": revision}
+        branch = DRIVER.stable_publish_branch("fixture", "7", "task-1", revision)
+        candidate = {
+            "url": "https://github.com/acme/spec/pull/8",
+            "body": DRIVER.pull_request_marker("fixture", "7", "task-1", revision),
+            "baseRefName": "main",
+            "headRefName": branch,
+            "mergeCommit": {"oid": "a" * 40},
+        }
+
+        def listed(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess([], 0, json.dumps([candidate]), "")
+
+        with mock.patch.object(DRIVER, "run", side_effect=listed):
+            facts, _ = DRIVER.merged_github_tasks(
+                "acme/spec", "fixture", "7", "main", [task_value]
+            )
+            self.assertEqual(facts[0]["revision"], revision)
+            task_value["revision"] = "sha256:" + "2" * 64
+            stale, _ = DRIVER.merged_github_tasks(
+                "acme/spec", "fixture", "7", "main", [task_value]
+            )
+            self.assertEqual(stale, [])
+
 
 class LaneLifecycleTests(unittest.TestCase):
     def test_conflicting_published_head_is_aborted_abandoned_and_rebuilt(self) -> None:
@@ -1159,6 +1281,56 @@ class LaneLifecycleTests(unittest.TestCase):
                 )
                 self.assertEqual(swept["liveRuns"], [])
                 self.assertFalse(worktree.exists())
+
+    def test_sweep_liveness_survives_an_issue_campaign_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            old_flow = "00000000-0000-4000-8000-000000000930"
+            new_flow = "00000000-0000-4000-8000-000000000931"
+            identity = "00000000-0000-4000-8000-000000000932"
+            with FakeTally(root, old_flow) as tally:
+                DRIVER.action_sweep(
+                    sweep_brief(
+                        checkout,
+                        workspace_root,
+                        "old-pass",
+                        tally.program,
+                        campaign="old-name",
+                        campaign_identity=identity,
+                    )
+                )
+                old_prep = prep_brief(checkout, workspace_root, "old-pass")
+                old_prep["campaign"] = "old-name"
+                prepared = DRIVER.action_prep(old_prep)
+                worktree = Path(prepared["worktreePath"])
+                tally.update(
+                    currentFlowRunId=new_flow,
+                    flows={
+                        old_flow: [
+                            {
+                                "anchor": "00000000-0000-4000-8000-000000000933",
+                                "liveState": "running",
+                                "taskRef": f"{identity}/task-1",
+                                "orchestration": {"flowRunId": old_flow},
+                            }
+                        ]
+                    },
+                )
+                deferred = DRIVER.action_sweep(
+                    sweep_brief(
+                        checkout,
+                        workspace_root,
+                        "new-pass",
+                        tally.program,
+                        campaign="new-name",
+                        campaign_identity=identity,
+                    )
+                )
+                self.assertTrue(worktree.is_dir())
+                self.assertEqual(deferred["blockingJobs"][0]["flowRunId"], old_flow)
+                self.assertEqual(deferred["blockingJobs"][0]["taskRef"], f"{identity}/task-1")
 
     def test_sweep_leaves_legacy_lane_without_daemon_liveness_proof_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

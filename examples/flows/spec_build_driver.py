@@ -4426,10 +4426,6 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
         merge_commit = merge_github(data, config, integration)
     else:
         merge_commit = merge_local(data, config, integration)
-        # forge=local is an explicit mechanism-test mode, but its issue
-        # container still needs a forge mutation so the poller observes the
-        # completed lane and admits the dependency-ready successor.
-        github_progress_comment(data, integration, merge_commit)
     return {
         "taskId": task_id,
         "head": head,

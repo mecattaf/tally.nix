@@ -97,7 +97,7 @@ pub(super) enum CampaignCommand {
     Project(CampaignProjectArgs),
     /// Reconcile changed armed issue graphs into fresh bounded flow passes.
     Poll(CampaignPollArgs),
-    /// Print the local locator registry; campaign policy remains on the forge.
+    /// Print local campaign locators, admitted digests, and authority bindings.
     List(CampaignListArgs),
     /// Remove a local campaign registration without changing its forge issues.
     Disarm(CampaignDisarmArgs),
