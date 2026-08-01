@@ -306,6 +306,7 @@ beginning if the daemon or cursor snapshot is gone.
 ```console
 $ tally query status
 $ tally query status --pool build
+$ tally query storage
 $ tally query proof --task TASK-UUID --attempt 2
 $ tally query proof --flow-run RUN-UUID
 $ tally query log --task TASK-UUID --attempt 2 --event completed
@@ -317,6 +318,11 @@ $ tally query trace --task TASK-UUID --attempt 2 --limit 100
 supports `--cursor`. `query trace` also supports page cursors. Proof is not just a witness
 lookup: it reports whether a witness is expected, returns the canonical record when present,
 separates advisory attestations, and includes ledger verification state.
+
+`query storage` is the daemon's own disk-pressure view. It reports both stores' allocated and
+apparent bytes, configured warning/hard levels, TaskChampion database/WAL/SHM sizes and operation
+high-water mark, and growth per canonical completion. At a hard level,
+`intake.accepting` is false; existing work and this query remain usable.
 
 Each `failed` log item includes the bounded `stderrTail` and a
 `stderrTruncated` boolean. Start there before constructing a capture path by

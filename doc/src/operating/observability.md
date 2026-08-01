@@ -11,6 +11,30 @@ have equal authority:
 When they disagree, the query keeps the disagreement visible and the witness
 wins for canonical verdict and usage. Querying does not mutate a job.
 
+## Monitor tally's own disk
+
+Use the daemon's measured view before workload-side free-space guards:
+
+```console
+$ tally query storage | jq '{intake, dataDir, stateDir, taskchampion, growthPerCompletion}'
+```
+
+The two store sizes use allocated filesystem blocks for budget decisions and also expose
+apparent bytes and file counts. `taskchampion` separates `databaseBytes`, `walBytes`, and
+`shmBytes`, then reports `taskCount` and the append-only SQLite `operationHighWater`. A projection
+read failure is visible as `readError`; total store budgets remain authoritative.
+
+`growthPerCompletion` compares samples across canonical witness-count boundaries. Signed byte
+rates make both growth and successful compaction visible. `query status` embeds the same object
+under `storage`, so a future human-oriented status surface can consume it without another disk
+contract.
+
+Warning and hard transitions are fsynced to `<dataDir>/storage-warnings.jsonl` and emitted on the
+daemon's journal stream. GitHub campaign intake with evidence receipts enabled also gets one
+idempotent issue comment per warning episode. At a hard threshold, tally rejects only new enqueue
+and continuation requests with `storage-budget-exceeded`; admitted work, retry, cancel, pause,
+resume, and every query remain available.
+
 ## Find the task anchor
 
 `tally enqueue` returns a task UUID. Keep it: query pages call it the `anchor`,
@@ -219,7 +243,7 @@ snapshot, then start a new watch. Do not pretend the stream was continuous.
 | Data | Home Manager default | NixOS default | Retention |
 |---|---|---|---|
 | Witness and attestation ledgers | `~/.local/share/tally/` | `/var/lib/tally/data/` | Append-only |
-| Lifecycle history and watch log | same data directory | same data directory | Lifecycle is unbounded; watch keeps 4,096 records |
+| Lifecycle history and watch log | same data directory | same data directory | Lifecycle compacts an old prefix after `lifecycleMaxBytes`, preserving `lifecycleHorizon`; watch keeps 4,096 records |
 | Enqueue events, captures, unit exits, meters | `~/.local/state/tally/` | `/var/lib/tally/state/` | Selected sets only; see retention policy |
 | Current stdout/raw adapter stderr | Ordinary: `<stateDir>/capture/<uuid>.out` and `.adapter.err`; task-ref node: `<uuid>.<task-id>.out` and `.adapter.err` | same layout | Accumulates |
 | Failure-only stderr | Ordinary: `<stateDir>/capture/<uuid>.err`; task-ref node: `<uuid>.<task-id>.err`; atomic UTF-8 projection capped at 2 KiB, only present after `failed` | same layout | Current generation remains; archived copy follows the archive horizon |

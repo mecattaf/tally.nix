@@ -262,6 +262,55 @@ pub struct RetentionConfig {
     pub events_rejected_horizon: String,
     #[serde(default = "default_events_rejected_max_count")]
     pub events_rejected_max_count: usize,
+    #[serde(default = "default_projection_archive_horizon")]
+    pub projection_archive_horizon: String,
+    #[serde(default = "default_lifecycle_horizon")]
+    pub lifecycle_horizon: String,
+    #[serde(default = "default_lifecycle_max_bytes")]
+    pub lifecycle_max_bytes: u64,
+}
+
+pub const DEFAULT_STORAGE_WARNING_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+pub const DEFAULT_STORAGE_HARD_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub const DEFAULT_STORAGE_POLL_INTERVAL_SEC: u64 = 60;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StorageBudgetConfig {
+    #[serde(default = "default_storage_warning_bytes")]
+    pub warning_bytes: u64,
+    #[serde(default = "default_storage_hard_bytes")]
+    pub hard_bytes: u64,
+}
+
+impl Default for StorageBudgetConfig {
+    fn default() -> Self {
+        Self {
+            warning_bytes: default_storage_warning_bytes(),
+            hard_bytes: default_storage_hard_bytes(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StorageConfig {
+    #[serde(default = "default_storage_poll_interval_sec")]
+    pub poll_interval_sec: u64,
+    #[serde(default)]
+    pub data_dir: StorageBudgetConfig,
+    #[serde(default)]
+    pub state_dir: StorageBudgetConfig,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            poll_interval_sec: default_storage_poll_interval_sec(),
+            data_dir: StorageBudgetConfig::default(),
+            state_dir: StorageBudgetConfig::default(),
+        }
+    }
 }
 
 impl Default for RetentionConfig {
@@ -274,6 +323,9 @@ impl Default for RetentionConfig {
             events_done_horizon: default_events_done_horizon(),
             events_rejected_horizon: default_events_rejected_horizon(),
             events_rejected_max_count: default_events_rejected_max_count(),
+            projection_archive_horizon: default_projection_archive_horizon(),
+            lifecycle_horizon: default_lifecycle_horizon(),
+            lifecycle_max_bytes: default_lifecycle_max_bytes(),
         }
     }
 }
@@ -399,6 +451,30 @@ const fn default_events_rejected_max_count() -> usize {
     crate::retention::DEFAULT_EVENTS_REJECTED_MAX_COUNT
 }
 
+fn default_projection_archive_horizon() -> String {
+    crate::retention::DEFAULT_PROJECTION_ARCHIVE_MAX_AGE.to_owned()
+}
+
+fn default_lifecycle_horizon() -> String {
+    "30d".to_owned()
+}
+
+const fn default_lifecycle_max_bytes() -> u64 {
+    256 * 1024 * 1024
+}
+
+const fn default_storage_warning_bytes() -> u64 {
+    DEFAULT_STORAGE_WARNING_BYTES
+}
+
+const fn default_storage_hard_bytes() -> u64 {
+    DEFAULT_STORAGE_HARD_BYTES
+}
+
+const fn default_storage_poll_interval_sec() -> u64 {
+    DEFAULT_STORAGE_POLL_INTERVAL_SEC
+}
+
 const fn default_lease_grace_sec() -> u64 {
     90
 }
@@ -429,6 +505,8 @@ pub struct Config {
     #[serde(default)]
     pub retention: RetentionConfig,
     #[serde(default)]
+    pub storage: StorageConfig,
+    #[serde(default)]
     pub git_ai: GitAiConfig,
     #[serde(default)]
     pub attestations: AttestationsConfig,
@@ -454,6 +532,7 @@ impl Default for Config {
             enqueue: EnqueueConfig::default(),
             lease: LeaseConfig::default(),
             retention: RetentionConfig::default(),
+            storage: StorageConfig::default(),
             git_ai: GitAiConfig::default(),
             attestations: AttestationsConfig::default(),
             pools: BTreeMap::new(),
@@ -505,6 +584,10 @@ pub enum ConfigError {
     InvalidRetentionHorizon(String),
     #[error("retention onCalendar must be non-empty")]
     InvalidRetentionCalendar,
+    #[error("storage pollIntervalSec must be positive")]
+    InvalidStoragePollInterval,
+    #[error("storage {store} budget requires 0 < warningBytes < hardBytes")]
+    InvalidStorageBudget { store: &'static str },
     #[error("gitAi awaitTimeoutSec must be positive")]
     InvalidGitAiAwaitTimeout,
     #[error("maxFrameBytes and agingThresholdSec must both be positive")]
@@ -547,12 +630,30 @@ impl Config {
             &self.retention.capture_archive_horizon,
             &self.retention.events_done_horizon,
             &self.retention.events_rejected_horizon,
+            &self.retention.projection_archive_horizon,
+            &self.retention.lifecycle_horizon,
         ] {
             crate::retention::parse_horizon(horizon)
                 .map_err(|error| ConfigError::InvalidRetentionHorizon(error.to_string()))?;
         }
         if self.retention.on_calendar.trim().is_empty() {
             return Err(ConfigError::InvalidRetentionCalendar);
+        }
+        if self.retention.lifecycle_max_bytes == 0 {
+            return Err(ConfigError::InvalidRetentionHorizon(
+                "lifecycleMaxBytes must be positive".to_owned(),
+            ));
+        }
+        if self.storage.poll_interval_sec == 0 {
+            return Err(ConfigError::InvalidStoragePollInterval);
+        }
+        for (store, budget) in [
+            ("dataDir", &self.storage.data_dir),
+            ("stateDir", &self.storage.state_dir),
+        ] {
+            if budget.warning_bytes == 0 || budget.warning_bytes >= budget.hard_bytes {
+                return Err(ConfigError::InvalidStorageBudget { store });
+            }
         }
         if self.git_ai.await_timeout_sec == 0 {
             return Err(ConfigError::InvalidGitAiAwaitTimeout);
@@ -872,6 +973,10 @@ mod tests {
             Config::default().retention.events_rejected_max_count,
             crate::retention::DEFAULT_EVENTS_REJECTED_MAX_COUNT
         );
+        assert_eq!(
+            Config::default().retention.lifecycle_max_bytes,
+            256 * 1024 * 1024
+        );
 
         for invalid in [
             r#"{"pools":{},"retention":{"horizon":"never"}}"#,
@@ -880,11 +985,46 @@ mod tests {
             r#"{"pools":{},"retention":{"captureArchiveHorizon":"never"}}"#,
             r#"{"pools":{},"retention":{"eventsDoneHorizon":""}}"#,
             r#"{"pools":{},"retention":{"eventsRejectedHorizon":"1fortnight"}}"#,
+            r#"{"pools":{},"retention":{"projectionArchiveHorizon":"never"}}"#,
+            r#"{"pools":{},"retention":{"lifecycleHorizon":""}}"#,
+            r#"{"pools":{},"retention":{"lifecycleMaxBytes":0}}"#,
         ] {
             let result = serde_json::from_str::<Config>(invalid)
                 .map_err(ConfigError::from)
                 .and_then(|config| config.validate());
             assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn storage_budgets_are_defaulted_strict_and_ordered() {
+        let defaults: Config = serde_json::from_str(r#"{"pools":{}}"#).unwrap();
+        defaults.validate().unwrap();
+        assert_eq!(defaults.storage.poll_interval_sec, 60);
+        assert_eq!(
+            defaults.storage.data_dir.warning_bytes,
+            32 * 1024 * 1024 * 1024
+        );
+        assert_eq!(
+            defaults.storage.data_dir.hard_bytes,
+            64 * 1024 * 1024 * 1024
+        );
+
+        let configured: Config = serde_json::from_str(
+            r#"{"pools":{},"storage":{"pollIntervalSec":5,"dataDir":{"warningBytes":10,"hardBytes":20},"stateDir":{"warningBytes":30,"hardBytes":40}}}"#,
+        )
+        .unwrap();
+        configured.validate().unwrap();
+        for invalid in [
+            r#"{"pools":{},"storage":{"pollIntervalSec":0}}"#,
+            r#"{"pools":{},"storage":{"dataDir":{"warningBytes":20,"hardBytes":20}}}"#,
+            r#"{"pools":{},"storage":{"stateDir":{"warningBytes":40,"hardBytes":30}}}"#,
+            r#"{"pools":{},"storage":{"extra":1}}"#,
+        ] {
+            let result = serde_json::from_str::<Config>(invalid)
+                .map_err(ConfigError::from)
+                .and_then(|config| config.validate());
+            assert!(result.is_err(), "accepted invalid storage policy {invalid}");
         }
     }
 

@@ -246,6 +246,16 @@ pub(super) async fn run_query(
             )
             .await
         }
+        QueryCommand::Storage => {
+            print_rpc(
+                socket,
+                config_path,
+                rpc_timeout,
+                "query.storage",
+                Some(json!({})),
+            )
+            .await
+        }
         QueryCommand::Log {
             task,
             flow_run,

@@ -20,6 +20,78 @@ pub(super) struct GhTerminalWork {
 }
 
 impl DaemonHandler {
+    pub(super) fn post_storage_warning_receipts(
+        &self,
+        origin: Option<crate::taskdb::GhOrigin>,
+        warnings: &[crate::storage::ActiveStorageWarning],
+    ) {
+        let Some(origin) = origin else {
+            return;
+        };
+        for warning in warnings {
+            let warning = warning.clone();
+            let handler = self.clone();
+            let origin = origin.clone();
+            let task = tokio::task::spawn_local(async move {
+                let (registry, events_dir, state_dir, data_dir, gh_program, mut shutdown) = {
+                    let context = handler.context.read().await;
+                    (
+                        context.config.producers.clone(),
+                        context.paths.events_dir(),
+                        context.paths.state_dir.clone(),
+                        context.paths.data_dir.clone(),
+                        handler.gh_program.clone(),
+                        handler.execution_shutdown.clone(),
+                    )
+                };
+                let mut retry_delay = Duration::from_secs(1);
+                loop {
+                    let registry = registry.clone();
+                    let events_dir = events_dir.clone();
+                    let state_dir = state_dir.clone();
+                    let data_dir = data_dir.clone();
+                    let gh_program = gh_program.clone();
+                    let origin = origin.clone();
+                    let warning = warning.clone();
+                    let warning_sequence = warning.warning_sequence;
+                    let posted = tokio::task::spawn_blocking(move || {
+                        let engine =
+                            ProducerEngine::new(&registry, events_dir, state_dir, data_dir);
+                        let mut sink = GhCliMutationSink::with_program(gh_program);
+                        engine.post_storage_warning_once(&origin, &warning, &mut sink)
+                    })
+                    .await;
+                    match posted {
+                        Ok(Ok(_)) => break,
+                        Ok(Err(error)) => eprintln!(
+                            "tally: GitHub storage-warning receipt {} failed and will retry: {error}",
+                            warning_sequence
+                        ),
+                        Err(error) => eprintln!(
+                            "tally: GitHub storage-warning worker {} failed and will retry: {error}",
+                            warning_sequence
+                        ),
+                    }
+                    if *shutdown.borrow() {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(retry_delay) => {}
+                        changed = shutdown.changed() => {
+                            if changed.is_err() || *shutdown.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                    retry_delay = retry_delay.saturating_mul(2).min(Duration::from_secs(60));
+                }
+            });
+            let mut tasks = self.post_ack_tasks.borrow_mut();
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(task);
+        }
+    }
+
     pub(super) fn complete_terminal_post_ack(&self, work: TerminalWork) {
         self.revoke_job_token(&work.job);
         if self.commits.send(CommitCommand::Rebuild).is_err() {

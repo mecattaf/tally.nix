@@ -135,6 +135,7 @@ use crate::retention::{
     acquire_registration_lock, gcroots_lock_path, parse_horizon, reconcile_recent_roots,
     register_record_roots, GcRootsLock, RetentionError,
 };
+use crate::storage::{StorageError, StorageMetrics, StorageMonitor, StorageWarningRecord};
 use crate::taskdb::{
     admits_durable_row, migrate_acknowledged_events, read_acknowledged_events,
     update_enqueue_event_atomic, write_enqueue_event_atomic, AdmissionInput, AdmissionOrigin,
@@ -328,6 +329,8 @@ pub enum DaemonError {
     History(#[from] HistoryError),
     #[error("change log error: {0}")]
     Change(#[from] ChangeError),
+    #[error("storage monitor error: {0}")]
+    Storage(#[from] StorageError),
     #[error("recovery error: {0}")]
     Recovery(#[from] crate::recovery::RecoveryError),
     #[error("executor error: {0}")]
@@ -543,6 +546,7 @@ struct DaemonHandler {
     journal: JournalEmitter,
     history: Rc<RefCell<LifecycleStore>>,
     changes: Rc<RefCell<ChangeStore>>,
+    storage: Rc<RefCell<StorageMonitor>>,
     trace_adapters: Rc<BTreeSet<String>>,
     pages: Rc<RefCell<PageCache>>,
     execution_shutdown: watch::Receiver<bool>,
@@ -600,6 +604,7 @@ const DISPATCHER_METHODS: &[(&str, DispatchMethod)] = &[
     ("query.jobs", DispatchMethod::Query),
     ("query.job", DispatchMethod::Query),
     ("query.status", DispatchMethod::Query),
+    ("query.storage", DispatchMethod::Query),
     ("query.log", DispatchMethod::Query),
     ("query.proof", DispatchMethod::Query),
     ("query.trace", DispatchMethod::Query),
@@ -739,6 +744,86 @@ fn decode_params<T: for<'de> Deserialize<'de>>(params: Option<Value>) -> Result<
 
 fn internal_wire(error: impl ToString) -> WireError {
     WireError::new(WireErrorCode::Internal, error.to_string())
+}
+
+fn storage_budget_wire(snapshot: &StorageMetrics) -> WireError {
+    let reason = snapshot.intake.reason.clone().unwrap_or_else(|| {
+        "storage budget prevents new intake while already-admitted work continues".to_owned()
+    });
+    WireError {
+        code: WireErrorCode::StorageBudgetExceeded,
+        message: reason,
+        data: Some(json!({
+            "schemaVersion": 1,
+            "activeWarnings": snapshot.active_warnings,
+            "storage": snapshot,
+        })),
+    }
+}
+
+fn log_storage_warning(warning: &StorageWarningRecord) {
+    // The daemon service owns stdout/stderr, so this is a journal entry even
+    // when native structured emission is disabled. The same transition was
+    // fsynced to storage-warnings.jsonl before it reaches this advisory sink.
+    eprintln!(
+        "tally: STORAGE BUDGET transition {}: {}",
+        warning.sequence, warning.message
+    );
+}
+
+impl DaemonHandler {
+    async fn refresh_storage(&self) -> StorageMetrics {
+        let completion_count = self.context.read().await.witness.head().seq;
+        let refresh_error = {
+            let mut storage = self.storage.borrow_mut();
+            storage
+                .refresh(completion_count)
+                .err()
+                .map(|error| error.to_string())
+        };
+        if let Some(error) = refresh_error {
+            eprintln!("tally: storage monitor refresh failed; new intake will be refused: {error}");
+        }
+        let (snapshot, warnings) = {
+            let mut storage = self.storage.borrow_mut();
+            let snapshot = storage
+                .query_snapshot()
+                .expect("storage monitor takes a successful sample during daemon startup");
+            (snapshot, storage.take_warnings())
+        };
+        for warning in &warnings {
+            log_storage_warning(warning);
+        }
+        snapshot
+    }
+
+    async fn compact_lifecycle_if_needed(&self) {
+        let retention = self.context.read().await.config.retention.clone();
+        if !retention.enable {
+            return;
+        }
+        let keep = match parse_horizon(&retention.lifecycle_horizon) {
+            Ok(keep) => keep,
+            Err(error) => {
+                eprintln!("tally: lifecycle compaction policy is invalid: {error}");
+                return;
+            }
+        };
+        match self.history.borrow_mut().compact_if_over_limit(
+            keep,
+            retention.lifecycle_max_bytes,
+            Utc::now(),
+        ) {
+            Ok(Some(report)) => eprintln!(
+                "tally: lifecycle retention compacted {} old records; {} remain (boundary {})",
+                report.dropped,
+                report.kept,
+                report.truncation_boundary.as_deref().unwrap_or("none")
+            ),
+            Ok(None) => {}
+            Err(error) => eprintln!("tally: lifecycle retention compaction failed: {error}"),
+        }
+    }
 }
 
 pub struct Daemon {

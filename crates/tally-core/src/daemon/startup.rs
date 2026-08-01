@@ -356,6 +356,15 @@ impl Daemon {
             .filter(|(_, adapter)| adapter.trace.is_some())
             .map(|(name, _)| name.clone())
             .collect::<BTreeSet<_>>();
+        let mut storage = StorageMonitor::open(
+            &paths.data_dir,
+            &paths.state_dir,
+            config.storage.clone(),
+            context.witness.head().seq,
+        )?;
+        for warning in storage.take_warnings() {
+            log_storage_warning(&warning);
+        }
         let handler = DaemonHandler {
             context: Rc::new(RwLock::new(context)),
             job_tokens: Rc::new(RefCell::new(job_tokens)),
@@ -366,6 +375,7 @@ impl Daemon {
             journal: JournalEmitter::from_config(&config.journald),
             history: Rc::new(RefCell::new(LifecycleStore::open(&paths.data_dir)?)),
             changes: Rc::new(RefCell::new(changes)),
+            storage: Rc::new(RefCell::new(storage)),
             trace_adapters: Rc::new(trace_adapters),
             pages: Rc::new(RefCell::new(PageCache::default())),
             execution_shutdown: execution_shutdown_rx,

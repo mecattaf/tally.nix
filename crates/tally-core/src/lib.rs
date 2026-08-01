@@ -23,6 +23,7 @@ pub mod query;
 pub mod query_v2;
 pub mod recovery;
 pub mod retention;
+pub mod storage;
 pub mod taskdb;
 pub mod trace;
 pub mod view;

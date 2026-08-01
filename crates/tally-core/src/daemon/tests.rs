@@ -572,6 +572,86 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn hard_storage_budget_refuses_new_intake_but_keeps_existing_work_and_queries_legible() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut config = one_pool_config();
+                let budget = crate::config::StorageBudgetConfig {
+                    warning_bytes: 1024 * 1024,
+                    hard_bytes: 2 * 1024 * 1024,
+                };
+                config.storage.data_dir = budget.clone();
+                config.storage.state_dir = budget;
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let admitted_id = Uuid::parse_str(admitted["job_id"].as_str().unwrap()).unwrap();
+
+                fs::write(paths.data_dir.join("controlled-pressure"), vec![0_u8; 3 * 1024 * 1024])
+                    .unwrap();
+                let storage = daemon
+                    .handler
+                    .query("query.storage", Some(json!({})))
+                    .await
+                    .unwrap();
+                assert_eq!(storage["dataDir"]["level"], "hard");
+                assert_eq!(storage["intake"]["accepting"], false);
+                assert!(storage["taskchampion"]["databaseBytes"].as_u64().unwrap() > 0);
+                assert!(storage["taskchampion"]["operationHighWater"].is_number());
+
+                let rows_before = daemon.handler.context.read().await.rows.len();
+                let refused = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap_err();
+                assert_eq!(refused.code, WireErrorCode::StorageBudgetExceeded);
+                assert!(refused.message.contains("already-admitted work continues"));
+                assert_eq!(daemon.handler.context.read().await.rows.len(), rows_before);
+                assert_eq!(
+                    daemon.handler.context.read().await.jobs[&admitted_id].state,
+                    JobState::Paused
+                );
+                let status = daemon
+                    .handler
+                    .query("query.status", Some(json!({})))
+                    .await
+                    .unwrap();
+                assert_eq!(status["storage"]["intake"]["accepting"], false);
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn local_execution_token_is_durable_resolvable_remote_safe_and_revocable() {
         let local = LocalSet::new();
         local

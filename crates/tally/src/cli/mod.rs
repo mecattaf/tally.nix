@@ -927,6 +927,9 @@ fn run_gc(args: GcArgs) -> Result<()> {
             state_dir: state_dir.as_deref(),
             horizon_text: &args.horizon,
             state_retention,
+            projection_archive_max_age: tally_core::retention::parse_horizon(
+                &args.projection_archive_horizon,
+            )?,
             now: Utc::now(),
             dry_run: args.dry_run,
             collect: args.collect,

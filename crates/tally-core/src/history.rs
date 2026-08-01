@@ -14,7 +14,7 @@ pub const LIFECYCLE_FILE: &str = "lifecycle.jsonl";
 pub const LIFECYCLE_RETENTION_FILE: &str = "lifecycle-retention.json";
 pub const LIFECYCLE_SCHEMA_VERSION: u32 = 1;
 pub const LIFECYCLE_RETENTION_SCHEMA_VERSION: u32 = 1;
-pub const LIFECYCLE_RETENTION_POLICY: &str = "unbounded-until-compacted";
+pub const LIFECYCLE_RETENTION_POLICY: &str = "declared-prefix-compaction";
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -292,6 +292,120 @@ impl LifecycleStore {
     pub fn retention_path(&self) -> &Path {
         &self.retention_path
     }
+
+    /// Compact an old contiguous prefix once the lifecycle log crosses its
+    /// declared byte ceiling. The ceiling triggers work; the horizon decides
+    /// what is eligible, so recent observability is never discarded merely to
+    /// hit a target size.
+    pub fn compact_if_over_limit(
+        &mut self,
+        keep: std::time::Duration,
+        max_bytes: u64,
+        now: DateTime<Utc>,
+    ) -> Result<Option<LifecycleCompaction>, HistoryError> {
+        let bytes = self
+            .file
+            .metadata()
+            .map_err(|source| io_error(&self.path, source))?
+            .len();
+        if bytes <= max_bytes {
+            return Ok(None);
+        }
+        let keep = chrono::Duration::from_std(keep).map_err(|_| {
+            HistoryError::Invalid("lifecycle retention horizon is out of range".to_owned())
+        })?;
+        let cutoff_us = u64::try_from((now - keep).timestamp_micros()).unwrap_or(0);
+        let examined = self.records.len();
+        let keep_from = self
+            .records
+            .iter()
+            .position(|record| record.realtime_us >= cutoff_us)
+            .unwrap_or(examined);
+        if keep_from == 0 {
+            return Ok(None);
+        }
+
+        let kept_records = self.records[keep_from..].to_vec();
+        let boundary_sequence = kept_records.first().map_or_else(
+            || self.records[keep_from - 1].sequence,
+            |record| record.sequence - 1,
+        );
+        let boundary = lifecycle_cursor(boundary_sequence);
+        let temporary = self.path.with_extension(format!(
+            "jsonl.tmp-{}-{}",
+            std::process::id(),
+            now.timestamp_micros()
+        ));
+
+        self.file
+            .lock_exclusive()
+            .map_err(|source| io_error(&self.path, source))?;
+        let result = (|| -> Result<File, HistoryError> {
+            let mut replacement = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .append(true)
+                .mode(0o600)
+                .open(&temporary)
+                .map_err(|source| io_error(&temporary, source))?;
+            for record in &kept_records {
+                serde_json::to_writer(&mut replacement, record)?;
+                replacement
+                    .write_all(b"\n")
+                    .map_err(|source| io_error(&temporary, source))?;
+            }
+            replacement
+                .sync_all()
+                .map_err(|source| io_error(&temporary, source))?;
+
+            // Record the conservative incomplete-history boundary before the
+            // rename. A crash can therefore leave full history plus an early
+            // boundary, but never a truncated history falsely marked complete.
+            let mut retention = self.retention.clone();
+            retention.complete = false;
+            retention.truncation_boundary = Some(boundary.clone());
+            retention.reason = Some(format!(
+                "automatic-byte-triggered-compaction-max-{max_bytes}"
+            ));
+            write_retention_state(&self.retention_path, &retention)?;
+            std::fs::rename(&temporary, &self.path)
+                .map_err(|source| io_error(&self.path, source))?;
+            self.retention = retention;
+            Ok(replacement)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(&temporary);
+        }
+        let unlock = FileExt::unlock(&self.file).map_err(|source| io_error(&self.path, source));
+        let replacement = result?;
+        // Once rename succeeded, switch the live append handle even if
+        // unlocking the now-unlinked predecessor reports an error. Returning
+        // with the old handle would send later lifecycle records into an
+        // unreachable inode.
+        self.file = replacement;
+        self.records = kept_records;
+        unlock?;
+        File::open(
+            self.path
+                .parent()
+                .expect("lifecycle path always has a parent"),
+        )
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| {
+            io_error(
+                self.path
+                    .parent()
+                    .expect("lifecycle path always has a parent"),
+                source,
+            )
+        })?;
+        Ok(Some(LifecycleCompaction {
+            examined,
+            dropped: keep_from,
+            kept: self.records.len(),
+            truncation_boundary: Some(boundary),
+        }))
+    }
 }
 
 fn parse_lifecycle_cursor(cursor: &str) -> Result<u64, HistoryError> {
@@ -394,6 +508,13 @@ pub fn compact_lifecycle(
         }
         file.sync_all()
             .map_err(|source| io_error(&temporary, source))?;
+        // As in online compaction, publish the conservative boundary before
+        // replacing the log so a crash can never expose a truncated file with
+        // metadata that still claims completeness.
+        store.retention.complete = false;
+        store.retention.truncation_boundary = Some(boundary.clone());
+        store.retention.reason = Some(format!("compacted-keep-days-{keep_days}"));
+        write_retention_state(&store.retention_path, &store.retention)?;
         std::fs::rename(&temporary, &store.path).map_err(|source| io_error(&store.path, source))?;
         File::open(data_dir)
             .and_then(|directory| directory.sync_all())
@@ -405,10 +526,6 @@ pub fn compact_lifecycle(
     }
     result?;
 
-    store.retention.complete = false;
-    store.retention.truncation_boundary = Some(boundary.clone());
-    store.retention.reason = Some(format!("compacted-keep-days-{keep_days}"));
-    write_retention_state(&store.retention_path, &store.retention)?;
     FileExt::unlock(&lock).map_err(|source| io_error(&lock_path, source))?;
     Ok(LifecycleCompaction {
         examined,
@@ -737,6 +854,44 @@ mod tests {
             .append_at(fields("resumes"), base_us + 200)
             .unwrap();
         assert_eq!(appended.sequence, 5);
+    }
+
+    #[test]
+    fn online_byte_triggered_compaction_keeps_the_declared_recent_suffix() {
+        let temp = tempfile::tempdir().unwrap();
+        let data_dir = temp.path().join("data");
+        let base_us = 1_700_000_000_000_000_u64;
+        let day_us = 86_400_000_000_u64;
+        let mut store = LifecycleStore::open(&data_dir).unwrap();
+        for index in 0..8_u64 {
+            store
+                .append_at(fields(&format!("online-{index}")), base_us + index * day_us)
+                .unwrap();
+        }
+        let now =
+            DateTime::<Utc>::from_timestamp_micros((base_us + 7 * day_us + 1) as i64).unwrap();
+        let outcome = store
+            .compact_if_over_limit(std::time::Duration::from_secs(3 * 86_400), 1, now)
+            .unwrap()
+            .unwrap();
+        assert_eq!(outcome.dropped, 5);
+        assert_eq!(outcome.kept, 3);
+        assert_eq!(store.snapshot().records[0].sequence, 6);
+        assert_eq!(
+            store.snapshot().retention.reason.as_deref(),
+            Some("automatic-byte-triggered-compaction-max-1")
+        );
+        assert_eq!(
+            store
+                .append_at(fields("online-after"), base_us + 8 * day_us)
+                .unwrap()
+                .sequence,
+            9
+        );
+        drop(store);
+        let reopened = LifecycleStore::open(&data_dir).unwrap();
+        assert_eq!(reopened.snapshot().records.len(), 4);
+        assert_eq!(reopened.snapshot().records[0].sequence, 6);
     }
 
     #[test]

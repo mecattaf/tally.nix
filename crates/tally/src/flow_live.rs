@@ -888,6 +888,7 @@ fn client_error(error: WireIoError) -> ClientError {
             let stable_code = match code {
                 WireErrorCode::DedupKeyConflict => "dedup-key-conflict",
                 WireErrorCode::FlowNodeCap => "flow-node-cap",
+                WireErrorCode::StorageBudgetExceeded => "storage-budget-exceeded",
                 WireErrorCode::InvalidParams | WireErrorCode::NotFound => "admission-denied",
                 WireErrorCode::FrameTooLarge => "frame-too-large",
                 WireErrorCode::UnsupportedProtocol => "unsupported-protocol",
