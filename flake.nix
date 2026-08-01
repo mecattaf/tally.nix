@@ -800,6 +800,20 @@
           coordinatorProgram = "${flowCoordinatorHandoff}/bin/tally-fs7-coordinator-handoff";
         };
         multiHostFlowArgsJson = builtins.toJSON multiHostFlowArgs;
+        # The NixOS test disks are intentionally about 1 GiB. Keep the
+        # production storage defaults covered by the module/evaluation checks,
+        # while giving live VM daemons an explicit fixture-sized free-space
+        # policy so their first enqueue exercises the intended test surface.
+        vmStorageBudget = {
+          dataDir = {
+            warningFreeBytes = 134217728;
+            minimumFreeBytes = 67108864;
+          };
+          stateDir = {
+            warningFreeBytes = 134217728;
+            minimumFreeBytes = 67108864;
+          };
+        };
         gitAiRemoteTally = pkgs.writeShellScript "tally-d12-remote-helper" ''
           export PATH="/var/lib/tally-worker/fleet-bin:${pkgs.git}/bin:${pkgs.coreutils}/bin:${pkgs.python3}/bin:$PATH"
           exec ${tally}/bin/tally "$@"
@@ -825,6 +839,7 @@
         gitAiRemoteConfig = pkgs.writeText "tally-d12-remote-config.json" (
           builtins.toJSON {
             retention.enable = false;
+            storage = vmStorageBudget;
             attestations.exec.enable = false;
             gitAi = {
               enable = true;
@@ -1814,6 +1829,7 @@
               services.tally = {
                 enable = true;
                 retention.onCalendar = "2099-01-01 00:00:00";
+                storage = vmStorageBudget;
                 pools.stock = {
                   resource = "build-slot";
                   enforce = "cooperative";
@@ -1832,6 +1848,7 @@
                   };
                   services.tally = {
                     enable = true;
+                    storage = vmStorageBudget;
                     pools.stock = {
                       resource = "build-slot";
                       enforce = "cooperative";
@@ -1916,6 +1933,7 @@
                 dataDir = "/srv/tally/data";
                 stateDir = "/srv/tally/state";
                 retention.enable = false;
+                storage = vmStorageBudget;
                 pools.stock = {
                   resource = "build-slot";
                   capacity = 1;
@@ -2069,6 +2087,7 @@
                   services.tally = {
                     enable = true;
                     retention.enable = false;
+                    storage = vmStorageBudget;
                     pools.stock = {
                       resource = "build-slot";
                       enforce = "cooperative";
@@ -2265,6 +2284,7 @@
                     };
                     services.tally = {
                       enable = true;
+                      storage = vmStorageBudget;
                       pools = {
                         coordinator-slot = {
                           resource = "build-slot";
