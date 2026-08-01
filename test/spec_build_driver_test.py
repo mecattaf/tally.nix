@@ -612,7 +612,7 @@ class GitHubForgeTests(unittest.TestCase):
     def test_forge_native_issue_graph_derives_blocking_and_escalation_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            checkout, _ = initialize_repository(root)
+            checkout, _ = initialize_repository(root, remote=True)
             manifest = {
                 "schemaVersion": 1,
                 "name": "fixture",
@@ -855,7 +855,7 @@ class GitHubForgeTests(unittest.TestCase):
 
     def test_issue_graph_digest_is_admitted_and_preserves_checkpoint_kind(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            checkout, _ = initialize_repository(Path(temporary))
+            checkout, _ = initialize_repository(Path(temporary), remote=True)
             manifest = {
                 "schemaVersion": 1,
                 "name": "fixture",
@@ -936,6 +936,10 @@ class GitHubForgeTests(unittest.TestCase):
             self.assertEqual([task["kind"] for task in worklist["tasks"]], ["implementation", "checkpoint"])
             self.assertEqual(worklist["tasks"][1]["argv"], ["true"])
             self.assertRegex(worklist["tasks"][0]["revision"], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(
+                worklist["source"]["revision"],
+                git(checkout, "rev-parse", "origin/main"),
+            )
 
             changed = [dict(candidate) for candidate in issues]
             changed[0]["body"] = "Edited after arm."
@@ -960,12 +964,12 @@ class GitHubForgeTests(unittest.TestCase):
 
         with mock.patch.object(DRIVER, "run", side_effect=listed):
             facts, _ = DRIVER.merged_github_tasks(
-                "acme/spec", "fixture", "7", "main", [task_value]
+                "acme/spec", {}, "fixture", "7", "main", None, [task_value]
             )
             self.assertEqual(facts[0]["revision"], revision)
             task_value["revision"] = "sha256:" + "2" * 64
             stale, _ = DRIVER.merged_github_tasks(
-                "acme/spec", "fixture", "7", "main", [task_value]
+                "acme/spec", {}, "fixture", "7", "main", None, [task_value]
             )
             self.assertEqual(stale, [])
 
