@@ -85,16 +85,23 @@ export const meta = {
         type: "array",
         minItems: 1,
         maxItems: 16,
+        uniqueItems: true,
         items: {
           type: "object",
-          required: ["id", "argv"],
+          required: ["id", "preflightArgv", "argv", "runtimeMaxSec"],
           properties: {
             id: { type: "string", pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$" },
+            preflightArgv: {
+              type: "array",
+              minItems: 1,
+              items: { type: "string" }
+            },
             argv: {
               type: "array",
               minItems: 1,
               items: { type: "string" }
-            }
+            },
+            runtimeMaxSec: { type: "integer", minimum: 1 }
           },
           additionalProperties: false
         }
@@ -269,6 +276,17 @@ function workspaceFor(prepared) {
 }
 
 (async () => {
+  const gateIds = [];
+  for (const gate of args.gates) {
+    if (gateIds.indexOf(gate.id) !== -1) {
+      const error = new Error(`campaign gate id ${gate.id} is duplicated`);
+      error.name = "SpecBuildConfigurationError";
+      error.code = "duplicate-gate-id";
+      throw error;
+    }
+    gateIds.push(gate.id);
+  }
+
   const repositoryConfig = args.repositories[args.repository];
   if (!repositoryConfig) {
     const error = new Error(`campaign repository ${args.repository} is not configured`);
@@ -315,14 +333,17 @@ function workspaceFor(prepared) {
     const workspace = workspaceFor(prepared.result);
 
     // The first prepared worktree is a fresh checkout of the fetched remote
-    // base. Prove every exact gate argv there before an implementation adapter
-    // is admitted; these named nodes become a clear, replayable receipt.
+    // base. Run each explicitly declared, base-safe preflight argv there before
+    // an implementation adapter is admitted. The real merge criterion may
+    // depend on files the agent has not built yet, so it remains gate.argv.
     if (merged.length === 0) {
       for (const gate of args.gates) {
-        await sh(gate.argv, {
+        await sh(gate.preflightArgv, {
           pools: ["campaign-control"],
           priority: "low",
           workspace,
+          env: { CAMPAIGN_TASK_ID: task.id },
+          runtimeMaxSec: gate.runtimeMaxSec,
           evidence: ["exit:0"],
           key: `preflight-gate-${gate.id}`,
           label: `preflight-gate-${gate.id}`
@@ -375,6 +396,7 @@ function workspaceFor(prepared) {
         priority: "low",
         workspace,
         env: { CAMPAIGN_TASK_ID: task.id },
+        runtimeMaxSec: gate.runtimeMaxSec,
         evidence: ["exit:0"],
         key: `gate-${task.id}-${gate.id}`,
         label: `gate-${task.id}-${gate.id}`
