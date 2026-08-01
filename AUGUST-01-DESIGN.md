@@ -296,9 +296,11 @@ code, removes zero items).
 
 ### 9.3 Rulings on the record (2026-08-01)
 
-1. **TaskChampion live projection: full-delete.** `tally view rebuild` may
-   survive as an offline verb; the live commit channel goes. #252 closes via
-   the delete, not via repair of the rebuild path.
+1. **TaskChampion live projection: full-delete.** The ruling menu was
+   full-delete versus a hedged path that kept `tally view rebuild` as an
+   offline verb; full-delete won, so the verb and the bundled taskchampion
+   dependency go with the live commit channel. #252 closes via the delete,
+   not via repair of the rebuild path.
 2. **git-ai: always on.** Enable estate-wide immediately; advisory while the
    publish-node binding (bind/rebind on the final squash commit, §7) proves
    itself on real squash merges; then flip to `required`, accepting the 1.6.17
