@@ -78,8 +78,10 @@ by default.
   and [project conventions](https://mecattaf.github.io/tally.nix/conventions.html)
 
 Book source and local build instructions live in [`doc/`](doc/README.md).
-The older design and campaign records in [`legacy-docs/`](legacy-docs/README.md)
-remain provenance, not the current user manual.
+The older design and campaign records in
+[`legacy-docs/`](https://github.com/mecattaf/tally.nix/tree/65a5bbbc956e3768421bf9838c5534ac9d5d893a/legacy-docs)
+remain provenance, not the current user manual. They were removed from the working
+tree; the pinned link is the archival copy.
 
 ## Platform support
 

@@ -40,6 +40,10 @@ use tokio::task::JoinHandle;
 
 #[path = "support/shell_program.rs"]
 mod shell_program;
+#[path = "support/timeout_scale.rs"]
+mod timeout_scale;
+
+use timeout_scale::scaled;
 
 const CONCURRENT_RUN: &str = "00000000-0000-4000-8000-000000000501";
 const KILLED_RUN: &str = "00000000-0000-4000-8000-000000000502";
@@ -132,7 +136,7 @@ impl Drop for PathGuard {
 impl RunningDaemon {
     async fn stop(self) {
         self.shutdown.send(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(10), self.task)
+        tokio::time::timeout(scaled(Duration::from_secs(10)), self.task)
             .await
             .expect("daemon shutdown timed out")
             .expect("daemon task panicked")
@@ -895,7 +899,7 @@ async fn wait_for_flow_state(
 async fn await_items(client: &RpcClient, items: &[Value]) {
     for item in items {
         let terminal = tokio::time::timeout(
-            Duration::from_secs(20),
+            scaled(Duration::from_secs(20)),
             client.call(
                 "queue.await_job",
                 Some(json!({"task_uuid": item["anchor"]})),
@@ -909,7 +913,7 @@ async fn await_items(client: &RpcClient, items: &[Value]) {
 }
 
 async fn runner_output(child: Child) -> std::process::Output {
-    tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+    tokio::time::timeout(scaled(Duration::from_secs(60)), child.wait_with_output())
         .await
         .expect("flow runner timed out")
         .unwrap()
@@ -1071,7 +1075,7 @@ async fn fs5_live_acceptance_matrix() {
                 .unwrap();
             let parent_uuid = parent["task_uuid"].as_str().unwrap().to_owned();
             let parent_terminal = tokio::time::timeout(
-                Duration::from_secs(30),
+                scaled(Duration::from_secs(30)),
                 client.call("queue.await_job", Some(json!({"task_uuid": parent_uuid}))),
             )
             .await
@@ -1151,7 +1155,7 @@ async fn fs5_live_acceptance_matrix() {
                 .unwrap();
             assert_eq!(github_parent["task_uuid"], expected_parent_uuid);
             let github_parent_terminal = tokio::time::timeout(
-                Duration::from_secs(30),
+                scaled(Duration::from_secs(30)),
                 client.call(
                     "queue.await_job",
                     Some(json!({"task_uuid": expected_parent_uuid})),

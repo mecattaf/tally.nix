@@ -295,6 +295,20 @@ authorized.
 
 ### Changed
 
+- Removed the tracked `legacy-docs/` tree. Those 26 pre-book design and campaign
+  records were entirely off the build path; `README.md` now points at them
+  through a pinned-commit GitHub link, the same archival form
+  `doc/src/architecture/lineage.md` already used. Git history keeps every byte.
+- Added `.wrangler/` to `.gitignore` so a worktree carrying build and tool
+  clutter (`result`, `result-*`, `__pycache__/`, `.wrangler/`) still reports a
+  clean `git status`.
+- Added the `TALLY_TEST_TIMEOUT_SCALE` test-harness knob. It multiplies the
+  fixed wait budgets in the live flow suite so a loaded host can be given slack
+  without editing tests or changing what they assert. Unset is byte-identical to
+  the previous budgets; a value that is not a positive finite number panics
+  rather than silently running unscaled. The variable is read from the test
+  process environment, so it applies to a direct `cargo test` reproduce run and
+  not to the sandboxed tests run by `nix flake check`.
 - Changed `tally query log` to print one terse human line per lifecycle
   transition by default. `--json` retains structured fields; both human and
   JSON modes collapse journal/evidence/witness echoes, while `--provenance`
