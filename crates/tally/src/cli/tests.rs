@@ -393,6 +393,7 @@ fn flow_run_and_check_cli_shapes_match_the_declarative_contract() {
             command: FlowCommand::Check(FlowCheckArgs {
                 script,
                 args: Some(args),
+                args_path: None,
                 catalog: Some(catalog),
             })
         }) if script == Path::new("/nix/store/example-flow.js")
@@ -426,6 +427,38 @@ fn flow_run_and_check_cli_shapes_match_the_declarative_contract() {
             })
         }) if flow_run_id == "run-47"
     ));
+
+    let path_inputs = Opts::try_parse_from([
+        "tally",
+        "flow",
+        "run",
+        "/nix/store/example-flow.js",
+        "--args-from-brief",
+    ])
+    .unwrap();
+    assert!(matches!(
+        path_inputs.command,
+        Some(Command::Flow {
+            command: FlowCommand::Run(FlowRunArgs {
+                args: None,
+                args_path: None,
+                args_from_brief: true,
+                ..
+            })
+        })
+    ));
+
+    assert!(Opts::try_parse_from([
+        "tally",
+        "flow",
+        "run",
+        "/nix/store/example-flow.js",
+        "--args",
+        "{}",
+        "--args-path",
+        "/tmp/args.json",
+    ])
+    .is_err());
 
     let cancel = Opts::try_parse_from([
         "tally",

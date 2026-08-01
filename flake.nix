@@ -169,13 +169,16 @@
                     "flow"
                     "run"
                     "${./examples/flows/pooled-review.js}"
-                    "--args"
-                    "{\"subject\":\"\${gh.url}\",\"minimumValid\":2}"
+                    "--args-from-brief"
                     "--max-nodes"
                     "1000"
                     "--catalog"
                     "${catalogFixture}"
                   ];
+                  brief = {
+                    subject = "\${gh.url}";
+                    minimumValid = 2;
+                  };
                   pool = "slot";
                   noEnqueue = false;
                 };
@@ -3194,10 +3197,9 @@
               .producers["flow-fixture"].kind == "calendar" and
               .producers["flow-fixture"].onCalendar == "daily" and
               .producers["flow-fixture"].enqueue.argv[0:3] == ["tally", "flow", "run"] and
-              .producers["flow-fixture"].enqueue.argv[4] == "--args" and
-              (.producers["flow-fixture"].enqueue.argv[5] | fromjson) == {"task":"ship"} and
-              .producers["flow-fixture"].enqueue.argv[6:8] == ["--max-nodes", "1000"] and
-              .producers["flow-fixture"].enqueue.argv[8] == "--catalog" and
+              .producers["flow-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "1000"] and
+              .producers["flow-fixture"].enqueue.argv[7] == "--catalog" and
+              .producers["flow-fixture"].enqueue.brief == {"task":"ship"} and
               .producers["flow-fixture"].enqueue.adapter == "shell" and
               .producers["flow-fixture"].enqueue.pool == ["flow","flow-run-mutex"] and
               .producers["flow-fixture"].enqueue.priority == "low" and
@@ -3305,8 +3307,8 @@
                 test -e "$activationPackage"
                 ${tally}/bin/tally --mode check-config --config "$checkedConfig" >/dev/null
                 jq -e '
-                  (.producers["campaign-fixture"].enqueue.argv[5] | fromjson) as $fixtureArgs |
-                  (.producers["campaign-defaulted"].enqueue.argv[5] | fromjson) as $defaultedArgs |
+                  .producers["campaign-fixture"].enqueue.brief as $fixtureArgs |
+                  .producers["campaign-defaulted"].enqueue.brief as $defaultedArgs |
                   .enqueue.fanoutCap == 64 and
                   .pools["fixture-campaign"].resource == "mutex" and
                   .pools["fixture-campaign"].capacity == 1 and
@@ -3348,8 +3350,7 @@
                   .producers["campaign-fixture"].enqueue.argv[0:3] == [
                     "${tally}/bin/tally", "flow", "run"
                   ] and
-                  .producers["campaign-fixture"].enqueue.argv[4] == "--args" and
-                  .producers["campaign-fixture"].enqueue.argv[6:8] == ["--max-nodes", "21"] and
+                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "21"] and
                   .producers["campaign-defaulted"].allowSelfTriggered == false
                 ' "$checkedConfig" >/dev/null
 
@@ -3398,28 +3399,30 @@
                   __producer-dispatch campaign-fixture --state-dir "$TMPDIR/state" \
                   --event "$event")"
                 payload="$(printf '%s' "$dispatch" | jq -r '.emitted')"
+                runtime_args="$(jq -r '.briefPath' "$payload")"
+                test -f "$runtime_args"
                 jq -e '
-                  (.argv[5] | fromjson) as $args |
-                  $args.campaign == "fixture" and
-                  $args.repository == "acme/spec" and
-                  $args.issue == {
+                  .campaign == "fixture" and
+                  .repository == "acme/spec" and
+                  .issue == {
                     "number": "7",
                     "url": "https://github.com/acme/spec/issues/7"
                   } and
-                  $args.runId == "comment-7" and
-                  $args.worklist == "specs/*/tasks.json" and
-                  $args.maxTasks == 3 and
-                  $args.repositories["acme/spec"].baseBranch == "main" and
-                  $args.repositories["acme/spec"].forge == "github" and
-                  $args.agent.adapter == "shell" and
-                  $args.agent.argv == ["/bin/true"] and
-                  $args.agent.approvalPolicy == null and
-                  $args.agent.sandboxPolicy == null and
-                  [$args.gates[].id] == ["content", "clean"]
-                ' "$payload" >/dev/null
-                runtime_args="$(jq -r '.argv[5]' "$payload")"
+                  .runId == "comment-7" and
+                  .worklist == "specs/*/tasks.json" and
+                  .maxTasks == 3 and
+                  .repositories["acme/spec"].baseBranch == "main" and
+                  .repositories["acme/spec"].forge == "github" and
+                  .agent.adapter == "shell" and
+                  .agent.argv == ["/bin/true"] and
+                  .agent.approvalPolicy == null and
+                  .agent.sandboxPolicy == null and
+                  [.gates[].id] == ["content", "clean"]
+                ' "$runtime_args" >/dev/null
+                jq -e --arg args "$runtime_args" \
+                  '.briefPath == $args and (has("brief") | not)' "$payload" >/dev/null
                 ${tally}/bin/tally --config "$checkedConfig" flow check \
-                  ${./examples/flows/spec-build.js} --args "$runtime_args" >/dev/null
+                  ${./examples/flows/spec-build.js} --args-path "$runtime_args" >/dev/null
                 test "$(jq -r '.argv[3]' "$payload")" = \
                   "$(jq -r '.flows.fixture.script' "$checkedConfig")"
                 touch "$out"
@@ -3456,23 +3459,23 @@
                   ${tally}/bin/tally flow check "$example" >/dev/null
                 done
                 ${tally}/bin/tally flow check ${./examples/flows/academic-ocr.js} \
-                  --args "$(cat ${exampleArgs.academic-ocr})" >/dev/null
+                  --args-path ${exampleArgs.academic-ocr} >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/domain-failure.js} \
-                  --args "$(cat ${exampleArgs.domain-failure})" >/dev/null
+                  --args-path ${exampleArgs.domain-failure} >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/fleet-deploy.js} \
-                  --args "$(cat ${exampleArgs.fleet-deploy})" >/dev/null
+                  --args-path ${exampleArgs.fleet-deploy} >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/monthly-review.js} \
-                  --args "$(cat ${exampleArgs.monthly-review})" --catalog ${catalogFixture} >/dev/null
+                  --args-path ${exampleArgs.monthly-review} --catalog ${catalogFixture} >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/pooled-review.js} \
-                  --args "$(cat ${exampleArgs.pooled-review})" --catalog ${catalogFixture} >/dev/null
+                  --args-path ${exampleArgs.pooled-review} --catalog ${catalogFixture} >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/worklist-fanout.js} \
-                  --args "$(cat ${exampleArgs.worklist-fanout})" >/dev/null
+                  --args-path ${exampleArgs.worklist-fanout} >/dev/null
                 # The agency wave's worklist IS its arguments, so its
                 # representative arguments are the checked-in documented wave
                 # rather than an inline attrset, and that file has to satisfy
                 # the flow's own argsSchema.
                 agency_meta="$(${tally}/bin/tally flow check ${./examples/flows/agency-nightly.js} \
-                  --args "$(cat ${./examples/flows/agency-nightly.args.json})")"
+                  --args-path ${./examples/flows/agency-nightly.args.json})"
                 test "$(printf '%s' "$agency_meta" | jq -r '.name')" = agency-nightly
                 test "$(printf '%s' "$agency_meta" | jq -r '.maxNodes')" = 20
                 test "$(printf '%s' "$agency_meta" | jq -r '.iterationCap')" = 8
@@ -3780,22 +3783,27 @@
                 flow="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github-flow --state-dir "$producer_state" --event "$flow_event")"
                 test "$(printf '%s' "$flow" | jq -r 'keys[0]')" = emitted
                 flow_path="$(printf '%s' "$flow" | jq -r '.emitted')"
+                flow_args="$(jq -r '.briefPath' "$flow_path")"
+                test -f "$flow_args"
                 jq -e \
                   --arg script ${./examples/flows/pooled-review.js} \
-                  --arg catalog ${catalogFixture} '
+                  --arg catalog ${catalogFixture} \
+                  --arg args "$flow_args" '
                     .source == "gh" and
                     .noEnqueue == false and
                     .argv[0:3] == ["tally", "flow", "run"] and
                     .argv[3] == $script and
-                    .argv[4] == "--args" and
-                    (.argv[5] | fromjson) == {
-                      "subject": "https://github.com/agency-agency/spec/issues/61",
-                      "minimumValid": 2
-                    } and
-                    .argv[6:9] == ["--max-nodes", "1000", "--catalog"] and
-                    .argv[9] == $catalog and
+                    .argv[4:7] == ["--args-from-brief", "--max-nodes", "1000"] and
+                    .briefPath == $args and
+                    (has("brief") | not) and
+                    .argv[7] == "--catalog" and
+                    .argv[8] == $catalog and
                     ([.argv[] | contains("must-not-run")] | any | not)
                   ' "$flow_path" >/dev/null
+                jq -e '. == {
+                  "subject": "https://github.com/agency-agency/spec/issues/61",
+                  "minimumValid": 2
+                }' "$flow_args" >/dev/null
                 flow_duplicate="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github-flow --state-dir "$producer_state" --event "$flow_event")"
                 test "$(printf '%s' "$flow_duplicate" | jq -r '.')" = duplicate
                 rejected_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":21,"htmlUrl":"https://github.com/agency-agency/spec/issues/21","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"untrusted-user","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-43","commentId":"comment-43","triggerTimestamp":"2026-07-20T12:31:00Z","context":{"schemaVersion":2,"title":"Self-authored issue","body":"untrusted","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-43","author":"untrusted-user","body":"/tally run"}}}'

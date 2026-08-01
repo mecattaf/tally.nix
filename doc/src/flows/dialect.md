@@ -151,7 +151,8 @@ The standalone checker always parses the module, extracts and validates `meta`,
 runs the static determinism lint, checks literal pool declarations, and reparses
 the normalized source as a Script. Optional flags add two checks:
 
-- `--args JSON` validates the invocation against `meta.argsSchema`.
+- `--args JSON` or `--args-path /absolute/args.json` validates the invocation
+  against `meta.argsSchema`; the two forms are mutually exclusive.
 - `--catalog PATH` validates the catalog schema and semantics, proves every
   declared selector is non-empty, and resolves direct `members()` calls whose
   selector and options are literals. Dynamically assembled selector requests stay

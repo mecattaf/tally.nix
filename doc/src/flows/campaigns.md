@@ -87,6 +87,12 @@ at its default: a fixed instruction telling the adapter to read the structured
 brief at `TALLY_BRIEF`. It can be overridden for a fixture or a purpose-built
 adapter executable, but the campaign never interpolates task prose into argv.
 
+The campaign runner follows the same rule. Its complete structured flow
+arguments travel in the producer enqueue's content-addressed brief and are read
+from `TALLY_BRIEF`; the runner argv contains only the flow script path and stable
+control flags. Campaign issue or policy text therefore does not inflate job
+queries or transient-unit status output and is not bounded by process argv size.
+
 An implementation node defaults to `agentSandboxPolicy = "workspace-write"`
 because its contract requires a commit, paired with
 `agentApprovalPolicy = "on-request"` so the adapter can surface a request to go

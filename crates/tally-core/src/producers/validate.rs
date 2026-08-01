@@ -224,6 +224,13 @@ pub(super) fn validate_enqueue(
             ))
         })?;
     }
+    if let Some(brief) = &enqueue.brief {
+        validate_origin_value(brief, allow_origin_templates).map_err(|detail| {
+            ProducerError::InvalidConfig(format!(
+                "producer {producer:?} {field} brief template is invalid: {detail}"
+            ))
+        })?;
+    }
     if let Some(cwd) = &enqueue.cwd {
         let cwd = cwd.to_str().ok_or_else(|| {
             ProducerError::InvalidConfig(format!(
@@ -331,6 +338,14 @@ pub(super) fn render_origin_template(
     template: &str,
     origin: Option<&GhOrigin>,
 ) -> Result<String, ProducerError> {
+    render_origin_template_with_limit(template, origin, Some(64 * 1024))
+}
+
+fn render_origin_template_with_limit(
+    template: &str,
+    origin: Option<&GhOrigin>,
+    max_bytes: Option<usize>,
+) -> Result<String, ProducerError> {
     validate_origin_template(template, origin.is_some())
         .map_err(ProducerError::InvalidObservation)?;
     let mut rendered = String::new();
@@ -351,12 +366,56 @@ pub(super) fn render_origin_template(
         rest = &rest[end + 1..];
     }
     rendered.push_str(rest);
-    if rendered.len() > 64 * 1024 {
+    if max_bytes.is_some_and(|max_bytes| rendered.len() > max_bytes) {
         return Err(ProducerError::InvalidObservation(
             "rendered origin template exceeds 65536 bytes".to_owned(),
         ));
     }
     Ok(rendered)
+}
+
+pub(super) fn validate_origin_value(value: &Value, allowed: bool) -> Result<(), String> {
+    match value {
+        Value::String(value) => validate_origin_template(value, allowed),
+        Value::Array(values) => values
+            .iter()
+            .try_for_each(|value| validate_origin_value(value, allowed)),
+        Value::Object(values) => values.iter().try_for_each(|(name, value)| {
+            validate_origin_template(name, allowed)?;
+            validate_origin_value(value, allowed)
+        }),
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+    }
+}
+
+pub(super) fn render_origin_value(
+    value: &Value,
+    origin: Option<&GhOrigin>,
+) -> Result<Value, ProducerError> {
+    match value {
+        Value::String(value) => {
+            render_origin_template_with_limit(value, origin, None).map(Value::String)
+        }
+        Value::Array(values) => values
+            .iter()
+            .map(|value| render_origin_value(value, origin))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::Object(values) => {
+            let mut rendered = serde_json::Map::new();
+            for (name, value) in values {
+                let name = render_origin_template_with_limit(name, origin, None)?;
+                let value = render_origin_value(value, origin)?;
+                if rendered.insert(name.clone(), value).is_some() {
+                    return Err(ProducerError::InvalidObservation(format!(
+                        "rendered producer brief contains duplicate field {name:?}"
+                    )));
+                }
+            }
+            Ok(Value::Object(rendered))
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => Ok(value.clone()),
+    }
 }
 
 pub(super) fn origin_template_value(

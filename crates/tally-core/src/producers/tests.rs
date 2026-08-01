@@ -20,6 +20,7 @@ fn enqueue(command: &str) -> ProducerEnqueue {
         workspace: None,
         adapter_options: AdapterJobOptions::default(),
         gate_manifest: None,
+        brief: None,
         pools: vec!["slot".to_owned()],
         executor: None,
         priority: Priority::Low,
@@ -664,6 +665,7 @@ fn calendar_emits_a_direct_payload_with_strftime_dedup_and_credentials() {
         "token".to_owned(),
         PathBuf::from("/run/credentials/calendar-token"),
     );
+    calendar.enqueue.brief = Some(serde_json::json!({"task": "nightly"}));
     let engine = ProducerEngine::new(
         &registry,
         temp.path().join("events"),
@@ -684,10 +686,17 @@ fn calendar_emits_a_direct_payload_with_strftime_dedup_and_credentials() {
         payload.credentials["token"],
         PathBuf::from("/run/credentials/calendar-token")
     );
+    let brief_path = payload.brief_path.as_ref().unwrap();
+    assert_eq!(
+        crate::brief::PreparedBrief::from_path(brief_path)
+            .unwrap()
+            .document(),
+        &serde_json::json!({"task": "nightly"})
+    );
 }
 
 #[test]
-fn github_origin_templates_render_into_literal_argv_and_cwd_without_a_shell() {
+fn github_origin_templates_render_into_literal_fields_without_a_shell() {
     let temp = tempdir().unwrap();
     let marker = temp.path().join("must-not-exist");
     let mut registry = registry(&temp.path().join("effects.jsonl"));
@@ -700,6 +709,16 @@ fn github_origin_templates_render_into_literal_argv_and_cwd_without_a_shell() {
         "${gh.headSha}".to_owned(),
         format!("$(touch {})", marker.display()),
     ];
+    let campaign_issue = "campaign issue body ".repeat(60_000);
+    assert!(campaign_issue.len() > MAX_INGRESS_BYTES as usize);
+    github.enqueue.brief = Some(serde_json::json!({
+        "issue": {
+            "url": "${gh.url}",
+            "number": "${gh.number}",
+            "body": campaign_issue,
+        },
+        "runId": "${gh.eventId}",
+    }));
     github.enqueue.cwd = Some(PathBuf::from("/worktrees/${repoName}"));
     validate_registry(
         &registry,
@@ -719,15 +738,36 @@ fn github_origin_templates_render_into_literal_argv_and_cwd_without_a_shell() {
     else {
         panic!("GitHub observation did not emit")
     };
+    assert!(std::fs::metadata(&path).unwrap().len() < MAX_INGRESS_BYTES);
     let payload: EnqueuePayload = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let argv = payload.argv.as_ref().unwrap();
     assert_eq!(
-        payload.argv.unwrap(),
-        vec![
+        argv.as_slice(),
+        &[
             "review".to_owned(),
             "https://github.com/acme/widgets/pull/128".to_owned(),
             "0123456789abcdef0123456789abcdef01234567".to_owned(),
             format!("$(touch {})", marker.display()),
         ]
+    );
+    assert!(argv.iter().all(|argument| argument.len() < 64 * 1024));
+    assert!(argv
+        .iter()
+        .all(|argument| !argument.contains("campaign issue body")));
+    assert!(payload.brief.is_none());
+    let brief_path = payload.brief_path.as_ref().unwrap();
+    assert!(brief_path.starts_with(temp.path().join("state/briefs")));
+    let prepared = crate::brief::PreparedBrief::from_path(brief_path).unwrap();
+    assert_eq!(
+        prepared.document(),
+        &serde_json::json!({
+            "issue": {
+                "url": "https://github.com/acme/widgets/pull/128",
+                "number": "128",
+                "body": campaign_issue,
+            },
+            "runId": "thread-128",
+        })
     );
     assert_eq!(
         payload.cwd.as_deref(),
@@ -739,7 +779,8 @@ fn github_origin_templates_render_into_literal_argv_and_cwd_without_a_shell() {
     let ProducerConfig::Gh(github) = unknown.get_mut("github").unwrap() else {
         unreachable!()
     };
-    github.enqueue.argv = vec!["${gh.body}".to_owned()];
+    github.enqueue.argv = vec!["review".to_owned()];
+    github.enqueue.brief = Some(serde_json::json!({"body": "${gh.body}"}));
     assert!(validate_registry(
         &unknown,
         &BTreeSet::from(["slot".to_owned()]),

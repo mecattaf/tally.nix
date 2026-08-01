@@ -109,6 +109,24 @@ fn flow_check_cli_accepts_valid_and_rejects_the_eval_fixture_matrix() {
     assert_eq!(meta["name"], "fixture-valid");
     assert_eq!(meta["selectors"], serde_json::json!(["pooled-fast"]));
 
+    let temp = tempfile::tempdir().unwrap();
+    let args_path = temp.path().join("flow-args.json");
+    fs::write(&args_path, br#"{"task":"from-path"}"#).unwrap();
+    let from_path = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["flow", "check"])
+        .arg(fixture("valid.js"))
+        .arg("--args-path")
+        .arg(&args_path)
+        .arg("--catalog")
+        .arg(fixture("catalog.json"))
+        .output()
+        .unwrap();
+    assert!(
+        from_path.status.success(),
+        "{}",
+        String::from_utf8_lossy(&from_path.stderr)
+    );
+
     let drv = Command::new(env!("CARGO_BIN_EXE_tally"))
         .args(["flow", "check"])
         .arg(fixture("valid-drv.js"))
@@ -283,10 +301,20 @@ fn flow_run_allows_a_registered_flow_without_a_workload_mutex() {
 }
 
 #[test]
-fn flow_run_captures_identity_then_starts_worker_with_task_uuid_absent() {
+fn flow_run_captures_identity_and_reads_args_from_inherited_brief() {
     let temp = tempfile::tempdir().unwrap();
     let config = write_config(temp.path());
     let socket = temp.path().join("tally.sock");
+    let args_path = temp.path().join("runner-args.json");
+    fs::write(
+        &args_path,
+        serde_json::to_vec(&json!({
+            "marker": "issue-250",
+            "body": "x".repeat(256 * 1024),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
     let server = serve_empty_flow_history(&socket, Some("00000000-0000-4000-8000-000000000048"));
     let output = Command::new(env!("CARGO_BIN_EXE_tally"))
         .arg("--config")
@@ -294,21 +322,15 @@ fn flow_run_captures_identity_then_starts_worker_with_task_uuid_absent() {
         .arg("--socket")
         .arg(&socket)
         .args(["flow", "run"])
-        .arg(fixture("valid.js"))
-        .args([
-            "--args",
-            r#"{"task":"ship"}"#,
-            "--max-nodes",
-            "12",
-            "--catalog",
-        ])
-        .arg(fixture("catalog.json"))
+        .arg(fixture("args-from-brief.js"))
+        .args(["--args-from-brief", "--max-nodes", "12"])
         .env("TALLY_TASK_UUID", "00000000-0000-4000-8000-000000000048")
         .env("TALLY_JOB_ID", "00000000-0000-4000-8000-000000000048")
         .env(
             "TALLY_JOB_TOKEN",
             "abababababababababababababababababababababababababababababababab",
         )
+        .env("TALLY_BRIEF", &args_path)
         .output()
         .unwrap();
     server.join().unwrap();
@@ -329,7 +351,10 @@ fn flow_run_captures_identity_then_starts_worker_with_task_uuid_absent() {
         events[1]["report"]["flowRunId"],
         "00000000-0000-4000-8000-000000000048"
     );
-    assert_eq!(events[1]["report"]["finalValue"], "ship");
+    assert_eq!(
+        events[1]["report"]["finalValue"],
+        json!({"marker": "issue-250", "bodyBytes": 256 * 1024})
+    );
 }
 
 #[test]

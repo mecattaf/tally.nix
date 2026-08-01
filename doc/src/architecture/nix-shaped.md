@@ -190,9 +190,11 @@ The default flow pool has capacity eight, not infinite or literally free.
 
 For a declaratively configured scheduled flow—one with `onCalendar` set—the Nix
 module turns the script and optional catalog into store paths in the producer's
-literal argv. The runner records hashes of the exact script bytes, serialized
-arguments, and exact optional catalog bytes on every node. A later invocation of
-the same run with different identity fails as `script-changed-mid-run`,
+literal argv. Serialized arguments travel separately as a daemon-managed,
+content-addressed brief file whose path is exposed through `TALLY_BRIEF`; their
+size does not change the runner argv. The runner records hashes of the exact
+script bytes, arguments, and exact optional catalog bytes on every node. A later
+invocation of the same run with different identity fails as `script-changed-mid-run`,
 `args-changed-mid-run`, or `catalog-changed-mid-run`. Together these mechanisms
 give orchestration a generation:
 

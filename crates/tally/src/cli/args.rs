@@ -146,8 +146,23 @@ pub(super) struct FlowCancelArgs {
 pub(super) struct FlowRunArgs {
     #[arg(value_name = "SCRIPT")]
     pub(super) script: PathBuf,
-    #[arg(long, default_value = "{}", value_parser = parse_opaque_json, allow_hyphen_values = true)]
-    pub(super) args: Value,
+    #[arg(
+        long,
+        value_parser = parse_opaque_json,
+        allow_hyphen_values = true,
+        conflicts_with_all = ["args_path", "args_from_brief"]
+    )]
+    pub(super) args: Option<Value>,
+    /// Read flow arguments from an absolute JSON file instead of argv.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["args", "args_from_brief"]
+    )]
+    pub(super) args_path: Option<PathBuf>,
+    /// Read flow arguments from the private file named by TALLY_BRIEF.
+    #[arg(long, conflicts_with_all = ["args", "args_path"])]
+    pub(super) args_from_brief: bool,
     #[arg(long, value_name = "PATH")]
     pub(super) catalog: Option<PathBuf>,
     // `tally flow run` named this `--flow-run-id` while `tally query` named the
@@ -164,8 +179,16 @@ pub(super) struct FlowRunArgs {
 pub(super) struct FlowCheckArgs {
     #[arg(value_name = "SCRIPT")]
     pub(super) script: PathBuf,
-    #[arg(long, value_parser = parse_opaque_json, allow_hyphen_values = true)]
+    #[arg(
+        long,
+        value_parser = parse_opaque_json,
+        allow_hyphen_values = true,
+        conflicts_with = "args_path"
+    )]
     pub(super) args: Option<Value>,
+    /// Read flow arguments from an absolute JSON file instead of argv.
+    #[arg(long, value_name = "PATH", conflicts_with = "args")]
+    pub(super) args_path: Option<PathBuf>,
     #[arg(long, value_name = "PATH")]
     pub(super) catalog: Option<PathBuf>,
 }

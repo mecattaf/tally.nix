@@ -1019,8 +1019,23 @@ impl<'a> ProducerEngine<'a> {
         if ingress_name_exists(&self.events_dir, name)? {
             return Ok(EmitOutcome::Duplicate);
         }
+        let mut payload = payload.clone();
+        if let Some(document) = payload.brief.take() {
+            if payload.brief_path.is_some() {
+                return Err(ProducerError::InvalidObservation(
+                    "producer payload contains both brief and briefPath".to_owned(),
+                ));
+            }
+            create_dir_durable(&self.state_dir)?;
+            let prepared = crate::brief::PreparedBrief::from_value(document)
+                .map_err(|error| ProducerError::InvalidObservation(error.to_string()))?;
+            payload.brief_path = Some(
+                crate::brief::store(&self.state_dir, &prepared)
+                    .map_err(|error| ProducerError::InvalidObservation(error.to_string()))?,
+            );
+        }
         create_dir_durable(&self.events_dir)?;
-        let bytes = serde_json::to_vec(payload)?;
+        let bytes = serde_json::to_vec(&payload)?;
         if bytes.len().saturating_add(1) > MAX_INGRESS_BYTES as usize {
             return Err(ProducerError::InvalidObservation(format!(
                 "producer payload exceeds the {MAX_INGRESS_BYTES} byte ingress limit"

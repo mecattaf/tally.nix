@@ -10,6 +10,7 @@ pub(super) struct InheritedFlowEnvironment {
     pub(super) task_uuid: Option<String>,
     pub(super) job_id: Option<String>,
     pub(super) job_token: Option<String>,
+    pub(super) brief_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -30,6 +31,7 @@ impl InvocationEnvironment {
             task_uuid: std::env::var("TALLY_TASK_UUID").ok(),
             job_id: std::env::var("TALLY_JOB_ID").ok(),
             job_token: std::env::var("TALLY_JOB_TOKEN").ok(),
+            brief_path: std::env::var_os("TALLY_BRIEF").map(PathBuf::from),
         });
         Self {
             rpc_timeout: std::env::var_os(RPC_TIMEOUT_ENV),
@@ -94,6 +96,12 @@ pub(super) async fn run_flow(
         FlowCommand::Check(args) => {
             let source = std::fs::read_to_string(&args.script)
                 .with_context(|| format!("cannot read flow script {}", args.script.display()))?;
+            let supplied_args = match (args.args, args.args_path) {
+                (Some(args), None) => Some(args),
+                (None, Some(path)) => Some(load_flow_args(&path)?),
+                (None, None) => None,
+                (Some(_), Some(_)) => unreachable!("clap rejects conflicting flow args inputs"),
+            };
             let catalog = args
                 .catalog
                 .as_deref()
@@ -104,7 +112,7 @@ pub(super) async fn run_flow(
                 &source,
                 Some(&args.script),
                 CheckOptions {
-                    args: args.args.as_ref(),
+                    args: supplied_args.as_ref(),
                     catalog: catalog.as_ref().map(|(catalog, _)| catalog),
                     catalog_hash: catalog.as_ref().map(|(_, hash)| hash.as_str()),
                 },
@@ -133,9 +141,23 @@ pub(super) async fn run_flow(
             let rpc_call_timeout = args.rpc_call_deadline_sec.map(Duration::from_secs);
             let source = std::fs::read_to_string(&args.script)
                 .with_context(|| format!("cannot read flow script {}", args.script.display()))?;
-            let inherited_task_uuid = inherited.task_uuid;
-            let inherited_job_id = inherited.job_id;
-            let inherited_job_token = inherited.job_token;
+            let InheritedFlowEnvironment {
+                task_uuid: inherited_task_uuid,
+                job_id: inherited_job_id,
+                job_token: inherited_job_token,
+                brief_path,
+            } = inherited;
+            let flow_args = match (args.args, args.args_path, args.args_from_brief) {
+                (Some(args), None, false) => args,
+                (None, Some(path), false) => load_flow_args(&path)?,
+                (None, None, true) => {
+                    let path = brief_path
+                        .ok_or_else(|| invalid("--args-from-brief requires TALLY_BRIEF"))?;
+                    load_flow_args(&path)?
+                }
+                (None, None, false) => json!({}),
+                _ => unreachable!("clap rejects conflicting flow args inputs"),
+            };
             let flow_run_id = args
                 .flow_run_id
                 .or_else(|| inherited_task_uuid.clone())
@@ -168,7 +190,7 @@ pub(super) async fn run_flow(
                 .map(load_catalog)
                 .transpose()
                 .map_err(flow_error)?;
-            let mut options = RunOptions::new(flow_run_id, args.args);
+            let mut options = RunOptions::new(flow_run_id, flow_args);
             options.max_nodes = args.max_nodes;
             if let Some((catalog, hash)) = catalog {
                 options.catalog = Some(catalog);
@@ -251,6 +273,12 @@ pub(super) async fn run_flow(
             }
         }
     }
+}
+
+fn load_flow_args(path: &Path) -> Result<Value> {
+    tally_core::brief::PreparedBrief::from_path(path)
+        .map(|prepared| prepared.document().clone())
+        .with_context(|| format!("cannot read flow arguments from {}", path.display()))
 }
 
 fn matching_workload_mutex<'a>(
