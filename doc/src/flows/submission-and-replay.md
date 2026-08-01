@@ -187,8 +187,8 @@ registration would let a hung awaited node or transport hold an evaluator, its
 need run-identity continuity use witnessed replay as their checkpoint mechanism.
 Forge-backed spec-build campaigns instead run bounded, fresh reconcile passes;
 their continuation state is the set of marked merged pull requests and
-content-bound automated checkpoint refs, plus authenticated diagnosis and
-escalation comments on the campaign issue. Node
+content-and-exact-base-bound automated checkpoint refs, plus authenticated
+diagnosis and escalation comments on the campaign issue. Node
 `runtimeMaxSec`, the runner job's registration-level `runtimeMaxSec`, and the
 RPC call deadline remain separate bounds; changing one does not change the
 24-hour evaluation budget.

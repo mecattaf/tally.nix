@@ -144,6 +144,11 @@ authorized.
 
 ### Fixed
 
+- Bound campaign worklists to the fetched remote-base blob and checkpoint
+  receipts to one exact base revision. Immutable create-only receipts now prove
+  dependency ancestry, reject forged or annotated targets, and are invalidated
+  by either a pushed worklist edit or any later base commit instead of silently
+  treating a point-in-time integration result as permanent.
 - Completed campaign task-reference observability in `query trace` records and
   generations and in every `query standup` bucket; task-ref-qualified archived
   captures are now regression-tested through retry trace lookup and recovered

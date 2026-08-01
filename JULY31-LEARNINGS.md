@@ -74,6 +74,8 @@ has no implementation agent, publication, merge, or human approval transition.
 A red checkpoint withholds only its own completion fact, so the existing
 dependency frontier leaves its descendants unready while independent subtrees
 continue. “Phase done, awaiting operator” is explicitly not a campaign state.
+The receipt is a point-in-time statement about one exact remote-base revision:
+any later base commit requires the automated checkpoint to answer again.
 
 **Further scoped on 2026-08-01 by #258:** the “spec repo is the work source”
 rule applies to recurring, declaratively deployed campaigns. It was itself a

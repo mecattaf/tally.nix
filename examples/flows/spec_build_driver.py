@@ -5,11 +5,10 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import glob
 import hashlib
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
@@ -164,6 +163,31 @@ def run(
     return result
 
 
+def run_bytes(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        fail(f"cannot execute {command[0]!r}: {error}")
+    if check and result.returncode != 0:
+        detail = (
+            (result.stderr or result.stdout).decode(errors="replace").strip()
+            or "no output"
+        )
+        fail(f"command {command!r} exited {result.returncode}: {detail}")
+    return result
+
+
 def git(
     checkout: Path,
     *arguments: str,
@@ -175,6 +199,12 @@ def git(
         check=check,
         input_text=input_text,
     )
+
+
+def git_bytes(
+    checkout: Path, *arguments: str, check: bool = True
+) -> subprocess.CompletedProcess[bytes]:
+    return run_bytes(["git", "-C", str(checkout), *arguments], check=check)
 
 
 def repo_config(value: Any) -> dict[str, Any]:
@@ -371,17 +401,44 @@ def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     if max_parallel > max_tasks:
         fail("maxParallel must not exceed maxTasks")
 
-    checkout = config["checkout"]
-    matches = sorted(Path(path) for path in glob.glob(str(checkout / pattern), recursive=False))
-    matches = [path for path in matches if path.is_file()]
+    checkout: Path = config["checkout"]
+    remote = config["remote"]
+    git(checkout, "fetch", "--prune", "--no-tags", remote)
+    base_ref = f"{remote}/{config['baseBranch']}"
+    base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
+    pattern_parts = PurePosixPath(pattern).parts
+    literal_prefix: list[str] = []
+    for part in pattern_parts:
+        if any(character in part for character in "*?["):
+            break
+        literal_prefix.append(part)
+    tree_arguments = ["ls-tree", "-r", "-z", "--full-tree", base_rev]
+    if literal_prefix:
+        tree_arguments.extend(["--", "/".join(literal_prefix)])
+    tree = git_bytes(checkout, *tree_arguments).stdout
+    matches: list[tuple[str, str]] = []
+    for raw_entry in tree.split(b"\0"):
+        if not raw_entry:
+            continue
+        try:
+            metadata, raw_path = raw_entry.split(b"\t", 1)
+            mode, object_type, object_id = metadata.decode("ascii").split(" ")
+            path = raw_path.decode("utf-8")
+        except (UnicodeDecodeError, ValueError):
+            fail("remote base tree contains a malformed worklist candidate")
+        path_parts = PurePosixPath(path).parts
+        if len(path_parts) != len(pattern_parts) or not all(
+            (not part.startswith(".") or candidate.startswith("."))
+            and fnmatch.fnmatchcase(part, candidate)
+            for part, candidate in zip(path_parts, pattern_parts, strict=True)
+        ):
+            continue
+        if object_type == "blob" and mode in {"100644", "100755"}:
+            matches.append((path, object_id))
     if len(matches) != 1:
         fail(f"worklist pattern {pattern!r} matched {len(matches)} regular files; expected exactly one")
-    source = matches[0].resolve()
-    try:
-        source.relative_to(checkout)
-    except ValueError:
-        fail("worklist match resolves outside the configured checkout")
-    raw = source.read_bytes()
+    source_path, source_object = matches[0]
+    raw = git_bytes(checkout, "cat-file", "blob", source_object).stdout
     try:
         document = json.loads(raw)
     except json.JSONDecodeError as error:
@@ -411,8 +468,9 @@ def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
         "schemaVersion": 1,
         "repository": repository,
         "source": {
-            "path": str(source.relative_to(checkout)),
+            "path": source_path,
             "sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+            "revision": base_rev,
         },
         "tasks": tasks,
     }
@@ -1090,17 +1148,24 @@ def pull_request_marker(campaign: str, issue_number: str, task_id: str) -> str:
 
 
 def checkpoint_ref(
-    campaign: str, issue_number: str, task_id: str, source_sha256: str
+    campaign: str,
+    issue_number: str,
+    task_id: str,
+    source_sha256: str,
+    base_rev: str,
 ) -> str:
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_sha256):
         fail("worklist source digest is not a lowercase SHA-256 identity")
     digest = source_sha256.removeprefix("sha256:")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", base_rev):
+        fail("checkpoint base revision must be a full Git object ID")
     readable = re.sub(r"[^a-z0-9]+", "-", campaign.casefold()).strip("-")
     readable = (readable or "campaign")[:24].rstrip("-") or "campaign"
     campaign_identity = hashlib.sha256(campaign.encode()).hexdigest()[:12]
     return (
         "refs/tags/tally/spec-build/v1/"
-        f"{readable}-{campaign_identity}-issue-{issue_number}/{task_id}-{digest}"
+        f"{readable}-{campaign_identity}-issue-{issue_number}/"
+        f"{task_id}-{digest}/{base_rev}"
     )
 
 
@@ -1121,9 +1186,11 @@ def remote_ref_oid(checkout: Path, remote: str, reference: str) -> str | None:
 
 def merged_github_tasks(
     repository: str,
+    config: dict[str, Any],
     campaign: str,
     issue_number: str,
     base_branch: str,
+    base_rev: str | None,
     tasks: list[dict[str, Any]],
 ) -> tuple[list[dict[str, str]], list[str]]:
     fields = "url,body,baseRefName,headRefName,mergeCommit"
@@ -1197,6 +1264,17 @@ def merged_github_tasks(
         oid = commit.get("oid") if isinstance(commit, dict) else None
         if not isinstance(oid, str) or not GIT_OID.fullmatch(oid):
             problems.append("has no valid merge commit")
+        elif base_rev is not None and git(
+            config["checkout"],
+            "merge-base",
+            "--is-ancestor",
+            oid,
+            base_rev,
+            check=False,
+        ).returncode:
+            problems.append(
+                f"has merge commit {oid} outside witnessed base {base_rev}"
+            )
         if problems:
             return None, f"ignored {url} for task {task_id!r}: {'; '.join(problems)}"
         return {
@@ -1299,14 +1377,19 @@ def merged_local_tasks(
     config: dict[str, Any],
     campaign: str,
     issue_number: str,
+    base_rev: str | None,
     tasks: list[dict[str, Any]],
 ) -> list[dict[str, str]]:
     checkout: Path = config["checkout"]
     remote = config["remote"]
-    base_branch = config["baseBranch"]
-    git(checkout, "fetch", "--prune", remote)
-    base_ref = f"{remote}/{base_branch}"
-    base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
+    git(checkout, "fetch", "--prune", "--no-tags", remote)
+    if base_rev is None:
+        base_rev = git(
+            checkout,
+            "rev-parse",
+            "--verify",
+            f"{remote}/{config['baseBranch']}^{{commit}}",
+        ).stdout.strip()
     facts: list[dict[str, str]] = []
     for task in tasks:
         if task["kind"] != "implementation":
@@ -1322,7 +1405,7 @@ def merged_local_tasks(
             {
                 "taskId": task["id"],
                 "pullRequest": f"local://{repository}/{branch}",
-                "mergeCommit": base_rev,
+                "mergeCommit": head,
             }
         )
     return facts
@@ -1334,7 +1417,7 @@ def completed_checkpoint_tasks(
     issue_number: str,
     tasks: list[dict[str, Any]],
     source: dict[str, str],
-    merged_ids: set[str],
+    merged: list[dict[str, str]],
 ) -> list[dict[str, str]]:
     checkpoints = [task for task in tasks if task["kind"] == "checkpoint"]
     if not checkpoints:
@@ -1342,15 +1425,16 @@ def completed_checkpoint_tasks(
     checkout: Path = config["checkout"]
     remote = config["remote"]
     git(checkout, "fetch", "--prune", "--no-tags", remote)
-    base_ref = f"{remote}/{config['baseBranch']}"
-    base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
+    base_rev = required_string(source.get("revision"), "worklist source revision")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", base_rev):
+        fail("worklist source revision must be a full Git object ID")
     facts: list[dict[str, str]] = []
-    completed_ids = set(merged_ids)
+    completed_revisions = {fact["taskId"]: fact["mergeCommit"] for fact in merged}
     for task in checkpoints:
-        if not all(dependency in completed_ids for dependency in task["dependencies"]):
+        if not all(dependency in completed_revisions for dependency in task["dependencies"]):
             continue
         reference = checkpoint_ref(
-            campaign, issue_number, task["id"], source["sha256"]
+            campaign, issue_number, task["id"], source["sha256"], base_rev
         )
         target = remote_ref_oid(checkout, remote, reference)
         if target is None:
@@ -1359,10 +1443,24 @@ def completed_checkpoint_tasks(
         fetched = git(checkout, "rev-parse", "--verify", "FETCH_HEAD^{commit}").stdout.strip()
         if fetched != target or git(checkout, "cat-file", "-t", target).stdout.strip() != "commit":
             fail(f"checkpoint ref {reference!r} must point directly to a commit")
-        if git(checkout, "merge-base", "--is-ancestor", target, base_rev, check=False).returncode:
-            continue
+        if target != base_rev:
+            fail(f"checkpoint ref {reference!r} does not point to its named base revision")
+        for dependency in task["dependencies"]:
+            dependency_revision = completed_revisions[dependency]
+            if git(
+                checkout,
+                "merge-base",
+                "--is-ancestor",
+                dependency_revision,
+                target,
+                check=False,
+            ).returncode:
+                fail(
+                    f"checkpoint ref {reference!r} does not contain dependency "
+                    f"{dependency!r} revision {dependency_revision}"
+                )
         facts.append({"taskId": task["id"], "ref": reference, "revision": target})
-        completed_ids.add(task["id"])
+        completed_revisions[task["id"]] = target
     return facts
 
 
@@ -1504,12 +1602,21 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         repository = worklist["repository"]
         config = repo_config(data.get("repositoryConfig"))
         max_parallel = data["maxParallel"]
+    base_rev = (
+        None
+        if forge_native
+        else required_string(
+            worklist["source"].get("revision"), "worklist source revision"
+        )
+    )
     if config["forge"] == "github":
         merged, warnings = merged_github_tasks(
             repository,
+            config,
             campaign,
             issue["number"],
             config["baseBranch"],
+            base_rev,
             worklist["tasks"],
         )
     else:
@@ -1518,6 +1625,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             config,
             campaign,
             issue["number"],
+            base_rev,
             worklist["tasks"],
         )
         warnings = []
@@ -1527,7 +1635,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         issue["number"],
         worklist["tasks"],
         worklist["source"],
-        {fact["taskId"] for fact in merged},
+        merged,
     )
     merged_ids = {fact["taskId"] for fact in merged}
     completed_ids = {fact["taskId"] for fact in merged + checkpoints}
@@ -3337,7 +3445,7 @@ def github_checkpoint_progress_comment(
     marker = (
         "<!-- tally:spec-build:v1 "
         f"campaign={campaign} issue={issue['number']} checkpoint={task_id} "
-        f"source={source_sha256} passed -->"
+        f"source={source_sha256} revision={revision} passed -->"
     )
     comments = run(
         [
@@ -3404,9 +3512,12 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     argv(task.get("argv"), "checkpoint task.argv")
     positive_integer(task.get("runtimeMaxSec"), "checkpoint task.runtimeMaxSec")
     string_list(task.get("dependencies"), "checkpoint task.dependencies")
-    source = object_exact(data.get("source"), {"path", "sha256"}, "source")
+    source = object_exact(data.get("source"), {"path", "sha256", "revision"}, "source")
     required_string(source.get("path"), "source.path")
     source_sha256 = required_string(source.get("sha256"), "source.sha256")
+    source_revision = required_string(source.get("revision"), "source.revision")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", source_revision):
+        fail("source.revision must be a full Git object ID")
     workspace = object_exact(
         data.get("workspace"),
         {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
@@ -3438,16 +3549,35 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
         "--verify",
         f"{remote}/{config['baseBranch']}^{{commit}}",
     ).stdout.strip()
-    if current_base != base_rev:
-        fail("remote base moved after the checkpoint command was witnessed")
-    reference = checkpoint_ref(campaign, issue["number"], task_id, source_sha256)
+    if git(
+        checkout,
+        "merge-base",
+        "--is-ancestor",
+        source_revision,
+        base_rev,
+        check=False,
+    ).returncode:
+        fail("prepared checkpoint base does not descend from the witnessed worklist revision")
+    if git(
+        checkout,
+        "merge-base",
+        "--is-ancestor",
+        base_rev,
+        current_base,
+        check=False,
+    ).returncode:
+        fail("remote base diverged after the checkpoint command was witnessed")
+    reference = checkpoint_ref(
+        campaign, issue["number"], task_id, source_sha256, base_rev
+    )
     existing = remote_ref_oid(worktree, remote, reference)
-    if existing != base_rev:
-        push_arguments = ["push"]
-        if existing is not None:
-            push_arguments.append(f"--force-with-lease={reference}:{existing}")
-        push_arguments.extend([remote, f"{base_rev}:{reference}"])
-        git(worktree, *push_arguments)
+    if existing is not None and existing != base_rev:
+        fail(f"immutable checkpoint ref {reference!r} already points to another object")
+    if existing is None:
+        pushed = git(worktree, "push", remote, f"{base_rev}:{reference}", check=False)
+        if pushed.returncode and remote_ref_oid(worktree, remote, reference) != base_rev:
+            detail = pushed.stderr.strip() or pushed.stdout.strip() or "no output"
+            fail(f"cannot create immutable checkpoint ref {reference!r}: {detail}")
     if remote_ref_oid(worktree, remote, reference) != base_rev:
         fail("checkpoint completion ref did not expose the witnessed base revision")
     if config["forge"] == "github":

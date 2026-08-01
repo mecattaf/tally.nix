@@ -3535,6 +3535,9 @@
                 printf '%s\n' source > "$TMPDIR/spec/rename-source"
                 git -C "$TMPDIR/spec" add --all
                 git -C "$TMPDIR/spec" commit --quiet -m "fixture: frozen spec"
+                git init --bare --quiet --initial-branch=main "$TMPDIR/spec-source-remote.git"
+                git -C "$TMPDIR/spec" remote add origin "$TMPDIR/spec-source-remote.git"
+                git -C "$TMPDIR/spec" push --quiet --set-upstream origin main
                 jq -n --arg checkout "$TMPDIR/spec" '{
                   repository: "acme/spec",
                   repositoryConfig: {
@@ -3555,6 +3558,7 @@
                   .repository == "acme/spec" and
                   .source.path == "specs/001-toy/tasks.json" and
                   (.source.sha256 | test("^sha256:[0-9a-f]{64}$")) and
+                  (.source.revision | test("^[0-9a-f]{40,64}$")) and
                   [.tasks[].id] == ["task-1", "phase-one-checkpoint", "task-2", "task-3", "task-4", "task-5", "task-6"] and
                   all(.tasks[] | select(.kind == "implementation");
                     (.goal | length) > 0 and
@@ -3576,9 +3580,20 @@
                 ' worklist.json >/dev/null
 
                 worklistPath="$TMPDIR/spec/specs/001-toy/tasks.json"
+                publish_worklist_change() {
+                  git -C "$TMPDIR/spec" add "$worklistPath"
+                  git -C "$TMPDIR/spec" commit --quiet -m "$1"
+                  git -C "$TMPDIR/spec" push --quiet origin main
+                }
+                restore_worklist() {
+                  cp ${./test/fixtures/spec-build/repo/specs/001-toy/tasks.json} \
+                    "$worklistPath"
+                  publish_worklist_change "$1"
+                }
                 jq 'del(.tasks[0].kind)' "$worklistPath" \
                   > "$TMPDIR/missing-task-kind.json"
                 mv "$TMPDIR/missing-task-kind.json" "$worklistPath"
+                publish_worklist_change "fixture: remove task kind"
                 if ${specBuildDriver}/bin/spec-build-driver worklist \
                   > /dev/null 2> "$TMPDIR/missing-task-kind.err"; then
                   echo "worklist implementation without a kind unexpectedly passed" >&2
@@ -3586,12 +3601,12 @@
                 fi
                 grep -F 'tasks[0].kind must equal implementation or checkpoint' \
                   "$TMPDIR/missing-task-kind.err" >/dev/null
-                cp ${./test/fixtures/spec-build/repo/specs/001-toy/tasks.json} \
-                  "$worklistPath"
+                restore_worklist "fixture: restore task kind"
 
                 jq '.tasks[1].goal = "checkpoints do not implement"' "$worklistPath" \
                   > "$TMPDIR/checkpoint-with-agent-field.json"
                 mv "$TMPDIR/checkpoint-with-agent-field.json" "$worklistPath"
+                publish_worklist_change "fixture: add invalid checkpoint field"
                 if ${specBuildDriver}/bin/spec-build-driver worklist \
                   > /dev/null 2> "$TMPDIR/checkpoint-with-agent-field.err"; then
                   echo "checkpoint with an implementation field unexpectedly passed" >&2
@@ -3599,8 +3614,20 @@
                 fi
                 grep -F 'tasks[1] has unknown fields: goal' \
                   "$TMPDIR/checkpoint-with-agent-field.err" >/dev/null
-                cp ${./test/fixtures/spec-build/repo/specs/001-toy/tasks.json} \
-                  "$worklistPath"
+                restore_worklist "fixture: restore checkpoint shape"
+
+                jq 'del(.tasks[0].conflictDomains)' "$worklistPath" \
+                  > "$TMPDIR/missing-conflict-domains.json"
+                mv "$TMPDIR/missing-conflict-domains.json" "$worklistPath"
+                publish_worklist_change "fixture: remove conflict domains"
+                if ${specBuildDriver}/bin/spec-build-driver worklist \
+                  > /dev/null 2> "$TMPDIR/missing-conflict-domains.err"; then
+                  echo "parallel worklist without conflictDomains unexpectedly passed" >&2
+                  exit 1
+                fi
+                grep -F 'tasks[0].conflictDomains must be a non-empty array' \
+                  "$TMPDIR/missing-conflict-domains.err"
+                restore_worklist "fixture: restore conflict domains"
 
                 base_rev="$(git -C "$TMPDIR/spec" rev-parse HEAD)"
                 write_constraint_brief() {
@@ -3739,7 +3766,7 @@
                 git -C "$TMPDIR/spec" add build/LATE.SQLite
                 git -C "$TMPDIR/spec" commit --quiet -m "fixture: mutate head after constraint"
                 git init --bare --quiet --initial-branch=main "$TMPDIR/publication-remote.git"
-                git -C "$TMPDIR/spec" remote add origin "$TMPDIR/publication-remote.git"
+                git -C "$TMPDIR/spec" remote set-url origin "$TMPDIR/publication-remote.git"
                 git -C "$TMPDIR/spec" push --quiet origin \
                   "$base_rev:refs/heads/main"
                 jq -n \
@@ -3812,20 +3839,6 @@
                 test "$(git -C "$TMPDIR/spec" ls-remote origin \
                   refs/heads/tally/fixture-issue-7/task-1 | cut -f1)" = \
                   "$witnessed_head"
-
-                jq 'del(.tasks[0].conflictDomains)' "$worklistPath" \
-                  > "$TMPDIR/missing-conflict-domains.json"
-                mv "$TMPDIR/missing-conflict-domains.json" "$worklistPath"
-                export TALLY_BRIEF="$TMPDIR/worklist-brief.json"
-                if ${specBuildDriver}/bin/spec-build-driver worklist \
-                  > /dev/null 2> "$TMPDIR/missing-conflict-domains.err"; then
-                  echo "parallel worklist without conflictDomains unexpectedly passed" >&2
-                  exit 1
-                fi
-                grep -F 'tasks[0].conflictDomains must be a non-empty array' \
-                  "$TMPDIR/missing-conflict-domains.err"
-                cp ${./test/fixtures/spec-build/repo/specs/001-toy/tasks.json} \
-                  "$worklistPath"
 
                 default_event='{"kind":"gh","source":"search","repo":"acme/spec","number":6,"htmlUrl":"https://github.com/acme/spec/issues/6","itemType":"issue","nodeId":"I-campaign-6","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-6","commentId":"comment-6","triggerTimestamp":"2026-07-31T08:59:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["campaign"],"assignees":[],"triggeringComment":{"id":"comment-6","author":"operator","body":"@tally build"}}}'
                 mkdir -p "$TMPDIR/data"
@@ -3983,6 +3996,19 @@
               }
               ''
                 ${pkgs.python3}/bin/python3 ${./test/spec_build_conflict_domains_test.py}
+                touch "$out"
+              '';
+          spec-build-checkpoint-receipts =
+            pkgs.runCommand "tally-spec-build-checkpoint-receipts"
+              {
+                nativeBuildInputs = [
+                  pkgs.git
+                  pkgs.python3
+                ];
+                SPEC_BUILD_DRIVER = ./examples/flows/spec_build_driver.py;
+              }
+              ''
+                ${pkgs.python3}/bin/python3 ${./test/spec_build_checkpoint_receipts_test.py}
                 touch "$out"
               '';
           flow-dialect-reject-nonliteral-meta = flowNonliteralFailure;
