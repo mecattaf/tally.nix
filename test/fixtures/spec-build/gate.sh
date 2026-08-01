@@ -3,18 +3,15 @@ set -eu
 
 control=$1
 gate=$2
-task=${CAMPAIGN_TASK_ID:-preflight}
+task=${CAMPAIGN_TASK_ID:?CAMPAIGN_TASK_ID is required}
 
-if [ "$task" = preflight ] && [ "$gate" = first ] && [ ! -e "$control/preflight-failed-once" ]; then
-  : >"$control/preflight-failed-once"
-  printf '%s\n' 'fixture preflight gate fails once before any agent dispatch' >&2
+if [ "$task" = task-1 ] && [ "$gate" = first ] && [ ! -e "$control/post-change-failed-once" ]; then
+  : >"$control/post-change-failed-once"
+  printf '%s\n' 'fixture post-change gate fails once before publish' >&2
   exit 1
 fi
 
 case "$task" in
-  preflight)
-    test ! -e build/one.txt
-    ;;
   task-1)
     test "$(cat build/one.txt)" = one
     ;;

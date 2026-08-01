@@ -56,11 +56,15 @@ services.tally = {
     gates = [
       {
         id = "tests";
+        preflightArgv = [ "nix" "develop" "--command" "cargo" "--version" ];
         argv = [ "nix" "develop" "--command" "cargo" "test" "--workspace" ];
+        runtimeMaxSec = 900;
       }
       {
         id = "format";
+        preflightArgv = [ "nix" "develop" "--command" "cargo" "fmt" "--version" ];
         argv = [ "nix" "develop" "--command" "cargo" "fmt" "--all" "--check" ];
+        runtimeMaxSec = 900;
       }
     ];
 
@@ -118,14 +122,32 @@ $ tally adapter smoke codex
 That command is the activation check introduced by issue #233; campaign
 rendering does not depend on its implementation.
 
-An accepted campaign then performs its own gate preflight. After the worklist
-has been schema-validated and witnessed, tally prepares task 1 from the fetched
-remote base and runs every configured gate there, in declaration order, as
-`preflight-gate-<id>`. Each node executes the exact direct argv on the campaign
-host and records ordinary `exit:0` evidence. A red preflight stops evaluation
-before the implementation adapter is admitted, so its capture and witnessed
-node are the failure receipt rather than an agent cycle spent discovering the
-same broken gate.
+An accepted campaign then performs its own gate preflight. Every gate declares
+two direct argvs deliberately:
+
+- `preflightArgv` is a base-safe activation probe. It must succeed before the
+  first agent dispatch and should exercise the actual compiler, linker, daemon,
+  or other estate dependency that can make the later gate unusable. A version
+  check alone is insufficient when the gate needs more of the toolchain.
+- `argv` is the post-change merge criterion. It may require files that do not
+  exist in the frozen spec-only base and therefore is not required to be green
+  before an agent has built them.
+
+After the worklist has been schema-validated and witnessed, tally prepares task
+1 from the fetched remote base and runs every `preflightArgv` there, in
+declaration order, as `preflight-gate-<id>`. The declared argv is passed through
+without rewriting. Preflight and post-change invocations use the same worktree
+contract, the same `runtimeMaxSec`, and `CAMPAIGN_TASK_ID`; during preflight that
+variable is the first witnessed task ID. If the real merge criterion is itself
+base-safe, repeat it as `preflightArgv` explicitly rather than relying on an
+implicit fallback.
+
+Each preflight records ordinary `exit:0` evidence. A red or timed-out preflight
+stops evaluation before the implementation adapter is admitted, so its capture
+and witnessed node are the failure receipt rather than an agent cycle spent
+discovering the same broken host. Gate IDs must be unique; declarative Nix
+configuration rejects duplicates, and direct `tally flow run` arguments are
+validated before the worklist node is admitted.
 
 ## The per-task brief contract
 
@@ -188,14 +210,16 @@ For every witnessed task, `spec-build` executes this chain serially:
 
 ```text
 validate worklist -> fetch current remote main -> prepare task 1 worktree
-  -> preflight configured gates on that base -> agent -> configured gates
+  -> run configured gate preflights on that base -> agent -> configured gates
   -> push branch -> open/reuse PR -> merge -> fetch current main for next task
 ```
 
 The preflight runs once per campaign flow run. It uses task 1's still-unmodified
 worktree, so the checkout and execution host are the same ones the first agent
-and post-change gates will use. Replays reuse passing preflight witnesses and do
-not silently rerun or skip a recorded red result.
+and post-change gates will use. The argv differs only where the operator has
+explicitly separated a base-safe `preflightArgv` from the post-change `argv`;
+environment, workspace, host, and deadline do not drift. Replays reuse passing
+preflight witnesses and do not silently rerun or skip a recorded red result.
 
 The agent must leave a clean worktree with at least one commit descended from
 the prepared base. Publication refuses dirty, empty, or non-descendant work.

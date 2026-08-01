@@ -1803,6 +1803,19 @@ let
           example = "tests";
           description = "Stable gate identifier used in the witnessed node key.";
         };
+        preflightArgv = mkOption {
+          type = types.listOf types.str;
+          example = [
+            "sh"
+            "-euc"
+            "command -v go >/dev/null; command -v gcc >/dev/null; go env CGO_ENABLED >/dev/null"
+          ];
+          description = ''
+            Base-safe direct argv executed before the first agent dispatch.
+            Declare the actual host and toolchain probe; do not make the
+            post-change merge criterion pretend that unbuilt output exists.
+          '';
+        };
         argv = mkOption {
           type = types.listOf types.str;
           example = [
@@ -1812,6 +1825,12 @@ let
           ];
           description = "Direct argv executed in each task worktree after the agent exits successfully.";
         };
+        runtimeMaxSec = mkOption {
+          type = types.ints.positive;
+          default = 900;
+          example = 300;
+          description = "Process deadline shared by the base preflight and each post-change gate invocation.";
+        };
         _tallyAssertions = internalAssertionsOption;
       };
 
@@ -1819,6 +1838,14 @@ let
         {
           assertion = validComponent config.id;
           message = "tally campaign gate ${name} id ${config.id} is not a safe node-key component";
+        }
+        {
+          assertion = config.preflightArgv != [ ] && builtins.head config.preflightArgv != "";
+          message = "tally campaign gate ${name} preflightArgv must start with a non-empty executable";
+        }
+        {
+          assertion = lib.all (argument: !(lib.hasInfix "\u0000" argument)) config.preflightArgv;
+          message = "tally campaign gate ${name} preflightArgv must not contain NUL bytes";
         }
         {
           assertion = config.argv != [ ] && builtins.head config.argv != "";
@@ -1902,6 +1929,11 @@ let
           example = [
             {
               id = "tests";
+              preflightArgv = [
+                "sh"
+                "-euc"
+                "command -v go >/dev/null; command -v gcc >/dev/null; go env CGO_ENABLED >/dev/null"
+              ];
               argv = [
                 "go"
                 "test"
@@ -1910,9 +1942,10 @@ let
             }
           ];
           description = ''
-            Ordered direct-argv gates preflight once on the fetched base before
-            the first agent dispatch, then run for every task; the first red
-            gate stops the campaign.
+            Ordered gates with an explicit base-safe preflight argv and a
+            post-change merge-criterion argv. Both run with the same task
+            environment and deadline; the first red invocation stops the
+            campaign.
           '';
         };
         agent = mkOption {
@@ -2366,6 +2399,11 @@ let
           gates = [
             {
               id = "tests";
+              preflightArgv = [
+                "sh"
+                "-euc"
+                "command -v go >/dev/null; command -v gcc >/dev/null; go env CGO_ENABLED >/dev/null"
+              ];
               argv = [
                 "go"
                 "test"
@@ -2756,7 +2794,12 @@ let
   );
 
   renderCampaignGates = map (gate: {
-    inherit (gate) id argv;
+    inherit (gate)
+      id
+      preflightArgv
+      argv
+      runtimeMaxSec
+      ;
   });
 
   campaignMaxNodes =

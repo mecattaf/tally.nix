@@ -8,9 +8,11 @@ authorized.
 
 ### Added
 
-- Added accept-time campaign gate preflights: every declared gate's exact argv
-  now executes once on the fetched base checkout before the first agent
-  dispatch, with a witnessed `preflight-gate-<id>` receipt on failure.
+- Added accept-time campaign gate preflights: every gate now declares a
+  base-safe `preflightArgv` separately from its post-change `argv`. The exact
+  probe executes once on the fetched base, with the same task environment and a
+  bounded deadline, before the first agent dispatch; a witnessed
+  `preflight-gate-<id>` records failure or timeout.
 - Added flow-node `approvalPolicy` and `sandboxPolicy` fields plus campaign
   `agentApprovalPolicy`/`agentSandboxPolicy` options. Spec-build implementation
   agents now default to Codex's writable `workspace-write` + `on-request`

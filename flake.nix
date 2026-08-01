@@ -1160,6 +1160,7 @@
                   gates = [
                     {
                       id = "content";
+                      preflightArgv = [ "/bin/true" ];
                       argv = [
                         "/bin/sh"
                         "-eu"
@@ -1169,6 +1170,11 @@
                     }
                     {
                       id = "clean";
+                      preflightArgv = [
+                        "git"
+                        "diff"
+                        "--exit-code"
+                      ];
                       argv = [
                         "git"
                         "diff"
@@ -1191,6 +1197,7 @@
                   gates = [
                     {
                       id = "content";
+                      preflightArgv = [ "/bin/true" ];
                       argv = [ "/bin/true" ];
                     }
                   ];
@@ -1671,6 +1678,7 @@
                   gates = [
                     {
                       id = "tests";
+                      preflightArgv = [ "true" ];
                       argv = [ "true" ];
                     }
                   ];
@@ -3312,6 +3320,9 @@
                   (.flows.fixture.script | endswith("spec-build.js")) and
                   $fixtureArgs.agent.approvalPolicy == null and
                   $fixtureArgs.agent.sandboxPolicy == null and
+                  $fixtureArgs.gates[0].preflightArgv == ["/bin/true"] and
+                  $fixtureArgs.gates[0].runtimeMaxSec == 900 and
+                  $fixtureArgs.gates[1].preflightArgv == ["git", "diff", "--exit-code"] and
                   $defaultedArgs.agent.adapter == "codex" and
                   $defaultedArgs.agent.approvalPolicy == "on-request" and
                   $defaultedArgs.agent.sandboxPolicy == "workspace-write" and

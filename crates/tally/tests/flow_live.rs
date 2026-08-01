@@ -57,6 +57,7 @@ const REORDERED_RUN: &str = "00000000-0000-4000-8000-000000000514";
 const CATALOG_PIN_RUN: &str = "00000000-0000-4000-8000-000000000515";
 const REGEX_RESULT_RUN: &str = "00000000-0000-4000-8000-000000000516";
 const SPEC_BUILD_RUN: &str = "00000000-0000-4000-8000-000000000517";
+const SPEC_BUILD_DUPLICATE_GATE_RUN: &str = "00000000-0000-4000-8000-000000000518";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -2297,6 +2298,19 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             let client = rpc(&daemon_paths.socket).await;
             let script = repository_fixture("examples/flows/spec-build.js");
             let gate = repository_fixture("test/fixtures/spec-build/gate.sh");
+            let preflight = repository_fixture("test/fixtures/spec-build/preflight.sh");
+            let first_preflight_argv = vec![
+                "/bin/sh".to_owned(),
+                preflight.display().to_string(),
+                control.display().to_string(),
+                "first".to_owned(),
+            ];
+            let second_preflight_argv = vec![
+                "/bin/sh".to_owned(),
+                preflight.display().to_string(),
+                control.display().to_string(),
+                "second".to_owned(),
+            ];
             let first_gate_argv = vec![
                 "/bin/sh".to_owned(),
                 gate.display().to_string(),
@@ -2341,15 +2355,57 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 "gates": [
                     {
                         "id": "fixture-first",
-                        "argv": first_gate_argv.clone()
+                        "preflightArgv": first_preflight_argv.clone(),
+                        "argv": first_gate_argv.clone(),
+                        "runtimeMaxSec": 1
                     },
                     {
                         "id": "fixture-second",
-                        "argv": second_gate_argv.clone()
+                        "preflightArgv": second_preflight_argv.clone(),
+                        "argv": second_gate_argv.clone(),
+                        "runtimeMaxSec": 1
                     }
                 ]
-            })
-            .to_string();
+            });
+
+            let mut duplicate_arguments = arguments.clone();
+            duplicate_arguments["gates"][1]["id"] = json!("fixture-first");
+            let duplicate = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_DUPLICATE_GATE_RUN,
+                &duplicate_arguments.to_string(),
+                20,
+            )
+            .spawn()
+            .unwrap();
+            let duplicate = runner_output(duplicate).await;
+            assert_eq!(
+                duplicate.status.code(),
+                Some(1),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&duplicate.stdout),
+                String::from_utf8_lossy(&duplicate.stderr)
+            );
+            let duplicate_failure = flow_failure(&duplicate);
+            assert_eq!(
+                duplicate_failure["error"]["name"],
+                "SpecBuildConfigurationError"
+            );
+            assert_eq!(duplicate_failure["error"]["code"], "duplicate-gate-id");
+            assert!(duplicate_failure["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("campaign gate id fixture-first is duplicated"));
+            assert!(
+                flow_items(&client, SPEC_BUILD_DUPLICATE_GATE_RUN)
+                    .await
+                    .is_empty(),
+                "duplicate gate ids must be rejected before the worklist node is admitted"
+            );
+
+            let arguments = arguments.to_string();
 
             let first = runner(
                 &config_path,
@@ -2385,12 +2441,17 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                     )
                     .await
                     .unwrap();
-                if terminal["verdict"] == "failed" {
-                    assert!(
-                        failed_preflight.is_none(),
-                        "only the preflight gate may fail"
-                    );
+                let projected = client
+                    .call("query.job", Some(json!({"id": item["anchor"]})))
+                    .await
+                    .unwrap();
+                if projected["job"]["orchestration"]["nodeLabel"]
+                    == "preflight-gate-fixture-first"
+                {
+                    assert_ne!(terminal["verdict"], "pass");
                     failed_preflight = terminal["task_uuid"].as_str().map(str::to_owned);
+                } else {
+                    assert_eq!(terminal["verdict"], "pass");
                 }
             }
             let failed_preflight = failed_preflight.expect("the preflight gate did not fail");
@@ -2400,17 +2461,20 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 .unwrap();
             assert_eq!(
                 projected_preflight["job"]["argv"],
-                json!(first_gate_argv),
-                "preflight must execute the declared gate argv without rewriting it"
+                json!(first_preflight_argv),
+                "preflight must execute the declared base-safe argv without rewriting it"
             );
             assert_eq!(
                 projected_preflight["job"]["orchestration"]["nodeLabel"],
                 "preflight-gate-fixture-first"
             );
-            assert!(capture(&daemon_paths, &failed_preflight)
-                .contains("fixture preflight gate fails once before any agent dispatch"));
+            assert_eq!(projected_preflight["job"]["runtimeMaxSec"], 1);
+            assert!(capture(&daemon_paths, &failed_preflight).contains(
+                "fixture preflight exceeds its bounded deadline before any agent dispatch"
+            ));
             assert!(!control.join("agent-order.log").exists());
             assert!(!control.join("policy-order.log").exists());
+            assert!(!control.join("preflight-order.log").exists());
             assert!(!control.join("gate-order.log").exists());
             assert_eq!(
                 fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
@@ -2438,6 +2502,98 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             .unwrap();
             assert_eq!(retried["verdict"], "pass");
 
+            let post_change_failure = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN,
+                &arguments,
+                20,
+            )
+            .spawn()
+            .unwrap();
+            let post_change_failure = runner_output(post_change_failure).await;
+            assert_eq!(post_change_failure.status.code(), Some(1));
+            assert_eq!(
+                flow_failure(&post_change_failure)["error"]["code"],
+                "terminal-failure"
+            );
+            let submitted = runner_events(&post_change_failure, "node-submitted");
+            assert_eq!(submitted.len(), 6);
+            assert!(submitted[..3]
+                .iter()
+                .all(|event| event["disposition"] == "reused"));
+            assert!(submitted[3..]
+                .iter()
+                .all(|event| event["disposition"] == "created"));
+
+            let post_change_items = wait_for_flow_items(&client, SPEC_BUILD_RUN, 6).await;
+            let mut failed_gate = None;
+            for item in &post_change_items {
+                let terminal = client
+                    .call(
+                        "queue.await_job",
+                        Some(json!({"task_uuid": item["anchor"]})),
+                    )
+                    .await
+                    .unwrap();
+                if terminal["verdict"] == "failed" {
+                    assert!(failed_gate.is_none(), "only the post-change gate may fail");
+                    failed_gate = terminal["task_uuid"].as_str().map(str::to_owned);
+                }
+            }
+            let failed_gate = failed_gate.expect("the first post-change gate did not fail");
+            let projected_gate = client
+                .call("query.job", Some(json!({"id": failed_gate.clone()})))
+                .await
+                .unwrap();
+            assert_eq!(projected_gate["job"]["argv"], json!(first_gate_argv));
+            assert_eq!(
+                projected_gate["job"]["orchestration"]["nodeLabel"],
+                "gate-task-1-fixture-first"
+            );
+            assert_eq!(projected_gate["job"]["runtimeMaxSec"], 1);
+            assert!(capture(&daemon_paths, &failed_gate)
+                .contains("fixture post-change gate fails once before publish"));
+            assert_eq!(
+                fs::read_to_string(control.join("agent-order.log")).unwrap(),
+                "task-1\n"
+            );
+            assert_eq!(
+                fs::read_to_string(control.join("policy-order.log")).unwrap(),
+                "task-1:on-request:workspace-write\n"
+            );
+            assert_eq!(
+                fs::read_to_string(control.join("preflight-order.log")).unwrap(),
+                "preflight:task-1:first\npreflight:task-1:second\n"
+            );
+            assert!(!control.join("gate-order.log").exists());
+            assert_eq!(
+                fixture_git(&checkout, &["rev-list", "--count", "origin/main"]),
+                "1",
+                "a red post-change gate must stop before publish, merge, and task-2 prep"
+            );
+
+            let retry = client
+                .call(
+                    "queue.retry",
+                    Some(json!({"task_uuid": failed_gate.clone()})),
+                )
+                .await
+                .unwrap();
+            assert_eq!(retry["attempt"], 2);
+            let retried = tokio::time::timeout(
+                Duration::from_secs(20),
+                client.call(
+                    "queue.await_job",
+                    Some(json!({"task_uuid": failed_gate, "attempt": 2})),
+                ),
+            )
+            .await
+            .expect("retried post-change gate timed out")
+            .unwrap();
+            assert_eq!(retried["verdict"], "pass");
+
             let replay = runner(
                 &config_path,
                 &daemon_paths.socket,
@@ -2457,10 +2613,10 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
             );
             let submitted = runner_events(&replay, "node-submitted");
             assert_eq!(submitted.len(), 15);
-            assert!(submitted[..3]
+            assert!(submitted[..6]
                 .iter()
                 .all(|event| event["disposition"] == "reused"));
-            assert!(submitted[3..]
+            assert!(submitted[6..]
                 .iter()
                 .all(|event| event["disposition"] == "created"));
             assert_eq!(flow_items(&client, SPEC_BUILD_RUN).await.len(), 15);
@@ -2494,8 +2650,12 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                 "task-1:on-request:workspace-write\ntask-2:on-request:workspace-write\n"
             );
             assert_eq!(
+                fs::read_to_string(control.join("preflight-order.log")).unwrap(),
+                "preflight:task-1:first\npreflight:task-1:second\n"
+            );
+            assert_eq!(
                 fs::read_to_string(control.join("gate-order.log")).unwrap(),
-                "preflight:first\npreflight:second\ntask-1:first\ntask-1:second\ntask-2:first\ntask-2:second\n"
+                "task-1:first\ntask-1:second\ntask-2:first\ntask-2:second\n"
             );
 
             daemon.stop().await;
