@@ -231,7 +231,18 @@
             pkgs.python3
             pkgs.taskwarrior3
           ];
+          nativeBuildInputs = [ pkgs.makeWrapper ];
           postInstall = ''
+            mkdir -p "$out/share/tally/flows" "$out/libexec/tally"
+            cp ${./examples/flows/spec-build.js} "$out/share/tally/flows/spec-build.js"
+            ln -s ${specBuildDriver}/bin/spec-build-driver "$out/libexec/tally/spec-build-driver"
+            wrapProgram "$out/bin/tally" \
+              --prefix PATH : ${
+                pkgs.lib.makeBinPath [
+                  pkgs.gh
+                  pkgs.git
+                ]
+              }
             ln -s tally $out/bin/tallyd
           '';
           meta.mainProgram = "tally";

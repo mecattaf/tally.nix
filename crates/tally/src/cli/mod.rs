@@ -1,5 +1,6 @@
 mod adapter;
 mod args;
+mod campaign;
 mod daemon;
 mod enqueue;
 mod exit;
@@ -63,6 +64,7 @@ const DEFAULT_RPC_TIMEOUT_SEC: u64 = 60;
 const RPC_TIMEOUT_ENV: &str = "TALLY_RPC_TIMEOUT_SEC";
 use adapter::*;
 use args::*;
+use campaign::*;
 use daemon::*;
 use enqueue::*;
 use exit::*;
@@ -252,6 +254,9 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
         Some(Command::Producer { command }) => run_producer(opts.config, command),
         Some(Command::Adapter { command }) => {
             run_adapter(&socket, opts.config.as_deref(), rpc_timeout, command).await
+        }
+        Some(Command::Campaign { command }) => {
+            run_campaign(&socket, opts.config.as_deref(), rpc_timeout, command).await
         }
         Some(Command::Witness { command }) => run_witness(command),
         Some(Command::History { command }) => run_history(command),

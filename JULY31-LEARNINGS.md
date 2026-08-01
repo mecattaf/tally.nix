@@ -75,6 +75,18 @@ A red checkpoint withholds only its own completion fact, so the existing
 dependency frontier leaves its descendants unready while independent subtrees
 continue. “Phase done, awaiting operator” is explicitly not a campaign state.
 
+**Further scoped on 2026-08-01 by #258:** the “spec repo is the work source”
+rule applies to recurring, declaratively deployed campaigns. It was itself a
+weight-class error for a one-night buildout: changing an ad-hoc mention token
+required a dotfiles commit and fleet deploy, while putting its worklist in the
+product repository left orchestration history behind. For an ad-hoc campaign,
+the explicitly armed master issue is now the durable container: its managed
+manifest carries policy and DAG references, its native sub-issue bodies are the
+complete briefs, and merged PRs remain the only completion facts. Projection
+from a spec-kit-shaped JSON worklist creates and maintains that graph, including
+proof-derived checkboxes. `services.tally.campaigns` remains the recurring-work
+surface; neither doctrine is universal across both weight classes.
+
 ### Where the work graph lives, and what each agent actually reads
 
 A fair objection to "the spec repo is the work source": doesn't that force

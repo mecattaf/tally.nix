@@ -51,6 +51,10 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: AdapterCommand,
     },
+    Campaign {
+        #[command(subcommand)]
+        command: CampaignCommand,
+    },
     Witness {
         #[command(subcommand)]
         command: WitnessCommand,
@@ -83,6 +87,82 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: HistoryCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(super) enum CampaignCommand {
+    /// Register a forge-native campaign issue and admit its current reconcile pass.
+    Arm(CampaignArmArgs),
+    /// Project a worklist into one master issue and native task sub-issues.
+    Project(CampaignProjectArgs),
+    /// Reconcile changed armed issue graphs into fresh bounded flow passes.
+    Poll(CampaignPollArgs),
+    /// Print the local locator registry; campaign policy remains on the forge.
+    List(CampaignListArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CampaignArmArgs {
+    /// GitHub master issue URL containing the campaign manifest.
+    pub(super) issue: String,
+    /// Register and validate without admitting a reconcile runner.
+    #[arg(long, conflicts_with = "wait")]
+    pub(super) no_enqueue: bool,
+    /// Wait for this bounded reconcile pass to become terminal.
+    #[arg(long)]
+    pub(super) wait: bool,
+    /// Override the packaged spec-build flow (primarily for mechanism testing).
+    #[arg(long, value_name = "PATH")]
+    pub(super) flow: Option<PathBuf>,
+    /// Override the packaged policy driver (primarily for mechanism testing).
+    #[arg(long, value_name = "PATH")]
+    pub(super) driver: Option<PathBuf>,
+    /// Durable registration and worktree root; defaults beneath tally state.
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
+    /// Override the per-campaign worktree root.
+    #[arg(long, value_name = "PATH")]
+    pub(super) workspace_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CampaignProjectArgs {
+    /// JSON worklist, optionally carrying a top-level `campaign` object.
+    #[arg(value_name = "WORKLIST")]
+    pub(super) worklist: PathBuf,
+    /// Separate JSON campaign configuration when WORKLIST has none.
+    #[arg(long, value_name = "PATH")]
+    pub(super) campaign_config: Option<PathBuf>,
+    /// GitHub repository receiving the issue graph.
+    #[arg(long, value_name = "OWNER/REPO")]
+    pub(super) repo: String,
+    /// Existing master issue URL to maintain instead of creating one.
+    #[arg(long, value_name = "URL")]
+    pub(super) issue: Option<String>,
+    /// Master issue title; required only on initial creation when no campaign name exists.
+    #[arg(long)]
+    pub(super) title: Option<String>,
+    /// Label applied to the master issue (created when absent).
+    #[arg(long, default_value = "tally-campaign")]
+    pub(super) label: String,
+    /// Label applied to projected task issues (created when absent).
+    #[arg(long, default_value = "tally-campaign-task")]
+    pub(super) task_label: String,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CampaignPollArgs {
+    /// Perform one bounded registry scan.
+    #[arg(long)]
+    pub(super) once: bool,
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CampaignListArgs {
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]

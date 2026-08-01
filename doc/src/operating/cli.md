@@ -51,6 +51,7 @@ assertions.
 | `queue` | Enqueue, continue, retry, cancel, pause/resume, drain, and await. | RPC result JSON. |
 | `producer` | Preview and exercise configured GitHub producers. | Diagnostic/admission JSON. |
 | `adapter` | Execute a minimal live adapter diagnostic. | Smoke result JSON. |
+| `campaign` | Project, arm, poll, or inspect forge-native campaigns. | Projection, admission, or registry JSON. |
 | `witness` | Verify/compare chains, verify authorship, or append an advisory observation. | Text or JSON. |
 | `view` | Rebuild the derived TaskChampion view. | Rebuild report JSON. |
 | `attest` | Run a child through the advisory execution-attestation wrapper. | Child output; child's exit. |
@@ -64,6 +65,43 @@ The installed `tallyd` symlink with no arguments is equivalent to `tally daemon 
 
 Several `__...` helper commands exist for systemd units and producers. They are hidden,
 implementation-private, and not part of this CLI contract.
+
+## Forge-native campaigns
+
+Project a schema-versioned worklist into a GitHub master issue and native
+sub-issues, then register that issue as desired state:
+
+```console
+$ tally campaign project WORKLIST.json --repo OWNER/REPO
+$ tally campaign project WORKLIST.json --repo OWNER/REPO --issue ISSUE-URL
+$ tally campaign arm ISSUE-URL [--wait]
+```
+
+`project` accepts `--campaign-config PATH` when the worklist does not carry a
+top-level `campaign` object. `--title`, `--label`, and `--task-label` control
+the forge projection. On maintenance runs, omit `--title` to preserve the
+master title. Managed marker sections and projected task bodies are replaced;
+operator prose outside the master markers is preserved.
+
+`arm` accepts only canonical `https://github.com/OWNER/REPO/issues/NUMBER`
+locators. `--no-enqueue` validates and registers without admitting the initial
+pass. `--flow`, `--driver`, `--state-dir`, and `--workspace-root` are mechanism
+overrides intended primarily for verification; normal installations use the
+packaged assets and tally state directory. Re-arming increments the locator's
+retry generation even when the issue graph did not change.
+
+The Home Manager timer invokes the same bounded scan available to operators:
+
+```console
+$ tally campaign poll --once
+$ tally campaign list
+```
+
+Both accept `--state-dir`. `poll` prints observed, dispatched, and failed
+registration counts and returns nonzero when any live registration cannot be
+validated or dispatched. Closed master issues are inert. See
+[Campaigns](../flows/campaigns.md) for the manifest, task-brief, checkbox-proof,
+and host-mechanism contracts.
 
 ## Adapter smoke
 

@@ -337,6 +337,32 @@ let
         'tally-producer-*' 'tally-meter-*')
     '';
   };
+  campaignPollProgram = pkgs.writeShellApplication {
+    name = "tally-campaign-poll";
+    runtimeInputs = [
+      pkgs.gh
+      pkgs.git
+    ];
+    text = ''
+      socket="''${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required}/tally/tally.sock"
+      exec ${
+        lib.escapeShellArgs [
+          "${cfg.package}/bin/tally"
+          "--config"
+          configPath
+          "--socket"
+        ]
+      } "$socket" ${
+        lib.escapeShellArgs [
+          "campaign"
+          "poll"
+          "--once"
+          "--state-dir"
+          (toString cfg.stateDir)
+        ]
+      }
+    '';
+  };
 in
 {
   options.services.tally = common.mkOptions {
@@ -493,6 +519,32 @@ in
             ];
           };
         };
+
+        tally-campaign-poll = {
+          Unit = {
+            Description = "reconcile armed forge-native tally campaigns";
+            After = [
+              "network-online.target"
+              "tally-daemon.service"
+            ];
+            Requires = [ "tally-daemon.service" ];
+            ConditionPathExists = configPath;
+          };
+          Service = {
+            Type = "oneshot";
+            ExecStart = "${campaignPollProgram}/bin/tally-campaign-poll";
+            UMask = "0077";
+            NoNewPrivileges = true;
+            PrivateTmp = true;
+            ProtectSystem = "strict";
+            ReadWritePaths = [ (toString cfg.stateDir) ];
+            RestrictAddressFamilies = [
+              "AF_UNIX"
+              "AF_INET"
+              "AF_INET6"
+            ];
+          };
+        };
       }
       // producerUnits.services
       // meterUnits.services;
@@ -513,6 +565,16 @@ in
             OnCalendar = cfg.retention.onCalendar;
             Persistent = true;
             Unit = "tally-retention.service";
+          };
+          Install.WantedBy = [ "timers.target" ];
+        };
+        tally-campaign-poll = {
+          Unit.Description = "poll armed forge-native tally campaigns";
+          Timer = {
+            OnActiveSec = "15s";
+            OnUnitActiveSec = "60s";
+            Persistent = true;
+            Unit = "tally-campaign-poll.service";
           };
           Install.WantedBy = [ "timers.target" ];
         };

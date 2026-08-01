@@ -1,20 +1,30 @@
 # Campaigns
 
-`services.tally.campaigns` turns a frozen specification corpus into a
-forge-reconciled build campaign. The spec repository defines the work, marked
-merged pull requests and automated checkpoint refs are its durable completion
-facts, one GitHub issue admits and steers reconcile passes, and tally witnesses
-every observation and gate. A new campaign needs no new flow or producer code.
+Tally has two campaign weights:
+
+- **Ad-hoc campaigns are forge-native.** One GitHub master issue contains the
+  campaign configuration and ordered DAG. Its native sub-issues contain the
+  exact per-task briefs. `tally campaign arm ISSUE-URL` registers that durable
+  object without a Nix edit, generation build, fleet deploy, or orchestration
+  commit in the product repository.
+- **Recurring campaigns are declarative.** `services.tally.campaigns` remains
+  the right surface when the same label, mention, repository policy, and
+  worklist discovery should be estate configuration.
+
+Both modes use the same shipped, bounded, stateless `spec-build` reconciler.
+Marked merged pull requests and automated checkpoint refs are durable
+completion facts, and tally witnesses every observation and gate.
 
 Keep those roles separate:
 
-- **The spec repository is the work source.** Its versioned tasks artifact
-  contains the decomposition and each complete per-task brief.
-- **GitHub is intake, steering, state, and projection.** An exact mention on one
-  open, labeled campaign issue starts a pass. Merged implementation pull
-  requests and content-bound checkpoint tags are the completion facts read by
-  every later pass. Issue comments steer later agent attempts; receipts and
-  evidence project each reconciliation.
+- **The selected container is the work source.** A recurring campaign reads its
+  versioned tasks artifact. An ad-hoc campaign reads the manifest and native
+  sub-issue bodies from its master issue graph on every pass.
+- **GitHub is intake, steering, state, and projection.** Manual `arm` is the
+  explicit intent boundary for ad-hoc work; an exact mention is that boundary
+  for a recurring campaign. Merged implementation pull requests and
+  content-bound checkpoint tags are the completion facts read by every later
+  pass. Issue comments steer later agent attempts.
 - **tally is the workflow engine.** It validates and witnesses the worklist,
   selects the dependency-ready frontier, creates isolated worktrees, runs
   deterministic gates and checkpoint commands, and serializes re-gated merges.
@@ -23,7 +33,118 @@ The module deliberately supplies mechanism, not project policy. Repository
 owners still choose the corpus shape, gates, adapter, label, trusted actors, and
 when a corpus is frozen.
 
-## Configure one campaign
+## Arm an ad-hoc issue campaign
+
+The Home Manager module installs the generic campaign pools, packaged flow and
+driver, and `tally-campaign-poll.timer` once. The timer only scans locally armed
+issue locators; an empty registry performs no work. The GitHub CLI identity used
+by the user service must be able to read the campaign issue graph and, for a
+GitHub target repository, push, open, and merge pull requests.
+
+An operator may author the master and sub-issues directly, but projection avoids
+that hand-maintained copy. Start from one JSON worklist:
+
+```json
+{
+  "schemaVersion": 1,
+  "campaign": {
+    "name": "crm-night",
+    "repository": {
+      "checkout": "/srv/spec-repositories/crm",
+      "baseBranch": "main",
+      "remote": "origin",
+      "forge": "github"
+    },
+    "maxTasks": 32,
+    "maxParallel": 3,
+    "runtimeMaxSec": 86400,
+    "pool": "campaign",
+    "agent": {
+      "adapter": "codex",
+      "argv": [
+        "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set."
+      ],
+      "priority": "low",
+      "runtimeMaxSec": 14400,
+      "approvalPolicy": "on-request",
+      "sandboxPolicy": "workspace-write"
+    },
+    "gates": [
+      {
+        "kind": "command",
+        "id": "tests",
+        "preflightArgv": ["nix", "develop", "--command", "cargo", "--version"],
+        "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"],
+        "runtimeMaxSec": 900
+      }
+    ]
+  },
+  "tasks": [
+    {
+      "id": "customer-model",
+      "title": "Implement the customer model",
+      "body": "## Goal\n\nImplement the frozen customer contract.\n\n## Acceptance\n\n- The focused model tests pass.",
+      "dependencies": [],
+      "conflictDomains": ["src/domain/customer.rs"]
+    }
+  ]
+}
+```
+
+Project and arm it:
+
+```console
+$ tally campaign project ./crm-night.json --repo mecattaf/crm
+{"issue":"https://github.com/mecattaf/crm/issues/42",...}
+$ tally campaign arm https://github.com/mecattaf/crm/issues/42
+```
+
+`project` creates or maintains one labeled master issue, one native sub-issue
+per task, and native blocked-by relations for `dependencies`. Re-run it with
+`--issue URL` to update the same graph. It preserves prose outside tally's
+marker-delimited manifest and worklist sections. A task may supply an existing
+positive `issue` number; otherwise projection creates one. `--campaign-config`
+accepts the campaign object in a separate file.
+
+The embedded manifest owns configuration and only task references (`id`, issue
+number, dependencies, and conflict domains). The full human brief is always the
+sub-issue body. The manifest task set must exactly equal GitHub's native
+sub-issue set, task IDs form a topological order, and forge-native campaigns are
+bounded to 100 tasks by the native sub-issue API. Drift fails closed before
+admission. Directly authored sub-issues need no tally marker: their native
+parent relation plus the manifest's issue number bind each brief to its task.
+The task-body marker is projection ownership metadata added only by `project`;
+an explicit `issue` field lets `project` adopt an unmarked task issue.
+
+The master worklist is generated from those references:
+
+```markdown
+- [ ] <!-- tally:campaign-task:v1 id=customer-model --> #43 — Implement the customer model
+```
+
+Those boxes are a projection, not mutable truth. At every reconcile the driver
+recomputes them from merged pull requests carrying the campaign/task identity
+marker. Closing a task issue or manually checking a box cannot complete a task;
+the next observed graph change restores the proof-derived state. A GitHub task
+PR includes `Closes #<sub-issue>` and a successful merge flips the box and
+updates the progress comment.
+
+`arm` validates the live issue graph, local checkout, configured pools and
+adapters, agent policy names, flow fanout bound, and packaged assets together.
+It then writes only the issue locator plus local mechanism paths beneath
+`$XDG_STATE_HOME/tally/campaigns/armed/` and admits a bounded pass. Policy, DAG,
+titles, and briefs are never copied into that registry. Re-arming the same URL
+forces a fresh retry; `--no-enqueue` registers after validation without starting
+one. `--wait` returns the terminal pass verdict. `tally campaign list` inspects
+registrations, while `tally campaign poll --once` is the timer's bounded scan.
+
+Edits to the master or task issues, merge-driven issue changes, and steering
+comments advance the issue graph revision. The poller submits a fresh pass
+behind the capacity-one `campaign` mutex. A closed master stays registered but
+is inert. This is desired state on the forge plus actual state in merged PRs;
+there is no campaign-long runner state to resume.
+
+## Configure a recurring campaign
 
 Campaigns are a Home Manager surface because their GitHub producer is a managed
 user service. The configured checkout must be writable by that user, have the
@@ -159,7 +280,7 @@ path, and stable control flags. Repository maps, gate definitions, agent argv,
 store paths, and other campaign policy therefore do not inflate job queries or
 transient-unit status output. GitHub issue bodies are not campaign flow args:
 they remain in the separate `TALLY_GH_CONTEXT` file before and after this
-transport.
+transport for recurring campaigns.
 
 An implementation node defaults to `agentSandboxPolicy = "workspace-write"`
 because its contract requires a commit, paired with
@@ -483,7 +604,7 @@ frontier branches execute concurrently and do not promise the same ordinal
 interleaving. Recovery must use a fresh mention and therefore a fresh forge
 event ID.
 
-## Starting a new repository
+## Starting recurring automation
 
 The complete operational sequence is:
 
@@ -496,5 +617,8 @@ The complete operational sequence is:
 5. Run `tally adapter smoke <agent>` on the deployed host.
 6. Post the exact configured mention on the issue.
 
-That is the whole activation path: no per-repository flow script, dispatch
-wrapper, producer block, or extra serialization service.
+That is the recurring activation path: no per-repository flow script, dispatch
+wrapper, producer block, or extra serialization service. For a one-night or
+otherwise ad-hoc buildout, stop before steps 3–6: project the worklist and run
+`tally campaign arm` instead. Promoting a repeated ad-hoc campaign into this
+declarative surface is an explicit change of weight class.

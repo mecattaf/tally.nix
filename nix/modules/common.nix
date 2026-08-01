@@ -3248,23 +3248,35 @@ let
     cfg:
     let
       enabled = filterAttrs (_: campaign: campaign.enable) cfg.campaigns;
-      requiredParallelism = lib.foldl' (capacity: campaign: lib.max capacity campaign.maxParallel) 1 (
+      requiredParallelism = lib.foldl' (capacity: campaign: lib.max capacity campaign.maxParallel) 4 (
         builtins.attrValues enabled
       );
       requiredFanout = lib.foldl' (capacity: campaign: lib.max capacity (campaignMaxNodes campaign)) 64 (
         builtins.attrValues enabled
       );
-      mutexPools = lib.foldl' (
-        pools: campaign:
-        pools
-        // {
-          ${campaign.pool.name} = {
-            resource = lib.mkDefault "mutex";
-            capacity = lib.mkDefault 1;
-            predicate.co-residency = { };
-          };
-        }
-      ) { } (builtins.attrValues enabled);
+      mutexPools =
+        lib.foldl'
+          (
+            pools: campaign:
+            pools
+            // {
+              ${campaign.pool.name} = {
+                resource = lib.mkDefault "mutex";
+                capacity = lib.mkDefault 1;
+                predicate.co-residency = { };
+              };
+            }
+          )
+          {
+            # The forge-native ad-hoc lane is installed once. Arming a campaign
+            # only registers an issue locator; it never mutates Nix state.
+            campaign = {
+              resource = lib.mkDefault "mutex";
+              capacity = lib.mkDefault 1;
+              predicate.co-residency = { };
+            };
+          }
+          (builtins.attrValues enabled);
     in
     {
       enqueue.fanoutCap = lib.mkDefault requiredFanout;
@@ -3277,23 +3289,22 @@ let
           "campaign-${name}-reconcile" = mkCampaignReconcileProducer cfg name enabled.${name};
         }
       ) { } (builtins.attrNames enabled);
-      pools =
-        mutexPools
-        // optionalAttrs (enabled != { }) {
-          campaign-control = {
-            resource = lib.mkDefault "cpu-slot";
-            capacity = lib.mkDefault requiredParallelism;
-            enforce = lib.mkDefault "cooperative";
-            hardPreempt = lib.mkDefault false;
-          };
-          campaign-agent = {
-            resource = lib.mkDefault "slot";
-            capacity = lib.mkDefault requiredParallelism;
-            enforce = lib.mkDefault "cooperative";
-            hardPreempt = lib.mkDefault false;
-          };
+      pools = mutexPools // {
+        flow = flowPoolDefaults;
+        campaign-control = {
+          resource = lib.mkDefault "cpu-slot";
+          capacity = lib.mkDefault requiredParallelism;
+          enforce = lib.mkDefault "cooperative";
+          hardPreempt = lib.mkDefault false;
         };
-      adapters = optionalAttrs (enabled != { }) {
+        campaign-agent = {
+          resource = lib.mkDefault "slot";
+          capacity = lib.mkDefault requiredParallelism;
+          enforce = lib.mkDefault "cooperative";
+          hardPreempt = lib.mkDefault false;
+        };
+      };
+      adapters = {
         spec-build-driver = {
           scrape.finalMessage = {
             stream = "stdout";
