@@ -44,6 +44,7 @@ output.mkdir(exist_ok=True)
 
 if task == "task-1":
     (output / "one.txt").write_text("one\n", encoding="utf-8")
+    (output / "checkpoint-red").write_text("pending phase validation\n", encoding="utf-8")
     # The integration test requests one forbidden artifact, then clears that
     # steering condition before a fresh reconcile attempt proves recovery.
     if (control / "inject-forbidden-path").exists() and not (
@@ -63,10 +64,13 @@ elif task == "task-3":
     (output / "three.txt").write_text("three\n", encoding="utf-8")
 elif task == "task-4":
     (output / "four.txt").write_text("four\n", encoding="utf-8")
+    (output / "checkpoint-red").unlink()
+elif task == "task-5":
+    (output / "five.txt").write_text("five\n", encoding="utf-8")
 else:
     raise SystemExit(f"unexpected fixture task: {task}")
 
-subprocess.run(["git", "add", "build"], check=True)
+subprocess.run(["git", "add", "--all", "build"], check=True)
 status = subprocess.run(
     ["git", "status", "--porcelain"], check=True, text=True, stdout=subprocess.PIPE
 ).stdout

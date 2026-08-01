@@ -67,6 +67,14 @@ merge. Replay remains the right mechanism for flows that genuinely require one
 run identity, but not for forge-backed campaigns whose completion facts already
 live in merged PRs.
 
+**Extended on 2026-08-01 by #256:** a worklist may place an automated
+`checkpoint` barrier after any accumulated phase. It runs deeper validation as
+an ordinary witnessed node and records a content-bound Git ref on success; it
+has no implementation agent, publication, merge, or human approval transition.
+A red checkpoint withholds only its own completion fact, so the existing
+dependency frontier leaves its descendants unready while independent subtrees
+continue. “Phase done, awaiting operator” is explicitly not a campaign state.
+
 ### Where the work graph lives, and what each agent actually reads
 
 A fair objection to "the spec repo is the work source": doesn't that force

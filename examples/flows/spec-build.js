@@ -2,12 +2,12 @@
 //
 // Every invocation witnesses current forge state, selects one dependency-ready
 // and conflict-disjoint frontier, advances those tasks in isolated worktrees,
-// and exits. Merged pull requests are the durable checkboxes; a new mention or
-// merge-triggered invocation always starts from those facts instead of a prior
-// runner's witnessed prefix.
+// and exits. Merged pull requests and content-bound checkpoint refs are the
+// durable completion facts; a new mention or continuation invocation always
+// starts from those facts instead of a prior runner's witnessed prefix.
 export const meta = {
   name: "spec-build",
-  description: "Reconcile one witnessed spec-build frontier against merged pull requests",
+  description: "Reconcile one witnessed spec-build frontier against durable forge facts",
   pools: ["campaign-agent", "campaign-control"],
   argsSchema: {
     type: "object",
@@ -158,10 +158,11 @@ const taskIdSchema = {
   maxLength: 80
 };
 
-const taskSchema = {
+const implementationTaskSchema = {
   type: "object",
   required: [
     "id",
+    "kind",
     "title",
     "goal",
     "deliveredBehaviors",
@@ -172,6 +173,7 @@ const taskSchema = {
   ],
   properties: {
     id: taskIdSchema,
+    kind: { const: "implementation" },
     title: { type: "string", minLength: 1, maxLength: 300 },
     goal: { type: "string", minLength: 1, maxLength: 12000 },
     deliveredBehaviors: {
@@ -219,6 +221,31 @@ const taskSchema = {
   additionalProperties: false
 };
 
+const checkpointTaskSchema = {
+  type: "object",
+  required: ["id", "kind", "title", "argv", "runtimeMaxSec", "dependencies"],
+  properties: {
+    id: taskIdSchema,
+    kind: { const: "checkpoint" },
+    title: { type: "string", minLength: 1, maxLength: 300 },
+    argv: {
+      type: "array",
+      minItems: 1,
+      items: { type: "string" }
+    },
+    runtimeMaxSec: { type: "integer", minimum: 1 },
+    dependencies: {
+      type: "array",
+      items: taskIdSchema
+    }
+  },
+  additionalProperties: false
+};
+
+const taskSchema = {
+  oneOf: [implementationTaskSchema, checkpointTaskSchema]
+};
+
 const sourceSchema = {
   type: "object",
   required: ["path", "sha256"],
@@ -240,6 +267,17 @@ const mergedFactSchema = {
   additionalProperties: false
 };
 
+const checkpointFactSchema = {
+  type: "object",
+  required: ["taskId", "ref", "revision"],
+  properties: {
+    taskId: taskIdSchema,
+    ref: { type: "string", pattern: "^refs/tags/tally/spec-build/v1/" },
+    revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
+  },
+  additionalProperties: false
+};
+
 const reconcileSchema = {
   type: "object",
   required: [
@@ -248,6 +286,7 @@ const reconcileSchema = {
     "source",
     "tasks",
     "merged",
+    "checkpoints",
     "remaining",
     "frontier",
     "complete"
@@ -263,6 +302,7 @@ const reconcileSchema = {
       items: taskSchema
     },
     merged: { type: "array", items: mergedFactSchema },
+    checkpoints: { type: "array", items: checkpointFactSchema },
     remaining: { type: "array", items: taskIdSchema },
     frontier: { type: "array", maxItems: 128, items: taskSchema },
     complete: { type: "boolean" }
@@ -309,6 +349,17 @@ const cleanupSchema = {
   properties: {
     taskId: taskIdSchema,
     cleaned: { const: true }
+  },
+  additionalProperties: false
+};
+
+const checkpointCompletionSchema = {
+  type: "object",
+  required: ["taskId", "ref", "revision"],
+  properties: {
+    taskId: taskIdSchema,
+    ref: { type: "string", pattern: "^refs/tags/tally/spec-build/v1/" },
+    revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
   },
   additionalProperties: false
 };
@@ -518,55 +569,57 @@ async function runPreflightGate(task, gate, workspace) {
     reconciliation.merged.length === 0 &&
     commandGates.length > 0
   ) {
-    const preflightTask = reconciliation.frontier[0];
-    const preflightTaskRef = `${args.campaign}/${preflightTask.id}`;
-    const preflight = await driverNode(
-      "preflight",
-      {
-        campaign: args.campaign,
-        repository: args.repository,
-        repositoryConfig,
-        issue: args.issue,
-        runId: args.runId,
-        workspaceRoot: args.workspaceRoot
-      },
-      "preflight-prep",
-      "preflight-prep",
-      workspaceSchema,
-      null,
-      false,
-      preflightTaskRef
-    );
-    const preflightWorkspace = workspaceFor(preflight.result);
-    let failedGate = null;
-    for (const gate of commandGates) {
-      const gated = await runPreflightGate(preflightTask, gate, preflightWorkspace);
-      if (gated.verdict !== "pass") {
-        failedGate = { gate, node: gated };
-        break;
-      }
-    }
-    await driverNode(
-      "cleanup",
-      { repositoryConfig, workspace: preflight.result },
-      "preflight-cleanup",
-      "preflight-cleanup",
-      cleanupSchema,
-      null,
-      false,
-      preflightTaskRef
-    );
-    if (failedGate !== null) {
-      const error = new Error(
-        `campaign preflight gate ${failedGate.gate.id} failed: ${bounded(failedGate.node, 2000)}`
+    const preflightTask = reconciliation.frontier.find(task => task.kind === "implementation");
+    if (preflightTask !== undefined) {
+      const preflightTaskRef = `${args.campaign}/${preflightTask.id}`;
+      const preflight = await driverNode(
+        "preflight",
+        {
+          campaign: args.campaign,
+          repository: args.repository,
+          repositoryConfig,
+          issue: args.issue,
+          runId: args.runId,
+          workspaceRoot: args.workspaceRoot
+        },
+        "preflight-prep",
+        "preflight-prep",
+        workspaceSchema,
+        null,
+        false,
+        preflightTaskRef
       );
-      error.name = "SpecBuildPreflightError";
-      error.code = "preflight-failed";
-      error.details = {
-        gateId: failedGate.gate.id,
-        node: failedGate.node
-      };
-      throw error;
+      const preflightWorkspace = workspaceFor(preflight.result);
+      let failedGate = null;
+      for (const gate of commandGates) {
+        const gated = await runPreflightGate(preflightTask, gate, preflightWorkspace);
+        if (gated.verdict !== "pass") {
+          failedGate = { gate, node: gated };
+          break;
+        }
+      }
+      await driverNode(
+        "cleanup",
+        { repositoryConfig, workspace: preflight.result },
+        "preflight-cleanup",
+        "preflight-cleanup",
+        cleanupSchema,
+        null,
+        false,
+        preflightTaskRef
+      );
+      if (failedGate !== null) {
+        const error = new Error(
+          `campaign preflight gate ${failedGate.gate.id} failed: ${bounded(failedGate.node, 2000)}`
+        );
+        error.name = "SpecBuildPreflightError";
+        error.code = "preflight-failed";
+        error.details = {
+          gateId: failedGate.gate.id,
+          node: failedGate.node
+        };
+        throw error;
+      }
     }
   }
 
@@ -595,6 +648,66 @@ async function runPreflightGate(task, gate, workspace) {
         return { task, failure: nodeFailure(task, "prep", prepared) };
       }
       const workspace = workspaceFor(prepared.result);
+
+      if (task.kind === "checkpoint") {
+        const checkpoint = await sh(task.argv, {
+          pools: ["campaign-control"],
+          priority: "low",
+          workspace,
+          env: { CAMPAIGN_TASK_ID: task.id },
+          runtimeMaxSec: task.runtimeMaxSec,
+          evidence: ["exit:0"],
+          key: `checkpoint-${task.id}`,
+          label: `checkpoint-${task.id}`,
+          settle: true,
+          taskRef
+        });
+        let recorded = null;
+        if (checkpoint.verdict === "pass") {
+          recorded = await driverNode(
+            "checkpoint",
+            {
+              campaign: args.campaign,
+              repository: args.repository,
+              repositoryConfig,
+              issue: args.issue,
+              reconcileCommand: args.reconcileCommand,
+              task,
+              source: reconciliation.source,
+              workspace: prepared.result
+            },
+            `checkpoint-record-${task.id}`,
+            `checkpoint-record-${task.id}`,
+            checkpointCompletionSchema,
+            workspace,
+            true,
+            taskRef
+          );
+        }
+        await driverNode(
+          "cleanup",
+          { repositoryConfig, workspace: prepared.result },
+          `checkpoint-cleanup-${task.id}`,
+          `checkpoint-cleanup-${task.id}`,
+          cleanupSchema,
+          null,
+          false,
+          taskRef
+        );
+        if (checkpoint.verdict !== "pass") {
+          return {
+            task,
+            failure: nodeFailure(task, "checkpoint", checkpoint)
+          };
+        }
+        if (!nodePassed(recorded)) {
+          return {
+            task,
+            failure: nodeFailure(task, "checkpoint:record", recorded)
+          };
+        }
+        return { task, checkpoint: recorded.result };
+      }
 
       const agentSpec = {
         argv: args.agent.argv,
@@ -699,6 +812,7 @@ async function runPreflightGate(task, gate, workspace) {
     return { task, failure: nodeFailure(task, "lane", outcome.error) };
   });
   const failures = lanes.filter(lane => lane.failure).map(lane => lane.failure);
+  const checkpoints = lanes.filter(lane => lane.checkpoint).map(lane => lane.checkpoint);
   const publications = lanes.filter(lane => lane.publication);
   const merged = [];
 
@@ -786,16 +900,18 @@ async function runPreflightGate(task, gate, workspace) {
     worklist: reconciliation.source,
     state: reconciliation.complete
       ? "complete"
-      : merged.length > 0
+      : merged.length > 0 || checkpoints.length > 0
         ? "advanced"
         : failures.length > 0
           ? "needs-attention"
           : "idle",
     reconciled: {
       merged: reconciliation.merged,
+      checkpoints: reconciliation.checkpoints,
       remaining: reconciliation.remaining,
       frontier: reconciliation.frontier.map(task => task.id)
     },
+    checkpoints,
     merged,
     failures
   };

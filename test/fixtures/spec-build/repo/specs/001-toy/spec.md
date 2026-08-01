@@ -2,13 +2,21 @@
 
 ## Task one
 
-Create `build/one.txt` containing exactly `one` followed by a newline.
+Create `build/one.txt` containing exactly `one` followed by a newline and the
+temporary `build/checkpoint-red` marker used by the integration fixture.
+
+## Phase one checkpoint
+
+After task one merges, validate the accumulated base directly: `build/one.txt`
+must have its exact content and `build/checkpoint-red` must be absent. This
+checkpoint intentionally fails while task four, which is not its descendant,
+continues and removes the marker.
 
 ## Task two
 
-Task two starts only after task one's pull request has merged. It must observe
-`build/one.txt`, then create `build/two.txt` containing exactly `two` followed by
-a newline.
+Task two starts only after task one's pull request has merged and the automated
+phase-one checkpoint has passed. It must observe `build/one.txt`, then create
+`build/two.txt` containing exactly `two` followed by a newline.
 
 ## Task three
 
@@ -19,5 +27,12 @@ task owns a disjoint path and may run alongside task one.
 
 Create `build/four.txt` containing exactly `four` followed by a newline. This
 task conservatively shares task one's `build/one.txt` conflict domain, so it
-must wait while task one is in a frontier. It may run beside task two after task
-one merges; its rebased head must then be gated again after task two merges.
+must wait while task one is in a frontier. It does not depend on the phase-one
+checkpoint, so it may remove `build/checkpoint-red` and merge while that
+checkpoint is failing.
+
+## Task five
+
+Task five starts only after the phase-one checkpoint. It creates
+`build/five.txt` containing exactly `five` followed by a newline and may run
+beside task two. Its rebased head must be gated again after task two merges.

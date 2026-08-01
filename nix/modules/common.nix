@@ -2040,16 +2040,17 @@ let
           type = types.ints.between 1 128;
           default = 64;
           example = 24;
-          description = "Maximum tasks accepted from the witnessed worklist.";
+          description = "Maximum implementation and checkpoint nodes accepted from the witnessed worklist.";
         };
         maxParallel = mkOption {
           type = types.ints.between 1 128;
           default = 1;
           example = 4;
           description = ''
-            Maximum dependency-ready, conflict-disjoint tasks dispatched by
-            one stateless reconcile pass. Values above one require every
-            worklist task to declare non-empty conflictDomains.
+            Maximum dependency-ready nodes dispatched by one stateless
+            reconcile pass. Values above one require every implementation
+            node to declare non-empty conflictDomains; checkpoints are
+            non-mutating and therefore have no conflict domains.
           '';
         };
         gates = mkOption {
@@ -3067,8 +3068,10 @@ let
   campaignReconcileCommand = name: "/tally reconcile ${name}";
 
   # Reconcile, optional pristine-base preflight prep/gates/cleanup, and one
-  # frontier's prep, agent, initial gates, publication, rebase check, optional
-  # re-gates, and merge. This is a pass bound, not the complete worklist size.
+  # frontier's worst-case implementation lanes: prep, agent, initial gates,
+  # publication, rebase check, optional re-gates, and merge. A checkpoint lane
+  # is smaller (prep, direct validation, durable fact, cleanup). This is a pass
+  # bound, not the complete worklist size.
   campaignMaxNodes =
     campaign:
     let

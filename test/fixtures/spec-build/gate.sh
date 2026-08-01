@@ -24,6 +24,10 @@ case "$task" in
     ;;
   task-4)
     test "$(cat build/four.txt)" = four
+    test ! -e build/checkpoint-red
+    ;;
+  task-5)
+    test "$(cat build/five.txt)" = five
     ;;
   *)
     printf 'unknown fixture task: %s\n' "$task" >&2

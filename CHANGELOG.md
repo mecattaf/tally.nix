@@ -8,6 +8,13 @@ authorized.
 
 ### Added
 
+- Added automated `checkpoint` nodes to spec-build worklists. These
+  dependency barriers run a declared deep-validation argv against the exact
+  accumulated base, record a content-bound Git completion ref after a
+  witnessed pass, and deliberately skip agents, publication, and merge. A red
+  checkpoint leaves only its DAG descendants unready while independent
+  frontiers continue; it never creates an operator pause. Every worklist node
+  now declares an explicit `kind` of `implementation` or `checkpoint`.
 - Added accept-time campaign gate preflights: every command gate declares a
   base-safe `preflightArgv` separately from its post-change `argv`. The exact
   probe executes once on the fetched base, with the same task environment and a

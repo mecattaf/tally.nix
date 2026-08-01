@@ -3,10 +3,12 @@
   "tasks": [
     {
       "id": "task-1",
+      "kind": "implementation",
       "title": "Create the first fixture artifact",
       "goal": "Materialize the first behavior as a committed text artifact.",
       "deliveredBehaviors": [
-        "build/one.txt exists and contains one followed by a newline"
+        "build/one.txt exists and contains one followed by a newline",
+        "build/checkpoint-red exists until the independent cleanup task removes it"
       ],
       "readFirst": {
         "specSections": [
@@ -29,11 +31,28 @@
       ],
       "dependencies": [],
       "conflictDomains": [
-        "build/one.txt"
+        "build/one.txt",
+        "build/checkpoint-red"
+      ]
+    },
+    {
+      "id": "phase-one-checkpoint",
+      "kind": "checkpoint",
+      "title": "Validate the accumulated first phase",
+      "argv": [
+        "sh",
+        "-eu",
+        "-c",
+        "test \"$(cat build/one.txt)\" = one && test ! -e build/checkpoint-red"
+      ],
+      "runtimeMaxSec": 10,
+      "dependencies": [
+        "task-1"
       ]
     },
     {
       "id": "task-2",
+      "kind": "implementation",
       "title": "Build on the merged first task",
       "goal": "Prove serial campaign ordering while materializing the second artifact.",
       "deliveredBehaviors": [
@@ -60,7 +79,7 @@
         }
       ],
       "dependencies": [
-        "task-1"
+        "phase-one-checkpoint"
       ],
       "conflictDomains": [
         "build/two.txt",
@@ -69,6 +88,7 @@
     },
     {
       "id": "task-3",
+      "kind": "implementation",
       "title": "Create an independent fixture artifact",
       "goal": "Materialize work that can advance alongside the first task.",
       "deliveredBehaviors": [
@@ -100,10 +120,12 @@
     },
     {
       "id": "task-4",
+      "kind": "implementation",
       "title": "Create a second independent fixture artifact",
-      "goal": "Exercise re-gating after another frontier task moves main.",
+      "goal": "Advance beside a failing checkpoint and remove the temporary phase marker.",
       "deliveredBehaviors": [
-        "build/four.txt exists and contains four followed by a newline"
+        "build/four.txt exists and contains four followed by a newline",
+        "build/checkpoint-red is absent"
       ],
       "readFirst": {
         "specSections": [
@@ -124,10 +146,47 @@
           ]
         }
       ],
-      "dependencies": [],
+      "dependencies": [
+        "task-1"
+      ],
       "conflictDomains": [
         "build/one.txt",
+        "build/checkpoint-red",
         "build/four.txt"
+      ]
+    },
+    {
+      "id": "task-5",
+      "kind": "implementation",
+      "title": "Create the post-checkpoint fixture artifact",
+      "goal": "Exercise re-gating when two checkpoint descendants integrate in order.",
+      "deliveredBehaviors": [
+        "build/five.txt exists and contains five followed by a newline"
+      ],
+      "readFirst": {
+        "specSections": [
+          "specs/001-toy/spec.md#task-five"
+        ],
+        "styleReferences": [
+          "specs/001-toy/style/example.txt"
+        ]
+      },
+      "acceptanceCriteria": [
+        {
+          "id": "five-content",
+          "description": "The post-checkpoint artifact has the exact specified bytes.",
+          "argv": [
+            "sh",
+            "-c",
+            "test \"$(cat build/five.txt)\" = five"
+          ]
+        }
+      ],
+      "dependencies": [
+        "phase-one-checkpoint"
+      ],
+      "conflictDomains": [
+        "build/five.txt"
       ]
     }
   ]

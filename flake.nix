@@ -1161,7 +1161,7 @@
                   postFailureEvidence = true;
                   postFailureStderr = true;
                   worklist = "specs/*/tasks.json";
-                  maxTasks = 4;
+                  maxTasks = 6;
                   maxParallel = 3;
                   gates = [
                     {
@@ -3493,7 +3493,7 @@
                     forge: "local"
                   },
                   worklist: "specs/*/tasks.json",
-                  maxTasks: 4,
+                  maxTasks: 6,
                   maxParallel: 3
                 }' > "$TMPDIR/worklist-brief.json"
                 export TALLY_BRIEF="$TMPDIR/worklist-brief.json"
@@ -3504,8 +3504,8 @@
                   .repository == "acme/spec" and
                   .source.path == "specs/001-toy/tasks.json" and
                   (.source.sha256 | test("^sha256:[0-9a-f]{64}$")) and
-                  [.tasks[].id] == ["task-1", "task-2", "task-3", "task-4"] and
-                  all(.tasks[];
+                  [.tasks[].id] == ["task-1", "phase-one-checkpoint", "task-2", "task-3", "task-4", "task-5"] and
+                  all(.tasks[] | select(.kind == "implementation");
                     (.goal | length) > 0 and
                     (.deliveredBehaviors | length) > 0 and
                     (.readFirst.specSections | length) > 0 and
@@ -3513,8 +3513,43 @@
                     (.acceptanceCriteria | length) > 0 and
                     all(.acceptanceCriteria[]; (.argv | length) > 0)
                   ) and
-                  .tasks[1].dependencies == ["task-1"]
+                  .tasks[1] == {
+                    id: "phase-one-checkpoint",
+                    kind: "checkpoint",
+                    title: "Validate the accumulated first phase",
+                    argv: ["sh", "-eu", "-c", "test \"$(cat build/one.txt)\" = one && test ! -e build/checkpoint-red"],
+                    runtimeMaxSec: 10,
+                    dependencies: ["task-1"]
+                  } and
+                  .tasks[2].dependencies == ["phase-one-checkpoint"]
                 ' worklist.json >/dev/null
+
+                worklistPath="$TMPDIR/spec/specs/001-toy/tasks.json"
+                jq 'del(.tasks[0].kind)' "$worklistPath" \
+                  > "$TMPDIR/missing-task-kind.json"
+                mv "$TMPDIR/missing-task-kind.json" "$worklistPath"
+                if ${specBuildDriver}/bin/spec-build-driver worklist \
+                  > /dev/null 2> "$TMPDIR/missing-task-kind.err"; then
+                  echo "worklist implementation without a kind unexpectedly passed" >&2
+                  exit 1
+                fi
+                grep -F 'tasks[0].kind must equal implementation or checkpoint' \
+                  "$TMPDIR/missing-task-kind.err" >/dev/null
+                cp ${./test/fixtures/spec-build/repo/specs/001-toy/tasks.json} \
+                  "$worklistPath"
+
+                jq '.tasks[1].goal = "checkpoints do not implement"' "$worklistPath" \
+                  > "$TMPDIR/checkpoint-with-agent-field.json"
+                mv "$TMPDIR/checkpoint-with-agent-field.json" "$worklistPath"
+                if ${specBuildDriver}/bin/spec-build-driver worklist \
+                  > /dev/null 2> "$TMPDIR/checkpoint-with-agent-field.err"; then
+                  echo "checkpoint with an implementation field unexpectedly passed" >&2
+                  exit 1
+                fi
+                grep -F 'tasks[1] has unknown fields: goal' \
+                  "$TMPDIR/checkpoint-with-agent-field.err" >/dev/null
+                cp ${./test/fixtures/spec-build/repo/specs/001-toy/tasks.json} \
+                  "$worklistPath"
 
                 base_rev="$(git -C "$TMPDIR/spec" rev-parse HEAD)"
                 write_constraint_brief() {
@@ -3719,7 +3754,6 @@
                   refs/heads/tally/spec-build/v1/fixture/7/task-1 | cut -f1)" = \
                   "$witnessed_head"
 
-                worklistPath="$TMPDIR/spec/specs/001-toy/tasks.json"
                 jq 'del(.tasks[0].conflictDomains)' "$worklistPath" \
                   > "$TMPDIR/missing-conflict-domains.json"
                 mv "$TMPDIR/missing-conflict-domains.json" "$worklistPath"
@@ -3762,7 +3796,7 @@
                   } and
                   .runId == "comment-7" and
                   .worklist == "specs/*/tasks.json" and
-                  .maxTasks == 4 and
+                  .maxTasks == 6 and
                   .maxParallel == 3 and
                   .reconcileCommand == "/tally reconcile fixture" and
                   .repositories["acme/spec"].baseBranch == "main" and

@@ -62,6 +62,8 @@ const SPEC_BUILD_RUN_3: &str = "00000000-0000-4000-8000-000000000519";
 const SPEC_BUILD_RUN_4: &str = "00000000-0000-4000-8000-000000000520";
 const SPEC_BUILD_RUN_5: &str = "00000000-0000-4000-8000-000000000521";
 const SPEC_BUILD_DUPLICATE_GATE_RUN: &str = "00000000-0000-4000-8000-000000000522";
+const SPEC_BUILD_RUN_6: &str = "00000000-0000-4000-8000-000000000523";
+const SPEC_BUILD_RUN_7: &str = "00000000-0000-4000-8000-000000000524";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -2375,7 +2377,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                         }
                     },
                     "worklist": "specs/*/tasks.json",
-                    "maxTasks": 4,
+                    "maxTasks": 6,
                     "maxParallel": 3,
                     "reconcileCommand": "/tally reconcile fixture",
                     "workspaceRoot": workspace_root,
@@ -2696,7 +2698,10 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 fixture_git(&checkout, &["show", "origin/main:build/one.txt"]),
                 "one"
             );
-            let task_2_base = fixture_git(&checkout, &["rev-parse", "origin/main"]);
+            assert_eq!(
+                fixture_git(&checkout, &["show", "origin/main:build/checkpoint-red"]),
+                "pending phase validation"
+            );
 
             let fourth = runner(
                 &config_path,
@@ -2718,14 +2723,17 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             let fourth_value = &flow_report(&fourth)["report"]["finalValue"];
             assert_eq!(
                 fourth_value["reconciled"]["frontier"],
-                json!(["task-2", "task-4"])
+                json!(["phase-one-checkpoint", "task-4"])
             );
-            assert_eq!(fourth_value["merged"][0]["taskId"], "task-2");
-            assert_eq!(fourth_value["merged"][1]["taskId"], "task-4");
-            assert_eq!(fourth_value["merged"][1]["regated"], true);
-            assert_eq!(fourth_value["failures"], json!([]));
+            assert_eq!(fourth_value["merged"][0]["taskId"], "task-4");
+            assert_eq!(fourth_value["checkpoints"], json!([]));
+            assert_eq!(
+                fourth_value["failures"][0]["taskId"],
+                "phase-one-checkpoint"
+            );
+            assert_eq!(fourth_value["failures"][0]["stage"], "checkpoint");
             let fourth_submitted = runner_events(&fourth, "node-submitted");
-            assert_eq!(fourth_submitted.len(), 20);
+            assert_eq!(fourth_submitted.len(), 12);
             assert!(fourth_submitted
                 .iter()
                 .all(|event| event["disposition"] == "created"));
@@ -2733,34 +2741,181 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(
                 fourth_submitted[1..]
                     .iter()
-                    .filter(|event| event["taskRef"] == "fixture/task-2")
+                    .filter(|event| event["taskRef"] == "fixture/phase-one-checkpoint")
                     .count(),
-                8
+                3
             );
             assert_eq!(
                 fourth_submitted[1..]
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-4")
                     .count(),
-                11
+                8
             );
             assert!(fourth_submitted
                 .iter()
-                .any(|event| event["label"] == "regate-task-4-no-db-artifacts"));
+                .any(|event| event["label"] == "checkpoint-phase-one-checkpoint"));
 
             let fourth_items = flow_items(&client, SPEC_BUILD_RUN_4).await;
             assert!(fourth_items[0].get("taskRef").is_none());
-            assert!(fourth_items.iter().any(|item| {
-                item["orchestration"]["nodeLabel"] == "gate-task-4-no-db-artifacts"
+            let failed_checkpoint = fourth_items
+                .iter()
+                .find(|item| {
+                    item["orchestration"]["nodeLabel"] == "checkpoint-phase-one-checkpoint"
+                })
+                .expect("the failed checkpoint node was not projected");
+            assert_eq!(
+                failed_checkpoint["argv"],
+                json!([
+                    "sh",
+                    "-eu",
+                    "-c",
+                    "test \"$(cat build/one.txt)\" = one && test ! -e build/checkpoint-red"
+                ])
+            );
+            assert_eq!(failed_checkpoint["runtimeMaxSec"], 10);
+            assert_eq!(failed_checkpoint["taskRef"], "fixture/phase-one-checkpoint");
+
+            fixture_git(&checkout, &["fetch", "origin"]);
+            assert_eq!(
+                fixture_git(&checkout, &["show", "origin/main:build/four.txt"]),
+                "four"
+            );
+            assert!(
+                StdCommand::new("git")
+                    .arg("-C")
+                    .arg(&checkout)
+                    .args(["cat-file", "-e", "origin/main:build/checkpoint-red"])
+                    .status()
+                    .unwrap()
+                    .code()
+                    .is_some_and(|code| code != 0),
+                "an independent task must be able to advance while the checkpoint is red"
+            );
+
+            let checkpoint_pass = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_5,
+                &arguments("fixture-comment-10", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let checkpoint_pass = runner_output(checkpoint_pass).await;
+            assert!(
+                checkpoint_pass.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&checkpoint_pass.stdout),
+                String::from_utf8_lossy(&checkpoint_pass.stderr)
+            );
+            let checkpoint_value = &flow_report(&checkpoint_pass)["report"]["finalValue"];
+            assert_eq!(
+                checkpoint_value["reconciled"]["frontier"],
+                json!(["phase-one-checkpoint"])
+            );
+            assert_eq!(checkpoint_value["state"], "advanced");
+            assert_eq!(checkpoint_value["failures"], json!([]));
+            assert_eq!(checkpoint_value["merged"], json!([]));
+            assert_eq!(
+                checkpoint_value["checkpoints"][0]["taskId"],
+                "phase-one-checkpoint"
+            );
+            let checkpoint_revision = checkpoint_value["checkpoints"][0]["revision"]
+                .as_str()
+                .unwrap();
+            assert_eq!(
+                checkpoint_revision,
+                fixture_git(&checkout, &["rev-parse", "origin/main"])
+            );
+            let checkpoint_ref = checkpoint_value["checkpoints"][0]["ref"].as_str().unwrap();
+            assert!(checkpoint_ref.starts_with("refs/tags/tally/spec-build/v1/fixture-"));
+            assert!(checkpoint_ref.contains("-issue-7/phase-one-checkpoint-"));
+            assert_eq!(
+                fixture_git(&checkout, &["ls-remote", "origin", checkpoint_ref])
+                    .split_whitespace()
+                    .next()
+                    .unwrap(),
+                checkpoint_revision
+            );
+            let checkpoint_items = flow_items(&client, SPEC_BUILD_RUN_5).await;
+            assert_eq!(checkpoint_items.len(), 5);
+            assert!(checkpoint_items[0].get("taskRef").is_none());
+            assert!(checkpoint_items[1..]
+                .iter()
+                .all(|item| item["taskRef"] == "fixture/phase-one-checkpoint"));
+            assert!(checkpoint_items.iter().all(|item| {
+                item["orchestration"]["nodeLabel"] != "agent-phase-one-checkpoint"
+                    && item["orchestration"]["nodeLabel"] != "publish-phase-one-checkpoint"
+                    && item["orchestration"]["nodeLabel"] != "merge-phase-one-checkpoint"
             }));
-            assert!(fourth_items.iter().any(|item| {
-                item["orchestration"]["nodeLabel"] == "regate-task-4-no-db-artifacts"
-            }));
+
+            fixture_git(&checkout, &["fetch", "origin"]);
+            let task_2_base = fixture_git(&checkout, &["rev-parse", "origin/main"]);
+
+            let sixth = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_6,
+                &arguments("fixture-comment-11", "high"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let sixth = runner_output(sixth).await;
+            assert!(
+                sixth.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&sixth.stdout),
+                String::from_utf8_lossy(&sixth.stderr)
+            );
+            let sixth_value = &flow_report(&sixth)["report"]["finalValue"];
+            assert_eq!(
+                sixth_value["reconciled"]["frontier"],
+                json!(["task-2", "task-5"])
+            );
+            assert_eq!(
+                sixth_value["reconciled"]["checkpoints"][0]["taskId"],
+                "phase-one-checkpoint"
+            );
+            assert_eq!(sixth_value["merged"][0]["taskId"], "task-2");
+            assert_eq!(sixth_value["merged"][1]["taskId"], "task-5");
+            assert_eq!(sixth_value["merged"][1]["regated"], true);
+            assert_eq!(sixth_value["failures"], json!([]));
+            let sixth_submitted = runner_events(&sixth, "node-submitted");
+            assert_eq!(sixth_submitted.len(), 20);
+            assert!(sixth_submitted
+                .iter()
+                .all(|event| event["disposition"] == "created"));
+            assert!(sixth_submitted[0].get("taskRef").is_none());
+            assert_eq!(
+                sixth_submitted[1..]
+                    .iter()
+                    .filter(|event| event["taskRef"] == "fixture/task-2")
+                    .count(),
+                8
+            );
+            assert_eq!(
+                sixth_submitted[1..]
+                    .iter()
+                    .filter(|event| event["taskRef"] == "fixture/task-5")
+                    .count(),
+                11
+            );
+            assert!(sixth_submitted
+                .iter()
+                .any(|event| event["label"] == "regate-task-5-no-db-artifacts"));
 
             fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
                 fixture_git(&checkout, &["show", "origin/main:build/two.txt"]),
                 "two"
+            );
+            assert_eq!(
+                fixture_git(&checkout, &["show", "origin/main:build/five.txt"]),
+                "five"
             );
             assert!(
                 !fixture_git(&checkout, &["ls-tree", "-r", "--name-only", "origin/main"])
@@ -2778,23 +2933,23 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 &["rev-list", "--first-parent", "--reverse", "origin/main"],
             );
             let commits = first_parent.lines().collect::<Vec<_>>();
-            assert_eq!(commits.len(), 5, "initial commit plus four task merges");
+            assert_eq!(
+                commits.len(),
+                6,
+                "initial commit plus five implementation merges"
+            );
             assert_eq!(
                 fixture_git(&checkout, &["show", "origin/main:build/task-2-base.txt"]),
                 task_2_base,
-                "the dependent task must be prepared from current merged forge state"
-            );
-            assert_eq!(
-                fixture_git(&checkout, &["show", "origin/main:build/four.txt"]),
-                "four"
+                "the dependent task must be prepared from current checkpointed forge state"
             );
 
             let complete = runner(
                 &config_path,
                 &daemon_paths.socket,
                 &script,
-                SPEC_BUILD_RUN_5,
-                &arguments("fixture-comment-10", "low"),
+                SPEC_BUILD_RUN_7,
+                &arguments("fixture-comment-12", "low"),
                 32,
             )
             .spawn()
@@ -2815,28 +2970,33 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .iter()
                     .map(|fact| fact["taskId"].as_str().unwrap())
                     .collect::<Vec<_>>(),
-                vec!["task-1", "task-2", "task-3", "task-4"]
+                vec!["task-1", "task-2", "task-3", "task-4", "task-5"]
+            );
+            assert_eq!(
+                complete_value["reconciled"]["checkpoints"][0]["taskId"],
+                "phase-one-checkpoint"
             );
             assert_eq!(complete_value["reconciled"]["remaining"], json!([]));
             assert_eq!(complete_value["reconciled"]["frontier"], json!([]));
-            let complete_items = flow_items(&client, SPEC_BUILD_RUN_5).await;
+            let complete_items = flow_items(&client, SPEC_BUILD_RUN_7).await;
             assert_eq!(complete_items.len(), 1);
             assert!(complete_items[0].get("taskRef").is_none());
 
             let agent_order = fs::read_to_string(control.join("agent-order.log")).unwrap();
             let agents = agent_order.lines().collect::<Vec<_>>();
-            assert_eq!(agents.len(), 5);
+            assert_eq!(agents.len(), 6);
             let mut first_frontier = agents[..2].to_vec();
             first_frontier.sort_unstable();
             assert_eq!(first_frontier, vec!["task-1", "task-3"]);
             assert_eq!(agents[2], "task-1");
-            let mut fourth_frontier = agents[3..].to_vec();
-            fourth_frontier.sort_unstable();
-            assert_eq!(fourth_frontier, vec!["task-2", "task-4"]);
+            assert_eq!(agents[3], "task-4");
+            let mut post_checkpoint_frontier = agents[4..].to_vec();
+            post_checkpoint_frontier.sort_unstable();
+            assert_eq!(post_checkpoint_frontier, vec!["task-2", "task-5"]);
 
             let policy_order = fs::read_to_string(control.join("policy-order.log")).unwrap();
             let policies = policy_order.lines().collect::<Vec<_>>();
-            assert_eq!(policies.len(), 5);
+            assert_eq!(policies.len(), 6);
             assert!(policies
                 .iter()
                 .all(|line| line.ends_with(":on-request:workspace-write")));
@@ -2850,8 +3010,10 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 ("task-2:second", 1),
                 ("task-3:first", 1),
                 ("task-3:second", 1),
-                ("task-4:first", 2),
-                ("task-4:second", 2),
+                ("task-4:first", 1),
+                ("task-4:second", 1),
+                ("task-5:first", 2),
+                ("task-5:second", 2),
             ] {
                 assert_eq!(
                     gated
