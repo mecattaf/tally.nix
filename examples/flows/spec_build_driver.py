@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import fnmatch
 import hashlib
 import json
@@ -14,7 +15,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from typing import Any
+import uuid
 
 
 TASK_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
@@ -41,6 +44,8 @@ MAX_DIAGNOSIS_CHARS = 12_000
 MAX_DIFF_CHARS = 128 * 1024
 PUBLIC_REDACTION = "conservative-v1"
 PUBLIC_DIAGNOSIS_TRUNCATION = "\n[... diagnosis truncated after redaction ...]"
+LIVE_JOB_STATES = {"paused", "queued", "running"}
+PASS_RECORD_SCHEMA_VERSION = 2
 
 
 class DriverError(RuntimeError):
@@ -136,6 +141,13 @@ def load_brief() -> dict[str, Any]:
 
 def emit(value: dict[str, Any]) -> None:
     print("TALLY_FINAL_MESSAGE=" + json.dumps(value, sort_keys=True, separators=(",", ":")))
+
+
+def canonical_sha256(value: Any) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
 def run(
@@ -593,7 +605,9 @@ def forge_gates(value: Any) -> list[dict[str, Any]]:
     return result
 
 
-def forge_manifest(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def forge_manifest(
+    value: Any,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
     manifest = object_exact(
         value,
         {
@@ -627,11 +641,11 @@ def forge_manifest(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         or not 1 <= max_parallel <= max_tasks
     ):
         fail("campaign manifest.maxParallel must be positive and not exceed maxTasks")
-    positive_integer(
+    driver_runtime = positive_integer(
         manifest.get("driverRuntimeMaxSec", 900),
         "campaign manifest.driverRuntimeMaxSec",
     )
-    runtime = manifest.get("runtimeMaxSec")
+    runtime = manifest.get("runtimeMaxSec", 86_400)
     if runtime is not None:
         positive_integer(runtime, "campaign manifest.runtimeMaxSec")
     pool = manifest.get("pool", "campaign")
@@ -647,11 +661,23 @@ def forge_manifest(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     issues: set[int] = set()
     for index, candidate in enumerate(candidates):
         context = f"campaign manifest.tasks[{index}]"
-        task = object_exact(
-            candidate,
-            {"id", "issue", "dependencies", "conflictDomains"},
-            context,
-        )
+        if not isinstance(candidate, dict):
+            fail(f"{context} must be an object")
+        kind = candidate.get("kind")
+        if kind == "implementation":
+            task = object_exact(
+                candidate,
+                {"id", "kind", "issue", "dependencies", "conflictDomains"},
+                context,
+            )
+        elif kind == "checkpoint":
+            task = object_exact(
+                candidate,
+                {"id", "kind", "issue", "dependencies", "argv", "runtimeMaxSec"},
+                context,
+            )
+        else:
+            fail(f"{context}.kind must be implementation or checkpoint")
         identifier = required_string(task.get("id"), f"{context}.id", 80)
         if not TASK_ID.fullmatch(identifier) or identifier in prior:
             fail(f"{context}.id is invalid or duplicated")
@@ -661,17 +687,32 @@ def forge_manifest(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         dependencies = string_list(task.get("dependencies", []), f"{context}.dependencies")
         if len(dependencies) != len(set(dependencies)) or any(item not in prior for item in dependencies):
             fail(f"{context}.dependencies must be unique earlier task ids")
-        conflicts = normalize_conflict_domains(
-            task.get("conflictDomains"),
-            f"{context}.conflictDomains",
-            required=max_parallel > 1,
+        conflicts = (
+            normalize_conflict_domains(
+                task.get("conflictDomains"),
+                f"{context}.conflictDomains",
+                required=max_parallel > 1,
+            )
+            if kind == "implementation"
+            else []
+        )
+        checkpoint_argv = (
+            argv(task.get("argv"), f"{context}.argv") if kind == "checkpoint" else None
+        )
+        checkpoint_runtime = (
+            positive_integer(task.get("runtimeMaxSec"), f"{context}.runtimeMaxSec")
+            if kind == "checkpoint"
+            else None
         )
         references.append(
             {
                 "id": identifier,
+                "kind": kind,
                 "issue": number,
                 "dependencies": dependencies,
                 "conflictDomains": conflicts,
+                "argv": checkpoint_argv,
+                "runtimeMaxSec": checkpoint_runtime,
             }
         )
         prior.add(identifier)
@@ -689,7 +730,25 @@ def forge_manifest(value: Any) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         "gates": gates,
         "reconcileCommand": None,
     }
-    return config, references
+    normalized_manifest = {
+        "schemaVersion": 1,
+        "name": campaign,
+        "repository": {
+            "checkout": str(repository_config["checkout"]),
+            "baseBranch": repository_config["baseBranch"],
+            "remote": repository_config["remote"],
+            "forge": repository_config["forge"],
+        },
+        "maxTasks": max_tasks,
+        "maxParallel": max_parallel,
+        "driverRuntimeMaxSec": driver_runtime,
+        "runtimeMaxSec": runtime,
+        "pool": pool,
+        "agent": agent,
+        "gates": gates,
+        "tasks": references,
+    }
+    return config, references, normalized_manifest
 
 
 def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
@@ -701,9 +760,12 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     expected_url = f"https://github.com/{repository}/issues/{issue['number']}"
     if issue["url"] != expected_url:
         fail("campaign issue URL does not match repository and issue number")
-    selector = object_exact(data.get("worklist"), {"kind"}, "worklist")
+    selector = object_exact(data.get("worklist"), {"kind", "graphDigest"}, "worklist")
     if selector.get("kind") != "github-issue":
         fail("forge-native worklist.kind must equal github-issue")
+    admitted_digest = required_string(selector.get("graphDigest"), "worklist.graphDigest")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", admitted_digest):
+        fail("worklist.graphDigest must be a lowercase SHA-256 identity")
     master = github_json(
         ["api", f"repos/{repository}/issues/{issue['number']}"],
         "campaign master issue",
@@ -722,7 +784,7 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
         manifest_value = json.loads(section[len("```json") : -3].strip())
     except json.JSONDecodeError as error:
         fail(f"campaign manifest is invalid JSON: {error}")
-    config, references = forge_manifest(manifest_value)
+    config, references, normalized_manifest = forge_manifest(manifest_value)
     subissues = github_json(
         [
             "api",
@@ -761,44 +823,62 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
         expected_task_url = f"https://github.com/{repository}/issues/{reference['issue']}"
         if task_url != expected_task_url:
             fail(f"task {reference['id']} issue URL is not canonical")
-        tasks.append(
-            {
-                "id": reference["id"],
-                "kind": "implementation",
-                "title": title,
-                "brief": {
-                    "issue": {"number": str(reference["issue"]), "url": task_url},
-                    "body": task_body,
-                },
-                "dependencies": reference["dependencies"],
-                "conflictDomains": reference["conflictDomains"],
-            }
-        )
+        common = {
+            "id": reference["id"],
+            "kind": reference["kind"],
+            "title": title,
+            "brief": {
+                "issue": {"number": str(reference["issue"]), "url": task_url},
+                "body": task_body,
+            },
+            "dependencies": reference["dependencies"],
+        }
+        if reference["kind"] == "implementation":
+            common["conflictDomains"] = reference["conflictDomains"]
+        else:
+            common["argv"] = reference["argv"]
+            common["runtimeMaxSec"] = reference["runtimeMaxSec"]
+        tasks.append(common)
     source_value = {
-        "manifest": manifest_value,
-        "master": {
-            "body": body,
-            "state": master.get("state"),
-            "updatedAt": master.get("updated_at"),
-        },
+        "manifest": normalized_manifest,
         "tasks": [
             {
-                "number": candidate.get("number"),
-                "title": candidate.get("title"),
-                "body": candidate.get("body"),
-                "state": candidate.get("state"),
-                "updatedAt": candidate.get("updated_at"),
+                "number": reference["issue"],
+                "title": by_number[reference["issue"]].get("title"),
+                "body": by_number[reference["issue"]].get("body"),
             }
-            for candidate in subissues
+            for reference in references
         ],
     }
-    digest = hashlib.sha256(
-        json.dumps(source_value, sort_keys=True, separators=(",", ":")).encode()
-    ).hexdigest()
+    digest = canonical_sha256(source_value)
+    if digest != admitted_digest:
+        fail(
+            "live issue executable graph does not match the armed digest; "
+            "inspect it and explicitly re-arm"
+        )
+    for task in tasks:
+        task["revision"] = canonical_sha256(
+            {"source": admitted_digest, "task": task["id"]}
+        )
+    repository_config = repo_config(config["repositoryConfig"])
+    checkout = repository_config["checkout"]
+    remote = repository_config["remote"]
+    git(checkout, "fetch", "--prune", "--no-tags", remote)
+    source_revision = git(
+        checkout,
+        "rev-parse",
+        "--verify",
+        f"{remote}/{repository_config['baseBranch']}^{{commit}}",
+    ).stdout.strip()
     return {
         "schemaVersion": 1,
         "repository": repository,
-        "source": {"kind": "github-issue", "url": expected_url, "sha256": f"sha256:{digest}"},
+        "source": {
+            "kind": "github-issue",
+            "url": expected_url,
+            "sha256": admitted_digest,
+            "revision": source_revision,
+        },
         "tasks": tasks,
         "config": config,
         "masterBody": body,
@@ -1140,10 +1220,29 @@ def forge_campaign_state(
     return diagnoses, escalations[0] if escalations else None
 
 
-def pull_request_marker(campaign: str, issue_number: str, task_id: str) -> str:
+def task_revision(task: dict[str, Any]) -> str | None:
+    value = task.get("revision")
+    if value is None:
+        return None
+    value = required_string(value, f"task {task.get('id')} revision")
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", value):
+        fail("task revision must be a lowercase SHA-256 identity")
+    return value
+
+
+def pull_request_marker(
+    campaign: str, issue_number: str, task_id: str, revision: str | None = None
+) -> str:
+    if revision is None:
+        return (
+            "<!-- tally:spec-build:v1 "
+            f"campaign={campaign} issue={issue_number} task={task_id} -->"
+        )
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", revision):
+        fail("pull request marker revision must be a lowercase SHA-256 identity")
     return (
-        "<!-- tally:spec-build:v1 "
-        f"campaign={campaign} issue={issue_number} task={task_id} -->"
+        "<!-- tally:spec-build:v2 "
+        f"campaign={campaign} issue={issue_number} task={task_id} revision={revision} -->"
     )
 
 
@@ -1219,19 +1318,24 @@ def merged_github_tasks(
     warnings: list[str] = []
     claimed_urls: set[str] = set()
     markers = {
-        task["id"]: pull_request_marker(campaign, issue_number, task["id"])
+        task["id"]: pull_request_marker(
+            campaign, issue_number, task["id"], task_revision(task)
+        )
         for task in tasks
         if task["kind"] == "implementation"
     }
-    campaign_marker_prefix = (
-        "<!-- tally:spec-build:v1 "
-        f"campaign={campaign} issue={issue_number} task="
+    revisions = {task["id"]: task_revision(task) for task in tasks}
+    campaign_marker_prefixes = (
+        f"<!-- tally:spec-build:v1 campaign={campaign} issue={issue_number} task=",
+        f"<!-- tally:spec-build:v2 campaign={campaign} issue={issue_number} task=",
     )
     for candidate in candidates:
         if not isinstance(candidate, dict) or not isinstance(candidate.get("body"), str):
             continue
         body = candidate["body"]
-        if campaign_marker_prefix in body and not any(marker in body for marker in markers.values()):
+        if any(prefix in body for prefix in campaign_marker_prefixes) and not any(
+            marker in body for marker in markers.values()
+        ):
             url = candidate.get("url")
             identity = url if isinstance(url, str) and url else "an unidentifiable pull request"
             warnings.append(
@@ -1281,13 +1385,16 @@ def merged_github_tasks(
             "taskId": task_id,
             "pullRequest": url_value,
             "mergeCommit": oid,
+            **({"revision": revisions[task_id]} if revisions[task_id] is not None else {}),
         }, None
 
     for task in tasks:
         if task["kind"] != "implementation":
             continue
         marker = markers[task["id"]]
-        branch = stable_publish_branch(campaign, issue_number, task["id"])
+        branch = stable_publish_branch(
+            campaign, issue_number, task["id"], task_revision(task)
+        )
         matching = [
             candidate
             for candidate in candidates
@@ -1367,9 +1474,12 @@ def merged_github_tasks(
     return facts, list(dict.fromkeys(warnings))
 
 
-def stable_publish_branch(campaign: str, issue_number: str, task_id: str) -> str:
+def stable_publish_branch(
+    campaign: str, issue_number: str, task_id: str, revision: str | None = None
+) -> str:
     campaign_slug = safe_slug(campaign, 32)
-    return f"tally/{campaign_slug}-issue-{issue_number}/{task_id}"
+    suffix = "" if revision is None else "-" + revision.removeprefix("sha256:")[:16]
+    return f"tally/{campaign_slug}-issue-{issue_number}/{task_id}{suffix}"
 
 
 def merged_local_tasks(
@@ -1394,7 +1504,8 @@ def merged_local_tasks(
     for task in tasks:
         if task["kind"] != "implementation":
             continue
-        branch = stable_publish_branch(campaign, issue_number, task["id"])
+        revision = task_revision(task)
+        branch = stable_publish_branch(campaign, issue_number, task["id"], revision)
         remote_ref = f"refs/remotes/{remote}/{branch}"
         if git(checkout, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode:
             continue
@@ -1406,6 +1517,7 @@ def merged_local_tasks(
                 "taskId": task["id"],
                 "pullRequest": f"local://{repository}/{branch}",
                 "mergeCommit": head,
+                **({"revision": revision} if revision is not None else {}),
             }
         )
     return facts
@@ -1485,7 +1597,7 @@ def sync_issue_checkboxes(
     issue_number: str,
     body: str,
     tasks: list[dict[str, Any]],
-    merged_ids: set[str],
+    completed_ids: set[str],
 ) -> None:
     start_index = body.find(WORKLIST_BEGIN)
     if start_index < 0:
@@ -1500,7 +1612,7 @@ def sync_issue_checkboxes(
         fail("campaign master issue repeats a worklist marker")
     lines = [""]
     for task in tasks:
-        state = "x" if task["id"] in merged_ids else " "
+        state = "x" if task["id"] in completed_ids else " "
         title = task["title"].replace("\r", " ").replace("\n", " ")
         lines.append(
             f"- [{state}] {TASK_MARKER_PREFIX}{task['id']} --> "
@@ -1523,6 +1635,62 @@ def sync_issue_checkboxes(
             ],
             input_text=updated,
         )
+
+
+def close_completed_issue_campaign(
+    repository: str,
+    issue_number: str,
+    source: dict[str, str],
+    tasks: list[dict[str, Any]],
+) -> None:
+    for task in tasks:
+        task_issue = campaign_issue(task["brief"].get("issue"))
+        viewed = github_json(
+            ["api", f"repos/{repository}/issues/{task_issue['number']}"],
+            f"campaign task issue {task['id']}",
+        )
+        if not isinstance(viewed, dict):
+            fail(f"campaign task issue {task['id']} did not return an object")
+        if viewed.get("state") == "open":
+            run(
+                [
+                    "gh",
+                    "issue",
+                    "close",
+                    task_issue["number"],
+                    "--repo",
+                    repository,
+                ]
+            )
+    digest = required_string(source.get("sha256"), "source.sha256")
+    marker = f"<!-- tally:campaign-complete:v1 source={digest} -->"
+    comments = run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            f"repos/{repository}/issues/{issue_number}/comments?per_page=100",
+            "--jq",
+            ".[] | .body",
+        ]
+    ).stdout
+    if marker not in comments:
+        run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                issue_number,
+                "--repo",
+                repository,
+                "--body",
+                (
+                    f"{marker}\nCampaign complete: {len(tasks)} task(s) are bound to "
+                    f"durable merge/checkpoint facts for `{digest}`."
+                ),
+            ]
+        )
+    run(["gh", "issue", "close", issue_number, "--repo", repository])
 
 
 def parallelism_warnings(
@@ -1602,12 +1770,8 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         repository = worklist["repository"]
         config = repo_config(data.get("repositoryConfig"))
         max_parallel = data["maxParallel"]
-    base_rev = (
-        None
-        if forge_native
-        else required_string(
-            worklist["source"].get("revision"), "worklist source revision"
-        )
+    base_rev = required_string(
+        worklist["source"].get("revision"), "worklist source revision"
     )
     if config["forge"] == "github":
         merged, warnings = merged_github_tasks(
@@ -1683,8 +1847,15 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             issue["number"],
             worklist["masterBody"],
             worklist["tasks"],
-            merged_ids,
+            completed_ids,
         )
+        if not remaining:
+            close_completed_issue_campaign(
+                repository,
+                issue["number"],
+                worklist["source"],
+                worklist["tasks"],
+            )
     warnings.extend(parallelism_warnings(ready, frontier, max_parallel))
     result = {
         "schemaVersion": 1,
@@ -2024,18 +2195,7 @@ def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
     if not command.startswith("/"):
         fail("reconcileCommand must be an explicit slash command")
     if config["forge"] == "github":
-        run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                issue["number"],
-                "--repo",
-                repository,
-                "--body",
-                command,
-            ]
-        )
+        post_verified_issue_comment(repository, issue["number"], command)
         created = True
     else:
         run_key = hashlib.sha256(run_id.encode()).hexdigest()[:24]
@@ -2118,6 +2278,18 @@ def marker_path(identity: dict[str, Any]) -> Path:
     return identity["workspaceRoot"] / ".state" / run_hash / f"{identity['taskId']}.json"
 
 
+def pass_record_path(workspace_root: Path, run_hash: str) -> Path:
+    return workspace_root / ".state" / "passes" / f"{run_hash}.json"
+
+
+def task_state_markers(state_root: Path) -> list[Path]:
+    return [
+        marker
+        for marker in state_root.glob("*/*.json")
+        if marker.parent != state_root / "passes"
+    ]
+
+
 def prune_empty_ancestors(path: Path, stop: Path) -> None:
     current = path
     while current != stop:
@@ -2139,7 +2311,7 @@ def remove_prep_markers(
     state_root = workspace_root / ".state"
     if not state_root.is_dir():
         return
-    for marker in state_root.glob("*/*.json"):
+    for marker in task_state_markers(state_root):
         try:
             saved = json.loads(marker.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -2173,15 +2345,273 @@ def parse_worktrees(checkout: Path) -> list[dict[str, str]]:
     return records
 
 
+def tally_executable(value: Any) -> Path:
+    executable = Path(required_string(value, "tally"))
+    if not executable.is_absolute() or not executable.is_file() or not os.access(executable, os.X_OK):
+        fail("tally must name an absolute executable file")
+    return executable
+
+
+def json_command(command: list[str], context: str) -> dict[str, Any]:
+    result = run(command)
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        fail(f"{context} returned invalid JSON: {error}")
+    if not isinstance(value, dict):
+        fail(f"{context} must return a JSON object")
+    return value
+
+
+def current_flow_run_id(tally: Path) -> str:
+    task_uuid = required_string(os.environ.get("TALLY_TASK_UUID"), "TALLY_TASK_UUID")
+    try:
+        uuid.UUID(task_uuid)
+    except ValueError:
+        fail("TALLY_TASK_UUID must be a UUID")
+    response = json_command(
+        [str(tally), "query", "job", task_uuid],
+        "tally query job for the sweep node",
+    )
+    job = response.get("job")
+    if not isinstance(job, dict):
+        fail("tally query job for the sweep node omitted job")
+    orchestration = job.get("orchestration")
+    if not isinstance(orchestration, dict):
+        fail("tally query job for the sweep node omitted orchestration")
+    flow_run_id = required_string(
+        orchestration.get("flowRunId"),
+        "sweep node orchestration.flowRunId",
+    )
+    try:
+        uuid.UUID(flow_run_id)
+    except ValueError:
+        fail("sweep node orchestration.flowRunId must be a UUID")
+    return flow_run_id
+
+
+def query_live_flow_jobs(tally: Path, flow_run_id: str) -> list[dict[str, Any]]:
+    cursor: str | None = None
+    seen_cursors: set[str] = set()
+    live: list[dict[str, Any]] = []
+    for _ in range(128):
+        command = [
+            str(tally),
+            "query",
+            "jobs",
+            "--flow-run",
+            flow_run_id,
+            "--limit",
+            "1000",
+        ]
+        if cursor is not None:
+            command.extend(["--cursor", cursor])
+        response = json_command(command, f"tally query jobs for flow {flow_run_id}")
+        items = response.get("items")
+        if not isinstance(items, list):
+            fail(f"tally query jobs for flow {flow_run_id} omitted items")
+        for index, candidate in enumerate(items):
+            if not isinstance(candidate, dict):
+                fail(f"tally query jobs for flow {flow_run_id} item {index} is not an object")
+            state = candidate.get("liveState")
+            if state is None:
+                continue
+            if state not in LIVE_JOB_STATES:
+                fail(
+                    f"tally query jobs for flow {flow_run_id} returned unknown live state "
+                    f"{state!r}"
+                )
+            orchestration = candidate.get("orchestration")
+            if not isinstance(orchestration, dict) or orchestration.get("flowRunId") != flow_run_id:
+                fail(f"tally query jobs for flow {flow_run_id} returned a mismatched job")
+            task_ref = candidate.get("taskRef")
+            if task_ref is not None and not isinstance(task_ref, str):
+                fail(f"tally query jobs for flow {flow_run_id} returned an invalid taskRef")
+            live.append(
+                {
+                    "anchor": required_string(
+                        candidate.get("anchor"),
+                        f"tally query jobs for flow {flow_run_id} item {index}.anchor",
+                    ),
+                    "liveState": state,
+                    "taskRef": task_ref,
+                }
+            )
+        next_cursor = response.get("nextCursor")
+        if next_cursor is None:
+            return live
+        cursor = required_string(next_cursor, "tally query jobs nextCursor")
+        if cursor in seen_cursors:
+            fail(f"tally query jobs for flow {flow_run_id} repeated a pagination cursor")
+        seen_cursors.add(cursor)
+    fail(f"tally query jobs for flow {flow_run_id} exceeded 128 pages")
+
+
+def query_live_campaign_jobs(
+    tally: Path,
+    campaign_identity: str,
+    current_flow_run_id: str,
+) -> list[dict[str, Any]]:
+    live: list[dict[str, Any]] = []
+    for state in sorted(LIVE_JOB_STATES):
+        cursor: str | None = None
+        seen_cursors: set[str] = set()
+        for _ in range(128):
+            command = [
+                str(tally),
+                "query",
+                "jobs",
+                "--state",
+                state,
+                "--limit",
+                "1000",
+            ]
+            if cursor is not None:
+                command.extend(["--cursor", cursor])
+            response = json_command(command, f"tally query jobs in state {state}")
+            items = response.get("items")
+            if not isinstance(items, list):
+                fail(f"tally query jobs in state {state} omitted items")
+            for index, candidate in enumerate(items):
+                if not isinstance(candidate, dict):
+                    fail(f"tally query jobs in state {state} item {index} is not an object")
+                if candidate.get("liveState") != state:
+                    fail(f"tally query jobs in state {state} returned a mismatched live state")
+                task_ref = candidate.get("taskRef")
+                if not isinstance(task_ref, str) or not task_ref.startswith(
+                    f"{campaign_identity}/"
+                ):
+                    continue
+                orchestration = candidate.get("orchestration")
+                flow_run_id = (
+                    orchestration.get("flowRunId")
+                    if isinstance(orchestration, dict)
+                    else None
+                )
+                if not isinstance(flow_run_id, str):
+                    fail(
+                        f"live campaign job {candidate.get('anchor')!r} omitted "
+                        "orchestration.flowRunId"
+                    )
+                if flow_run_id == current_flow_run_id:
+                    continue
+                live.append(
+                    {
+                        "anchor": required_string(
+                            candidate.get("anchor"),
+                            f"tally query jobs in state {state} item {index}.anchor",
+                        ),
+                        "flowRunId": flow_run_id,
+                        "liveState": state,
+                        "taskRef": task_ref,
+                    }
+                )
+            next_cursor = response.get("nextCursor")
+            if next_cursor is None:
+                break
+            cursor = required_string(next_cursor, "tally query jobs nextCursor")
+            if cursor in seen_cursors:
+                fail(f"tally query jobs in state {state} repeated a pagination cursor")
+            seen_cursors.add(cursor)
+        else:
+            fail(f"tally query jobs in state {state} exceeded 128 pages")
+    return sorted(live, key=lambda item: (item["flowRunId"], item["anchor"]))
+
+
+def validated_pass_record(
+    workspace_root: Path,
+    run_hash: str,
+    campaign: str,
+    campaign_identity: str,
+    repository: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    path = pass_record_path(workspace_root, run_hash)
+    if not path.exists():
+        return None, "no daemon liveness record exists"
+    if path.is_symlink() or not path.is_file():
+        return None, f"daemon liveness record is not a regular file: {path}"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        return None, f"cannot read daemon liveness record {path}: {error}"
+    if not isinstance(saved, dict):
+        return None, f"daemon liveness record is not an object: {path}"
+    expected_fields = {
+        "schemaVersion",
+        "campaign",
+        "campaignIdentity",
+        "repository",
+        "runId",
+        "runHash",
+        "flowRunId",
+    }
+    if set(saved) != expected_fields:
+        return None, f"daemon liveness record has an unexpected shape: {path}"
+    saved_run_id = saved.get("runId")
+    flow_run_id = saved.get("flowRunId")
+    if (
+        saved.get("schemaVersion") != PASS_RECORD_SCHEMA_VERSION
+        or not isinstance(saved.get("campaign"), str)
+        or saved.get("campaignIdentity") != campaign_identity
+        or saved.get("repository") != repository
+        or not isinstance(saved_run_id, str)
+        or not saved_run_id
+        or hashlib.sha256(saved_run_id.encode()).hexdigest()[:12] != run_hash
+        or saved.get("runHash") != run_hash
+        or not isinstance(flow_run_id, str)
+    ):
+        return None, f"daemon liveness record identity does not match run {run_hash}: {path}"
+    try:
+        uuid.UUID(flow_run_id)
+    except ValueError:
+        return None, f"daemon liveness record has an invalid flowRunId: {path}"
+    return saved, None
+
+
 def action_sweep(brief: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(brief, dict):
+        fail("sweep brief must be an object")
+    workspace_root = Path(required_string(brief.get("workspaceRoot"), "workspaceRoot"))
+    if not workspace_root.is_absolute():
+        fail("workspaceRoot must be absolute")
+    state_root = workspace_root / ".state"
+    if state_root.exists() and (state_root.is_symlink() or not state_root.is_dir()):
+        fail("workspaceRoot .state must be a real directory")
+    state_root.mkdir(parents=True, exist_ok=True)
+    lock_path = state_root / "sweep.lock"
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError as error:
+        fail(f"cannot open campaign sweep lock {lock_path}: {error}")
+    with os.fdopen(descriptor, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return action_sweep_locked(brief)
+
+
+def action_sweep_locked(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
         brief,
-        {"campaign", "repository", "repositoryConfig", "runId", "workspaceRoot"},
+        {
+            "campaign",
+            "campaignIdentity",
+            "repository",
+            "repositoryConfig",
+            "runId",
+            "workspaceRoot",
+            "tally",
+        },
         "sweep brief",
     )
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
         fail("campaign is not a safe component")
+    campaign_identity = required_string(
+        data.get("campaignIdentity", campaign), "campaignIdentity", 80
+    )
     repository = required_string(data.get("repository"), "repository")
     if not REPOSITORY.fullmatch(repository):
         fail("repository must use owner/name form")
@@ -2189,6 +2619,7 @@ def action_sweep(brief: dict[str, Any]) -> dict[str, Any]:
     workspace_root = Path(required_string(data.get("workspaceRoot"), "workspaceRoot"))
     if not workspace_root.is_absolute():
         fail("workspaceRoot must be absolute")
+    tally = tally_executable(data.get("tally"))
     config = repo_config(data.get("repositoryConfig"))
     checkout: Path = config["checkout"]
     campaign_slug = safe_slug(campaign, 24)
@@ -2201,8 +2632,119 @@ def action_sweep(brief: dict[str, Any]) -> dict[str, Any]:
     )
     cleaned: list[str] = []
     warnings: list[str] = []
+    live_runs: list[dict[str, Any]] = []
 
-    for record in parse_worktrees(checkout):
+    state_root = workspace_root / ".state"
+    passes_root = state_root / "passes"
+    if passes_root.exists() and (passes_root.is_symlink() or not passes_root.is_dir()):
+        fail("workspaceRoot .state/passes must be a real directory")
+    passes_root.mkdir(exist_ok=True)
+    flow_run_id = current_flow_run_id(tally)
+    write_atomic(
+        pass_record_path(workspace_root, current_hash),
+        {
+            "schemaVersion": PASS_RECORD_SCHEMA_VERSION,
+            "campaign": campaign,
+            "campaignIdentity": campaign_identity,
+            "repository": repository,
+            "runId": run_id,
+            "runHash": current_hash,
+            "flowRunId": flow_run_id,
+        },
+    )
+    blocking_jobs = query_live_campaign_jobs(tally, campaign_identity, flow_run_id)
+
+    worktree_records = parse_worktrees(checkout)
+    listed = git(
+        checkout,
+        "for-each-ref",
+        "--format=%(refname:short)",
+        f"refs/heads/tally-work/{campaign_slug}-",
+    ).stdout.splitlines()
+    state_markers = task_state_markers(state_root) if state_root.is_dir() else []
+    candidate_hashes: set[str] = set()
+    for record in worktree_records:
+        raw_path = record.get("worktree")
+        if not raw_path:
+            continue
+        try:
+            relative = Path(raw_path).resolve().relative_to(repository_root)
+        except ValueError:
+            continue
+        if relative.parts and re.fullmatch(r"[0-9a-f]{12}", relative.parts[0]):
+            candidate_hashes.add(relative.parts[0])
+    for branch in listed:
+        matched = branch_pattern.fullmatch(branch)
+        if matched is not None:
+            candidate_hashes.add(matched.group(1))
+    for marker in state_markers:
+        try:
+            saved = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(saved, dict)
+            and saved.get("campaign") == campaign
+            and saved.get("repository") == repository
+            and isinstance(saved.get("runId"), str)
+            and saved["runId"]
+        ):
+            candidate_hashes.add(hashlib.sha256(saved["runId"].encode()).hexdigest()[:12])
+    if passes_root.is_dir() and not passes_root.is_symlink():
+        for record in passes_root.glob("*.json"):
+            if re.fullmatch(r"[0-9a-f]{12}\.json", record.name):
+                candidate_hashes.add(record.stem)
+    if repository_root.is_dir():
+        for child in repository_root.iterdir():
+            if child.is_dir() and re.fullmatch(r"[0-9a-f]{12}", child.name):
+                candidate_hashes.add(child.name)
+    candidate_hashes.discard(current_hash)
+
+    protected_hashes: set[str] = set()
+    for candidate_hash in sorted(candidate_hashes):
+        pass_record, reason = validated_pass_record(
+            workspace_root,
+            candidate_hash,
+            campaign,
+            campaign_identity,
+            repository,
+        )
+        if pass_record is None:
+            protected_hashes.add(candidate_hash)
+            warnings.append(
+                f"left campaign run {candidate_hash} untouched because {reason}"
+            )
+            continue
+        jobs = query_live_flow_jobs(tally, pass_record["flowRunId"])
+        if jobs:
+            protected_hashes.add(candidate_hash)
+            live_runs.append(
+                {
+                    "runHash": candidate_hash,
+                    "flowRunId": pass_record["flowRunId"],
+                    "jobs": jobs,
+                }
+            )
+            summary = ", ".join(
+                f"{job['liveState']}:{job['anchor']}"
+                + (f":{job['taskRef']}" if job["taskRef"] is not None else "")
+                for job in jobs
+            )
+            warnings.append(
+                f"left live campaign run {candidate_hash} untouched: {summary}"
+            )
+    if blocking_jobs:
+        protected_hashes.update(candidate_hashes)
+        summary = ", ".join(
+            f"{job['liveState']}:{job['anchor']}:{job['taskRef']}"
+            for job in blocking_jobs
+        )
+        warnings.append(
+            "deferred campaign reconciliation because older campaign jobs remain live: "
+            + summary
+        )
+
+    for record in worktree_records:
         raw_path = record.get("worktree")
         if not raw_path:
             continue
@@ -2224,6 +2766,8 @@ def action_sweep(brief: dict[str, Any]) -> dict[str, Any]:
         lane_hash = relative.parts[0]
         if lane_hash == current_hash:
             continue
+        if lane_hash in protected_hashes:
+            continue
         branch_ref = record.get("branch", "")
         branch = branch_ref.removeprefix("refs/heads/")
         matched_branch = branch_pattern.fullmatch(branch) if branch else None
@@ -2244,15 +2788,11 @@ def action_sweep(brief: dict[str, Any]) -> dict[str, Any]:
         cleaned.append(f"worktree:{worktree}")
 
     git(checkout, "worktree", "prune", check=False)
-    listed = git(
-        checkout,
-        "for-each-ref",
-        "--format=%(refname:short)",
-        f"refs/heads/tally-work/{campaign_slug}-",
-    ).stdout.splitlines()
     for branch in listed:
         matched = branch_pattern.fullmatch(branch)
         if matched is None or matched.group(1) == current_hash:
+            continue
+        if matched.group(1) in protected_hashes:
             continue
         deleted = git(checkout, "branch", "-D", branch, check=False)
         if deleted.returncode == 0:
@@ -2261,9 +2801,8 @@ def action_sweep(brief: dict[str, Any]) -> dict[str, Any]:
             detail = deleted.stderr.strip() or deleted.stdout.strip() or "no output"
             warnings.append(f"could not sweep branch {branch!r}: {detail}")
 
-    state_root = workspace_root / ".state"
     if state_root.is_dir():
-        for marker in state_root.glob("*/*.json"):
+        for marker in state_markers:
             try:
                 saved = json.loads(marker.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as error:
@@ -2281,6 +2820,8 @@ def action_sweep(brief: dict[str, Any]) -> dict[str, Any]:
                 warnings.append(f"left identity-less campaign state marker untouched: {marker}")
                 continue
             saved_hash = hashlib.sha256(saved_run_id.encode()).hexdigest()[:12]
+            if saved_hash in protected_hashes:
+                continue
             saved_worktree_value = saved.get("worktreePath")
             saved_branch = saved.get("branch")
             if not isinstance(saved_worktree_value, str) or not isinstance(saved_branch, str):
@@ -2336,9 +2877,47 @@ def action_sweep(brief: dict[str, Any]) -> dict[str, Any]:
         for child in repository_root.iterdir():
             if child.is_dir():
                 prune_empty_ancestors(child, repository_root)
+
+    remaining_hashes: set[str] = set()
+    for record in parse_worktrees(checkout):
+        raw_path = record.get("worktree")
+        if not raw_path:
+            continue
+        try:
+            relative = Path(raw_path).resolve().relative_to(repository_root)
+        except ValueError:
+            continue
+        if relative.parts and re.fullmatch(r"[0-9a-f]{12}", relative.parts[0]):
+            remaining_hashes.add(relative.parts[0])
+    remaining_branches = git(
+        checkout,
+        "for-each-ref",
+        "--format=%(refname:short)",
+        f"refs/heads/tally-work/{campaign_slug}-",
+    ).stdout.splitlines()
+    for branch in remaining_branches:
+        matched = branch_pattern.fullmatch(branch)
+        if matched is not None:
+            remaining_hashes.add(matched.group(1))
+    if repository_root.is_dir():
+        for child in repository_root.iterdir():
+            if child.is_dir() and re.fullmatch(r"[0-9a-f]{12}", child.name):
+                remaining_hashes.add(child.name)
+    for candidate_hash in sorted(candidate_hashes - protected_hashes - remaining_hashes):
+        record = pass_record_path(workspace_root, candidate_hash)
+        if record.is_file() and not record.is_symlink():
+            try:
+                record.unlink()
+            except OSError as error:
+                warnings.append(f"could not remove swept pass record {record}: {error}")
+            else:
+                prune_empty_ancestors(record.parent, state_root)
+                cleaned.append(f"pass:{record}")
     return {
         "currentRunHash": current_hash,
+        "blockingJobs": blocking_jobs,
         "cleaned": sorted(set(cleaned)),
+        "liveRuns": live_runs,
         "warnings": list(dict.fromkeys(warnings)),
     }
 
@@ -2351,7 +2930,7 @@ def write_atomic(path: Path, value: dict[str, Any]) -> None:
 
 
 def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
-    _, config, identity = prep_identity(brief)
+    data, config, identity = prep_identity(brief)
     checkout: Path = config["checkout"]
     remote = config["remote"]
     base_branch = config["baseBranch"]
@@ -2360,7 +2939,10 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     repository_slug = safe_slug(identity["repository"].split("/", 1)[1], 40)
     branch = f"tally-work/{campaign_slug}-{run_hash}/{identity['taskId']}"
     publish_branch = stable_publish_branch(
-        identity["campaign"], identity["issueNumber"], identity["taskId"]
+        identity["campaign"],
+        identity["issueNumber"],
+        identity["taskId"],
+        task_revision(data["task"]),
     )
     worktree = (
         identity["workspaceRoot"] / repository_slug / run_hash / identity["taskId"]
@@ -2924,7 +3506,10 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
     task = data["task"]
     issue = campaign_issue(data.get("issue"))
     marker = pull_request_marker(
-        required_string(data.get("campaign"), "campaign"), issue["number"], task["id"]
+        required_string(data.get("campaign"), "campaign"),
+        issue["number"],
+        task["id"],
+        task_revision(task),
     )
     existing = run(
         [
@@ -3075,6 +3660,28 @@ def publication(value: Any, context: str = "publication") -> dict[str, Any]:
     }
 
 
+def abandon_published_head(
+    worktree: Path,
+    remote: str,
+    published: dict[str, str],
+    context: str,
+) -> None:
+    abandoned = git(
+        worktree,
+        "push",
+        f"--force-with-lease=refs/heads/{published['branch']}:{published['head']}",
+        remote,
+        f":refs/heads/{published['branch']}",
+        check=False,
+    )
+    if abandoned.returncode != 0:
+        detail = abandoned.stderr.strip() or abandoned.stdout.strip() or "no output"
+        fail(
+            f"{context}; exact published head {published['head']} could not be "
+            f"abandoned: {detail}"
+        )
+
+
 def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
     data, config, worktree = publication_identity(brief, "rebase")
     published = publication(data.get("publication"))
@@ -3134,50 +3741,54 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
     if rebased.returncode != 0:
         detail = rebased.stderr.strip() or rebased.stdout.strip() or "no output"
         aborted = git(worktree, "rebase", "--abort", check=False)
-        abandoned = git(
+        abandon_published_head(
             worktree,
-            "push",
-            f"--force-with-lease=refs/heads/{published['branch']}:{published['head']}",
             remote,
-            f":refs/heads/{published['branch']}",
-            check=False,
+            published,
+            f"cannot rebase task onto current base {base_rev}: {detail}; "
+            f"rebase abort exited {aborted.returncode}",
         )
-        if abandoned.returncode != 0:
-            abandon_detail = (
-                abandoned.stderr.strip() or abandoned.stdout.strip() or "no output"
-            )
-            fail(
-                f"cannot rebase task onto current base {base_rev}: {detail}; "
-                f"rebase abort exited {aborted.returncode}, and the exact published head "
-                f"could not be abandoned: {abandon_detail}"
-            )
         if aborted.returncode != 0:
             abort_detail = aborted.stderr.strip() or aborted.stdout.strip() or "no output"
             fail(
                 f"cannot rebase task onto current base {base_rev}: {detail}; "
-                f"the published branch was abandoned, but rebase abort failed: {abort_detail}"
+                f"published head {published['head']} was abandoned, but rebase abort "
+                f"failed: {abort_detail}"
             )
         fail(
             f"cannot rebase task onto current base {base_rev}: {detail}; "
-            "rebase was aborted and the exact published branch was abandoned so a fresh "
-            "pass can rebuild the task from current base"
+            f"rebase was aborted and exact published head {published['head']} was abandoned; "
+            "a fresh pass can rebuild the task from current base"
         )
     rebased_head = git(worktree, "rev-parse", "HEAD").stdout.strip()
-    ownership = enforce_conflict_domains(
-        worktree,
-        base_rev,
-        rebased_head,
-        data.get("task"),
-        published["taskId"],
-        domains_required,
-    )
-    for constraint in constraints:
-        evaluate_forbid_paths(
+    try:
+        ownership = enforce_conflict_domains(
             worktree,
             base_rev,
             rebased_head,
-            constraint["gateId"],
-            constraint["patterns"],
+            data.get("task"),
+            published["taskId"],
+            domains_required,
+        )
+        for constraint in constraints:
+            evaluate_forbid_paths(
+                worktree,
+                base_rev,
+                rebased_head,
+                constraint["gateId"],
+                constraint["patterns"],
+            )
+    except DriverError as error:
+        abandon_published_head(
+            worktree,
+            remote,
+            published,
+            f"rebased task failed integration policy against current base {base_rev}: {error}",
+        )
+        fail(
+            f"rebased task failed integration policy against current base {base_rev}: {error}; "
+            f"exact published head {published['head']} was abandoned so a fresh pass can "
+            "rebuild the task"
         )
     git(
         worktree,
@@ -3476,6 +4087,98 @@ def github_checkpoint_progress_comment(
                 body,
             ]
         )
+    issue_view = github_json(
+        ["api", f"repos/{repository}/issues/{issue['number']}"],
+        "campaign issue",
+    )
+    issue_body = issue_view.get("body") if isinstance(issue_view, dict) else None
+    if not isinstance(issue_body, str):
+        fail("campaign issue has no body while recording checkpoint progress")
+    task_marker = f"{TASK_MARKER_PREFIX}{task_id} -->"
+    updated_lines: list[str] = []
+    found = False
+    for line in issue_body.splitlines(keepends=True):
+        if task_marker in line:
+            if found:
+                fail(f"campaign worklist repeats task marker {task_id!r}")
+            found = True
+            line = re.sub(r"^- \[[ xX]\]", "- [x]", line)
+        updated_lines.append(line)
+    if not found:
+        fail(f"campaign worklist lacks task marker {task_id!r}")
+    updated_body = "".join(updated_lines)
+    if updated_body != issue_body:
+        run(
+            [
+                "gh",
+                "issue",
+                "edit",
+                issue["number"],
+                "--repo",
+                repository,
+                "--body-file",
+                "-",
+            ],
+            input_text=updated_body,
+        )
+def issue_comment_bodies(repository: str, issue_number: str) -> subprocess.CompletedProcess[str]:
+    return run(
+        [
+            "gh",
+            "api",
+            "--paginate",
+            f"repos/{repository}/issues/{issue_number}/comments?per_page=100",
+            "--jq",
+            ".[].body",
+        ],
+        check=False,
+    )
+
+
+def post_verified_issue_comment(repository: str, issue_number: str, body: str) -> None:
+    failures: list[str] = []
+    for attempt in range(3):
+        before = issue_comment_bodies(repository, issue_number)
+        if before.returncode != 0:
+            detail = before.stderr.strip() or before.stdout.strip() or "no output"
+            failures.append(f"attempt {attempt + 1} preflight read: {detail}")
+        else:
+            before_count = before.stdout.splitlines().count(body)
+            posted = run(
+                [
+                    "gh",
+                    "issue",
+                    "comment",
+                    issue_number,
+                    "--repo",
+                    repository,
+                    "--body",
+                    body,
+                ],
+                check=False,
+            )
+            after = issue_comment_bodies(repository, issue_number)
+            if after.returncode == 0 and after.stdout.splitlines().count(body) > before_count:
+                return
+            post_detail = (
+                "posted"
+                if posted.returncode == 0
+                else posted.stderr.strip() or posted.stdout.strip() or "no output"
+            )
+            verify_detail = (
+                "comment count did not advance"
+                if after.returncode == 0
+                else after.stderr.strip() or after.stdout.strip() or "no output"
+            )
+            failures.append(
+                f"attempt {attempt + 1} post={post_detail}; verification={verify_detail}"
+            )
+        if attempt < 2:
+            time.sleep(2**attempt)
+    fail(
+        f"could not post and verify continuation comment on {repository}#{issue_number} "
+        f"after 3 attempts: {'; '.join(failures)}"
+    )
 
 
 def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
@@ -3502,7 +4205,16 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     config = repo_config(data.get("repositoryConfig"))
     task = object_exact(
         data.get("task"),
-        {"id", "kind", "title", "argv", "runtimeMaxSec", "dependencies"},
+        {
+            "id",
+            "kind",
+            "title",
+            "argv",
+            "runtimeMaxSec",
+            "dependencies",
+            "brief",
+            "revision",
+        },
         "checkpoint task",
     )
     task_id = required_string(task.get("id"), "checkpoint task.id", 80)
@@ -3512,8 +4224,18 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     argv(task.get("argv"), "checkpoint task.argv")
     positive_integer(task.get("runtimeMaxSec"), "checkpoint task.runtimeMaxSec")
     string_list(task.get("dependencies"), "checkpoint task.dependencies")
-    source = object_exact(data.get("source"), {"path", "sha256", "revision"}, "source")
-    required_string(source.get("path"), "source.path")
+    revision = task_revision(task)
+    source_value = data.get("source")
+    if isinstance(source_value, dict) and source_value.get("kind") == "github-issue":
+        source = object_exact(
+            source_value, {"kind", "url", "sha256", "revision"}, "source"
+        )
+        required_string(source.get("url"), "source.url")
+        if revision is None:
+            fail("issue-backed checkpoint task must carry its admitted revision")
+    else:
+        source = object_exact(source_value, {"path", "sha256", "revision"}, "source")
+        required_string(source.get("path"), "source.path")
     source_sha256 = required_string(source.get("sha256"), "source.sha256")
     source_revision = required_string(source.get("revision"), "source.revision")
     if not re.fullmatch(r"[0-9a-f]{40,64}", source_revision):

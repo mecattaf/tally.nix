@@ -149,6 +149,13 @@ authorized.
   dependency ancestry, reject forged or annotated targets, and are invalidated
   by either a pushed worklist edit or any later base commit instead of silently
   treating a point-in-time integration result as permanent.
+- Made campaign sweeping daemon-liveness-backed instead of process-assumed:
+  every run hash is bound to its flow-run identity, an older paused, queued, or
+  running child defers the new pass before reconciliation, and legacy lanes
+  without that proof leak safely. Rebase abandonment receipts now name the
+  recoverable published head, post-rebase policy failures abandon it with the
+  same exact lease, completed-sweep replay refusal is limited to `reused`, and
+  the single continuation comment is retried and read-after-write verified.
 - Completed campaign task-reference observability in `query trace` records and
   generations and in every `query standup` bucket; task-ref-qualified archived
   captures are now regression-tested through retry trace lookup and recovered
@@ -215,6 +222,15 @@ authorized.
   JSON modes collapse journal/evidence/witness echoes, while `--provenance`
   restores the uncollapsed source stream.
 
+- Hardened forge-native campaign admission: arming now binds the authenticated
+  GitHub identity, allowed issue/comment actors, checkout repository, immutable
+  registration identity, and canonical executable graph digest. Polling refuses
+  executable revisions until explicit re-arm; agents receive filtered steering
+  snapshots; PR/checkpoint completion is source-revision-bound; issue-native
+  checkpoints remain typed end to end; completed masters close and are pruned;
+  and `campaign disarm` removes a locked local registration. Ad-hoc workspaces
+  now default outside tally's state/data budgets, and `forge: "local"` is an
+  explicit test-only mode.
 - Restored `postEvidence` to its original pass/reuse-only meaning. Operators
   may opt into one idempotent public comment per failed attempt with
   `postFailureEvidence`; retries therefore accumulate distinct failure

@@ -66,6 +66,9 @@ const SPEC_BUILD_RUN_6: &str = "00000000-0000-4000-8000-000000000523";
 const SPEC_BUILD_RUN_7: &str = "00000000-0000-4000-8000-000000000524";
 const SPEC_BUILD_RUN_8: &str = "00000000-0000-4000-8000-000000000525";
 const SPEC_BUILD_RUN_9: &str = "00000000-0000-4000-8000-000000000526";
+const SPEC_BUILD_ORPHAN_RUN: &str = "00000000-0000-4000-8000-000000000527";
+const SPEC_BUILD_DEFERRED_RUN: &str = "00000000-0000-4000-8000-000000000528";
+const SPEC_BUILD_ATTACHED_RUN: &str = "00000000-0000-4000-8000-000000000529";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -853,6 +856,16 @@ async fn wait_for_flow_items(client: &RpcClient, flow_run_id: &str, expected: us
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     panic!("flow run {flow_run_id} did not reach {expected} durable rows");
+}
+
+async fn wait_for_path(path: &Path) {
+    for _ in 0..400 {
+        if path.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("path did not appear: {}", path.display());
 }
 
 async fn wait_for_flow_state(
@@ -2395,6 +2408,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     "maxParallel": 3,
                     "reconcileCommand": "/tally reconcile fixture",
                     "workspaceRoot": workspace_root,
+                    "tally": env!("CARGO_BIN_EXE_tally"),
                     "driver": driver,
                     "driverRuntimeMaxSec": 30,
                     "agent": {
@@ -2589,6 +2603,97 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .contains("_campaign-preflight")
             );
 
+            fs::write(control.join("hold-task-1"), b"").unwrap();
+            fs::write(control.join("hold-task-3"), b"").unwrap();
+            let mut orphan = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_ORPHAN_RUN,
+                &arguments("orphan-comment", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            wait_for_path(&control.join("holding-task-1")).await;
+            wait_for_path(&control.join("holding-task-3")).await;
+            let orphan_items = flow_items(&client, SPEC_BUILD_ORPHAN_RUN).await;
+            assert!(orphan_items.iter().any(|item| {
+                item["orchestration"]["nodeLabel"] == "agent-task-1"
+                    && item["liveState"] == "running"
+            }));
+            assert!(orphan_items.iter().any(|item| {
+                item["orchestration"]["nodeLabel"] == "agent-task-3"
+                    && item["liveState"] == "running"
+            }));
+
+            orphan.kill().await.unwrap();
+            let orphan_status = orphan.wait().await.unwrap();
+            assert!(!orphan_status.success());
+
+            let deferred = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_DEFERRED_RUN,
+                &arguments("deferred-comment", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let deferred = runner_output(deferred).await;
+            assert!(
+                deferred.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&deferred.stdout),
+                String::from_utf8_lossy(&deferred.stderr)
+            );
+            let deferred_value = &flow_report(&deferred)["report"]["finalValue"];
+            assert_eq!(deferred_value["state"], "deferred-live-jobs");
+            assert!(deferred_value["maintenance"]["blockingJobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|job| {
+                    job["flowRunId"] == SPEC_BUILD_ORPHAN_RUN
+                        && job["taskRef"] == "fixture/task-1"
+                        && job["liveState"] == "running"
+                }));
+            assert!(deferred_value["maintenance"]["liveRuns"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|run| run["flowRunId"] == SPEC_BUILD_ORPHAN_RUN));
+            let deferred_items = wait_for_flow_items(&client, SPEC_BUILD_DEFERRED_RUN, 1).await;
+            assert_eq!(
+                deferred_items[0]["orchestration"]["nodeLabel"],
+                "spec-build-sweep"
+            );
+            assert!(
+                fixture_git(&checkout, &["worktree", "list", "--porcelain"])
+                    .contains(workspace_root.to_str().unwrap()),
+                "a fresh pass removed a lane still owned by live daemon jobs"
+            );
+
+            fs::remove_file(control.join("hold-task-1")).unwrap();
+            fs::remove_file(control.join("hold-task-3")).unwrap();
+            await_items(&client, &orphan_items).await;
+            for artifact in [
+                "agent-order.log",
+                "policy-order.log",
+                "preflight-order.log",
+                "started-task-1",
+                "started-task-3",
+                "holding-task-1",
+                "holding-task-3",
+            ] {
+                let path = control.join(artifact);
+                if path.exists() {
+                    fs::remove_file(path).unwrap();
+                }
+            }
+
+            fs::write(control.join("inject-forbidden-path"), b"").unwrap();
             fs::write(control.join("post-change-failed-once"), b"").unwrap();
 
             let second = runner(
@@ -2753,13 +2858,16 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .contains(workspace_root.to_str().unwrap()),
                 "pass exit must reclaim both the failed and merged frontier lanes"
             );
+            let state_root = workspace_root.join(".state");
             assert!(
-                !workspace_root.join(".state").exists()
-                    || fs::read_dir(workspace_root.join(".state"))
-                        .unwrap()
-                        .next()
-                        .is_none(),
-                "pass exit left prep state behind"
+                !state_root.exists()
+                    || fs::read_dir(&state_root).unwrap().all(|entry| {
+                        matches!(
+                            entry.unwrap().file_name().to_str(),
+                            Some("passes" | "sweep.lock")
+                        )
+                    }),
+                "pass exit left task prep state behind"
             );
 
             let third = runner(
@@ -3343,6 +3451,70 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert!(
                 !fixture_git(&checkout, &["worktree", "list", "--porcelain"])
                     .contains(workspace_root.to_str().unwrap())
+            );
+
+            pause(&client, "campaign-control").await;
+            let attached_arguments = arguments("attached-comment", "low");
+            let attached_first = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_ATTACHED_RUN,
+                &attached_arguments,
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let attached_items =
+                wait_for_flow_state(&client, SPEC_BUILD_ATTACHED_RUN, 1, "paused").await;
+            assert_eq!(
+                attached_items[0]["orchestration"]["nodeLabel"],
+                "spec-build-sweep"
+            );
+            let attached_stdout = temp.path().join("attached-replay.out");
+            let mut attached_second_command = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_ATTACHED_RUN,
+                &attached_arguments,
+                32,
+            );
+            attached_second_command
+                .stdout(Stdio::from(fs::File::create(&attached_stdout).unwrap()));
+            let attached_second = attached_second_command.spawn().unwrap();
+            for _ in 0..400 {
+                if fs::read_to_string(&attached_stdout)
+                    .unwrap_or_default()
+                    .contains("\"disposition\":\"attached\"")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            let attached_log = fs::read_to_string(&attached_stdout).unwrap();
+            assert!(
+                attached_log.contains("\"disposition\":\"attached\""),
+                "the concurrent replay did not attach to the live sweep: {attached_log}"
+            );
+            resume_all(&client).await;
+            let (attached_first, attached_second) = tokio::join!(
+                runner_output(attached_first),
+                runner_output(attached_second)
+            );
+            for output in [&attached_first, &attached_second] {
+                assert!(
+                    output.status.success(),
+                    "attached campaign runner failed:\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            assert_eq!(
+                wait_for_flow_items(&client, SPEC_BUILD_ATTACHED_RUN, 2)
+                    .await
+                    .len(),
+                2,
+                "an attached live replay must share sweep and reconcile nodes"
             );
 
             let agent_order = fs::read_to_string(control.join("agent-order.log")).unwrap();

@@ -75,7 +75,8 @@ sub-issues, then register that issue as desired state:
 ```console
 $ tally campaign project WORKLIST.json --repo OWNER/REPO
 $ tally campaign project WORKLIST.json --repo OWNER/REPO --issue ISSUE-URL
-$ tally campaign arm ISSUE-URL [--wait]
+$ tally campaign arm ISSUE-URL [--allow-actor LOGIN]... [--wait]
+$ tally campaign disarm ISSUE-URL
 ```
 
 `project` accepts `--campaign-config PATH` when the worklist does not carry a
@@ -85,22 +86,26 @@ master title. Managed marker sections and projected task bodies are replaced;
 operator prose outside the master markers is preserved.
 
 `arm` accepts only canonical `https://github.com/OWNER/REPO/issues/NUMBER`
-locators. `--no-enqueue` validates and registers without admitting the initial
-pass. `--flow`, `--driver`, `--state-dir`, and `--workspace-root` are mechanism
-overrides intended primarily for verification; normal installations use the
-packaged assets and tally state directory. Re-arming increments the locator's
-retry generation even when the issue graph did not change.
+locators. It binds the current `gh` identity, an actor allowlist, the checkout's
+GitHub remote, and the exact executable issue-graph digest. Polling refuses
+executable edits until explicit re-arm. `--no-enqueue` validates and registers
+without admitting the initial pass. `--flow`, `--driver`, `--state-dir`, and
+`--workspace-root` are mechanism overrides intended primarily for verification;
+`--allow-test-local-forge` is required for the non-continuing local test mode.
+Re-arming increments the retry generation even when the graph did not change.
+`disarm` removes only the locked local registration.
 
 The Home Manager timer invokes the same bounded scan available to operators:
 
 ```console
 $ tally campaign poll --once
+$ tally campaign poll --once --wait
 $ tally campaign list
 ```
 
-Both accept `--state-dir`. `poll` prints observed, dispatched, and failed
+All accept `--state-dir`. `poll` prints observed, dispatched, pruned, and failed
 registration counts and returns nonzero when any live registration cannot be
-validated or dispatched. Closed master issues are inert. See
+validated or dispatched. It prunes closed masters. See
 [Campaigns](../flows/campaigns.md) for the manifest, task-brief, checkbox-proof,
 and host-mechanism contracts.
 

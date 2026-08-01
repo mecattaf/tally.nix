@@ -292,6 +292,34 @@ class CheckpointReceiptTests(unittest.TestCase):
         current = driver.action_worklist(self.worklist_brief)
         self.assertEqual(self.completed(source=current["source"]), [])
 
+    def test_issue_checkpoint_binds_graph_digest_task_revision_and_base(self) -> None:
+        brief = self.checkpoint_brief()
+        brief["source"] = {
+            "kind": "github-issue",
+            "url": "https://github.com/acme/spec/issues/7",
+            "sha256": "sha256:" + "a" * 64,
+            "revision": self.base_rev,
+        }
+        brief["task"] = {
+            **checkpoint_task(),
+            "brief": {
+                "issue": {
+                    "number": "9",
+                    "url": "https://github.com/acme/spec/issues/9",
+                },
+                "body": "Run the admitted checkpoint.",
+            },
+            "revision": "sha256:" + "b" * 64,
+        }
+
+        recorded = driver.action_checkpoint(brief)
+        self.assertEqual(recorded["revision"], self.base_rev)
+        self.assertIn("-" + "a" * 64 + "/" + self.base_rev, recorded["ref"])
+
+        del brief["task"]["revision"]
+        with self.assertRaisesRegex(driver.DriverError, "admitted revision"):
+            driver.action_checkpoint(brief)
+
     def test_checkpoint_rejects_diverged_remote_base(self) -> None:
         advancer = self.clone_advancer()
         git("switch", "--orphan", "replacement", cwd=advancer)

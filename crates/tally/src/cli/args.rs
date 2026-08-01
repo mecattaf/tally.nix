@@ -97,8 +97,10 @@ pub(super) enum CampaignCommand {
     Project(CampaignProjectArgs),
     /// Reconcile changed armed issue graphs into fresh bounded flow passes.
     Poll(CampaignPollArgs),
-    /// Print the local locator registry; campaign policy remains on the forge.
+    /// Print local campaign locators, admitted digests, and authority bindings.
     List(CampaignListArgs),
+    /// Remove a local campaign registration without changing its forge issues.
+    Disarm(CampaignDisarmArgs),
 }
 
 #[derive(Debug, Args)]
@@ -111,13 +113,20 @@ pub(super) struct CampaignArmArgs {
     /// Wait for this bounded reconcile pass to become terminal.
     #[arg(long)]
     pub(super) wait: bool,
+    /// GitHub login whose authored issues/comments may supply campaign input.
+    /// Defaults to the currently authenticated gh login; repeat to add actors.
+    #[arg(long = "allow-actor", value_name = "LOGIN")]
+    pub(super) allowed_actors: Vec<String>,
+    /// Permit forge=local for an explicitly test-only campaign.
+    #[arg(long)]
+    pub(super) allow_test_local_forge: bool,
     /// Override the packaged spec-build flow (primarily for mechanism testing).
     #[arg(long, value_name = "PATH")]
     pub(super) flow: Option<PathBuf>,
     /// Override the packaged policy driver (primarily for mechanism testing).
     #[arg(long, value_name = "PATH")]
     pub(super) driver: Option<PathBuf>,
-    /// Durable registration and worktree root; defaults beneath tally state.
+    /// Durable registration root; defaults beneath tally state.
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
     /// Override the per-campaign worktree root.
@@ -155,12 +164,23 @@ pub(super) struct CampaignPollArgs {
     /// Perform one bounded registry scan.
     #[arg(long)]
     pub(super) once: bool,
+    /// Wait for each newly admitted reconcile pass to become terminal.
+    #[arg(long)]
+    pub(super) wait: bool,
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
 pub(super) struct CampaignListArgs {
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct CampaignDisarmArgs {
+    /// Canonical GitHub master issue URL to remove from the local registry.
+    pub(super) issue: String,
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
 }

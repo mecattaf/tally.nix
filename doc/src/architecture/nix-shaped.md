@@ -218,11 +218,14 @@ script, arguments, or catalog midway.
 Forge-native ad-hoc campaigns make the same weight distinction explicit. The
 Nix generation installs the generic campaign mechanism—the bounded flow,
 driver, pools, adapters, and poller—once. `tally campaign arm` then records a
-GitHub issue locator, not campaign policy. Each fresh pass witnesses the current
-marker-delimited manifest and native task issue bodies; merged pull requests
-remain actual state. This mutable desired-state object is intentional operator
-input, admitted by the explicit arm command, rather than estate configuration
-pretending that a one-night worklist is recurring automation.
+GitHub issue locator plus local admission authority and an executable-graph
+digest, not a second copy of campaign policy. Each fresh pass may observe
+proof-derived projection and authorized steering, but it executes the admitted
+marker-delimited manifest and native task bodies only after independently
+recomputing that digest. Executable edits require explicit re-arm; revision-bound
+merged pull requests remain actual state. This forge object is intentional
+operator input, admitted by the explicit arm command, rather than estate
+configuration pretending that a one-night worklist is recurring automation.
 
 ## Isolation by composition
 

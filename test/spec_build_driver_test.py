@@ -108,6 +108,28 @@ def prep_brief(
     }
 
 
+def sweep_brief(
+    checkout: Path,
+    workspace_root: Path,
+    run_id: str,
+    tally: Path,
+    *,
+    campaign: str = "fixture",
+    campaign_identity: str | None = None,
+) -> dict[str, object]:
+    brief: dict[str, object] = {
+        "campaign": campaign,
+        "repository": "acme/spec",
+        "repositoryConfig": repository_config(checkout),
+        "runId": run_id,
+        "workspaceRoot": str(workspace_root),
+        "tally": str(tally),
+    }
+    if campaign_identity is not None:
+        brief["campaignIdentity"] = campaign_identity
+    return brief
+
+
 class FakeGitHub:
     def __init__(self, root: Path, state: dict[str, object]) -> None:
         self.root = root
@@ -163,6 +185,12 @@ class FakeGitHub:
                         for comment in issue_comments:
                             print(comment.get("body", ""))
                 elif args[:2] == ["issue", "comment"]:
+                    failures = state.get("commentFailures", 0)
+                    if failures:
+                        state["commentFailures"] = failures - 1
+                        state_path.write_text(json.dumps(state), encoding="utf-8")
+                        print("injected comment failure", file=sys.stderr)
+                        raise SystemExit(93)
                     body = args[args.index("--body") + 1]
                     state.setdefault("comments", []).append(body)
                     comment_number = len(state["comments"])
@@ -213,10 +241,11 @@ class FakeGitHub:
 
 
 class ForgeNativeReconcileTests(unittest.TestCase):
-    def test_issue_worklist_accepts_a_revision_free_source_identity(self) -> None:
+    def test_issue_worklist_binds_completion_to_the_observed_base_revision(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root)
+            base_revision = git(checkout, "rev-parse", "HEAD")
             issue_task = {
                 "id": "task-1",
                 "kind": "implementation",
@@ -230,6 +259,7 @@ class ForgeNativeReconcileTests(unittest.TestCase):
                 },
                 "dependencies": [],
                 "conflictDomains": ["task-1"],
+                "revision": "sha256:" + "b" * 64,
             }
             worklist = {
                 "schemaVersion": 1,
@@ -238,6 +268,7 @@ class ForgeNativeReconcileTests(unittest.TestCase):
                     "kind": "github-issue",
                     "url": "https://github.com/acme/spec/issues/7",
                     "sha256": "sha256:" + "a" * 64,
+                    "revision": base_revision,
                 },
                 "tasks": [issue_task],
                 "config": {
@@ -262,9 +293,105 @@ class ForgeNativeReconcileTests(unittest.TestCase):
                 )
 
             self.assertEqual(result["source"], worklist["source"])
-            self.assertNotIn("revision", result["source"])
-            self.assertIsNone(merged.call_args.args[5])
+            self.assertEqual(result["source"]["revision"], base_revision)
+            self.assertEqual(merged.call_args.args[5], base_revision)
             self.assertEqual([item["id"] for item in result["frontier"]], ["task-1"])
+
+
+class FakeTally:
+    TASK_UUID = "00000000-0000-4000-8000-000000000901"
+
+    def __init__(self, root: Path, current_flow_run_id: str) -> None:
+        self.root = root
+        self.state_path = root / "fake-tally-state.json"
+        self.program = root / "fake-tally"
+        self.state_path.write_text(
+            json.dumps(
+                {
+                    "currentFlowRunId": current_flow_run_id,
+                    "flows": {},
+                    "calls": [],
+                    "failQueries": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.program.write_text(
+            f"#!{sys.executable}\n"
+            + textwrap.dedent(
+                """\
+                import json
+                import os
+                from pathlib import Path
+                import sys
+
+                state_path = Path(os.environ["FAKE_TALLY_STATE"])
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                args = sys.argv[1:]
+                state.setdefault("calls", []).append(args)
+                state_path.write_text(json.dumps(state), encoding="utf-8")
+                if state.get("failQueries"):
+                    print("injected tally query failure", file=sys.stderr)
+                    raise SystemExit(92)
+                if args[:2] == ["query", "job"]:
+                    print(json.dumps({
+                        "job": {
+                            "orchestration": {
+                                "flowRunId": state["currentFlowRunId"]
+                            }
+                        }
+                    }))
+                elif args[:2] == ["query", "jobs"]:
+                    if "--flow-run" in args:
+                        flow_run_id = args[args.index("--flow-run") + 1]
+                        items = state.get("flows", {}).get(flow_run_id, [])
+                    else:
+                        live_state = args[args.index("--state") + 1]
+                        configured = state.get("liveJobs")
+                        if configured is None:
+                            configured = [
+                                item
+                                for flow_items in state.get("flows", {}).values()
+                                for item in flow_items
+                            ]
+                        items = [
+                            item for item in configured
+                            if item.get("liveState") == live_state
+                        ]
+                    print(json.dumps({
+                        "items": items,
+                        "nextCursor": None
+                    }))
+                else:
+                    print(f"unexpected fake tally argv: {args!r}", file=sys.stderr)
+                    raise SystemExit(91)
+                """
+            ),
+            encoding="utf-8",
+        )
+        self.program.chmod(0o755)
+
+    def __enter__(self) -> "FakeTally":
+        self.environment = mock.patch.dict(
+            os.environ,
+            {
+                "FAKE_TALLY_STATE": str(self.state_path),
+                "TALLY_TASK_UUID": self.TASK_UUID,
+            },
+        )
+        self.environment.start()
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.environment.stop()
+
+    def state(self) -> dict[str, object]:
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def update(self, **values: object) -> None:
+        state = self.state()
+        state.update(values)
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
 
 
 class GitHubForgeTests(unittest.TestCase):
@@ -485,7 +612,7 @@ class GitHubForgeTests(unittest.TestCase):
     def test_forge_native_issue_graph_derives_blocking_and_escalation_config(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            checkout, _ = initialize_repository(root)
+            checkout, _ = initialize_repository(root, remote=True)
             manifest = {
                 "schemaVersion": 1,
                 "name": "fixture",
@@ -515,12 +642,14 @@ class GitHubForgeTests(unittest.TestCase):
                 "tasks": [
                     {
                         "id": "task-1",
+                        "kind": "implementation",
                         "issue": 8,
                         "dependencies": [],
                         "conflictDomains": ["src/one"],
                     },
                     {
                         "id": "task-2",
+                        "kind": "implementation",
                         "issue": 9,
                         "dependencies": ["task-1"],
                         "conflictDomains": ["src/two"],
@@ -582,10 +711,27 @@ class GitHubForgeTests(unittest.TestCase):
                 ],
                 "calls": [],
             }
+            _, references, normalized_manifest = DRIVER.forge_manifest(manifest)
+            graph_digest = DRIVER.canonical_sha256(
+                {
+                    "manifest": normalized_manifest,
+                    "tasks": [
+                        {
+                            "number": reference["issue"],
+                            "title": state["subIssues"][index]["title"],
+                            "body": state["subIssues"][index]["body"],
+                        }
+                        for index, reference in enumerate(references)
+                    ],
+                }
+            )
             reconcile_brief = {
                 "repository": "acme/spec",
                 "issue": issue(),
-                "worklist": {"kind": "github-issue"},
+                "worklist": {
+                    "kind": "github-issue",
+                    "graphDigest": graph_digest,
+                },
             }
             with FakeGitHub(root, state) as github:
                 result = DRIVER.action_reconcile(reconcile_brief)
@@ -670,6 +816,215 @@ class GitHubForgeTests(unittest.TestCase):
                     1,
                 )
 
+    def test_continuation_comment_is_retried_and_read_after_write_verified(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root)
+            state = {
+                "comments": ["/tally reconcile fixture"],
+                "commentFailures": 1,
+                "calls": [],
+            }
+            with FakeGitHub(root, state) as github, mock.patch.object(
+                DRIVER.time, "sleep", return_value=None
+            ) as sleep:
+                continued = DRIVER.action_continue(
+                    {
+                        "campaign": "fixture",
+                        "repository": "acme/spec",
+                        "repositoryConfig": repository_config(checkout, "github"),
+                        "issue": issue(),
+                        "runId": "pass-2",
+                        "reconcileCommand": "/tally reconcile fixture",
+                    }
+                )
+                self.assertEqual(
+                    continued,
+                    {"command": "/tally reconcile fixture", "posted": True},
+                )
+                final_state = github.state()
+                self.assertEqual(
+                    final_state["comments"].count("/tally reconcile fixture"),
+                    2,
+                )
+                self.assertEqual(
+                    sum(call[:2] == ["issue", "comment"] for call in final_state["calls"]),
+                    2,
+                )
+                sleep.assert_called_once_with(1)
+
+    def test_issue_graph_digest_is_admitted_and_preserves_checkpoint_kind(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout, _ = initialize_repository(Path(temporary), remote=True)
+            manifest = {
+                "schemaVersion": 1,
+                "name": "fixture",
+                "repository": repository_config(checkout, "github"),
+                "maxParallel": 1,
+                "agent": {},
+                "gates": [
+                    {
+                        "kind": "command",
+                        "id": "tests",
+                        "preflightArgv": ["true"],
+                        "argv": ["true"],
+                    }
+                ],
+                "tasks": [
+                    {
+                        "id": "build",
+                        "kind": "implementation",
+                        "issue": 8,
+                        "dependencies": [],
+                        "conflictDomains": [],
+                    },
+                    {
+                        "id": "verify",
+                        "kind": "checkpoint",
+                        "issue": 9,
+                        "dependencies": ["build"],
+                        "argv": ["true"],
+                        "runtimeMaxSec": 30,
+                    },
+                ],
+            }
+            _, references, normalized = DRIVER.forge_manifest(manifest)
+            issues = [
+                {
+                    "number": 8,
+                    "title": "Build",
+                    "body": "Implement the admitted change.",
+                    "state": "open",
+                    "html_url": "https://github.com/acme/spec/issues/8",
+                },
+                {
+                    "number": 9,
+                    "title": "Verify",
+                    "body": "Run the admitted automated barrier.",
+                    "state": "open",
+                    "html_url": "https://github.com/acme/spec/issues/9",
+                },
+            ]
+            source = {
+                "manifest": normalized,
+                "tasks": [
+                    {
+                        "number": reference["issue"],
+                        "title": issues[index]["title"],
+                        "body": issues[index]["body"],
+                    }
+                    for index, reference in enumerate(references)
+                ],
+            }
+            digest = DRIVER.canonical_sha256(source)
+            master = {
+                "number": 7,
+                "state": "open",
+                "html_url": "https://github.com/acme/spec/issues/7",
+                "body": (
+                    f"{DRIVER.CAMPAIGN_BEGIN}\n```json\n"
+                    f"{json.dumps(manifest)}\n```\n{DRIVER.CAMPAIGN_END}\n"
+                ),
+            }
+            brief = {
+                "repository": "acme/spec",
+                "issue": issue(),
+                "worklist": {"kind": "github-issue", "graphDigest": digest},
+            }
+            with mock.patch.object(DRIVER, "github_json", side_effect=[master, issues]):
+                worklist = DRIVER.issue_graph_worklist(brief)
+            self.assertEqual([task["kind"] for task in worklist["tasks"]], ["implementation", "checkpoint"])
+            self.assertEqual(worklist["tasks"][1]["argv"], ["true"])
+            self.assertRegex(worklist["tasks"][0]["revision"], r"^sha256:[0-9a-f]{64}$")
+            self.assertEqual(
+                worklist["source"]["revision"],
+                git(checkout, "rev-parse", "origin/main"),
+            )
+
+            changed = [dict(candidate) for candidate in issues]
+            changed[0]["body"] = "Edited after arm."
+            with mock.patch.object(DRIVER, "github_json", side_effect=[master, changed]):
+                with self.assertRaisesRegex(DRIVER.DriverError, "explicitly re-arm"):
+                    DRIVER.issue_graph_worklist(brief)
+
+    def test_merged_pr_completion_is_bound_to_task_revision(self) -> None:
+        revision = "sha256:" + "1" * 64
+        task_value = {"id": "task-1", "kind": "implementation", "revision": revision}
+        branch = DRIVER.stable_publish_branch("fixture", "7", "task-1", revision)
+        candidate = {
+            "url": "https://github.com/acme/spec/pull/8",
+            "body": DRIVER.pull_request_marker("fixture", "7", "task-1", revision),
+            "baseRefName": "main",
+            "headRefName": branch,
+            "mergeCommit": {"oid": "a" * 40},
+        }
+
+        def listed(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess([], 0, json.dumps([candidate]), "")
+
+        with mock.patch.object(DRIVER, "run", side_effect=listed):
+            facts, _ = DRIVER.merged_github_tasks(
+                "acme/spec", {}, "fixture", "7", "main", None, [task_value]
+            )
+            self.assertEqual(facts[0]["revision"], revision)
+            task_value["revision"] = "sha256:" + "2" * 64
+            stale, _ = DRIVER.merged_github_tasks(
+                "acme/spec", {}, "fixture", "7", "main", None, [task_value]
+            )
+            self.assertEqual(stale, [])
+
+    def test_issue_campaign_checkbox_repair_and_closeout_are_separate(self) -> None:
+        tasks = [
+            {
+                "id": "first",
+                "title": "First task",
+                "brief": {
+                    "issue": {
+                        "number": "2",
+                        "url": "https://github.com/acme/spec/issues/2",
+                    }
+                },
+            },
+            {
+                "id": "second",
+                "title": "Second task",
+                "brief": {
+                    "issue": {
+                        "number": "3",
+                        "url": "https://github.com/acme/spec/issues/3",
+                    }
+                },
+            },
+        ]
+        body = (
+            "operator prose\n"
+            f"{DRIVER.WORKLIST_BEGIN}\n\nold projection\n\n"
+            f"{DRIVER.WORKLIST_END}\n"
+        )
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with mock.patch.object(DRIVER, "run", return_value=completed) as run:
+            DRIVER.sync_issue_checkboxes("acme/spec", "1", body, tasks, {"first"})
+        edited = run.call_args.kwargs["input_text"]
+        self.assertIn("- [x] <!-- tally:campaign-task:v1 id=first -->", edited)
+        self.assertIn("- [ ] <!-- tally:campaign-task:v1 id=second -->", edited)
+        self.assertTrue(edited.startswith("operator prose\n"))
+
+        digest = "sha256:" + "a" * 64
+        with mock.patch.object(
+            DRIVER,
+            "github_json",
+            side_effect=[{"state": "open"}, {"state": "closed"}],
+        ), mock.patch.object(DRIVER, "run", return_value=completed) as run:
+            DRIVER.close_completed_issue_campaign(
+                "acme/spec", "1", {"sha256": digest}, tasks
+            )
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["gh", "issue", "close", "2", "--repo", "acme/spec"], commands)
+        self.assertNotIn(["gh", "issue", "close", "3", "--repo", "acme/spec"], commands)
+        self.assertIn(["gh", "issue", "close", "1", "--repo", "acme/spec"], commands)
+        comment = next(command for command in commands if command[:3] == ["gh", "issue", "comment"])
+        self.assertIn(digest, comment[-1])
+
 
 class LaneLifecycleTests(unittest.TestCase):
     def test_conflicting_published_head_is_aborted_abandoned_and_rebuilt(self) -> None:
@@ -717,8 +1072,10 @@ class LaneLifecycleTests(unittest.TestCase):
                 },
                 "constraints": [],
             }
-            with self.assertRaisesRegex(DRIVER.DriverError, "published branch was abandoned"):
+            with self.assertRaises(DRIVER.DriverError) as raised:
                 DRIVER.action_rebase(rebase_brief)
+            self.assertIn("was abandoned", str(raised.exception))
+            self.assertIn(published_head, str(raised.exception))
             rebase_head = git(
                 Path(prepared["worktreePath"]),
                 "rev-parse",
@@ -768,25 +1125,93 @@ class LaneLifecycleTests(unittest.TestCase):
             )
             self.assertFalse(Path(rebuilt["worktreePath"]).exists())
 
+    def test_post_rebase_domain_failure_abandons_and_names_the_published_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            stable_branch = "tally/fixture-issue-7/task-1"
+
+            git(checkout, "switch", "--quiet", "-c", "published")
+            (checkout / "root.go").write_text("task\n", encoding="utf-8")
+            git(checkout, "commit", "--quiet", "-am", "task change")
+            published_head = git(checkout, "rev-parse", "HEAD")
+            git(checkout, "push", "--quiet", "origin", f"HEAD:refs/heads/{stable_branch}")
+            git(checkout, "switch", "--quiet", "main")
+            (checkout / "main-only.txt").write_text("main\n", encoding="utf-8")
+            git(checkout, "add", "main-only.txt")
+            git(checkout, "commit", "--quiet", "-m", "independent base change")
+            git(checkout, "push", "--quiet", "origin", "main")
+
+            rebase_task = task("task-1")
+            rebase_task["conflictDomains"] = ["owned-only.txt"]
+            old_brief = {
+                **prep_brief(checkout, workspace_root, "old-pass"),
+                "task": rebase_task,
+            }
+            prepared = DRIVER.action_prep(old_brief)
+            with self.assertRaises(DRIVER.DriverError) as raised:
+                DRIVER.action_rebase(
+                    {
+                        **old_brief,
+                        "domainsRequired": True,
+                        "workspace": prepared,
+                        "publication": {
+                            "taskId": "task-1",
+                            "branch": stable_branch,
+                            "head": published_head,
+                            "pullRequest": "local://acme/spec/task-1",
+                            "ownership": {
+                                "taskId": "task-1",
+                                "domainsRequired": True,
+                                "conflictDomains": ["owned-only.txt"],
+                                "ownedPaths": ["owned-only.txt"],
+                                "baseRev": prepared["baseRev"],
+                                "head": published_head,
+                            },
+                        },
+                        "constraints": [],
+                    }
+                )
+            message = str(raised.exception)
+            self.assertIn("failed integration policy", message)
+            self.assertIn(published_head, message)
+            self.assertIn("was abandoned", message)
+            self.assertNotEqual(
+                command(
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "ls-remote",
+                    "--exit-code",
+                    "origin",
+                    stable_branch,
+                    check=False,
+                ).returncode,
+                0,
+            )
+
     def test_next_pass_sweeps_old_worktree_branch_and_state_marker(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
             workspace_root = root / "workspaces"
-            prepared = DRIVER.action_prep(prep_brief(checkout, workspace_root, "dead-pass"))
-            worktree = Path(prepared["worktreePath"])
-            self.assertTrue(worktree.is_dir())
-            self.assertTrue(any((workspace_root / ".state").glob("*/*.json")))
-
-            swept = DRIVER.action_sweep(
-                {
-                    "campaign": "fixture",
-                    "repository": "acme/spec",
-                    "repositoryConfig": repository_config(checkout),
-                    "runId": "live-pass",
-                    "workspaceRoot": str(workspace_root),
-                }
-            )
+            dead_flow = "00000000-0000-4000-8000-000000000911"
+            live_flow = "00000000-0000-4000-8000-000000000912"
+            with FakeTally(root, dead_flow) as tally:
+                DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "dead-pass", tally.program)
+                )
+                prepared = DRIVER.action_prep(
+                    prep_brief(checkout, workspace_root, "dead-pass")
+                )
+                worktree = Path(prepared["worktreePath"])
+                self.assertTrue(worktree.is_dir())
+                self.assertTrue(any(DRIVER.task_state_markers(workspace_root / ".state")))
+                tally.update(currentFlowRunId=live_flow, flows={dead_flow: []})
+                swept = DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "live-pass", tally.program)
+                )
             self.assertFalse(worktree.exists())
             self.assertNotEqual(
                 command(
@@ -801,8 +1226,21 @@ class LaneLifecycleTests(unittest.TestCase):
                 ).returncode,
                 0,
             )
-            self.assertFalse(any((workspace_root / ".state").glob("*/*.json")))
+            self.assertFalse(any(DRIVER.task_state_markers(workspace_root / ".state")))
+            self.assertFalse(
+                DRIVER.pass_record_path(
+                    workspace_root,
+                    hashlib.sha256(b"dead-pass").hexdigest()[:12],
+                ).exists()
+            )
+            self.assertTrue(
+                DRIVER.pass_record_path(
+                    workspace_root,
+                    hashlib.sha256(b"live-pass").hexdigest()[:12],
+                ).is_file()
+            )
             self.assertTrue(any(item.startswith("worktree:") for item in swept["cleaned"]))
+            self.assertEqual(swept["liveRuns"], [])
             self.assertEqual(swept["warnings"], [])
 
     def test_next_pass_sweeps_identity_validated_unregistered_lane(self) -> None:
@@ -812,36 +1250,36 @@ class LaneLifecycleTests(unittest.TestCase):
             workspace_root = root / "workspaces"
             run_id = "dead-unregistered-pass"
             run_hash = hashlib.sha256(run_id.encode()).hexdigest()[:12]
-            worktree = workspace_root / "spec" / run_hash / "task-1"
-            worktree.mkdir(parents=True)
-            (worktree / "uncommitted.txt").write_text("stale\n", encoding="utf-8")
-            branch = f"tally-work/fixture-{run_hash}/task-1"
-            git(checkout, "branch", branch)
-            marker = workspace_root / ".state" / "marker-directory" / "task-1.json"
-            marker.parent.mkdir(parents=True)
-            marker.write_text(
-                json.dumps(
-                    {
-                        "campaign": "fixture",
-                        "repository": "acme/spec",
-                        "runId": run_id,
-                        "taskId": "task-1",
-                        "branch": branch,
-                        "worktreePath": str(worktree),
-                    }
-                ),
-                encoding="utf-8",
-            )
-
-            swept = DRIVER.action_sweep(
-                {
-                    "campaign": "fixture",
-                    "repository": "acme/spec",
-                    "repositoryConfig": repository_config(checkout),
-                    "runId": "live-pass",
-                    "workspaceRoot": str(workspace_root),
-                }
-            )
+            dead_flow = "00000000-0000-4000-8000-000000000913"
+            live_flow = "00000000-0000-4000-8000-000000000914"
+            with FakeTally(root, dead_flow) as tally:
+                DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, run_id, tally.program)
+                )
+                worktree = workspace_root / "spec" / run_hash / "task-1"
+                worktree.mkdir(parents=True)
+                (worktree / "uncommitted.txt").write_text("stale\n", encoding="utf-8")
+                branch = f"tally-work/fixture-{run_hash}/task-1"
+                git(checkout, "branch", branch)
+                marker = workspace_root / ".state" / "marker-directory" / "task-1.json"
+                marker.parent.mkdir(parents=True)
+                marker.write_text(
+                    json.dumps(
+                        {
+                            "campaign": "fixture",
+                            "repository": "acme/spec",
+                            "runId": run_id,
+                            "taskId": "task-1",
+                            "branch": branch,
+                            "worktreePath": str(worktree),
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                tally.update(currentFlowRunId=live_flow, flows={dead_flow: []})
+                swept = DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "live-pass", tally.program)
+                )
             self.assertFalse(worktree.exists())
             self.assertFalse(marker.exists())
             self.assertNotEqual(
@@ -858,7 +1296,175 @@ class LaneLifecycleTests(unittest.TestCase):
                 0,
             )
             self.assertIn(f"worktree:{worktree}", swept["cleaned"])
+            self.assertEqual(swept["liveRuns"], [])
             self.assertEqual(swept["warnings"], [])
+
+    def test_sweep_defers_and_preserves_every_lane_while_an_old_flow_job_is_live(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            dead_flow = "00000000-0000-4000-8000-000000000915"
+            waiting_flow = "00000000-0000-4000-8000-000000000916"
+            settled_flow = "00000000-0000-4000-8000-000000000917"
+            with FakeTally(root, dead_flow) as tally:
+                DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "dead-pass", tally.program)
+                )
+                prepared = DRIVER.action_prep(
+                    prep_brief(checkout, workspace_root, "dead-pass")
+                )
+                worktree = Path(prepared["worktreePath"])
+                old_job = {
+                    "anchor": "00000000-0000-4000-8000-000000000918",
+                    "liveState": "running",
+                    "taskRef": "fixture/task-1",
+                    "orchestration": {"flowRunId": dead_flow},
+                }
+                tally.update(
+                    currentFlowRunId=waiting_flow,
+                    flows={dead_flow: [old_job]},
+                )
+                deferred = DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "waiting-pass", tally.program)
+                )
+                self.assertTrue(worktree.is_dir())
+                self.assertEqual(
+                    deferred["liveRuns"],
+                    [
+                        {
+                            "runHash": hashlib.sha256(b"dead-pass").hexdigest()[:12],
+                            "flowRunId": dead_flow,
+                            "jobs": [
+                                {
+                                    "anchor": old_job["anchor"],
+                                    "liveState": "running",
+                                    "taskRef": "fixture/task-1",
+                                }
+                            ],
+                        }
+                    ],
+                )
+                self.assertTrue(any("left live campaign run" in item for item in deferred["warnings"]))
+
+                tally.update(
+                    currentFlowRunId=settled_flow,
+                    flows={dead_flow: [], waiting_flow: []},
+                )
+                swept = DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "settled-pass", tally.program)
+                )
+                self.assertEqual(swept["liveRuns"], [])
+                self.assertFalse(worktree.exists())
+
+    def test_sweep_liveness_survives_an_issue_campaign_rename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            old_flow = "00000000-0000-4000-8000-000000000930"
+            new_flow = "00000000-0000-4000-8000-000000000931"
+            identity = "00000000-0000-4000-8000-000000000932"
+            with FakeTally(root, old_flow) as tally:
+                DRIVER.action_sweep(
+                    sweep_brief(
+                        checkout,
+                        workspace_root,
+                        "old-pass",
+                        tally.program,
+                        campaign="old-name",
+                        campaign_identity=identity,
+                    )
+                )
+                old_prep = prep_brief(checkout, workspace_root, "old-pass")
+                old_prep["campaign"] = "old-name"
+                prepared = DRIVER.action_prep(old_prep)
+                worktree = Path(prepared["worktreePath"])
+                tally.update(
+                    currentFlowRunId=new_flow,
+                    flows={
+                        old_flow: [
+                            {
+                                "anchor": "00000000-0000-4000-8000-000000000933",
+                                "liveState": "running",
+                                "taskRef": f"{identity}/task-1",
+                                "orchestration": {"flowRunId": old_flow},
+                            }
+                        ]
+                    },
+                )
+                deferred = DRIVER.action_sweep(
+                    sweep_brief(
+                        checkout,
+                        workspace_root,
+                        "new-pass",
+                        tally.program,
+                        campaign="new-name",
+                        campaign_identity=identity,
+                    )
+                )
+                self.assertTrue(worktree.is_dir())
+                self.assertEqual(deferred["blockingJobs"][0]["flowRunId"], old_flow)
+                self.assertEqual(deferred["blockingJobs"][0]["taskRef"], f"{identity}/task-1")
+
+    def test_sweep_leaves_legacy_lane_without_daemon_liveness_proof_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            prepared = DRIVER.action_prep(
+                prep_brief(checkout, workspace_root, "legacy-pass")
+            )
+            worktree = Path(prepared["worktreePath"])
+            with FakeTally(
+                root,
+                "00000000-0000-4000-8000-000000000919",
+            ) as tally:
+                tally.update(
+                    liveJobs=[
+                        {
+                            "anchor": "00000000-0000-4000-8000-000000000922",
+                            "liveState": "running",
+                            "taskRef": "fixture/task-1",
+                            "orchestration": {
+                                "flowRunId": "00000000-0000-4000-8000-000000000923"
+                            },
+                        }
+                    ]
+                )
+                swept = DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "new-pass", tally.program)
+                )
+            self.assertTrue(worktree.is_dir())
+            self.assertEqual(swept["liveRuns"], [])
+            self.assertEqual(len(swept["blockingJobs"]), 1)
+            self.assertTrue(
+                any("no daemon liveness record exists" in item for item in swept["warnings"])
+            )
+
+    def test_sweep_query_failure_is_fail_closed_before_lane_removal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            dead_flow = "00000000-0000-4000-8000-000000000920"
+            with FakeTally(root, dead_flow) as tally:
+                DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "dead-pass", tally.program)
+                )
+                prepared = DRIVER.action_prep(
+                    prep_brief(checkout, workspace_root, "dead-pass")
+                )
+                worktree = Path(prepared["worktreePath"])
+                tally.update(
+                    currentFlowRunId="00000000-0000-4000-8000-000000000921",
+                    failQueries=True,
+                )
+                with self.assertRaisesRegex(DRIVER.DriverError, "injected tally query failure"):
+                    DRIVER.action_sweep(
+                        sweep_brief(checkout, workspace_root, "new-pass", tally.program)
+                    )
+                self.assertTrue(worktree.is_dir())
 
     def test_pass_exit_cleans_partial_prep_lanes_without_workspace_results(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
