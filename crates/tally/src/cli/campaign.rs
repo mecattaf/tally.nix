@@ -1321,13 +1321,15 @@ fn max_flow_nodes(manifest: &CampaignManifest) -> u32 {
     };
     // Sweep, reconcile, one possible continuation, and each worst-case
     // implementation lane: prep, agent, ownership, gates, publish, rebase,
-    // optional re-gates, merge, then the failure path's diff, diagnosis, and
-    // steering, and finally cleanup. A lane that fails at merge is the
-    // expensive one, not a lane that merges: maxNodes counts cumulative rows,
-    // so finished nodes never return budget. Budgeting the success path alone
-    // starves failure steering exactly when it is needed. Checkpoint lanes are
-    // smaller.
-    (3 + preflight + manifest.max_parallel * (10 + 2 * manifest.gates.len())) as u32
+    // optional re-gates, merge, then the failure path's machinery retry, diff,
+    // diagnosis, and steering, and finally cleanup. A lane that fails at merge
+    // is the expensive one, not a lane that merges: maxNodes counts cumulative
+    // rows, so finished nodes never return budget. Budgeting the success path
+    // alone starves failure steering exactly when it is needed. A machinery
+    // fault whose retry budget is already spent records the retry node and is
+    // then steered, so both failure paths can land in one lane. Checkpoint
+    // lanes are smaller.
+    (3 + preflight + manifest.max_parallel * (11 + 2 * manifest.gates.len())) as u32
 }
 
 async fn dispatch_campaign(
@@ -2931,18 +2933,20 @@ mod tests {
         let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
         // The Nix module computes this budget independently in
         // campaignMaxNodes. Its fixture campaign has this exact shape and is
-        // asserted to be 48 too; change one side and the other must follow.
-        assert_eq!(max_flow_nodes(&manifest), 48);
+        // asserted to be 51 too; change one side and the other must follow.
+        assert_eq!(max_flow_nodes(&manifest), 51);
     }
 
     #[test]
     fn flow_node_bound_covers_lanes_that_fail_at_merge() {
         // A lane that fails at merge spends every success-path node and then
-        // diff, diagnosis, and steering on top. maxNodes counts cumulative
-        // rows, so the budget must hold all of them at once.
+        // its machinery retry, diff, diagnosis, and steering on top. maxNodes
+        // counts cumulative rows, so the budget must hold all of them at once:
+        // a machinery fault past its retry budget records the retry receipt
+        // node and is steered in the same pass.
         const PASS_MAINTENANCE: usize = 3;
         const LANE_SUCCESS_PATH: usize = 7;
-        const LANE_FAILURE_PATH: usize = 3;
+        const LANE_FAILURE_PATH: usize = 4;
 
         for max_parallel in 1..=4 {
             for gate_count in 0..=3 {

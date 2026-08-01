@@ -2127,11 +2127,23 @@ let
           default = "workspace-write";
           example = "read-only";
           description = ''
-            Named adapter sandbox policy for implementation and diagnosis
-            nodes. The writable default matches the implementation node's
-            obligation to create commits; diagnosis briefs prohibit mutation.
-            Set read-only explicitly for a wholly non-writing adapter, or null
-            only when the selected adapter declares no sandbox policies.
+            Named adapter sandbox policy for implementation nodes. The writable
+            default matches the implementation node's obligation to create
+            commits. Set null only when the selected adapter declares no
+            sandbox policies.
+          '';
+        };
+        agentDiagnosisSandboxPolicy = mkOption {
+          type = types.nullOr types.str;
+          default = "read-only";
+          example = "workspace-write";
+          description = ''
+            Named adapter sandbox policy for diagnosis nodes. Diagnosis briefs
+            prohibit mutation, so the default holds the node to that obligation
+            rather than inheriting the implementation node's writable policy.
+            Set null only when the selected adapter declares no sandbox
+            policies, or name a writable policy when the adapter refuses to
+            read a worktree without one.
           '';
         };
         agentRuntimeMaxSec = mkOption {
@@ -2212,6 +2224,10 @@ let
         {
           assertion = config.agentSandboxPolicy == null || config.agentSandboxPolicy != "";
           message = "tally campaign ${name} agentSandboxPolicy must be null or non-empty";
+        }
+        {
+          assertion = config.agentDiagnosisSandboxPolicy == null || config.agentDiagnosisSandboxPolicy != "";
+          message = "tally campaign ${name} agentDiagnosisSandboxPolicy must be null or non-empty";
         }
         {
           assertion = validComponent config.pool.name;
@@ -3150,17 +3166,20 @@ let
   # Sweep, reconcile, one optional pass-level continuation, optional
   # pristine-base preflight prep/gates/cleanup, and one frontier's worst-case
   # implementation lanes: prep, agent, ownership check, initial gates,
-  # publication, rebase, optional re-gates, merge, diff/diagnosis/steering,
-  # and cleanup. Checkpoint lanes are smaller; quiescent escalation needs only
-  # sweep, reconcile, and escalation. This is a pass bound, not the complete
-  # worklist size.
+  # publication, rebase, optional re-gates, merge, machinery retry,
+  # diff/diagnosis/steering, and cleanup. A machinery fault past its retry
+  # budget records the retry node and is then steered, so one lane can spend
+  # both failure paths. Checkpoint lanes are smaller; quiescent escalation
+  # needs only sweep, reconcile, and escalation. This is a pass bound, not the
+  # complete worklist size. max_flow_nodes in crates/tally/src/cli/campaign.rs
+  # computes the same bound independently and is pinned against this one.
   campaignMaxNodes =
     campaign:
     let
       commandGateCount = builtins.length (builtins.filter (gate: gate.kind == "command") campaign.gates);
       preflightNodes = if commandGateCount == 0 then 0 else 2 + commandGateCount;
     in
-    3 + preflightNodes + campaign.maxParallel * (10 + 2 * builtins.length campaign.gates);
+    3 + preflightNodes + campaign.maxParallel * (11 + 2 * builtins.length campaign.gates);
 
   mkCampaignArgs = cfg: name: campaign: repository: issueNumber: issueUrl: runId: {
     campaign = name;
@@ -3183,6 +3202,7 @@ let
       runtimeMaxSec = campaign.agentRuntimeMaxSec;
       approvalPolicy = campaign.agentApprovalPolicy;
       sandboxPolicy = campaign.agentSandboxPolicy;
+      diagnosisSandboxPolicy = campaign.agentDiagnosisSandboxPolicy;
     };
     gates = renderCampaignGates campaign.gates;
   };
@@ -3530,6 +3550,18 @@ let
                   cfg.adapters.${campaign.agent}.launch.sandboxPolicies
             );
           message = "tally campaign ${name} agentSandboxPolicy is not declared by adapter ${campaign.agent}";
+        }
+        {
+          assertion =
+            !campaign.enable
+            || campaign.agentDiagnosisSandboxPolicy == null
+            || (
+              builtins.hasAttr campaign.agent cfg.adapters
+              &&
+                builtins.hasAttr campaign.agentDiagnosisSandboxPolicy
+                  cfg.adapters.${campaign.agent}.launch.sandboxPolicies
+            );
+          message = "tally campaign ${name} agentDiagnosisSandboxPolicy is not declared by adapter ${campaign.agent}";
         }
         {
           assertion = !campaign.enable || cfg.enqueue.fanoutCap >= campaignMaxNodes campaign;

@@ -40,9 +40,24 @@ DIAGNOSIS_MARKER = re.compile(
     r"task=([a-z0-9](?:[a-z0-9-]*[a-z0-9])?) "
     r"attempt=([12]) -->$"
 )
+RETRY_MARKER = re.compile(
+    r"^<!-- tally:spec-build:retry:v1 "
+    r"campaign=([A-Za-z0-9_][A-Za-z0-9_.-]*) "
+    r"issue=([1-9][0-9]*) "
+    r"task=([a-z0-9](?:[a-z0-9-]*[a-z0-9])?) "
+    r"attempt=([12]) -->$"
+)
+# A campaign machinery fault is not evidence that the task's work is wrong, so
+# it buys a retry instead of a steering attempt. The budget is bounded and read
+# back from the forge: past it, the fault is treated as a failed attempt.
+MAX_MACHINE_RETRIES = 2
+MAX_RETRY_CHARS = 2_000
 MAX_DIAGNOSIS_CHARS = 12_000
 MAX_DIFF_CHARS = 128 * 1024
-PUBLIC_REDACTION = "conservative-v1"
+PUBLIC_REDACTION = "conservative-v2"
+# Receipts written by an earlier redactor stay readable: a redaction identity
+# this driver no longer writes must never brick a running campaign.
+PUBLIC_REDACTIONS = frozenset({"conservative-v1", PUBLIC_REDACTION})
 PUBLIC_DIAGNOSIS_TRUNCATION = "\n[... diagnosis truncated after redaction ...]"
 LIVE_JOB_STATES = {"paused", "queued", "running"}
 PASS_RECORD_SCHEMA_VERSION = 2
@@ -519,6 +534,7 @@ def forge_agent(value: Any) -> dict[str, Any]:
             "runtimeMaxSec",
             "approvalPolicy",
             "sandboxPolicy",
+            "diagnosisSandboxPolicy",
         },
         "campaign agent",
     )
@@ -538,6 +554,13 @@ def forge_agent(value: Any) -> dict[str, Any]:
     sandbox = agent.get("sandboxPolicy", "workspace-write")
     if sandbox is not None:
         sandbox = required_string(sandbox, "campaign agent.sandboxPolicy")
+    # The diagnosis brief prohibits mutation, so its node does not inherit the
+    # implementation node's writable sandbox.
+    diagnosis_sandbox = agent.get("diagnosisSandboxPolicy", "read-only")
+    if diagnosis_sandbox is not None:
+        diagnosis_sandbox = required_string(
+            diagnosis_sandbox, "campaign agent.diagnosisSandboxPolicy"
+        )
     return {
         "adapter": adapter,
         "argv": arguments,
@@ -545,6 +568,7 @@ def forge_agent(value: Any) -> dict[str, Any]:
         "runtimeMaxSec": runtime,
         "approvalPolicy": approval,
         "sandboxPolicy": sandbox,
+        "diagnosisSandboxPolicy": diagnosis_sandbox,
     }
 
 
@@ -905,6 +929,20 @@ def diagnosis_heading(task_id: str, attempt: int) -> str:
     return f"### Machine steering for `{task_id}` (attempt {attempt}/2)"
 
 
+def retry_marker(campaign: str, issue_number: str, task_id: str, attempt: int) -> str:
+    return (
+        "<!-- tally:spec-build:retry:v1 "
+        f"campaign={campaign} issue={issue_number} task={task_id} attempt={attempt} -->"
+    )
+
+
+def retry_heading(task_id: str, attempt: int) -> str:
+    return (
+        f"### Machine retry for `{task_id}` "
+        f"(campaign fault {attempt}/{MAX_MACHINE_RETRIES})"
+    )
+
+
 def escalation_marker(campaign: str, issue_number: str) -> str:
     return (
         "<!-- tally:spec-build:escalation:v1 "
@@ -912,25 +950,53 @@ def escalation_marker(campaign: str, issue_number: str) -> str:
     )
 
 
+SECRET_TOKEN_PREFIXES = (
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "sk-",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxr-",
+)
+SENSITIVE_LINE_MARKERS = (
+    "authorization",
+    "bearer",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "credentials",
+    "api_key",
+    "api-key",
+    "apikey",
+    "private key",
+    "access key",
+    "access_key",
+    "secret_key",
+    "client_secret",
+    "client key",
+    "cookie",
+    "dsn",
+    "session_id",
+    "sessionid",
+)
+GIT_OBJECT_ID_LENGTHS = frozenset({40, 64})
+
+
 def public_token_is_sensitive(value: str) -> bool:
     token = value.strip("'\"`()[]{},;")
     lower = token.lower()
-    prefixes = (
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
-        "github_pat_",
-        "sk-",
-        "xoxb-",
-        "xoxp-",
-        "xoxa-",
-        "xoxr-",
-    )
+    # Prefixes identify a secret only at the start of a token. Substring
+    # matching redacted ordinary campaign words: "task-1" contains "sk-".
     if (
-        any(prefix in lower for prefix in prefixes)
-        or (("AKIA" in token or "ASIA" in token) and len(token) >= 16)
+        any(lower.startswith(prefix) for prefix in SECRET_TOKEN_PREFIXES)
+        or ((token.startswith("AKIA") or token.startswith("ASIA")) and len(token) >= 16)
         or ("://" in token and ("@" in token or "?" in token))
     ):
         return True
@@ -943,34 +1009,32 @@ def public_token_is_sensitive(value: str) -> bool:
     has_upper = any(char.isupper() for char in token)
     has_digit = any(char.isdigit() for char in token)
     if all(char in "0123456789abcdefABCDEF" for char in token):
+        # A bare lowercase 40 or 64 character hex word is a git object id, which
+        # steering must be able to name. A hex secret carried by a labelled line
+        # ("GITHUB_TOKEN=<40 hex>") is still caught by the line rule below.
+        if token == lower and len(token) in GIT_OBJECT_ID_LENGTHS:
+            return False
         return True
     token_like = all(char.isalnum() or char in "+/_-=" for char in token)
     return token_like and has_digit and ((has_lower and has_upper) or len(token) >= 40)
 
 
+def public_line_is_sensitive(lower: str) -> bool:
+    # A marker only hides a whole line when it stands in key position, so that
+    # "token=<secret>" is redacted while a diagnosis about a token bug survives.
+    for marker in SENSITIVE_LINE_MARKERS:
+        start = lower.find(marker)
+        while start != -1:
+            index = start + len(marker)
+            while index < len(lower) and lower[index] in "'\"` \t":
+                index += 1
+            if index < len(lower) and lower[index] in ":=":
+                return True
+            start = lower.find(marker, start + 1)
+    return False
+
+
 def redact_public_text(value: str) -> tuple[str, bool]:
-    sensitive_markers = (
-        "authorization",
-        "bearer ",
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "credential",
-        "api_key",
-        "api-key",
-        "apikey",
-        "private key",
-        "access key",
-        "access_key",
-        "secret_key",
-        "client_secret",
-        "client key",
-        "cookie",
-        "dsn=",
-        "session_id",
-        "sessionid",
-    )
     output: list[str] = []
     redacted = False
     private_key_block = False
@@ -978,7 +1042,7 @@ def redact_public_text(value: str) -> tuple[str, bool]:
         lower = line.lower()
         if "-----begin " in lower and "private key-----" in lower:
             private_key_block = True
-        if private_key_block or any(marker in lower for marker in sensitive_markers):
+        if private_key_block or public_line_is_sensitive(lower):
             output.append("[redacted sensitive diagnosis line]")
             if line.endswith("\n"):
                 output.append("\n")
@@ -1082,15 +1146,58 @@ def write_local_blob(
     return True, value
 
 
+def contiguous_receipts(
+    receipts: list[dict[str, Any]], kind: str, warnings: list[str]
+) -> list[dict[str, Any]]:
+    """Keep the attempt-1-anchored run of receipts and witness what it drops.
+
+    An operator who deletes a machine comment between passes leaves a gap. The
+    campaign reports the gap and reasons from the receipts that remain instead
+    of refusing to reconcile at all.
+    """
+    kept: list[dict[str, Any]] = []
+    for task_id in sorted({receipt["taskId"] for receipt in receipts}):
+        owned = sorted(
+            (receipt for receipt in receipts if receipt["taskId"] == task_id),
+            key=lambda receipt: receipt["attempt"],
+        )
+        expected = 1
+        for receipt in owned:
+            if receipt["attempt"] != expected:
+                warnings.append(
+                    f"dropped machine {kind} for {task_id!r} attempt "
+                    f"{receipt['attempt']}: no attempt {expected} receipt precedes it"
+                )
+                continue
+            kept.append(receipt)
+            expected += 1
+    return kept
+
+
 def forge_campaign_state(
     repository: str,
     config: dict[str, Any],
     campaign: str,
     issue_number: str,
     task_ids: set[str] | None = None,
-) -> tuple[list[dict[str, Any]], str | None]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, list[str]]:
     diagnoses: list[dict[str, Any]] = []
+    retries: list[dict[str, Any]] = []
     escalations: list[str] = []
+    warnings: list[str] = []
+
+    def accept(kind: str, task_id: str) -> bool:
+        # A worklist edit that renames or drops a task leaves receipts naming a
+        # task the campaign no longer has. campaigns.md invites those edits
+        # between passes, so an orphan receipt is reported and ignored rather
+        # than treated as forgery.
+        if task_ids is None or task_id in task_ids:
+            return True
+        warnings.append(
+            f"dropped machine {kind} for {task_id!r}: the worklist no longer names that task"
+        )
+        return False
+
     if config["forge"] == "github":
         comments = github_machine_comments(repository, issue_number)
         expected_escalation = escalation_marker(campaign, issue_number)
@@ -1100,12 +1207,13 @@ def forge_campaign_state(
                 continue
             first_line = body.splitlines()[0]
             match = DIAGNOSIS_MARKER.fullmatch(first_line)
+            retry_match = None if match is not None else RETRY_MARKER.fullmatch(first_line)
             if match is not None:
                 marker_campaign, marker_issue, task_id, attempt_text = match.groups()
                 if marker_campaign != campaign or marker_issue != issue_number:
                     continue
-                if task_ids is not None and task_id not in task_ids:
-                    fail(f"machine diagnosis names unknown campaign task {task_id!r}")
+                if not accept("diagnosis", task_id):
+                    continue
                 attempt = int(attempt_text)
                 heading = diagnosis_heading(task_id, attempt)
                 prefix = f"{first_line}\n\n{heading}\n\n"
@@ -1125,6 +1233,31 @@ def forge_campaign_state(
                         ),
                     }
                 )
+            elif retry_match is not None:
+                marker_campaign, marker_issue, task_id, attempt_text = retry_match.groups()
+                if marker_campaign != campaign or marker_issue != issue_number:
+                    continue
+                if not accept("retry", task_id):
+                    continue
+                attempt = int(attempt_text)
+                heading = retry_heading(task_id, attempt)
+                prefix = f"{first_line}\n\n{heading}\n\n"
+                if not body.startswith(prefix):
+                    fail(f"machine retry for {task_id!r} has malformed content")
+                retries.append(
+                    {
+                        "taskId": task_id,
+                        "attempt": attempt,
+                        "comment": required_string(
+                            comment.get("html_url"), "machine retry comment URL"
+                        ),
+                        "reason": required_text(
+                            body[len(prefix) :],
+                            f"machine retry for {task_id!r}",
+                            MAX_RETRY_CHARS,
+                        ),
+                    }
+                )
             elif first_line == expected_escalation:
                 escalations.append(
                     required_string(comment.get("html_url"), "machine escalation comment URL")
@@ -1133,9 +1266,13 @@ def forge_campaign_state(
         prefix = local_state_prefix(campaign, issue_number)
         refs = local_remote_refs(config, f"{prefix}/*")
         diagnosis_prefix = f"{prefix}/diagnosis/"
+        retry_prefix = f"{prefix}/retry/"
         for ref in sorted(refs):
-            if not ref.startswith(diagnosis_prefix):
+            is_retry = ref.startswith(retry_prefix)
+            if not is_retry and not ref.startswith(diagnosis_prefix):
                 continue
+            kind = "retry" if is_retry else "diagnosis"
+            payload = "reason" if is_retry else "diagnosis"
             receipt = object_exact(
                 read_local_blob(config, ref),
                 {
@@ -1145,42 +1282,43 @@ def forge_campaign_state(
                     "issueNumber",
                     "taskId",
                     "attempt",
-                    "diagnosis",
+                    payload,
                     "redaction",
                 },
-                f"local forge diagnosis {ref}",
+                f"local forge {kind} {ref}",
             )
             if (
                 receipt.get("schemaVersion") != 1
-                or receipt.get("kind") != "diagnosis"
+                or receipt.get("kind") != kind
                 or receipt.get("campaign") != campaign
                 or receipt.get("issueNumber") != issue_number
-                or receipt.get("redaction") != PUBLIC_REDACTION
+                or receipt.get("redaction") not in PUBLIC_REDACTIONS
             ):
-                fail(f"local forge diagnosis {ref!r} has invalid identity")
-            task_id = required_string(receipt.get("taskId"), "local diagnosis taskId")
+                fail(f"local forge {kind} {ref!r} has invalid identity")
+            task_id = required_string(receipt.get("taskId"), f"local {kind} taskId")
             if not TASK_ID.fullmatch(task_id):
-                fail(f"local forge diagnosis {ref!r} has unsafe taskId")
-            if task_ids is not None and task_id not in task_ids:
-                fail(f"machine diagnosis names unknown campaign task {task_id!r}")
+                fail(f"local forge {kind} {ref!r} has unsafe taskId")
             attempt = receipt.get("attempt")
             if attempt not in {1, 2}:
-                fail(f"local forge diagnosis {ref!r} has invalid attempt")
-            expected_ref = f"{diagnosis_prefix}{task_id}/{attempt}"
-            if ref != expected_ref:
-                fail(f"local forge diagnosis {ref!r} disagrees with its identity")
-            diagnoses.append(
-                {
-                    "taskId": task_id,
-                    "attempt": attempt,
-                    "comment": f"local://{repository}/{ref}",
-                    "diagnosis": required_text(
-                        receipt.get("diagnosis"),
-                        f"local diagnosis for {task_id!r}",
-                        MAX_DIAGNOSIS_CHARS,
-                    ),
-                }
+                fail(f"local forge {kind} {ref!r} has invalid attempt")
+            expected_ref = (
+                f"{retry_prefix if is_retry else diagnosis_prefix}{task_id}/{attempt}"
             )
+            if ref != expected_ref:
+                fail(f"local forge {kind} {ref!r} disagrees with its identity")
+            if not accept(kind, task_id):
+                continue
+            record = {
+                "taskId": task_id,
+                "attempt": attempt,
+                "comment": f"local://{repository}/{ref}",
+                payload: required_text(
+                    receipt.get(payload),
+                    f"local {kind} for {task_id!r}",
+                    MAX_RETRY_CHARS if is_retry else MAX_DIAGNOSIS_CHARS,
+                ),
+            }
+            (retries if is_retry else diagnoses).append(record)
         escalation_ref = f"{prefix}/escalation"
         if escalation_ref in refs:
             receipt = object_exact(
@@ -1200,24 +1338,28 @@ def forge_campaign_state(
 
     if len(escalations) > 1:
         fail("multiple machine escalations claim this campaign")
-    seen: set[tuple[str, int]] = set()
-    for diagnosis in diagnoses:
-        identity = (diagnosis["taskId"], diagnosis["attempt"])
-        if identity in seen:
-            fail(
-                f"multiple machine diagnoses claim task {identity[0]!r} attempt {identity[1]}"
+    for kind, records in (("diagnosis", diagnoses), ("retry", retries)):
+        seen: set[tuple[str, int]] = set()
+        for record in records:
+            identity = (record["taskId"], record["attempt"])
+            if identity in seen:
+                fail(
+                    f"multiple machine {kind} receipts claim task {identity[0]!r} "
+                    f"attempt {identity[1]}"
+                )
+            seen.add(identity)
+    order_source = task_ids or {record["taskId"] for record in diagnoses + retries}
+    task_order = {task_id: index for index, task_id in enumerate(sorted(order_source))}
+    diagnoses = contiguous_receipts(diagnoses, "diagnosis", warnings)
+    retries = contiguous_receipts(retries, "retry", warnings)
+    for records in (diagnoses, retries):
+        records.sort(
+            key=lambda item: (
+                task_order.get(item["taskId"], len(task_order)),
+                item["attempt"],
             )
-        seen.add(identity)
-    task_order = {
-        task_id: index
-        for index, task_id in enumerate(sorted(task_ids or {d["taskId"] for d in diagnoses}))
-    }
-    diagnoses.sort(key=lambda item: (task_order.get(item["taskId"], len(task_order)), item["attempt"]))
-    for task_id in {item["taskId"] for item in diagnoses}:
-        attempts = [item["attempt"] for item in diagnoses if item["taskId"] == task_id]
-        if attempts not in ([1], [1, 2]):
-            fail(f"machine diagnosis attempts for {task_id!r} are not contiguous")
-    return diagnoses, escalations[0] if escalations else None
+        )
+    return diagnoses, retries, escalations[0] if escalations else None, warnings
 
 
 def task_revision(task: dict[str, Any]) -> str | None:
@@ -1730,6 +1872,58 @@ def parallelism_warnings(
     ]
 
 
+def related_tasks(tasks: list[dict[str, Any]], task_id: str) -> set[str]:
+    """Every task the named task depends on, plus every task that depends on it."""
+    dependencies = {task["id"]: set(task["dependencies"]) for task in tasks}
+    related = {task_id}
+    frontier = [task_id]
+    while frontier:
+        current = frontier.pop()
+        for candidate in dependencies.get(current, set()):
+            if candidate not in related:
+                related.add(candidate)
+                frontier.append(candidate)
+    frontier = [task_id]
+    while frontier:
+        current = frontier.pop()
+        for task in tasks:
+            if current in dependencies[task["id"]] and task["id"] not in related:
+                related.add(task["id"])
+                frontier.append(task["id"])
+    return related
+
+
+def checkpoint_deferrals(
+    tasks: list[dict[str, Any]],
+    remaining: list[dict[str, Any]],
+    completed_ids: set[str],
+    blocked_ids: set[str],
+) -> list[dict[str, Any]]:
+    """Name the checkpoints whose verdict outstanding unrelated work can still change.
+
+    A checkpoint reads the accumulated tree, so a red verdict while an unrelated
+    implementation task is still live says nothing about the checkpoint itself.
+    Such a run is a deferral, not a failed attempt. Tasks that are blocked, or
+    that sit on either side of the checkpoint's dependency chain, cannot change
+    the verdict and so never defer it: the campaign still reaches quiescence.
+    """
+    deferrals: list[dict[str, Any]] = []
+    for task in tasks:
+        if task["kind"] != "checkpoint" or task["id"] in completed_ids:
+            continue
+        related = related_tasks(tasks, task["id"])
+        waiting = [
+            candidate["id"]
+            for candidate in remaining
+            if candidate["kind"] != "checkpoint"
+            and candidate["id"] not in related
+            and candidate["id"] not in blocked_ids
+        ]
+        if waiting:
+            deferrals.append({"taskId": task["id"], "waitingOn": waiting})
+    return deferrals
+
+
 def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     forge_native = isinstance(brief.get("worklist"), dict)
     if forge_native:
@@ -1804,15 +1998,17 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     merged_ids = {fact["taskId"] for fact in merged}
     completed_ids = {fact["taskId"] for fact in merged + checkpoints}
     task_ids = {task["id"] for task in worklist["tasks"]}
-    diagnoses, escalation = forge_campaign_state(
+    diagnoses, retries, escalation, state_warnings = forge_campaign_state(
         repository,
         config,
         campaign,
         issue["number"],
         task_ids,
     )
+    warnings.extend(state_warnings)
     order = {task["id"]: index for index, task in enumerate(worklist["tasks"])}
     diagnoses.sort(key=lambda item: (order[item["taskId"]], item["attempt"]))
+    retries.sort(key=lambda item: (order[item["taskId"]], item["attempt"]))
     remaining = [task for task in worklist["tasks"] if task["id"] not in completed_ids]
     direct_blocked = {
         diagnosis["taskId"]
@@ -1835,6 +2031,11 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         if task["id"] not in blocked_ids
         and all(dependency in completed_ids for dependency in task["dependencies"])
     ]
+    deferrals = checkpoint_deferrals(worklist["tasks"], remaining, completed_ids, blocked_ids)
+    deferred_ids = {deferral["taskId"] for deferral in deferrals}
+    # A checkpoint whose verdict can still be changed by unrelated outstanding
+    # work never displaces that work from a bounded frontier.
+    ready.sort(key=lambda task: task["id"] in deferred_ids)
     frontier: list[dict[str, Any]] = []
     for task in ready:
         if len(frontier) == max_parallel:
@@ -1868,6 +2069,8 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         "remaining": [task["id"] for task in remaining],
         "frontier": frontier,
         "diagnoses": diagnoses,
+        "retries": retries,
+        "deferrals": deferrals,
         "blocked": blocked,
         "quiescent": bool(remaining) and not frontier,
         "escalation": escalation,
@@ -1980,7 +2183,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     attempt = data.get("attempt")
     if attempt not in {1, 2}:
         fail("attempt must equal 1 or 2")
-    existing, _ = forge_campaign_state(
+    existing, _, _, _ = forge_campaign_state(
         repository, config, campaign, issue["number"]
     )
     task_receipts = [receipt for receipt in existing if receipt["taskId"] == task_id]
@@ -2058,6 +2261,111 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
+    """Record a campaign machinery fault without spending a steering attempt.
+
+    Prep, lane, rebase, merge and publish faults say nothing about whether the
+    task's work is right, so they buy a bounded retry instead. The budget is
+    read back from the forge like every other campaign fact; once it is spent
+    the caller must treat the next fault as a failed attempt.
+    """
+    data = object_exact(
+        brief,
+        {
+            "campaign",
+            "repository",
+            "repositoryConfig",
+            "issue",
+            "taskId",
+            "stage",
+            "detail",
+        },
+        "retry brief",
+    )
+    campaign = required_string(data.get("campaign"), "campaign")
+    if not COMPONENT.fullmatch(campaign):
+        fail("campaign is not a safe component")
+    repository = required_string(data.get("repository"), "repository")
+    if not REPOSITORY.fullmatch(repository):
+        fail("repository must use owner/name form")
+    config = repo_config(data.get("repositoryConfig"))
+    issue = campaign_issue(data.get("issue"))
+    task_id = required_string(data.get("taskId"), "taskId")
+    if not TASK_ID.fullmatch(task_id):
+        fail("taskId is not safe")
+    stage = required_string(data.get("stage"), "stage")
+    if not re.fullmatch(r"[a-z][a-z0-9:._-]{0,63}", stage):
+        fail("stage is not a safe campaign stage name")
+    detail = required_text(data.get("detail"), "detail", MAX_RETRY_CHARS)
+    _, existing, _, _ = forge_campaign_state(
+        repository, config, campaign, issue["number"]
+    )
+    spent = len([receipt for receipt in existing if receipt["taskId"] == task_id])
+    if spent >= MAX_MACHINE_RETRIES:
+        return {
+            "taskId": task_id,
+            "attempt": spent,
+            "comment": None,
+            "exhausted": True,
+            "posted": False,
+            "redacted": False,
+        }
+    attempt = spent + 1
+    reason, redacted = redact_public_text(f"Stage `{stage}` faulted.\n\n{detail}")
+    if len(reason) > MAX_RETRY_CHARS:
+        reason = reason[: MAX_RETRY_CHARS - 3].rstrip() + "..."
+    reason = required_text(reason, "retry reason", MAX_RETRY_CHARS)
+    marker = retry_marker(campaign, issue["number"], task_id, attempt)
+    body = f"{marker}\n\n{retry_heading(task_id, attempt)}\n\n{reason}"
+    if config["forge"] == "github":
+        posted = run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                issue["number"],
+                "--repo",
+                repository,
+                "--body",
+                body,
+            ]
+        )
+        comment = required_string(
+            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
+            "machine retry comment URL",
+        )
+    else:
+        ref = (
+            f"{local_state_prefix(campaign, issue['number'])}/retry/"
+            f"{task_id}/{attempt}"
+        )
+        created, _ = write_local_blob(
+            config,
+            ref,
+            {
+                "schemaVersion": 1,
+                "kind": "retry",
+                "campaign": campaign,
+                "issueNumber": issue["number"],
+                "taskId": task_id,
+                "attempt": attempt,
+                "reason": reason,
+                "redaction": PUBLIC_REDACTION,
+            },
+        )
+        if not created:
+            fail(f"local forge retry {ref!r} appeared concurrently")
+        comment = f"local://{repository}/{ref}"
+    return {
+        "taskId": task_id,
+        "attempt": attempt,
+        "comment": comment,
+        "exhausted": attempt == MAX_MACHINE_RETRIES,
+        "posted": True,
+        "redacted": redacted,
+    }
+
+
 def compact_summary(value: str, maximum: int = 64) -> str:
     compact = re.sub(r"\s+", " ", value).strip()
     return compact if len(compact) <= maximum else compact[: maximum - 3] + "..."
@@ -2093,6 +2401,7 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
             "posted": False,
             "comment": reconciliation["escalation"],
             "diagnosisCount": len(reconciliation["diagnoses"]),
+            "retryCount": len(reconciliation["retries"]),
         }
     campaign = required_string(reconciliation.get("campaign"), "campaign")
     repository = reconciliation["repository"]
@@ -2126,6 +2435,19 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
         f"{compact_summary(item['diagnosis'])}"
         for item in reconciliation["diagnoses"]
     )
+    if reconciliation["retries"]:
+        lines.extend(["", "Campaign machinery faults that bought a retry:"])
+        lines.extend(
+            f"- `{item['taskId']}` fault {item['attempt']}: "
+            f"{compact_summary(item['reason'])}"
+            for item in reconciliation["retries"]
+        )
+    if reconciliation["warnings"]:
+        lines.extend(["", "Reconciler warnings:"])
+        lines.extend(
+            f"- {compact_summary(warning, 200)}"
+            for warning in reconciliation["warnings"][:12]
+        )
     body = "\n".join(lines)
     if len(body) > 60_000:
         fail("machine escalation exceeds the bounded GitHub comment size")
@@ -2166,6 +2488,7 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
         "posted": True,
         "comment": comment,
         "diagnosisCount": len(reconciliation["diagnoses"]),
+        "retryCount": len(reconciliation["retries"]),
     }
 
 
@@ -4446,6 +4769,7 @@ def main() -> int:
             "reconcile",
             "diff",
             "steer",
+            "retry",
             "escalate",
             "continue",
             "preflight",
@@ -4467,6 +4791,7 @@ def main() -> int:
         "reconcile": action_reconcile,
         "diff": action_diff,
         "steer": action_steer,
+        "retry": action_retry,
         "escalate": action_escalate,
         "continue": action_continue,
         "preflight": action_preflight,

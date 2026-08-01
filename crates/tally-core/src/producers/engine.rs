@@ -1172,7 +1172,7 @@ impl<'a> ProducerEngine<'a> {
 }
 
 const PUBLIC_STDERR_TRUNCATION_MARKER: &str = "[... earlier redacted stderr omitted ...]\n";
-const PUBLIC_STDERR_REDACTION: &str = "conservative-v1";
+const PUBLIC_STDERR_REDACTION: &str = "conservative-v2";
 
 fn public_evidence(evidence: Option<Value>, include_failure_stderr: bool) -> Option<Value> {
     evidence.map(|mut evidence| {
@@ -1251,31 +1251,68 @@ fn redact_public_stderr(stderr: &str) -> (String, bool, bool) {
     (bounded, redacted, true)
 }
 
+/// Markers that hide a whole line, but only where they stand in key position.
+/// Substring matching alone redacted ordinary prose: a failure report about a
+/// token bug collapsed to nothing. `examples/flows/spec_build_driver.py` runs
+/// the same rules, and `test/fixtures/redaction/vectors.json` holds the shared
+/// vector both sides assert against.
+const SENSITIVE_LINE_MARKERS: [&str; 21] = [
+    "authorization",
+    "bearer",
+    "token",
+    "secret",
+    "password",
+    "passwd",
+    "credential",
+    "credentials",
+    "api_key",
+    "api-key",
+    "apikey",
+    "private key",
+    "access key",
+    "access_key",
+    "secret_key",
+    "client_secret",
+    "client key",
+    "cookie",
+    "dsn",
+    "session_id",
+    "sessionid",
+];
+
+const SECRET_TOKEN_PREFIXES: [&str; 11] = [
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "sk-",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xoxr-",
+];
+
 fn stderr_line_is_sensitive(lower: &str) -> bool {
-    [
-        "authorization",
-        "bearer ",
-        "token",
-        "secret",
-        "password",
-        "passwd",
-        "credential",
-        "api_key",
-        "api-key",
-        "apikey",
-        "private key",
-        "access key",
-        "access_key",
-        "secret_key",
-        "client_secret",
-        "client key",
-        "cookie",
-        "dsn=",
-        "session_id",
-        "sessionid",
-    ]
-    .iter()
-    .any(|marker| lower.contains(marker))
+    for marker in SENSITIVE_LINE_MARKERS {
+        let mut search = 0;
+        while let Some(offset) = lower[search..].find(marker) {
+            let start = search + offset;
+            let rest = &lower[start + marker.len()..];
+            let value_position = rest
+                .trim_start_matches(['\'', '"', '`', ' ', '\t'])
+                .starts_with([':', '=']);
+            if value_position {
+                return true;
+            }
+            search = start + 1;
+            if search >= lower.len() {
+                break;
+            }
+        }
+    }
+    false
 }
 
 fn redact_stderr_tokens(line: &str) -> (String, bool) {
@@ -1303,22 +1340,12 @@ fn stderr_token_is_sensitive(token: &str) -> bool {
         )
     });
     let lower = token.to_ascii_lowercase();
-    if [
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
-        "github_pat_",
-        "sk-",
-        "xoxb-",
-        "xoxp-",
-        "xoxa-",
-        "xoxr-",
-    ]
-    .iter()
-    .any(|prefix| lower.contains(prefix))
-        || ((token.contains("AKIA") || token.contains("ASIA")) && token.len() >= 16)
+    // Prefixes identify a secret only at the start of a token. Substring
+    // matching redacted ordinary words: "task-1" contains "sk-".
+    if SECRET_TOKEN_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+        || ((token.starts_with("AKIA") || token.starts_with("ASIA")) && token.len() >= 16)
         || (token.contains("://") && (token.contains('@') || token.contains('?')))
     {
         return true;
@@ -1333,7 +1360,13 @@ fn stderr_token_is_sensitive(token: &str) -> bool {
     let has_lower = token.bytes().any(|byte| byte.is_ascii_lowercase());
     let has_upper = token.bytes().any(|byte| byte.is_ascii_uppercase());
     let has_digit = token.bytes().any(|byte| byte.is_ascii_digit());
-    if token.len() >= 32 && token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if token.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        // A bare lowercase 40 or 64 character hex word is a git object id, which
+        // a failure report must be able to name. A hex secret carried by a
+        // labelled line ("GITHUB_TOKEN=<40 hex>") is still caught by the line rule.
+        if token == lower && matches!(token.len(), 40 | 64) {
+            return false;
+        }
         return true;
     }
     let token_like = token.bytes().all(|byte| {
@@ -1515,4 +1548,40 @@ pub(super) fn collect_json_store_paths(
         paths.insert(PathBuf::from(validate_store_path(Path::new(candidate))?));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod redaction_vector_tests {
+    use super::redact_public_stderr;
+    use serde_json::Value;
+
+    /// The Python steering driver hand-implements the same rules. Both sides
+    /// assert against this committed corpus so neither can drift alone.
+    const VECTORS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/redaction/vectors.json"
+    ));
+
+    #[test]
+    fn shared_redaction_vector_holds_for_stderr() {
+        let corpus: Value = serde_json::from_str(VECTORS).unwrap();
+        let cases = corpus["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let input = case["input"].as_str().unwrap();
+            let expected = case["output"]
+                .as_str()
+                .unwrap()
+                .replace("%LINE%", "[redacted sensitive stderr line]");
+            let (output, redacted, truncated) = redact_public_stderr(input);
+            assert_eq!(output, expected, "redacted text for {name}");
+            assert_eq!(
+                redacted,
+                case["redacted"].as_bool().unwrap(),
+                "flag for {name}"
+            );
+            assert!(!truncated, "vector case {name} must fit the excerpt bound");
+        }
+    }
 }

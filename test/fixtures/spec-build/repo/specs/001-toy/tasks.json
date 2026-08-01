@@ -43,7 +43,7 @@
         "sh",
         "-eu",
         "-c",
-        "test \"$(cat build/one.txt)\" = one; if test -e build/checkpoint-red; then echo 'phase one checkpoint remains red' >&2; exit 1; fi; grep -q '\"attempt\":1' \"$TALLY_BRIEF\""
+        "test \"$(cat build/one.txt)\" = one; if test -e build/checkpoint-red; then echo 'phase one checkpoint remains red' >&2; exit 1; fi; grep -q '\"attempt\":1' \"$TALLY_BRIEF\" || { echo 'phase one checkpoint has no prior steering' >&2; exit 1; }"
       ],
       "runtimeMaxSec": 10,
       "dependencies": [

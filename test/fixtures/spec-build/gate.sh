@@ -21,7 +21,7 @@ case "$task" in
   task-1)
     test "$(cat build/one.txt)" = one
     ;;
-  task-2)
+  task-2 | task-2b)
     test "$(cat build/one.txt)" = one
     test "$(cat build/two.txt)" = two
     ;;
