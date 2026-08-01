@@ -520,7 +520,7 @@ in
           };
         };
 
-        tally-campaign-poll = {
+        tally-campaign-poll = lib.mkIf cfg.campaignPoll.enable {
           Unit = {
             Description = "reconcile armed forge-native tally campaigns";
             After = [
@@ -532,6 +532,10 @@ in
           };
           Service = {
             Type = "oneshot";
+            # The scan holds the registry lock exclusively across its forge
+            # round-trips, so a wedged call would block interactive arm,
+            # disarm, and list until this fires.
+            TimeoutStartSec = cfg.campaignPoll.timeout;
             ExecStart = "${campaignPollProgram}/bin/tally-campaign-poll";
             UMask = "0077";
             NoNewPrivileges = true;
@@ -568,11 +572,11 @@ in
           };
           Install.WantedBy = [ "timers.target" ];
         };
-        tally-campaign-poll = {
+        tally-campaign-poll = lib.mkIf cfg.campaignPoll.enable {
           Unit.Description = "poll armed forge-native tally campaigns";
           Timer = {
             OnActiveSec = "15s";
-            OnUnitActiveSec = "60s";
+            OnUnitActiveSec = cfg.campaignPoll.interval;
             Persistent = true;
             Unit = "tally-campaign-poll.service";
           };

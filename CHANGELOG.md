@@ -146,6 +146,20 @@ authorized.
 
 ### Fixed
 
+- Stopped campaign passes from starving their own failure diagnosis. The
+  per-lane node budget counted only the success path, but `maxNodes` counts
+  cumulative rows, so a lane that failed at merge overran it on the diff,
+  diagnosis, and steering nodes — the machine-steering write was rejected
+  exactly when a failure needed it. Lanes are now budgeted at their worst case.
+- Made the forge-native campaign poll schedulable. The timer's interval and its
+  bound on one scan are now `services.tally.campaignPoll.interval` and
+  `.timeout`, and `.enable` turns the poller off. The scan holds the registry
+  lock exclusively across its forge round-trips, so the explicit timeout caps
+  how long a wedged call can block an interactive `arm`, `disarm`, or `list`.
+- Fixed the failure-path `taskRef` in the spec-build flow. Diff, diagnosis, and
+  steering nodes derived their task reference from the campaign name rather
+  than the campaign task identity, so under a forge-native container those
+  nodes were invisible to the cross-run blocking filter.
 - Stopped adapter-controlled terminal control from reaching an operator's TTY.
   Every human rendering of adapter text — `query run` and `query log` tables,
   failure stderr tails, and the `adapter smoke` capture excerpt — now passes

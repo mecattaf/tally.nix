@@ -1176,6 +1176,10 @@
               };
               services.tally = {
                 enable = true;
+                campaignPoll = {
+                  interval = "4min";
+                  timeout = "2min";
+                };
                 campaigns.fixture = {
                   enable = true;
                   repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
@@ -1251,6 +1255,23 @@
                 stateVersion = "26.11";
               };
               services.tally.enable = false;
+            }
+          ];
+        };
+        pollDisabledHome = home-manager.lib.homeManagerConfiguration {
+          inherit pkgs;
+          modules = [
+            self.homeManagerModules.tally
+            {
+              home = {
+                username = "tally-poll-disabled";
+                homeDirectory = "/tmp/tally-poll-disabled-home";
+                stateVersion = "26.11";
+              };
+              services.tally = {
+                enable = true;
+                campaignPoll.enable = false;
+              };
             }
           ];
         };
@@ -3098,6 +3119,9 @@
             value = homeServices.${name}.Service.ExecStart;
           in
           if builtins.isList value then builtins.head value else value;
+        campaignHomeServices = campaignHome.config.systemd.user.services;
+        campaignHomeTimers = campaignHome.config.systemd.user.timers;
+        campaignPollScript = campaignHomeServices.tally-campaign-poll.Service.ExecStart;
         checkedHomeConfig = stockHome.config.xdg.configFile."tally/config.json".source;
         checkedCampaignConfig = campaignHome.config.xdg.configFile."tally/config.json".source;
         systemServices = stockNixos.config.systemd.services;
@@ -3150,6 +3174,24 @@
           assert pkgs.lib.hasInfix
             "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000 --projection-archive-horizon 30d"
             (homeServiceExec "tally-retention");
+          # Forge-native campaigns post no continuation comment, so this timer
+          # is the only thing that carries a campaign past its first pass.
+          assert homeServices ? tally-campaign-poll;
+          assert homeTimers ? tally-campaign-poll;
+          assert homeTimers.tally-campaign-poll.Timer.OnUnitActiveSec == "60s";
+          assert homeTimers.tally-campaign-poll.Timer.Unit == "tally-campaign-poll.service";
+          assert homeServices.tally-campaign-poll.Service.TimeoutStartSec == "90s";
+          assert campaignHomeTimers.tally-campaign-poll.Timer.OnUnitActiveSec == "4min";
+          assert campaignHomeServices.tally-campaign-poll.Service.TimeoutStartSec == "2min";
+          assert !(pollDisabledHome.config.systemd.user.timers ? tally-campaign-poll);
+          assert !(pollDisabledHome.config.systemd.user.services ? tally-campaign-poll);
+          # campaignMaxNodes and the CLI's max_flow_nodes are two independent
+          # implementations of one budget, and nothing else makes them agree.
+          # The fixture campaign has the shape the CLI unit test uses --
+          # maxParallel 3, two gates, one of them a command gate -- so both
+          # sides must land on 48. Drift on either side breaks a test rather
+          # than silently capping a run below its own worst case.
+          assert campaignHome.config.services.tally.flows.fixture.maxNodes == 48;
           assert systemServices ? tally-drain;
           assert systemTimers ? tally-drain;
           assert systemTimers.tally-drain.timerConfig.OnActiveSec == "1s";
@@ -3446,6 +3488,7 @@
               {
                 activationPackage = campaignHome.activationPackage;
                 checkedConfig = checkedCampaignConfig;
+                pollScript = campaignPollScript;
                 nativeBuildInputs = [
                   pkgs.git
                   pkgs.jq
@@ -3455,6 +3498,16 @@
                 trap 'echo "campaign-render: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
                 test -e "$activationPackage"
                 ${tally}/bin/tally --mode check-config --config "$checkedConfig" >/dev/null
+                # The poll holds the registry lock exclusively for its whole
+                # run, so the timer must scan once and return rather than wait
+                # out a campaign pass under the lock; --wait would block
+                # interactive arm, disarm, and list for the pass duration.
+                test -x "$pollScript"
+                grep -Fq -- "campaign poll --once" "$pollScript"
+                if grep -Fq -- "--wait" "$pollScript"; then
+                  echo "campaign-render: poll timer must not pass --wait" >&2
+                  exit 1
+                fi
                 jq -e '
                   .producers["campaign-fixture"].enqueue.brief as $fixtureArgs |
                   .producers["campaign-fixture-reconcile"].enqueue.brief as $reconcileArgs |
@@ -3985,6 +4038,21 @@
                 export HOME="$TMPDIR/home"
                 mkdir -p "$HOME"
                 ${pkgs.python3}/bin/python3 ${./test/agency_nightly_driver_test.py}
+                touch "$out"
+              '';
+          spec-build-task-ref-identity =
+            pkgs.runCommand "tally-spec-build-task-ref-identity" { nativeBuildInputs = [ pkgs.ripgrep ]; }
+              ''
+                # Every taskRef must come from taskRefFor(), which resolves to
+                # the issue-scoped container in forge-native mode. Interpolating
+                # effective.campaign instead hides those nodes from the
+                # cross-run blocking filter, and the failure path (diff,
+                # diagnose, steer) is exactly where that matters most.
+                if rg -n 'taskRef[^;]*\$\{effective\.campaign\}' \
+                  ${./examples/flows/spec-build.js}; then
+                  echo "spec-build.js must build taskRef with taskRefFor()" >&2
+                  exit 1
+                fi
                 touch "$out"
               '';
           spec-build-conflict-domains =

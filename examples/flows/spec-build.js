@@ -1654,7 +1654,7 @@ function sweepDeferral(sweepNode) {
   const diagnosisOutcomes = await parallel(
     failures.map(failure => () => (async () => {
       const task = failure.task;
-      const taskRef = `${effective.campaign}/${task.id}`;
+      const taskRef = taskRefFor(task.id);
       let diff = {
         taskId: task.id,
         available: false,
