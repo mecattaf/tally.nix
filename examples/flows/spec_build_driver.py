@@ -45,7 +45,7 @@ MAX_DIFF_CHARS = 128 * 1024
 PUBLIC_REDACTION = "conservative-v1"
 PUBLIC_DIAGNOSIS_TRUNCATION = "\n[... diagnosis truncated after redaction ...]"
 LIVE_JOB_STATES = {"paused", "queued", "running"}
-PASS_RECORD_SCHEMA_VERSION = 1
+PASS_RECORD_SCHEMA_VERSION = 2
 
 
 class DriverError(RuntimeError):
@@ -2449,7 +2449,7 @@ def query_live_flow_jobs(tally: Path, flow_run_id: str) -> list[dict[str, Any]]:
 
 def query_live_campaign_jobs(
     tally: Path,
-    campaign: str,
+    campaign_identity: str,
     current_flow_run_id: str,
 ) -> list[dict[str, Any]]:
     live: list[dict[str, Any]] = []
@@ -2478,7 +2478,9 @@ def query_live_campaign_jobs(
                 if candidate.get("liveState") != state:
                     fail(f"tally query jobs in state {state} returned a mismatched live state")
                 task_ref = candidate.get("taskRef")
-                if not isinstance(task_ref, str) or not task_ref.startswith(f"{campaign}/"):
+                if not isinstance(task_ref, str) or not task_ref.startswith(
+                    f"{campaign_identity}/"
+                ):
                     continue
                 orchestration = candidate.get("orchestration")
                 flow_run_id = (
@@ -2520,6 +2522,7 @@ def validated_pass_record(
     workspace_root: Path,
     run_hash: str,
     campaign: str,
+    campaign_identity: str,
     repository: str,
 ) -> tuple[dict[str, Any] | None, str | None]:
     path = pass_record_path(workspace_root, run_hash)
@@ -2536,6 +2539,7 @@ def validated_pass_record(
     expected_fields = {
         "schemaVersion",
         "campaign",
+        "campaignIdentity",
         "repository",
         "runId",
         "runHash",
@@ -2547,7 +2551,8 @@ def validated_pass_record(
     flow_run_id = saved.get("flowRunId")
     if (
         saved.get("schemaVersion") != PASS_RECORD_SCHEMA_VERSION
-        or saved.get("campaign") != campaign
+        or not isinstance(saved.get("campaign"), str)
+        or saved.get("campaignIdentity") != campaign_identity
         or saved.get("repository") != repository
         or not isinstance(saved_run_id, str)
         or not saved_run_id
@@ -2590,12 +2595,23 @@ def action_sweep(brief: dict[str, Any]) -> dict[str, Any]:
 def action_sweep_locked(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
         brief,
-        {"campaign", "repository", "repositoryConfig", "runId", "workspaceRoot", "tally"},
+        {
+            "campaign",
+            "campaignIdentity",
+            "repository",
+            "repositoryConfig",
+            "runId",
+            "workspaceRoot",
+            "tally",
+        },
         "sweep brief",
     )
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
         fail("campaign is not a safe component")
+    campaign_identity = required_string(
+        data.get("campaignIdentity", campaign), "campaignIdentity", 80
+    )
     repository = required_string(data.get("repository"), "repository")
     if not REPOSITORY.fullmatch(repository):
         fail("repository must use owner/name form")
@@ -2629,13 +2645,14 @@ def action_sweep_locked(brief: dict[str, Any]) -> dict[str, Any]:
         {
             "schemaVersion": PASS_RECORD_SCHEMA_VERSION,
             "campaign": campaign,
+            "campaignIdentity": campaign_identity,
             "repository": repository,
             "runId": run_id,
             "runHash": current_hash,
             "flowRunId": flow_run_id,
         },
     )
-    blocking_jobs = query_live_campaign_jobs(tally, campaign, flow_run_id)
+    blocking_jobs = query_live_campaign_jobs(tally, campaign_identity, flow_run_id)
 
     worktree_records = parse_worktrees(checkout)
     listed = git(
@@ -2689,6 +2706,7 @@ def action_sweep_locked(brief: dict[str, Any]) -> dict[str, Any]:
             workspace_root,
             candidate_hash,
             campaign,
+            campaign_identity,
             repository,
         )
         if pass_record is None:

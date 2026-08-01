@@ -1027,6 +1027,7 @@ async function sweepCampaign(repositoryConfig) {
     "sweep",
     {
       campaign: effective.campaign,
+      campaignIdentity: campaignTaskIdentity,
       repository: args.repository,
       repositoryConfig,
       runId: args.runId,
