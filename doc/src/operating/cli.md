@@ -319,10 +319,11 @@ supports `--cursor`. `query trace` also supports page cursors. Proof is not just
 lookup: it reports whether a witness is expected, returns the canonical record when present,
 separates advisory attestations, and includes ledger verification state.
 
-`query storage` is the daemon's own disk-pressure view. It reports both stores' allocated and
-apparent bytes, configured warning/hard levels, TaskChampion database/WAL/SHM sizes and operation
-high-water mark, and growth per canonical completion. At a hard level,
-`intake.accepting` is false; existing work and this query remain usable.
+`query storage` is the daemon's cached disk-pressure view. It reports both stores' allocated and
+apparent bytes, filesystem-available bytes, configured warning/hard/free-space levels,
+TaskChampion database/WAL/SHM sizes and operation high-water mark, and growth per canonical
+completion. `sampledAt` identifies the off-thread sample; the query itself never walks the stores.
+At a hard level, `intake.accepting` is false; existing work and this query remain usable.
 
 Each `failed` log item includes the bounded `stderrTail` and a
 `stderrTruncated` boolean. Start there before constructing a capture path by

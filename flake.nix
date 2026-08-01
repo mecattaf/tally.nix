@@ -3094,10 +3094,12 @@
               dataDir = {
                 warningBytes = 34359738368;
                 hardBytes = 68719476736;
+                minimumFreeBytes = 268435456;
               };
               stateDir = {
                 warningBytes = 34359738368;
                 hardBytes = 68719476736;
+                minimumFreeBytes = 268435456;
               };
             };
           assert stockHome.config.services.tally.attestations.exec.enable;
@@ -3269,7 +3271,7 @@
               .enqueue.fanoutCap == 64 and
               .lease.yieldGraceSec == 20 and
               .retention == {"enable":true,"horizon":"30d","onCalendar":"daily","captureArchiveHorizon":"30d","eventsDoneHorizon":"180d","eventsRejectedHorizon":"30d","eventsRejectedMaxCount":10000,"projectionArchiveHorizon":"30d","lifecycleHorizon":"30d","lifecycleMaxBytes":268435456} and
-              .storage == {"pollIntervalSec":60,"dataDir":{"warningBytes":34359738368,"hardBytes":68719476736},"stateDir":{"warningBytes":34359738368,"hardBytes":68719476736}} and
+              .storage == {"pollIntervalSec":60,"dataDir":{"warningBytes":34359738368,"hardBytes":68719476736,"minimumFreeBytes":268435456},"stateDir":{"warningBytes":34359738368,"hardBytes":68719476736,"minimumFreeBytes":268435456}} and
               .attestations == {"exec":{"enable":true}} and
               .gitAi == {"enable":false,"mode":"advisory","awaitTimeoutSec":60,"globalAwaitOk":false} and
               .pools.build.resource == "build-slot" and

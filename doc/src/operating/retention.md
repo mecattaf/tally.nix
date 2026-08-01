@@ -70,8 +70,16 @@ services.tally.retention = {
 
 services.tally.storage = {
   pollIntervalSec = 60;
-  dataDir = { warningBytes = 34359738368; hardBytes = 68719476736; };
-  stateDir = { warningBytes = 34359738368; hardBytes = 68719476736; };
+  dataDir = {
+    warningBytes = 34359738368;
+    hardBytes = 68719476736;
+    minimumFreeBytes = 268435456;
+  };
+  stateDir = {
+    warningBytes = 34359738368;
+    hardBytes = 68719476736;
+    minimumFreeBytes = 268435456;
+  };
 };
 ```
 
@@ -205,6 +213,42 @@ The current storage story is intentionally uneven:
 | Unit-exit state | Durable recovery input; no general pruner | Do not prune by age. |
 | In-memory barrier tracker | At most 64 unclaimed drain snapshots; connected waits scale with active calls, and disconnected waiters are evicted on the next tracker operation | Automatic and restart-local. |
 | In-memory parent guardrails | Terminal parents retire after their outstanding-child count reaches zero | Automatic; rebuilt from active durable rows. |
+
+### Recover from a hard projection-archive crossing
+
+Hard pressure never launches GC implicitly. Retention horizons are evidence policy, and the
+timer's `--collect` action is host-wide; a daemon must not silently shorten either policy merely
+to admit another job.
+
+An offline `tally view rebuild` deliberately leaves the former projection as a fresh
+`taskdata.pre-rebuild-*` archive. If active projection plus that rollback copy crosses the data
+budget, the default 30-day archive horizon will keep intake refused. Inspect the bounded archive
+pass, explicitly accept losing those rollback copies, then run it without `--dry-run`:
+
+```console
+$ tally gc --horizon 30d --projection-archive-horizon 0s --skip-state-dir --dry-run
+$ tally gc --horizon 30d --projection-archive-horizon 0s --skip-state-dir
+```
+
+Omitting `--collect` prevents this recovery pass from running host-wide Nix GC. It still applies
+the chosen witness-root horizon, so use the configured `retention.horizon` in place of `30d`.
+Only timestamp-valid, plain-tree projection archives are eligible; the active `taskdata`
+directory is never touched. The cached storage view records recovery on its next sample (within
+`storage.pollIntervalSec`); restart the daemon only if an immediate fresh sample is operationally
+necessary.
+
+### Ownership boundaries of the byte budgets
+
+The data/state walks do not follow symlinks. In particular, a witness GC-root link is counted as
+directory metadata, not as the target Nix store closure. That avoids crossing into a shared
+global store and attributing deduplicated closure bytes to one daemon. The filesystem free-space
+floor still sees Nix growth when `/nix/store` and the tally directory share a filesystem; when
+they do not, inspect and retain the Nix store through its own GC-root policy.
+
+Campaign `workspaceRoot` trees and ordinary `artifact:<path>` files are workload-owned, not tally
+state, and are outside both directory budgets. Remote executor state is likewise measured on its
+host, not by the coordinator. Give those lanes their own filesystem monitoring and retention
+policy; do not raise tally's state-store budget as a substitute.
 
 Use the daemon's self-metrics first, then ordinary filesystem accounting to locate individual
 files:

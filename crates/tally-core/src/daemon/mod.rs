@@ -546,7 +546,9 @@ struct DaemonHandler {
     journal: JournalEmitter,
     history: Rc<RefCell<LifecycleStore>>,
     changes: Rc<RefCell<ChangeStore>>,
-    storage: Rc<RefCell<StorageMonitor>>,
+    storage: Rc<RefCell<StorageRuntime>>,
+    storage_refresh: Rc<Mutex<()>>,
+    storage_receipts: Rc<RefCell<HashSet<StorageReceiptKey>>>,
     trace_adapters: Rc<BTreeSet<String>>,
     pages: Rc<RefCell<PageCache>>,
     execution_shutdown: watch::Receiver<bool>,
@@ -562,6 +564,36 @@ struct DaemonHandler {
     git_ai: GitAiConfig,
     exec_attestations: bool,
     attestations: Arc<std::sync::Mutex<SharedAttestations>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct StorageReceiptKey {
+    producer: String,
+    source: String,
+    item_id: String,
+    warning_sequence: u64,
+}
+
+struct StorageRuntime {
+    monitor: Option<StorageMonitor>,
+    snapshot: StorageMetrics,
+    poll_interval: Duration,
+    last_sample: Instant,
+}
+
+impl StorageRuntime {
+    fn new(monitor: StorageMonitor) -> Self {
+        Self {
+            snapshot: monitor.query_snapshot(),
+            poll_interval: monitor.poll_interval(),
+            monitor: Some(monitor),
+            last_sample: Instant::now(),
+        }
+    }
+
+    fn sample_due(&self) -> bool {
+        self.last_sample.elapsed() >= self.poll_interval
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -746,15 +778,19 @@ fn internal_wire(error: impl ToString) -> WireError {
     WireError::new(WireErrorCode::Internal, error.to_string())
 }
 
-fn storage_budget_wire(snapshot: &StorageMetrics) -> WireError {
+fn storage_intake_wire(snapshot: &StorageMetrics) -> WireError {
     let reason = snapshot.intake.reason.clone().unwrap_or_else(|| {
         "storage budget prevents new intake while already-admitted work continues".to_owned()
     });
     WireError {
-        code: WireErrorCode::StorageBudgetExceeded,
+        code: if snapshot.monitor_error.is_some() {
+            WireErrorCode::StorageMonitorUnavailable
+        } else {
+            WireErrorCode::StorageBudgetExceeded
+        },
         message: reason,
         data: Some(json!({
-            "schemaVersion": 1,
+            "schemaVersion": snapshot.schema_version,
             "activeWarnings": snapshot.active_warnings,
             "storage": snapshot,
         })),
@@ -772,25 +808,75 @@ fn log_storage_warning(warning: &StorageWarningRecord) {
 }
 
 impl DaemonHandler {
-    async fn refresh_storage(&self) -> StorageMetrics {
+    fn cached_storage(&self) -> StorageMetrics {
+        self.storage.borrow().snapshot.clone()
+    }
+
+    async fn refresh_storage_if_due(&self) -> StorageMetrics {
+        if !self.storage.borrow().sample_due() {
+            return self.cached_storage();
+        }
+        let _refresh = self.storage_refresh.lock().await;
+        if !self.storage.borrow().sample_due() {
+            return self.cached_storage();
+        }
+        self.refresh_storage_locked().await
+    }
+
+    async fn refresh_storage_now(&self) -> StorageMetrics {
+        let _refresh = self.storage_refresh.lock().await;
+        self.refresh_storage_locked().await
+    }
+
+    async fn refresh_storage_locked(&self) -> StorageMetrics {
         let completion_count = self.context.read().await.witness.head().seq;
-        let refresh_error = {
+        let monitor = {
             let mut storage = self.storage.borrow_mut();
-            storage
+            storage.monitor.take()
+        };
+        let Some(mut monitor) = monitor else {
+            let error = "storage sampler is unavailable after its blocking worker stopped";
+            let snapshot = self.cached_storage().with_monitor_error(error);
+            self.storage.borrow_mut().snapshot = snapshot.clone();
+            eprintln!("tally: {error}; new intake will be refused");
+            return snapshot;
+        };
+
+        let sampled = tokio::task::spawn_blocking(move || {
+            let refresh_error = monitor
                 .refresh(completion_count)
                 .err()
-                .map(|error| error.to_string())
+                .map(|error| error.to_string());
+            let snapshot = monitor.query_snapshot();
+            let warnings = monitor.take_warnings();
+            let notices = monitor.take_notices();
+            (monitor, snapshot, warnings, notices, refresh_error)
+        })
+        .await;
+        let (snapshot, warnings, notices, refresh_error) = match sampled {
+            Ok((monitor, snapshot, warnings, notices, refresh_error)) => {
+                let mut storage = self.storage.borrow_mut();
+                storage.monitor = Some(monitor);
+                storage.snapshot = snapshot.clone();
+                storage.last_sample = Instant::now();
+                (snapshot, warnings, notices, refresh_error)
+            }
+            Err(error) => {
+                let message = format!("storage sampler blocking worker failed: {error}");
+                let snapshot = self.cached_storage().with_monitor_error(&message);
+                let mut storage = self.storage.borrow_mut();
+                storage.snapshot = snapshot.clone();
+                storage.last_sample = Instant::now();
+                eprintln!("tally: {message}; new intake will be refused");
+                return snapshot;
+            }
         };
         if let Some(error) = refresh_error {
             eprintln!("tally: storage monitor refresh failed; new intake will be refused: {error}");
         }
-        let (snapshot, warnings) = {
-            let mut storage = self.storage.borrow_mut();
-            let snapshot = storage
-                .query_snapshot()
-                .expect("storage monitor takes a successful sample during daemon startup");
-            (snapshot, storage.take_warnings())
-        };
+        for notice in notices {
+            eprintln!("tally: {notice}");
+        }
         for warning in &warnings {
             log_storage_warning(warning);
         }

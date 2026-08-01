@@ -178,7 +178,23 @@ impl Daemon {
             witness_path: witness_path.clone(),
             adapter_metadata,
         });
-        Self::build_locked(
+        let storage_data_dir = paths.data_dir.clone();
+        let storage_state_dir = paths.state_dir.clone();
+        let storage_config = config.storage.clone();
+        let storage_completion_count = witness_ledger.head().seq;
+        let storage = tokio::task::spawn_blocking(move || {
+            StorageMonitor::open(
+                storage_data_dir,
+                storage_state_dir,
+                storage_config,
+                storage_completion_count,
+            )
+        })
+        .await
+        .map_err(|error| {
+            DaemonError::Invalid(format!("initial storage sampler worker failed: {error}"))
+        })?;
+        let daemon = Self::build_locked(
             config,
             paths,
             settings,
@@ -188,10 +204,13 @@ impl Daemon {
             plan,
             committer,
             state_lock,
+            storage,
             attestations,
             witness_ledger,
             facts.durable.witness().to_vec(),
-        )
+        )?;
+        daemon.handler.refresh_storage_now().await;
+        Ok(daemon)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -210,6 +229,12 @@ impl Daemon {
         let attestations = SharedAttestations::new(paths.attestations_path());
         let witness_ledger = WitnessLedger::open(paths.witness_path())?;
         let witness_records = facts_witness(&plan, &paths)?;
+        let storage = StorageMonitor::open(
+            &paths.data_dir,
+            &paths.state_dir,
+            config.storage.clone(),
+            witness_ledger.head().seq,
+        );
         Self::build_locked(
             config,
             paths,
@@ -220,6 +245,7 @@ impl Daemon {
             plan,
             committer,
             state_lock,
+            storage,
             attestations,
             witness_ledger,
             witness_records,
@@ -237,6 +263,7 @@ impl Daemon {
         plan: crate::recovery::RecoveryPlan,
         committer: Box<dyn ReplicaCommitter>,
         state_lock: DaemonLockGuard,
+        mut storage: StorageMonitor,
         mut attestations: SharedAttestations,
         witness_ledger: WitnessLedger,
         witness_records: Vec<crate::witness::WitnessRecord>,
@@ -356,12 +383,14 @@ impl Daemon {
             .filter(|(_, adapter)| adapter.trace.is_some())
             .map(|(name, _)| name.clone())
             .collect::<BTreeSet<_>>();
-        let mut storage = StorageMonitor::open(
-            &paths.data_dir,
-            &paths.state_dir,
-            config.storage.clone(),
-            context.witness.head().seq,
-        )?;
+        for notice in storage.take_notices() {
+            eprintln!("tally: {notice}");
+        }
+        if let Some(error) = storage.query_snapshot().monitor_error {
+            eprintln!(
+                "tally: initial storage monitor sample failed; new intake will be refused: {error}"
+            );
+        }
         for warning in storage.take_warnings() {
             log_storage_warning(&warning);
         }
@@ -375,7 +404,9 @@ impl Daemon {
             journal: JournalEmitter::from_config(&config.journald),
             history: Rc::new(RefCell::new(LifecycleStore::open(&paths.data_dir)?)),
             changes: Rc::new(RefCell::new(changes)),
-            storage: Rc::new(RefCell::new(storage)),
+            storage: Rc::new(RefCell::new(StorageRuntime::new(storage))),
+            storage_refresh: Rc::new(Mutex::new(())),
+            storage_receipts: Rc::new(RefCell::new(HashSet::new())),
             trace_adapters: Rc::new(trace_adapters),
             pages: Rc::new(RefCell::new(PageCache::default())),
             execution_shutdown: execution_shutdown_rx,
