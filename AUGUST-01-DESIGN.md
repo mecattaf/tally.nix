@@ -170,7 +170,34 @@ stdout discarded) and one deliberate non-port: its mid-run human gate.
 campaign can enter; bounded machine judgment (#256, #257) is what makes that
 refusal viable at scale.
 
-## 7. Wave-3 backlog owed by the August 1 audit
+## 7. git-ai: the dormant fourth proof axis
+
+The codebase carries a complete authorship integration that has never been
+armed: `services.tally.gitAi` (default `enable = false`, never set by the
+estate) runs a settlement barrier at code-result completion — waiting for the
+externally provisioned `git-ai` binary's notes (`refs/notes/ai`) on the result
+revision — and binds session, model, and note content into the witness record,
+cross-linked by task/attempt/lease/flow-run. `mode = "required"` makes a
+missing binding fail the result; `tally authorship verify` re-checks the
+binding later with typed failure statuses. The estate packages the binary
+(dotfiles) but no config enables the binding; no flow references it.
+
+Where it sits in this design: it is the **fourth proof axis**, not a
+replacement for anything model-shaped. Gates prove behavior; the witness proves
+execution; checkpoints prove the accumulated system; git-ai proves authorship —
+in the repository itself, which is the quiet-surface doctrine done properly:
+prose provenance claims in PR bodies become verifiable repo-native metadata
+plus the `Assisted-by: <adapter>:<model> (tally:<taskUuid> witness:<seq>)`
+trailer (a pointer, never the proof).
+
+One hard interaction before arming it: **notes do not survive squash-merge.**
+A squash mints a new commit with no note and the noted working branch is
+deleted after merge. Under campaign squash semantics the binding point must
+move to the publish node — bind/rebind on the final squash commit, with the
+steward-authored message carrying the trailer. Arming git-ai (advisory first)
+is therefore one work item with the `mergeMethod` option, not a separate one.
+
+## 8. Wave-3 backlog owed by the August 1 audit
 
 To be minted as issues once wave 2 lands; audit evidence lives in the session
 record.
@@ -183,7 +210,8 @@ record.
 2. **Steward seam** — narrator/standardizer adapter (config-only: Nix adapter
    table, curl shim, `scrape.finalMessage` precedent); the `steward` catalog
    role in campaign options; `mergeMethod` option (squash default for
-   campaigns) with steward-authored messages.
+   campaigns) with steward-authored messages **including git-ai note
+   propagation and the Assisted-by trailer** (§7).
 3. **Two-repo campaigns** — spec-repo worklist/evidence, code-repo PRs;
    additive per the audit; prerequisite for the agency campaigns.
 4. **Defect list** — flow `codex()` nodes get the right process cwd but lose
