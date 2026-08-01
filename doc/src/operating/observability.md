@@ -138,9 +138,15 @@ order and `node-terminal` follows the replay-stable observation order.
 The same run ID filters the two ledgers:
 
 ```console
+$ tally query run <flow-run-uuid>
 $ tally query log --flow-run <flow-run-uuid>
 $ tally query proof --flow-run <flow-run-uuid>
 ```
+
+Start with `query run` when the question is “what is happening now?” It shows the
+spec-build reconciler's task table, any current nodes with elapsed time and remaining runtime
+budget, and failure capture pointers plus stderr tails. Use `--json` when a steering agent needs
+the same compact view as structured data.
 
 `query log` restricts the lifecycle stream to the run's nodes, resolved from the
 orchestration capsule on the durable rows and the witness chain, because a
@@ -211,10 +217,18 @@ Lifecycle events and provider output are separate:
 
 ```console
 $ tally query log --task <task-uuid> --attempt 2 --limit 100
+$ tally query log --task <task-uuid> --attempt 2 --json
+$ tally query log --task <task-uuid> --attempt 2 --json --provenance
 $ tally query trace --task <task-uuid> --attempt 2 --limit 100
 ```
 
-The log is tally's durable observation history. The trace is exposed only when
+The default log is a terse human transition view. It suppresses evidence observations and
+collapses a terminal journal record with its canonical witness, so “started” and “passed” are
+not repeated just because tally retained both authorities. `--json` retains the structured
+fields with the same collapse. `--provenance` restores every journal, evidence, and witness echo
+for an audit. The underlying RPC remains tally's uncollapsed durable observation history.
+
+The trace is exposed only when
 the adapter declares a JSON-lines provider stream. Trace records preserve
 provider order, parsed JSON when valid, raw text, and base64 for non-UTF-8
 bytes. Both each trace record and each generation summary expose `taskRef` when

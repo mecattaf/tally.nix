@@ -66,11 +66,13 @@ re-mention is always safe and always cheap.
 
 ## Observe
 
-Monitor **ground truth only**: merged PRs, the presence of capture `.err` files, and
-the runner unit's liveness. Do not build monitors on `tally query log
---flow-run` — it freezes silently on long runs (DEBT: #247). Silence is not
-success: any watcher must fire on every terminal state, including "runner gone
-with work remaining."
+Start an operator check with `tally query run <runner-task-uuid>`; it projects
+the reconciled task table, current-node elapsed/budget state, and failure
+pointers. For persistent monitoring, still corroborate ground truth: merged
+PRs, capture `.err` files, and runner-unit liveness. Do not treat a quiet
+`tally query log --flow-run` as progress — it freezes silently between
+transitions on long runs (DEBT: #247). Silence is not success: any watcher must
+fire on every terminal state, including "runner gone with work remaining."
 
 Known adapter noise such as "Reading additional input from stdin..." is retained
 in `.adapter.err`. The conventional `.err` path is an atomic, bounded
@@ -86,7 +88,9 @@ The campaign must keep working unless it is genuinely blocked or done. There are
 no approval pauses, no "phase done, awaiting operator" states, and Claude must
 never introduce one.
 
-1. On any failed node, read the bounded `stderrTail` in `tally query log` first.
+1. On any failed node, read the bounded stderr tail in `tally query run` first;
+   use `tally query log --task <uuid> --json` when the exact `stderrTail` field
+   or transition provenance is needed.
    A campaign failure receipt contains a conservatively redacted copy only when
    its GitHub producer explicitly enables both failure-publication switches. Read
    `~/.local/state/tally/capture/<task-uuid>.err` only when the tail is

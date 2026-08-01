@@ -30,7 +30,7 @@ Start with the lifecycle projection; failed events carry the final bounded
 2 KiB of captured stderr directly:
 
 ```console
-$ tally query log --task <task-uuid> --event failed \
+$ tally query log --task <task-uuid> --event failed --json \
     | jq '.items[] | {exitCode, stderrTail, stderrTruncated}'
 ```
 

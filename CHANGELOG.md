@@ -21,6 +21,11 @@ authorized.
   registers that issue without a Nix edit or deploy. A generic Home Manager
   poller now re-reads armed issue graphs into the shipped stateless reconciler,
   while `services.tally.campaigns` remains the recurring-work surface.
+- Added `tally query run <flow-run-id>` as the compact operational view of a
+  flow pass. Spec-build runs show reconciled campaign tasks as
+  done/running/blocked/pending, live node elapsed time and remaining runtime
+  budget, and failed stages with their retained `.err` path and bounded stderr
+  tail.
 - Added accept-time campaign gate preflights: every command gate declares a
   base-safe `preflightArgv` separately from its post-change `argv`. The exact
   probe executes once on the fetched base, with the same task environment and a
@@ -192,6 +197,11 @@ authorized.
   legitimately valid, so the properties reported a false tamper miss on the seeds that selected it.
 
 ### Changed
+
+- Changed `tally query log` to print one terse human line per lifecycle
+  transition by default. `--json` retains structured fields; both human and
+  JSON modes collapse journal/evidence/witness echoes, while `--provenance`
+  restores the uncollapsed source stream.
 
 - Restored `postEvidence` to its original pass/reuse-only meaning. Operators
   may opt into one idempotent public comment per failed attempt with

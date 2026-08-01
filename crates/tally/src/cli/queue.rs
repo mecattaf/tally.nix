@@ -236,6 +236,18 @@ pub(super) async fn run_query(
             )
             .await
         }
+        QueryCommand::Run { id, json } => {
+            let client = connect_rpc(socket, config_path).await?;
+            let result = client
+                .call_with_deadline("query.run", Some(json!({"id": id})), rpc_timeout)
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string(&result)?);
+                Ok(())
+            } else {
+                print_run_human(&result)
+            }
+        }
         QueryCommand::Status { pool } => {
             print_rpc(
                 socket,
@@ -267,13 +279,14 @@ pub(super) async fn run_query(
             until,
             limit,
             cursor,
+            json,
+            provenance,
         } => {
-            print_rpc(
-                socket,
-                config_path,
-                rpc_timeout,
-                "query.log",
-                Some(json!({
+            let client = connect_rpc(socket, config_path).await?;
+            let result = client
+                .call_with_deadline(
+                    "query.log",
+                    Some(json!({
                     "task": task,
                     "flowRun": flow_run,
                     "attempt": attempt,
@@ -284,9 +297,17 @@ pub(super) async fn run_query(
                     "until": until,
                     "limit": limit,
                     "cursor": cursor,
-                })),
-            )
-            .await
+                    "provenance": provenance,
+                    })),
+                    rpc_timeout,
+                )
+                .await?;
+            if json {
+                println!("{}", serde_json::to_string(&result)?);
+                Ok(())
+            } else {
+                print_lifecycle_human(&result, provenance)
+            }
         }
         QueryCommand::Proof {
             task,
@@ -376,6 +397,247 @@ pub(super) async fn run_query(
             )
             .await
         }
+    }
+}
+
+fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
+    let items = envelope
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid lifecycle log response"))?;
+    if items.is_empty() {
+        println!("No lifecycle transitions.");
+    }
+    for item in items {
+        let timestamp = item["timestamp"].as_str().unwrap_or("unknown-time");
+        let identity = item["taskRef"]
+            .as_str()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| short_identity(item["taskUuid"].as_str().unwrap_or("unknown")));
+        let label = item["nodeLabel"].as_str().unwrap_or("-");
+        let state = item["terminalVerdict"]
+            .as_str()
+            .unwrap_or_else(|| human_event(item["event"].as_str().unwrap_or("unknown")));
+        let mut detail = Vec::new();
+        if matches!(item["event"].as_str(), Some("started" | "dispatched")) {
+            if let Some(adapter) = item["adapter"].as_str() {
+                detail.push(format!("adapter={adapter}"));
+            }
+            if let Some(pools) = item["pool"].as_array() {
+                let pools = pools.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                if !pools.is_empty() {
+                    detail.push(format!("pool={}", pools.join(",")));
+                }
+            }
+        }
+        if let Some(seconds) = item["wallClockSeconds"].as_f64() {
+            detail.push(format!("elapsed={}", human_seconds_f64(seconds)));
+        }
+        if let Some(exit_code) = item["exitCode"].as_i64() {
+            if item
+                .get("terminalVerdict")
+                .is_some_and(|value| !value.is_null())
+            {
+                detail.push(format!("exit={exit_code}"));
+            }
+        }
+        if let Some(stderr) = item["stderrTail"].as_str() {
+            detail.push(format!(
+                "stderr={}",
+                serde_json::to_string(&compact_text(stderr))?
+            ));
+        }
+        if let Some(attempt) = item["attempt"].as_u64() {
+            detail.push(format!("attempt={attempt}"));
+        }
+        if provenance {
+            let origin = item["origin"].as_str().unwrap_or("unknown");
+            let source = item["provenance"].as_str().unwrap_or("unknown");
+            detail.push(format!("provenance={origin}:{source}"));
+        }
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!("  {}", detail.join(" "))
+        };
+        println!(
+            "{}  {:<14}  {:<24}  {}{}",
+            timestamp,
+            compact_text(&identity),
+            compact_text(label),
+            compact_text(state),
+            suffix
+        );
+    }
+    if let Some(cursor) = envelope["nextCursor"].as_str() {
+        eprintln!("More transitions are available; continue with --cursor {cursor}");
+    }
+    Ok(())
+}
+
+fn print_run_human(run: &Value) -> Result<()> {
+    let flow_run_id = run["flowRunId"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid run response"))?;
+    let state = run["state"].as_str().unwrap_or("unknown");
+    let flow_name = run["flowName"].as_str().unwrap_or("flow");
+    let campaign = run["campaign"].as_str();
+    println!(
+        "{}{}  {}  {}",
+        flow_name,
+        campaign.map_or_else(String::new, |value| format!(" {value}")),
+        flow_run_id,
+        state
+    );
+
+    let counts = &run["counts"];
+    println!(
+        "Tasks: {} done, {} running, {} blocked, {} pending",
+        counts["done"].as_u64().unwrap_or(0),
+        counts["running"].as_u64().unwrap_or(0),
+        counts["blocked"].as_u64().unwrap_or(0),
+        counts["pending"].as_u64().unwrap_or(0)
+    );
+    let tasks = run["tasks"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid run task table"))?;
+    if tasks.is_empty() {
+        println!("No reconciled task table is available for this run.");
+    } else {
+        println!();
+        println!(
+            "{:<9}  {:<18}  {:<24}  TITLE",
+            "STATUS", "TASK", "CURRENT / BLOCKED BY"
+        );
+        for task in tasks {
+            let task_ref = task["taskRef"].as_str().unwrap_or("-");
+            let context = task["failureStage"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .or_else(|| task["currentNode"].as_str().map(ToOwned::to_owned))
+                .or_else(|| {
+                    let blocked = task["blockedBy"]
+                        .as_array()?
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>();
+                    (!blocked.is_empty()).then(|| blocked.join(","))
+                })
+                .or_else(|| task["pullRequest"].as_str().map(ToOwned::to_owned))
+                .unwrap_or_else(|| "-".to_owned());
+            println!(
+                "{:<9}  {:<18}  {:<24}  {}",
+                task["status"].as_str().unwrap_or("unknown"),
+                compact_text(task_ref),
+                compact_text(&context),
+                compact_text(task["title"].as_str().unwrap_or("-"))
+            );
+        }
+    }
+
+    let current_nodes = run["currentNodes"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid current-node table"))?;
+    if !current_nodes.is_empty() {
+        println!();
+        println!("Current nodes");
+        for node in current_nodes {
+            let identity = node["taskRef"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| short_identity(node["taskUuid"].as_str().unwrap_or("unknown")));
+            let elapsed = node["elapsedSeconds"]
+                .as_u64()
+                .map(human_seconds)
+                .unwrap_or_else(|| "unknown".to_owned());
+            let budget = node["budgetRemainingSeconds"]
+                .as_u64()
+                .map(human_seconds)
+                .unwrap_or_else(|| "unbounded".to_owned());
+            println!(
+                "  {:<18}  {:<24}  {:<10}  elapsed={} budget={}",
+                compact_text(&identity),
+                compact_text(node["label"].as_str().unwrap_or("-")),
+                compact_text(node["state"].as_str().unwrap_or("unknown")),
+                elapsed,
+                budget
+            );
+        }
+    }
+
+    let failures = run["failures"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid failure table"))?;
+    if !failures.is_empty() {
+        println!();
+        println!("Failures");
+        for failure in failures {
+            let identity = failure["taskRef"]
+                .as_str()
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| {
+                    short_identity(failure["taskUuid"].as_str().unwrap_or("unknown"))
+                });
+            println!(
+                "  {}  {}  {}",
+                compact_text(&identity),
+                compact_text(failure["stage"].as_str().unwrap_or("unknown-stage")),
+                compact_text(failure["verdict"].as_str().unwrap_or("failed"))
+            );
+            if let Some(path) = failure["capturePath"].as_str() {
+                println!("    capture: {}", compact_text(path));
+            }
+            if let Some(stderr) = failure["stderrTail"].as_str() {
+                let truncated = failure["stderrTruncated"].as_bool().unwrap_or(false);
+                println!(
+                    "    stderr tail{}:",
+                    if truncated { " (truncated)" } else { "" }
+                );
+                for line in stderr.lines() {
+                    println!("      {}", compact_text(line));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn human_event(event: &str) -> &str {
+    match event {
+        "enqueued" => "queued",
+        "heartbeat" => "running",
+        "completed" => "pass",
+        "failed" => "failed",
+        "evidence_pass" => "evidence-pass",
+        "evidence_fail" => "evidence-fail",
+        "witness_emitted" => "terminal",
+        value => value,
+    }
+}
+
+fn short_identity(value: &str) -> String {
+    value.chars().take(8).collect()
+}
+
+fn compact_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn human_seconds(seconds: u64) -> String {
+    if seconds >= 3_600 {
+        format!("{}h{:02}m", seconds / 3_600, seconds % 3_600 / 60)
+    } else if seconds >= 60 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn human_seconds_f64(seconds: f64) -> String {
+    if seconds < 10.0 {
+        format!("{seconds:.1}s")
+    } else {
+        human_seconds(seconds.round().max(0.0) as u64)
     }
 }
 

@@ -588,13 +588,15 @@ brief.
 
 After a node failure:
 
-1. Inspect `tally query log` and the local structured flow error, which carries
-   the failed child and that child's bounded captured tail. A public campaign
+1. Start with `tally query run <runner-task-uuid>`. Its task table identifies
+   the blocked campaign task and failed stage, and its failure section carries
+   the retained capture path and bounded stderr tail. Use
+   `tally query log --flow-run <runner-task-uuid>` only when the transition or
+   provenance history is needed. A public campaign
    receipt is absent by default; it includes failure metadata only with
    `postFailureEvidence` and a conservatively redacted tail only with the
-   additional `postFailureStderr` opt-in. Locate the full
-   lifecycle with `tally query log --flow-run <runner-task-uuid>` when needed.
-   Task-specific records expose `taskRef`, so the worklist ID is visible
+   additional `postFailureStderr` opt-in. Task-specific records expose
+   `taskRef`, so the worklist ID is visible
    without a UUID lookup.
 2. Add the steering decision to the campaign issue.
 3. Correct any host or base defect exposed by preflight, then post the

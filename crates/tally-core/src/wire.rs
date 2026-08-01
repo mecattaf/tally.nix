@@ -47,6 +47,7 @@ pub const RPC_METHODS: &[&str] = &[
     "lease.status",
     "query.jobs",
     "query.job",
+    "query.run",
     "query.status",
     "query.storage",
     "query.log",
@@ -78,6 +79,7 @@ pub fn method_class(method: &str) -> Option<MethodClass> {
         | "queue.await_barrier"
         | "query.jobs"
         | "query.job"
+        | "query.run"
         | "query.status"
         | "query.storage"
         | "query.log"

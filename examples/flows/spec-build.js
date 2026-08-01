@@ -387,6 +387,7 @@ const reconcileSchema = {
   type: "object",
   required: [
     "schemaVersion",
+    "campaign",
     "repository",
     "source",
     "tasks",
@@ -399,6 +400,11 @@ const reconcileSchema = {
   ],
   properties: {
     schemaVersion: { const: 1 },
+    campaign: {
+      type: "string",
+      maxLength: 80,
+      pattern: "^[A-Za-z0-9_][A-Za-z0-9_.-]*$"
+    },
     repository: { type: "string", minLength: 1 },
     source: sourceSchema,
     tasks: {

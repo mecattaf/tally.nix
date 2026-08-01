@@ -2,8 +2,9 @@
 
 `tally` is both an operator command and the first client of the
 [Unix-socket RPC contract](../reference/rpc-protocol.md). Most online commands print one compact
-JSON value to stdout. Flow runs and watches are JSONL streams; selected witness commands and
-`query render --format text` also have human-readable output.
+JSON value to stdout. Flow runs and watches are JSONL streams; `query log` and `query run` are
+human-first, and selected witness commands plus `query render --format text` also have
+human-readable output. Both human-first query commands accept `--json`.
 
 On failure, the CLI normally prints `tally: ...` to stderr. Scripts should branch on the
 [documented exit classes](../reference/errors.md), then parse the structured stdout or RPC
@@ -57,7 +58,7 @@ assertions.
 | `attest` | Run a child through the advisory execution-attestation wrapper. | Child output; child's exit. |
 | `lease` | Acquire, release, or inspect an explicit reservation. | Lease JSON. |
 | `daemon` | Run the daemon or drain event ingress. | Long-running process or drain JSON. |
-| `query` | Jobs, proof, traces, producers, watch, status, and pool headroom. | JSON, JSONL, or text render. |
+| `query` | Jobs, run status, lifecycle, proof, traces, producers, watch, status, and pool headroom. | JSON, JSONL, or compact text. |
 | `flow` | Check or execute a deterministic JavaScript flow. | Meta JSON or lifecycle JSONL. |
 
 The installed `tallyd` symlink with no arguments is equivalent to `tally daemon run`.
@@ -312,6 +313,7 @@ $ tally query jobs --state running --pool local-ai --limit 100
 $ tally query jobs --flow-run RUN-UUID
 $ tally query jobs --cursor 'OPAQUE-CURSOR'
 $ tally query job TASK-UUID
+$ tally query run RUN-UUID
 ```
 
 `query jobs` filters:
@@ -339,21 +341,40 @@ uses works here too. Each item carries the node's `dedupKey` and the `dispositio
 row. Pagination cursors are daemon-memory snapshots: repeat the same filters, and restart from the
 beginning if the daemon or cursor snapshot is gone.
 
-### Status, proof, log, and trace
+### Run status, proof, log, and trace
 
 ```console
 $ tally query status
 $ tally query status --pool build
 $ tally query storage
+$ tally query run RUN-UUID
+$ tally query run RUN-UUID --json
 $ tally query proof --task TASK-UUID --attempt 2
 $ tally query proof --flow-run RUN-UUID
 $ tally query log --task TASK-UUID --attempt 2 --event completed
 $ tally query log --flow-run RUN-UUID
+$ tally query log --flow-run RUN-UUID --json
+$ tally query log --flow-run RUN-UUID --json --provenance
 $ tally query trace --task TASK-UUID --attempt 2 --limit 100
 ```
 
+`query run` prints the flow state and a per-task table. A spec-build pass shows every
+`campaign/task-id` as done, running, blocked, or pending. Its current-node section includes
+elapsed time and the remaining `runtimeMaxSec` budget; its failure section prints the retained
+failure capture path and bounded stderr tail. `--json` emits the same compact projection as a
+structured object.
+
+`query log` prints terse human transition lines by default. Evidence observations and the
+second journal/witness representation of a terminal fact are collapsed, so a node normally
+appears once when queued, started, and passed or failed. `--json` keeps the structured fields
+while applying the same collapse. Add `--provenance` to either rendering mode to preserve every
+journal, evidence, and witness record. An explicit `--event evidence_pass` or
+`--event evidence_fail` keeps the requested evidence observations even without
+`--provenance`.
+
 `query log` additionally filters by `--session`, `--source`, `--since`, and `--until`, and
-supports `--cursor`. `query trace` also supports page cursors. Proof is not just a witness
+supports `--cursor`; the human renderer writes a continuation hint to stderr when another page
+exists. `query trace` also supports page cursors. Proof is not just a witness
 lookup: it reports whether a witness is expected, returns the canonical record when present,
 separates advisory attestations, and includes ledger verification state.
 

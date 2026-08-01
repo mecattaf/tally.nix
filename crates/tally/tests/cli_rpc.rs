@@ -121,6 +121,25 @@ impl RpcHandler for CliHandler {
                     );
                     Ok(serde_json::json!({"schemaVersion": 1, "protocolVersion": 4}))
                 }
+                "query.run" => {
+                    assert_eq!(
+                        request.params.as_ref().unwrap()["id"],
+                        "00000000-0000-4000-8000-000000000045"
+                    );
+                    Ok(serde_json::json!({
+                        "schemaVersion": 1,
+                        "protocolVersion": 4,
+                        "flowRunId": "00000000-0000-4000-8000-000000000045",
+                        "flowName": "spec-build",
+                        "campaign": "crm",
+                        "state": "running",
+                        "counts": {"done": 1, "running": 1, "blocked": 0, "pending": 0},
+                        "tasks": [],
+                        "currentNodes": [],
+                        "failures": [],
+                        "snapshot": {}
+                    }))
+                }
                 "query.log" => {
                     let params = request.params.as_ref().unwrap();
                     assert_eq!(params["attempt"], 2);
@@ -131,6 +150,7 @@ impl RpcHandler for CliHandler {
                     assert_eq!(params["until"], "2026-07-25T00:00:00Z");
                     assert_eq!(params["limit"], 23);
                     assert_eq!(params["cursor"], "page-v1:log");
+                    assert_eq!(params["provenance"], false);
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
                         "protocolVersion": 4,
@@ -197,6 +217,118 @@ impl RpcHandler for CliHandler {
                     }))
                 }
                 method => Err(WireError::invalid(format!("unexpected method {method}"))),
+            }
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HumanQueryHandler;
+
+impl RpcHandler for HumanQueryHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        Box::pin(async move {
+            match request.method.as_str() {
+                "query.log" => {
+                    let mut response = serde_json::json!({
+                    "schemaVersion": 1,
+                    "protocolVersion": 4,
+                    "items": [
+                        {
+                            "origin": "journal", "eventId": "event:1", "cursor": "event:1",
+                            "timestamp": "2026-08-01T10:00:00.000Z", "event": "enqueued",
+                            "taskUuid": "00000000-0000-4000-8000-000000000261",
+                            "taskRef": "crm/t07", "nodeLabel": "agent-t07",
+                            "attempt": 1, "leaseEpoch": 7,
+                            "authority": "tally-lifecycle-observation",
+                            "provenance": "durable-lifecycle-history"
+                        },
+                        {
+                            "origin": "journal", "eventId": "event:2", "cursor": "event:2",
+                            "timestamp": "2026-08-01T10:00:01.000Z", "event": "started",
+                            "taskUuid": "00000000-0000-4000-8000-000000000261",
+                            "taskRef": "crm/t07", "nodeLabel": "agent-t07",
+                            "attempt": 1, "leaseEpoch": 7, "adapter": "codex", "pool": ["campaign-agent"],
+                            "authority": "tally-lifecycle-observation",
+                            "provenance": "durable-lifecycle-history"
+                        },
+                        {
+                            "origin": "journal", "eventId": "event:3", "cursor": "event:3",
+                            "timestamp": "2026-08-01T10:00:02.000Z", "event": "evidence_pass",
+                            "taskUuid": "00000000-0000-4000-8000-000000000261",
+                            "taskRef": "crm/t07", "nodeLabel": "agent-t07",
+                            "attempt": 1, "leaseEpoch": 7,
+                            "authority": "tally-lifecycle-observation",
+                            "provenance": "durable-lifecycle-history"
+                        },
+                        {
+                            "origin": "journal", "eventId": "event:4", "cursor": "event:4",
+                            "timestamp": "2026-08-01T10:00:03.000Z", "event": "completed",
+                            "taskUuid": "00000000-0000-4000-8000-000000000261",
+                            "taskRef": "crm/t07", "nodeLabel": "agent-t07",
+                            "attempt": 1, "leaseEpoch": 7, "exitCode": 0,
+                            "authority": "tally-lifecycle-observation",
+                            "provenance": "durable-lifecycle-history"
+                        },
+                        {
+                            "origin": "witness", "eventId": "witness:11", "cursor": "witness:11",
+                            "timestamp": "2026-08-01T10:00:03.100Z", "event": "witness_emitted",
+                            "taskUuid": "00000000-0000-4000-8000-000000000261",
+                            "taskRef": "crm/t07", "nodeLabel": "agent-t07",
+                            "attempt": 1, "leaseEpoch": 7, "exitCode": 0,
+                            "terminalVerdict": "pass", "witnessSeq": 11, "wallClockSeconds": 3.1,
+                            "authority": "canonical-witness-fact", "provenance": "witness-ledger"
+                        }
+                    ],
+                    "nextCursor": null,
+                        "snapshot": {}
+                    });
+                    if request.params.as_ref().unwrap()["provenance"] == false {
+                        let queued = response["items"][0].clone();
+                        let started = response["items"][1].clone();
+                        let mut terminal = response["items"][3].clone();
+                        terminal["origin"] = Value::String("journal+witness".to_owned());
+                        terminal["authority"] = Value::String("canonical-witness-fact".to_owned());
+                        terminal["provenance"] =
+                            Value::String("durable-lifecycle-history+witness-ledger".to_owned());
+                        terminal["terminalVerdict"] = Value::String("pass".to_owned());
+                        terminal["witnessSeq"] = serde_json::json!(11);
+                        terminal["wallClockSeconds"] = serde_json::json!(3.1);
+                        response["items"] = Value::Array(vec![queued, started, terminal]);
+                    }
+                    Ok(response)
+                }
+                "query.run" => Ok(serde_json::json!({
+                    "schemaVersion": 1,
+                    "protocolVersion": 4,
+                    "flowRunId": "00000000-0000-4000-8000-000000000262",
+                    "flowName": "spec-build",
+                    "campaign": "crm",
+                    "repository": "mecattaf/tally.nix",
+                    "state": "needs-attention",
+                    "counts": {"done": 1, "running": 0, "blocked": 1, "pending": 0},
+                    "tasks": [
+                        {"taskRef": "crm/t01", "title": "Done task", "status": "done", "blockedBy": [], "pullRequest": "https://example.test/pr/1"},
+                        {"taskRef": "crm/t02", "title": "Failed task", "status": "blocked", "blockedBy": [], "failureStage": "agent-t02"}
+                    ],
+                    "currentNodes": [{
+                        "taskUuid": "00000000-0000-4000-8000-000000000263",
+                        "taskRef": "crm/t02", "ordinal": 3, "label": "cleanup-t02", "state": "running",
+                        "startedAt": "2026-08-01T10:00:00Z", "elapsedSeconds": 9,
+                        "runtimeMaxSec": 60, "budgetRemainingSeconds": 51
+                    }],
+                    "failures": [{
+                        "taskUuid": "00000000-0000-4000-8000-000000000264",
+                        "taskRef": "crm/t02", "ordinal": 2, "stage": "agent-t02", "verdict": "failed",
+                        "attempt": 1, "leaseEpoch": 4, "timestamp": "2026-08-01T10:00:03Z",
+                        "capturePath": "/tmp/tally/crm.t02.err", "stderrTail": "actionable failure\n", "stderrTruncated": false
+                    }],
+                    "snapshot": {}
+                })),
+                method => panic!("unexpected method {method}"),
             }
         })
     }
@@ -653,7 +785,7 @@ async fn query_v4_cli_forwards_all_durable_observability_commands() {
     local
         .run_until(async {
             let server = tokio::task::spawn_local(async move {
-                for _ in 0..7 {
+                for _ in 0..8 {
                     let (stream, _) = listener.accept().await.unwrap();
                     serve_connection(stream, CliHandler).await.unwrap();
                 }
@@ -701,6 +833,16 @@ async fn query_v4_cli_forwards_all_durable_observability_commands() {
                     &socket,
                     &[
                         "query",
+                        "run",
+                        "00000000-0000-4000-8000-000000000045",
+                        "--json",
+                    ],
+                )
+                .await,
+                run_tally(
+                    &socket,
+                    &[
+                        "query",
                         "log",
                         "--task",
                         task,
@@ -720,6 +862,7 @@ async fn query_v4_cli_forwards_all_durable_observability_commands() {
                         "23",
                         "--cursor",
                         "page-v1:log",
+                        "--json",
                     ],
                 )
                 .await,
@@ -771,6 +914,88 @@ async fn query_v4_cli_forwards_all_durable_observability_commands() {
                 assert!(output.status.success(), "{:?}", output);
                 let value: Value = serde_json::from_slice(&output.stdout).unwrap();
                 assert_eq!(value["protocolVersion"], 4);
+            }
+            server.await.unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn query_log_is_human_first_and_collapses_echoes_in_human_and_json_modes() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                for _ in 0..3 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(stream, HumanQueryHandler).await.unwrap();
+                }
+            });
+
+            let human = run_tally(&socket, &["query", "log"]).await;
+            assert!(human.status.success(), "{human:?}");
+            let human = String::from_utf8(human.stdout).unwrap();
+            assert_eq!(human.lines().count(), 3, "{human}");
+            assert!(human.contains("crm/t07"));
+            assert!(human.contains("agent-t07"));
+            assert!(human.contains("pass"));
+            assert!(!human.contains("evidence-pass"));
+            assert!(!human.contains("schemaVersion"));
+
+            let json = run_tally(&socket, &["query", "log", "--json"]).await;
+            assert!(json.status.success(), "{json:?}");
+            let json: Value = serde_json::from_slice(&json.stdout).unwrap();
+            assert_eq!(json["items"].as_array().unwrap().len(), 3);
+            assert_eq!(json["items"][2]["origin"], "journal+witness");
+            assert_eq!(json["items"][2]["terminalVerdict"], "pass");
+            assert_eq!(json["items"][2]["witnessSeq"], 11);
+
+            let raw = run_tally(&socket, &["query", "log", "--json", "--provenance"]).await;
+            assert!(raw.status.success(), "{raw:?}");
+            let raw: Value = serde_json::from_slice(&raw.stdout).unwrap();
+            assert_eq!(raw["items"].as_array().unwrap().len(), 5);
+            assert!(raw["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["event"] == "evidence_pass"));
+            server.await.unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn query_run_human_view_includes_tasks_budget_and_failure_pointer() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_connection(stream, HumanQueryHandler).await.unwrap();
+            });
+            let output = run_tally(
+                &socket,
+                &["query", "run", "00000000-0000-4000-8000-000000000262"],
+            )
+            .await;
+            assert!(output.status.success(), "{output:?}");
+            let text = String::from_utf8(output.stdout).unwrap();
+            for expected in [
+                "spec-build crm",
+                "needs-attention",
+                "crm/t01",
+                "crm/t02",
+                "budget=51s",
+                "/tmp/tally/crm.t02.err",
+                "actionable failure",
+            ] {
+                assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
             }
             server.await.unwrap();
         })
