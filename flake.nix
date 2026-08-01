@@ -3430,6 +3430,7 @@
                 ];
               }
               ''
+                trap 'echo "campaign-render: failed at line $LINENO: $BASH_COMMAND" >&2' ERR
                 test -e "$activationPackage"
                 ${tally}/bin/tally --mode check-config --config "$checkedConfig" >/dev/null
                 jq -e '
@@ -3442,7 +3443,7 @@
                   .pools["campaign-control"].resource == "cpu-slot" and
                   .pools["campaign-control"].capacity == 3 and
                   .pools["campaign-agent"].resource == "slot" and
-                  .pools["campaign-agent"].capacity == 3 and
+                  .pools["campaign-agent"].capacity == 4 and
                   .adapters["spec-build-driver"].scrape.finalMessage.mode == "regex" and
                   .adapters["spec-build-driver"].scrape.finalMessage.pattern == "^TALLY_FINAL_MESSAGE=(.*)$" and
                   .flows.fixture.workloadMutex == "fixture-campaign" and

@@ -299,8 +299,8 @@ One enabled attrset expands to all of the following:
 | `producers.campaign-<name>` | A GitHub search producer scoped to the configured repositories, open issues, label, exact mention, and optional actor allowlist. |
 | `producers.campaign-<name>-reconcile` | A GitHub search producer for the exact self-posted continuation command emitted after a merge. |
 | `<pool.name>` | A capacity-1 mutex held for one reconcile pass. |
-| `campaign-agent` | A counted `slot` pool whose rendered capacity is the largest enabled `maxParallel`. |
-| `campaign-control` | A `cpu-slot` pool for reconciliation, Git, GitHub, and gate nodes; its default capacity is the largest enabled `maxParallel`. |
+| `campaign-agent` | A counted `slot` pool with baseline capacity four, raised when an enabled recurring campaign has a larger `maxParallel`. |
+| `campaign-control` | A `cpu-slot` pool for reconciliation, Git, GitHub, and gate nodes, with the same baseline and recurring-campaign scaling. |
 | `spec-build-driver` | The packaged deterministic policy driver used for reconcile, prep, built-in constraints, checkpoint recording, publish, rebase, and merge projections. |
 
 The producer posts its receipt and witnessed evidence. Each merge posts an
