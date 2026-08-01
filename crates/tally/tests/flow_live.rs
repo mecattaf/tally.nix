@@ -2445,8 +2445,7 @@ async fn spec_build_campaign_is_serial_fail_fast_and_replay_continuable() {
                     .call("query.job", Some(json!({"id": item["anchor"]})))
                     .await
                     .unwrap();
-                if projected["job"]["orchestration"]["nodeLabel"]
-                    == "preflight-gate-fixture-first"
+                if projected["job"]["orchestration"]["nodeLabel"] == "preflight-gate-fixture-first"
                 {
                     assert_ne!(terminal["verdict"], "pass");
                     failed_preflight = terminal["task_uuid"].as_str().map(str::to_owned);
