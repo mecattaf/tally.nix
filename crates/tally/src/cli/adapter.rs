@@ -95,7 +95,10 @@ async fn run_adapter_smoke(
     let probe = if args.assert_commit {
         let parent = match args.probe_root {
             Some(root) => root,
-            None => CommitProbe::default_root()?,
+            None => CommitProbe::root_under(&match args.state_dir {
+                Some(state_dir) => state_dir,
+                None => default_state_dir()?,
+            }),
         };
         Some(CommitProbe::seed(&parent)?)
     } else {
@@ -323,12 +326,15 @@ impl CommitProbe {
     /// directory rather than from `std::env::temp_dir()` is the whole point: a
     /// hardened adapter's transient unit gets a private `/tmp` it cannot chdir
     /// into, and an agent sandbox may treat `$TMPDIR` as writable by default.
+    ///
+    /// This is the *same* derivation `tally gc` sweeps
+    /// (`retention::ADAPTER_SMOKE_DIRECTORY` under the state directory it is
+    /// given), so handing both commands the same `--state-dir` makes the
+    /// producer of these repositories and their reaper name one place. Without
+    /// `--state-dir` the CLI resolves the XDG state directory, which on a NixOS
+    /// deployment is not the module's `stateDir` — that is why the flag exists.
     fn root_under(state_dir: &Path) -> PathBuf {
         state_dir.join(tally_core::retention::ADAPTER_SMOKE_DIRECTORY)
-    }
-
-    fn default_root() -> Result<PathBuf> {
-        Ok(Self::root_under(&default_state_dir()?))
     }
 
     fn seed(parent: &Path) -> Result<Self> {

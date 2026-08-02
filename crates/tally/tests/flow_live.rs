@@ -1263,7 +1263,7 @@ async fn fs5_live_acceptance_matrix() {
             assert!(durable_children[0].row.gh_origin.is_none());
 
             let completed_dir = paths.state_dir.join("producers/gh-completed");
-            let (completed_deadline, _) = poll_deadline();
+            let (completed_deadline, completed_budget) = poll_deadline();
             loop {
                 let completed = fs::read_dir(&completed_dir)
                     .ok()
@@ -1282,7 +1282,15 @@ async fn fs5_live_acceptance_matrix() {
                 .lines()
                 .map(|line| serde_json::from_str::<Value>(line).unwrap())
                 .collect::<Vec<_>>();
-            assert_eq!(gh_requests.len(), 2);
+            // The wait above ends either on the completion marker or on its
+            // scaled deadline, so this is where an expired budget surfaces —
+            // and it names the knob that would widen it, like every other wait
+            // in this suite.
+            assert_eq!(
+                gh_requests.len(),
+                2,
+                "the gh completion mutation did not land {completed_budget}: {gh_requests:?}"
+            );
             let completion = gh_requests
                 .iter()
                 .find(|request| {
@@ -3876,7 +3884,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             attached_second_command
                 .stdout(Stdio::from(fs::File::create(&attached_stdout).unwrap()));
             let attached_second = attached_second_command.spawn().unwrap();
-            let (attached_deadline, _) = poll_deadline();
+            let (attached_deadline, attached_budget) = poll_deadline();
             loop {
                 if fs::read_to_string(&attached_stdout)
                     .unwrap_or_default()
@@ -3890,7 +3898,8 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             let attached_log = fs::read_to_string(&attached_stdout).unwrap();
             assert!(
                 attached_log.contains("\"disposition\":\"attached\""),
-                "the concurrent replay did not attach to the live sweep: {attached_log}"
+                "the concurrent replay did not attach to the live sweep {attached_budget}: \
+                 {attached_log}"
             );
             resume_all(&client).await;
             let (attached_first, attached_second) = tokio::join!(

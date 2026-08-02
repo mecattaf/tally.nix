@@ -219,7 +219,10 @@ authorized.
   `(0, 1)`, which *narrowed* every budget it reached and produced reds that read
   as product timeouts, and values large enough to overflow `Duration::mul_f64`
   inside libcore where nothing named the variable; the accepted range is now
-  `[1, 1000]` and every rejection names the variable and its value.
+  `[1, 1000]` and every rejection names the variable, its value, and the reason
+  for the bound it crossed. `test/fleet-gate.sh` validates `TALLY_GATE_TIMEOUT_SCALE`
+  against that same range, so a value the Rust knob will refuse is refused at
+  second zero rather than an hour later inside the ladder's `cargo test`.
 
 - A retained adapter-smoke commit probe is now bounded, named, and never seeded
   for a failure that has nothing to do with the adapter (#328). `tally adapter
@@ -228,10 +231,20 @@ authorized.
   now happens after the connection is open. Retaining the repository on an
   adapter failure is still deliberate — a failed probe is the evidence — but
   every failure past the seed now names the retained path, not just the
-  commit-assertion failure, and `tally gc` sweeps `adapter-smoke/probe-*` under
-  the state directory on the capture-archive horizon, reporting
+  commit-assertion failure, and `tally gc --state-dir DIR` sweeps `probe-*`
+  under `DIR/adapter-smoke/` on the capture-archive horizon, reporting
   `adapterProbesExamined`/`adapterProbesPruned`. Nothing had ever known that
   prefix, so every retained repository was permanent.
+
+  `tally adapter smoke` gained **`--state-dir PATH`**, the state directory the
+  default probe root derives from, because a sweep and a producer that resolve
+  different state directories reap nothing. Without it the CLI resolves
+  `$XDG_STATE_HOME/tally`, which on a NixOS deployment is not the module's
+  `stateDir` (`/var/lib/tally/state`) that the retention timer hands to
+  `tally gc` — so on that path the growth this closed was still unbounded. Pass
+  the same directory to both. `--probe-root` still names a directory outright
+  and is *not* swept unless it happens to be `<gc state dir>/adapter-smoke/`;
+  that limit is now stated in `doc/src/operating/cli.md` rather than implied.
 
 - `services.tally.producers.<name>.reviewers` no longer accepts a login the
   daemon will refuse (routed from the #318 evaluation). The Nix assertion

@@ -263,10 +263,20 @@ pristine_clone="$cache_dir/pristine.git"
 # the ladder's own `cargo test` and make a 10x-budget run byte-indistinguishable
 # from an honest one in the transcript. The ladder scrubs that variable and
 # honours this one instead, and records the decision in the transcript header.
+#
+# The accepted range is the one `crates/tally/tests/support/timeout_scale.rs`
+# enforces: [1, 1000]. The two validators are written in different languages and
+# must refuse the same values — an earlier version applied the optional fraction
+# to the `1000` alternative as well, so it blessed the whole interval
+# (1000, 1001) and the ladder then died an hour later inside `cargo test`. This
+# regex is deliberately the stricter of the two on exotic spellings that the
+# Rust parser would accept (`1e3`, surrounding whitespace): refusing them here
+# costs a retype at second zero, accepting one the Rust side then rejects costs
+# a gate run.
 gate_timeout_scale="${TALLY_GATE_TIMEOUT_SCALE:-}"
 if [[ -n "$gate_timeout_scale" ]]; then
-  [[ "$gate_timeout_scale" =~ ^([1-9][0-9]{0,2}|1000)(\.[0-9]+)?$ ]] \
-    || fail "TALLY_GATE_TIMEOUT_SCALE must be a multiplier between 1 and 1000: $gate_timeout_scale"
+  [[ "$gate_timeout_scale" =~ ^([1-9][0-9]{0,2}(\.[0-9]+)?|1000(\.0+)?)$ ]] \
+    || fail "TALLY_GATE_TIMEOUT_SCALE=\"$gate_timeout_scale\" must be a multiplier between 1 and 1000; the knob only widens budgets, so a value below 1 would tighten them, and a value above 1000 would overflow the scaled Duration"
 fi
 
 require_command date
