@@ -1216,14 +1216,20 @@ fn public_evidence(evidence: Option<Value>, include_failure_stderr: bool) -> Opt
 
 /// Redact a stderr tail for publication.
 ///
-/// Returns the redacted text, how many replacements were applied, and whether
-/// redaction itself pushed the tail over the publication bound. The count is
-/// over the whole redaction pass: a tail that is additionally truncated
-/// afterwards says so through `stderrTruncated`, so the two fields together
-/// still describe everything that was dropped.
+/// Returns the redacted text, how many replacements the *published* text
+/// carries, and whether redaction itself pushed the tail over the publication
+/// bound. The count describes what the reader is looking at: when redaction
+/// overflows the bound and the head is dropped, replacements that fell outside
+/// the surviving window are not counted, because a receipt reading
+/// `stderrRedactions: 60` over a tail with no redaction in it is a worse lie
+/// than a smaller number. `stderrTruncated` separately says the head is gone.
+///
+/// Positions rather than marker text: a job can print
+/// `[redacted sensitive stderr line]` itself, and counting occurrences in the
+/// output would let it inflate its own receipt.
 fn redact_public_stderr(stderr: &str) -> (String, usize, bool) {
     let mut output = String::with_capacity(stderr.len());
-    let mut redactions = 0_usize;
+    let mut redactions = Vec::new();
     let mut private_key_block = false;
     for line in stderr.split_inclusive('\n') {
         let lower = line.to_ascii_lowercase();
@@ -1232,15 +1238,16 @@ fn redact_public_stderr(stderr: &str) -> (String, usize, bool) {
         }
         let sensitive_line = private_key_block || stderr_line_is_sensitive(&lower);
         if sensitive_line {
+            redactions.push(output.len());
             output.push_str("[redacted sensitive stderr line]");
             if line.ends_with('\n') {
                 output.push('\n');
             }
-            redactions += 1;
         } else {
+            let base = output.len();
             let (line, line_redactions) = redact_stderr_tokens(line);
             output.push_str(&line);
-            redactions += line_redactions;
+            redactions.extend(line_redactions.into_iter().map(|offset| base + offset));
         }
         if lower.contains("-----end ") && lower.contains("private key-----") {
             private_key_block = false;
@@ -1251,7 +1258,7 @@ fn redact_public_stderr(stderr: &str) -> (String, usize, bool) {
         output.clear();
     }
     if output.len() <= crate::executor::CAPTURE_EXCERPT_MAX_BYTES {
-        return (output, redactions, false);
+        return (output, redactions.len(), false);
     }
     let tail_limit =
         crate::executor::CAPTURE_EXCERPT_MAX_BYTES - PUBLIC_STDERR_TRUNCATION_MARKER.len();
@@ -1262,7 +1269,10 @@ fn redact_public_stderr(stderr: &str) -> (String, usize, bool) {
     let mut bounded = String::with_capacity(crate::executor::CAPTURE_EXCERPT_MAX_BYTES);
     bounded.push_str(PUBLIC_STDERR_TRUNCATION_MARKER);
     bounded.push_str(&output[start..]);
-    (bounded, redactions, true)
+    // A replacement the cut bisected is not published whole, so it does not
+    // count: only those that begin inside the surviving window do.
+    let published = redactions.iter().filter(|offset| **offset >= start).count();
+    (bounded, published, true)
 }
 
 /// Markers that hide a whole line, but only where they stand in key position.
@@ -1329,15 +1339,17 @@ fn stderr_line_is_sensitive(lower: &str) -> bool {
     false
 }
 
-fn redact_stderr_tokens(line: &str) -> (String, usize) {
+/// Returns the redacted line and the byte offset within it of each replacement,
+/// so the caller can tell which replacements survive a later truncation.
+fn redact_stderr_tokens(line: &str) -> (String, Vec<usize>) {
     let mut output = String::with_capacity(line.len());
-    let mut redactions = 0_usize;
+    let mut redactions = Vec::new();
     for chunk in line.split_inclusive(char::is_whitespace) {
         let content_len = chunk.trim_end_matches(char::is_whitespace).len();
         let (content, spacing) = chunk.split_at(content_len);
         if stderr_token_is_sensitive(content) {
+            redactions.push(output.len());
             output.push_str("[redacted-token]");
-            redactions += 1;
         } else {
             output.push_str(content);
         }
@@ -1599,5 +1611,45 @@ mod redaction_vector_tests {
             );
             assert!(!truncated, "vector case {name} must fit the excerpt bound");
         }
+    }
+
+    /// The count is a claim about the text the receipt publishes, so it must
+    /// not survive the truncation that drops the text it counted.
+    #[test]
+    fn the_redaction_count_describes_only_the_published_tail() {
+        let secret = "GITHUB_TOKEN=ghp_012345678901234567890123456789012345\n";
+        let head = secret.repeat(60);
+        // Enough plain output after the secrets to push them out of the bound.
+        let tail = "plain diagnostic output\n".repeat(200);
+        let (published, redactions, truncated) = redact_public_stderr(&format!("{head}{tail}"));
+        assert!(truncated);
+        assert!(published.len() <= crate::executor::CAPTURE_EXCERPT_MAX_BYTES);
+        assert!(!published.contains("[redacted sensitive stderr line]"));
+        assert_eq!(
+            redactions, 0,
+            "counted redactions the receipt no longer publishes: {published}"
+        );
+
+        // The partial case: more secret lines than the bound holds. Only those
+        // that begin inside the surviving window count, and the count matches
+        // the markers actually published — the one the cut bisected counts for
+        // neither.
+        let (published, redactions, truncated) = redact_public_stderr(&secret.repeat(100));
+        assert!(truncated);
+        assert_eq!(
+            redactions,
+            published
+                .matches("[redacted sensitive stderr line]")
+                .count()
+        );
+        assert!(
+            redactions > 0 && redactions < 100,
+            "expected a partial count, got {redactions}"
+        );
+
+        // Untruncated output still counts every replacement.
+        let (_, redactions, truncated) = redact_public_stderr(&secret.repeat(3));
+        assert!(!truncated);
+        assert_eq!(redactions, 3);
     }
 }

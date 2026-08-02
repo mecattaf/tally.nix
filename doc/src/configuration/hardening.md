@@ -68,11 +68,19 @@ gate manifest. A cooperative yield hook does not need a state-directory write
 grant: it calls the daemon over `TALLY_SOCKET`.
 
 The per-execution capture lock is deliberately absent from that list. It lives
-in `capture-lock/<uuid>.capture.lock`, a sibling of `unit-exit` that no preset
-grants and that the daemon creates 0600 for itself. It used to sit in
-`unit-exit`, where a job could open and hold it — and the daemon waits on it
-while materializing a failure excerpt. Locks left in `unit-exit` by an older
-daemon are never taken again; `tally gc` drains them.
+in `capture-lock/<uuid>.capture.lock`, a sibling of `unit-exit` that neither
+`strict` nor `production` grants and that the daemon creates 0600 for itself. It
+used to sit in `unit-exit`, where a job under any preset could open and hold it —
+and the daemon waits on it while materializing a failure excerpt. Locks left in
+`unit-exit` by an older daemon are never taken again; `tally gc` drains them.
+
+`workspace` and `none` are exceptions, because neither narrows anything here:
+`workspace` grants the state directory whole and `none` emits no
+`ReadWritePaths=` at all, so a job under either can still reach `capture-lock/`.
+The relocation moves that surface off the narrowing presets; it does not remove
+it from the two that were never narrowing. This is the same trusted-programs-only
+caveat those presets already carry, and it is why the daemon additionally gives
+up on a contended lock after a bounded wait instead of trusting the filesystem.
 
 Every extra writable path must be absolute, contain no systemd `%` specifier,
 already exist when the job starts, and be writable by the daemon user. Grant the
@@ -106,9 +114,11 @@ access is already unconstrained there.
   credential, or trust boundary between jobs. In particular, the shared
   `unit-exit` directory and any shared extra writable path remain writable by
   other jobs using that same identity. That is why nothing the daemon blocks on
-  lives there: the capture lock moved to `capture-lock/`, which no preset
-  grants, and the daemon gives up on it after a bounded wait rather than
-  stalling if it is ever held too long.
+  lives there: the capture lock moved to `capture-lock/`, which `strict` and
+  `production` do not grant. Under `workspace` or `none` a job can still reach
+  it, so the guarantee that actually holds for every preset is the bounded wait —
+  the daemon gives up on a contended lock rather than stalling, and a dispatch
+  that loses the lock is recorded as preempted, never as a job failure.
 - `LoadCredential=` keeps working independently of the preset. A credential
   delivered to a job is still available to that job.
 

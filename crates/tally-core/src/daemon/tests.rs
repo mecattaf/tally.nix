@@ -9217,4 +9217,142 @@ mod tests {
         assert!(paths.socket.parent().unwrap().is_dir());
         assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 3);
     }
+
+    /// A dispatch that cannot take the capture lock never launched the unit, so
+    /// it must not be recorded as the agent having failed. Before this the
+    /// bounded deadline reached the catch-all executor-error arm and produced a
+    /// `Failed` witness with exit code 1 — a burnt attempt and, with
+    /// `postFailureEvidence` on, a public failure receipt with no evidence in
+    /// it — for a daemon-side file-locking condition.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_contended_capture_lock_preempts_the_dispatch_instead_of_failing_the_job() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let program = temp.path().join("failing-agent");
+                crate::test_support::install_shell_program(&program, "#!/bin/sh\nexit 1\n");
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+
+                // A client cannot preassign a task UUID, so run one attempt to
+                // learn the identity, then wedge its lock and retry: attempt 2
+                // dispatches under the same unit UUID.
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": [program],
+                        "pool": "slot",
+                    })))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(10), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+
+                let lock_dir = paths.state_dir.join(crate::executor::CAPTURE_LOCK_DIRECTORY);
+                fs::create_dir_all(&lock_dir).unwrap();
+                let holder = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .read(true)
+                    .write(true)
+                    .open(lock_dir.join(format!(
+                        "{task_uuid}{}",
+                        crate::executor::CAPTURE_LOCK_SUFFIX
+                    )))
+                    .unwrap();
+                FileExt::lock_exclusive(&holder).unwrap();
+
+                daemon
+                    .handler
+                    .retry_job(Some(json!({"task_uuid": task_uuid})))
+                    .await
+                    .unwrap();
+
+                // The dispatch is now waiting out the capture-lock deadline.
+                // `execute_raw` runs under `spawn_local` on this single-threaded
+                // runtime, so waiting inline would park the daemon's only thread
+                // for the whole deadline: no RPC answered, no timer fired. Drive
+                // the local set for a window well inside the deadline and watch
+                // for a step that does not come back.
+                let mut worst_stall = Duration::ZERO;
+                let watch = Instant::now();
+                while watch.elapsed() < Duration::from_millis(1_500) {
+                    let step = Instant::now();
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    worst_stall = worst_stall.max(step.elapsed());
+                }
+                assert!(
+                    worst_stall < Duration::from_secs(1),
+                    "the dispatch parked the runtime thread for {worst_stall:?}"
+                );
+
+                // And the daemon is still answering, mid-deadline.
+                let answered = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    daemon.handler.query("query.jobs", Some(json!({"limit": 1}))),
+                )
+                .await
+                .expect("a contended dispatch must not park the daemon's runtime thread")
+                .unwrap();
+                assert_eq!(answered["items"].as_array().unwrap().len(), 1);
+
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(60), daemon.completion_rx.recv())
+                        .await
+                        .expect("the dispatch must give up on the lock, not block forever")
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                drop(holder);
+
+                let result = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": task_uuid, "attempt": 2})))
+                    .await
+                    .unwrap();
+                assert_eq!(result["verdict"], "preempted");
+
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                assert_eq!(records.len(), 2);
+                assert_eq!(records[0].verdict, Verdict::Failed);
+                let records = &records[1..];
+                assert_eq!(records[0].verdict, Verdict::Preempted);
+                // Not charged to the agent, and re-runnable rather than terminal.
+                assert!(!crate::witness::counts_toward_canonical_gpu_seconds(
+                    &records[0]
+                ));
+                assert_eq!(
+                    crate::evidence::retry_trigger(records[0].verdict),
+                    Some(crate::evidence::RetryTrigger::ResourceReturn)
+                );
+                // A preempted attempt is not a failure, so no failure receipt.
+                assert_ne!(
+                    terminal_lifecycle_event(
+                        records[0].verdict,
+                        records[0].artifact_content_hash.is_some()
+                    ),
+                    TallyEvent::Failed
+                );
+            })
+            .await;
+    }
 }

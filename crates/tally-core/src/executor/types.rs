@@ -7,10 +7,18 @@ pub const CAPTURE_ARCHIVE_DIRECTORY: &str = "capture/archive";
 /// A sibling of `unit-exit/`, deliberately not inside it: the `strict` and
 /// `production` hardening presets grant a job write access to that whole
 /// directory, because its `ExecStopPost` recorder writes the exit record there.
-/// The presets grant the two current capture streams by name and no capture
-/// directory at all, so a top-level sibling is outside every one of them. A lock
-/// the daemon may have to wait on must not be a file a job can create, replace,
-/// or hold.
+/// Those two presets grant the two current capture streams by name and no
+/// capture directory at all, so a top-level sibling is outside both of them. A
+/// lock the daemon may have to wait on must not be a file a job under a
+/// narrowing preset can create, replace, or hold.
+///
+/// `workspace` and `none` are stated exceptions, not oversights. `workspace`
+/// grants the whole state directory and `none` emits no `ReadWritePaths=` at
+/// all, so a job under either can still reach this directory — the relocation
+/// moves that surface, it does not remove it. Both presets are documented as
+/// for trusted programs only, and
+/// `executor::tests::hardening_presets_grant_the_capture_lock_directory_only_where_documented`
+/// pins all four variants so the exception cannot become an accident.
 pub const CAPTURE_LOCK_DIRECTORY: &str = "capture-lock";
 /// Where capture locks lived before they moved to [`CAPTURE_LOCK_DIRECTORY`].
 ///

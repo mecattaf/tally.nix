@@ -2889,14 +2889,23 @@ fn a_capture_lock_detached_from_its_name_is_never_accepted() {
 }
 
 #[test]
-fn no_hardening_preset_grants_a_job_the_capture_lock_directory() {
+fn hardening_presets_grant_the_capture_lock_directory_only_where_documented() {
     let state_dir = Path::new("/state tree");
     let executor = executor(state_dir);
     let lock_dir = state_dir.join(CAPTURE_LOCK_DIRECTORY);
     let lock = executor.capture_lock_path(&request().identity);
     assert!(lock.starts_with(&lock_dir));
 
-    for hardening in [AdapterHardening::Strict, AdapterHardening::Production] {
+    // Every variant, so a widened preset cannot silently reopen the surface the
+    // relocation closed. `workspace` and `none` are documented exceptions — they
+    // grant the state directory whole, or constrain nothing at all — and this
+    // test asserts they still behave exactly that way rather than skipping them.
+    for hardening in [
+        AdapterHardening::Strict,
+        AdapterHardening::Production,
+        AdapterHardening::Workspace,
+        AdapterHardening::None,
+    ] {
         let mut request = request();
         request.hardening = hardening;
         request.workspace = Some(WorkspaceMetadata {
@@ -2911,8 +2920,34 @@ fn no_hardening_preset_grants_a_job_the_capture_lock_directory() {
             .unwrap();
         let writable = strings(&args)
             .into_iter()
-            .find(|value| value.starts_with("ReadWritePaths="))
-            .expect("a preset always states its writable set");
+            .find(|value| value.starts_with("ReadWritePaths="));
+
+        let Some(writable) = writable else {
+            // `none` emits no writable-path property at all: the job's
+            // filesystem access is already unconstrained, so there is nothing
+            // for the relocation to narrow.
+            assert_eq!(hardening, AdapterHardening::None);
+            continue;
+        };
+        let granted = writable
+            .trim_start_matches("ReadWritePaths=")
+            .split("\" \"")
+            .map(|value| PathBuf::from(value.trim_matches('"')))
+            .collect::<Vec<_>>();
+        let containing = granted.iter().find(|path| lock.starts_with(path)).cloned();
+
+        if hardening == AdapterHardening::Workspace {
+            // The compatibility-era grant is the whole state directory, which
+            // contains the lock. Documented in hardening.md as trusted-programs
+            // only; the relocation moves that surface, it does not remove it.
+            assert_eq!(
+                containing,
+                Some(state_dir.to_owned()),
+                "workspace is expected to grant the state directory whole: {writable}"
+            );
+            continue;
+        }
+
         assert!(
             !writable.contains(lock_dir.to_str().unwrap()),
             "{hardening:?} grants the capture lock directory: {writable}"
@@ -2921,17 +2956,11 @@ fn no_hardening_preset_grants_a_job_the_capture_lock_directory() {
         assert!(writable.contains(state_dir.join(UNIT_EXIT_DIRECTORY).to_str().unwrap()));
         // No granted path is an ancestor of the lock either: a job that could
         // write `capture/` could create the directory itself.
-        for granted in writable
-            .trim_start_matches("ReadWritePaths=")
-            .split("\" \"")
-        {
-            let granted = Path::new(granted.trim_matches('"'));
-            assert!(
-                !lock.starts_with(granted),
-                "{hardening:?} grants {} which contains {}",
-                granted.display(),
-                lock.display()
-            );
-        }
+        assert!(
+            containing.is_none(),
+            "{hardening:?} grants {:?} which contains {}",
+            containing,
+            lock.display()
+        );
     }
 }

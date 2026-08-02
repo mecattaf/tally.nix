@@ -265,19 +265,31 @@ authorized.
 
 - Capture locks moved out of the job-writable `unit-exit/` directory and the
   daemon no longer blocks on one. New locks live at
-  `<stateDir>/capture-lock/<uuid>.capture.lock`, a sibling that no hardening
-  preset grants to a job — `strict` and `production` grant `unit-exit/` whole,
-  because the `ExecStopPost` recorder writes the exit record there, so any job
-  running as the daemon user could open and hold the lock the daemon waits on.
-  The wait is now a bounded try-lock: five seconds of backoff, then a clear
-  `capture lock … was still held` error instead of an indefinite `flock`. The
-  durable-wait RPC handlers additionally project a terminal witness after
-  releasing the daemon context write lock, on a blocking thread, so no capture
-  file work happens inline on the async runtime under that lock. Callers already
-  tolerate a failed excerpt materialization: a receipt loses its `stderrTail`
-  rather than the daemon losing the ability to answer. Locks left behind in
-  `unit-exit/` by an older daemon are never taken again and are drained by
-  `tally gc`, which now sweeps both locations.
+  `<stateDir>/capture-lock/<uuid>.capture.lock`, a sibling that neither `strict`
+  nor `production` grants to a job — both grant `unit-exit/` whole, because the
+  `ExecStopPost` recorder writes the exit record there, so any job running as
+  the daemon user could open and hold the lock the daemon waits on. `workspace`
+  and `none` are stated exceptions: they grant the state directory whole or
+  constrain nothing at all, so the relocation moves that surface off the
+  narrowing presets rather than removing it everywhere, and both are already
+  documented as for trusted programs only. The wait is now a bounded try-lock:
+  five seconds of backoff, then a clear `capture lock … was still held` error
+  instead of an indefinite `flock`. Dispatch takes the lock on the blocking
+  pool, and the durable-wait RPC handlers project a terminal witness after
+  releasing the daemon context write lock, also on a blocking thread — so a
+  contended lock never parks the daemon's single async thread, whatever the
+  preset. Callers already tolerate a failed excerpt materialization: a receipt
+  loses its `stderrTail` rather than the daemon losing the ability to answer.
+  Locks left behind in `unit-exit/` by an older daemon are never taken again and
+  are drained by `tally gc`, which now sweeps both locations.
+- A dispatch that cannot take the capture lock inside the deadline is recorded
+  as `preempted`, not as a job failure. The unit was never launched, so
+  attributing it to the agent burnt an attempt, wrote a `Failed` witness with
+  exit code 1, and — with `postFailureEvidence` on — posted a public failure
+  receipt with no evidence in it, all for a daemon-side file-locking condition.
+  `preempted` carries a resource-return retry trigger, is excluded from
+  canonical GPU seconds, and emits no failure receipt. No gate manifest is
+  evaluated for an attempt that never ran.
 - `tally gc`'s capture-lock sweep actually drains now. The daemon used to create
   the lock file *before* checking whether the capture generation still existed,
   so the startup reconciler — which replays every failed witness in the ledger
@@ -288,8 +300,11 @@ authorized.
   a dead task mints nothing.
 - Failure receipts now carry `stderrRedactions` beside `stderrRedacted`, so a
   reader can tell one dropped token from forty dropped lines. The boolean keeps
-  its meaning; the count is the number of replacements the redactor applied to
-  the tail. Redaction *matching* is unchanged.
+  its meaning; the count is the number of replacements present in the published
+  tail. When redaction overflows the publication bound and the head is dropped,
+  replacements that fell outside the surviving window are not counted — the
+  number always describes the text in the receipt, and `stderrTruncated` says
+  the head is gone. Redaction *matching* is unchanged.
 - `retention.horizon` now doubles as the retry window for brief-bearing jobs.
   This is not new behavior and not a regression, but it has never carried a
   release note: once a job's brief has expired out of `<dataDir>/briefs`, that
