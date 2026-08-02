@@ -368,15 +368,30 @@ authorized.
 
 ### Fixed
 
-- A human query whose reader hangs up now ends quietly instead of panicking.
+- A command whose reader hangs up now ends quietly instead of panicking.
   `tally query run <id> | head -1` printed through stock `println!`, so the
   first write after the pipe closed panicked with `failed printing to stdout:
-  Broken pipe` and a failing exit status. Every human-facing print on the
-  queue, lease, and query surface now writes through a helper that reports a
-  closed reader as exit 0 with no message; any other write failure is still an
-  error with its message. The process-wide SIGPIPE disposition is untouched, so
-  `daemon run`, `__remote-executor`, and `__record-unit-exit` keep seeing a
-  closed socket as an error to report rather than a reason to die mid-write.
+  Broken pipe` and a failing exit status. Every human-facing print in the CLI —
+  `query`, `queue` (including `queue continue`), `lease`, `enqueue`, `flow`,
+  `campaign`, `adapter`, `producer`, `witness`, `gc`, and the clap-generated
+  help — now writes through a helper that reports a closed reader as exit 0
+  with no message; any other write failure is still an error with its message.
+  The `tally: <error>` line in the top-level error printer is dropped rather
+  than panicked on, and the exit code stays the error's own. `clippy.toml`
+  disallows `println!`/`eprintln!` so a converted file cannot regress silently;
+  the writers that must keep printing unconditionally — the daemon's log
+  surface in `tally-core`, the executor's captured diagnostics, and test
+  harness output — carry an explicit `allow` naming the reason.
+
+  The process-wide SIGPIPE disposition is untouched, so `daemon run`,
+  `__remote-executor`, and `__record-unit-exit` keep seeing a closed socket as
+  an error to report rather than a reason to die mid-write. Two paths keep
+  their own behaviour by design: the flow runner's JSONL lifecycle stream still
+  turns a write failure into a `FlowCaptureError` (its stdout is the daemon's
+  ingest channel, not an operator's pipeline), and a command that would have
+  exited nonzero exits 0 if the pipe breaks before its last line — the same
+  outcome the default SIGPIPE disposition produces, for a reader that is gone
+  either way.
 
 - Terminal-output sanitization now covers the remaining daemon-sourced strings
   in `tally query run` and `tally query log`: flow name, campaign, flow-run id,

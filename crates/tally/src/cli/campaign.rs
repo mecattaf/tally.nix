@@ -1948,7 +1948,7 @@ async fn run_campaign_arm(
     )?;
     write_registration(&state_dir, &registration)?;
     if args.no_enqueue {
-        println!(
+        outln!(
             "{}",
             serde_json::to_string(&json!({
                 "status": "armed",
@@ -1977,7 +1977,7 @@ async fn run_campaign_arm(
     )
     .await?;
     write_registration(&state_dir, &registration)?;
-    println!(
+    outln!(
         "{}",
         serde_json::to_string(&armed_projection(&result, registration.sub_issue_walk))?
     );
@@ -2073,7 +2073,7 @@ async fn run_campaign_poll(
             Err(error) => failures.push(format!("{}: {error:#}", path.display())),
         }
     }
-    println!(
+    outln!(
         "{}",
         serde_json::to_string(&json!({
             "observed": observed,
@@ -2096,7 +2096,7 @@ fn run_campaign_list(args: CampaignListArgs) -> Result<()> {
         .into_iter()
         .map(|(_, registration)| registration)
         .collect::<Vec<_>>();
-    println!("{}", serde_json::to_string(&values)?);
+    outln!("{}", serde_json::to_string(&values)?);
     Ok(())
 }
 
@@ -2111,7 +2111,7 @@ fn run_campaign_disarm(args: CampaignDisarmArgs) -> Result<()> {
     } else {
         false
     };
-    println!(
+    outln!(
         "{}",
         serde_json::to_string(&json!({"issue": locator.url, "disarmed": removed}))?
     );
@@ -3250,7 +3250,7 @@ fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
         &args.label,
         &master_body,
     )?;
-    println!(
+    outln!(
         "{}",
         serde_json::to_string(&json!({
             "issue": locator.url,

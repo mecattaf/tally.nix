@@ -96,6 +96,8 @@ async fn read_since(epoch_seconds: u64) -> std::process::Output {
 
 #[tokio::test]
 #[ignore = "requires an explicitly selected NixOS host with a user manager and journal socket"]
+// The stdout line below is the payload under test, not operator output.
+#[allow(clippy::disallowed_macros)]
 async fn real_user_manager_journal_paths() {
     if let Ok(marker) = std::env::var(CHILD_MODE) {
         // libtest writes `test <name> ... ` without a newline before entering the

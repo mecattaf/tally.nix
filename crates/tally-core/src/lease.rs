@@ -2733,6 +2733,8 @@ mod tests {
 
     #[test]
     #[ignore = "requires an explicitly selected NixOS host with a user manager"]
+    // A test harness skip notice; the cargo test runner owns this stream.
+    #[allow(clippy::disallowed_macros)]
     fn systemd_user_manager_liveness_smoke() {
         let remote_host = std::env::var("TALLY_TEST_REMOTE_HOST")
             .ok()

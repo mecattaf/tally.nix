@@ -136,7 +136,7 @@ pub(super) async fn run_flow(
                 validate_flow_pool_predicates(&checked.meta, &windowed_consumption_pools)
                     .map_err(flow_error)?;
             }
-            println!("{}", serde_json::to_string(&checked.meta_json)?);
+            outln!("{}", serde_json::to_string(&checked.meta_json)?);
             Ok(())
         }
         FlowCommand::Run(args) => {

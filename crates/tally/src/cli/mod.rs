@@ -71,6 +71,7 @@ use daemon::*;
 use enqueue::*;
 use exit::*;
 use flow::*;
+use out::{errln, outln};
 use queue::*;
 
 pub(crate) fn main() {
@@ -99,7 +100,11 @@ pub(crate) fn main() {
         Ok(()) => {}
         Err(error) => {
             if !helper_mode && !error.to_string().is_empty() {
-                eprintln!("tally: {error:#}");
+                // The last-resort printer cannot propagate anything: this is
+                // already the error path and `main` returns nothing. A closed
+                // stderr is dropped rather than panicked on, which is the same
+                // silence the stdout path takes.
+                let _ = out::write_error_line(format_args!("tally: {error:#}"));
             }
             std::process::exit(error_exit_code(&error));
         }
@@ -112,7 +117,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             .config
             .context("--mode check-config requires --config PATH")?;
         Config::from_path(&path)?;
-        println!("{}", serde_json::to_string(&configuration_contract())?);
+        outln!("{}", serde_json::to_string(&configuration_contract())?);
         return Ok(());
     }
 
@@ -180,7 +185,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
                     None,
                 )
             };
-            println!(
+            outln!(
                 "{}",
                 serde_json::to_string(&json!({
                     "argv": invocation.argv,
@@ -194,7 +199,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             Ok(())
         }
         Some(Command::AdapterSmokeShell) => {
-            println!("ok");
+            outln!("ok");
             Ok(())
         }
         Some(Command::AdapterSmokeCommit) => run_adapter_smoke_commit(),
@@ -204,7 +209,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
         Some(Command::Daemon {
             command: DaemonCommand::Run { mock: true, .. },
         }) => {
-            println!("tally mock daemon ready");
+            outln!("tally mock daemon ready");
             Ok(())
         }
         Some(Command::Daemon {
@@ -281,8 +286,8 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             .await
         }
         None => {
-            Opts::command().print_help()?;
-            println!();
+            Opts::command().print_help().map_err(out::map_write_error)?;
+            outln!();
             Ok(())
         }
     }
@@ -410,7 +415,7 @@ fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Resul
             }
         }
     };
-    println!("{}", serde_json::to_string(&result)?);
+    outln!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
@@ -622,7 +627,7 @@ async fn run_producer_dispatch(
     };
     let runtime_recorded = runtime.is_ok();
     if let Err(error) = runtime {
-        eprintln!(
+        errln!(
             "tally: producer runtime state for {producer_name:?} could not be recorded: {error}"
         );
     }
@@ -636,20 +641,20 @@ async fn run_producer_dispatch(
                     )
                     .await
                 {
-                    eprintln!(
+                    errln!(
                         "tally: producer runtime update for {producer_name:?} could not notify the daemon: {error}"
                     );
                 }
             }
             Err(error) => {
-                eprintln!(
+                errln!(
                     "tally: producer runtime update for {producer_name:?} could not reach the daemon: {error}"
                 );
             }
         }
     }
     let result = dispatched?;
-    println!("{}", serde_json::to_string(&result)?);
+    outln!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
@@ -664,7 +669,7 @@ fn run_history(command: HistoryCommand) -> Result<()> {
                 args.keep_days,
                 chrono::Utc::now(),
             )?;
-            println!("{}", serde_json::to_string_pretty(&outcome)?);
+            outln!("{}", serde_json::to_string_pretty(&outcome)?);
             Ok(())
         }
     }
@@ -676,7 +681,7 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
             let path = ledger.unwrap_or(default_data_dir()?.join("attestations.jsonl"));
             let payload = serde_json::from_str(&payload).context("--payload must be valid JSON")?;
             let record = append_attestation(&path, payload)?;
-            println!("{}", serde_json::to_string(&record)?);
+            outln!("{}", serde_json::to_string(&record)?);
             Ok(())
         }
         WitnessCommand::Verify {
@@ -704,22 +709,25 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
             match format {
                 WitnessVerifyFormat::Text => {
                     if verdict_report.ok {
-                        println!(
+                        outln!(
                             "verdict chain: ok ({} records, seq {:?}..{:?})",
                             verdict_report.records,
                             verdict_report.first_seq,
                             verdict_report.last_seq
                         );
                     } else {
-                        println!("verdict chain: invalid");
+                        outln!("verdict chain: invalid");
                         for problem in &verdict_report.problems {
-                            println!(
+                            outln!(
                                 "line {} seq {:?} {:?}: {}",
-                                problem.line, problem.seq, problem.kind, problem.reason
+                                problem.line,
+                                problem.seq,
+                                problem.kind,
+                                problem.reason
                             );
                         }
                     }
-                    println!(
+                    outln!(
                         "attestation chain: {} ({} records; {})",
                         if attestation_report.ok {
                             "ok"
@@ -730,7 +738,7 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                         attestation_report.authentication
                     );
                     for (path, report) in &exec_reports {
-                        println!(
+                        outln!(
                             "execution attestation chain {}: {} ({} records; {})",
                             path.display(),
                             if report.ok { "ok" } else { "invalid" },
@@ -738,7 +746,7 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                             report.authentication
                         );
                         if let Some(problem) = &report.problem {
-                            println!("  {problem}");
+                            outln!("  {problem}");
                         }
                     }
                 }
@@ -751,7 +759,7 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                         || json!({"seq": 0, "hash": GENESIS_PREV_HASH}),
                         |record| json!({"seq": record.seq, "hash": record.hash}),
                     );
-                    println!(
+                    outln!(
                         "{}",
                         serde_json::to_string(&json!({
                             "schemaVersion": 2,
@@ -802,19 +810,21 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
                 .map_err(|error| exit_failure(2, error.to_string()))?;
             match format {
                 WitnessVerifyFormat::Json => {
-                    println!("{}", serde_json::to_string(&report)?);
+                    outln!("{}", serde_json::to_string(&report)?);
                 }
                 WitnessVerifyFormat::Text => {
                     for execution in &report.executions {
-                        println!(
+                        outln!(
                             "{} {} {:?}",
-                            execution.witness_ref, execution.execution_id, execution.agreement
+                            execution.witness_ref,
+                            execution.execution_id,
+                            execution.agreement
                         );
                         for diff in &execution.diffs {
-                            println!("  {diff}");
+                            outln!("  {diff}");
                         }
                     }
-                    println!(
+                    outln!(
                         "compared={} unanimous={} diverged={} unattested={} orphans={}",
                         report.summary.compared,
                         report.summary.unanimous,
@@ -851,44 +861,44 @@ fn run_witness(command: WitnessCommand) -> Result<()> {
             };
             match format {
                 WitnessVerifyFormat::Json => {
-                    println!("{}", serde_json::to_string(&report)?);
+                    outln!("{}", serde_json::to_string(&report)?);
                 }
                 WitnessVerifyFormat::Text => {
-                    println!(
+                    outln!(
                         "authorship binding: {}",
                         serde_json::to_value(report.status)?
                             .as_str()
                             .expect("status serializes as a string")
                     );
                     if let Some(ledger) = &report.ledger {
-                        println!(
+                        outln!(
                             "verdict chain: {} ({} records)",
                             if ledger.ok { "ok" } else { "invalid" },
                             ledger.records
                         );
                     } else {
-                        println!("verdict chain: not consulted (revision mode)");
+                        outln!("verdict chain: not consulted (revision mode)");
                     }
                     if let Some(note_ref) = &report.note_ref {
-                        println!("note ref: {note_ref}");
+                        outln!("note ref: {note_ref}");
                     }
                     if let Some(revision) = &report.result_revision {
-                        println!("result revision: {revision}");
+                        outln!("result revision: {revision}");
                     }
                     if let Some(expected) = &report.expected_note_content_sha256 {
-                        println!("expected note digest: {expected}");
+                        outln!("expected note digest: {expected}");
                     }
                     if let Some(observed) = &report.observed_note_content_sha256 {
-                        println!("observed note digest: {observed}");
+                        outln!("observed note digest: {observed}");
                     }
                     if let Some(expected) = &report.expected_notes_ref_target {
-                        println!("expected notes-ref target: {expected}");
+                        outln!("expected notes-ref target: {expected}");
                     }
                     if let Some(observed) = &report.observed_notes_ref_target {
-                        println!("observed notes-ref target: {observed}");
+                        outln!("observed notes-ref target: {observed}");
                     }
                     if let Some(reason) = &report.reason {
-                        println!("reason: {reason}");
+                        outln!("reason: {reason}");
                     }
                 }
             }
@@ -960,6 +970,6 @@ fn run_gc(args: GcArgs) -> Result<()> {
         },
         &tally_core::nix_store::NixStore::default(),
     )?;
-    println!("{}", serde_json::to_string(&report)?);
+    outln!("{}", serde_json::to_string(&report)?);
     Ok(())
 }

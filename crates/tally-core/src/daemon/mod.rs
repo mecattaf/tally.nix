@@ -1,3 +1,8 @@
+#![allow(clippy::disallowed_macros)]
+// The daemon's stdout/stderr is its log surface, read by journald rather than
+// by an operator's pipeline. `cli::out`'s hang-up mapping is a CLI contract and
+// deliberately does not reach here (#315).
+
 mod barriers;
 mod completion;
 mod notify;

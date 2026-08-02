@@ -1,3 +1,7 @@
+#![allow(clippy::disallowed_macros)]
+// Executor diagnostics land in the job's captured streams, not on an operator's
+// terminal; they keep the stock macros (#315).
+
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fs::{File, OpenOptions};

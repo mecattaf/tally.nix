@@ -494,6 +494,29 @@ impl RpcHandler for FloodQueryHandler {
     }
 }
 
+/// Answers the two methods that share `submit_payload`.
+#[derive(Clone, Copy)]
+struct SubmitHandler;
+
+impl RpcHandler for SubmitHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        Box::pin(async move {
+            assert!(matches!(
+                request.method.as_str(),
+                "queue.enqueue" | "queue.continue"
+            ));
+            Ok(serde_json::json!({
+                "task_uuid": "00000000-0000-4000-8000-000000000141",
+                "job_id": "00000000-0000-4000-8000-000000000141",
+                "state": "queued"
+            }))
+        })
+    }
+}
+
 const NO_ENQUEUE_JOB: &str = "00000000-0000-4000-8000-000000000132";
 
 #[derive(Clone, Default)]
@@ -1372,6 +1395,117 @@ async fn a_human_query_whose_reader_hangs_up_exits_without_a_panic() {
             server.await.unwrap();
         })
         .await;
+}
+
+/// Run `tally` with a stdout whose reader is already gone: the deterministic
+/// form of `| head -1` exiting before the first write, with no race to lose.
+///
+/// `Command::output()` is deliberately not used — it replaces the configured
+/// stdout with a pipe of its own, which would quietly un-close the reader and
+/// make the assertion vacuous.
+async fn tally_writing_into_a_closed_pipe(
+    args: &[&str],
+    socket: Option<&Path>,
+) -> std::process::Output {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
+    if let Some(socket) = socket {
+        command.arg("--socket").arg(socket);
+    }
+    command
+        .args(args)
+        .env_remove("TALLY_JOB_ID")
+        .env_remove("TALLY_JOB_TOKEN")
+        .stdout(Stdio::from(writer))
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn submitting_commands_exit_quietly_when_their_reader_is_gone() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let _ = serve_connection(stream, SubmitHandler).await;
+                }
+            });
+
+            // `enqueue` and `queue continue` share `submit_payload`, the print
+            // site the first pass left on stock `println!`.
+            for args in [
+                vec!["enqueue", "--pool", "slot", "--", "true"],
+                vec![
+                    "queue",
+                    "continue",
+                    "00000000-0000-4000-8000-000000000141",
+                    "--",
+                    "true",
+                ],
+            ] {
+                let output = tally_writing_into_a_closed_pipe(&args, Some(&socket)).await;
+                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+                assert!(stderr.is_empty(), "{args:?} wrote to stderr:\n{stderr}");
+                assert_eq!(
+                    (
+                        output.status.code(),
+                        std::os::unix::process::ExitStatusExt::signal(&output.status)
+                    ),
+                    (Some(0), None),
+                    "{args:?} did not end quietly: {:?}",
+                    output.status
+                );
+            }
+            server.await.unwrap();
+        })
+        .await;
+}
+
+#[tokio::test]
+async fn a_closed_stream_never_panics_the_help_or_the_error_printer() {
+    let temp = tempfile::tempdir().unwrap();
+    let absent = temp.path().join("absent.sock");
+
+    // No arguments: clap writes the help text itself, so the mapping has to
+    // reach a writer this crate does not own.
+    let help = tally_writing_into_a_closed_pipe(&[], None).await;
+    let stderr = String::from_utf8_lossy(&help.stderr).into_owned();
+    assert!(stderr.is_empty(), "help wrote to stderr:\n{stderr}");
+    assert_eq!(help.status.code(), Some(0), "{:?}", help.status);
+
+    // A failing command whose *stderr* is the closed stream: the last-resort
+    // printer in `cli::main` has no `Result` to return, so it drops the line
+    // rather than panicking — and the exit code stays the error's own (3,
+    // daemon unreachable), never the panic's 101 and never a silent 0.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    let unreachable = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .arg("--socket")
+        .arg(&absent)
+        .args(["query", "run", "00000000-0000-4000-8000-000000000262"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(writer))
+        .spawn()
+        .unwrap()
+        .wait_with_output()
+        .await
+        .unwrap();
+    assert_eq!(
+        unreachable.status.code(),
+        Some(3),
+        "{:?}",
+        unreachable.status
+    );
 }
 
 #[tokio::test]

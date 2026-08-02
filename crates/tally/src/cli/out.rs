@@ -31,6 +31,15 @@ pub(super) fn write_error_line(args: Arguments<'_>) -> Result<()> {
     write_to(&mut io::stderr().lock(), "stderr", args)
 }
 
+/// The same mapping for a writer this module does not own — clap's help
+/// printer writes to stdout itself and hands back the raw `io::Error`.
+pub(super) fn map_write_error(error: io::Error) -> anyhow::Error {
+    if error.kind() == io::ErrorKind::BrokenPipe {
+        return exit_failure(0, "");
+    }
+    anyhow::Error::new(error).context("writing to stdout")
+}
+
 fn write_to(sink: &mut impl Write, name: &str, args: Arguments<'_>) -> Result<()> {
     match writeln!(sink, "{args}") {
         Ok(()) => Ok(()),
