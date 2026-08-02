@@ -10028,4 +10028,287 @@ mod tests {
             })
             .await;
     }
+
+    /// The whole rollover contract at the daemon boundary: the old run is
+    /// preserved, the successor is durable, repeats are safe, contradictions are
+    /// refused, and every query surface says which generation is current.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_supersede_records_durable_lineage_idempotently_and_refuses_contradictions() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let old_run = "00000000-0000-4000-8000-000000000251";
+                let new_run = "00000000-0000-4000-8000-000000000252";
+                let other_run = "00000000-0000-4000-8000-000000000253";
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let mut payload =
+                    fs1_full_payload("flow:supersede:0", &["true"], ["exit:0".to_owned()]);
+                payload["source"] = json!("orchestrator");
+                payload["orchestration"] = json!({
+                    "flowName": "generation-a",
+                    "flowRunId": old_run,
+                    "scriptHash": "sha256:generation-a-script",
+                    "argsHash": "sha256:generation-a-args",
+                    "nodeOrdinal": 0,
+                    "maxNodes": 2
+                });
+                let created = client.call("queue.enqueue", Some(payload)).await.unwrap();
+                assert_eq!(fs1_wait(&client, &created).await["verdict"], "pass");
+                let before = client
+                    .call("query.jobs", Some(json!({"flowRun": old_run})))
+                    .await
+                    .unwrap();
+
+                // Nothing is recorded until an operator asks for it.
+                let empty = client
+                    .call("query.lineage", Some(json!({"flowRun": old_run})))
+                    .await
+                    .unwrap();
+                assert_eq!(empty["superseded"], false);
+                assert_eq!(empty["chain"], json!([old_run]));
+                assert_eq!(empty["currentFlowRunId"], old_run);
+
+                let recorded = client
+                    .call(
+                        "flow.supersede",
+                        Some(json!({
+                            "flowRunId": old_run,
+                            "successorFlowRunId": new_run,
+                            "reason": "generation-change"
+                        })),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(recorded["disposition"], "recorded");
+                // The abandoned generation's own pins are the audit record, and
+                // they come from its rows rather than from the caller.
+                assert_eq!(
+                    recorded["record"]["predecessorScriptHash"],
+                    "sha256:generation-a-script"
+                );
+                assert_eq!(
+                    recorded["record"]["predecessorArgsHash"],
+                    "sha256:generation-a-args"
+                );
+
+                // Idempotent across supervisor restarts: same call, same answer,
+                // one durable record.
+                let repeated = client
+                    .call(
+                        "flow.supersede",
+                        Some(json!({
+                            "flowRunId": old_run,
+                            "successorFlowRunId": new_run,
+                            "reason": "generation-change"
+                        })),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(repeated["disposition"], "reused");
+                assert_eq!(repeated["record"], recorded["record"]);
+                assert_eq!(
+                    fs::read_to_string(paths.flow_lineage_path())
+                        .unwrap()
+                        .lines()
+                        .count(),
+                    1
+                );
+
+                // The predecessor's history is preserved byte for byte.
+                let after = client
+                    .call("query.jobs", Some(json!({"flowRun": old_run})))
+                    .await
+                    .unwrap();
+                assert_eq!(after["items"], before["items"]);
+
+                // A contradicting rollover is refused rather than rewritten.
+                let conflict = client
+                    .call(
+                        "flow.supersede",
+                        Some(json!({
+                            "flowRunId": old_run,
+                            "successorFlowRunId": other_run,
+                            "reason": "generation-change"
+                        })),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        conflict,
+                        WireIoError::Rpc(WireErrorCode::FlowLineageConflict, _, _)
+                    ),
+                    "{conflict:?}"
+                );
+
+                // Both ends of the boundary, from both directions.
+                let predecessor = client
+                    .call("query.lineage", Some(json!({"flowRun": old_run})))
+                    .await
+                    .unwrap();
+                assert_eq!(predecessor["superseded"], true);
+                assert_eq!(predecessor["supersededBy"]["successorFlowRunId"], new_run);
+                assert_eq!(predecessor["supersededBy"]["reason"], "generation-change");
+                assert_eq!(predecessor["currentFlowRunId"], new_run);
+                let successor = client
+                    .call("query.lineage", Some(json!({"flowRun": new_run})))
+                    .await
+                    .unwrap();
+                assert_eq!(successor["superseded"], false);
+                assert_eq!(successor["supersedes"]["flowRunId"], old_run);
+                assert_eq!(successor["chain"], json!([old_run, new_run]));
+
+                // The run view is unambiguous: terminal, with its successor named.
+                let view = client
+                    .call("query.run", Some(json!({"id": old_run})))
+                    .await
+                    .unwrap();
+                assert_eq!(view["state"], "superseded");
+                assert_eq!(view["supersededBy"]["successorFlowRunId"], new_run);
+
+                // The record survives the daemon that wrote it.
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+                drop(client);
+                let reopened = fs1_daemon(&paths).await;
+                let (second_shutdown, second_shutdown_rx) = watch::channel(false);
+                let second_task = tokio::task::spawn_local(reopened.run_until(second_shutdown_rx));
+                let restarted = RpcClient::connect(&paths.socket).await.unwrap();
+                let durable = restarted
+                    .call("query.lineage", Some(json!({"flowRun": old_run})))
+                    .await
+                    .unwrap();
+                assert_eq!(durable["supersededBy"]["successorFlowRunId"], new_run);
+                second_shutdown.send(true).unwrap();
+                second_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    /// A rollover may not strand live work, and a successor starts fresh.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_supersede_refuses_a_live_predecessor_and_a_started_successor() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let old_run = "00000000-0000-4000-8000-000000000261";
+                let new_run = "00000000-0000-4000-8000-000000000262";
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let node = |run: &str, key: &str, argv: &[&str]| {
+                    let mut payload = fs1_full_payload(key, argv, ["exit:0".to_owned()]);
+                    payload["source"] = json!("orchestrator");
+                    payload["orchestration"] = json!({
+                        "flowName": "generation",
+                        "flowRunId": run,
+                        "scriptHash": "sha256:generation-script",
+                        "nodeOrdinal": 0,
+                        "maxNodes": 2
+                    });
+                    payload
+                };
+
+                let live = client
+                    .call("queue.enqueue", Some(node(old_run, "flow:live:0", &["sleep", "30"])))
+                    .await
+                    .unwrap();
+                let refused = client
+                    .call(
+                        "flow.supersede",
+                        Some(json!({
+                            "flowRunId": old_run,
+                            "successorFlowRunId": new_run,
+                            "reason": "generation-change"
+                        })),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        refused,
+                        WireIoError::Rpc(WireErrorCode::FlowLineageConflict, _, _)
+                    ),
+                    "{refused:?}"
+                );
+                assert!(!paths.flow_lineage_path().exists());
+
+                client
+                    .call(
+                        "queue.cancel",
+                        Some(json!({"task_uuid": live["task_uuid"], "force": true})),
+                    )
+                    .await
+                    .unwrap();
+
+                // The successor must not have started: a rollover mints a fresh
+                // run, it does not adopt one already in flight.
+                client
+                    .call("queue.enqueue", Some(node(new_run, "flow:started:0", &["true"])))
+                    .await
+                    .unwrap();
+                let started = client
+                    .call(
+                        "flow.supersede",
+                        Some(json!({
+                            "flowRunId": old_run,
+                            "successorFlowRunId": new_run,
+                            "reason": "generation-change"
+                        })),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        started,
+                        WireIoError::Rpc(WireErrorCode::FlowLineageConflict, _, _)
+                    ),
+                    "{started:?}"
+                );
+                assert!(!paths.flow_lineage_path().exists());
+
+                // A run started under an earlier daemon epoch is still a started
+                // run: the freshness question is asked of the durable rows, not
+                // of whichever jobs this process happens to hold in memory.
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+                drop(client);
+                let reopened = fs1_daemon(&paths).await;
+                let (second_shutdown, second_shutdown_rx) = watch::channel(false);
+                let second_task = tokio::task::spawn_local(reopened.run_until(second_shutdown_rx));
+                let restarted = RpcClient::connect(&paths.socket).await.unwrap();
+                let after_restart = restarted
+                    .call(
+                        "flow.supersede",
+                        Some(json!({
+                            "flowRunId": old_run,
+                            "successorFlowRunId": new_run,
+                            "reason": "generation-change"
+                        })),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(
+                        after_restart,
+                        WireIoError::Rpc(WireErrorCode::FlowLineageConflict, _, _)
+                    ),
+                    "{after_restart:?}"
+                );
+                assert!(!paths.flow_lineage_path().exists());
+                second_shutdown.send(true).unwrap();
+                second_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
 }

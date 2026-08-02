@@ -247,6 +247,47 @@ pub(super) enum FlowCommand {
     Run(FlowRunArgs),
     Check(FlowCheckArgs),
     Cancel(FlowCancelArgs),
+    /// Record that a terminal run is replaced by a fresh successor run.
+    ///
+    /// The old run and its history are preserved unchanged. Repeating the exact
+    /// same call is safe, so a supervisor may retry it after its own restart.
+    Supersede(FlowSupersedeArgs),
+}
+
+#[derive(Debug, Args)]
+pub(super) struct FlowSupersedeArgs {
+    /// The terminal run being retired.
+    #[arg(long, value_name = "UUID")]
+    pub(super) flow_run_id: String,
+    /// The fresh run that replaces it. It must not have started yet.
+    #[arg(long, value_name = "UUID")]
+    pub(super) new_flow_run_id: String,
+    /// Why the old run was abandoned; recorded durably for later audit.
+    #[arg(long, value_enum)]
+    pub(super) reason: SupersedeReasonArg,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+#[clap(rename_all = "kebab-case")]
+pub(super) enum SupersedeReasonArg {
+    /// A declarative activation moved the script and/or argument store paths.
+    GenerationChange,
+    ScriptChanged,
+    ArgsChanged,
+    CatalogChanged,
+    Operator,
+}
+
+impl SupersedeReasonArg {
+    pub(super) fn as_str(self) -> &'static str {
+        match self {
+            Self::GenerationChange => "generation-change",
+            Self::ScriptChanged => "script-changed",
+            Self::ArgsChanged => "args-changed",
+            Self::CatalogChanged => "catalog-changed",
+            Self::Operator => "operator",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -878,6 +919,12 @@ pub(super) enum QueryCommand {
         json: bool,
     },
     Job {
+        id: String,
+    },
+    /// Print the generation lineage of one flow run: what it superseded, what
+    /// superseded it, and which run in the chain is current.
+    Lineage {
+        #[arg(value_name = "FLOW_RUN_ID")]
         id: String,
     },
     Run {

@@ -126,7 +126,11 @@ re-executed would have written new rows.
 
 Do not change the script, arguments, catalog, or node payload while retaining the
 run ID. The dedicated `*-changed-mid-run` identity errors and
-`replay-divergence` are deliberate stop conditions, not recovery modes. See
+`replay-divergence` are deliberate stop conditions, not recovery modes. When the
+original inputs are gone for good — the ordinary case once a declarative
+activation has moved their store paths — retire the run with
+`tally flow supersede` and start the recorded successor; that transition is
+durable, idempotent, and leaves the old run untouched. See
 [Submission identity and replay](../flows/submission-and-replay.md) and
 [Troubleshooting](troubleshooting.md).
 

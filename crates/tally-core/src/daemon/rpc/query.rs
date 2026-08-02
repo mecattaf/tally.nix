@@ -55,6 +55,26 @@ impl DaemonHandler {
             ))
             .map_err(internal_wire);
         }
+        if method == "query.lineage" {
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields, rename_all = "camelCase")]
+            struct Params {
+                #[serde(alias = "id", alias = "flow_run")]
+                flow_run: String,
+            }
+            let params: Params = decode_params(params)?;
+            if params.flow_run.trim().is_empty() {
+                return Err(WireError::invalid("query lineage run ID must not be empty"));
+            }
+            // A run with no recorded rollover is a valid, empty answer rather
+            // than a not-found: a supervisor asks this question about every run
+            // it is about to replay, including the very first one.
+            let path = self.context.read().await.paths.flow_lineage_path();
+            let view = FlowLineage::read(&path)
+                .map_err(lineage_wire)?
+                .view(&params.flow_run);
+            return serde_json::to_value(view).map_err(internal_wire);
+        }
         if method == "query.storage" {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -142,6 +162,11 @@ impl DaemonHandler {
                 let mut result =
                     query_run(&params.id, &details, &live, &history, &witness, Utc::now())
                         .map_err(observability_wire)?;
+                let lineage_path = self.context.read().await.paths.flow_lineage_path();
+                apply_run_lineage(
+                    &mut result,
+                    &FlowLineage::read(&lineage_path).map_err(lineage_wire)?,
+                );
                 for failure in &mut result.failures {
                     let (Some(attempt), Some(lease_epoch), Ok(uuid)) = (
                         failure.attempt,

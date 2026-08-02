@@ -29,7 +29,7 @@ pub use model::{
     Derivation, DerivationOutput, Disposition, FlowEnqueueFieldDisposition, FlowEnqueueFieldParity,
     FlowSubmission, NodeCanonicalProjection, NodeFailure, NodeResult, NodeSpec,
     NodeSpecFieldContract, NodeSpecSurface, NodeWireProjection, Orchestration, RunInspection,
-    RunReport, SelectionProvenance, TaskRef, Verdict, FLOW_ENQUEUE_FIELD_PARITY,
+    RunReport, RunSupersede, SelectionProvenance, TaskRef, Verdict, FLOW_ENQUEUE_FIELD_PARITY,
     NODE_SPEC_FIELD_CONTRACT,
 };
 

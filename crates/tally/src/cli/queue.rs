@@ -245,6 +245,16 @@ pub(super) async fn run_query(
             )
             .await
         }
+        QueryCommand::Lineage { id } => {
+            print_rpc(
+                socket,
+                config_path,
+                rpc_timeout,
+                "query.lineage",
+                Some(json!({"flowRun": id})),
+            )
+            .await
+        }
         QueryCommand::Run { id, json, status } => {
             let client = connect_rpc(socket, config_path).await?;
             let result = client
@@ -722,6 +732,40 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
         compact_text(flow_run_id),
         compact_text(state)
     );
+
+    // Directly under the header, before any task board: a superseded run is
+    // terminal, and a reader who misses that fact will wait for progress that
+    // can never come.
+    if let Some(record) = run["supersededBy"].as_object() {
+        outln!(
+            "!! SUPERSEDED by {} ({}) at {}; this run is terminal and replaying it is refused",
+            compact_text(
+                record
+                    .get("successorFlowRunId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+            ),
+            compact_text(record.get("reason").and_then(Value::as_str).unwrap_or("-")),
+            compact_text(
+                record
+                    .get("recordedAt")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+            )
+        );
+    }
+    if let Some(record) = run["supersedes"].as_object() {
+        outln!(
+            "supersedes {} ({})",
+            compact_text(
+                record
+                    .get("flowRunId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("-")
+            ),
+            compact_text(record.get("reason").and_then(Value::as_str).unwrap_or("-"))
+        );
+    }
 
     let counts = &run["counts"];
     outln!(

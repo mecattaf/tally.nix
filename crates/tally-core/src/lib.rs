@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod evidence;
 pub mod exec_attestation;
 pub mod executor;
+pub mod flow_lineage;
 pub mod git_ai;
 pub mod history;
 pub mod journal;

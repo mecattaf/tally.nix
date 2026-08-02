@@ -268,6 +268,65 @@ change this identity.
 Replay with the exact original catalog bytes, or start a new `flowRunId` for a
 new catalog generation.
 
+### `flow-run-superseded` — exit 20
+
+A durable rollover already retired this run ID. The runner checks lineage before it compares any
+hash, so this answer outranks the three pins above: the run was abandoned by an explicit decision,
+and repeating which input moved would not help. The error names `successorFlowRunId`, the recorded
+`reason`, and `recordedAt`.
+
+Start the successor. Do not re-key the old run.
+
+## Superseding a terminal run
+
+The three identity pins fail closed, which is correct — but a refusal alone is not a recovery. A
+long-lived supervisor that persists one `flowRunId` per work item and retries it after every
+deployment can only ever re-observe the same refusal, and three such items adjacent in a worklist
+can starve everything behind them.
+
+`tally flow supersede` is the explicit, durable transition:
+
+```console
+$ tally flow supersede \
+    --flow-run-id 4f8608e1-608f-4e04-bf47-0e49fd9801f1 \
+    --new-flow-run-id 9a2c1f70-3d5e-4a11-9f2b-8c6e0b7d4413 \
+    --reason generation-change
+```
+
+What it does, and equally what it does not:
+
+- The old run is **preserved unchanged** — same rows, same witnesses, same history. Superseding
+  is a statement about the run, not an edit of it.
+- The predecessor/successor relationship and the reason become durable in
+  `<dataDir>/flow-lineage.jsonl`, together with the abandoned generation's own recorded script,
+  argument, and catalog hashes.
+- Repeating the identical call is safe. It answers `disposition: "reused"` and writes nothing, so
+  a supervisor may call it again after its own restart.
+- Replaying the superseded ID is refused with `flow-run-superseded`, which names the successor.
+- The successor is **not** created and inherits nothing. It starts as a fresh run, which is why a
+  run that already has nodes is refused as a successor. Reusing application-level artifacts or
+  checkpoints across the boundary remains the consumer's own concern, exactly as it was before.
+
+Reasons are a closed set: `generation-change` (a declarative activation moved the script or
+argument store paths), `script-changed`, `args-changed`, `catalog-changed`, and `operator`.
+
+Read the boundary back from either end:
+
+```console
+$ tally query lineage 4f8608e1-608f-4e04-bf47-0e49fd9801f1
+$ tally query run 4f8608e1-608f-4e04-bf47-0e49fd9801f1
+```
+
+`query lineage` reports `superseded`, `supersededBy`, `supersedes`, the whole `chain`
+oldest-first, and `currentFlowRunId` — the run that should actually be started. `query run`
+reports `state: superseded` for a retired run whatever its own node verdicts say, and names the
+successor above the task board.
+
+A contradiction is refused rather than rewritten: a second different successor, a successor that
+already succeeds another run, or a rollover that would close a cycle all fail with
+`flow-lineage-conflict`. A predecessor with unfinished nodes is refused too — cancel the run
+first, so that a rollover can never strand live work.
+
 ### `replay-divergence` — exit 20
 
 If a same-run ordinal or flow-local key re-derives a different `payloadHash`, the
@@ -296,6 +355,7 @@ ordinal. This distinction is why raw keys should be rare and domain-specific.
 | Script edited after any node exists | `script-changed-mid-run`, exit 20, before new admission. |
 | Arguments changed after any node exists | `args-changed-mid-run`, exit 20, before new admission, regardless of the key they would derive. |
 | Catalog bytes changed, added, or removed after any node exists | `catalog-changed-mid-run`, exit 20, before new admission, even when the selected work payload would be identical. |
+| Run ID replayed after `tally flow supersede` retired it | `flow-run-superseded`, exit 20, before any hash comparison, naming the successor to start instead. |
 | Same key, changed payload | Same-run identity: fatal `replay-divergence`, exit 20. Raw cross-run identity: `dedup-key-conflict`, exit 1. |
 | `--max-nodes` increased on replay | The cap is orchestration metadata, not payload identity; a later new frontier can use the larger cap. |
 | Prior artifact changed or vanished | Reuse is rejected with a drift reason and a fresh node is `created`. |
@@ -376,6 +436,13 @@ re-executed with the same run ID against a changed script, the first thing the
 runner does is compare hashes and stop with `script-changed-mid-run`, exit 20.
 That is the intended outcome: the alternative is a run whose first half and
 second half came from different programs.
+
+**A supervisor recovers from that by superseding, not by retrying.** After a
+declarative activation the old generation may no longer be operationally
+available, so "restore the exact old inputs" can be impossible. Record the
+rollover instead — `tally flow supersede --reason generation-change` — and run
+the successor. The transition is durable, idempotent, and auditable from both
+ends; see [Superseding a terminal run](#superseding-a-terminal-run).
 
 **The next timer firing belongs to the new generation.** A calendar-registered
 flow derives its runner's `dedupKey` from an strftime template, so the identity

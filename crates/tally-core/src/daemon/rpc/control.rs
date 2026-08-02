@@ -395,12 +395,7 @@ impl DaemonHandler {
                 .jobs
                 .values()
                 .filter(|job| job.state != JobState::Completed)
-                .filter(|job| {
-                    job.row
-                        .orchestration
-                        .as_ref()
-                        .is_some_and(|orchestration| orchestration.flow_run_id() == flow_run_id)
-                })
+                .filter(|job| job_is_in_flow_run(job, flow_run_id))
                 .map(Job::stable_key)
                 .collect::<Vec<_>>()
         };
@@ -420,6 +415,137 @@ impl DaemonHandler {
             "flowRunId": flow_run_id,
             "results": results,
         }))
+    }
+
+    /// Record the durable transition from a terminal generation to its successor.
+    ///
+    /// Fatal replay divergence is a correct refusal, but a refusal alone is not
+    /// a recovery: a supervisor that persists one `flowRunId` per work item can
+    /// only re-observe it forever. This operation is the machine-actionable half
+    /// — it preserves the old run untouched, names the successor durably, and is
+    /// safe to call again after the supervisor's own restart.
+    pub(crate) async fn supersede_flow(&self, params: Option<Value>) -> Result<Value, WireError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields, rename_all = "camelCase")]
+        struct Params {
+            #[serde(alias = "flow_run_id")]
+            flow_run_id: String,
+            #[serde(alias = "newFlowRunId", alias = "new_flow_run_id")]
+            successor_flow_run_id: String,
+            reason: SupersedeReason,
+        }
+        let params: Params = decode_params(params)?;
+        for (name, value) in [
+            ("flowRunId", &params.flow_run_id),
+            ("successorFlowRunId", &params.successor_flow_run_id),
+        ] {
+            Uuid::parse_str(value)
+                .map_err(|_| WireError::invalid(format!("{name} must be a UUID")))?;
+        }
+        let path = self.context.read().await.paths.flow_lineage_path();
+        let already_recorded = FlowLineage::read(&path)
+            .map_err(lineage_wire)?
+            .classify(
+                &params.flow_run_id,
+                &params.successor_flow_run_id,
+                params.reason,
+            )
+            .map_err(lineage_wire)?
+            .is_some();
+        // The idempotent retry answers from the durable record before any
+        // liveness question, so a supervisor that crashed between recording the
+        // rollover and running the successor can always call again.
+        if !already_recorded {
+            self.assert_supersedable(&params.flow_run_id, &params.successor_flow_run_id)
+                .await?;
+        }
+        let pins = self.predecessor_pins(&params.flow_run_id).await;
+        let outcome = record_supersede(
+            &path,
+            &params.flow_run_id,
+            &params.successor_flow_run_id,
+            params.reason,
+            &pins,
+        )
+        .map_err(lineage_wire)?;
+        serde_json::to_value(outcome).map_err(internal_wire)
+    }
+
+    /// Refuse a rollover that would strand live work or continue an already
+    /// started successor.
+    ///
+    /// The successor's freshness is asked of the durable row projection rather
+    /// than of live jobs: a run started under an earlier daemon epoch is still a
+    /// started run, and the same projection is what the runner's own identity
+    /// scan reads.
+    async fn assert_supersedable(
+        &self,
+        predecessor: &str,
+        successor: &str,
+    ) -> Result<(), WireError> {
+        let (unfinished, details) = {
+            let mut context = self.context.write().await;
+            let unfinished = context
+                .jobs
+                .values()
+                .filter(|job| job.state != JobState::Completed)
+                .filter(|job| job_is_in_flow_run(job, predecessor))
+                .count();
+            (unfinished, context.query_details.snapshot())
+        };
+        if unfinished > 0 {
+            return Err(WireError::new(
+                WireErrorCode::FlowLineageConflict,
+                format!(
+                    "flow run {predecessor} still has {unfinished} unfinished node(s); \
+                     cancel the run before superseding it"
+                ),
+            ));
+        }
+        let started = flow_run_details(&details, successor).count();
+        if started > 0 {
+            return Err(WireError::new(
+                WireErrorCode::FlowLineageConflict,
+                format!(
+                    "successor flow run {successor} already has {started} node(s); \
+                     a successor starts fresh"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The abandoned generation's own pinned hashes, read from its durable rows.
+    ///
+    /// Never taken from the caller: this is the frozen fingerprint of what was
+    /// abandoned, and it is what makes the boundary auditable later. A run whose
+    /// rows disagree records no pin rather than an arbitrary one.
+    async fn predecessor_pins(&self, predecessor: &str) -> PredecessorPins {
+        let details = self.context.write().await.query_details.snapshot();
+        let mut script = BTreeSet::new();
+        let mut args = BTreeSet::new();
+        let mut catalog = BTreeSet::new();
+        for orchestration in flow_run_details(&details, predecessor)
+            .filter_map(|detail| detail.orchestration.as_ref())
+        {
+            for (field, sink) in [
+                ("scriptHash", &mut script),
+                ("argsHash", &mut args),
+                ("catalogHash", &mut catalog),
+            ] {
+                if let Some(hash) = orchestration.as_value().get(field).and_then(Value::as_str) {
+                    sink.insert(hash.to_owned());
+                }
+            }
+        }
+        let single = |values: BTreeSet<String>| {
+            (values.len() == 1).then(|| values.into_iter().next().expect("one element"))
+        };
+        PredecessorPins {
+            script_hash: single(script),
+            args_hash: single(args),
+            catalog_hash: single(catalog),
+        }
     }
 
     pub(crate) async fn cancel_one(
@@ -609,6 +735,35 @@ impl DaemonHandler {
             .status(&lease, context.epoch)
             .map_err(lease_wire)?;
         serde_json::to_value(status).map_err(|error| internal_wire(error.to_string()))
+    }
+}
+
+fn flow_run_details<'a>(
+    details: &'a [RowDetailFact],
+    flow_run_id: &'a str,
+) -> impl Iterator<Item = &'a RowDetailFact> {
+    details.iter().filter(move |detail| {
+        detail
+            .orchestration
+            .as_ref()
+            .is_some_and(|orchestration| orchestration.flow_run_id() == flow_run_id)
+    })
+}
+
+pub(crate) fn job_is_in_flow_run(job: &Job, flow_run_id: &str) -> bool {
+    job.row
+        .orchestration
+        .as_ref()
+        .is_some_and(|orchestration| orchestration.flow_run_id() == flow_run_id)
+}
+
+pub(crate) fn lineage_wire(error: FlowLineageError) -> WireError {
+    match error {
+        FlowLineageError::Invalid(message) => WireError::invalid(message),
+        FlowLineageError::Conflict(message) => {
+            WireError::new(WireErrorCode::FlowLineageConflict, message)
+        }
+        other => internal_wire(other),
     }
 }
 

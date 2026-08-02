@@ -98,6 +98,20 @@ pub(super) async fn run_flow(
             )
             .await
         }
+        FlowCommand::Supersede(args) => {
+            print_rpc(
+                socket,
+                config_path,
+                rpc_timeout,
+                "flow.supersede",
+                Some(json!({
+                    "flowRunId": args.flow_run_id,
+                    "successorFlowRunId": args.new_flow_run_id,
+                    "reason": args.reason.as_str(),
+                })),
+            )
+            .await
+        }
         FlowCommand::Check(args) => {
             let source = std::fs::read_to_string(&args.script)
                 .with_context(|| format!("cannot read flow script {}", args.script.display()))?;
@@ -415,7 +429,8 @@ pub(super) fn flow_error(error: FlowError) -> anyhow::Error {
         "replay-divergence"
         | "script-changed-mid-run"
         | "args-changed-mid-run"
-        | "catalog-changed-mid-run" => 20,
+        | "catalog-changed-mid-run"
+        | "flow-run-superseded" => 20,
         "flow-cancelled" => 4,
         "flow-run-id-missing"
         | "flow-run-id-invalid"

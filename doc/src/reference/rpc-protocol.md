@@ -125,12 +125,14 @@ The table between the markers is checked against the daemon's `RPC_METHODS` cons
 | `queue.drain` | `{producer?: string}` | Drain result and barrier |
 | `queue.await_job` | `{task_uuid?: string, job_id?: string, attempt?: integer}` | Terminal job result |
 | `queue.await_barrier` | `{barrier: string}` | Completed barrier result |
+| `flow.supersede` | `{flowRunId: UUID, successorFlowRunId: UUID, reason: SupersedeReason}` | `{ok, disposition, record}` |
 | `lease.acquire` | `{pool: string \| string[]}` | `{epoch: integer, outcome: AdmitOutcome}` |
 | `lease.release` | `{lease: string}` | `{released: LeaseGrant, promoted: LeaseGrant[]}` |
 | `lease.status` | `{lease?: string, jobId?: string}` | `LeaseStatus` |
 | `query.jobs` | Jobs filters plus `limit` and `cursor` | Paginated job collection |
 | `query.job` | `{id: string}` | Job detail |
 | `query.run` | `{id: string}` | Compact flow-run status |
+| `query.lineage` | `{flowRun: string}` (`id` is accepted as an alias) | Generation lineage of one flow run |
 | `query.status` | `{pool?: string}` | Status view |
 | `query.storage` | `{}` | Daemon-owned storage metrics and intake state |
 | `query.log` | Lifecycle filters plus `limit`, `cursor`, and `after` | Paginated lifecycle collection |
@@ -293,6 +295,49 @@ Drain barriers have the form `barrier:drain:<daemon-namespace>:<sequence>`. They
 memory-resident snapshots and do not survive restart. After reconnect, issue a new drain or
 await the known jobs individually. Completed unclaimed drain barriers are also bounded in
 memory, so they are not durable bookmarks.
+
+## Flow methods
+
+`flow.supersede` records that one flow run is terminal and is replaced by a fresh successor.
+It writes nothing into either run: the predecessor's rows, witnesses, and history are untouched,
+and the successor is not created — only the relationship between them becomes durable, in
+`<dataDir>/flow-lineage.jsonl`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `flowRunId` | UUID | The terminal run being retired. |
+| `successorFlowRunId` | UUID | The fresh run that replaces it. Must differ, and must have no nodes yet. |
+| `reason` | `generation-change`, `script-changed`, `args-changed`, `catalog-changed`, or `operator` | Recorded durably for later audit. |
+
+The result is `{ok: true, disposition, record}`. `disposition` is `recorded` when a new line was
+appended and `reused` when the identical `(flowRunId, successorFlowRunId, reason)` triple was
+already durable — the call is idempotent by construction, so a supervisor that crashes between
+recording a rollover and acting on it may simply call again. `record` additionally carries
+`recordedAt` and the predecessor's own `predecessorScriptHash`, `predecessorArgsHash`, and
+`predecessorCatalogHash`, read from the abandoned run's durable rows rather than from the caller.
+
+These are refused with `flow-lineage-conflict`:
+
+- a second, different successor for a run that already has one, or the same successor under a
+  different reason — a durable rollover is never rewritten;
+- a successor already claimed by another predecessor;
+- a rollover that would close a cycle in the chain;
+- a predecessor with unfinished nodes (cancel the run first);
+- a successor that already has nodes.
+
+`query.lineage` answers the read side for any run, including one with no recorded rollover:
+
+```text
+schemaVersion, flowRunId, superseded, supersededBy?, supersedes?, chain[], currentFlowRunId
+```
+
+`chain` is the whole generation chain oldest-first and always contains `flowRunId`;
+`currentFlowRunId` is its tip, which is the run an operator or supervisor should actually start.
+A run with no lineage answers `superseded: false`, `chain: [flowRunId]`, and
+`currentFlowRunId: flowRunId` rather than `not_found`.
+
+`query.run` carries the same two records as optional `supersededBy` and `supersedes` fields, and
+reports `state: "superseded"` for a retired run regardless of its own node verdicts.
 
 ## Lease methods
 
@@ -531,6 +576,6 @@ the log is `invalid_params`. Watch records are typed as `job`, `lifecycle`, `tra
 
 Every declared wire code, its current emission status, and CLI mapping is listed in
 [Exit codes and error taxonomy](errors.md). In particular, do not collapse
-`dedup-key-conflict`, `flow-node-cap`, `storage-budget-exceeded`,
+`dedup-key-conflict`, `flow-node-cap`, `flow-lineage-conflict`, `storage-budget-exceeded`,
 `storage-monitor-unavailable`, or `not_found` into a generic retry: each carries a different
 recovery decision.

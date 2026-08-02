@@ -362,6 +362,19 @@ pub struct RunInspection {
     pub args_hash: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog_hash: Option<String>,
+    /// A durable rollover recorded against this run ID. When present the run is
+    /// terminal by operator decision and no replay of it may start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersede: Option<RunSupersede>,
+}
+
+/// The daemon's answer to "was this run abandoned, and for what?".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunSupersede {
+    pub successor_flow_run_id: String,
+    pub reason: String,
+    pub recorded_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -71,6 +71,7 @@ const CONCURRENT_RUN: &str = "00000000-0000-4000-8000-000000000501";
 const KILLED_RUN: &str = "00000000-0000-4000-8000-000000000502";
 const RESTARTED_RUN: &str = "00000000-0000-4000-8000-000000000503";
 const DIVERGENT_RUN: &str = "00000000-0000-4000-8000-000000000504";
+const DIVERGENT_SUCCESSOR_RUN: &str = "00000000-0000-4000-8000-000000000537";
 const DRV_BUILD_RUN: &str = "00000000-0000-4000-8000-000000000505";
 const DRV_SUBSTITUTE_RUN: &str = "00000000-0000-4000-8000-000000000506";
 const STRUCTURED_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000507";
@@ -1493,6 +1494,135 @@ async fn fs5_live_acceptance_matrix() {
             assert_eq!(edited.status.code(), Some(20));
             assert!(String::from_utf8_lossy(&edited.stdout).contains("script-changed-mid-run"));
             assert_eq!(flow_items(&client, DIVERGENT_RUN).await.len(), 1);
+            // The refusal carries its own recovery instruction, so a supervisor
+            // never has to read the message to know retrying is pointless.
+            let edited_error = flow_failure(&edited)["error"].clone();
+            assert_eq!(edited_error["details"]["divergentInput"], "script");
+            assert_eq!(edited_error["details"]["transient"], false);
+            assert_eq!(edited_error["details"]["resolution"], "supersede");
+
+            // The generation boundary: a durable rollover from the terminal old
+            // run to a fresh successor, recorded once and safe to repeat.
+            let supersede = || {
+                Command::new(env!("CARGO_BIN_EXE_tally"))
+                    .arg("--config")
+                    .arg(&config_path)
+                    .arg("--socket")
+                    .arg(&paths.socket)
+                    .args(["flow", "supersede"])
+                    .args(["--flow-run-id", DIVERGENT_RUN])
+                    .args(["--new-flow-run-id", DIVERGENT_SUCCESSOR_RUN])
+                    .args(["--reason", "generation-change"])
+                    .output()
+            };
+            let recorded = supersede().await.unwrap();
+            assert!(
+                recorded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&recorded.stderr)
+            );
+            let recorded: Value = serde_json::from_slice(&recorded.stdout).unwrap();
+            assert_eq!(recorded["disposition"], "recorded");
+            assert_eq!(
+                recorded["record"]["successorFlowRunId"],
+                DIVERGENT_SUCCESSOR_RUN
+            );
+            assert_eq!(recorded["record"]["reason"], "generation-change");
+            let repeated = supersede().await.unwrap();
+            assert!(repeated.status.success());
+            let repeated: Value = serde_json::from_slice(&repeated.stdout).unwrap();
+            assert_eq!(repeated["disposition"], "reused");
+            assert_eq!(repeated["record"], recorded["record"]);
+
+            // Replaying the retired ID now names its successor instead of
+            // re-reporting which hash moved.
+            let retired = runner(
+                &config_path,
+                &paths.socket,
+                &divergent_script,
+                DIVERGENT_RUN,
+                r#"{"variant":"recorded"}"#,
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let retired = runner_output(retired).await;
+            assert_eq!(retired.status.code(), Some(20));
+            let retired_error = flow_failure(&retired)["error"].clone();
+            assert_eq!(retired_error["code"], "flow-run-superseded");
+            assert_eq!(
+                retired_error["details"]["successorFlowRunId"],
+                DIVERGENT_SUCCESSOR_RUN
+            );
+            assert_eq!(retired_error["details"]["resolution"], "run-successor");
+            // The old run is untouched: one durable row, exactly as before.
+            assert_eq!(flow_items(&client, DIVERGENT_RUN).await.len(), 1);
+
+            // The successor runs the new generation's script to completion.
+            let successor = runner(
+                &config_path,
+                &paths.socket,
+                &divergent_script,
+                DIVERGENT_SUCCESSOR_RUN,
+                r#"{"variant":"successor"}"#,
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let successor = runner_output(successor).await;
+            assert!(
+                successor.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&successor.stdout),
+                String::from_utf8_lossy(&successor.stderr)
+            );
+            assert_eq!(
+                flow_report(&successor)["report"]["flowRunId"],
+                DIVERGENT_SUCCESSOR_RUN
+            );
+            assert_eq!(
+                flow_items(&client, DIVERGENT_SUCCESSOR_RUN).await.len(),
+                1,
+                "the successor starts fresh rather than adopting old nodes"
+            );
+
+            // Both query surfaces answer the generation question unambiguously.
+            let lineage = Command::new(env!("CARGO_BIN_EXE_tally"))
+                .arg("--config")
+                .arg(&config_path)
+                .arg("--socket")
+                .arg(&paths.socket)
+                .args(["query", "lineage", DIVERGENT_RUN])
+                .output()
+                .await
+                .unwrap();
+            assert!(
+                lineage.status.success(),
+                "{}",
+                String::from_utf8_lossy(&lineage.stderr)
+            );
+            let lineage: Value = serde_json::from_slice(&lineage.stdout).unwrap();
+            assert_eq!(lineage["superseded"], true);
+            assert_eq!(lineage["currentFlowRunId"], DIVERGENT_SUCCESSOR_RUN);
+            assert_eq!(
+                lineage["chain"],
+                json!([DIVERGENT_RUN, DIVERGENT_SUCCESSOR_RUN])
+            );
+            let retired_view = client
+                .call("query.run", Some(json!({"id": DIVERGENT_RUN})))
+                .await
+                .unwrap();
+            assert_eq!(retired_view["state"], "superseded");
+            assert_eq!(
+                retired_view["supersededBy"]["successorFlowRunId"],
+                DIVERGENT_SUCCESSOR_RUN
+            );
+            let successor_view = client
+                .call("query.run", Some(json!({"id": DIVERGENT_SUCCESSOR_RUN})))
+                .await
+                .unwrap();
+            assert_ne!(successor_view["state"], "superseded");
+            assert_eq!(successor_view["supersedes"]["flowRunId"], DIVERGENT_RUN);
 
             let events = read_acknowledged_events(&paths.events_dir()).unwrap();
             let parent_event = events

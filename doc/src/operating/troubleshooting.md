@@ -20,6 +20,7 @@ the shipped implementation; placeholders vary with the job.
 | Flow script changes during one run | code `script-changed-mid-run`; `flow run ID is pinned to RECORDED, not CURRENT` | One flow run observed two script hashes. |
 | Flow arguments change during one run | code `args-changed-mid-run`; `flow run ID is pinned to RECORDED, not CURRENT` | One flow run observed two serialized argument hashes. |
 | Flow catalog changes during one run | code `catalog-changed-mid-run`; `flow run ID is pinned to RECORDED, not CURRENT` | One flow run observed different exact catalog bytes, or changed between a catalog and none. |
+| A retired run ID is replayed | code `flow-run-superseded`; `flow run OLD was superseded by NEW ...` | `tally flow supersede` durably retired that run; start the successor. |
 | CLI loses the socket on a large request or response | `wire frame exceeds N bytes` or `daemon closed the socket before replying` | One side exceeded its configured frame bound. |
 | Declared culmination is absent | `cannot read gate manifest PATH: ...` in `completion.gates.manifestError` | The job did not write the declared file on its execution host. |
 | Remote work appears hung | `tally: remote executor "NAME" transport is unavailable; retaining leases and retrying: ...` | SSH or the fixed worker helper is unavailable after dispatch. |
@@ -270,6 +271,10 @@ a new run. Declarative `services.tally.flows` reduces this risk because each
 generation refers to an immutable Nix store path, but the identity is the
 SHA-256 of the bytes, not a generation number.
 
+If the old generation is no longer available — the usual case after an
+activation — retire the run instead of retrying it; see
+[`flow-run-superseded`](#flow-run-superseded).
+
 ## `args-changed-mid-run` and `catalog-changed-mid-run`
 
 The same run also pins `orchestration.argsHash` and
@@ -283,6 +288,47 @@ values with the same serialized identity. For a catalog, use the exact original
 bytes, including insignificant-looking whitespace; adding or removing the
 catalog is also an identity change. Use a new flow run ID when either change is
 intentional.
+
+## `flow-run-superseded`
+
+The run ID was durably retired by `tally flow supersede`. The runner reports
+this before comparing any hash and exits 20:
+
+```text
+flow run <OLD> was superseded by <NEW> (<reason>) at <timestamp>; run the successor
+```
+
+Start `<NEW>`. The old run is intact and still queryable; it simply will not
+advance again.
+
+This is the machine-actionable end of the identity refusals above. A supervised
+runner that keeps one `flowRunId` per work item and retries it across
+deployments cannot recover from `script-changed-mid-run` or
+`args-changed-mid-run` on its own — after an activation, the exact old script or
+`args.tools` store path may not exist any more, so "restore the original inputs"
+has no operator answer. Three such items adjacent in a worklist will trip a
+supervisor's failure fuse on every pass and starve everything behind them.
+
+Record the generation boundary instead:
+
+```console
+$ tally flow supersede \
+    --flow-run-id <OLD> \
+    --new-flow-run-id <NEW> \
+    --reason generation-change
+$ tally query lineage <OLD>
+```
+
+Repeating the identical supersede call is safe — it answers
+`disposition: "reused"` — so an unattended supervisor may issue it, crash, and
+issue it again. `tally query lineage` reports `currentFlowRunId`, which is the
+run to start. `tally query run <OLD>` reads `superseded` and names the successor
+above its task board.
+
+A supersede that contradicts durable lineage — a different second successor, a
+successor already claimed, a cycle, a predecessor with unfinished nodes, or a
+successor that has already started — is refused with `flow-lineage-conflict` and
+exits 1. Cancel a live predecessor first; pick a fresh UUID for a successor.
 
 ## Oversized wire frame
 
