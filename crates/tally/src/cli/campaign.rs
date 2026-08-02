@@ -249,6 +249,11 @@ struct CampaignRegistration {
     sub_issue_walk: bool,
     #[serde(default)]
     last_observation: Option<String>,
+    /// The cheap half of the last observation: everything the poll can see
+    /// from the two REST reads it makes anyway. Absent on a registration
+    /// written before this existed, which only costs one extra walk.
+    #[serde(default)]
+    last_forge_observation: Option<String>,
     flow: PathBuf,
     driver: PathBuf,
     workspace_root: PathBuf,
@@ -428,7 +433,12 @@ fn gh_program() -> OsString {
     std::env::var_os("TALLY_GH_PROGRAM").unwrap_or_else(|| OsString::from("gh"))
 }
 
-fn run_gh(arguments: &[OsString], stdin: Option<&str>) -> Result<String> {
+/// Run one `gh` invocation and hand back its raw result.
+///
+/// Every ordinary caller wants `run_gh`, which turns a non-zero exit into an
+/// error. The capability probe is the exception: it has to read what the forge
+/// actually said before it decides whether the failure was an answer.
+fn run_gh_output(arguments: &[OsString], stdin: Option<&str>) -> Result<std::process::Output> {
     let program = gh_program();
     let mut command = ProcessCommand::new(&program);
     command
@@ -449,7 +459,11 @@ fn run_gh(arguments: &[OsString], stdin: Option<&str>) -> Result<String> {
             .context("gh stdin was unavailable")?
             .write_all(input.as_bytes())?;
     }
-    let output = child.wait_with_output()?;
+    Ok(child.wait_with_output()?)
+}
+
+fn run_gh(arguments: &[OsString], stdin: Option<&str>) -> Result<String> {
+    let output = run_gh_output(arguments, stdin)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -650,6 +664,27 @@ struct GraphqlComment {
     author: Option<GithubActor>,
 }
 
+fn sub_issue_walk_arguments(
+    owner: &str,
+    name: &str,
+    number: u64,
+    cursor: Option<&str>,
+) -> Vec<OsString> {
+    let mut arguments = os_arguments(&["api", "graphql", "-f"]);
+    arguments.push(format!("query={SUB_ISSUE_THREAD_QUERY}").into());
+    arguments.extend(os_arguments(&["-F"]));
+    arguments.push(format!("owner={owner}").into());
+    arguments.extend(os_arguments(&["-F"]));
+    arguments.push(format!("name={name}").into());
+    arguments.extend(os_arguments(&["-F"]));
+    arguments.push(format!("number={number}").into());
+    if let Some(cursor) = cursor {
+        arguments.extend(os_arguments(&["-F"]));
+        arguments.push(format!("cursor={cursor}").into());
+    }
+    arguments
+}
+
 fn sub_issue_threads(locator: &IssueLocator) -> Result<BTreeMap<u64, Vec<GraphqlComment>>> {
     let (owner, name) = locator
         .repository
@@ -658,18 +693,7 @@ fn sub_issue_threads(locator: &IssueLocator) -> Result<BTreeMap<u64, Vec<Graphql
     let mut threads = BTreeMap::new();
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_SUB_ISSUE_PAGES {
-        let mut arguments = os_arguments(&["api", "graphql", "-f"]);
-        arguments.push(format!("query={SUB_ISSUE_THREAD_QUERY}").into());
-        arguments.extend(os_arguments(&["-F"]));
-        arguments.push(format!("owner={owner}").into());
-        arguments.extend(os_arguments(&["-F"]));
-        arguments.push(format!("name={name}").into());
-        arguments.extend(os_arguments(&["-F"]));
-        arguments.push(format!("number={}", locator.number).into());
-        if let Some(cursor) = cursor.as_deref() {
-            arguments.extend(os_arguments(&["-F"]));
-            arguments.push(format!("cursor={cursor}").into());
-        }
+        let arguments = sub_issue_walk_arguments(owner, name, locator.number, cursor.as_deref());
         let payload: Value = gh_json(&arguments)?;
         let connection = payload
             .pointer("/data/repository/issue/subIssues")
@@ -710,11 +734,88 @@ fn sub_issue_threads(locator: &IssueLocator) -> Result<BTreeMap<u64, Vec<Graphql
     ))
 }
 
+/// Did the forge answer "my schema has no such field", or did the call simply
+/// fail?
+///
+/// Only a GraphQL schema refusal is a capability answer. GitHub reports one as
+/// an `errors[]` entry typed `UNDEFINED_FIELD` — older responses spell the same
+/// thing as `extensions.code = "undefinedField"` — with a message naming the
+/// field and the type. A transport error, a rate limit, or a 502 says nothing
+/// about the forge's schema and will very likely be gone a minute later.
+fn undefined_field_refusal(output: &str) -> bool {
+    if let Ok(value) = serde_json::from_str::<Value>(output) {
+        let typed = value
+            .get("errors")
+            .and_then(Value::as_array)
+            .is_some_and(|errors| {
+                errors.iter().any(|error| {
+                    error
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .is_some_and(|kind| kind.eq_ignore_ascii_case("UNDEFINED_FIELD"))
+                        || error
+                            .pointer("/extensions/code")
+                            .and_then(Value::as_str)
+                            .is_some_and(|code| code.eq_ignore_ascii_case("undefinedField"))
+                })
+            });
+        if typed {
+            return true;
+        }
+    }
+    let lowered = output.to_ascii_lowercase();
+    lowered.contains("undefined_field")
+        || lowered.contains("undefinedfield")
+        || lowered.contains("doesn't exist on type")
+        || lowered.contains("does not exist on type")
+}
+
 /// Probe whether this forge serves the sub-issue walk the native read path
-/// needs. A refusal is a capability answer, not a campaign failure: the
-/// campaign arms in degraded mode and keeps the checkbox projection.
-fn probe_sub_issue_walk(locator: &IssueLocator) -> bool {
-    sub_issue_threads(locator).is_ok()
+/// needs.
+///
+/// A schema refusal is a capability answer, not a campaign failure: the
+/// campaign arms in degraded mode and keeps the checkbox projection. Anything
+/// else fails the arm. Treating every failure as an answer meant one flaky
+/// round trip could arm a campaign with no per-task steering threads, no
+/// merged-oracle walk and no anomaly surface, for the rest of its life, and
+/// the only evidence would be the projection label.
+fn probe_sub_issue_walk(locator: &IssueLocator) -> Result<bool> {
+    let (owner, name) = locator
+        .repository
+        .split_once('/')
+        .ok_or_else(|| invalid("campaign repository is not in owner/name form"))?;
+    let arguments = sub_issue_walk_arguments(owner, name, locator.number, None);
+    let output = run_gh_output(&arguments, None)?;
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    if undefined_field_refusal(&stdout) || undefined_field_refusal(&stderr) {
+        return Ok(false);
+    }
+    if !output.status.success() {
+        let detail = if stderr.trim().is_empty() {
+            stdout.trim()
+        } else {
+            stderr.trim()
+        };
+        bail!(
+            "campaign sub-issue capability probe failed: gh exited {}: {}; \
+             this is not a capability answer, so the campaign is not armed degraded",
+            output.status,
+            if detail.is_empty() {
+                "no output"
+            } else {
+                detail
+            }
+        );
+    }
+    let payload: Value = serde_json::from_str(&stdout)
+        .context("campaign sub-issue capability probe returned invalid JSON")?;
+    payload
+        .pointer("/data/repository/issue/subIssues")
+        .ok_or_else(|| {
+            invalid("campaign sub-issue capability probe returned no sub-issue connection")
+        })?;
+    Ok(true)
 }
 
 const fn projection_label(sub_issue_walk: bool) -> &'static str {
@@ -1287,6 +1388,38 @@ fn sha256_json(value: &Value) -> Result<String> {
     Ok(format!("sha256:{:x}", Sha256::digest(canonical.as_bytes())))
 }
 
+fn forge_state_value(graph: &CampaignGraph) -> Value {
+    json!({
+        "master": {
+            "state": graph.master.state,
+            "updatedAt": graph.master.updated_at,
+        },
+        "tasks": graph.tasks.iter().map(|issue| json!({
+            "number": issue.number,
+            "state": issue.state,
+            "updatedAt": issue.updated_at,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// The half of the observation that the poll's two REST reads already paid for.
+///
+/// Every surface the expensive GraphQL walk reads hangs off one of these
+/// items: a comment posted or edited on the master or on a task sub-issue, a
+/// sub-issue closing behind a merged pull request, an edit to the master body.
+/// Each of those moves that item's `updated_at` or `state`, so an unchanged
+/// digest here means the walk would return what it returned last time. It is
+/// therefore a sound precondition for skipping the walk — and skipping it is
+/// what makes a short poll interval genuinely cheap, which is what the
+/// interval's own documentation has always claimed.
+fn forge_observation(graph: &CampaignGraph, arm_serial: u64) -> Result<String> {
+    sha256_json(&json!({
+        "graph": graph.executable_digest,
+        "forgeState": forge_state_value(graph),
+        "armSerial": arm_serial,
+    }))
+}
+
 fn campaign_observation(
     graph: &CampaignGraph,
     steering: &CampaignSteering,
@@ -1294,17 +1427,7 @@ fn campaign_observation(
 ) -> Result<String> {
     sha256_json(&json!({
         "graph": graph.executable_digest,
-        "forgeState": {
-            "master": {
-                "state": graph.master.state,
-                "updatedAt": graph.master.updated_at,
-            },
-            "tasks": graph.tasks.iter().map(|issue| json!({
-                "number": issue.number,
-                "state": issue.state,
-                "updatedAt": issue.updated_at,
-            })).collect::<Vec<_>>(),
-        },
+        "forgeState": forge_state_value(graph),
         "steering": steering.master,
         // A comment on one task's sub-issue thread must nudge the campaign
         // exactly like a comment on the master does.
@@ -1896,7 +2019,7 @@ async fn run_campaign_arm(
     require_allowed_issue_authors(&graph, &allowed_actors)?;
     // Probe once, at arm, and record the answer. A pass never has to discover
     // mid-flight that half its projection is unavailable.
-    let sub_issue_walk = probe_sub_issue_walk(&locator);
+    let sub_issue_walk = probe_sub_issue_walk(&locator)?;
     let steering = fetch_campaign_steering(&graph, &allowed_actors, sub_issue_walk)?;
     let path = registration_path(&state_dir, &locator.url);
     let prior = if path.exists() {
@@ -1935,6 +2058,9 @@ async fn run_campaign_arm(
         allow_test_local_forge: args.allow_test_local_forge,
         sub_issue_walk,
         last_observation: prior.and_then(|value| value.last_observation),
+        // Arming always dispatches, so the cheap precondition starts empty and
+        // the first poll after an arm re-establishes it.
+        last_forge_observation: None,
         flow,
         driver,
         workspace_root,
@@ -2028,6 +2154,15 @@ async fn run_campaign_poll(
                     graph.executable_digest
                 );
             }
+            // The cheap comparison comes first. Reading the steering surfaces
+            // runs the full bounded GraphQL walk over every sub-issue thread,
+            // and running it before deciding whether anything moved made every
+            // tick of a 60 s timer pay for a traversal that almost always
+            // returned what the previous tick returned.
+            let forge = forge_observation(&graph, registration.arm_serial)?;
+            if registration.last_forge_observation.as_deref() == Some(&forge) {
+                return Ok((false, false));
+            }
             let steering = fetch_campaign_steering(
                 &graph,
                 &registration.allowed_actors,
@@ -2035,8 +2170,11 @@ async fn run_campaign_poll(
             )?;
             let observation = campaign_observation(&graph, &steering, registration.arm_serial)?;
             if registration.last_observation.as_deref() == Some(&observation) {
+                registration.last_forge_observation = Some(forge);
+                write_registration(&state_dir, &registration)?;
                 return Ok((false, false));
             }
+            registration.last_forge_observation = Some(forge);
             let result = dispatch_campaign(
                 CampaignHost {
                     socket,
@@ -2672,9 +2810,13 @@ fn merged_project_tasks(
     for task in &manifest.tasks {
         if task.kind == "checkpoint" {
             let reference =
-                checkpoint_reference(&manifest.name, issue_number, &task.id, &graph_digest)?;
-            let legacy =
-                legacy_checkpoint_tag(&manifest.name, issue_number, &task.id, &graph_digest)?;
+                checkpoint_reference_prefix(&manifest.name, issue_number, &task.id, &graph_digest)?;
+            let legacy = legacy_checkpoint_tag_prefix(
+                &manifest.name,
+                issue_number,
+                &task.id,
+                &graph_digest,
+            )?;
             if projected_checkpoint_complete(manifest, &reference)?
                 || projected_checkpoint_complete(manifest, &legacy)?
             {
@@ -2758,7 +2900,17 @@ fn merged_project_tasks(
     Ok(merged)
 }
 
-fn projected_checkpoint_complete(manifest: &CampaignManifest, reference: &str) -> Result<bool> {
+/// Has this checkpoint published a receipt the base branch already contains?
+///
+/// `prefix` names the task's receipt family, not one ref: the driver appends
+/// the tested base revision as a final path component, and this projection —
+/// which runs from a manifest, not from a reconcile pass — does not know which
+/// revision that was. Reading the exact prefix as if it were the ref name is
+/// how both namespaces silently matched nothing at all. Every receipt under
+/// the family is considered and one that the base branch contains is enough;
+/// the driver's own exact-revision check remains the completion oracle, and
+/// this is the checkbox the reader sees.
+fn projected_checkpoint_complete(manifest: &CampaignManifest, prefix: &str) -> Result<bool> {
     let git = |arguments: &[&str]| -> Result<std::process::Output> {
         ProcessCommand::new("git")
             .arg("-C")
@@ -2767,59 +2919,64 @@ fn projected_checkpoint_complete(manifest: &CampaignManifest, reference: &str) -
             .output()
             .context("cannot query projected checkpoint completion")
     };
-    let listed = git(&[
-        "ls-remote",
-        "--refs",
-        &manifest.repository.remote,
-        reference,
-    ])?;
+    let pattern = format!("{prefix}/*");
+    let listed = git(&["ls-remote", "--refs", &manifest.repository.remote, &pattern])?;
     if !listed.status.success() {
         bail!(
-            "cannot query checkpoint ref {reference}: {}",
+            "cannot query checkpoint refs {pattern}: {}",
             String::from_utf8_lossy(&listed.stderr).trim()
         );
     }
     let stdout = String::from_utf8(listed.stdout).context("git ls-remote was not UTF-8")?;
-    if stdout.trim().is_empty() {
-        return Ok(false);
-    }
-    let lines = stdout.lines().collect::<Vec<_>>();
-    if lines.len() != 1 {
-        bail!("checkpoint ref {reference} returned more than one remote row");
-    }
-    let target = lines[0]
-        .split_once('\t')
-        .filter(|(_, name)| *name == reference)
-        .map(|(target, _)| target)
-        .filter(|target| {
-            (40..=64).contains(&target.len()) && target.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
-        .ok_or_else(|| {
+    let mut receipts = Vec::new();
+    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
+        let (target, name) = line.split_once('\t').ok_or_else(|| {
             invalid(format!(
-                "checkpoint ref {reference} returned malformed output"
+                "checkpoint refs {pattern} returned malformed output"
             ))
         })?;
+        if !name.starts_with(&format!("{prefix}/")) {
+            bail!("checkpoint refs {pattern} returned unrelated ref {name}");
+        }
+        if !((40..=64).contains(&target.len())
+            && target.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            return Err(invalid(format!(
+                "checkpoint ref {name} returned malformed output"
+            )));
+        }
+        receipts.push((target.to_owned(), name.to_owned()));
+    }
+    if receipts.is_empty() {
+        return Ok(false);
+    }
     let fetched_base = git(&["fetch", "--prune", "--no-tags", &manifest.repository.remote])?;
     if !fetched_base.status.success() {
         bail!("cannot refresh campaign base while projecting checkpoint state");
-    }
-    let fetched_tag = git(&["fetch", "--no-tags", &manifest.repository.remote, reference])?;
-    if !fetched_tag.status.success() {
-        bail!("cannot fetch checkpoint ref {reference}");
-    }
-    let object_type = git(&["cat-file", "-t", target])?;
-    if !object_type.status.success()
-        || String::from_utf8_lossy(&object_type.stdout).trim() != "commit"
-    {
-        return Ok(false);
     }
     let base = format!(
         "{}/{}",
         manifest.repository.remote, manifest.repository.base_branch
     );
-    Ok(git(&["merge-base", "--is-ancestor", target, &base])?
-        .status
-        .success())
+    for (target, name) in receipts {
+        let fetched = git(&["fetch", "--no-tags", &manifest.repository.remote, &name])?;
+        if !fetched.status.success() {
+            bail!("cannot fetch checkpoint ref {name}");
+        }
+        let object_type = git(&["cat-file", "-t", &target])?;
+        if !object_type.status.success()
+            || String::from_utf8_lossy(&object_type.stdout).trim() != "commit"
+        {
+            continue;
+        }
+        if git(&["merge-base", "--is-ancestor", &target, &base])?
+            .status
+            .success()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn stable_publish_branch(
@@ -2837,13 +2994,18 @@ fn stable_publish_branch(
     format!("tally/{slug}-issue-{issue_number}/{task_id}{suffix}")
 }
 
-/// Where new checkpoint receipts are published.
+/// The family of refs one checkpoint's receipts are published under.
+///
+/// The driver appends `/<baseRevision>` to this prefix for the revision it
+/// actually tested (`checkpoint_ref` in `spec_build_driver.py`); the shared
+/// vectors in `test/fixtures/spec-build/checkpoint-refs.json` pin the two
+/// layouts together from both languages.
 ///
 /// The pre-#307 namespace was `refs/tags/`, which every clone of a public
 /// target repository auto-fetches; a campaign's checkpoint ledger became part
 /// of that repository's public surface. Receipts now share the hidden
 /// namespace the campaign's other durable state already uses.
-fn checkpoint_reference(
+fn checkpoint_reference_prefix(
     campaign: &str,
     issue_number: u64,
     task_id: &str,
@@ -2863,9 +3025,11 @@ fn checkpoint_reference(
     ))
 }
 
-/// The visible tag receipt published before the namespace moved. Read for
+/// The visible tag family published before the namespace moved. Read for
 /// compatibility so an existing campaign is never re-executed; never written.
-fn legacy_checkpoint_tag(
+/// Like the hidden namespace above this is a prefix: the tested base revision
+/// is the last path component.
+fn legacy_checkpoint_tag_prefix(
     campaign: &str,
     issue_number: u64,
     task_id: &str,
@@ -3265,6 +3429,55 @@ fn run_campaign_project(args: CampaignProjectArgs) -> Result<()> {
 mod tests {
     use super::*;
 
+    /// The one shared checkpoint-ref vector file, asserted from here and from
+    /// `test/spec_build_checkpoint_receipts_test.py`.
+    ///
+    /// Two languages computing the same ref name with nothing pinning them
+    /// together is how the projection came to read a namespace the driver has
+    /// never written: it built the receipt family and queried it as if it were
+    /// the ref. Neither side owns this file; both are checked against it.
+    #[test]
+    fn checkpoint_ref_layout_matches_the_shared_driver_vectors() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/spec-build/checkpoint-refs.json");
+        let document: Value = serde_json::from_str(
+            &std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display())),
+        )
+        .expect("checkpoint ref vectors must be JSON");
+        assert_eq!(document["schemaVersion"], json!(1));
+        let vectors = document["vectors"]
+            .as_array()
+            .expect("checkpoint ref vectors must be a list");
+        assert!(!vectors.is_empty());
+        for vector in vectors {
+            let campaign = vector["campaign"].as_str().unwrap();
+            let issue_number = vector["issueNumber"].as_u64().unwrap();
+            let task_id = vector["taskId"].as_str().unwrap();
+            let source = vector["source"].as_str().unwrap();
+            let base_revision = vector["baseRevision"].as_str().unwrap();
+
+            let prefix =
+                checkpoint_reference_prefix(campaign, issue_number, task_id, source).unwrap();
+            assert_eq!(prefix, vector["refPrefix"].as_str().unwrap());
+            let legacy =
+                legacy_checkpoint_tag_prefix(campaign, issue_number, task_id, source).unwrap();
+            assert_eq!(legacy, vector["legacyTagPrefix"].as_str().unwrap());
+
+            // The prefix has to be exactly the driver's ref minus the tested
+            // revision, or the `<prefix>/*` query the projection runs matches
+            // nothing the driver ever published.
+            assert_eq!(
+                vector["ref"].as_str().unwrap(),
+                format!("{prefix}/{base_revision}")
+            );
+            assert_eq!(
+                vector["legacyTag"].as_str().unwrap(),
+                format!("{legacy}/{base_revision}")
+            );
+        }
+    }
+
     fn manifest_value_for_test(tasks: Value) -> Value {
         json!({
             "schemaVersion": 1,
@@ -3324,12 +3537,28 @@ mod tests {
         let refusing = fake_gh(
             temporary.path(),
             "gh-refusing",
-            "echo 'Field subIssues does not exist' >&2; exit 1",
+            "echo '{\"errors\":[{\"type\":\"UNDEFINED_FIELD\",\
+             \"message\":\"Field '\\''subIssues'\\'' doesn'\\''t exist on type '\\''Issue'\\''\"}]}'; \
+             echo \"gh: Field 'subIssues' doesn't exist on type 'Issue'\" >&2; exit 1",
         );
         std::env::set_var("TALLY_GH_PROGRAM", &refusing);
-        // A forge that cannot serve the walk is a capability answer, not an
+        // A forge whose schema has no such field is a capability answer, not an
         // error: the campaign still arms, in degraded mode.
-        assert!(!probe_sub_issue_walk(&locator));
+        assert!(!probe_sub_issue_walk(&locator).unwrap());
+
+        // A transport error, a rate limit, or a 502 says nothing about the
+        // schema. Reading one as "this forge has no sub-issues" armed the
+        // campaign degraded for the rest of its life over one bad minute, so
+        // the probe now fails the arm and says why.
+        let flaky = fake_gh(
+            temporary.path(),
+            "gh-flaky",
+            "echo 'gh: HTTP 502: Bad gateway (https://api.github.com/graphql)' >&2; exit 1",
+        );
+        std::env::set_var("TALLY_GH_PROGRAM", &flaky);
+        let failure = probe_sub_issue_walk(&locator).unwrap_err().to_string();
+        assert!(failure.contains("capability probe failed"), "{failure}");
+        assert!(failure.contains("502"), "{failure}");
 
         let serving = fake_gh(
             temporary.path(),
@@ -3337,7 +3566,7 @@ mod tests {
             &format!("cat <<'TALLY_WALK'\n{WALK_PAYLOAD}\nTALLY_WALK"),
         );
         std::env::set_var("TALLY_GH_PROGRAM", &serving);
-        assert!(probe_sub_issue_walk(&locator));
+        assert!(probe_sub_issue_walk(&locator).unwrap());
         assert_eq!(
             sub_issue_threads(&locator)
                 .unwrap()
@@ -3439,6 +3668,77 @@ mod tests {
             campaign_observation(&graph, &quiet, 1).unwrap(),
             campaign_observation(&graph, &steered, 1).unwrap()
         );
+    }
+
+    /// The poll skips the expensive sub-issue walk while this digest holds
+    /// still, so anything the walk could see has to move it.
+    #[test]
+    fn the_cheap_poll_precondition_moves_with_every_surface_the_walk_reads() {
+        let base = graph_for_forge_observation();
+        let unchanged = graph_for_forge_observation();
+        assert_eq!(
+            forge_observation(&base, 1).unwrap(),
+            forge_observation(&unchanged, 1).unwrap()
+        );
+        let quiet = forge_observation(&base, 1).unwrap();
+
+        // A comment on the master thread bumps the master's updated_at.
+        let mut master_touched = graph_for_forge_observation();
+        master_touched.master.updated_at = "2026-08-01T11:00:00Z".to_owned();
+        assert_ne!(forge_observation(&master_touched, 1).unwrap(), quiet);
+
+        // A comment on a task's own sub-issue bumps that sub-issue's.
+        let mut task_touched = graph_for_forge_observation();
+        task_touched.tasks[0].updated_at = "2026-08-01T11:00:00Z".to_owned();
+        assert_ne!(forge_observation(&task_touched, 1).unwrap(), quiet);
+
+        // A merged pull request closing a sub-issue changes its state.
+        let mut task_closed = graph_for_forge_observation();
+        task_closed.tasks[0].state = "closed".to_owned();
+        assert_ne!(forge_observation(&task_closed, 1).unwrap(), quiet);
+
+        // Re-arming always dispatches, so it must invalidate the precondition.
+        assert_ne!(forge_observation(&base, 2).unwrap(), quiet);
+    }
+
+    fn graph_for_forge_observation() -> CampaignGraph {
+        let task = GithubIssue {
+            number: 43,
+            title: "Foundation".to_owned(),
+            body: None,
+            state: "open".to_owned(),
+            html_url: "https://github.com/acme/widgets/issues/43".to_owned(),
+            updated_at: "2026-08-01T10:00:00Z".to_owned(),
+            user: GithubActor {
+                login: "operator".to_owned(),
+            },
+            pull_request: None,
+        };
+        CampaignGraph {
+            locator: parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap(),
+            manifest: serde_json::from_value(manifest_value_for_test(json!([{
+                "id": "foundation",
+                "kind": "implementation",
+                "issue": 43,
+                "dependencies": [],
+                "conflictDomains": []
+            }])))
+            .unwrap(),
+            master: GithubIssue {
+                number: 42,
+                title: "Campaign".to_owned(),
+                body: None,
+                state: "open".to_owned(),
+                html_url: "https://github.com/acme/widgets/issues/42".to_owned(),
+                updated_at: "2026-08-01T10:00:00Z".to_owned(),
+                user: GithubActor {
+                    login: "operator".to_owned(),
+                },
+                pull_request: None,
+            },
+            tasks: vec![task],
+            executable_digest: format!("sha256:{}", "a".repeat(64)),
+        }
     }
 
     #[test]
@@ -3905,6 +4205,7 @@ mod tests {
             allow_test_local_forge: false,
             sub_issue_walk: true,
             last_observation: None,
+            last_forge_observation: None,
             flow: PathBuf::from("/nix/store/flow.js"),
             driver: PathBuf::from("/nix/store/driver"),
             workspace_root: PathBuf::from("/srv/tally-campaigns"),

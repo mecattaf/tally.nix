@@ -23,6 +23,13 @@ assert SPEC is not None and SPEC.loader is not None
 driver = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(driver)
 
+CHECKPOINT_REF_VECTORS = Path(
+    os.environ.get(
+        "SPEC_BUILD_CHECKPOINT_REF_VECTORS",
+        Path(__file__).parents[1] / "test/fixtures/spec-build/checkpoint-refs.json",
+    )
+)
+
 
 def git(*argv: str, cwd: Path | None = None, check: bool = True) -> str:
     return subprocess.run(
@@ -491,6 +498,53 @@ class CheckpointReceiptTests(unittest.TestCase):
         self.assertEqual(
             git("ls-remote", "origin", self.reference(), cwd=self.checkout).strip(), ""
         )
+
+
+class CheckpointRefVectorTests(unittest.TestCase):
+    """The driver half of the shared cross-language checkpoint-ref vectors.
+
+    `crates/tally/src/cli/campaign.rs` computes the same ref layout to project
+    checkpoint completion onto the master issue, and for two waves it computed
+    a name the driver has never written in either namespace, because nothing
+    pinned the two implementations to one another. Both sides now assert
+    against this file; neither owns it.
+    """
+
+    def vectors(self) -> list[dict[str, Any]]:
+        document = json.loads(CHECKPOINT_REF_VECTORS.read_text(encoding="utf-8"))
+        self.assertEqual(document["schemaVersion"], 1)
+        self.assertTrue(document["vectors"])
+        return document["vectors"]
+
+    def test_driver_ref_layout_matches_the_shared_vectors(self) -> None:
+        for vector in self.vectors():
+            with self.subTest(campaign=vector["campaign"], task=vector["taskId"]):
+                arguments = (
+                    vector["campaign"],
+                    str(vector["issueNumber"]),
+                    vector["taskId"],
+                    vector["source"],
+                    vector["baseRevision"],
+                )
+                self.assertEqual(driver.checkpoint_ref(*arguments), vector["ref"])
+                self.assertEqual(
+                    driver.legacy_checkpoint_tag(*arguments), vector["legacyTag"]
+                )
+
+    def test_every_vector_ref_is_its_prefix_plus_the_tested_revision(self) -> None:
+        # The Rust projection knows the family but not the revision, so it
+        # queries `<prefix>/*`. A ref that is not exactly prefix + revision
+        # would make that query match nothing.
+        for vector in self.vectors():
+            with self.subTest(campaign=vector["campaign"], task=vector["taskId"]):
+                self.assertEqual(
+                    vector["ref"],
+                    f"{vector['refPrefix']}/{vector['baseRevision']}",
+                )
+                self.assertEqual(
+                    vector["legacyTag"],
+                    f"{vector['legacyTagPrefix']}/{vector['baseRevision']}",
+                )
 
 
 if __name__ == "__main__":

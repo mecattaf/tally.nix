@@ -12,6 +12,36 @@ use super::*;
 const STORE_A: &str = "/nix/store/00000000000000000000000000000000-output-a";
 const STORE_B: &str = "/nix/store/11111111111111111111111111111111-output-b";
 
+/// A receipt written before `duplicateAcknowledged` was retired still loads.
+///
+/// The struct denies unknown fields, so dropping the key outright would have
+/// made every trigger receipt already on a real host unreadable; the field
+/// stays declared and is read by nothing, and it is not written back.
+#[test]
+fn a_receipt_carrying_the_retired_duplicate_flag_still_loads_and_stops_being_written() {
+    let stored = serde_json::json!({
+        "schemaVersion": 1,
+        "receiptId": "receipt-42",
+        "producer": "github",
+        "source": "search",
+        "itemId": "I_widget_42",
+        "eventId": "event-1",
+        "triggerKind": "comment",
+        "triggerActor": "contributor",
+        "triggerTimestamp": "2026-07-20T12:30:00Z",
+        "primaryDecision": "accepted",
+        "primaryAcknowledged": true,
+        "duplicateAcknowledged": true,
+        "duplicateCount": 3,
+    });
+    let receipt: super::gh_decision::GhTriggerReceipt =
+        serde_json::from_value(stored).expect("a pre-retirement receipt must still load");
+    assert_eq!(receipt.duplicate_count, 3);
+    assert!(receipt.primary_acknowledged);
+    let rewritten = serde_json::to_value(&receipt).unwrap();
+    assert!(rewritten.get("duplicateAcknowledged").is_none());
+}
+
 fn enqueue(command: &str) -> ProducerEnqueue {
     ProducerEnqueue {
         argv: vec![command.to_owned()],
@@ -1783,22 +1813,29 @@ fn github_duplicate_trigger_acknowledgement_is_never_published() {
     )
     .unwrap();
 
+    // The suppression lives at the decision point now, so a duplicate is never
+    // built into an acknowledgement and never dispatched. A sink handed one
+    // anyway says so loudly instead of dropping it: silence here is what let a
+    // second sink re-introduce the public duplicate by default.
     let mut sink = GhCliAcknowledgementSink::with_program(&gh).with_state_dir(&state_dir);
-    sink.post_acknowledgement(&trigger_acknowledgement(
-        "receipt-42",
-        GhDecisionStatus::Duplicate,
-    ))
-    .unwrap();
+    let refused = sink
+        .post_acknowledgement(&trigger_acknowledgement(
+            "receipt-42",
+            GhDecisionStatus::Duplicate,
+        ))
+        .unwrap_err();
+    assert!(refused.contains("non-terminal"), "{refused}");
     assert_eq!(scripted_operations(&requests), Vec::<String>::new());
     assert_eq!(thread_comments(&thread), ["IC_7"]);
 
     // Not even on a thread that carries no marker at all.
     std::fs::remove_file(thread.join("IC_7.body")).unwrap();
-    sink.post_acknowledgement(&trigger_acknowledgement(
-        "receipt-42",
-        GhDecisionStatus::Duplicate,
-    ))
-    .unwrap();
+    assert!(sink
+        .post_acknowledgement(&trigger_acknowledgement(
+            "receipt-42",
+            GhDecisionStatus::Duplicate,
+        ))
+        .is_err());
     assert_eq!(scripted_operations(&requests), Vec::<String>::new());
     assert_eq!(thread_comments(&thread), Vec::<String>::new());
 
@@ -1867,12 +1904,12 @@ fn github_receipt_comment_upserts_in_place_across_a_producer_restart() {
 
     // The id is durable, not process memory: a restarted producer edits the
     // comment it created before, and never paginates the thread again.
+    // One call, not two: re-reading the item's state after the edit landed
+    // gated nothing and made the realistic case -- a campaign issue well under
+    // one page of comments -- cost more API than the thread scan it replaced.
     let mut restarted = GhCliAcknowledgementSink::with_program(&gh).with_state_dir(&state_dir);
     restarted.post_acknowledgement(&accepted).unwrap();
-    assert_eq!(
-        scripted_operations(&requests),
-        ["TallyStickyComment", "TallyItemState"]
-    );
+    assert_eq!(scripted_operations(&requests), ["TallyStickyComment"]);
     assert_eq!(thread_comments(&thread), ["IC_1", "IC_2"]);
 
     // State loss with a marker still on the thread: recover, publish into the
@@ -2119,12 +2156,13 @@ fn github_completion_evidence_upserts_the_comment_it_already_created() {
         [("task-1:attempt-1:witness-5".to_owned(), "IC_1".to_owned())]
     );
 
+    // A sticky re-publication is exactly one round trip. The state assertion
+    // rides the thread scan the create and adopt paths already run; buying a
+    // second query for it here doubled the cost of the case the sticky path
+    // exists to make cheaper.
     let mut republished = GhCliMutationSink::with_program(&gh).with_state_dir(&state_dir);
     republished.post_evidence(&mutation).unwrap();
-    assert_eq!(
-        scripted_operations(&requests),
-        ["TallyStickyComment", "TallyItemState"]
-    );
+    assert_eq!(scripted_operations(&requests), ["TallyStickyComment"]);
     assert_eq!(thread_comments(&thread), ["IC_1"]);
 }
 
@@ -2408,11 +2446,11 @@ fn github_comment_receipts_ack_one_accept_one_duplicate_and_a_later_job() {
         duplicate.existing_task.as_deref(),
         Some(first_task.as_str())
     );
-    assert_eq!(acknowledgements.entries.len(), 2);
-    assert_eq!(
-        acknowledgements.entries[1].decision,
-        GhDecisionStatus::Duplicate
-    );
+    // A duplicate reaches no sink at all. The suppression used to live in the
+    // one production sink, which meant the decision point still built and
+    // dispatched an acknowledgement nobody was allowed to publish, and any
+    // second sink re-introduced the #245 public duplicate by default.
+    assert_eq!(acknowledgements.entries.len(), 1);
 
     let mut later_observation = gh_command_observation("comment-2", "contributor");
     later_observation.trigger_timestamp = "2026-07-20T12:35:00Z".to_owned();
@@ -2426,9 +2464,9 @@ fn github_comment_receipts_ack_one_accept_one_duplicate_and_a_later_job() {
         .unwrap();
     assert_eq!(later.decision, GhDecisionStatus::Accepted);
     assert_ne!(later.task_uuid.as_deref(), Some(first_task.as_str()));
-    assert_eq!(acknowledgements.entries.len(), 3);
+    assert_eq!(acknowledgements.entries.len(), 2);
     assert_eq!(
-        acknowledgements.entries[2].decision,
+        acknowledgements.entries[1].decision,
         GhDecisionStatus::Accepted
     );
     assert_eq!(
@@ -2454,8 +2492,8 @@ fn github_comment_receipts_ack_one_accept_one_duplicate_and_a_later_job() {
     assert_eq!(third_replay.decision, GhDecisionStatus::Duplicate);
     assert_eq!(
         acknowledgements.entries.len(),
-        3,
-        "the stable duplicate acknowledgement is emitted only once"
+        2,
+        "no replay of an already-recorded trigger ever reaches a sink"
     );
 }
 

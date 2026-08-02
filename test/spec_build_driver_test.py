@@ -1954,6 +1954,7 @@ class NativeSubIssueTests(unittest.TestCase):
         pulls: list[dict[str, object]] | None = None,
         comments: list[dict[str, object]] | None = None,
         truncated: bool = False,
+        comments_truncated: bool = False,
     ) -> dict[str, object]:
         return {
             "number": number,
@@ -1963,7 +1964,12 @@ class NativeSubIssueTests(unittest.TestCase):
                 "pageInfo": {"hasNextPage": truncated},
                 "nodes": pulls or [],
             },
-            "comments": {"nodes": comments or []},
+            # `last:` returns the newest comments, so an exhausted window drops
+            # the oldest: `hasPreviousPage`, not `hasNextPage`.
+            "comments": {
+                "pageInfo": {"hasPreviousPage": comments_truncated},
+                "nodes": comments or [],
+            },
         }
 
     @staticmethod
@@ -2111,15 +2117,93 @@ class NativeSubIssueTests(unittest.TestCase):
             ]
             with FakeGitHub(root, state):
                 result = DRIVER.action_reconcile(brief)
+            # The thread copy is the one the fact points at, and the master copy
+            # of the same attempt is counted once, not twice.
             self.assertEqual(
                 [(item["taskId"], item["comment"]) for item in result["diagnoses"]],
                 [("task-1", "https://github.com/acme/spec/issues/8#machine")],
             )
             self.assertTrue(
                 any(
-                    "master-thread machine diagnosis for 'task-1'" in warning
+                    "duplicate machine diagnosis for 'task-1' attempt 1 on the "
+                    "master thread" in warning
                     for warning in result["warnings"]
-                )
+                ),
+                result["warnings"],
+            )
+
+    def test_a_master_receipt_recorded_before_the_thread_still_counts(self) -> None:
+        """#334 item 6: an upgraded campaign keeps its diagnosis/retry ledger.
+
+        A campaign armed before the sub-issue walk capability records its
+        receipts on the master. Re-arming into the native projection moves
+        where new receipts are posted; discarding the old ones reset each
+        task's attempt counters, which bought one extra agent attempt and
+        re-posted a public comment that had already been made.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            state, brief = self.fixture(checkout)
+
+            def diagnosis(task_id: str, attempt: int) -> str:
+                marker = DRIVER.diagnosis_marker("fixture", "7", task_id, attempt)
+                heading = DRIVER.diagnosis_heading(task_id, attempt)
+                return f"{marker}\n\n{heading}\n\nsteering for {task_id}"
+
+            state["walk"] = [self.walk_node(8), self.walk_node(9)]
+            state["issueComments"] = [
+                {
+                    "body": diagnosis("task-1", 1),
+                    "html_url": "https://github.com/acme/spec/issues/7#legacy",
+                    "user": {"login": "tally-bot"},
+                }
+            ]
+            with FakeGitHub(root, state):
+                result = DRIVER.action_reconcile(brief)
+            self.assertEqual(
+                [(item["taskId"], item["attempt"], item["comment"]) for item in result["diagnoses"]],
+                [("task-1", 1, "https://github.com/acme/spec/issues/7#legacy")],
+            )
+            self.assertTrue(
+                any(
+                    "counted a master-thread machine diagnosis for 'task-1' "
+                    "attempt 1" in warning
+                    for warning in result["warnings"]
+                ),
+                result["warnings"],
+            )
+
+    def test_a_truncated_comment_window_is_reported_not_refused(self) -> None:
+        """#334 item 1: `comments(last: 100)` silently dropped the oldest.
+
+        A long human discussion on a task thread must not halt the campaign,
+        but an operator whose steering comment scrolled out of the window has
+        to be able to see why it never reached the agent.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            state, brief = self.fixture(checkout)
+            state["walk"] = [
+                self.walk_node(8, comments_truncated=True),
+                self.walk_node(9),
+            ]
+            with FakeGitHub(root, state):
+                result = DRIVER.action_reconcile(brief)
+            self.assertTrue(
+                any(
+                    "campaign sub-issue #8 carries more than 100 comments" in warning
+                    for warning in result["warnings"]
+                ),
+                result["warnings"],
+            )
+            self.assertNotIn(
+                True,
+                [
+                    "campaign sub-issue #9 carries more than" in warning
+                    for warning in result["warnings"]
+                ],
             )
 
     def test_steering_and_retry_receipts_post_on_the_task_thread(self) -> None:
@@ -2303,6 +2387,72 @@ class LaneLifecycleTests(unittest.TestCase):
                         checkout,
                         workspace_root,
                         "rewound-pass",
+                        source_revision=witnessed,
+                    )
+                )
+            self.assertIn(
+                "does not descend from the witnessed worklist revision",
+                str(raised.exception),
+            )
+
+    def test_the_resume_door_refuses_a_lane_the_fresh_cut_door_would_refuse(self) -> None:
+        """A prep retry inside one flow run took the resume path and skipped the check.
+
+        The already-prepared early return sat before the fetch and before the
+        worklist/worktree coherence check, so a prep node re-run that straddled
+        a remote force-replacement handed back the stale lane and its stale
+        baseRev with no error at all: the resume door bypassed the fail-closed
+        guard the fresh-cut door has.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            witnessed = git(checkout, "rev-parse", "HEAD")
+
+            prepared = DRIVER.action_prep(
+                prep_brief(
+                    checkout,
+                    workspace_root,
+                    "resumed-pass",
+                    source_revision=witnessed,
+                )
+            )
+            self.assertTrue(Path(prepared["worktreePath"]).is_dir())
+            # A second call inside the same run resumes the lane it just cut.
+            resumed = DRIVER.action_prep(
+                prep_brief(
+                    checkout,
+                    workspace_root,
+                    "resumed-pass",
+                    source_revision=witnessed,
+                )
+            )
+            self.assertEqual(resumed, prepared)
+
+            replacement = root / "replacement"
+            replacement.mkdir()
+            command("git", "init", "--quiet", "--initial-branch=main", str(replacement))
+            git(replacement, "config", "user.name", "Tally Test")
+            git(replacement, "config", "user.email", "tally-test@invalid")
+            (replacement / "other.go").write_text("other\n", encoding="utf-8")
+            git(replacement, "add", "other.go")
+            git(replacement, "commit", "--quiet", "-m", "unrelated root")
+            git(
+                replacement,
+                "remote",
+                "add",
+                "origin",
+                git(checkout, "remote", "get-url", "origin"),
+            )
+            git(replacement, "push", "--quiet", "--force", "origin", "main")
+
+            with self.assertRaises(DRIVER.DriverError) as raised:
+                DRIVER.action_prep(
+                    prep_brief(
+                        checkout,
+                        workspace_root,
+                        "resumed-pass",
                         source_revision=witnessed,
                     )
                 )

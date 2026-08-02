@@ -574,6 +574,12 @@ pub(super) struct GcArgs {
         default_value_t = tally_core::retention::DEFAULT_EVENTS_REJECTED_MAX_COUNT
     )]
     pub(super) events_rejected_max_count: usize,
+    #[arg(
+        long,
+        value_name = "DURATION",
+        default_value = tally_core::retention::DEFAULT_PRODUCER_MARKER_MAX_AGE
+    )]
+    pub(super) producer_marker_horizon: String,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]

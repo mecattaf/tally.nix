@@ -937,6 +937,21 @@ let
         example = 15;
         description = "Polling cadence for the events-directory drain unit.";
       };
+      selfDrain = mkOption {
+        type = types.bool;
+        default = true;
+        example = false;
+        description = ''
+          Whether this producer renders its own drain unit and timer. The
+          drain RPC always claims the whole events directory and only stamps
+          the admission origin with the producer that called it, so a second
+          drainer beside the shipped `tally-drain` timer buys no coverage: it
+          costs one redundant unit and one redundant call per interval, and
+          makes the durable admission origin depend on which timer won the
+          race. Set this false for a registry entry that exists to declare the
+          contract while `tally-drain` remains the single drainer.
+        '';
+      };
     } (_: _: [ ])
   );
 
@@ -2708,6 +2723,20 @@ let
                 file first.
               '';
             };
+            producerMarkerHorizon = mkOption {
+              type = types.str;
+              default = "180d";
+              example = "90d";
+              description = ''
+                Systemd timespan after which the per-dispatch marker files under
+                producers/gh-triggers, producers/gh-completed,
+                producers/gh-comments, and producers/gh-storage-warnings expire.
+                Each marker makes one forge mutation idempotent; collecting one
+                costs at most a re-publication that the marker scan on the
+                thread already collapses, so the envelope matches the ingress
+                audit trail rather than the shorter archive one.
+              '';
+            };
             lifecycleHorizon = mkOption {
               type = types.str;
               default = "30d";
@@ -2967,9 +2996,12 @@ let
               default = "60s";
               example = "5min";
               description = ''
-                Systemd timespan between poll scans. Each scan is bounded and
-                cheap when nothing has changed, so short intervals are
-                affordable; raise it to reduce forge API traffic.
+                Systemd timespan between poll scans. A scan that finds nothing
+                moved costs two REST reads per armed campaign: it compares the
+                master and sub-issue timestamps it already fetched before it
+                decides whether to run the bounded GraphQL steering walk at
+                all. Short intervals are affordable on that budget; raise it to
+                reduce forge API traffic further.
               '';
             };
             timeout = mkOption {
@@ -3302,6 +3334,7 @@ let
         eventsDoneHorizon
         eventsRejectedHorizon
         eventsRejectedMaxCount
+        producerMarkerHorizon
         lifecycleHorizon
         lifecycleMaxBytes
         ;
@@ -3645,9 +3678,19 @@ let
             # pool, so arming a campaign still needs no Nix change. Both campaign
             # classes write their next-pass payload here; the frozen enqueue
             # kernel collapses a duplicate against `tally-campaign-poll.timer`.
+            #
+            # It renders no unit of its own. `tally-drain.timer` already claimed
+            # this directory unconditionally at the same 5 s cadence on every
+            # tally home, and the drain RPC drains the whole directory whoever
+            # calls it, so a second timer only raced the first for the right to
+            # stamp `origin.producer`. This entry stays because it is the
+            # declared contract the continuation payload is written against; the
+            # drain itself is `tally-drain`'s, and the durable admission origin
+            # of a continuation event is therefore stably producer-less.
             campaign-continuation = {
               kind = "events-dir";
               pollIntervalSec = lib.mkDefault 5;
+              selfDrain = lib.mkDefault false;
             };
           }
           (builtins.attrNames enabled);
@@ -3673,6 +3716,17 @@ let
             mode = "regex";
             pattern = defaultFinalMessagePattern;
           };
+          # The continue node writes the next pass's enqueue payload into the
+          # daemon's events directory, so that directory is a hard write
+          # dependency of the driver adapter. Under the compatibility default
+          # (no hardening preset) nothing constrains the write and this list is
+          # inert; under `strict` or `production` the state directory stops
+          # being writable wholesale and only the paths named here survive.
+          # Declaring it means hardening this adapter cannot silently break a
+          # campaign's self-continuation. It is a plain definition rather than
+          # an mkDefault so an estate adding its own paths extends the list
+          # instead of replacing this one.
+          extraWritablePaths = [ "${toString cfg.stateDir}/events" ];
         };
       };
     };
@@ -3725,6 +3779,8 @@ let
     cfg.retention.eventsRejectedHorizon
     "--events-rejected-max-count"
     (toString cfg.retention.eventsRejectedMaxCount)
+    "--producer-marker-horizon"
+    cfg.retention.producerMarkerHorizon
   ];
 
   mkAssertions =
@@ -3749,6 +3805,10 @@ let
       {
         assertion = cfg.retention.eventsRejectedHorizon != "";
         message = "tally retention eventsRejectedHorizon must be non-empty";
+      }
+      {
+        assertion = cfg.retention.producerMarkerHorizon != "";
+        message = "tally retention producerMarkerHorizon must be non-empty";
       }
       {
         assertion = cfg.retention.lifecycleHorizon != "";
@@ -3787,6 +3847,17 @@ let
         {
           assertion = validComponent name && builtins.stringLength name <= 80;
           message = "tally campaign name ${name} must be a safe unit/file component of at most 80 bytes";
+        }
+        {
+          # Every declared campaign contributes a `campaign-<name>` gh producer
+          # on top of the generic `campaign-continuation` events-dir entry the
+          # campaign layer seeds. A campaign literally named `continuation`
+          # therefore overwrites that entry with a gh producer, and the only
+          # thing that noticed was a Home Manager assertion naming an internal
+          # producer rather than the campaign that collided with it. Reject the
+          # reserved name here, where the operator can read what to rename.
+          assertion = name != "continuation";
+          message = "tally campaign name continuation is reserved: it would replace the generic events-dir producer campaign-continuation with a gh producer; rename the campaign";
         }
         campaign._tallyAssertions
         {

@@ -199,6 +199,12 @@ let
             timers = acc.timers;
             desired = acc.desired ++ [ "${unit}.service" ];
           }
+        else if producer.kind == "events-dir" && !producer.selfDrain then
+          # A registry entry that declares the contract without adding a second
+          # drainer beside tally-drain.timer. Rendering nothing here is what
+          # keeps the durable admission origin of an event dropped in this
+          # directory from depending on which timer claimed the file first.
+          acc
         else if producer.kind == "events-dir" then
           let
             program = mkDispatchProgram name { kind = "events-dir"; };
@@ -410,7 +416,8 @@ in
           ''
             ${pkgs.coreutils}/bin/install -d -m 0700 -- \
               ${lib.escapeShellArg (toString cfg.dataDir)} \
-              ${lib.escapeShellArg (toString cfg.stateDir)}
+              ${lib.escapeShellArg (toString cfg.stateDir)} \
+              ${lib.escapeShellArg "${toString cfg.stateDir}/events"}
           '';
 
       xdg.configFile."tally/config.json" = {
@@ -437,6 +444,9 @@ in
             ];
             RuntimeDirectory = "tally";
             RuntimeDirectoryMode = "0700";
+            # The events directory is created here, not lazily by the first
+            # ingress write: a job whose adapter names it in
+            # extraWritablePaths cannot start at all while it is missing.
             ExecStartPre = lib.escapeShellArgs [
               "${pkgs.coreutils}/bin/install"
               "-d"
@@ -444,6 +454,7 @@ in
               "0700"
               (toString cfg.dataDir)
               (toString cfg.stateDir)
+              "${toString cfg.stateDir}/events"
             ];
             ExecStart = lib.escapeShellArgs daemonArgv;
             CPUWeight = 100;

@@ -1215,8 +1215,18 @@ function machineDiagnoses(reconciliation, taskId) {
 // still outstanding is neither - its verdict is not yet meaningful.
 function failureClass(reconciliation, failure) {
   const stage = failure.stage;
+  // The whole deferred lane is unpriced, not just its checkpoint command. A
+  // checkpoint lane fails at three stages -- `prep`, `checkpoint`, and
+  // `checkpoint:record` -- and matching only the middle one left the other two
+  // buying a machinery retry and then a steering attempt out of the budget of
+  // a task the reconciler has just said has no meaningful verdict yet. The
+  // #308 loop bound terminates by spending that budget on attempts that mean
+  // something; spending it on passes where the checkpoint could not have
+  // settled either way escalates a checkpoint that was never really run. The
+  // deferral set only ever names checkpoints, and it drains as unrelated work
+  // merges or blocks, so nothing here can defer for ever.
   if (
-    stage === "checkpoint" &&
+    failure.task.kind === "checkpoint" &&
     reconciliation.deferrals.some(item => item.taskId === failure.task.id)
   ) {
     return "deferred";

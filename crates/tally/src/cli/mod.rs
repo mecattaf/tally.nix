@@ -957,6 +957,7 @@ fn run_gc(args: GcArgs) -> Result<()> {
         &args.events_done_horizon,
         &args.events_rejected_horizon,
         args.events_rejected_max_count,
+        &args.producer_marker_horizon,
     )?;
     let report = tally_core::retention::run_gc(
         tally_core::retention::GcRequest {

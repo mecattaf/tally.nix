@@ -172,7 +172,17 @@ pub(super) struct GhTriggerReceipt {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) task_uuid: Option<String>,
     pub(super) primary_acknowledged: bool,
-    pub(super) duplicate_acknowledged: bool,
+    /// Retired. A duplicate acknowledgement is refused at the decision point
+    /// and never dispatched, so a durable flag saying one had been published
+    /// recorded a publication that never happened. Receipts written before it
+    /// was retired still carry the key, and `deny_unknown_fields` would refuse
+    /// them, so the field stays declared and is read by nothing.
+    #[allow(
+        dead_code,
+        reason = "durable compatibility only: pre-retirement receipts carry this key"
+    )]
+    #[serde(default, rename = "duplicateAcknowledged", skip_serializing)]
+    pub(super) retired_duplicate_acknowledged: bool,
     pub(super) duplicate_count: u64,
 }
 
@@ -453,12 +463,17 @@ pub(super) fn acknowledgement_for_decision(
             "acknowledgeable GitHub decision omitted receiptId".to_owned(),
         )
     })?;
+    // A duplicate is producer-internal bookkeeping and §3 keeps that off the
+    // forge, so it is refused here rather than built and handed to a sink that
+    // is trusted to drop it. Suppression that lives in the leaf sink is
+    // suppression every future sink has to remember to reimplement, and #245
+    // is what that costs when one does not.
     if !matches!(
         decision.decision,
-        GhDecisionStatus::Accepted | GhDecisionStatus::Filtered | GhDecisionStatus::Duplicate
+        GhDecisionStatus::Accepted | GhDecisionStatus::Filtered
     ) {
         return Err(ProducerError::InvalidObservation(
-            "only accepted, filtered, and duplicate GitHub decisions are acknowledged".to_owned(),
+            "only accepted and filtered GitHub decisions are acknowledged".to_owned(),
         ));
     }
     Ok(GhTriggerAcknowledgement {

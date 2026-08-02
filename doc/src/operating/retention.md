@@ -127,7 +127,8 @@ $ tally gc --horizon 30d --collect \
     --capture-archive-horizon 30d \
     --events-done-horizon 180d \
     --events-rejected-horizon 30d \
-    --events-rejected-max-count 10000
+    --events-rejected-max-count 10000 \
+    --producer-marker-horizon 180d
 ```
 
 The NixOS service runs the same command with its configured `--data-dir`
@@ -254,6 +255,7 @@ The current storage story is intentionally uneven:
 | Worker `stateDir` | Captures, launch markers, exit records, and execution attestations accumulate | Preserve live/ambiguous generations. No worker-side GC is shipped. |
 | Ordinary `artifact:<path>` files | Owned by the workload; no tally GC root | Apply a workload-specific policy only after accepting the reuse and audit consequences below. |
 | Producer events | Pending files are durable recovery inputs; consumed `events/done` defaults to 180 days, rejected files to 30 days/10,000 | Let `tally gc` prune only the managed done/rejected sets. |
+| Producer markers (`producers/gh-triggers`, `gh-completed`, `gh-comments`, `gh-storage-warnings`) | One `<key>.json` per dispatch making a forge mutation idempotent; expires under `producerMarkerHorizon` (180 days by default) | Automatic through `tally gc`. Collecting a marker costs at most a re-publication that the thread's own marker scan already collapses. A per-marker `<key>.lock` is collected only together with its marker and only when no writer holds it; the directory-wide `mutations.lock` is never collected. |
 | Inert `taskdata/` and `taskdata.pre-rebuild-*` directories | Left in place by the TaskChampion delete; no pruner reads or writes them | Nothing depends on them. Delete them by hand to reclaim the space. |
 | Unit-exit state | Durable recovery input; no general pruner. One exception: legacy `<uuid>.capture.lock` files expire under `captureArchiveHorizon` | Do not prune exit records or `<uuid>.capture.json` generations by age. `tally gc` removes only a `.capture.lock` that is both older than the horizon and unheld, proven by a non-blocking `flock` it takes before unlinking. Nothing creates a lock here any more, so this population only drains. |
 | Capture locks (`capture-lock/`) | One `<uuid>.capture.lock` per dispatched execution; expires under `captureArchiveHorizon` | Same two-check rule as above. The daemon no longer mints a lock for a task whose capture generation is already gone, so a swept lock stays swept instead of being re-created at the next startup reconcile. |

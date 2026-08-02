@@ -343,14 +343,21 @@ impl<'a> ProducerEngine<'a> {
             validate_receipt_identity(&receipt, producer, observation, &receipt_id)?;
             if receipt.primary_acknowledged {
                 receipt.duplicate_count = receipt.duplicate_count.saturating_add(1);
-                let needs_acknowledgement = !receipt.duplicate_acknowledged;
+                // Re-observing a trigger already in the ledger is
+                // producer-internal bookkeeping, and §3 keeps that off the
+                // forge. That decision belongs here, at the point where the
+                // disposition is known, not in whichever sink happens to be
+                // wired up: the one production sink dropped the acknowledgement
+                // silently, so the receipt recorded that a duplicate had been
+                // acknowledged when nothing was ever published, and any second
+                // sink would have re-introduced #245 by default.
                 let decision = duplicate_gh_decision(
                     producer,
                     observation,
                     &receipt_id,
                     receipt.task_uuid.clone(),
                 );
-                (receipt, decision, needs_acknowledgement)
+                (receipt, decision, false)
             } else {
                 let decision =
                     primary_receipt_decision(producer, config, observation, &receipt, now)?;
@@ -394,7 +401,7 @@ impl<'a> ProducerEngine<'a> {
                 rule,
                 task_uuid: receipt_task,
                 primary_acknowledged: false,
-                duplicate_acknowledged: false,
+                retired_duplicate_acknowledged: false,
                 duplicate_count: 0,
             };
             let decision = match primary_decision {
@@ -426,7 +433,6 @@ impl<'a> ProducerEngine<'a> {
                     .map_err(ProducerError::Acknowledgement)?;
             }
             match decision.decision {
-                GhDecisionStatus::Duplicate => receipt.duplicate_acknowledged = true,
                 GhDecisionStatus::Accepted | GhDecisionStatus::Filtered => {
                     receipt.primary_acknowledged = true
                 }
