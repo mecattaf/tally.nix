@@ -96,7 +96,16 @@ class ConflictDomainSemanticsTests(unittest.TestCase):
 
 
 class PublicationHarness(unittest.TestCase):
-    """One published lane on a local forge, shared by the publication suites."""
+    """One published lane on a local forge, shared by the publication suites.
+
+    `BASE_MERGE_METHOD` is the campaign `mergeMethod` whose base-branch
+    topology this run reproduces. Concrete suites derive once per value, so
+    every publication invariant is verified against both the merge-commit base
+    a `merge` campaign leaves and the linear base a `squash` campaign leaves.
+    """
+
+    BASE_MERGE_METHOD = "merge"
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -186,11 +195,14 @@ class PublicationHarness(unittest.TestCase):
     def advance_base(self, path: str, content: str, message: str) -> str:
         """Land a mainline commit exactly the way a campaign merge does.
 
-        `merge_local` integrates with `git merge --no-ff` and `merge_github`
-        asks the forge for a merge commit, so the tip of a base branch that has
-        integrated anything is a merge commit and every later lane inherits it
-        by rebasing. A fixture that advanced the base linearly would agree with
-        any claim about rebased lanes while production disagreed.
+        Which way that is depends on the campaign's `mergeMethod`, and both
+        ways ship. Under `merge` the base tip is a merge commit and every later
+        lane inherits it by rebasing; under `squash` — the default since #310 —
+        the base advances linearly and a rebasing lane inherits nothing. A
+        fixture pinned to either topology alone would agree with any claim
+        about rebased lanes while the other production shape disagreed, which
+        is the failure #338 landed this helper to prevent. `BASE_MERGE_METHOD`
+        selects one; `PublicationHarness` subclasses run the suite under both.
         """
         advancer = self.root / "advancer"
         if not advancer.exists():
@@ -210,7 +222,11 @@ class PublicationHarness(unittest.TestCase):
         git("add", "--all", cwd=advancer)
         git("commit", "-m", message, cwd=advancer)
         git("switch", "main", cwd=advancer)
-        git("merge", "--no-ff", "--no-edit", sibling, cwd=advancer)
+        if self.BASE_MERGE_METHOD == "squash":
+            git("merge", "--squash", sibling, cwd=advancer)
+            git("commit", "-m", message, cwd=advancer)
+        else:
+            git("merge", "--no-ff", "--no-edit", sibling, cwd=advancer)
         git("push", "origin", "main", cwd=advancer)
         git("fetch", "origin", cwd=self.checkout)
         return git("rev-parse", "HEAD", cwd=advancer)
@@ -541,17 +557,21 @@ class PublicationConflictDomainTests(PublicationHarness):
         self.assertNotEqual(
             git("rev-parse", "origin/main", cwd=self.checkout), rebased_head
         )
+        # The premise of the scenario, stated per topology: a `merge` campaign
+        # hands the rebasing lane a mainline merge commit, a `squash` campaign
+        # hands it a linear one. Both must reach the same ownership verdict.
+        inherited_merges = len(
+            git(
+                "rev-list",
+                "--merges",
+                f"{self.base_rev}..{rebased_head}",
+                cwd=self.checkout,
+            ).split()
+        )
         self.assertEqual(
-            len(
-                git(
-                    "rev-list",
-                    "--merges",
-                    f"{self.base_rev}..{rebased_head}",
-                    cwd=self.checkout,
-                ).split()
-            ),
-            1,
-            "the lane inherited a mainline merge commit by rebasing",
+            inherited_merges,
+            1 if self.BASE_MERGE_METHOD == "merge" else 0,
+            f"unexpected inherited mainline shape under {self.BASE_MERGE_METHOD}",
         )
 
         ownership = driver.action_ownership(self.ownership_brief(["internal/contacts"]))
@@ -904,6 +924,20 @@ class PublicationNarrationTests(PublicationHarness):
             git("--git-dir", str(self.remote), "log", "-1", "--format=%s", merge_commit),
             "conflict-domain: Implement conflict-domain",
         )
+
+
+# #310 made `squash` the default mergeMethod, so the base topology every later
+# lane rebases onto is now linear for a default campaign and a merge commit for
+# an explicit `mergeMethod = "merge"` one. Both ship, so the publication suites
+# run under both: the union-base and conflict-domain invariants repaired by
+# #276/#308/#338 must hold on either shape, and a regression that only appears
+# on one of them must not be able to go green.
+class SquashBasePublicationConflictDomainTests(PublicationConflictDomainTests):
+    BASE_MERGE_METHOD = "squash"
+
+
+class SquashBasePublicationNarrationTests(PublicationNarrationTests):
+    BASE_MERGE_METHOD = "squash"
 
 
 if __name__ == "__main__":
