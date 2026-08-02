@@ -1196,10 +1196,17 @@
                     "/bin/sh"
                     "/srv/campaign-fixtures/narrate"
                   ];
+                  # The adapter entry is what supplies the narrator's endpoint
+                  # and credentials, so the seam must carry env into the brief;
+                  # a narrator that got only argv would fail twice and narrate
+                  # from the template for ever without saying so.
+                  env.NARRATOR_ENDPOINT = "https://narrator.invalid/v1";
+                  # And the proposal is read back from the capture the adapter
+                  # declares, not from a pattern the driver hardcodes.
                   scrape.finalMessage = {
                     stream = "stdout";
                     mode = "regex";
-                    pattern = "^TALLY_FINAL_MESSAGE=(.*)$";
+                    pattern = "^NARRATOR_RESULT=(.*)$";
                   };
                 };
                 campaigns.fixture = {
@@ -3616,7 +3623,13 @@
                     "/bin/sh", "/srv/campaign-fixtures/narrate", "--narrate"
                   ] and
                   $fixtureArgs.steward.runtimeMaxSec == 45 and
-                  .adapters.narrator.scrape.finalMessage.pattern
+                  $fixtureArgs.steward.env
+                    == {"NARRATOR_ENDPOINT": "https://narrator.invalid/v1"} and
+                  ($fixtureArgs.steward.env == .adapters.narrator.env) and
+                  ($fixtureArgs.steward.finalMessagePattern
+                    == .adapters.narrator.scrape.finalMessage.pattern) and
+                  $fixtureArgs.steward.finalMessagePattern == "^NARRATOR_RESULT=(.*)$" and
+                  .adapters["spec-build-driver"].scrape.finalMessage.pattern
                     == "^TALLY_FINAL_MESSAGE=(.*)$" and
                   $defaultedArgs.mergeMethod == "squash" and
                   $defaultedArgs.steward == null and

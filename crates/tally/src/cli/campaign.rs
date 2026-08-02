@@ -140,6 +140,14 @@ struct CampaignManifest {
 struct CampaignSteward {
     adapter: String,
     argv: Vec<String>,
+    /// The adapter entry's environment: where a narrator's endpoint and
+    /// credentials live. Empty is the shipped state.
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+    /// The adapter's declared final-message capture. Absent means the shipped
+    /// `^TALLY_FINAL_MESSAGE=(.*)$` contract.
+    #[serde(default)]
+    final_message_pattern: Option<String>,
     #[serde(default)]
     runtime_max_sec: Option<u64>,
 }
@@ -882,6 +890,29 @@ fn validate_manifest(manifest: &CampaignManifest) -> Result<()> {
         }
         if steward.runtime_max_sec == Some(0) {
             return Err(invalid("campaign steward runtimeMaxSec must be positive"));
+        }
+        for name in steward.env.keys() {
+            if name.is_empty()
+                || name == "TALLY_BRIEF"
+                || !name.chars().enumerate().all(|(index, character)| {
+                    character == '_'
+                        || character.is_ascii_alphabetic()
+                        || (index > 0 && character.is_ascii_digit())
+                })
+            {
+                return Err(invalid(format!(
+                    "campaign steward env name {name:?} is not an assignable environment identifier"
+                )));
+            }
+        }
+        if steward
+            .final_message_pattern
+            .as_ref()
+            .is_some_and(|pattern| pattern.is_empty())
+        {
+            return Err(invalid(
+                "campaign steward finalMessagePattern must be non-empty when set",
+            ));
         }
     }
     validate_gates(&manifest.gates)?;
@@ -3619,6 +3650,52 @@ mod tests {
         validate_manifest(&manifest).unwrap();
         assert_eq!(manifest.merge_method, "merge");
         assert_eq!(manifest.steward.as_ref().unwrap().adapter, "narrator");
+
+        // The adapter entry's environment and declared capture ride along; a
+        // steward that carried only argv could never be pointed at a real
+        // endpoint.
+        let mut value = manifest_value_for_test(json!([
+            { "id": "task-1", "kind": "implementation", "issue": 8 }
+        ]));
+        value.as_object_mut().unwrap().insert(
+            "steward".into(),
+            json!({
+                "adapter": "narrator",
+                "argv": ["narrate"],
+                "env": {"NARRATOR_ENDPOINT": "https://narrator.invalid/v1"},
+                "finalMessagePattern": "^NARRATOR_RESULT=(.*)$"
+            }),
+        );
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        validate_manifest(&manifest).unwrap();
+        let steward = manifest.steward.as_ref().unwrap();
+        assert_eq!(
+            steward.env.get("NARRATOR_ENDPOINT").map(String::as_str),
+            Some("https://narrator.invalid/v1")
+        );
+        assert_eq!(
+            steward.final_message_pattern.as_deref(),
+            Some("^NARRATOR_RESULT=(.*)$")
+        );
+
+        // TALLY_BRIEF is the publish node's own; a steward may not redefine it.
+        let mut value = manifest_value_for_test(json!([
+            { "id": "task-1", "kind": "implementation", "issue": 8 }
+        ]));
+        value.as_object_mut().unwrap().insert(
+            "steward".into(),
+            json!({
+                "adapter": "narrator",
+                "argv": ["narrate"],
+                "env": {"TALLY_BRIEF": "/tmp/x"}
+            }),
+        );
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        let error = validate_manifest(&manifest).unwrap_err().to_string();
+        assert!(
+            error.contains("not an assignable environment identifier"),
+            "{error}"
+        );
 
         // An empty narration argv would render a steward that cannot be run.
         let mut value = manifest_value_for_test(json!([

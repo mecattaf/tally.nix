@@ -21,9 +21,12 @@ authorized.
   the existing branch-head ancestry proof.
 - Added the steward's narrate slot at the publication boundary.
   `services.tally.campaigns.<name>.steward` binds an adapter from the open
-  adapter map as a catalog role and `stewardArgv` is appended to that adapter's
-  argv; the publish node runs it, hands it a JSON narration request on stdin,
-  and reads its proposal back from a `TALLY_FINAL_MESSAGE=` line. A
+  adapter map as a catalog role; that adapter's `argv`, `env`, and
+  `scrape.finalMessage` are what supply the narrator's model, endpoint,
+  credentials, and capture, and `stewardArgv` is appended to its argv. The
+  publish node runs it, hands it a JSON narration request on stdin, and reads
+  its proposal back from the declared capture, defaulting to
+  `^TALLY_FINAL_MESSAGE=(.*)$`. A
   deterministic commitlint-shaped validator accepts or refuses the proposed
   conventional-commit text, re-requests once on refusal, and falls back to the
   brief-derived template on a second failure. The narration governs the pull
@@ -478,6 +481,38 @@ authorized.
 - Excluded the trailing record-framing newline from the single-byte mutation properties for the
   witness and attestation chains. Replacing that byte leaves every record identical and the chain
   legitimately valid, so the properties reported a false tamper miss on the seeds that selected it.
+
+### Fixed
+
+- Fixed a campaign squash merge on a `forge = "local"` repository wedging a task
+  permanently after one lost base-branch push. The merge receipt ref was pushed
+  without `--force`, and Git enforces fast-forward on every non-tag ref, so the
+  next pass's rebased squash — necessarily a different object ID — was refused
+  and the node failed before the base push it needed to make progress. The
+  receipt carries no authority of its own, because the reader still requires the
+  commit it names to be an ancestor of the witnessed base, so it is now forced
+  and the fast-forward reconciliation that could never succeed is gone.
+- Fixed steward narration silently discarding everything the bound adapter
+  carries except `argv`. The adapter's `env` — where a narrator's endpoint and
+  credentials live — and its declared `scrape.finalMessage` capture now reach
+  the publish node, so an adapter configured the documented way works instead of
+  failing twice and narrating from the template for ever. The narrator's
+  environment is the publish node's plus that `env`, minus `TALLY_BRIEF`, which
+  it has no business reading. A steward adapter that declares per-job launch
+  policies, a hardening preset, or `extraWritablePaths` is now refused when the
+  module is evaluated rather than run without them, because the narration seam
+  runs a direct argv rather than a tally job and cannot apply them.
+
+### Security
+
+- Campaign narration proposals that carry a GitHub closing keyword
+  (`Closes #12`, `resolved acme/spec#9`, a `.../issues/3` URL) or an `@mention`
+  are now refused by the narration validator. A pull-request body is executable
+  on GitHub and a squash commit message lands on the default branch, so an
+  unfiltered narrator could close issues the campaign never named and notify
+  people or teams on a public repository. The node's own `Closes #<sub-issue>`
+  is unaffected; a bare `#<n>` cross-reference stays allowed because it
+  backlinks and notifies nobody.
 
 ### Changed
 
