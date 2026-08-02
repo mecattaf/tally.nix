@@ -262,6 +262,8 @@ pub struct RetentionConfig {
     pub events_rejected_horizon: String,
     #[serde(default = "default_events_rejected_max_count")]
     pub events_rejected_max_count: usize,
+    #[serde(default = "default_producer_marker_horizon")]
+    pub producer_marker_horizon: String,
     #[serde(default = "default_lifecycle_horizon")]
     pub lifecycle_horizon: String,
     #[serde(default = "default_lifecycle_max_bytes")]
@@ -329,6 +331,7 @@ impl Default for RetentionConfig {
             events_done_horizon: default_events_done_horizon(),
             events_rejected_horizon: default_events_rejected_horizon(),
             events_rejected_max_count: default_events_rejected_max_count(),
+            producer_marker_horizon: default_producer_marker_horizon(),
             lifecycle_horizon: default_lifecycle_horizon(),
             lifecycle_max_bytes: default_lifecycle_max_bytes(),
         }
@@ -454,6 +457,10 @@ fn default_events_rejected_horizon() -> String {
 
 const fn default_events_rejected_max_count() -> usize {
     crate::retention::DEFAULT_EVENTS_REJECTED_MAX_COUNT
+}
+
+fn default_producer_marker_horizon() -> String {
+    crate::retention::DEFAULT_PRODUCER_MARKER_MAX_AGE.to_owned()
 }
 
 fn default_lifecycle_horizon() -> String {

@@ -192,10 +192,16 @@ closes an item, whatever `postEvidence` is set to.
 Re-observing a trigger the ledger already holds — what every producer restart
 does to every historical trigger — is producer-internal bookkeeping and is
 never published, so `postReceipt` stays one switch rather than splitting by
-decision. Receipts and evidence comments are sticky: tally stores the node id
+decision. That refusal lives at the decision point, not in the sink: no
+acknowledgement is built for a duplicate at all, and a sink handed one reports
+an error rather than dropping it, so a future sink cannot re-introduce the
+public duplicate by forgetting to suppress it. Receipts and evidence comments
+are sticky: tally stores the node id
 of the comment it created under the producer state directory and edits that
 comment in place afterwards, falling back to the marker scan only for a thread
-whose comment predates the stored id or whose state was lost. That fallback
+whose comment predates the stored id or whose state was lost. A sticky edit is
+exactly one round trip; the item-state assertion rides the thread scan the
+create and adopt paths run anyway. That fallback
 publishes into the comment it finds rather than merely adopting it, and a
 publication the forge refuses fails the mutation instead of reporting success,
 so a receipt on the thread is never silently stale. Steering, escalation, and

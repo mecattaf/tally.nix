@@ -1473,17 +1473,22 @@ impl GhMutationSink for GhCliMutationSink {
             || format!("{remote_marker}\n{encoded}"),
             |assisted_by| format!("{remote_marker}\n{encoded}\n\n{}", assisted_by.trailer()),
         );
-        let (kind, state) = self.upsert_sticky_comment(
+        let observed = self.upsert_sticky_comment(
             &GhStickyKey::completion(&mutation.producer, &mutation.item_id, completion_id),
             &mutation.item_id,
             &remote_marker,
             &body,
         )?;
-        if !matches!(state.as_str(), "OPEN" | "CLOSED" | "MERGED") {
-            return Err(format!(
-                "GitHub {kind} {:?} has unsupported state {state:?}",
-                mutation.item_id
-            ));
+        // Asserted where publishing observed it. On the sticky-edit path there
+        // is nothing to assert against and nothing this assertion could have
+        // prevented: the edit landed before the state could be read.
+        if let Some((kind, state)) = observed {
+            if !matches!(state.as_str(), "OPEN" | "CLOSED" | "MERGED") {
+                return Err(format!(
+                    "GitHub {kind} {:?} has unsupported state {state:?}",
+                    mutation.item_id
+                ));
+            }
         }
         Ok(())
     }
@@ -1592,11 +1597,10 @@ impl GhAcknowledgementSink for GhCliAcknowledgementSink {
         let (decision, summary) = match acknowledgement.decision {
             GhDecisionStatus::Accepted => ("accepted", "Tally accepted this trigger."),
             GhDecisionStatus::Filtered => ("filtered", "Tally filtered this trigger by policy."),
-            // Re-observing a trigger that is already in the ledger is
-            // producer-internal bookkeeping, and §3 keeps that off the forge.
-            // Publishing it meant every producer restart added one public
-            // "already recorded" comment per historical trigger (#245).
-            GhDecisionStatus::Duplicate => return Ok(()),
+            // A duplicate never reaches a sink: §3 keeps producer-internal
+            // bookkeeping off the forge, and that is now decided where the
+            // disposition is, so a duplicate arriving here is a caller bug and
+            // says so instead of being silently dropped.
             _ => {
                 return Err(format!(
                     "refusing to acknowledge non-terminal trigger intake decision {:?}",
@@ -1617,7 +1621,7 @@ impl GhAcknowledgementSink for GhCliAcknowledgementSink {
         if let Some(pointer) = &acknowledgement.status_pointer {
             body.push_str(&format!("\nStatus: `{pointer}`"));
         }
-        let (_, state) = self.mutation.upsert_sticky_comment(
+        let observed = self.mutation.upsert_sticky_comment(
             &GhStickyKey::receipt(
                 &acknowledgement.producer,
                 &acknowledgement.item_id,
@@ -1627,11 +1631,13 @@ impl GhAcknowledgementSink for GhCliAcknowledgementSink {
             &marker_prefix,
             &body,
         )?;
-        if !matches!(state.as_str(), "OPEN" | "CLOSED" | "MERGED") {
-            return Err(format!(
-                "GitHub item {:?} has unsupported state {state:?}",
-                acknowledgement.item_id
-            ));
+        if let Some((_, state)) = observed {
+            if !matches!(state.as_str(), "OPEN" | "CLOSED" | "MERGED") {
+                return Err(format!(
+                    "GitHub item {:?} has unsupported state {state:?}",
+                    acknowledgement.item_id
+                ));
+            }
         }
         Ok(())
     }
@@ -1672,18 +1678,28 @@ impl GhCliMutationSink {
     /// success. Steering, escalation, and the closing summary deliberately do
     /// not come through here — they must stay fresh comments so the operator
     /// is actually notified.
+    /// Publish one logical comment, editing the remembered one where there is
+    /// one. Returns the item's `(kind, state)` only where publishing observed
+    /// them, which is the thread scan the create/adopt path has to run anyway.
+    ///
+    /// The sticky-edit fast path deliberately observes neither. §9.1.3 bought
+    /// this path to stop paginating a whole thread per post; spending a second
+    /// GraphQL round trip purely to re-read a state that gates nothing — the
+    /// edit has already happened by then — made the realistic case, a campaign
+    /// issue well under one page of comments, cost *two* calls where the old
+    /// scan cost one.
     fn upsert_sticky_comment(
         &self,
         key: &GhStickyKey,
         item_id: &str,
         marker: &str,
         body: &str,
-    ) -> Result<(String, String), String> {
+    ) -> Result<Option<(String, String)>, String> {
         let mut failed_edit = None;
         if let Some(store) = &self.sticky {
             if let Some(comment_id) = store.lookup(key) {
                 match self.edit_comment(&comment_id, body) {
-                    Ok(()) => return self.item_state(item_id),
+                    Ok(()) => return Ok(None),
                     // The remembered comment may simply be gone, which the
                     // marker scan below recovers from by creating a new one.
                     // Forget the id so the next attempt does not repeat a
@@ -1735,7 +1751,7 @@ impl GhCliMutationSink {
         if let (Some(store), Some(comment_id)) = (&self.sticky, comment_id) {
             store.record(key, &comment_id)?;
         }
-        Ok((scan.kind, scan.state))
+        Ok(Some((scan.kind, scan.state)))
     }
 
     /// Resolve one configured login to the node id `requestReviews` needs.

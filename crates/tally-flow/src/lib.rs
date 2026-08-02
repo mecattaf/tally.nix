@@ -6,6 +6,8 @@
 
 use std::time::Duration;
 
+#[cfg(test)]
+mod campaign_flow_tests;
 mod catalog;
 mod client;
 mod dialect;

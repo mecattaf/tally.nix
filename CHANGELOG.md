@@ -8,6 +8,114 @@ authorized.
 
 ### Fixed
 
+- Swept the campaign-wave residue (#332, #334, #337, #340), plus one finding
+  routed from the #318 evaluation.
+
+  **One drainer for the events directory (#332).** `tally-drain.timer` already
+  drained `${stateDir}/events` unconditionally on every tally home at a
+  five-second cadence, and the campaign layer's `campaign-continuation`
+  producer then rendered a second oneshot and timer at the same cadence over
+  the same directory. The drain RPC claims the whole directory whoever calls
+  it — the `producer` parameter only stamps the durable admission origin — so
+  the second timer bought no coverage, cost one systemd unit and one call per
+  interval on every host whether or not it ran campaigns, and made the
+  `origin.producer` recorded for a campaign's own self-continuation flip
+  between `null` and `campaign-continuation` depending on which timer won the
+  race. `producers.<name>.selfDrain` is a new events-dir option, false for
+  `campaign-continuation`: the registry entry stays as the declared contract
+  and `tally-drain` is the single drainer. `campaigns.<name>` now also refuses
+  the reserved name `continuation`, naming the campaign rather than the
+  internal producer it would have replaced, and the campaign layer declares
+  `${stateDir}/events` in the `spec-build-driver` adapter's
+  `extraWritablePaths`, so hardening that adapter cannot silently break a
+  campaign's self-continuation. The continue node's write reports through the
+  driver's bounded failure path instead of an unhandled `OSError`.
+
+  **The sub-issue capability probe answers only schema questions (#334).**
+  `tally campaign arm` degraded to the checkbox projection on *any* probe
+  failure, so one transport error, rate limit, or 502 could cost a campaign its
+  per-task steering threads, its merged-oracle walk, and its anomaly surface
+  for the rest of its life, with the projection label as the only evidence.
+  Only a GraphQL schema refusal (`UNDEFINED_FIELD` / `undefinedField` / a
+  field-not-found message) is a capability answer now; anything else fails the
+  arm and says why.
+
+  **The poll stops paying for a walk that finds nothing (#334).** Every tick
+  read the steering surfaces — a full bounded GraphQL traversal of every
+  sub-issue thread — before comparing anything. The scan now compares the
+  master and sub-issue `updated_at`/`state` values it already fetched over REST
+  and runs the walk only when one has moved, so an idle armed campaign costs
+  two REST reads per tick and the interval's documented cheapness is true.
+
+  **The Rust checkpoint-receipt reader matched neither namespace (#334).** The
+  driver publishes a receipt at `<family>/<baseRevision>`; the projection built
+  `<family>` and queried it as if it were the ref name, in both the hidden
+  `refs/tally/…` namespace and the legacy `refs/tags/…` one, so the compat
+  fallback was dead code and a completed checkpoint never ticked its box.
+  Projection now globs the family and accepts a receipt the base branch
+  contains. The two implementations are pinned together by shared vectors in
+  `test/fixtures/spec-build/checkpoint-refs.json`, asserted from
+  `campaign.rs` and from `spec_build_checkpoint_receipts_test.py`.
+
+  **A truncated task-thread comment window is reported (#334).** The walk asked
+  for `comments(last: 100)` with no `pageInfo`, so a long human discussion
+  silently dropped the oldest comments from the steering read. It now carries
+  `pageInfo` and warns; it does not fail the pass, because ordinary discussion
+  must not halt a campaign.
+
+  **An upgraded campaign keeps its ledger (#334).** Machine receipts recorded
+  on the master before a campaign had task threads were ignored once it had
+  them, which reset each task's diagnosis and retry counters mid-flight: a task
+  could take one more agent attempt than its budget allows and re-post a public
+  comment it had already made. The ledger now reads both surfaces and counts
+  one receipt per `(kind, task, attempt)`, preferring the task thread.
+
+  **A deferred checkpoint lane spends no budget (#337).** The #308 loop bound
+  relies on a `failureClass` arm that matched only stage `checkpoint`. A
+  checkpoint lane also fails at `prep` and at `checkpoint:record`, so a
+  checkpoint the reconciler had just declared to have no meaningful verdict yet
+  still bought a machinery retry and then a steering attempt out of its own
+  budget, and could reach escalation without ever having had a real attempt.
+  The whole deferred lane is unpriced now.
+
+  **A sweeper for the producer marker directories (#340).**
+  `producers/gh-triggers`, `gh-completed`, `gh-comments` and
+  `gh-storage-warnings` each wrote one file per dispatch and were collected by
+  nothing — no sweeper, no retention entry, no tmpfiles rule. `tally gc` now
+  collects all four under a new `retention.producerMarkerHorizon` /
+  `--producer-marker-horizon` (180 days by default, matching the ingress audit
+  envelope). A per-marker `.lock` goes only with its own marker and only when
+  unheld; the directory-wide `mutations.lock` is never collected.
+
+  **A sticky re-publication is one round trip again (#340).** The sticky path
+  edited the comment and then spent a second GraphQL query purely to re-read
+  the item state for an assertion that gated nothing — the edit had already
+  landed — so on a thread under one page of comments the "sticky" path cost
+  *two* calls where the scan it replaced cost one. The state assertion now
+  rides the thread scan the create and adopt paths run anyway.
+
+  **Duplicate-acknowledgement suppression moved to the decision point (#340).**
+  A duplicate trigger acknowledgement was built, dispatched, recorded in the
+  receipt as acknowledged, and then silently discarded by the one production
+  sink — so the receipt claimed a publication that never happened, and any
+  future sink re-introduced the #245 public duplicate by default. No
+  acknowledgement is built for a duplicate now, a sink handed one errors, and
+  the vestigial `duplicateAcknowledged` receipt field is retired (still
+  accepted on existing receipts, never written).
+
+  **Routed from the #318 evaluation:** `action_prep`'s already-prepared early
+  return sat before the fetch and before the worklist/worktree coherence check,
+  so a prep retry within one flow run that straddled a remote force-replacement
+  returned the stale lane and its stale `baseRev` with no error — the resume
+  door bypassed the fail-closed guard the fresh-cut door has. The check now
+  runs first, and an existing lane whose own base no longer descends from the
+  witnessed revision is refused rather than resumed.
+
+  Also added the repository's first executable coverage of `spec-build.js`
+  itself: a Boa-backed harness that evaluates the flow source exactly as the
+  engine does and calls its pure helpers, replacing the ripgrep string matches
+  that were all that guarded the per-task steering composition.
+
 - Repaired the two-repository campaign seam (#321): a split campaign could not
   pass a checkpoint, and every pull request it opened published a wrong
   cross-repository reference.

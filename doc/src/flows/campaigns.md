@@ -52,7 +52,12 @@ issue locators; an empty registry performs no work. A pass that advanced admits
 its own successor through the events directory, so the timer is the recovery
 path for a lost continuation event and the way an outside change to the issue
 graph is noticed, not the ordinary way a campaign reaches its next pass. It
-scans every `services.tally.campaignPoll.interval` (60s by default). A scan holds the registry lock exclusively across its forge
+scans every `services.tally.campaignPoll.interval` (60s by default). A scan that
+finds nothing moved costs two REST reads per armed campaign: it compares the
+master and sub-issue timestamps that fetch already returned before it decides
+whether to run the bounded GraphQL steering walk at all, so an idle campaign no
+longer pays for a full sub-issue traversal every tick. A scan holds the registry
+lock exclusively across its forge
 round-trips, which blocks an interactive `tally campaign arm`, `disarm`, or
 `list` for its duration; `services.tally.campaignPoll.timeout` caps that hold.
 The GitHub CLI identity used
@@ -163,9 +168,13 @@ the old PR as proof.
 `arm` probes once, before it registers anything, whether this forge can serve
 the walk the native read path needs: parent → `subIssues` →
 `closedByPullRequestsReferences` → `pullRequest.merged`, in one bounded
-GraphQL query per pass, paginated within the 100-task cap. A forge that refuses
-the query is a capability answer, not a campaign failure — the campaign arms in
-degraded mode and every projection above falls back to checkboxes. Every `arm`
+GraphQL query per pass, paginated within the 100-task cap. A forge whose schema
+has no such field is a capability answer, not a campaign failure — the campaign
+arms in degraded mode and every projection above falls back to checkboxes. Only
+a schema refusal counts: a transport error, a rate limit, or a 502 says nothing
+about the forge and fails the arm loudly instead, because degrading on one bad
+minute would silently cost the campaign its per-task steering threads, its
+merged-oracle walk, and its anomaly surface for the rest of its life. Every `arm`
 path reports which mode it recorded, as `subIssueWalk` and `projection`
 (`native-sub-issues` or `degraded-checkboxes`) alongside its ordinary output;
 `tally campaign list` shows the same field for an already-armed campaign. Read
@@ -212,9 +221,17 @@ history and no other task's. A comment by an allowed actor on `T`'s sub-issue
 reaches `T`'s agent as `steering.authorizedComments` and advances the
 observation revision exactly like a master comment does. The master issue stays
 the campaign-wide channel: campaign-level human steering reaches every task, and
-escalation and the closing summary are always posted there. A receipt left on
-the master by a pre-#307 pass is reported and ignored rather than double
-counted; receipt parsing follows the posting surface.
+escalation and the closing summary are always posted there.
+
+New receipts always go to the task's own thread, but the ledger reads both
+surfaces and counts one receipt per `(kind, task, attempt)`. A campaign armed
+before the walk capability existed — or re-armed into it mid-flight — has its
+earlier receipts on the master, and discarding them reset every task's
+diagnosis and retry counters, which bought one extra agent attempt and
+re-posted a public comment that had already been made. The thread copy wins
+where both surfaces carry the same attempt, since that is where the current
+receipt lives; the duplicate is reported as a warning rather than counted
+twice.
 
 `arm` authenticates the current `gh` login, defaults the local allowlist to that
 login, and requires the master and every task issue to have an allowed author.
@@ -472,10 +489,29 @@ One enabled attrset expands to all of the following:
 | `spec-build-driver` | The packaged deterministic policy driver used for reconcile, prep, ownership checks, built-in constraints, checkpoint recording, diff capture, steering, machinery retries, escalation, continuation, publish, rebase, and merge projections. |
 
 One further mechanism is installed once for the whole host rather than per
-campaign: `producers.campaign-continuation`, an `events-dir` producer that
-drains the machine self-continuation every campaign class writes after a pass
-merges work, passes a checkpoint, or publishes machine steering. It is not
-per-campaign state, so arming still requires no Nix change.
+campaign: `producers.campaign-continuation`, an `events-dir` registry entry
+declaring the contract that the machine self-continuation every campaign class
+writes — after a pass merges work, passes a checkpoint, or publishes machine
+steering — is an events-directory enqueue payload. It is not per-campaign
+state, so arming still requires no Nix change.
+
+That entry renders no unit of its own: it carries `selfDrain = false`, and the
+shipped `tally-drain.timer` is the single drainer. Every tally home already ran
+that timer unconditionally over the same directory at the same five-second
+cadence, and the drain RPC claims the whole directory whoever calls it — the
+`producer` parameter only stamps the durable admission origin. A second timer
+therefore bought no coverage: it added one systemd unit and one call per
+interval on every host whether or not it runs campaigns, and made the
+`origin.producer` recorded for a campaign's own self-continuation depend on
+which of the two timers won the race. `campaigns.<name>` refuses the reserved
+name `continuation` for the same reason: `campaigns.continuation` would render
+`producers.campaign-continuation` as a `gh` producer and replace the entry.
+
+The name is also why the campaign layer declares `${stateDir}/events` in the
+`spec-build-driver` adapter's `extraWritablePaths`. The continue node writes
+that file directly, which is a hard write dependency the compatibility default
+(no hardening preset) leaves unconstrained but `strict` or `production` would
+otherwise refuse.
 
 The producer posts its receipt and witnessed evidence. Under the degraded
 projection, each merge and passed checkpoint repairs its own worklist checkbox

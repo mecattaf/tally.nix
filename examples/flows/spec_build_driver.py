@@ -1747,6 +1747,8 @@ def forge_campaign_state(
     escalations: list[str] = []
     warnings: list[str] = []
     threaded = set(threads or {})
+    # One ledger entry per (kind, task, attempt) whichever surface carries it.
+    counted: set[tuple[str, str, int]] = set()
 
     def accept(kind: str, task_id: str) -> bool:
         # A worklist edit that renames or drops a task leaves receipts naming a
@@ -1768,9 +1770,15 @@ def forge_campaign_state(
         """Parse machine receipts from one posting surface.
 
         `surface` is the task whose sub-issue thread these comments came from,
-        or None for the campaign master. Receipt parsing follows the posting
-        surface: once a task owns a thread, a master receipt naming it is a
-        pre-#307 leftover, reported and ignored rather than double-counted.
+        or None for the campaign master. New receipts are always posted to the
+        task's own thread where the campaign has one, but the ledger reads both
+        surfaces: a campaign armed before the walk capability existed -- or
+        re-armed into it mid-flight -- has its earlier receipts on the master,
+        and discarding them reset every task's diagnosis and retry counters, so
+        a task got one attempt more than its budget allows and re-posted a
+        public comment it had already made. A receipt is counted once per
+        (kind, task, attempt); the master copy wins because it is the one that
+        was published first, and the duplicate is dropped rather than counted.
         """
         expected_escalation = escalation_marker(campaign, issue_number)
         for comment in comments:
@@ -1786,12 +1794,6 @@ def forge_campaign_state(
                 marker_campaign, marker_issue, task_id, attempt_text = groups
                 if marker_campaign != campaign or marker_issue != issue_number:
                     continue
-                if surface is None and task_id in threaded:
-                    warnings.append(
-                        f"ignored a master-thread machine {kind} for {task_id!r}: "
-                        "task receipts live on the task sub-issue thread"
-                    )
-                    continue
                 if surface is not None and task_id != surface:
                     warnings.append(
                         f"ignored a machine {kind} for {task_id!r} found on the "
@@ -1801,6 +1803,25 @@ def forge_campaign_state(
                 if not accept(kind, task_id):
                     continue
                 attempt = int(attempt_text)
+                where = (
+                    "master thread"
+                    if surface is None
+                    else f"sub-issue thread of {surface!r}"
+                )
+                if (kind, task_id, attempt) in counted:
+                    warnings.append(
+                        f"ignored a duplicate machine {kind} for {task_id!r} attempt "
+                        f"{attempt} on the {where}: the ledger counts one receipt "
+                        "per attempt"
+                    )
+                    continue
+                counted.add((kind, task_id, attempt))
+                if surface is None and task_id in threaded:
+                    warnings.append(
+                        f"counted a master-thread machine {kind} for {task_id!r} "
+                        f"attempt {attempt}, recorded before that task owned a "
+                        "sub-issue thread"
+                    )
                 heading = (
                     diagnosis_heading(task_id, attempt)
                     if kind == "diagnosis"
@@ -1831,9 +1852,12 @@ def forge_campaign_state(
                 )
 
     if config["forge"] == "github":
-        ingest(github_machine_comments(repository, issue_number), surface=None)
+        # Task threads first: where a task owns one, that is where its current
+        # receipts are posted, so the thread copy is the one a fact should
+        # point at and a master copy of the same attempt is the older duplicate.
         for task_id in sorted(threaded):
             ingest(threads[task_id], surface=task_id)
+        ingest(github_machine_comments(repository, issue_number), surface=None)
     else:
         prefix = local_state_prefix(campaign, issue_number)
         refs = local_remote_refs(config, f"{prefix}/*")
@@ -2067,6 +2091,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
             }
           }
           comments(last: 100) {
+            pageInfo { hasPreviousPage }
             nodes { url body author { login } }
           }
         }
@@ -2085,9 +2110,18 @@ MAX_SUBISSUE_WALK_PAGES = 2
 # reading past that would let the walk narrow what counts as proof, which is
 # the one thing it must never do, so a full page fails the pass instead.
 MAX_SUBISSUE_PULL_REQUESTS = 20
+# `last:` returns the newest comments, so a truncated window drops the oldest.
+# Unlike the reference page this is not a proof surface — it is the steering
+# read — and a task thread long enough to exhaust it is ordinary human
+# discussion, which must not halt a campaign. The truncation is therefore
+# reported rather than refused, so an operator whose steering comment scrolled
+# out of the window can see why it never reached the agent.
+MAX_SUBISSUE_COMMENTS = 100
 
 
-def subissue_walk(repository: str, issue_number: str) -> dict[int, dict[str, Any]]:
+def subissue_walk(
+    repository: str, issue_number: str
+) -> tuple[dict[int, dict[str, Any]], list[str]]:
     """Read every sub-issue of the campaign parent in one bounded query.
 
     This narrows *where* completion candidates come from — a pull request has
@@ -2098,6 +2132,7 @@ def subissue_walk(repository: str, issue_number: str) -> dict[int, dict[str, Any
     owner, _, name = repository.partition("/")
     actor = github_actor()
     nodes: dict[int, dict[str, Any]] = {}
+    warnings: list[str] = []
     cursor: str | None = None
     for _ in range(MAX_SUBISSUE_WALK_PAGES):
         arguments = [
@@ -2162,6 +2197,16 @@ def subissue_walk(repository: str, issue_number: str) -> dict[int, dict[str, Any
             comment_nodes = comments.get("nodes") if isinstance(comments, dict) else None
             if not isinstance(comment_nodes, list):
                 fail(f"campaign sub-issue #{number} returned malformed comments")
+            comment_page = comments.get("pageInfo") if isinstance(comments, dict) else None
+            if not isinstance(comment_page, dict):
+                fail(f"campaign sub-issue #{number} returned no comment page information")
+            if comment_page.get("hasPreviousPage") is True:
+                warnings.append(
+                    f"campaign sub-issue #{number} carries more than "
+                    f"{MAX_SUBISSUE_COMMENTS} comments; the steering read sees only the "
+                    f"newest {MAX_SUBISSUE_COMMENTS} and older comments on that thread "
+                    "cannot reach this task"
+                )
             machine: list[dict[str, Any]] = []
             for comment in comment_nodes:
                 if not isinstance(comment, dict):
@@ -2186,7 +2231,7 @@ def subissue_walk(repository: str, issue_number: str) -> dict[int, dict[str, Any
         if not isinstance(page_info, dict):
             fail("campaign sub-issue walk returned no page information")
         if page_info.get("hasNextPage") is not True:
-            return nodes
+            return nodes, warnings
         cursor = required_string(page_info.get("endCursor"), "sub-issue walk cursor")
     fail(
         "campaign parent carries more sub-issues than the 100-task cap admits; "
@@ -3169,11 +3214,13 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     # One bounded walk per pass feeds both halves of the forge read: which
     # pull requests may be considered, and which machine receipts each task
     # thread carries.
-    walk = (
+    walked = (
         subissue_walk(issue_target["repository"], issue["number"])
         if forge_native and config["forge"] == "github" and capabilities["subIssueWalk"]
         else None
     )
+    walk = None if walked is None else walked[0]
+    walk_warnings = [] if walked is None else walked[1]
     if config["forge"] == "github":
         merged, warnings = merged_github_tasks(
             code["repository"],
@@ -3234,6 +3281,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         task_ids,
         threads,
     )
+    warnings.extend(walk_warnings)
     warnings.extend(state_warnings)
     order = {task["id"]: index for index, task in enumerate(worklist["tasks"])}
     diagnoses.sort(key=lambda item: (order[item["taskId"]], item["attempt"]))
@@ -3879,21 +3927,30 @@ def write_continuation_event(
     rendered = (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
     if len(rendered) > MAX_CONTINUATION_EVENT_BYTES:
         fail("continuation payload exceeds the bounded event size")
-    events_dir.mkdir(parents=True, exist_ok=True)
+    # This directory is the campaign's whole continuation mechanism and it is
+    # the one write in this node that a sandbox, a full filesystem or a wrong
+    # owner can refuse. An OSError escaping here would leave a Python traceback
+    # on the node's stderr instead of the driver's bounded, redacted failure
+    # line, so every step of the write reports through fail().
     temporary = events_dir / f".{name}.{uuid.uuid4()}.tmp"
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(rendered)
-            handle.flush()
-            os.fsync(handle.fileno())
+        events_dir.mkdir(parents=True, exist_ok=True)
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
-            os.link(temporary, path)
-            created = True
-        except FileExistsError:
-            created = False
-    finally:
-        os.unlink(temporary)
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(rendered)
+                handle.flush()
+                os.fsync(handle.fileno())
+            try:
+                os.link(temporary, path)
+                created = True
+            except FileExistsError:
+                created = False
+        finally:
+            os.unlink(temporary)
+    except OSError as error:
+        fail(f"cannot write the continuation event {path}: {error.strerror or error}")
+        raise AssertionError("unreachable")
     return created, path
 
 
@@ -4739,18 +4796,12 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
         publish_branch,
     )
 
-    resumed = worktree_call(
-        worktrees.resume, checkout, worktree, expected, required=("baserev",)
-    )
-    if resumed is not None and resumed["complete"]:
-        return {
-            "taskId": identity["taskId"],
-            "baseRev": required_string(resumed["identity"].get("baserev"), "lane baseRev"),
-            "branch": branch,
-            "publishBranch": publish_branch,
-            "worktreePath": str(worktree),
-        }
-
+    # The fetch and the coherence check come before the resume door, not after
+    # it. A prep node that re-runs inside one flow run takes the resume path,
+    # and returning an already-prepared lane before this check let exactly the
+    # history the fresh-cut door refuses come back through the other one: after
+    # a remote force-replacement the retry handed back the stale lane and its
+    # stale baseRev with no error at all.
     git(checkout, "fetch", "--prune", remote)
     base_ref = f"{remote}/{base_branch}"
     base_tip = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
@@ -4769,6 +4820,32 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
         check=False,
     ).returncode:
         fail("prepared lane base does not descend from the witnessed worklist revision")
+
+    resumed = worktree_call(
+        worktrees.resume, checkout, worktree, expected, required=("baserev",)
+    )
+    if resumed is not None and resumed["complete"]:
+        resumed_base = required_string(resumed["identity"].get("baserev"), "lane baseRev")
+        # The lane already exists, so nothing above narrowed where *it* forks
+        # from. An existing lane whose own base no longer descends from the
+        # witnessed revision is refused rather than resumed: it was cut from a
+        # history this pass is not reasoning about.
+        if git(
+            checkout,
+            "merge-base",
+            "--is-ancestor",
+            identity["sourceRevision"],
+            resumed_base,
+            check=False,
+        ).returncode:
+            fail("resumed lane base does not descend from the witnessed worklist revision")
+        return {
+            "taskId": identity["taskId"],
+            "baseRev": resumed_base,
+            "branch": branch,
+            "publishBranch": publish_branch,
+            "worktreePath": str(worktree),
+        }
     if resumed is not None:
         # A lane git registered whose identity is short a field: a lane cut by
         # a tally from before identity moved into git, or a runner killed

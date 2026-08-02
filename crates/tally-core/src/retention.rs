@@ -34,6 +34,29 @@ pub const DEFAULT_CAPTURE_ARCHIVE_MAX_AGE: &str = "30d";
 pub const DEFAULT_EVENTS_DONE_MAX_AGE: &str = "180d";
 pub const DEFAULT_EVENTS_REJECTED_MAX_AGE: &str = "30d";
 pub const DEFAULT_EVENTS_REJECTED_MAX_COUNT: usize = 10_000;
+/// Producer marker files are per-dispatch idempotency state, so they outlive
+/// the item they refer to by design and are only collectable long after the
+/// thread they guard has gone quiet. The default deliberately matches the
+/// `events/done` audit envelope rather than the shorter archive one.
+pub const DEFAULT_PRODUCER_MARKER_MAX_AGE: &str = "180d";
+
+/// The `producers/<set>` directories one sweep collects.
+///
+/// Every one of them is written once per dispatch and read back to make a
+/// forge mutation idempotent, and until now not one of them had a sweeper, a
+/// retention entry, or a tmpfiles rule. They are collected as one class rather
+/// than one at a time, because "anything written per dispatch with no GC" is
+/// the growth surface this tree keeps reproducing.
+const PRODUCER_MARKER_DIRECTORIES: [&str; 4] = [
+    "gh-triggers",
+    "gh-completed",
+    "gh-comments",
+    "gh-storage-warnings",
+];
+const PRODUCER_MARKER_DIRECTORY: &str = "producers";
+/// The mutual-exclusion file a marker directory keeps for its own writers. It
+/// belongs to the directory, not to any one marker, and is never collected.
+const PRODUCER_MUTATION_LOCK: &str = "mutations.lock";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateRetentionPolicy {
@@ -41,6 +64,7 @@ pub struct StateRetentionPolicy {
     pub events_done_max_age: Duration,
     pub events_rejected_max_age: Duration,
     pub events_rejected_max_count: usize,
+    pub producer_marker_max_age: Duration,
 }
 
 impl StateRetentionPolicy {
@@ -49,12 +73,14 @@ impl StateRetentionPolicy {
         events_done_max_age: &str,
         events_rejected_max_age: &str,
         events_rejected_max_count: usize,
+        producer_marker_max_age: &str,
     ) -> Result<Self, RetentionError> {
         Ok(Self {
             capture_archive_max_age: parse_horizon(capture_archive_max_age)?,
             events_done_max_age: parse_horizon(events_done_max_age)?,
             events_rejected_max_age: parse_horizon(events_rejected_max_age)?,
             events_rejected_max_count,
+            producer_marker_max_age: parse_horizon(producer_marker_max_age)?,
         })
     }
 }
@@ -66,6 +92,7 @@ impl Default for StateRetentionPolicy {
             DEFAULT_EVENTS_DONE_MAX_AGE,
             DEFAULT_EVENTS_REJECTED_MAX_AGE,
             DEFAULT_EVENTS_REJECTED_MAX_COUNT,
+            DEFAULT_PRODUCER_MARKER_MAX_AGE,
         )
         .expect("ratified default retention horizons are valid systemd timespans")
     }
@@ -164,6 +191,8 @@ pub struct GcReport {
     pub events_done_pruned: usize,
     pub events_rejected_examined: usize,
     pub events_rejected_pruned: usize,
+    pub producer_markers_examined: usize,
+    pub producer_markers_pruned: usize,
     pub collected: bool,
 }
 
@@ -517,6 +546,8 @@ pub fn run_gc(
         events_done_pruned: state.events_done_pruned,
         events_rejected_examined: state.events_rejected_examined,
         events_rejected_pruned: state.events_rejected_pruned,
+        producer_markers_examined: state.producer_markers_examined,
+        producer_markers_pruned: state.producer_markers_pruned,
         collected,
     })
 }
@@ -709,6 +740,8 @@ struct StateSweep {
     events_done_pruned: usize,
     events_rejected_examined: usize,
     events_rejected_pruned: usize,
+    producer_markers_examined: usize,
+    producer_markers_pruned: usize,
 }
 
 /// Prunes the unbounded on-disk sets under the daemon state directory.
@@ -736,6 +769,12 @@ fn sweep_state_directory(
     prune_capture_archives(&archive_root, capture_cutoff, dry_run, &mut sweep)?;
     for locks in [CAPTURE_LOCK_DIRECTORY, LEGACY_CAPTURE_LOCK_DIRECTORY] {
         prune_capture_locks(&state_dir.join(locks), capture_cutoff, dry_run, &mut sweep)?;
+    }
+
+    let marker_cutoff = mtime_cutoff(now, policy.producer_marker_max_age)?;
+    let markers_root = state_dir.join(PRODUCER_MARKER_DIRECTORY);
+    for set in PRODUCER_MARKER_DIRECTORIES {
+        prune_producer_markers(&markers_root.join(set), marker_cutoff, dry_run, &mut sweep)?;
     }
 
     let events_dir = state_dir.join(EVENTS_DIRECTORY);
@@ -929,6 +968,133 @@ fn prune_capture_locks(
         }
     }
     Ok(())
+}
+
+/// Collects expired per-dispatch marker files from one `producers/<set>`
+/// directory.
+///
+/// Each of these directories holds one `<stable-key>.json` per (producer, item,
+/// receipt-or-completion id), written once and never removed. A collected
+/// marker costs at most a re-publication that the marker scan on the thread
+/// already makes idempotent, which is why they are collectable at all — but
+/// only long after the item they guard has gone quiet, so the envelope is the
+/// long audit horizon rather than the short archive one.
+///
+/// Two things in these directories are not markers and are never collected:
+/// the directory-wide `mutations.lock`, and a `<stable-key>.lock` whose own
+/// marker is still present. A per-marker lock is collected together with the
+/// marker it guards, so the lock population drains with the markers instead of
+/// becoming the next unbounded set.
+fn prune_producer_markers(
+    directory: &Path,
+    cutoff: SystemTime,
+    dry_run: bool,
+    sweep: &mut StateSweep,
+) -> Result<(), RetentionError> {
+    if !directory.is_dir() {
+        return Ok(());
+    }
+    let mut entries = std::fs::read_dir(directory)
+        .map_err(|source| io_error(directory, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| io_error(directory, source))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    let mut markers = BTreeSet::new();
+    let mut locks = BTreeSet::new();
+    let mut expired = BTreeSet::new();
+    for entry in &entries {
+        let path = entry.path();
+        let Some(file_name) = entry.file_name().to_str().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if file_name == PRODUCER_MUTATION_LOCK {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error(&path, source)),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        if let Some(stem) = file_name.strip_suffix(".lock") {
+            locks.insert(stem.to_owned());
+            continue;
+        }
+        let Some(stem) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+        markers.insert(stem.to_owned());
+        sweep.producer_markers_examined += 1;
+        let modified = metadata
+            .modified()
+            .map_err(|source| io_error(&path, source))?;
+        if modified < cutoff {
+            expired.insert(stem.to_owned());
+        }
+    }
+    // A per-marker lock goes with its marker. `flock` never moves an mtime, so
+    // a lock's own timestamp says nothing; the marker is the signal. An orphan
+    // lock — no marker at all — is left over from an interrupted write or an
+    // earlier sweep and goes too, or it becomes the next unbounded set.
+    let collectable_locks = locks
+        .iter()
+        .filter(|stem| expired.contains(*stem) || !markers.contains(*stem))
+        .cloned()
+        .collect::<Vec<_>>();
+    for stem in collectable_locks {
+        let path = directory.join(format!("{stem}.lock"));
+        if !try_claim_exclusively(&path)? {
+            // A live writer holds it. Its marker keeps its lock this round.
+            expired.remove(&stem);
+            continue;
+        }
+        if dry_run {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&path, source)),
+        }
+    }
+    for stem in expired {
+        sweep.producer_markers_pruned += 1;
+        if dry_run {
+            continue;
+        }
+        let path = directory.join(format!("{stem}.json"));
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&path, source)),
+        }
+    }
+    Ok(())
+}
+
+/// Can this sweep take the file's own lock right now?
+///
+/// `false` means a live writer holds it, which is the only signal that matters:
+/// an idle lock file's mtime is whatever it was when it was created.
+fn try_claim_exclusively(path: &Path) -> Result<bool, RetentionError> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    {
+        Ok(file) => file,
+        // Already gone: there is nothing for anyone to be holding.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(source) => return Err(io_error(path, source)),
+    };
+    match FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(false),
+        Err(source) => Err(io_error(path, source)),
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -1666,6 +1832,10 @@ mod tests {
             Duration::from_secs(30 * 86_400)
         );
         assert_eq!(policy.events_rejected_max_count, 10_000);
+        assert_eq!(
+            policy.producer_marker_max_age,
+            Duration::from_secs(180 * 86_400)
+        );
     }
 
     #[test]
@@ -1851,6 +2021,96 @@ mod tests {
         // it is neither unlinked nor allowed to drag its directory away.
         assert!(fs::symlink_metadata(&dangling).is_ok());
         assert!(guarded_unit.exists());
+    }
+
+    /// Every `producers/*` marker directory was written once per dispatch and
+    /// collected by nothing: no sweeper, no retention entry, no tmpfiles rule.
+    /// One sweep covers all four, keeps the directory-wide mutation lock, and
+    /// takes a per-marker lock away only together with the marker it guards.
+    #[test]
+    fn expired_producer_markers_are_collected_across_all_four_directories() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&data).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
+        ledger_only_state(&data, now);
+
+        let markers = state.join("producers");
+        for set in [
+            "gh-triggers",
+            "gh-completed",
+            "gh-comments",
+            "gh-storage-warnings",
+        ] {
+            write_aged(
+                &markers.join(set).join("expired.json"),
+                chrono::TimeDelta::days(200),
+                now,
+            );
+            write_aged(
+                &markers.join(set).join("fresh.json"),
+                chrono::TimeDelta::days(2),
+                now,
+            );
+            // The directory-wide mutation lock belongs to the directory, not to
+            // any marker, and is old by construction on any real host.
+            write_aged(
+                &markers.join(set).join(PRODUCER_MUTATION_LOCK),
+                chrono::TimeDelta::days(200),
+                now,
+            );
+        }
+        // gh-triggers keeps one lock per receipt. `flock` never moves an mtime,
+        // so both look ancient; only the one whose marker expired may go.
+        let triggers = markers.join("gh-triggers");
+        write_aged(
+            &triggers.join("expired.lock"),
+            chrono::TimeDelta::days(200),
+            now,
+        );
+        write_aged(
+            &triggers.join("fresh.lock"),
+            chrono::TimeDelta::days(200),
+            now,
+        );
+        write_aged(
+            &triggers.join("orphan.lock"),
+            chrono::TimeDelta::days(200),
+            now,
+        );
+
+        let request = |dry_run: bool| GcRequest {
+            data_dir: &data,
+            state_dir: Some(&state),
+            horizon_text: "30d",
+            state_retention: StateRetentionPolicy::default(),
+            now,
+            dry_run,
+            collect: false,
+        };
+
+        let dry = run_gc(request(true), &FakeBackend::default()).unwrap();
+        assert_eq!(dry.producer_markers_examined, 8);
+        assert_eq!(dry.producer_markers_pruned, 4);
+        assert!(triggers.join("expired.json").exists());
+
+        let report = run_gc(request(false), &FakeBackend::default()).unwrap();
+        assert_eq!(report.producer_markers_examined, 8);
+        assert_eq!(report.producer_markers_pruned, 4);
+        for set in [
+            "gh-triggers",
+            "gh-completed",
+            "gh-comments",
+            "gh-storage-warnings",
+        ] {
+            assert!(!markers.join(set).join("expired.json").exists());
+            assert!(markers.join(set).join("fresh.json").exists());
+            assert!(markers.join(set).join(PRODUCER_MUTATION_LOCK).exists());
+        }
+        assert!(!triggers.join("expired.lock").exists());
+        assert!(!triggers.join("orphan.lock").exists());
+        assert!(triggers.join("fresh.lock").exists());
     }
 
     fn append_record_template() -> WitnessRecord {

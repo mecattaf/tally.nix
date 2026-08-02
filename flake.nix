@@ -1896,6 +1896,38 @@
             }
           ];
         };
+        reservedCampaignNameSchema = pkgs.lib.evalModules {
+          modules = [
+            {
+              options.services.tally = moduleCommon.mkOptions {
+                defaultPackage = tally;
+                defaultDataDir = "/tmp/tally-data";
+                defaultStateDir = "/tmp/tally-state";
+              };
+              # `campaigns.continuation` renders `producers.campaign-continuation`,
+              # which is the name the campaign layer seeds the generic events-dir
+              # drain under. The fold adds campaign producers on top of that seed,
+              # so the campaign would replace the drain with a gh producer.
+              config.services.tally.campaigns.continuation = {
+                enable = true;
+                repositories."acme/spec".checkout = "/tmp/spec";
+                gates = [
+                  {
+                    kind = "command";
+                    id = "content";
+                    preflightArgv = [ "/bin/true" ];
+                    argv = [ "/bin/true" ];
+                  }
+                ];
+              };
+            }
+          ];
+        };
+        reservedCampaignNameMessages = map (entry: entry.message) (
+          builtins.filter (entry: !entry.assertion) (
+            moduleCommon.mkAssertions reservedCampaignNameSchema.config.services.tally
+          )
+        );
         nonCommittingCampaignMessages = map (entry: entry.message) (
           builtins.filter (entry: !entry.assertion) (
             moduleCommon.mkAssertions nonCommittingCampaignSchema.config.services.tally
@@ -3292,6 +3324,7 @@
               eventsDoneHorizon = "180d";
               eventsRejectedHorizon = "30d";
               eventsRejectedMaxCount = 10000;
+              producerMarkerHorizon = "180d";
               lifecycleHorizon = "30d";
               lifecycleMaxBytes = 268435456;
             };
@@ -3324,7 +3357,7 @@
           assert homeTimers.tally-retention.Timer.OnCalendar == "daily";
           assert pkgs.lib.hasInfix "gc --horizon 30d --collect" (homeServiceExec "tally-retention");
           assert pkgs.lib.hasInfix
-            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000"
+            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000 --producer-marker-horizon 180d"
             (homeServiceExec "tally-retention");
           # Forge-native campaigns post no continuation comment, so this timer
           # is the only thing that carries a campaign past its first pass.
@@ -3356,6 +3389,27 @@
           assert campaignHome.config.services.tally.producers.campaign-fixture.closeOnAcceptance == false;
           assert campaignHome.config.services.tally.producers.campaign-fixture.closeOnPass == false;
           assert campaignHome.config.services.tally.producers.campaign-fixture.neverMutate == false;
+          # One drainer, not two. tally-drain.timer already claimed the whole
+          # events directory at this cadence on every tally home, and the drain
+          # RPC drains the directory whoever calls it, so the campaign
+          # continuation producer stays a registry entry and renders no unit:
+          # two timers at the same cadence raced for the right to stamp the
+          # durable admission origin of every event dropped in that directory.
+          assert homeTimers.tally-drain.Timer.OnUnitActiveSec == "5s";
+          assert campaignHomeTimers.tally-drain.Timer.OnUnitActiveSec == "5s";
+          assert campaignHome.config.services.tally.producers.campaign-continuation.selfDrain == false;
+          assert !(campaignHomeTimers ? tally-producer-campaign-continuation);
+          assert !(campaignHomeServices ? tally-producer-campaign-continuation);
+          # An ordinary events-dir producer keeps its own unit pair.
+          assert homeTimers ? tally-producer-drop;
+          assert homeServices ? tally-producer-drop;
+          # The continue node's write into that directory is a declared write
+          # dependency of the driver adapter, so hardening the adapter cannot
+          # silently break a campaign's self-continuation.
+          assert
+            campaignHome.config.services.tally.adapters.spec-build-driver.extraWritablePaths == [
+              "/tmp/tally-campaign-home/.local/state/tally/events"
+            ];
           assert systemServices ? tally-drain;
           assert systemTimers ? tally-drain;
           assert systemTimers.tally-drain.timerConfig.OnActiveSec == "1s";
@@ -3371,7 +3425,7 @@
             "gc --horizon 30d --collect --data-dir /var/lib/tally/data --state-dir /var/lib/tally/state"
             (systemServiceExec "tally-retention");
           assert pkgs.lib.hasInfix
-            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000"
+            "--capture-archive-horizon 30d --events-done-horizon 180d --events-rejected-horizon 30d --events-rejected-max-count 10000 --producer-marker-horizon 180d"
             (systemServiceExec "tally-retention");
           assert
             systemServices.tally-retention.serviceConfig.ReadWritePaths == [
@@ -3509,7 +3563,7 @@
               .enqueue.depthCap == 3 and
               .enqueue.fanoutCap == 64 and
               .lease.yieldGraceSec == 20 and
-              .retention == {"enable":true,"horizon":"30d","onCalendar":"daily","captureArchiveHorizon":"30d","eventsDoneHorizon":"180d","eventsRejectedHorizon":"30d","eventsRejectedMaxCount":10000,"lifecycleHorizon":"30d","lifecycleMaxBytes":268435456} and
+              .retention == {"enable":true,"horizon":"30d","onCalendar":"daily","captureArchiveHorizon":"30d","eventsDoneHorizon":"180d","eventsRejectedHorizon":"30d","eventsRejectedMaxCount":10000,"producerMarkerHorizon":"180d","lifecycleHorizon":"30d","lifecycleMaxBytes":268435456} and
               .storage == {"pollIntervalSec":60,"dataDir":{"warningBytes":34359738368,"hardBytes":68719476736,"warningFreeBytes":17179869184,"minimumFreeBytes":8589934592},"stateDir":{"warningBytes":34359738368,"hardBytes":68719476736,"warningFreeBytes":17179869184,"minimumFreeBytes":8589934592}} and
               .attestations == {"exec":{"enable":true}} and
               .gitAi == {"enable":false,"mode":"advisory","awaitTimeoutSec":60,"globalAwaitOk":false} and
@@ -4371,6 +4425,7 @@
                   pkgs.python3
                 ];
                 SPEC_BUILD_DRIVER = "${campaignDrivers}/spec_build_driver.py";
+                SPEC_BUILD_CHECKPOINT_REF_VECTORS = "${./test/fixtures/spec-build/checkpoint-refs.json}";
               }
               ''
                 ${pkgs.python3}/bin/python3 ${./test/spec_build_checkpoint_receipts_test.py}
@@ -4551,6 +4606,22 @@
             ) invalidCampaignMessages;
             assert !invalidCampaignAttempt.success;
             pkgs.runCommand "tally-campaign-gates-rejected" { } ''
+              touch "$out"
+            '';
+          campaign-reserved-name-rejected =
+            # The Home Manager assertion that used to be the only thing
+            # catching this named an internal producer and never the campaign
+            # that collided with it, and it fails closed only for as long as it
+            # exists: the fold *seeds* the generic drain rather than overlaying
+            # it, so relaxing that assertion would make the collision silent.
+            assert builtins.any (
+              message: nixpkgs.lib.hasInfix "tally campaign name continuation is reserved" message
+            ) reservedCampaignNameMessages;
+            # An ordinary campaign name is not caught by it.
+            assert builtins.all (
+              message: !nixpkgs.lib.hasInfix "is reserved" message
+            ) campaignAssertionMessages;
+            pkgs.runCommand "tally-campaign-reserved-name-rejected" { } ''
               touch "$out"
             '';
           campaign-noncommitting-sandbox-rejected =
