@@ -122,6 +122,40 @@ export const meta = {
           additionalProperties: false
         }
       },
+      // Human steering collected from each task's own sub-issue thread, keyed
+      // by sub-issue number. The master stays the campaign-wide channel and
+      // still reaches every task; a task thread reaches exactly one.
+      taskSteering: {
+        type: "object",
+        maxProperties: 100,
+        additionalProperties: {
+          type: "array",
+          maxItems: 1000,
+          items: {
+            type: "object",
+            required: ["id", "url", "author", "body", "createdAt", "updatedAt"],
+            properties: {
+              id: { type: "integer", minimum: 1 },
+              url: { type: "string", minLength: 1 },
+              author: { type: "string", minLength: 1, maxLength: 39 },
+              body: { type: "string", maxLength: 64000 },
+              createdAt: { type: "string", minLength: 1 },
+              updatedAt: { type: "string", minLength: 1 }
+            },
+            additionalProperties: false
+          }
+        }
+      },
+      // What the arm-time probe found this forge can serve. Absent means
+      // degraded: checkbox projection, per-branch pull-request lookup.
+      capabilities: {
+        type: "object",
+        required: ["subIssueWalk"],
+        properties: {
+          subIssueWalk: { type: "boolean" }
+        },
+        additionalProperties: false
+      },
       agent: {
         type: "object",
         required: [
@@ -432,7 +466,9 @@ const checkpointFactSchema = {
   required: ["taskId", "ref", "revision"],
   properties: {
     taskId: taskIdSchema,
-    ref: { type: "string", pattern: "^refs/tags/tally/spec-build/v1/" },
+    // New receipts land in the hidden state namespace; already-published
+    // visible tag receipts stay honored.
+    ref: { type: "string", pattern: "^refs/(tags/)?tally/spec-build/v1/" },
     revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
   },
   additionalProperties: false
@@ -510,6 +546,22 @@ const deferralFactSchema = {
   additionalProperties: false
 };
 
+// A sub-issue closed with no revision-valid merged pull request. Closure is
+// human-clickable and therefore proves nothing; the task stays incomplete and
+// the closure is surfaced loudly instead of being filed as a warning.
+const anomalyFactSchema = {
+  type: "object",
+  required: ["kind", "taskId", "issue", "url", "detail"],
+  properties: {
+    kind: { const: "closed-without-merged-proof" },
+    taskId: taskIdSchema,
+    issue: { type: "string", pattern: "^[1-9][0-9]*$" },
+    url: { type: "string", minLength: 1 },
+    detail: { type: "string", minLength: 1, maxLength: 2000 }
+  },
+  additionalProperties: false
+};
+
 const blockedFactSchema = {
   type: "object",
   required: ["taskId", "blockedBy"],
@@ -544,6 +596,7 @@ const reconcileSchema = {
     "quiescent",
     "escalation",
     "complete",
+    "anomalies",
     "warnings"
   ],
   properties: {
@@ -572,6 +625,7 @@ const reconcileSchema = {
     quiescent: { type: "boolean" },
     escalation: { type: ["string", "null"], minLength: 1 },
     complete: { type: "boolean" },
+    anomalies: { type: "array", maxItems: 128, items: anomalyFactSchema },
     warnings: stringList,
     config: effectiveConfigSchema
   },
@@ -706,7 +760,9 @@ const checkpointCompletionSchema = {
   required: ["taskId", "ref", "revision"],
   properties: {
     taskId: taskIdSchema,
-    ref: { type: "string", pattern: "^refs/tags/tally/spec-build/v1/" },
+    // New receipts land in the hidden state namespace; already-published
+    // visible tag receipts stay honored.
+    ref: { type: "string", pattern: "^refs/(tags/)?tally/spec-build/v1/" },
     revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
   },
   additionalProperties: false
@@ -997,7 +1053,7 @@ function implementationBrief(task, prepared, reconciliation) {
     steering: task.brief
       ? {
           channel: "locally-authorized-snapshot",
-          authorizedComments: args.steering,
+          authorizedComments: authorizedComments(task),
           machineDiagnoses: machineDiagnoses(reconciliation, task.id)
         }
       : {
@@ -1027,7 +1083,7 @@ function checkpointBrief(task, prepared, reconciliation) {
     steering: task.brief
       ? {
           channel: "locally-authorized-snapshot",
-          authorizedComments: args.steering,
+          authorizedComments: authorizedComments(task),
           machineDiagnoses: machineDiagnoses(reconciliation, task.id)
         }
       : {
@@ -1062,8 +1118,43 @@ function applyAgentPolicies(spec, sandboxPolicy = effective.agent.sandboxPolicy)
   return spec;
 }
 
+// The arm-time capability record travels with every brief that reads or
+// writes a forge surface, so one pass never mixes native and degraded
+// projections. Absent means degraded.
+function withCapabilities(brief) {
+  if (args.capabilities === undefined) {
+    return brief;
+  }
+  return { ...brief, capabilities: args.capabilities };
+}
+
+function nativeSubIssues() {
+  return args.capabilities !== undefined && args.capabilities.subIssueWalk === true;
+}
+
+// Task T's machine receipts belong on T's own sub-issue thread. Without that
+// capability, or without a sub-issue, they stay on the master.
+function taskThread(task) {
+  if (!nativeSubIssues() || !task.brief) {
+    return null;
+  }
+  return task.brief.issue;
+}
+
+// The master reaches every task; a task's own sub-issue thread reaches only
+// that task.
+function authorizedComments(task) {
+  const master = args.steering || [];
+  const thread = taskThread(task);
+  if (thread === null || args.taskSteering === undefined) {
+    return master;
+  }
+  return master.concat(args.taskSteering[thread.number] || []);
+}
+
 function reconciledProjection(reconciliation) {
   return {
+    anomalies: reconciliation.anomalies,
     merged: reconciliation.merged,
     checkpoints: reconciliation.checkpoints,
     remaining: reconciliation.remaining,
@@ -1228,11 +1319,11 @@ function sweepDeferral(sweepNode) {
     }
   }
   const reconcileBrief = forgeNative
-    ? {
+    ? withCapabilities({
         repository: args.repository,
         issue: args.issue,
         worklist: args.worklist
-      }
+      })
     : {
         campaign: args.campaign,
         repository: args.repository,
@@ -1463,7 +1554,7 @@ function sweepDeferral(sweepNode) {
         }
         const recorded = await driverNode(
           "checkpoint",
-          {
+          withCapabilities({
             campaign: effective.campaign,
             repository: args.repository,
             repositoryConfig,
@@ -1471,7 +1562,7 @@ function sweepDeferral(sweepNode) {
             task,
             source: reconciliation.source,
             workspace: prepared.result
-          },
+          }),
           `checkpoint-record-${task.id}`,
           `checkpoint-record-${task.id}`,
           checkpointCompletionSchema,
@@ -1734,7 +1825,7 @@ function sweepDeferral(sweepNode) {
 
     const merge = await driverNode(
       "merge",
-      {
+      withCapabilities({
         campaign: effective.campaign,
         repository: args.repository,
         repositoryConfig,
@@ -1744,7 +1835,7 @@ function sweepDeferral(sweepNode) {
         task,
         workspace: lane.prepared,
         integration: integration.result
-      },
+      }),
       `merge-${task.id}`,
       `merge-${task.id}`,
       mergeSchema,
@@ -1789,20 +1880,25 @@ function sweepDeferral(sweepNode) {
   const retryOutcomes = await parallel(
     machineryFaults.map(failure => () => (async () => {
       const task = failure.task;
+      const retryBrief = withCapabilities({
+        campaign: effective.campaign,
+        repository: args.repository,
+        repositoryConfig,
+        issue: args.issue,
+        taskId: task.id,
+        stage: failure.stage,
+        detail: bounded(
+          failure.node && failure.node.error ? failure.node.error : failure.node,
+          1500
+        )
+      });
+      const retryThread = taskThread(task);
+      if (retryThread !== null) {
+        retryBrief.taskIssue = retryThread;
+      }
       const recorded = await driverNode(
         "retry",
-        {
-          campaign: effective.campaign,
-          repository: args.repository,
-          repositoryConfig,
-          issue: args.issue,
-          taskId: task.id,
-          stage: failure.stage,
-          detail: bounded(
-            failure.node && failure.node.error ? failure.node.error : failure.node,
-            1500
-          )
-        },
+        retryBrief,
         `retry-${task.id}`,
         `retry-${task.id}`,
         retrySchema,
@@ -1924,17 +2020,22 @@ function sweepDeferral(sweepNode) {
       }
       const diagnosed = await job(diagnosisSpec, { settle: false });
       const attempt = previousDiagnoses.length + 1;
+      const steerBrief = withCapabilities({
+        campaign: effective.campaign,
+        repository: args.repository,
+        repositoryConfig,
+        issue: args.issue,
+        taskId: task.id,
+        attempt,
+        diagnosis: diagnosed.result
+      });
+      const steerThread = taskThread(task);
+      if (steerThread !== null) {
+        steerBrief.taskIssue = steerThread;
+      }
       const steering = await driverNode(
         "steer",
-        {
-          campaign: effective.campaign,
-          repository: args.repository,
-          repositoryConfig,
-          issue: args.issue,
-          taskId: task.id,
-          attempt,
-          diagnosis: diagnosed.result
-        },
+        steerBrief,
         `steer-${task.id}`,
         `steer-${task.id}`,
         steeringSchema,

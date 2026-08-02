@@ -25,7 +25,7 @@ Keep those roles separate:
 - **GitHub is intake, steering, state, and projection.** Manual `arm` is the
   explicit intent boundary for ad-hoc work; an exact mention is that boundary
   for a recurring campaign. Merged implementation pull requests and
-  content-and-exact-base-bound checkpoint tags are the completion facts read by
+  content-and-exact-base-bound checkpoint receipts are the completion facts read by
   every later pass. Only snapshotted comments authored by locally allowed actors
   steer an ad-hoc agent attempt; receipts and evidence project each
   reconciliation.
@@ -146,14 +146,56 @@ The master worklist is generated from those references:
 - [ ] <!-- tally:campaign-task:v1 id=customer-model --> #43 — Implement the customer model
 ```
 
-Those boxes are a projection, not mutable truth. At every reconcile the driver
-recomputes them from revision-bound merged pull requests and content-bound
-checkpoint refs. Closing a task issue or manually checking a box cannot complete
-a task; the next reconcile restores the proof-derived state. A GitHub task PR
-includes `Closes #<sub-issue>` and a successful merge flips the box and updates
-the progress comment. Completion identity includes the admitted graph digest:
+Those boxes are a projection, not mutable truth, and which projection you get
+depends on the arm-time capability probe below. Where GitHub serves the native
+sub-issue walk, the parent's own sub-issue progress bar is the projection and
+tally writes nothing: no checkbox edits, and no per-merge progress comment.
+Where it does not, the driver recomputes the boxes at every reconcile from
+revision-bound merged pull requests and content-bound checkpoint refs, and a
+merge repairs its own box. Under either projection, closing a task issue or
+manually checking a box cannot complete a task. A GitHub task PR includes
+`Closes #<sub-issue>`. Completion identity includes the admitted graph digest:
 editing a brief, gate, checkout, agent policy, or DAG after a merge cannot reuse
 the old PR as proof.
+
+### The sub-issue walk, and what a closed sub-issue does not prove
+
+`arm` probes once, before it registers anything, whether this forge can serve
+the walk the native read path needs: parent → `subIssues` →
+`closedByPullRequestsReferences` → `pullRequest.merged`, in one bounded
+GraphQL query per pass, paginated within the 100-task cap. A forge that refuses
+the query is a capability answer, not a campaign failure — the campaign arms in
+degraded mode, `arm --no-enqueue` reports which mode it recorded, and every
+projection above falls back to checkboxes. Re-arm to re-probe.
+
+The walk narrows **where** completion candidates come from; it never widens
+**what** counts as proof. A pull request reached through a task's sub-issue
+still completes that task only if its body carries the exact revision-bound
+marker for the admitted graph and it passes the same base branch, stable head
+branch, merge-commit and ancestry validation as before. A pull request from a
+pre-edit graph is named in the pass warnings and counts for nothing.
+
+A sub-issue is human-clickable, so its closure carries no authority at all.
+`pullRequest.merged` remains the only oracle. When the walk finds a sub-issue
+closed while its task holds no revision-valid merged pull request (or, for a
+checkpoint, no completion ref), the task stays incomplete and in the frontier,
+and the pass records a typed `closed-without-merged-proof` anomaly.
+`tally query run RUN-UUID` prints those anomalies above the task board and puts
+the run in `needs-attention`; they are not filed with the reconciler's
+warnings, because a reader who misses one debugs the wrong surface.
+
+### Per-task steering threads
+
+Where the walk is available, each task's sub-issue is that task's steering
+thread. A machine diagnosis or machinery-retry receipt for task `T` is posted on
+`T`'s sub-issue and read back from there, so `T`'s retry brief carries `T`'s
+history and no other task's. A comment by an allowed actor on `T`'s sub-issue
+reaches `T`'s agent as `steering.authorizedComments` and advances the
+observation revision exactly like a master comment does. The master issue stays
+the campaign-wide channel: campaign-level human steering reaches every task, and
+escalation and the closing summary are always posted there. A receipt left on
+the master by a pre-#307 pass is reported and ignored rather than double
+counted; receipt parsing follows the posting surface.
 
 `arm` authenticates the current `gh` login, defaults the local allowlist to that
 login, and requires the master and every task issue to have an allowed author.
@@ -386,8 +428,10 @@ drains the machine self-continuation every campaign class writes after a pass
 merges work, passes a checkpoint, or publishes machine steering. It is not
 per-campaign state, so arming still requires no Nix change.
 
-The producer posts its receipt and witnessed evidence. Each merge and passed
-checkpoint posts an idempotently marked progress comment. Once task execution,
+The producer posts its receipt and witnessed evidence. Under the degraded
+projection, each merge and passed checkpoint repairs its own worklist checkbox
+and a passed checkpoint posts an idempotently marked progress comment; under
+the native sub-issue projection neither is written. Once task execution,
 integration, and diagnosis settle, a pass that merged work, passed a checkpoint,
 or published machine steering writes its continuation payload from one separate
 node. That node writes no comment: the file lands in the events directory under
@@ -616,18 +660,33 @@ checkpoint command receives the corresponding structured retry brief but no
 implementation agent. Publication and integration remain separate deterministic
 nodes.
 
-A passed checkpoint is recorded as a lightweight Git tag below
-`refs/tags/tally/spec-build/v1/`. The expected ref includes the campaign, issue,
-checkpoint ID, full worklist SHA-256, and exact tested base revision. Changing
-the declared work graph or advancing the base requires a new pass.
-Reconciliation accepts the ref only when it points directly to that named base
-commit and every dependency's merge or checkpoint revision is its ancestor.
-An older green tag never certifies a later base, even when the later commit is
-unrelated to the checkpoint's declared dependencies: checkpoints ask questions
-about the accumulated repository state, not only their dependency closure.
+A passed checkpoint is recorded as a create-only ref below
+`refs/tally/spec-build/v1/<campaign-scope>/checkpoint/`. The expected ref
+includes the campaign-and-issue scope, checkpoint ID, full worklist SHA-256, and
+exact tested base revision. Changing the declared work graph or advancing the
+base requires a new pass. Reconciliation accepts the ref only when it points
+directly to that named base commit and every dependency's merge or checkpoint
+revision is its ancestor. An older green receipt never certifies a later base,
+even when the later commit is unrelated to the checkpoint's declared
+dependencies: checkpoints ask questions about the accumulated repository state,
+not only their dependency closure.
+
+That namespace is hidden, and deliberately so: it is the same one the
+campaign's diagnosis and escalation state already uses, and it is served only
+on request. Receipts were published as tags below
+`refs/tags/tally/spec-build/v1/` until #307, and **tags are auto-fetched by
+every clone** — a private campaign's checkpoint ledger became part of a public
+target repository's surface. Already-published tag receipts are still read and
+honored, so the move re-executes nothing; nothing new is ever written there.
+To clean a target that already carries them, list them with
+`git ls-remote --tags <remote> 'refs/tags/tally/spec-build/v1/*'`, confirm the
+campaigns they belong to are finished, and delete them under the repository's
+ordinary destructive-change procedure
+(`git push <remote> --delete <ref>`); the campaign will re-record any still-live
+checkpoint into the hidden namespace on its next pass.
 
 Checkpoint refs are immutable and create-only; the driver never force-moves a
-receipt. A tag ruleset should allow the tally forge identity to create refs in
+receipt. A ruleset should allow the tally forge identity to create refs in
 this namespace while denying other identities creation and denying updates or
 deletion. If protection denies that identity creation, recording fails closed.
 The credential allowed to create these refs is itself a trusted completion
@@ -639,10 +698,10 @@ from minting otherwise consistent ones.
 Old refs are retained as historical audit receipts. Worklist edits and base
 movement make them unreachable from the active completion calculation rather
 than deleting them. This deliberately preserves stateless recovery and works
-with update/delete-protected tags. When a campaign is permanently
+with update/delete-protected refs. When a campaign is permanently
 decommissioned, its campaign-and-issue namespace can be pruned under the
 repository's ordinary destructive-change procedure; there is no automatic
-campaign-lifetime inference or in-run tag garbage collection.
+campaign-lifetime inference or in-run receipt garbage collection.
 
 ## Reconciliation, parallelism, and the merge criterion
 
@@ -705,8 +764,9 @@ runs its argv as an ordinary settled `campaign-control` node with `exit:0`
 evidence, the declared deadline, and the checkpoint's `taskRef`. On success the
 driver verifies that `HEAD` is still the prepared base, no tracked file changed,
 and the prepared base still belongs to the current remote-base ancestry. It
-then publishes an immutable receipt for the exact revision that was tested and
-an idempotent progress comment. If the remote base advanced during validation,
+then publishes an immutable receipt for the exact revision that was tested,
+plus a progress comment where the degraded projection is in force. If the
+remote base advanced during validation,
 the receipt remains truthful historical evidence but is not complete for the
 next reconciliation; the checkpoint is prepared again on the newer base. A
 diverged or force-replaced base fails closed. The pass-wide continuation is

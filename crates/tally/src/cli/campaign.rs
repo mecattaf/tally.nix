@@ -199,6 +199,13 @@ struct CampaignRegistration {
     authenticated_actor: String,
     allowed_actors: Vec<String>,
     allow_test_local_forge: bool,
+    /// What the arm-time probe found this forge can serve. A registration
+    /// written before the probe existed carries no record, and absent means
+    /// degraded — the conservative direction, since the checkbox projection
+    /// and per-branch pull-request lookup work on every forge. Re-arming is
+    /// what turns the native sub-issue walk on.
+    #[serde(default)]
+    sub_issue_walk: bool,
     #[serde(default)]
     last_observation: Option<String>,
     flow: PathBuf,
@@ -546,6 +553,193 @@ fn fetch_subissues(locator: &IssueLocator) -> Result<Vec<GithubIssue>> {
         locator.repository, locator.number
     );
     gh_json(&os_arguments(&["api", &endpoint]))
+}
+
+/// The sub-issue surface the reconciler's read path and steering threads need.
+///
+/// One bounded GraphQL query walks the parent's sub-issues, the pull requests
+/// that close each of them, and each thread's comments. `arm` runs it once as
+/// a capability probe; every pass afterwards runs it for real.
+const SUB_ISSUE_THREAD_QUERY: &str = r"
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      subIssues(first: 50, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          number
+          closedByPullRequestsReferences(first: 1, includeClosedPrs: true) {
+            nodes { url merged }
+          }
+          comments(last: 100) {
+            nodes { databaseId url body createdAt updatedAt author { login } }
+          }
+        }
+      }
+    }
+  }
+}
+";
+/// The parent's sub-issue ceiling is 100 and a manifest caps at that number,
+/// so two pages of 50 always cover an admitted graph.
+const MAX_SUB_ISSUE_PAGES: usize = 2;
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GraphqlComment {
+    #[serde(default)]
+    database_id: Option<u64>,
+    url: String,
+    body: String,
+    created_at: String,
+    updated_at: String,
+    #[serde(default)]
+    author: Option<GithubActor>,
+}
+
+fn sub_issue_threads(locator: &IssueLocator) -> Result<BTreeMap<u64, Vec<GraphqlComment>>> {
+    let (owner, name) = locator
+        .repository
+        .split_once('/')
+        .ok_or_else(|| invalid("campaign repository is not in owner/name form"))?;
+    let mut threads = BTreeMap::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..MAX_SUB_ISSUE_PAGES {
+        let mut arguments = os_arguments(&["api", "graphql", "-f"]);
+        arguments.push(format!("query={SUB_ISSUE_THREAD_QUERY}").into());
+        arguments.extend(os_arguments(&["-F"]));
+        arguments.push(format!("owner={owner}").into());
+        arguments.extend(os_arguments(&["-F"]));
+        arguments.push(format!("name={name}").into());
+        arguments.extend(os_arguments(&["-F"]));
+        arguments.push(format!("number={}", locator.number).into());
+        if let Some(cursor) = cursor.as_deref() {
+            arguments.extend(os_arguments(&["-F"]));
+            arguments.push(format!("cursor={cursor}").into());
+        }
+        let payload: Value = gh_json(&arguments)?;
+        let connection = payload
+            .pointer("/data/repository/issue/subIssues")
+            .ok_or_else(|| invalid("campaign sub-issue walk returned no sub-issue connection"))?;
+        let nodes = connection
+            .get("nodes")
+            .and_then(Value::as_array)
+            .ok_or_else(|| invalid("campaign sub-issue walk returned a malformed node list"))?;
+        for node in nodes {
+            let number = node
+                .get("number")
+                .and_then(Value::as_u64)
+                .filter(|number| *number > 0)
+                .ok_or_else(|| invalid("campaign sub-issue walk returned an invalid number"))?;
+            let comments = node
+                .pointer("/comments/nodes")
+                .cloned()
+                .unwrap_or_else(|| Value::Array(Vec::new()));
+            let comments: Vec<GraphqlComment> = serde_json::from_value(comments)
+                .map_err(|error| invalid(format!("campaign sub-issue #{number}: {error}")))?;
+            if threads.insert(number, comments).is_some() {
+                bail!("campaign sub-issue walk repeated sub-issue #{number}");
+            }
+        }
+        if connection.pointer("/pageInfo/hasNextPage") != Some(&Value::Bool(true)) {
+            return Ok(threads);
+        }
+        cursor = Some(
+            connection
+                .pointer("/pageInfo/endCursor")
+                .and_then(Value::as_str)
+                .ok_or_else(|| invalid("campaign sub-issue walk returned no page cursor"))?
+                .to_owned(),
+        );
+    }
+    Err(invalid(
+        "campaign parent carries more sub-issues than the 100-task cap admits",
+    ))
+}
+
+/// Probe whether this forge serves the sub-issue walk the native read path
+/// needs. A refusal is a capability answer, not a campaign failure: the
+/// campaign arms in degraded mode and keeps the checkbox projection.
+fn probe_sub_issue_walk(locator: &IssueLocator) -> bool {
+    sub_issue_threads(locator).is_ok()
+}
+
+/// Every steering surface a pass reads: the campaign-wide master thread, plus
+/// each task's own sub-issue thread where the forge serves one.
+#[derive(Debug, Clone, Default)]
+struct CampaignSteering {
+    master: Vec<Value>,
+    tasks: BTreeMap<String, Vec<Value>>,
+}
+
+fn fetch_campaign_steering(
+    graph: &CampaignGraph,
+    allowed: &[String],
+    native: bool,
+) -> Result<CampaignSteering> {
+    let master = fetch_steering(&graph.locator, allowed)?;
+    let tasks = if native {
+        let numbers = graph
+            .tasks
+            .iter()
+            .map(|issue| issue.number)
+            .collect::<Vec<_>>();
+        task_steering(&graph.locator, allowed, &numbers)?
+    } else {
+        BTreeMap::new()
+    };
+    Ok(CampaignSteering { master, tasks })
+}
+
+fn task_steering(
+    locator: &IssueLocator,
+    allowed: &[String],
+    subissues: &[u64],
+) -> Result<BTreeMap<String, Vec<Value>>> {
+    let threads = sub_issue_threads(locator)?;
+    let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut steering = BTreeMap::new();
+    for number in subissues {
+        let mut comments = Vec::new();
+        for comment in threads.get(number).into_iter().flatten() {
+            if comment.body.contains(SYSTEM_COMMENT_PREFIX) {
+                continue;
+            }
+            let Some(author) = comment.author.as_ref() else {
+                continue;
+            };
+            let actor = author.login.to_ascii_lowercase();
+            if !allowed.contains(actor.as_str()) {
+                continue;
+            }
+            if comment.body.contains('\0') || comment.body.chars().count() > 64_000 {
+                bail!(
+                    "approved steering comment {} exceeds the campaign comment contract",
+                    comment.url
+                );
+            }
+            let Some(id) = comment.database_id else {
+                continue;
+            };
+            comments.push(json!({
+                "id": id,
+                "url": comment.url,
+                "author": actor,
+                "body": comment.body,
+                "createdAt": comment.created_at,
+                "updatedAt": comment.updated_at,
+            }));
+        }
+        if comments.len() > 1_000 {
+            return Err(invalid(format!(
+                "campaign sub-issue #{number} has more than 1000 approved steering comments"
+            )));
+        }
+        if !comments.is_empty() {
+            steering.insert(number.to_string(), comments);
+        }
+    }
+    Ok(steering)
 }
 
 fn extract_managed_section<'a>(body: &'a str, start: &str, end: &str) -> Result<&'a str> {
@@ -949,7 +1143,7 @@ fn sha256_json(value: &Value) -> Result<String> {
 
 fn campaign_observation(
     graph: &CampaignGraph,
-    steering: &[Value],
+    steering: &CampaignSteering,
     arm_serial: u64,
 ) -> Result<String> {
     sha256_json(&json!({
@@ -965,7 +1159,10 @@ fn campaign_observation(
                 "updatedAt": issue.updated_at,
             })).collect::<Vec<_>>(),
         },
-        "steering": steering,
+        "steering": steering.master,
+        // A comment on one task's sub-issue thread must nudge the campaign
+        // exactly like a comment on the master does.
+        "taskSteering": steering.tasks,
         "armSerial": arm_serial,
     }))
 }
@@ -1401,7 +1598,7 @@ impl CampaignHost<'_> {
 async fn dispatch_campaign(
     host: CampaignHost<'_>,
     graph: &CampaignGraph,
-    steering: &[Value],
+    steering: &CampaignSteering,
     registration: &mut CampaignRegistration,
     wait: bool,
 ) -> Result<Value> {
@@ -1440,7 +1637,9 @@ async fn dispatch_campaign(
             "kind": "github-issue",
             "graphDigest": &registration.approved_graph_digest,
         },
-        "steering": steering,
+        "steering": steering.master,
+        "taskSteering": steering.tasks,
+        "capabilities": {"subIssueWalk": registration.sub_issue_walk},
         "workspaceRoot": &registration.workspace_root,
         "tally": &executable,
         "driver": &registration.driver,
@@ -1542,7 +1741,10 @@ async fn run_campaign_arm(
     let allowed_actors = normalize_allowed_actors(&args.allowed_actors, &authenticated_actor)?;
     let graph = fetch_campaign_graph(&locator)?;
     require_allowed_issue_authors(&graph, &allowed_actors)?;
-    let steering = fetch_steering(&locator, &allowed_actors)?;
+    // Probe once, at arm, and record the answer. A pass never has to discover
+    // mid-flight that half its projection is unavailable.
+    let sub_issue_walk = probe_sub_issue_walk(&locator);
+    let steering = fetch_campaign_steering(&graph, &allowed_actors, sub_issue_walk)?;
     let path = registration_path(&state_dir, &locator.url);
     let prior = if path.exists() {
         Some(read_registration(&path)?)
@@ -1578,6 +1780,7 @@ async fn run_campaign_arm(
         authenticated_actor,
         allowed_actors,
         allow_test_local_forge: args.allow_test_local_forge,
+        sub_issue_walk,
         last_observation: prior.and_then(|value| value.last_observation),
         flow,
         driver,
@@ -1600,6 +1803,12 @@ async fn run_campaign_arm(
                 "tasks": graph.tasks.len(),
                 "graphDigest": graph.executable_digest,
                 "allowedActors": registration.allowed_actors,
+                "subIssueWalk": registration.sub_issue_walk,
+                "projection": if registration.sub_issue_walk {
+                    "native-sub-issues"
+                } else {
+                    "degraded-checkboxes"
+                },
                 "enqueued": false,
             }))?
         );
@@ -1667,7 +1876,11 @@ async fn run_campaign_poll(
                     graph.executable_digest
                 );
             }
-            let steering = fetch_steering(&locator, &registration.allowed_actors)?;
+            let steering = fetch_campaign_steering(
+                &graph,
+                &registration.allowed_actors,
+                registration.sub_issue_walk,
+            )?;
             let observation = campaign_observation(&graph, &steering, registration.arm_serial)?;
             if registration.last_observation.as_deref() == Some(&observation) {
                 return Ok((false, false));
@@ -2308,7 +2521,11 @@ fn merged_project_tasks(
         if task.kind == "checkpoint" {
             let reference =
                 checkpoint_reference(&manifest.name, issue_number, &task.id, &graph_digest)?;
-            if projected_checkpoint_complete(manifest, &reference)? {
+            let legacy =
+                legacy_checkpoint_tag(&manifest.name, issue_number, &task.id, &graph_digest)?;
+            if projected_checkpoint_complete(manifest, &reference)?
+                || projected_checkpoint_complete(manifest, &legacy)?
+            {
                 merged.insert(task.id.clone());
             }
             continue;
@@ -2468,7 +2685,35 @@ fn stable_publish_branch(
     format!("tally/{slug}-issue-{issue_number}/{task_id}{suffix}")
 }
 
+/// Where new checkpoint receipts are published.
+///
+/// The pre-#307 namespace was `refs/tags/`, which every clone of a public
+/// target repository auto-fetches; a campaign's checkpoint ledger became part
+/// of that repository's public surface. Receipts now share the hidden
+/// namespace the campaign's other durable state already uses.
 fn checkpoint_reference(
+    campaign: &str,
+    issue_number: u64,
+    task_id: &str,
+    source: &str,
+) -> Result<String> {
+    let digest = source
+        .strip_prefix("sha256:")
+        .filter(|value| value.len() == 64)
+        .ok_or_else(|| invalid("checkpoint source is not a SHA-256 identity"))?;
+    let scope = format!(
+        "{:x}",
+        Sha256::digest(format!("{campaign}\0{issue_number}").as_bytes())
+    );
+    Ok(format!(
+        "refs/tally/spec-build/v1/{}/checkpoint/{task_id}-{digest}",
+        &scope[..24],
+    ))
+}
+
+/// The visible tag receipt published before the namespace moved. Read for
+/// compatibility so an existing campaign is never re-executed; never written.
+fn legacy_checkpoint_tag(
     campaign: &str,
     issue_number: u64,
     task_id: &str,
@@ -2891,6 +3136,138 @@ mod tests {
         })
     }
 
+    fn fake_gh(directory: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let path = directory.join(name);
+        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    const WALK_PAYLOAD: &str = r#"{"data":{"repository":{"issue":{"subIssues":{
+        "pageInfo":{"hasNextPage":false,"endCursor":null},
+        "nodes":[{"number":8,
+          "closedByPullRequestsReferences":{"nodes":[]},
+          "comments":{"nodes":[
+            {"databaseId":11,"url":"https://github.com/acme/widgets/issues/8#c11",
+             "body":"rerun the gate with the fixture regenerated",
+             "createdAt":"2026-08-01T10:00:00Z","updatedAt":"2026-08-01T10:00:00Z",
+             "author":{"login":"Operator"}},
+            {"databaseId":12,"url":"https://github.com/acme/widgets/issues/8#c12",
+             "body":"<!-- tally:spec-build:diagnosis:v1 -->\nmachine receipt",
+             "createdAt":"2026-08-01T10:01:00Z","updatedAt":"2026-08-01T10:01:00Z",
+             "author":{"login":"operator"}},
+            {"databaseId":13,"url":"https://github.com/acme/widgets/issues/8#c13",
+             "body":"drive-by opinion",
+             "createdAt":"2026-08-01T10:02:00Z","updatedAt":"2026-08-01T10:02:00Z",
+             "author":{"login":"stranger"}}
+          ]}}]}}}}}"#;
+
+    #[test]
+    fn the_arm_probe_answers_degraded_instead_of_failing_the_campaign() {
+        let temporary = tempfile::tempdir().unwrap();
+        let locator = parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap();
+        let previous = std::env::var_os("TALLY_GH_PROGRAM");
+
+        let refusing = fake_gh(
+            temporary.path(),
+            "gh-refusing",
+            "echo 'Field subIssues does not exist' >&2; exit 1",
+        );
+        std::env::set_var("TALLY_GH_PROGRAM", &refusing);
+        // A forge that cannot serve the walk is a capability answer, not an
+        // error: the campaign still arms, in degraded mode.
+        assert!(!probe_sub_issue_walk(&locator));
+
+        let serving = fake_gh(
+            temporary.path(),
+            "gh-serving",
+            &format!("cat <<'TALLY_WALK'\n{WALK_PAYLOAD}\nTALLY_WALK"),
+        );
+        std::env::set_var("TALLY_GH_PROGRAM", &serving);
+        assert!(probe_sub_issue_walk(&locator));
+        assert_eq!(
+            sub_issue_threads(&locator)
+                .unwrap()
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![8]
+        );
+        // The task thread carries human steering under the same contract the
+        // master thread has always used: allowed actors only, machine
+        // receipts excluded.
+        let steering = task_steering(&locator, &["operator".to_owned()], &[8]).unwrap();
+        assert_eq!(steering["8"].len(), 1);
+        assert_eq!(steering["8"][0]["id"], json!(11));
+        assert_eq!(steering["8"][0]["author"], json!("operator"));
+
+        match previous {
+            Some(value) => std::env::set_var("TALLY_GH_PROGRAM", value),
+            None => std::env::remove_var("TALLY_GH_PROGRAM"),
+        }
+    }
+
+    #[test]
+    fn a_registration_written_before_the_probe_reads_as_degraded() {
+        let registration: CampaignRegistration = serde_json::from_value(json!({
+            "schemaVersion": REGISTRY_SCHEMA_VERSION,
+            "registrationId": "0198f000-0000-7000-8000-000000000001",
+            "issueUrl": "https://github.com/acme/widgets/issues/42",
+            "repository": "acme/widgets",
+            "issueNumber": 42,
+            "armedAt": "2026-08-01T10:00:00Z",
+            "armSerial": 1,
+            "approvedGraphDigest": format!("sha256:{}", "a".repeat(64)),
+            "authenticatedActor": "operator",
+            "allowedActors": ["operator"],
+            "allowTestLocalForge": false,
+            "flow": "/nix/store/spec-build.js",
+            "driver": "/nix/store/spec_build_driver.py",
+            "workspaceRoot": "/var/lib/tally/campaigns",
+        }))
+        .unwrap();
+        assert!(!registration.sub_issue_walk);
+    }
+
+    #[test]
+    fn a_task_thread_comment_moves_the_observation_revision() {
+        let graph = CampaignGraph {
+            locator: parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap(),
+            manifest: serde_json::from_value(manifest_value_for_test(json!([{
+                "id": "foundation",
+                "kind": "implementation",
+                "issue": 43,
+                "dependencies": [],
+                "conflictDomains": []
+            }])))
+            .unwrap(),
+            master: GithubIssue {
+                number: 42,
+                title: "Campaign".to_owned(),
+                body: None,
+                state: "open".to_owned(),
+                html_url: "https://github.com/acme/widgets/issues/42".to_owned(),
+                updated_at: "2026-08-01T10:00:00Z".to_owned(),
+                user: GithubActor {
+                    login: "operator".to_owned(),
+                },
+                pull_request: None,
+            },
+            tasks: Vec::new(),
+            executable_digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        let quiet = CampaignSteering::default();
+        let steered = CampaignSteering {
+            master: Vec::new(),
+            tasks: BTreeMap::from([("43".to_owned(), vec![json!({"body": "rerun it"})])]),
+        };
+        assert_ne!(
+            campaign_observation(&graph, &quiet, 1).unwrap(),
+            campaign_observation(&graph, &steered, 1).unwrap()
+        );
+    }
+
     #[test]
     fn issue_url_is_canonical_and_bounded() {
         let locator = parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap();
@@ -3173,6 +3550,7 @@ mod tests {
             authenticated_actor: authenticated.clone(),
             allowed_actors: normalize_allowed_actors(&["Reviewer".into()], &authenticated).unwrap(),
             allow_test_local_forge: false,
+            sub_issue_walk: true,
             last_observation: None,
             flow: PathBuf::from("/nix/store/flow.js"),
             driver: PathBuf::from("/nix/store/driver"),

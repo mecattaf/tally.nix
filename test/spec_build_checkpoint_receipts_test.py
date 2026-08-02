@@ -338,6 +338,59 @@ class CheckpointReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(driver.DriverError, "immutable checkpoint ref"):
             driver.action_checkpoint(self.checkpoint_brief())
 
+    def legacy_reference(self) -> str:
+        source = self.worklist["source"]
+        return driver.legacy_checkpoint_tag(
+            "fixture",
+            "7",
+            "phase-checkpoint",
+            source["sha256"],
+            source["revision"],
+        )
+
+    def test_new_receipts_are_hidden_refs_and_never_tags(self) -> None:
+        """A public target repository must not auto-fetch a campaign's ledger.
+
+        Tags are cloned by everyone; the hidden state namespace is served only
+        on request. A new receipt therefore lands beside the campaign's other
+        durable state and leaves the target's tag namespace untouched.
+        """
+        recorded = driver.action_checkpoint(self.checkpoint_brief())
+        self.assertTrue(recorded["ref"].startswith("refs/tally/spec-build/v1/"))
+        self.assertNotIn("refs/tags/", recorded["ref"])
+        self.assertEqual(
+            git("ls-remote", "--tags", "origin", cwd=self.checkout).strip(), ""
+        )
+        self.assertEqual(
+            git("ls-remote", "origin", recorded["ref"], cwd=self.checkout).split()[0],
+            self.base_rev,
+        )
+        self.assertEqual(
+            [fact["ref"] for fact in self.completed()], [recorded["ref"]]
+        )
+
+    def test_a_published_tag_receipt_is_still_honored(self) -> None:
+        """The namespace move must never re-execute a checkpoint that passed."""
+        legacy = self.legacy_reference()
+        self.push_receipt(self.base_rev, legacy)
+        self.assertEqual(
+            self.completed(),
+            [
+                {
+                    "taskId": "phase-checkpoint",
+                    "ref": legacy,
+                    "revision": self.base_rev,
+                }
+            ],
+        )
+        # Nothing new is published for a checkpoint whose receipt already
+        # exists, so the honored ref stays the one already on the forge.
+        recorded = driver.action_checkpoint(self.checkpoint_brief())
+        self.assertEqual(recorded["ref"], legacy)
+        self.assertEqual(
+            git("ls-remote", "origin", self.reference(), cwd=self.checkout).strip(), ""
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

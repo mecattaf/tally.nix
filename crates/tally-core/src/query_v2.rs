@@ -858,6 +858,20 @@ pub struct RunFailureProjection {
     pub stderr_truncated: Option<bool>,
 }
 
+/// A campaign fact that contradicts the forge's own projection: a sub-issue
+/// closed by hand while the task holds no merged proof. Closure is
+/// human-clickable, so it completes nothing; the run view says so out loud
+/// rather than filing it with the reconciler's warnings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct RunAnomalyProjection {
+    pub kind: String,
+    pub task_ref: TaskRef,
+    pub issue: String,
+    pub url: String,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RunView {
@@ -873,6 +887,8 @@ pub struct RunView {
     pub state: RunState,
     pub counts: RunTaskCounts,
     pub tasks: Vec<RunTaskProjection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anomalies: Vec<RunAnomalyProjection>,
     pub current_nodes: Vec<RunNodeProjection>,
     pub failures: Vec<RunFailureProjection>,
     pub snapshot: QuerySnapshotMetadata,
@@ -889,6 +905,18 @@ struct ReconcileProjection {
     #[serde(default)]
     checkpoints: Vec<ReconcileCheckpointTask>,
     frontier: Vec<ReconcileTask>,
+    #[serde(default)]
+    anomalies: Vec<ReconcileAnomaly>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReconcileAnomaly {
+    kind: String,
+    task_id: String,
+    issue: String,
+    url: String,
+    detail: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1117,6 +1145,7 @@ pub fn query_run(
         .is_some_and(|parent| parent.live_state.is_some())
         || !current_nodes.is_empty();
     let mut tasks = Vec::new();
+    let mut anomalies = Vec::new();
     let mut advanced_ids = BTreeSet::new();
     let mut pull_requests = BTreeMap::new();
     let mut done_ids = BTreeSet::new();
@@ -1221,6 +1250,21 @@ pub fn query_run(
                 pull_request: pull_requests.get(&task.id).cloned(),
             });
         }
+        for anomaly in &reconciliation.anomalies {
+            // A task that reached durable proof after the pass observed the
+            // closure is no longer anomalous.
+            if done_ids.contains(&anomaly.task_id) {
+                continue;
+            }
+            anomalies.push(RunAnomalyProjection {
+                kind: anomaly.kind.clone(),
+                task_ref: TaskRef::new(format!("{campaign}/{}", anomaly.task_id))
+                    .map_err(|_| ObservabilityError::InvalidRunProjection(flow_run.to_owned()))?,
+                issue: anomaly.issue.clone(),
+                url: anomaly.url.clone(),
+                detail: anomaly.detail.clone(),
+            });
+        }
     }
 
     let counts = tasks
@@ -1253,7 +1297,10 @@ pub fn query_run(
         .is_some_and(|verdict| !passing_verdict(verdict));
     let state = if run_active {
         RunState::Running
-    } else if !failures.is_empty() || parent_failed {
+    } else if !failures.is_empty() || parent_failed || !anomalies.is_empty() {
+        // A hand-closed sub-issue is a human's mistaken belief that a task is
+        // done. Nothing in the campaign can resolve it, so the run reports
+        // that it needs attention rather than sitting idle.
         RunState::NeedsAttention
     } else if all_tasks_done {
         RunState::Complete
@@ -1275,6 +1322,7 @@ pub fn query_run(
         state,
         counts,
         tasks,
+        anomalies,
         current_nodes,
         failures,
         snapshot: snapshot_metadata(history, witness),
@@ -3057,6 +3105,68 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_closed_sub_issue_surfaces_as_an_anomaly_that_needs_attention() {
+        let flow_run = "00000000-0000-4000-8000-000000000249";
+        let mut reconciliation = reconciliation_detail(flow_run);
+        reconciliation.final_message = Some(
+            serde_json::json!({
+                "campaign": "crm",
+                "repository": "mecattaf/tally.nix",
+                "tasks": [
+                    {"id": "t01", "title": "Hand-closed task", "dependencies": []},
+                    {"id": "t02", "title": "Merged task", "dependencies": []}
+                ],
+                "merged": [
+                    {"taskId": "t02", "pullRequest": "https://example.test/pr/2"}
+                ],
+                "frontier": [
+                    {"id": "t01", "title": "Hand-closed task", "dependencies": []}
+                ],
+                "anomalies": [
+                    {
+                        "kind": "closed-without-merged-proof",
+                        "taskId": "t01",
+                        "issue": "42",
+                        "url": "https://example.test/issues/42",
+                        "detail": "sub-issue #42 is closed but task 't01' holds no proof"
+                    },
+                    {
+                        "kind": "closed-without-merged-proof",
+                        "taskId": "t02",
+                        "issue": "43",
+                        "url": "https://example.test/issues/43",
+                        "detail": "observed closed before the merge landed"
+                    }
+                ]
+            })
+            .to_string(),
+        );
+
+        let view = query_run(
+            flow_run,
+            &[reconciliation],
+            &[],
+            &history(),
+            &[],
+            parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
+        )
+        .unwrap();
+
+        // Closure completes nothing: the task stays off the done list and the
+        // run reports that a human has to look.
+        assert_eq!(view.anomalies.len(), 1);
+        assert_eq!(view.anomalies[0].task_ref.as_str(), "crm/t01");
+        assert_eq!(view.anomalies[0].issue, "42");
+        assert_eq!(view.state, RunState::NeedsAttention);
+        assert_eq!(view.counts.done, 1);
+        // A task that reached durable proof anyway is no longer anomalous.
+        assert!(view
+            .anomalies
+            .iter()
+            .all(|anomaly| anomaly.task_ref.task_id() != "t02"));
+    }
+
+    #[test]
     fn run_view_uses_the_highest_ordinal_reconciliation() {
         let flow_run = "00000000-0000-4000-8000-000000000249";
         let stale = reconciliation_detail(flow_run);
@@ -3115,7 +3225,7 @@ mod tests {
                 "merged": [],
                 "checkpoints": [{
                     "taskId": "c01",
-                    "ref": "refs/tags/tally/spec-build/v1/crm/c01",
+                    "ref": "refs/tally/spec-build/v1/crm/c01",
                     "revision": "a".repeat(40)
                 }],
                 "frontier": [
@@ -3136,7 +3246,7 @@ mod tests {
         checkpoint.final_message = Some(
             serde_json::json!({
                 "taskId": "c02",
-                "ref": "refs/tags/tally/spec-build/v1/crm/c02",
+                "ref": "refs/tally/spec-build/v1/crm/c02",
                 "revision": "b".repeat(40)
             })
             .to_string(),

@@ -343,6 +343,41 @@ authorized.
 
 ### Changed
 
+- Forge-native campaigns now read completion through one bounded GraphQL walk
+  of the master issue's native sub-issues — parent → `subIssues` →
+  `closedByPullRequestsReferences` → `pullRequest.merged` — instead of scanning
+  the repository's recent merged pull requests. The walk narrows where a
+  candidate may come from; it never widens what counts as proof, so a pull
+  request reached this way still completes a task only under the exact
+  revision-bound marker and the same base, head, merge-commit, and ancestry
+  validation as before. `tally campaign arm` probes the walk once and records
+  the answer in the registration; a forge that cannot serve it arms in degraded
+  mode and keeps the checkbox projection, and the publish path's
+  already-open-pull-request lookup now reads the task's stable head branch
+  directly. Campaign proof no longer ages out of a forge-wide scan window.
+- A closed sub-issue is no longer silent. `pullRequest.merged` remains the only
+  completion oracle, so a sub-issue closed by hand while its task holds no
+  revision-valid merged pull request leaves the task incomplete and records a
+  typed `closed-without-merged-proof` anomaly. `tally query run` prints those
+  anomalies above the task board and reports the run as `needs-attention`.
+- Machine diagnoses and machinery-retry receipts for a task now post on that
+  task's own sub-issue thread, and its retry brief reads them back from there
+  scoped to that task. An allowed actor's comment on a task sub-issue reaches
+  that task's agent as `steering.authorizedComments` and advances the
+  observation revision. The master issue stays the campaign-wide channel:
+  campaign-level steering still reaches every task, and escalation and the
+  closing summary are still posted there.
+- Removed the per-merge progress comment. Under the native sub-issue projection
+  the parent's own progress bar is the projection and tally writes nothing —
+  no comment and no checkbox edit; a degraded campaign still recomputes and
+  repairs its checkboxes exactly as before.
+- Moved new checkpoint receipts from `refs/tags/tally/spec-build/v1/` to the
+  hidden `refs/tally/spec-build/v1/<scope>/checkpoint/` namespace the
+  campaign's other durable state already uses. Tags are auto-fetched by every
+  clone, so a private campaign's checkpoint ledger was becoming part of a
+  public target repository's surface. Already-published tag receipts are still
+  read and honored, so nothing is re-executed; `doc/src/flows/campaigns.md`
+  documents how to clean a target that carries them.
 - Campaigns now continue themselves through the events directory instead of a
   public `/tally reconcile <name>` comment. A pass that merged work, passed a
   checkpoint, or published machine steering writes one bounded JSON enqueue

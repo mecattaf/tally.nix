@@ -171,38 +171,103 @@ class FakeGitHub:
                 args = sys.argv[1:]
                 state.setdefault("calls", []).append(args)
 
-                if args[:2] == ["pr", "list"]:
-                    if args[args.index("--state") + 1] == "all":
-                        value = state.get("pulls", [])
-                    elif "--head" in args:
-                        head = args[args.index("--head") + 1]
-                        value = state.get("byHead", {}).get(head, [])
-                    else:
-                        value = state.get("merged", [])
-                    print(json.dumps(value))
-                elif args[:2] == ["pr", "reopen"]:
+                def rest_pull(item):
+                    merged = item.get("state", "MERGED") == "MERGED"
+                    return {
+                        "html_url": item.get("url"),
+                        "body": item.get("body"),
+                        "base": {"ref": item.get("baseRefName")},
+                        "head": {
+                            "ref": item.get("headRefName"),
+                            "sha": item.get("headRefOid"),
+                        },
+                        "merge_commit_sha": (item.get("mergeCommit") or {}).get("oid"),
+                        "merged_at": "2026-08-02T00:00:00Z" if merged else None,
+                        "state": "open" if item.get("state") == "OPEN" else "closed",
+                    }
+
+                def thread(number):
+                    if number == "7":
+                        return state.setdefault("issueComments", [])
+                    return state.setdefault("threadComments", {}).setdefault(number, [])
+
+                if args[:2] == ["pr", "reopen"]:
                     url = args[2]
                     for candidate in state.get("pulls", []):
                         if candidate.get("url") == url:
                             candidate["state"] = "OPEN"
                     print(url)
+                elif args[:2] == ["pr", "view"]:
+                    print(json.dumps(state.get("prView", {})))
                 elif args[:2] == ["api", "user"]:
                     print(state.get("actor", "tally-test"))
+                elif args[:2] == ["api", "graphql"]:
+                    if state.get("walkFails"):
+                        print("sub-issue walk unavailable", file=sys.stderr)
+                        state_path.write_text(json.dumps(state), encoding="utf-8")
+                        raise SystemExit(1)
+                    print(json.dumps({
+                        "data": {
+                            "repository": {
+                                "issue": {
+                                    "subIssues": {
+                                        "pageInfo": {
+                                            "hasNextPage": False,
+                                            "endCursor": None,
+                                        },
+                                        "nodes": state.get("walk", []),
+                                    }
+                                }
+                            }
+                        }
+                    }))
                 elif args and args[0] == "api":
                     endpoint = next(
                         (item for item in args[1:] if item.startswith("repos/")), ""
                     )
                     if endpoint.endswith("/sub_issues?per_page=100"):
                         print(json.dumps(state.get("subIssues", [])))
-                    elif endpoint.endswith("/issues/7"):
-                        print(json.dumps(state.get("master", {})))
-                    elif "--slurp" in args:
-                        issue_comments = state.get("issueComments", [])
-                        print(json.dumps([issue_comments]))
+                    elif "/pulls?head=" in endpoint:
+                        query = endpoint.split("/pulls?", 1)[1]
+                        fields = dict(
+                            pair.split("=", 1) for pair in query.split("&") if "=" in pair
+                        )
+                        branch = fields.get("head", "").split(":", 1)[-1]
+                        if fields.get("state") == "all":
+                            source = state.get("pulls", [])
+                        else:
+                            source = list(state.get("merged", []))
+                            source += state.get("byHead", {}).get(branch, [])
+                        print(json.dumps([
+                            rest_pull(item)
+                            for item in source
+                            if item.get("headRefName") == branch
+                        ]))
+                    elif "/comments" in endpoint:
+                        number = endpoint.split("/issues/", 1)[1].split("/", 1)[0]
+                        if "--slurp" in args:
+                            print(json.dumps([thread(number)]))
+                        else:
+                            for comment in thread(number):
+                                print(comment.get("body", ""))
+                    elif "/issues/" in endpoint:
+                        number = endpoint.rsplit("/issues/", 1)[1]
+                        if number == "7":
+                            print(json.dumps(state.get("master", {})))
+                        else:
+                            found = next(
+                                (
+                                    candidate
+                                    for candidate in state.get("subIssues", [])
+                                    if str(candidate.get("number")) == number
+                                ),
+                                {"number": int(number), "state": "closed"},
+                            )
+                            print(json.dumps(found))
                     else:
-                        issue_comments = state.get("issueComments", [])
-                        for comment in issue_comments:
-                            print(comment.get("body", ""))
+                        print(f"unexpected fake gh api endpoint: {endpoint!r}", file=sys.stderr)
+                        state_path.write_text(json.dumps(state), encoding="utf-8")
+                        raise SystemExit(92)
                 elif args[:2] == ["issue", "comment"]:
                     failures = state.get("commentFailures", 0)
                     if failures:
@@ -210,11 +275,15 @@ class FakeGitHub:
                         state_path.write_text(json.dumps(state), encoding="utf-8")
                         print("injected comment failure", file=sys.stderr)
                         raise SystemExit(93)
+                    number = args[2]
                     body = args[args.index("--body") + 1]
                     state.setdefault("comments", []).append(body)
                     comment_number = len(state["comments"])
-                    url = f"https://github.com/acme/spec/issues/7#issuecomment-test-{comment_number}"
-                    state.setdefault("issueComments", []).append({
+                    url = (
+                        f"https://github.com/acme/spec/issues/{number}"
+                        f"#issuecomment-test-{comment_number}"
+                    )
+                    thread(number).append({
                         "body": body,
                         "html_url": url,
                         "user": {"login": state.get("actor", "tally-test")},
@@ -495,25 +564,25 @@ class GitHubForgeTests(unittest.TestCase):
                             "Task `task-2`: quoted text without an identity marker"
                         ),
                         "baseRefName": "main",
-                        "headRefName": "unrelated",
+                        "headRefName": "tally/fixture-issue-7/task-2",
                         "mergeCommit": {"oid": "b" * 40},
                     },
                     {
                         "url": "https://github.com/acme/spec/pull/3",
                         "body": task_2_marker,
                         "baseRefName": "release",
-                        "headRefName": "quoted-branch",
+                        "headRefName": "tally/fixture-issue-7/task-2",
                         "mergeCommit": {"oid": "c" * 40},
                     },
                     {
                         "url": "https://github.com/acme/spec/pull/4",
                         "body": DRIVER.pull_request_marker("fixture", "7", "unknown-task"),
                         "baseRefName": "main",
-                        "headRefName": "tally/fixture-issue-7/unknown-task",
+                        "headRefName": "tally/fixture-issue-7/task-2",
                         "mergeCommit": {"oid": "d" * 40},
                     },
                 ],
-                "byHead": {"tally/fixture-issue-7/task-2": []},
+                "byHead": {},
                 "comments": [],
                 "calls": [],
             }
@@ -1041,9 +1110,8 @@ class GitHubForgeTests(unittest.TestCase):
                 self.assertEqual(url, "https://github.com/acme/spec/pull/7")
                 self.assertEqual(github.state()["pulls"][0]["state"], "OPEN")
 
-                integration = {"pullRequest": url}
-                DRIVER.github_progress_comment(data, integration, "b" * 40)
-                DRIVER.github_progress_comment(data, integration, "b" * 40)
+                DRIVER.github_merge_checkbox_repair(data)
+                DRIVER.github_merge_checkbox_repair(data)
                 events = root / "events"
                 continued = DRIVER.action_continue(
                     {
@@ -1077,12 +1145,13 @@ class GitHubForgeTests(unittest.TestCase):
 
                 final_state = github.state()
                 # The machine's note-to-self is process, and process belongs in
-                # the journal: the merge receipt is the only new public comment.
-                self.assertEqual(len(final_state["comments"]), 1)
-                self.assertIn("task=task-1 merged", final_state["comments"][0])
+                # the journal. A merging pass now leaves no public comment at
+                # all: the per-merge progress comment is gone, and a task with
+                # no sub-issue has no checkbox to repair either.
+                self.assertEqual(final_state["comments"], [])
                 self.assertEqual(
                     sum(call[:2] == ["issue", "comment"] for call in final_state["calls"]),
-                    1,
+                    0,
                 )
                 self.assertEqual(
                     sum(call[:2] == ["pr", "reopen"] for call in final_state["calls"]),
@@ -1296,11 +1365,13 @@ class GitHubForgeTests(unittest.TestCase):
         task_value = {"id": "task-1", "kind": "implementation", "revision": revision}
         branch = DRIVER.stable_publish_branch("fixture", "7", "task-1", revision)
         candidate = {
-            "url": "https://github.com/acme/spec/pull/8",
+            "html_url": "https://github.com/acme/spec/pull/8",
             "body": DRIVER.pull_request_marker("fixture", "7", "task-1", revision),
-            "baseRefName": "main",
-            "headRefName": branch,
-            "mergeCommit": {"oid": "a" * 40},
+            "base": {"ref": "main"},
+            "head": {"ref": branch, "sha": "c" * 40},
+            "merge_commit_sha": "a" * 40,
+            "merged_at": "2026-08-02T00:00:00Z",
+            "state": "closed",
         }
 
         def listed(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -1312,10 +1383,82 @@ class GitHubForgeTests(unittest.TestCase):
             )
             self.assertEqual(facts[0]["revision"], revision)
             task_value["revision"] = "sha256:" + "2" * 64
-            stale, _ = DRIVER.merged_github_tasks(
+            stale, warnings = DRIVER.merged_github_tasks(
                 "acme/spec", {}, "fixture", "7", "main", None, [task_value]
             )
             self.assertEqual(stale, [])
+            self.assertTrue(any("pull/8" in warning for warning in warnings))
+
+    def test_the_walk_binds_completion_to_the_admitted_task_revision(self) -> None:
+        """A stale-revision pull request reached through the walk proves nothing.
+
+        The walk narrows where candidates come from; it never widens what
+        counts. A pull request linked to the task's own sub-issue, merged, and
+        on the right base and head still fails to complete the task when its
+        marker names a pre-edit revision.
+        """
+        revision = "sha256:" + "1" * 64
+        task_value = {
+            "id": "task-1",
+            "kind": "implementation",
+            "revision": revision,
+            "brief": {
+                "issue": {
+                    "number": "8",
+                    "url": "https://github.com/acme/spec/issues/8",
+                }
+            },
+        }
+        branch = DRIVER.stable_publish_branch("fixture", "7", "task-1", revision)
+        walk = {
+            8: {
+                "number": 8,
+                "state": "open",
+                "url": "https://github.com/acme/spec/issues/8",
+                "comments": [],
+                "pullRequests": [
+                    {
+                        "url": "https://github.com/acme/spec/pull/8",
+                        "body": DRIVER.pull_request_marker(
+                            "fixture", "7", "task-1", revision
+                        ),
+                        "merged": True,
+                        "baseRefName": "main",
+                        "headRefName": branch,
+                        "mergeCommit": {"oid": "a" * 40},
+                    },
+                    {
+                        "url": "https://github.com/acme/spec/pull/9",
+                        "body": DRIVER.pull_request_marker("fixture", "7", "task-1"),
+                        "merged": False,
+                        "baseRefName": "main",
+                        "headRefName": branch,
+                        "mergeCommit": {"oid": "b" * 40},
+                    },
+                ],
+            }
+        }
+        facts, warnings = DRIVER.merged_github_tasks(
+            "acme/spec", {}, "fixture", "7", "main", None, [task_value], walk
+        )
+        self.assertEqual([fact["taskId"] for fact in facts], ["task-1"])
+        self.assertEqual(facts[0]["revision"], revision)
+        self.assertEqual(warnings, [])
+
+        # The graph was edited after that pull request merged: the task now
+        # carries a different revision, so its stable branch and marker moved.
+        stale_task = dict(task_value, revision="sha256:" + "2" * 64)
+        stale, warnings = DRIVER.merged_github_tasks(
+            "acme/spec", {}, "fixture", "7", "main", None, [stale_task], walk
+        )
+        self.assertEqual(stale, [])
+        self.assertEqual(
+            warnings,
+            [
+                "ignored https://github.com/acme/spec/pull/8: its campaign marker "
+                "names no task in the witnessed worklist"
+            ],
+        )
 
     def test_issue_campaign_checkbox_repair_and_closeout_are_separate(self) -> None:
         tasks = [
@@ -1368,6 +1511,321 @@ class GitHubForgeTests(unittest.TestCase):
         self.assertIn(["gh", "issue", "close", "1", "--repo", "acme/spec"], commands)
         comment = next(command for command in commands if command[:3] == ["gh", "issue", "comment"])
         self.assertIn(digest, comment[-1])
+
+
+class NativeSubIssueTests(unittest.TestCase):
+    """The native read path: one walk, per-task threads, no written projection."""
+
+    MANIFEST_TASKS = [
+        {
+            "id": "task-1",
+            "kind": "implementation",
+            "issue": 8,
+            "dependencies": [],
+            "conflictDomains": ["src/one"],
+        },
+        {
+            "id": "task-2",
+            "kind": "implementation",
+            "issue": 9,
+            "dependencies": [],
+            "conflictDomains": ["src/two"],
+        },
+    ]
+
+    def manifest(self, checkout: Path) -> dict[str, object]:
+        return {
+            "schemaVersion": 1,
+            "name": "fixture",
+            "repository": repository_config(checkout, "github"),
+            "maxTasks": 2,
+            "maxParallel": 2,
+            "driverRuntimeMaxSec": 900,
+            "runtimeMaxSec": 3600,
+            "pool": "campaign",
+            "agent": {
+                "adapter": "codex",
+                "argv": ["read the admitted brief"],
+                "priority": "low",
+                "runtimeMaxSec": 900,
+                "approvalPolicy": "never",
+                "sandboxPolicy": "danger-full-access",
+            },
+            "gates": [
+                {
+                    "kind": "command",
+                    "id": "tests",
+                    "preflightArgv": ["true"],
+                    "argv": ["true"],
+                    "runtimeMaxSec": 60,
+                }
+            ],
+            "tasks": self.MANIFEST_TASKS,
+        }
+
+    def subissues(self) -> list[dict[str, object]]:
+        return [
+            {
+                "number": number,
+                "title": f"Task {index + 1}",
+                "body": f"Implement task {index + 1}.",
+                "state": "open",
+                "html_url": f"https://github.com/acme/spec/issues/{number}",
+                "updated_at": "2026-08-01T12:00:00Z",
+            }
+            for index, number in enumerate((8, 9))
+        ]
+
+    def fixture(self, checkout: Path) -> tuple[dict[str, object], dict[str, object]]:
+        manifest = self.manifest(checkout)
+        subissues = self.subissues()
+        master_body = (
+            f"{DRIVER.CAMPAIGN_BEGIN}\n```json\n"
+            f"{json.dumps(manifest)}\n```\n{DRIVER.CAMPAIGN_END}\n\n"
+            f"{DRIVER.WORKLIST_BEGIN}\n\n{DRIVER.WORKLIST_END}\n"
+        )
+        _, references, normalized = DRIVER.forge_manifest(manifest)
+        digest = DRIVER.canonical_sha256(
+            {
+                "manifest": normalized,
+                "tasks": [
+                    {
+                        "number": reference["issue"],
+                        "title": subissues[index]["title"],
+                        "body": subissues[index]["body"],
+                    }
+                    for index, reference in enumerate(references)
+                ],
+            }
+        )
+        state = {
+            "actor": "tally-bot",
+            "master": {
+                "number": 7,
+                "state": "open",
+                "html_url": "https://github.com/acme/spec/issues/7",
+                "body": master_body,
+                "updated_at": "2026-08-01T12:00:00Z",
+            },
+            "subIssues": subissues,
+            "walk": [self.walk_node(8), self.walk_node(9)],
+            "comments": [],
+            "issueComments": [],
+            "calls": [],
+        }
+        brief = {
+            "repository": "acme/spec",
+            "issue": issue(),
+            "worklist": {"kind": "github-issue", "graphDigest": digest},
+            "capabilities": {"subIssueWalk": True},
+        }
+        return state, brief
+
+    @staticmethod
+    def walk_node(
+        number: int,
+        *,
+        state: str = "OPEN",
+        pulls: list[dict[str, object]] | None = None,
+        comments: list[dict[str, object]] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "number": number,
+            "state": state,
+            "url": f"https://github.com/acme/spec/issues/{number}",
+            "closedByPullRequestsReferences": {"nodes": pulls or []},
+            "comments": {"nodes": comments or []},
+        }
+
+    @staticmethod
+    def machine_comment(number: int, body: str) -> dict[str, object]:
+        return {
+            "url": f"https://github.com/acme/spec/issues/{number}#machine",
+            "body": body,
+            "author": {"login": "tally-bot"},
+        }
+
+    def test_a_hand_closed_sub_issue_is_an_anomaly_not_completion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            state, brief = self.fixture(checkout)
+            state["walk"] = [self.walk_node(8, state="CLOSED"), self.walk_node(9)]
+            with FakeGitHub(root, state) as github:
+                result = DRIVER.action_reconcile(brief)
+            self.assertEqual(result["merged"], [])
+            self.assertIn("task-1", result["remaining"])
+            self.assertIn("task-1", [task["id"] for task in result["frontier"]])
+            self.assertEqual(
+                result["anomalies"],
+                [
+                    {
+                        "kind": "closed-without-merged-proof",
+                        "taskId": "task-1",
+                        "issue": "8",
+                        "url": "https://github.com/acme/spec/issues/8",
+                        "detail": (
+                            "sub-issue #8 is closed but task 'task-1' holds no "
+                            "revision-valid merged pull request; closing a "
+                            "sub-issue by hand does not complete a task"
+                        ),
+                    }
+                ],
+            )
+            # Native mode writes no projection at all: no comment, and the
+            # master's checkbox list is left exactly as authored.
+            final = github.state()
+            self.assertEqual(final["comments"], [])
+            self.assertEqual(final["master"]["body"], state["master"]["body"])
+
+    def test_machine_receipts_follow_the_task_sub_issue_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            state, brief = self.fixture(checkout)
+
+            def diagnosis(task_id: str, attempt: int) -> str:
+                marker = DRIVER.diagnosis_marker("fixture", "7", task_id, attempt)
+                heading = DRIVER.diagnosis_heading(task_id, attempt)
+                return f"{marker}\n\n{heading}\n\nsteering for {task_id}"
+
+            state["walk"] = [
+                self.walk_node(
+                    8, comments=[self.machine_comment(8, diagnosis("task-1", 1))]
+                ),
+                self.walk_node(9),
+            ]
+            # A pre-#307 receipt for the same task still sits on the master.
+            state["issueComments"] = [
+                {
+                    "body": diagnosis("task-1", 1),
+                    "html_url": "https://github.com/acme/spec/issues/7#legacy",
+                    "user": {"login": "tally-bot"},
+                }
+            ]
+            with FakeGitHub(root, state):
+                result = DRIVER.action_reconcile(brief)
+            self.assertEqual(
+                [(item["taskId"], item["comment"]) for item in result["diagnoses"]],
+                [("task-1", "https://github.com/acme/spec/issues/8#machine")],
+            )
+            self.assertTrue(
+                any(
+                    "master-thread machine diagnosis for 'task-1'" in warning
+                    for warning in result["warnings"]
+                )
+            )
+
+    def test_steering_and_retry_receipts_post_on_the_task_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            state = {"actor": "tally-bot", "comments": [], "calls": []}
+            base = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "repositoryConfig": repository_config(checkout, "github"),
+                "issue": issue(),
+                "taskId": "task-1",
+                "capabilities": {"subIssueWalk": True},
+                "taskIssue": {
+                    "number": "8",
+                    "url": "https://github.com/acme/spec/issues/8",
+                },
+            }
+            with FakeGitHub(root, state) as github:
+                steered = DRIVER.action_steer(
+                    {**base, "attempt": 1, "diagnosis": "narrow the failing gate"}
+                )
+                retried = DRIVER.action_retry(
+                    {**base, "stage": "prep", "detail": "the lane vanished"}
+                )
+                # Reading the same thread back returns exactly what was posted,
+                # so a retry brief sees its own task's steering history.
+                replayed = DRIVER.action_steer(
+                    {**base, "attempt": 1, "diagnosis": "narrow the failing gate"}
+                )
+            self.assertTrue(steered["posted"])
+            self.assertTrue(retried["posted"])
+            self.assertFalse(replayed["posted"])
+            self.assertEqual(replayed["comment"], steered["comment"])
+            final = github.state()
+            self.assertEqual(
+                [call[2] for call in final["calls"] if call[:2] == ["issue", "comment"]],
+                ["8", "8"],
+            )
+            self.assertEqual(final.get("issueComments", []), [])
+            self.assertEqual(len(final["threadComments"]["8"]), 2)
+
+    def test_a_merging_pass_posts_no_progress_comment_in_native_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            git(checkout, "switch", "--quiet", "-c", "feature")
+            (checkout / "feature.txt").write_text("feature\n", encoding="utf-8")
+            git(checkout, "add", "feature.txt")
+            git(checkout, "commit", "--quiet", "-m", "feature")
+            head = git(checkout, "rev-parse", "HEAD")
+            git(checkout, "push", "--quiet", "origin", "feature")
+            git(checkout, "switch", "--quiet", "main")
+            git(checkout, "merge", "--quiet", "--no-ff", "--no-edit", "feature")
+            merge_commit = git(checkout, "rev-parse", "HEAD")
+            git(checkout, "push", "--quiet", "origin", "main")
+
+            master_body = (
+                f"{DRIVER.WORKLIST_BEGIN}\n"
+                f"- [ ] {DRIVER.TASK_MARKER_PREFIX}task-1 --> #8 — Task 1\n"
+                f"{DRIVER.WORKLIST_END}\n"
+            )
+            state = {
+                "actor": "tally-bot",
+                "master": {"number": 7, "state": "open", "body": master_body},
+                "prView": {
+                    "state": "MERGED",
+                    "mergeCommit": {"oid": merge_commit},
+                    "baseRefName": "main",
+                    "headRefName": "feature",
+                    "headRefOid": head,
+                },
+                "comments": [],
+                "calls": [],
+            }
+            data = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "issue": issue(),
+                "task": {
+                    **task("task-1"),
+                    "title": "Task 1",
+                    "brief": {
+                        "issue": {
+                            "number": "8",
+                            "url": "https://github.com/acme/spec/issues/8",
+                        },
+                        "body": "Implement task 1.",
+                    },
+                },
+            }
+            config = DRIVER.repo_config(repository_config(checkout, "github"))
+            integration = {
+                "pullRequest": "https://github.com/acme/spec/pull/1",
+                "branch": "feature",
+                "baseRev": git(checkout, "rev-parse", "origin/main"),
+                "head": head,
+            }
+            with FakeGitHub(root, state) as github:
+                DRIVER.merge_github(data, config, integration, {"subIssueWalk": True})
+                native = github.state()
+                self.assertEqual(native["comments"], [])
+                self.assertIn("- [ ] ", native["master"]["body"])
+
+                DRIVER.merge_github(data, config, integration, {"subIssueWalk": False})
+                degraded = github.state()
+                self.assertEqual(degraded["comments"], [])
+                self.assertIn(
+                    f"- [x] {DRIVER.TASK_MARKER_PREFIX}task-1 -->",
+                    degraded["master"]["body"],
+                )
 
 
 class LaneLifecycleTests(unittest.TestCase):

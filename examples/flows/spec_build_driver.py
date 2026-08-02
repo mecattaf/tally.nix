@@ -921,6 +921,40 @@ def campaign_issue(value: Any) -> dict[str, str]:
     return {"number": number, "url": url}
 
 
+def subissue_number(task: dict[str, Any]) -> int:
+    """The native sub-issue that carries this task's identity and thread."""
+    brief = task.get("brief")
+    issue = brief.get("issue") if isinstance(brief, dict) else None
+    number = issue.get("number") if isinstance(issue, dict) else None
+    if not isinstance(number, str) or not number.isdigit() or number.startswith("0"):
+        fail(f"task {task.get('id')!r} carries no native sub-issue number")
+    return int(number)
+
+
+def campaign_capabilities(value: Any) -> dict[str, bool]:
+    capabilities = object_exact(value, {"subIssueWalk"}, "capabilities")
+    return {
+        "subIssueWalk": required_bool(
+            capabilities.get("subIssueWalk"), "capabilities.subIssueWalk"
+        )
+    }
+
+
+def take_capabilities(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, bool]]:
+    """Split the arm-time capability record off an action brief.
+
+    Every action validates its brief against an exact key set, and a campaign
+    armed before the sub-issue probe existed carries no record at all. Absent
+    means degraded, which is the conservative direction: the checkbox
+    projection and the per-branch pull-request lookup, exactly as before native
+    sub-issues. Re-arming is what turns the native walk on.
+    """
+    if not isinstance(brief, dict) or "capabilities" not in brief:
+        return brief, {"subIssueWalk": False}
+    rest = {key: value for key, value in brief.items() if key != "capabilities"}
+    return rest, campaign_capabilities(brief["capabilities"])
+
+
 def diagnosis_marker(campaign: str, issue_number: str, task_id: str, attempt: int) -> str:
     return (
         "<!-- tally:spec-build:diagnosis:v1 "
@@ -1069,11 +1103,26 @@ def bound_public_diagnosis(value: str) -> str:
     return value[:width].rstrip() + PUBLIC_DIAGNOSIS_TRUNCATION
 
 
-def github_machine_comments(repository: str, issue_number: str) -> list[dict[str, Any]]:
-    actor = required_string(
+def github_actor() -> str:
+    return required_string(
         run(["gh", "api", "user", "--jq", ".login"]).stdout.strip(),
         "authenticated GitHub actor",
     )
+
+
+def machine_authored(comments: list[Any], actor: str) -> list[dict[str, Any]]:
+    return [
+        candidate
+        for candidate in comments
+        if isinstance(candidate, dict)
+        and isinstance(candidate.get("user"), dict)
+        and isinstance(candidate["user"].get("login"), str)
+        and candidate["user"]["login"].casefold() == actor.casefold()
+    ]
+
+
+def github_machine_comments(repository: str, issue_number: str) -> list[dict[str, Any]]:
+    actor = github_actor()
     viewed = run(
         [
             "gh",
@@ -1089,15 +1138,7 @@ def github_machine_comments(repository: str, issue_number: str) -> list[dict[str
         fail(f"gh issue comments returned invalid JSON: {error}")
     if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
         fail("gh issue comments pagination must return arrays")
-    comments = [candidate for page in pages for candidate in page]
-    return [
-        candidate
-        for candidate in comments
-        if isinstance(candidate, dict)
-        and isinstance(candidate.get("user"), dict)
-        and isinstance(candidate["user"].get("login"), str)
-        and candidate["user"]["login"].casefold() == actor.casefold()
-    ]
+    return machine_authored([candidate for page in pages for candidate in page], actor)
 
 
 def state_scope(campaign: str, issue_number: str) -> str:
@@ -1183,11 +1224,13 @@ def forge_campaign_state(
     campaign: str,
     issue_number: str,
     task_ids: set[str] | None = None,
+    threads: dict[str, list[dict[str, Any]]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], str | None, list[str]]:
     diagnoses: list[dict[str, Any]] = []
     retries: list[dict[str, Any]] = []
     escalations: list[str] = []
     warnings: list[str] = []
+    threaded = set(threads or {})
 
     def accept(kind: str, task_id: str) -> bool:
         # A worklist edit that renames or drops a task leaves receipts naming a
@@ -1201,8 +1244,18 @@ def forge_campaign_state(
         )
         return False
 
-    if config["forge"] == "github":
-        comments = github_machine_comments(repository, issue_number)
+    def ingest(
+        comments: list[dict[str, Any]],
+        *,
+        surface: str | None,
+    ) -> None:
+        """Parse machine receipts from one posting surface.
+
+        `surface` is the task whose sub-issue thread these comments came from,
+        or None for the campaign master. Receipt parsing follows the posting
+        surface: once a task owns a thread, a master receipt naming it is a
+        pre-#307 leftover, reported and ignored rather than double-counted.
+        """
         expected_escalation = escalation_marker(campaign, issue_number)
         for comment in comments:
             body = comment.get("body")
@@ -1211,60 +1264,60 @@ def forge_campaign_state(
             first_line = body.splitlines()[0]
             match = DIAGNOSIS_MARKER.fullmatch(first_line)
             retry_match = None if match is not None else RETRY_MARKER.fullmatch(first_line)
-            if match is not None:
-                marker_campaign, marker_issue, task_id, attempt_text = match.groups()
+            if match is not None or retry_match is not None:
+                kind = "diagnosis" if match is not None else "retry"
+                groups = (match or retry_match).groups()
+                marker_campaign, marker_issue, task_id, attempt_text = groups
                 if marker_campaign != campaign or marker_issue != issue_number:
                     continue
-                if not accept("diagnosis", task_id):
+                if surface is None and task_id in threaded:
+                    warnings.append(
+                        f"ignored a master-thread machine {kind} for {task_id!r}: "
+                        "task receipts live on the task sub-issue thread"
+                    )
+                    continue
+                if surface is not None and task_id != surface:
+                    warnings.append(
+                        f"ignored a machine {kind} for {task_id!r} found on the "
+                        f"sub-issue thread of {surface!r}"
+                    )
+                    continue
+                if not accept(kind, task_id):
                     continue
                 attempt = int(attempt_text)
-                heading = diagnosis_heading(task_id, attempt)
+                heading = (
+                    diagnosis_heading(task_id, attempt)
+                    if kind == "diagnosis"
+                    else retry_heading(task_id, attempt)
+                )
                 prefix = f"{first_line}\n\n{heading}\n\n"
                 if not body.startswith(prefix):
-                    fail(f"machine diagnosis for {task_id!r} has malformed content")
-                diagnoses.append(
+                    fail(f"machine {kind} for {task_id!r} has malformed content")
+                payload = "diagnosis" if kind == "diagnosis" else "reason"
+                (diagnoses if kind == "diagnosis" else retries).append(
                     {
                         "taskId": task_id,
                         "attempt": attempt,
                         "comment": required_string(
-                            comment.get("html_url"), "machine diagnosis comment URL"
+                            comment.get("html_url"), f"machine {kind} comment URL"
                         ),
-                        "diagnosis": required_text(
+                        payload: required_text(
                             body[len(prefix) :],
-                            f"machine diagnosis for {task_id!r}",
-                            MAX_DIAGNOSIS_CHARS,
+                            f"machine {kind} for {task_id!r}",
+                            MAX_DIAGNOSIS_CHARS if kind == "diagnosis" else MAX_RETRY_CHARS,
                         ),
                     }
                 )
-            elif retry_match is not None:
-                marker_campaign, marker_issue, task_id, attempt_text = retry_match.groups()
-                if marker_campaign != campaign or marker_issue != issue_number:
-                    continue
-                if not accept("retry", task_id):
-                    continue
-                attempt = int(attempt_text)
-                heading = retry_heading(task_id, attempt)
-                prefix = f"{first_line}\n\n{heading}\n\n"
-                if not body.startswith(prefix):
-                    fail(f"machine retry for {task_id!r} has malformed content")
-                retries.append(
-                    {
-                        "taskId": task_id,
-                        "attempt": attempt,
-                        "comment": required_string(
-                            comment.get("html_url"), "machine retry comment URL"
-                        ),
-                        "reason": required_text(
-                            body[len(prefix) :],
-                            f"machine retry for {task_id!r}",
-                            MAX_RETRY_CHARS,
-                        ),
-                    }
-                )
-            elif first_line == expected_escalation:
+            elif surface is None and first_line == expected_escalation:
+                # Escalation is campaign-wide and always stays on the master.
                 escalations.append(
                     required_string(comment.get("html_url"), "machine escalation comment URL")
                 )
+
+    if config["forge"] == "github":
+        ingest(github_machine_comments(repository, issue_number), surface=None)
+        for task_id in sorted(threaded):
+            ingest(threads[task_id], surface=task_id)
     else:
         prefix = local_state_prefix(campaign, issue_number)
         refs = local_remote_refs(config, f"{prefix}/*")
@@ -1391,6 +1444,16 @@ def pull_request_marker(
     )
 
 
+def checkpoint_identity(
+    campaign: str, task_id: str, source_sha256: str, base_rev: str
+) -> str:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_sha256):
+        fail("worklist source digest is not a lowercase SHA-256 identity")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", base_rev):
+        fail("checkpoint base revision must be a full Git object ID")
+    return f"{task_id}-{source_sha256.removeprefix('sha256:')}/{base_rev}"
+
+
 def checkpoint_ref(
     campaign: str,
     issue_number: str,
@@ -1398,18 +1461,37 @@ def checkpoint_ref(
     source_sha256: str,
     base_rev: str,
 ) -> str:
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_sha256):
-        fail("worklist source digest is not a lowercase SHA-256 identity")
-    digest = source_sha256.removeprefix("sha256:")
-    if not re.fullmatch(r"[0-9a-f]{40,64}", base_rev):
-        fail("checkpoint base revision must be a full Git object ID")
+    """Where a new checkpoint receipt is published.
+
+    Receipts live in the same hidden namespace as the campaign's other durable
+    state. The pre-#307 namespace was `refs/tags/`, which every clone of a
+    public target repository auto-fetches: a private campaign's checkpoint
+    ledger became part of the target's public surface. Hidden refs are served
+    on request and cloned by nobody.
+    """
+    identity = checkpoint_identity(campaign, task_id, source_sha256, base_rev)
+    return f"{local_state_prefix(campaign, issue_number)}/checkpoint/{identity}"
+
+
+def legacy_checkpoint_tag(
+    campaign: str,
+    issue_number: str,
+    task_id: str,
+    source_sha256: str,
+    base_rev: str,
+) -> str:
+    """The visible tag receipt published before the namespace moved.
+
+    Read for compatibility so a campaign already carrying tag receipts is not
+    re-executed; never written again.
+    """
+    identity = checkpoint_identity(campaign, task_id, source_sha256, base_rev)
     readable = re.sub(r"[^a-z0-9]+", "-", campaign.casefold()).strip("-")
     readable = (readable or "campaign")[:24].rstrip("-") or "campaign"
     campaign_identity = hashlib.sha256(campaign.encode()).hexdigest()[:12]
     return (
         "refs/tags/tally/spec-build/v1/"
-        f"{readable}-{campaign_identity}-issue-{issue_number}/"
-        f"{task_id}-{digest}/{base_rev}"
+        f"{readable}-{campaign_identity}-issue-{issue_number}/{identity}"
     )
 
 
@@ -1428,6 +1510,187 @@ def remote_ref_oid(checkout: Path, remote: str, reference: str) -> str | None:
     return fields[0]
 
 
+SUBISSUE_WALK_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      subIssues(first: 50, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          number
+          state
+          url
+          closedByPullRequestsReferences(first: 20, includeClosedPrs: true) {
+            nodes {
+              url
+              body
+              merged
+              baseRefName
+              headRefName
+              mergeCommit { oid }
+            }
+          }
+          comments(last: 100) {
+            nodes { url body author { login } }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+# The parent's sub-issue ceiling is 100 and `tally campaign project` caps a
+# manifest at that number, so two pages of 50 always cover an admitted graph.
+# A third page means the parent grew outside the campaign and the pass refuses
+# to reason from a partial walk.
+MAX_SUBISSUE_WALK_PAGES = 2
+
+
+def subissue_walk(repository: str, issue_number: str) -> dict[int, dict[str, Any]]:
+    """Read every sub-issue of the campaign parent in one bounded query.
+
+    This narrows *where* completion candidates come from — a pull request has
+    to be linked to the task's own sub-issue — and never what counts as proof.
+    `pullRequest.merged` plus the revision-bound body marker plus the existing
+    base/head/merge-commit validation remain the whole oracle.
+    """
+    owner, _, name = repository.partition("/")
+    actor = github_actor()
+    nodes: dict[int, dict[str, Any]] = {}
+    cursor: str | None = None
+    for _ in range(MAX_SUBISSUE_WALK_PAGES):
+        arguments = [
+            "api",
+            "graphql",
+            "-f",
+            f"query={SUBISSUE_WALK_QUERY}",
+            "-F",
+            f"owner={owner}",
+            "-F",
+            f"name={name}",
+            "-F",
+            f"number={issue_number}",
+        ]
+        if cursor is not None:
+            arguments.extend(["-F", f"cursor={cursor}"])
+        payload = github_json(arguments, "campaign sub-issue walk")
+        if not isinstance(payload, dict):
+            fail("campaign sub-issue walk did not return an object")
+        connection = payload.get("data")
+        for key in ("repository", "issue", "subIssues"):
+            connection = connection.get(key) if isinstance(connection, dict) else None
+        if not isinstance(connection, dict):
+            fail("campaign sub-issue walk returned no sub-issue connection")
+        page = connection.get("nodes")
+        if not isinstance(page, list):
+            fail("campaign sub-issue walk returned a malformed node list")
+        for index, candidate in enumerate(page):
+            if not isinstance(candidate, dict):
+                fail(f"campaign sub-issue walk node {index} is not an object")
+            number = candidate.get("number")
+            if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+                fail("campaign sub-issue walk returned an invalid sub-issue number")
+            if number in nodes:
+                fail(f"campaign sub-issue walk repeated sub-issue #{number}")
+            state = candidate.get("state")
+            if state not in {"OPEN", "CLOSED"}:
+                fail(f"campaign sub-issue #{number} has an unknown state")
+            pulls = []
+            references = candidate.get("closedByPullRequestsReferences")
+            reference_nodes = (
+                references.get("nodes") if isinstance(references, dict) else None
+            )
+            if not isinstance(reference_nodes, list):
+                fail(f"campaign sub-issue #{number} returned malformed pull requests")
+            for reference in reference_nodes:
+                if not isinstance(reference, dict):
+                    fail(f"campaign sub-issue #{number} returned a malformed reference")
+                pulls.append(reference)
+            comments = candidate.get("comments")
+            comment_nodes = comments.get("nodes") if isinstance(comments, dict) else None
+            if not isinstance(comment_nodes, list):
+                fail(f"campaign sub-issue #{number} returned malformed comments")
+            machine: list[dict[str, Any]] = []
+            for comment in comment_nodes:
+                if not isinstance(comment, dict):
+                    fail(f"campaign sub-issue #{number} returned a malformed comment")
+                author = comment.get("author")
+                login = author.get("login") if isinstance(author, dict) else None
+                machine.append(
+                    {
+                        "body": comment.get("body"),
+                        "html_url": comment.get("url"),
+                        "user": {"login": login} if isinstance(login, str) else None,
+                    }
+                )
+            nodes[number] = {
+                "number": number,
+                "state": "closed" if state == "CLOSED" else "open",
+                "url": candidate.get("url"),
+                "pullRequests": pulls,
+                "comments": machine_authored(machine, actor),
+            }
+        page_info = connection.get("pageInfo")
+        if not isinstance(page_info, dict):
+            fail("campaign sub-issue walk returned no page information")
+        if page_info.get("hasNextPage") is not True:
+            return nodes
+        cursor = required_string(page_info.get("endCursor"), "sub-issue walk cursor")
+    fail(
+        "campaign parent carries more sub-issues than the 100-task cap admits; "
+        "the walk refuses to reconcile from a partial page"
+    )
+    raise AssertionError("unreachable")
+
+
+def normalized_pull_request(value: Any) -> dict[str, Any] | None:
+    """Project a REST pull request onto the field names the walk returns."""
+    if not isinstance(value, dict):
+        return None
+    base = value.get("base")
+    head = value.get("head")
+    merged = isinstance(value.get("merged_at"), str)
+    state = value.get("state")
+    return {
+        "url": value.get("html_url"),
+        "body": value.get("body"),
+        "merged": merged,
+        "state": "MERGED" if merged else str(state).upper(),
+        "baseRefName": base.get("ref") if isinstance(base, dict) else None,
+        "headRefName": head.get("ref") if isinstance(head, dict) else None,
+        "headRefOid": head.get("sha") if isinstance(head, dict) else None,
+        "mergeCommit": {"oid": value.get("merge_commit_sha")},
+    }
+
+
+def pull_requests_by_head(
+    repository: str, branch: str, state: str, limit: int
+) -> list[dict[str, Any]]:
+    """Look a campaign's stable publish branch up directly on the forge.
+
+    The stable head ref is a durable lookup key. Reading through it, rather
+    than through a forge-wide recent-pull-request scan, is what keeps campaign
+    proof from ageing out of a window nobody controls.
+    """
+    owner, _, _ = repository.partition("/")
+    listed = github_json(
+        [
+            "api",
+            f"repos/{repository}/pulls?head={owner}:{branch}"
+            f"&state={state}&per_page={limit}",
+        ],
+        f"pull requests for {branch!r}",
+    )
+    if not isinstance(listed, list):
+        fail(f"pull request lookup for {branch!r} must return an array")
+    candidates = []
+    for value in listed:
+        candidate = normalized_pull_request(value)
+        if candidate is not None:
+            candidates.append(candidate)
+    return candidates
+
+
 def merged_github_tasks(
     repository: str,
     config: dict[str, Any],
@@ -1436,29 +1699,8 @@ def merged_github_tasks(
     base_branch: str,
     base_rev: str | None,
     tasks: list[dict[str, Any]],
+    walk: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, str]], list[str]]:
-    fields = "url,body,baseRefName,headRefName,mergeCommit"
-    viewed = run(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--repo",
-            repository,
-            "--state",
-            "merged",
-            "--limit",
-            "1000",
-            "--json",
-            fields,
-        ]
-    )
-    try:
-        candidates = json.loads(viewed.stdout)
-    except json.JSONDecodeError as error:
-        fail(f"gh pr list returned invalid JSON: {error}")
-    if not isinstance(candidates, list):
-        fail("gh pr list must return an array")
     facts: list[dict[str, str]] = []
     warnings: list[str] = []
     claimed_urls: set[str] = set()
@@ -1474,18 +1716,23 @@ def merged_github_tasks(
         f"<!-- tally:spec-build:v1 campaign={campaign} issue={issue_number} task=",
         f"<!-- tally:spec-build:v2 campaign={campaign} issue={issue_number} task=",
     )
-    for candidate in candidates:
-        if not isinstance(candidate, dict) or not isinstance(candidate.get("body"), str):
-            continue
-        body = candidate["body"]
-        if any(prefix in body for prefix in campaign_marker_prefixes) and not any(
-            marker in body for marker in markers.values()
-        ):
-            url = candidate.get("url")
-            identity = url if isinstance(url, str) and url else "an unidentifiable pull request"
-            warnings.append(
-                f"ignored {identity}: its campaign marker names no task in the witnessed worklist"
-            )
+
+    def unnamed_marker_warning(candidate: dict[str, Any]) -> str | None:
+        # A pull request carrying this campaign's marker for a revision the
+        # witnessed worklist no longer names is proof of nothing. Naming it is
+        # how a stale pre-edit pull request stays visible without counting.
+        body = candidate.get("body")
+        if not isinstance(body, str):
+            return None
+        if not any(prefix in body for prefix in campaign_marker_prefixes):
+            return None
+        if any(marker in body for marker in markers.values()):
+            return None
+        url = candidate.get("url")
+        identity = url if isinstance(url, str) and url else "an unidentifiable pull request"
+        return (
+            f"ignored {identity}: its campaign marker names no task in the witnessed worklist"
+        )
 
     def candidate_key(candidate: dict[str, Any]) -> str:
         url = candidate.get("url")
@@ -1540,72 +1787,38 @@ def merged_github_tasks(
         branch = stable_publish_branch(
             campaign, issue_number, task["id"], task_revision(task)
         )
-        matching = [
-            candidate
-            for candidate in candidates
-            if isinstance(candidate, dict)
-            and isinstance(candidate.get("body"), str)
-            and marker in candidate["body"]
+        if walk is None:
+            candidates = pull_requests_by_head(repository, branch, "closed", 20)
+        else:
+            node = walk.get(subissue_number(task))
+            if node is None:
+                fail(
+                    f"campaign sub-issue walk returned no sub-issue for task {task['id']!r}"
+                )
+            candidates = node["pullRequests"]
+        # A closed pull request that never merged proves nothing, in either
+        # read path: `merged` stays the only completion oracle.
+        candidates = [
+            candidate for candidate in candidates if candidate.get("merged") is True
         ]
 
         valid: list[dict[str, str]] = []
         seen_candidates: set[str] = set()
-        for candidate in matching:
+        for candidate in candidates:
             key = candidate_key(candidate)
             if key in seen_candidates:
                 continue
             seen_candidates.add(key)
+            if not isinstance(candidate.get("body"), str) or marker not in candidate["body"]:
+                warning = unnamed_marker_warning(candidate)
+                if warning is not None:
+                    warnings.append(warning)
+                continue
             fact, warning = validated_candidate(candidate, task["id"], branch)
             if warning is not None:
                 warnings.append(warning)
             if fact is not None:
                 valid.append(fact)
-
-        # The stable head ref remains a durable lookup key even after this
-        # campaign's PR ages out of the forge-wide recent-PR window. Query it
-        # when the broad list supplied no usable proof, including when a quoted
-        # or retargeted marker was ignored above.
-        if not valid:
-            by_branch = run(
-                [
-                    "gh",
-                    "pr",
-                    "list",
-                    "--repo",
-                    repository,
-                    "--head",
-                    branch,
-                    "--state",
-                    "merged",
-                    "--limit",
-                    "2",
-                    "--json",
-                    fields,
-                ]
-            )
-            try:
-                branch_candidates = json.loads(by_branch.stdout)
-            except json.JSONDecodeError as error:
-                fail(f"gh pr list for {branch!r} returned invalid JSON: {error}")
-            if not isinstance(branch_candidates, list):
-                fail(f"gh pr list for {branch!r} must return an array")
-            branch_matching = [
-                candidate
-                for candidate in branch_candidates
-                if isinstance(candidate, dict)
-                and isinstance(candidate.get("body"), str)
-                and marker in candidate["body"]
-            ]
-            for candidate in branch_matching:
-                key = candidate_key(candidate)
-                if key in seen_candidates:
-                    continue
-                seen_candidates.add(key)
-                fact, warning = validated_candidate(candidate, task["id"], branch)
-                if warning is not None:
-                    warnings.append(warning)
-                if fact is not None:
-                    valid.append(fact)
         if len(valid) > 1:
             fail(f"multiple merged pull requests claim campaign task {task['id']!r}")
         if not valid:
@@ -1694,6 +1907,14 @@ def completed_checkpoint_tasks(
             campaign, issue_number, task["id"], source["sha256"], base_rev
         )
         target = remote_ref_oid(checkout, remote, reference)
+        if target is None:
+            # Compatibility: a campaign that already published a visible tag
+            # receipt is honored where it stands, so the namespace move never
+            # re-executes a checkpoint that already passed.
+            reference = legacy_checkpoint_tag(
+                campaign, issue_number, task["id"], source["sha256"], base_rev
+            )
+            target = remote_ref_oid(checkout, remote, reference)
         if target is None:
             continue
         git(checkout, "fetch", "--no-tags", remote, reference)
@@ -1927,7 +2148,43 @@ def checkpoint_deferrals(
     return deferrals
 
 
+def closed_subissue_anomalies(
+    walk: dict[int, dict[str, Any]],
+    tasks: list[dict[str, Any]],
+    completed_ids: set[str],
+) -> list[dict[str, Any]]:
+    """A sub-issue closed with no merged proof is a loud anomaly, not progress.
+
+    A sub-issue is human-clickable, so closure carries no authority at all;
+    `pullRequest.merged` (or the checkpoint completion ref) stays the only
+    oracle. The task remains incomplete and the closure is surfaced rather than
+    filed as a reconciler warning nobody reads.
+    """
+    anomalies: list[dict[str, Any]] = []
+    for task in tasks:
+        if task["id"] in completed_ids:
+            continue
+        node = walk.get(subissue_number(task))
+        if node is None or node["state"] != "closed":
+            continue
+        anomalies.append(
+            {
+                "kind": "closed-without-merged-proof",
+                "taskId": task["id"],
+                "issue": str(node["number"]),
+                "url": task["brief"]["issue"]["url"],
+                "detail": (
+                    f"sub-issue #{node['number']} is closed but task {task['id']!r} "
+                    "holds no revision-valid merged pull request; closing a sub-issue "
+                    "by hand does not complete a task"
+                ),
+            }
+        )
+    return anomalies
+
+
 def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
+    brief, capabilities = take_capabilities(brief)
     forge_native = isinstance(brief.get("worklist"), dict)
     if forge_native:
         data = object_exact(brief, {"repository", "issue", "worklist"}, "reconcile brief")
@@ -1970,6 +2227,14 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     base_rev = required_string(
         worklist["source"].get("revision"), "worklist source revision"
     )
+    # One bounded walk per pass feeds both halves of the forge read: which
+    # pull requests may be considered, and which machine receipts each task
+    # thread carries.
+    walk = (
+        subissue_walk(repository, issue["number"])
+        if forge_native and config["forge"] == "github" and capabilities["subIssueWalk"]
+        else None
+    )
     if config["forge"] == "github":
         merged, warnings = merged_github_tasks(
             repository,
@@ -1979,6 +2244,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             config["baseBranch"],
             base_rev,
             worklist["tasks"],
+            walk,
         )
     else:
         merged = merged_local_tasks(
@@ -2001,12 +2267,27 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     merged_ids = {fact["taskId"] for fact in merged}
     completed_ids = {fact["taskId"] for fact in merged + checkpoints}
     task_ids = {task["id"] for task in worklist["tasks"]}
+    anomalies = (
+        closed_subissue_anomalies(walk, worklist["tasks"], completed_ids)
+        if walk is not None
+        else []
+    )
+    threads = (
+        {
+            task["id"]: walk[subissue_number(task)]["comments"]
+            for task in worklist["tasks"]
+            if subissue_number(task) in walk
+        }
+        if walk is not None
+        else None
+    )
     diagnoses, retries, escalation, state_warnings = forge_campaign_state(
         repository,
         config,
         campaign,
         issue["number"],
         task_ids,
+        threads,
     )
     warnings.extend(state_warnings)
     order = {task["id"]: index for index, task in enumerate(worklist["tasks"])}
@@ -2046,13 +2327,17 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         if not task_conflicts(task, frontier):
             frontier.append(task)
     if forge_native:
-        sync_issue_checkboxes(
-            repository,
-            issue["number"],
-            worklist["masterBody"],
-            worklist["tasks"],
-            completed_ids,
-        )
+        # Native sub-issues make the parent's own progress bar the projection,
+        # so tally stops writing one. Without that capability the recomputed
+        # checkbox list is still the only progress a reader gets.
+        if walk is None:
+            sync_issue_checkboxes(
+                repository,
+                issue["number"],
+                worklist["masterBody"],
+                worklist["tasks"],
+                completed_ids,
+            )
         if not remaining:
             close_completed_issue_campaign(
                 repository,
@@ -2078,6 +2363,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         "quiescent": bool(remaining) and not frontier,
         "escalation": escalation,
         "complete": not remaining,
+        "anomalies": anomalies,
         "warnings": warnings,
     }
     if forge_native:
@@ -2158,20 +2444,45 @@ def action_diff(brief: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def steering_thread(
+    repository: str,
+    config: dict[str, Any],
+    data: dict[str, Any],
+    capabilities: dict[str, bool],
+    task_id: str,
+) -> tuple[str, dict[str, list[dict[str, Any]]] | None]:
+    """Where this task's machine receipts are posted and read back.
+
+    A native campaign gives every task its own sub-issue thread: the diagnosis
+    for task T lands on T's sub-issue and T's retry brief reads it back from
+    there. The master stays the campaign-wide channel.
+    """
+    issue = campaign_issue(data.get("issue"))
+    task_issue = data.get("taskIssue")
+    if not capabilities["subIssueWalk"] or task_issue is None:
+        return issue["number"], None
+    thread = campaign_issue(task_issue)
+    if config["forge"] != "github":
+        return thread["number"], None
+    return thread["number"], {
+        task_id: github_machine_comments(repository, thread["number"])
+    }
+
+
 def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
-    data = object_exact(
-        brief,
-        {
-            "campaign",
-            "repository",
-            "repositoryConfig",
-            "issue",
-            "taskId",
-            "attempt",
-            "diagnosis",
-        },
-        "steer brief",
-    )
+    brief, capabilities = take_capabilities(brief)
+    fields = {
+        "campaign",
+        "repository",
+        "repositoryConfig",
+        "issue",
+        "taskId",
+        "attempt",
+        "diagnosis",
+    }
+    if "taskIssue" in brief:
+        fields.add("taskIssue")
+    data = object_exact(brief, fields, "steer brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
         fail("campaign is not a safe component")
@@ -2186,8 +2497,11 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     attempt = data.get("attempt")
     if attempt not in {1, 2}:
         fail("attempt must equal 1 or 2")
+    thread_number, threads = steering_thread(
+        repository, config, data, capabilities, task_id
+    )
     existing, _, _, _ = forge_campaign_state(
-        repository, config, campaign, issue["number"]
+        repository, config, campaign, issue["number"], None, threads
     )
     task_receipts = [receipt for receipt in existing if receipt["taskId"] == task_id]
     if any(receipt["attempt"] == attempt for receipt in task_receipts):
@@ -2221,7 +2535,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
                 "gh",
                 "issue",
                 "comment",
-                issue["number"],
+                thread_number,
                 "--repo",
                 repository,
                 "--body",
@@ -2272,19 +2586,19 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
     read back from the forge like every other campaign fact; once it is spent
     the caller must treat the next fault as a failed attempt.
     """
-    data = object_exact(
-        brief,
-        {
-            "campaign",
-            "repository",
-            "repositoryConfig",
-            "issue",
-            "taskId",
-            "stage",
-            "detail",
-        },
-        "retry brief",
-    )
+    brief, capabilities = take_capabilities(brief)
+    fields = {
+        "campaign",
+        "repository",
+        "repositoryConfig",
+        "issue",
+        "taskId",
+        "stage",
+        "detail",
+    }
+    if "taskIssue" in brief:
+        fields.add("taskIssue")
+    data = object_exact(brief, fields, "retry brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
         fail("campaign is not a safe component")
@@ -2300,8 +2614,11 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
     if not re.fullmatch(r"[a-z][a-z0-9:._-]{0,63}", stage):
         fail("stage is not a safe campaign stage name")
     detail = required_text(data.get("detail"), "detail", MAX_RETRY_CHARS)
+    thread_number, threads = steering_thread(
+        repository, config, data, capabilities, task_id
+    )
     _, existing, _, _ = forge_campaign_state(
-        repository, config, campaign, issue["number"]
+        repository, config, campaign, issue["number"], None, threads
     )
     spent = len([receipt for receipt in existing if receipt["taskId"] == task_id])
     if spent >= MAX_MACHINE_RETRIES:
@@ -2326,7 +2643,7 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
                 "gh",
                 "issue",
                 "comment",
-                issue["number"],
+                thread_number,
                 "--repo",
                 repository,
                 "--body",
@@ -2375,6 +2692,8 @@ def compact_summary(value: str, maximum: int = 64) -> str:
 
 
 def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
+    capability_brief = brief
+    brief, _ = take_capabilities(brief)
     forge_native = isinstance(brief.get("worklist"), dict)
     if forge_native:
         data = object_exact(
@@ -2396,7 +2715,7 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
             },
             "escalate brief",
         )
-    reconciliation = action_reconcile(data)
+    reconciliation = action_reconcile(capability_brief)
     if reconciliation["complete"] or not reconciliation["quiescent"]:
         fail("campaign escalation requires an incomplete empty frontier")
     if reconciliation["escalation"] is not None:
@@ -3932,27 +4251,7 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
         task["id"],
         task_revision(task),
     )
-    existing = run(
-        [
-            "gh",
-            "pr",
-            "list",
-            "--repo",
-            repository,
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--json",
-            "url,body,baseRefName,headRefName,headRefOid,state",
-        ]
-    )
-    try:
-        candidates = json.loads(existing.stdout)
-    except json.JSONDecodeError as error:
-        fail(f"gh pr list returned invalid JSON: {error}")
-    if not isinstance(candidates, list):
-        fail("gh pr list must return an array")
+    candidates = pull_requests_by_head(repository, branch, "all", 2)
     if len(candidates) > 1:
         fail(f"multiple pull requests use stable task branch {branch!r}")
     if candidates:
@@ -4395,7 +4694,12 @@ def merge_local(data: dict[str, Any], config: dict[str, Any], integration: dict[
     return merge_commit
 
 
-def merge_github(data: dict[str, Any], config: dict[str, Any], integration: dict[str, Any]) -> str:
+def merge_github(
+    data: dict[str, Any],
+    config: dict[str, Any],
+    integration: dict[str, Any],
+    capabilities: dict[str, bool],
+) -> str:
     repository = required_string(data.get("repository"), "repository")
     url = required_string(integration.get("pullRequest"), "integration.pullRequest")
     checkout: Path = config["checkout"]
@@ -4462,13 +4766,19 @@ def merge_github(data: dict[str, Any], config: dict[str, Any], integration: dict
         != 0
     ):
         fail("current remote base does not contain the merged task head")
-    github_progress_comment(data, integration, merge_commit)
+    if not capabilities["subIssueWalk"]:
+        github_merge_checkbox_repair(data)
     return merge_commit
 
 
 def github_checkpoint_progress_comment(
     data: dict[str, Any], reference: str, revision: str, source_sha256: str
 ) -> None:
+    """The degraded checkpoint projection: one comment plus the checkbox.
+
+    Suppressed wherever the sub-issue walk is available, for the same reason
+    the per-merge comment is: the parent renders its own progress.
+    """
     repository = required_string(data.get("repository"), "repository")
     campaign = required_string(data.get("campaign"), "campaign")
     issue = campaign_issue(data.get("issue"))
@@ -4545,6 +4855,7 @@ def github_checkpoint_progress_comment(
 
 
 def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
+    brief, capabilities = take_capabilities(brief)
     data = object_exact(
         brief,
         {
@@ -4652,8 +4963,15 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
         check=False,
     ).returncode:
         fail("remote base diverged after the checkpoint command was witnessed")
-    reference = checkpoint_ref(
+    # A receipt already published under the pre-#307 visible tag namespace is
+    # honored where it stands; the hidden namespace is only ever written new.
+    legacy = legacy_checkpoint_tag(
         campaign, issue["number"], task_id, source_sha256, base_rev
+    )
+    reference = (
+        legacy
+        if remote_ref_oid(worktree, remote, legacy) == base_rev
+        else checkpoint_ref(campaign, issue["number"], task_id, source_sha256, base_rev)
     )
     existing = remote_ref_oid(worktree, remote, reference)
     if existing is not None and existing != base_rev:
@@ -4665,93 +4983,66 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
             fail(f"cannot create immutable checkpoint ref {reference!r}: {detail}")
     if remote_ref_oid(worktree, remote, reference) != base_rev:
         fail("checkpoint completion ref did not expose the witnessed base revision")
-    if config["forge"] == "github":
+    if config["forge"] == "github" and not capabilities["subIssueWalk"]:
         github_checkpoint_progress_comment(data, reference, base_rev, source_sha256)
     return {"taskId": task_id, "ref": reference, "revision": base_rev}
 
 
-def github_progress_comment(
-    data: dict[str, Any], integration: dict[str, Any], merge_commit: str
-) -> None:
+def github_merge_checkbox_repair(data: dict[str, Any]) -> None:
+    """Tick this task's worklist checkbox on the master issue.
+
+    The degraded projection only. A campaign whose forge serves the sub-issue
+    walk renders progress from the parent's own `subIssuesSummary`, so tally
+    writes neither this checkbox nor the per-merge progress comment that used
+    to accompany it.
+    """
     repository = required_string(data.get("repository"), "repository")
-    campaign = required_string(data.get("campaign"), "campaign")
     issue = campaign_issue(data.get("issue"))
     issue_number = issue["number"]
     task = data.get("task")
     if not isinstance(task, dict):
         fail("task must be an object")
     task_id = required_string(task.get("id"), "task.id")
-    task_title = required_string(task.get("title"), "task.title")
-    if isinstance(task.get("brief"), dict):
-        issue_view = github_json(
-            ["api", f"repos/{repository}/issues/{issue_number}"],
-            "campaign issue",
-        )
-        issue_body = issue_view.get("body") if isinstance(issue_view, dict) else None
-        if not isinstance(issue_body, str):
-            fail("campaign issue has no body while recording merge progress")
-        task_marker = f"{TASK_MARKER_PREFIX}{task_id} -->"
-        updated_lines: list[str] = []
-        found_line = False
-        for line in issue_body.splitlines(keepends=True):
-            if task_marker in line:
-                if found_line:
-                    fail(f"campaign worklist repeats task marker {task_id!r}")
-                found_line = True
-                line = re.sub(r"^- \[[ xX]\]", "- [x]", line)
-            updated_lines.append(line)
-        if not found_line:
-            fail(f"campaign worklist lacks task marker {task_id!r}")
-        updated_body = "".join(updated_lines)
-        if updated_body != issue_body:
-            run(
-                [
-                    "gh",
-                    "issue",
-                    "edit",
-                    issue_number,
-                    "--repo",
-                    repository,
-                    "--body-file",
-                    "-",
-                ],
-                input_text=updated_body,
-            )
-    marker = (
-        "<!-- tally:spec-build:v1 "
-        f"campaign={campaign} issue={issue_number} task={task_id} merged -->"
+    if not isinstance(task.get("brief"), dict):
+        return
+    issue_view = github_json(
+        ["api", f"repos/{repository}/issues/{issue_number}"],
+        "campaign issue",
     )
-    comments = run(
-        [
-            "gh",
-            "api",
-            "--paginate",
-            f"repos/{repository}/issues/{issue_number}/comments?per_page=100",
-            "--jq",
-            ".[].body",
-        ]
-    ).stdout
-    if marker not in comments:
-        body = (
-            f"{marker}\n"
-            f"Campaign task `{task_id}` ({task_title}) merged via "
-            f"{integration['pullRequest']}.\n\n"
-            f"Task ref: `{campaign}/{task_id}`\n\n"
-            f"Merge commit: `{merge_commit}`"
-        )
+    issue_body = issue_view.get("body") if isinstance(issue_view, dict) else None
+    if not isinstance(issue_body, str):
+        fail("campaign issue has no body while recording merge progress")
+    task_marker = f"{TASK_MARKER_PREFIX}{task_id} -->"
+    updated_lines: list[str] = []
+    found_line = False
+    for line in issue_body.splitlines(keepends=True):
+        if task_marker in line:
+            if found_line:
+                fail(f"campaign worklist repeats task marker {task_id!r}")
+            found_line = True
+            line = re.sub(r"^- \[[ xX]\]", "- [x]", line)
+        updated_lines.append(line)
+    if not found_line:
+        fail(f"campaign worklist lacks task marker {task_id!r}")
+    updated_body = "".join(updated_lines)
+    if updated_body != issue_body:
         run(
             [
                 "gh",
                 "issue",
-                "comment",
+                "edit",
                 issue_number,
                 "--repo",
                 repository,
-                "--body",
-                body,
-            ]
+                "--body-file",
+                "-",
+            ],
+            input_text=updated_body,
         )
+
+
 def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
+    brief, capabilities = take_capabilities(brief)
     data, config, worktree = publication_identity(brief, "merge")
     integration = object_exact(
         data.get("integration"),
@@ -4786,7 +5077,7 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
     if integration["branch"] != data["workspace"]["publishBranch"]:
         fail("integration.branch does not match workspace.publishBranch")
     if config["forge"] == "github":
-        merge_commit = merge_github(data, config, integration)
+        merge_commit = merge_github(data, config, integration, capabilities)
     else:
         merge_commit = merge_local(data, config, integration)
     return {

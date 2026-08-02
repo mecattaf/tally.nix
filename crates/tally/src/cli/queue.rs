@@ -494,6 +494,27 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
         counts["blocked"].as_u64().unwrap_or(0),
         counts["pending"].as_u64().unwrap_or(0)
     );
+
+    // Above the board, never inside it: a sub-issue closed with no merged
+    // proof is a contradiction between what the forge shows a reader and what
+    // the campaign can prove, and a reader who misses it debugs the wrong
+    // surface.
+    let anomalies = run["anomalies"].as_array().map_or(&[][..], Vec::as_slice);
+    if !anomalies.is_empty() {
+        println!();
+        println!(
+            "!! ANOMALIES: {} closed sub-issue(s) hold no merged proof; those tasks are NOT done",
+            anomalies.len()
+        );
+        for anomaly in anomalies {
+            println!(
+                "  !! {}  {}  {}",
+                compact_text(anomaly["taskRef"].as_str().unwrap_or("-")),
+                compact_text(anomaly["url"].as_str().unwrap_or("-")),
+                compact_text(anomaly["detail"].as_str().unwrap_or("-"))
+            );
+        }
+    }
     let tasks = run["tasks"]
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid run task table"))?;

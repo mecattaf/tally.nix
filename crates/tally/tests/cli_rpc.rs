@@ -314,6 +314,13 @@ impl RpcHandler for HumanQueryHandler {
                         {"taskRef": "crm/t01", "title": "Done task", "status": "done", "blockedBy": [], "pullRequest": "https://example.test/pr/1"},
                         {"taskRef": "crm/t02", "title": "Failed task", "status": "blocked", "blockedBy": [], "failureStage": "agent-t02"}
                     ],
+                    "anomalies": [{
+                        "kind": "closed-without-merged-proof",
+                        "taskRef": "crm/t02",
+                        "issue": "42",
+                        "url": "https://example.test/issues/42",
+                        "detail": "sub-issue #42 is closed but task 't02' holds no revision-valid merged pull request"
+                    }],
                     "currentNodes": [{
                         "taskUuid": "00000000-0000-4000-8000-000000000263",
                         "taskRef": "crm/t02", "ordinal": 3, "label": "cleanup-t02", "state": "running",
@@ -1017,9 +1024,18 @@ async fn query_run_human_view_includes_tasks_budget_and_failure_pointer() {
                 // Failure-tail indentation survives; the six-space frame plus
                 // the line's own four spaces.
                 "\n          at gate.rs:1",
+                // A hand-closed sub-issue is rendered above the board, not
+                // buried in the pass projection.
+                "!! ANOMALIES: 1 closed sub-issue(s) hold no merged proof",
+                "https://example.test/issues/42",
             ] {
                 assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
             }
+            let anomaly_line = text.find("!! ANOMALIES").expect("anomaly banner");
+            assert!(
+                anomaly_line < text.find("STATUS").expect("task table"),
+                "the anomaly banner must precede the task board:\n{text}"
+            );
             assert!(
                 !text.contains('\u{1b}'),
                 "adapter-controlled escape reached the terminal:\n{text:?}"
