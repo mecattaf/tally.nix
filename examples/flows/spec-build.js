@@ -1489,226 +1489,68 @@ function sweepDeferral(sweepNode) {
     }
   }
 
-  const laneOutcomes = await parallel(
-    reconciliation.frontier.map(task => () => (async () => {
-      const taskRef = taskRefFor(task.id);
-      const prepBrief = {
-        campaign: effective.campaign,
-        repository: args.repository,
-        repositoryConfig,
-        issue: args.issue,
-        runId: args.runId,
-        workspaceRoot: args.workspaceRoot,
-        task
+  // A checkpoint reads the accumulated tree, so it is executed after this
+  // pass's own merges rather than beside them. Sharing a frontier with a
+  // mergeable implementation task used to guarantee waste: the checkpoint
+  // recorded a receipt against the pre-merge base and the pass then moved that
+  // base out from under it, so the next reconcile found nothing and ran the
+  // whole checkpoint again. Prepared after the merges, the tested revision is
+  // the one the next pass reconciles.
+  const laneFor = task => (async () => {
+    const taskRef = taskRefFor(task.id);
+    const prepBrief = {
+      campaign: effective.campaign,
+      repository: args.repository,
+      repositoryConfig,
+      issue: args.issue,
+      runId: args.runId,
+      workspaceRoot: args.workspaceRoot,
+      task
+    };
+    const prepared = await driverNode(
+      "prep",
+      prepBrief,
+      `prep-${task.id}`,
+      `prep-${task.id}`,
+      workspaceSchema,
+      null,
+      true,
+      taskRef
+    );
+    if (!nodePassed(prepared)) {
+      return {
+        task,
+        failure: taskFailure(task, "prep", prepared, prepBrief, [], null, null)
       };
-      const prepared = await driverNode(
-        "prep",
-        prepBrief,
-        `prep-${task.id}`,
-        `prep-${task.id}`,
-        workspaceSchema,
-        null,
-        true,
-        taskRef
-      );
-      if (!nodePassed(prepared)) {
-        return {
-          task,
-          failure: taskFailure(task, "prep", prepared, prepBrief, [], null, null)
-        };
-      }
-      const workspace = workspaceFor(prepared.result);
+    }
+    const workspace = workspaceFor(prepared.result);
 
-      if (task.kind === "checkpoint") {
-        const taskBrief = checkpointBrief(task, prepared.result, reconciliation);
-        const checkpoint = await sh(task.argv, {
-          pools: ["campaign-control"],
-          priority: "low",
-          workspace,
-          env: { CAMPAIGN_TASK_ID: task.id },
-          runtimeMaxSec: task.runtimeMaxSec,
-          evidence: ["exit:0"],
-          brief: taskBrief,
-          key: `checkpoint-${task.id}`,
-          label: `checkpoint-${task.id}`,
-          settle: true,
-          taskRef
-        });
-        const gateOutputs = [
-          { phase: "checkpoint", gateId: task.id, kind: "checkpoint", node: checkpoint }
-        ];
-        if (checkpoint.verdict !== "pass") {
-          return {
-            task,
-            prepared: prepared.result,
-            failure: taskFailure(
-              task,
-              "checkpoint",
-              checkpoint,
-              taskBrief,
-              gateOutputs,
-              prepared.result,
-              prepared.result.baseRev
-            )
-          };
-        }
-        const recorded = await driverNode(
-          "checkpoint",
-          withCapabilities({
-            campaign: effective.campaign,
-            repository: args.repository,
-            repositoryConfig,
-            issue: args.issue,
-            task,
-            source: reconciliation.source,
-            workspace: prepared.result
-          }),
-          `checkpoint-record-${task.id}`,
-          `checkpoint-record-${task.id}`,
-          checkpointCompletionSchema,
-          workspace,
-          true,
-          taskRef
-        );
-        if (!nodePassed(recorded)) {
-          return {
-            task,
-            prepared: prepared.result,
-            failure: taskFailure(
-              task,
-              "checkpoint:record",
-              recorded,
-              taskBrief,
-              gateOutputs,
-              prepared.result,
-              prepared.result.baseRev
-            )
-          };
-        }
-        return { task, prepared: prepared.result, checkpoint: recorded.result };
-      }
-
-      const taskBrief = implementationBrief(task, prepared.result, reconciliation);
-      const agentSpec = applyAgentPolicies({
-        argv: effective.agent.argv,
-        adapter: effective.agent.adapter,
-        pools: ["campaign-agent"],
-        priority: effective.agent.priority,
+    if (task.kind === "checkpoint") {
+      const taskBrief = checkpointBrief(task, prepared.result, reconciliation);
+      const checkpoint = await sh(task.argv, {
+        pools: ["campaign-control"],
+        priority: "low",
         workspace,
+        env: { CAMPAIGN_TASK_ID: task.id },
+        runtimeMaxSec: task.runtimeMaxSec,
         evidence: ["exit:0"],
         brief: taskBrief,
-        key: `agent-${task.id}`,
-        label: `agent-${task.id}`,
+        key: `checkpoint-${task.id}`,
+        label: `checkpoint-${task.id}`,
+        settle: true,
         taskRef
       });
-      const agent = await job(agentSpec, { settle: true });
-      if (agent.verdict !== "pass") {
+      const gateOutputs = [
+        { phase: "checkpoint", gateId: task.id, kind: "checkpoint", node: checkpoint }
+      ];
+      if (checkpoint.verdict !== "pass") {
         return {
           task,
           prepared: prepared.result,
           failure: taskFailure(
             task,
-            "agent",
-            agent,
-            taskBrief,
-            [],
-            prepared.result,
-            prepared.result.baseRev
-          )
-        };
-      }
-
-      const ownership = await driverNode(
-        "ownership",
-        {
-          task,
-          domainsRequired,
-          workspace: prepared.result
-        },
-        `ownership-${task.id}`,
-        `ownership-${task.id}`,
-        ownershipSchema,
-        workspace,
-        true,
-        taskRef
-      );
-      if (!nodePassed(ownership)) {
-        return {
-          task,
-          prepared: prepared.result,
-          failure: taskFailure(
-            task,
-            "ownership",
-            ownership,
-            taskBrief,
-            [
-              {
-                phase: "ownership",
-                gateId: "conflict-domains",
-                kind: "ownership",
-                node: ownership
-              }
-            ],
-            prepared.result,
-            prepared.result.baseRev
-          )
-        };
-      }
-
-      const constraintResults = [];
-      const gateOutputs = [];
-      for (const gate of effective.gates) {
-        const gated = await runGate(task, gate, workspace, "gate");
-        gateOutputs.push({ phase: "gate", gateId: gate.id, kind: gate.kind, node: gated });
-        if (gated.verdict !== "pass") {
-          return {
-            task,
-            prepared: prepared.result,
-            failure: taskFailure(
-              task,
-              `gate:${gate.id}`,
-              gated,
-              taskBrief,
-              gateOutputs,
-              prepared.result,
-              prepared.result.baseRev
-            )
-          };
-        }
-        if (gate.kind === "forbidPaths") {
-          constraintResults.push(gated.result);
-        }
-      }
-
-      const publication = await driverNode(
-        "publish",
-        {
-          campaign: effective.campaign,
-          repository: args.repository,
-          repositoryConfig,
-          issue: args.issue,
-          runId: args.runId,
-          workspaceRoot: args.workspaceRoot,
-          task,
-          domainsRequired,
-          workspace: prepared.result,
-          constraints: constraintResults
-        },
-        `publish-${task.id}`,
-        `publish-${task.id}`,
-        publicationSchema,
-        workspace,
-        true,
-        taskRef
-      );
-      if (!nodePassed(publication)) {
-        return {
-          task,
-          prepared: prepared.result,
-          failure: taskFailure(
-            task,
-            "publish",
-            publication,
+            "checkpoint",
+            checkpoint,
             taskBrief,
             gateOutputs,
             prepared.result,
@@ -1716,23 +1558,186 @@ function sweepDeferral(sweepNode) {
           )
         };
       }
+      const recorded = await driverNode(
+        "checkpoint",
+        withCapabilities({
+          campaign: effective.campaign,
+          repository: args.repository,
+          repositoryConfig,
+          issue: args.issue,
+          task,
+          source: reconciliation.source,
+          workspace: prepared.result
+        }),
+        `checkpoint-record-${task.id}`,
+        `checkpoint-record-${task.id}`,
+        checkpointCompletionSchema,
+        workspace,
+        true,
+        taskRef
+      );
+      if (!nodePassed(recorded)) {
+        return {
+          task,
+          prepared: prepared.result,
+          failure: taskFailure(
+            task,
+            "checkpoint:record",
+            recorded,
+            taskBrief,
+            gateOutputs,
+            prepared.result,
+            prepared.result.baseRev
+          )
+        };
+      }
+      return { task, prepared: prepared.result, checkpoint: recorded.result };
+    }
+
+    const taskBrief = implementationBrief(task, prepared.result, reconciliation);
+    const agentSpec = applyAgentPolicies({
+      argv: effective.agent.argv,
+      adapter: effective.agent.adapter,
+      pools: ["campaign-agent"],
+      priority: effective.agent.priority,
+      workspace,
+      evidence: ["exit:0"],
+      brief: taskBrief,
+      key: `agent-${task.id}`,
+      label: `agent-${task.id}`,
+      taskRef
+    });
+    const agent = await job(agentSpec, { settle: true });
+    if (agent.verdict !== "pass") {
       return {
         task,
         prepared: prepared.result,
-        publication: publication.result,
-        constraints: constraintResults,
-        taskBrief,
-        gateOutputs
+        failure: taskFailure(
+          task,
+          "agent",
+          agent,
+          taskBrief,
+          [],
+          prepared.result,
+          prepared.result.baseRev
+        )
       };
-    })()),
-    { settle: true }
-  );
+    }
 
-  const lanes = laneOutcomes.map((outcome, index) => {
+    const ownership = await driverNode(
+      "ownership",
+      {
+        task,
+        domainsRequired,
+        repositoryConfig,
+        workspace: prepared.result
+      },
+      `ownership-${task.id}`,
+      `ownership-${task.id}`,
+      ownershipSchema,
+      workspace,
+      true,
+      taskRef
+    );
+    if (!nodePassed(ownership)) {
+      return {
+        task,
+        prepared: prepared.result,
+        failure: taskFailure(
+          task,
+          "ownership",
+          ownership,
+          taskBrief,
+          [
+            {
+              phase: "ownership",
+              gateId: "conflict-domains",
+              kind: "ownership",
+              node: ownership
+            }
+          ],
+          prepared.result,
+          prepared.result.baseRev
+        )
+      };
+    }
+
+    const constraintResults = [];
+    const gateOutputs = [];
+    for (const gate of effective.gates) {
+      const gated = await runGate(task, gate, workspace, "gate");
+      gateOutputs.push({ phase: "gate", gateId: gate.id, kind: gate.kind, node: gated });
+      if (gated.verdict !== "pass") {
+        return {
+          task,
+          prepared: prepared.result,
+          failure: taskFailure(
+            task,
+            `gate:${gate.id}`,
+            gated,
+            taskBrief,
+            gateOutputs,
+            prepared.result,
+            prepared.result.baseRev
+          )
+        };
+      }
+      if (gate.kind === "forbidPaths") {
+        constraintResults.push(gated.result);
+      }
+    }
+
+    const publication = await driverNode(
+      "publish",
+      {
+        campaign: effective.campaign,
+        repository: args.repository,
+        repositoryConfig,
+        issue: args.issue,
+        runId: args.runId,
+        workspaceRoot: args.workspaceRoot,
+        task,
+        domainsRequired,
+        gates: effective.gates,
+        workspace: prepared.result,
+        constraints: constraintResults
+      },
+      `publish-${task.id}`,
+      `publish-${task.id}`,
+      publicationSchema,
+      workspace,
+      true,
+      taskRef
+    );
+    if (!nodePassed(publication)) {
+      return {
+        task,
+        prepared: prepared.result,
+        failure: taskFailure(
+          task,
+          "publish",
+          publication,
+          taskBrief,
+          gateOutputs,
+          prepared.result,
+          prepared.result.baseRev
+        )
+      };
+    }
+    return {
+      task,
+      prepared: prepared.result,
+      publication: publication.result,
+      constraints: constraintResults,
+      taskBrief,
+      gateOutputs
+    };
+  })();
+  const settledLanes = (outcomes, tasks) => outcomes.map((outcome, index) => {
     if (outcome.ok) {
       return outcome.value;
     }
-    const task = reconciliation.frontier[index];
+    const task = tasks[index];
     return {
       task,
       failure: taskFailure(
@@ -1746,8 +1751,20 @@ function sweepDeferral(sweepNode) {
       )
     };
   });
+
+  const implementationFrontier = reconciliation.frontier.filter(
+    task => task.kind !== "checkpoint"
+  );
+  const checkpointFrontier = reconciliation.frontier.filter(
+    task => task.kind === "checkpoint"
+  );
+  const laneOutcomes = await parallel(
+    implementationFrontier.map(task => () => laneFor(task)),
+    { settle: true }
+  );
+
+  const lanes = settledLanes(laneOutcomes, implementationFrontier);
   const failures = lanes.filter(lane => lane.failure).map(lane => lane.failure);
-  const checkpoints = lanes.filter(lane => lane.checkpoint).map(lane => lane.checkpoint);
   const publications = lanes.filter(lane => lane.publication);
   const merged = [];
 
@@ -1833,6 +1850,7 @@ function sweepDeferral(sweepNode) {
         runId: args.runId,
         workspaceRoot: args.workspaceRoot,
         task,
+        domainsRequired,
         workspace: lane.prepared,
         integration: integration.result
       }),
@@ -1859,6 +1877,22 @@ function sweepDeferral(sweepNode) {
     }
     merged.push(merge.result);
   }
+
+  // Every merge this pass will make has been made, so a checkpoint lane now
+  // prepares on the tree the next reconcile will read and its receipt names a
+  // revision that reconcile can find.
+  const checkpointOutcomes = await parallel(
+    checkpointFrontier.map(task => () => laneFor(task)),
+    { settle: true }
+  );
+  const checkpointLanes = settledLanes(checkpointOutcomes, checkpointFrontier);
+  lanes.push(...checkpointLanes);
+  failures.push(
+    ...checkpointLanes.filter(lane => lane.failure).map(lane => lane.failure)
+  );
+  const checkpoints = checkpointLanes
+    .filter(lane => lane.checkpoint)
+    .map(lane => lane.checkpoint);
 
   const steerable = [];
   const machineryFaults = [];

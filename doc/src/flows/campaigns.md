@@ -728,14 +728,15 @@ if remaining is nonempty and frontier is empty:
 if implemented is empty, an implementation is in the frontier, and command gates exist:
   prepare an isolated worktree at current remote main
   -> run each command gate.preflightArgv -> clean up the preflight lane
-parallel(frontier):
-  implementation: prepare isolated worktree -> agent -> witness ownership
+parallel(implementation frontier):
+  prepare isolated worktree -> agent -> witness ownership
     -> each configured gate -> recheck ownership -> push stable task branch
     -> open/reuse PR
-  checkpoint: prepare isolated worktree -> run checkpoint argv
-    -> record content-and-exact-base-bound completion ref
 serial(successful publications): compare current base -> rebase if moved
   -> re-run each configured gate only on a changed rebased head -> merge
+parallel(checkpoint frontier, after this pass's merges):
+  prepare isolated worktree -> run checkpoint argv
+    -> record content-and-exact-base-bound completion ref
 parallel(machinery faults with retry budget left): marked retry comment
 parallel(remaining failed tasks): capture diff -> diagnosis agent
   -> marked steering comment
@@ -759,6 +760,15 @@ implementation admission probe. Because it validates the first frontier
 implementation's prepared environment, each preflight node carries that task's
 `taskRef`.
 
+A checkpoint lane is prepared after this pass's merges, not beside them. A
+checkpoint reads the accumulated tree and its receipt is bound to the exact
+revision tested, so a checkpoint sharing a frontier with a mergeable
+implementation task used to have the pass move the base out from under its own
+fresh receipt: the next reconciliation found nothing and re-ran the whole
+checkpoint. Prepared after the merges, the tested revision is the one the next
+pass reconciles. A checkpoint is still admitted to the frontier alongside
+implementation work, and unrelated outstanding work still defers its verdict.
+
 A checkpoint prepares the exact current remote base in its own worktree and
 runs its argv as an ordinary settled `campaign-control` node with `exit:0`
 evidence, the declared deadline, and the checkpoint's `taskRef`. On success the
@@ -766,9 +776,15 @@ driver verifies that `HEAD` is still the prepared base, no tracked file changed,
 and the prepared base still belongs to the current remote-base ancestry. It
 then publishes an immutable receipt for the exact revision that was tested,
 plus a progress comment where the degraded projection is in force. If the
-remote base advanced during validation,
-the receipt remains truthful historical evidence but is not complete for the
-next reconciliation; the checkpoint is prepared again on the newer base. A
+remote base advanced during validation, the receipt is still published — it
+remains truthful historical evidence and nothing will re-test that revision —
+but the lane then fails, because the receipt names a revision the next
+reconciliation will not read. That failure is the bound on the re-validation
+loop: a base branch advancing faster than a checkpoint runs would otherwise
+record, be ignored, and be re-run for ever while every pass reported progress.
+Failing spends the checkpoint's ordinary retry and steering budget and reaches
+escalation instead. Because a campaign's own merges all land before its
+checkpoint lanes prepare, only base movement from outside the pass trips it. A
 diverged or force-replaced base fails closed. The pass-wide continuation is
 written after every lane settles, including after a checkpoint failure has
 published machine steering; checkpoint recording adds no second retry loop.
@@ -780,6 +796,29 @@ The agent must leave a clean worktree with at least one commit descended from
 the prepared base. Ownership validation then fails before the more expensive
 project gates if any commit touched an undeclared path. Publication independently
 refuses dirty, empty, non-descendant, or newly unowned work.
+
+The path union walks lane history with `git log -m`, which splits a merge
+commit and attributes both of its sides to the lane. A lane that merged the
+base branch instead of rebasing onto it would therefore claim every path its
+siblings landed. Such a lane is rejected by its real cause — "rebase instead of
+merging the base into your lane" — rather than reported as an ownership
+violation on paths no task commit touched; `--first-parent` would hide the
+false positive and reopen the transient-path hole with it. A lane that did
+rebase onto the advanced base, the documented remediation for a red constraint,
+is resolved against that current base rather than the stale prepared one, so it
+owns only its own commits. The receipt keeps naming the base the lane was
+prepared and gated on, and the union narrows only onto a current base the lane
+demonstrably already contains, so nothing this resolution does widens what a
+lane may touch.
+
+Publication answers to the campaign's configured gates, not to the receipts it
+is handed: the witnessed `forbidPaths` sets are cross-checked by gate id
+against the configured ones and any drift fails by name. Re-running a stored
+receipt against itself would otherwise let a campaign whose patterns were
+widened between the gate run and publication publish against the superseded
+set. Integration applies the same rule to the ownership receipt's
+`domainsRequired` bit, which merge compares against the campaign's own
+parallelism rather than normalizing and trusting.
 Each task has a stable remote branch across passes and a run-local worktree lane,
 so a dead runner cannot make a later pass share a writable directory with an
 old child. Pass-exit cleanup reclaims every prepared lane, including failures;

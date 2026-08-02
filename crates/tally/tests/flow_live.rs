@@ -3097,12 +3097,17 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             );
             assert_eq!(failed_checkpoint["runtimeMaxSec"], 10);
             assert_eq!(failed_checkpoint["taskRef"], "fixture/phase-one-checkpoint");
+            // The checkpoint lane prepares after this pass's own merges, so it
+            // reads the tree task four just cleaned and is red on the steering
+            // clause instead of the marker. Its verdict is still deferred by
+            // the unrelated work this pass left outstanding, which is what the
+            // deferral assertions above witness.
             assert!(task_capture(
                 &daemon_paths,
                 failed_checkpoint["anchor"].as_str().unwrap(),
                 "phase-one-checkpoint"
             )
-            .contains("phase one checkpoint remains red"));
+            .contains("phase one checkpoint has no prior steering"));
 
             fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(

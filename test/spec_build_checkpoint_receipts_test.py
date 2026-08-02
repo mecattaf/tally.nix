@@ -275,22 +275,123 @@ class CheckpointReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(driver.DriverError, "changed branches"):
             driver.action_checkpoint(self.checkpoint_brief())
 
+    def advance_remote_base(self, name: str) -> str:
+        """Land one mainline commit from outside this checkout."""
+        advancer = self.clone_advancer_once()
+        (advancer / f"{name}.txt").write_text(f"{name}\n", encoding="utf-8")
+        git("add", "--all", cwd=advancer)
+        git("commit", "-m", f"fixture: {name}", cwd=advancer)
+        git("push", "origin", "main", cwd=advancer)
+        return git("rev-parse", "HEAD", cwd=advancer)
+
+    def clone_advancer_once(self) -> Path:
+        advancer = self.root / "advancer"
+        if not advancer.exists():
+            return self.clone_advancer()
+        git("pull", "--ff-only", cwd=advancer)
+        return advancer
+
+    def prepare_on(self, revision: str) -> dict[str, Any]:
+        """Prepare the checkpoint lane on a revision, as a fresh pass would."""
+        git("fetch", "origin", cwd=self.checkout)
+        git("reset", "--hard", revision, cwd=self.checkout)
+        brief = self.checkpoint_brief()
+        brief["workspace"]["baseRev"] = revision
+        return brief
+
     def test_checkpoint_records_tested_point_when_remote_base_moves_forward(self) -> None:
+        """The tested point is recorded, and recording it is not progress.
+
+        A receipt is read back under the revision the campaign reconciled, so a
+        base that already moved past the tested one leaves this receipt unread
+        and the checkpoint incomplete. Publishing it keeps the record truthful;
+        reporting it as an advance is what let a base branch moving faster than
+        the checkpoint runs keep a campaign looping for ever.
+        """
         advancer = self.clone_advancer()
         (advancer / "later.txt").write_text("later\n", encoding="utf-8")
         git("add", "later.txt", cwd=advancer)
         git("commit", "-m", "fixture: advance while checkpoint runs", cwd=advancer)
         git("push", "origin", "main", cwd=advancer)
 
-        recorded = driver.action_checkpoint(self.checkpoint_brief())
-        self.assertEqual(recorded["revision"], self.base_rev)
-        self.assertEqual(recorded["ref"], self.reference())
+        with self.assertRaisesRegex(
+            driver.DriverError, "moving faster than this checkpoint runs"
+        ):
+            driver.action_checkpoint(self.checkpoint_brief())
+
         self.assertEqual(
-            git("ls-remote", "origin", recorded["ref"], cwd=self.checkout).split()[0],
+            git("ls-remote", "origin", self.reference(), cwd=self.checkout).split()[0],
             self.base_rev,
         )
         current = driver.action_worklist(self.worklist_brief)
         self.assertEqual(self.completed(source=current["source"]), [])
+
+    def test_a_base_that_outruns_the_checkpoint_never_reports_progress(self) -> None:
+        """#297 f1: the re-validation loop is bounded rather than endless.
+
+        Every pass prepares on the current base and the base advances again
+        before the receipt lands. No pass may return a completion the campaign
+        can count, or the run reports `advanced`, posts a continuation, and
+        never escalates.
+        """
+        tested: list[str] = []
+        for index in range(3):
+            prepared = self.advance_remote_base(f"pass-{index}")
+            brief = self.prepare_on(prepared)
+            self.advance_remote_base(f"traffic-{index}")
+            with self.assertRaisesRegex(
+                driver.DriverError, "moving faster than this checkpoint runs"
+            ):
+                driver.action_checkpoint(brief)
+            tested.append(prepared)
+
+        for revision in tested:
+            reference = driver.checkpoint_ref(
+                "fixture",
+                "7",
+                "phase-checkpoint",
+                self.worklist["source"]["sha256"],
+                revision,
+            )
+            self.assertEqual(
+                git("ls-remote", "origin", reference, cwd=self.checkout).split()[0],
+                revision,
+                "the tested point stays recorded so nothing re-tests it",
+            )
+        current = driver.action_worklist(self.worklist_brief)
+        self.assertEqual(
+            self.completed(source=current["source"]),
+            [],
+            "not one of those recordings completes the checkpoint",
+        )
+
+    def test_a_checkpoint_prepared_after_the_passes_merges_is_honored(self) -> None:
+        """#297 f2: a checkpoint scheduled after this pass's merges counts.
+
+        Sharing a frontier with a mergeable implementation task used to
+        guarantee waste: the checkpoint recorded against the pre-merge base and
+        the pass then moved that base, so the next reconcile found nothing and
+        re-ran the whole checkpoint. The flow now prepares checkpoint lanes
+        after the pass's merges, and the tested revision is the one the next
+        pass reconciles.
+        """
+        merge_revision = self.advance_remote_base("task-1-merge")
+
+        recorded = driver.action_checkpoint(self.prepare_on(merge_revision))
+
+        self.assertEqual(recorded["revision"], merge_revision)
+        following = driver.action_worklist(self.worklist_brief)
+        self.assertEqual(following["source"]["revision"], merge_revision)
+        self.assertEqual(
+            self.completed(source=following["source"], merged_revision=merge_revision),
+            [
+                {
+                    "taskId": "phase-checkpoint",
+                    "ref": recorded["ref"],
+                    "revision": merge_revision,
+                }
+            ],
+        )
 
     def test_issue_checkpoint_binds_graph_digest_task_revision_and_base(self) -> None:
         brief = self.checkpoint_brief()

@@ -3917,11 +3917,79 @@ def normalize_forbid_paths_gate(value: Any, context: str) -> dict[str, Any]:
     return {"kind": "forbidPaths", "id": gate_id, "forbidPaths": patterns}
 
 
+def reject_merge_commits(worktree: Path, base_rev: str, head: str) -> None:
+    """A merge commit in a task lane makes the whole mainline look authored.
+
+    The path union walks lane history with `git log -m`, which splits a merge
+    and attributes both sides to the lane. A lane that merged the base branch
+    instead of rebasing onto it therefore claims every path its siblings landed
+    while it was live: the union cannot tell those paths from the task's own,
+    the ownership receipt misattributes authorship, and the lane fails on paths
+    nobody in the task touched. `--first-parent` would hide the false positive
+    and reopen the transient-path hole with it, so the lane is rejected by its
+    real cause instead.
+    """
+    listed = git(
+        worktree,
+        "rev-list",
+        "--merges",
+        "--end-of-options",
+        f"{base_rev}..{head}",
+        "--",
+    ).stdout.split()
+    if not listed:
+        return
+    preview = ", ".join(listed[:5])
+    if len(listed) > 5:
+        preview += f", and {len(listed) - 5} more"
+    fail(
+        f"task lane history contains {len(listed)} merge commit(s) ({preview}); "
+        "rebase instead of merging the base into your lane"
+    )
+
+
+def resolved_union_base(
+    worktree: Path, base_rev: str, head: str, base_ref: str | None
+) -> str:
+    """The revision a lane's path union is resolved against.
+
+    The prepared base goes stale the moment a sibling lane merges. A lane
+    rebased onto the advanced base — the documented remediation for a red
+    constraint — then carries every mainline commit between the two bases, and
+    a union taken from the prepared base claims their paths for the task. The
+    union is therefore resolved against the current base branch, but only where
+    the lane demonstrably already contains it: the current base must descend
+    from the prepared base and be an ancestor of the lane head. Every other
+    shape keeps the prepared base, so nothing this resolution does can widen
+    what a lane is allowed to touch.
+    """
+    if base_ref is None:
+        return base_rev
+    resolved = git(
+        worktree,
+        "rev-parse",
+        "--verify",
+        "--quiet",
+        "--end-of-options",
+        f"{base_ref}^{{commit}}",
+        check=False,
+    )
+    current = resolved.stdout.strip()
+    if resolved.returncode != 0 or not GIT_OID.fullmatch(current) or current == base_rev:
+        return base_rev
+    if git(worktree, "merge-base", "--is-ancestor", base_rev, current, check=False).returncode:
+        return base_rev
+    if git(worktree, "merge-base", "--is-ancestor", current, head, check=False).returncode:
+        return base_rev
+    return current
+
+
 def changed_paths_in_history(
     worktree: Path, base_rev: str, head: str, *, include_deletions: bool = False
 ) -> list[str]:
     base_rev = full_git_oid(base_rev, "base revision")
     head = full_git_oid(head, "head revision")
+    reject_merge_commits(worktree, base_rev, head)
     diff_filter = "ACDMTUXB" if include_deletions else "ACMTUXB"
     changed = git(
         worktree,
@@ -3983,6 +4051,7 @@ def enforce_conflict_domains(
     task: Any,
     expected_task_id: str,
     domains_required: bool,
+    base_ref: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(task, dict):
         fail("task must be an object")
@@ -3999,8 +4068,14 @@ def enforce_conflict_domains(
     )
     base_rev = full_git_oid(base_rev, "base revision")
     head = full_git_oid(head, "head revision")
+    # The receipt keeps naming the base this lane was prepared and gated on;
+    # only the union narrows, and only onto a current base the lane already
+    # contains.
     changed_paths = changed_paths_in_history(
-        worktree, base_rev, head, include_deletions=True
+        worktree,
+        resolved_union_base(worktree, base_rev, head, base_ref),
+        head,
+        include_deletions=True,
     )
     outside = (
         [
@@ -4032,8 +4107,11 @@ def enforce_conflict_domains(
 
 def action_ownership(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
-        brief, {"task", "domainsRequired", "workspace"}, "ownership brief"
+        brief,
+        {"task", "domainsRequired", "repositoryConfig", "workspace"},
+        "ownership brief",
     )
+    config = repo_config(data.get("repositoryConfig"))
     workspace = object_exact(
         data.get("workspace"),
         {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
@@ -4066,6 +4144,7 @@ def action_ownership(brief: dict[str, Any]) -> dict[str, Any]:
         data.get("task"),
         task_id,
         data.get("domainsRequired"),
+        f"{config['remote']}/{config['baseBranch']}",
     )
 
 
@@ -4176,6 +4255,64 @@ def normalize_constraint_results(value: Any, context: str) -> list[dict[str, Any
     return results
 
 
+def normalize_campaign_gates(value: Any, context: str) -> list[dict[str, Any]]:
+    """The campaign's configured gates, reduced to the path-policy ones.
+
+    Command gates are named and then dropped: they are witnessed by their own
+    job, carry no pattern set, and have nothing for publication to cross-check.
+    """
+    if not isinstance(value, list):
+        fail(f"{context} must be an array")
+    if len(value) > 16:
+        fail(f"{context} exceeds 16 gates")
+    gates: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, candidate in enumerate(value):
+        if not isinstance(candidate, dict):
+            fail(f"{context}[{index}] must be an object")
+        gate_id = required_string(candidate.get("id"), f"{context}[{index}].id", 80)
+        if gate_id in seen:
+            fail(f"{context} repeats gate id {gate_id!r}")
+        seen.add(gate_id)
+        if candidate.get("kind") == "forbidPaths":
+            gates.append(normalize_forbid_paths_gate(candidate, f"{context}[{index}]"))
+    return gates
+
+
+def enforce_configured_gates(
+    constraints: list[dict[str, Any]], gates: list[dict[str, Any]]
+) -> None:
+    """Publication answers to the configured gates, not to the receipts.
+
+    A constraint receipt carries the pattern set that was witnessed, and
+    publication re-runs it. Re-running a receipt against itself proves only
+    that the receipt is self-consistent: a campaign whose `forbidPaths` was
+    widened between the gate run and publication would publish against the
+    superseded set. The two are cross-checked by gate id and pattern set here
+    and drift fails by name, the same way #254 stopped the merge path from
+    trusting an upstream flag.
+    """
+    configured = {gate["id"]: gate["forbidPaths"] for gate in gates}
+    witnessed = {constraint["gateId"]: constraint["patterns"] for constraint in constraints}
+    for gate_id, patterns in configured.items():
+        if gate_id not in witnessed:
+            fail(
+                f"forbidPaths gate {gate_id!r} is configured for this campaign but no "
+                "witnessed receipt reached publication"
+            )
+        if witnessed[gate_id] != patterns:
+            fail(
+                f"forbidPaths gate {gate_id!r} was witnessed against patterns "
+                f"{json.dumps(witnessed[gate_id])}, but the campaign configures "
+                f"{json.dumps(patterns)}"
+            )
+    for gate_id in sorted(set(witnessed) - set(configured)):
+        fail(
+            f"forbidPaths gate {gate_id!r} presented a receipt for a gate this "
+            "campaign does not configure"
+        )
+
+
 def enforce_constraint_results(
     worktree: Path,
     base_rev: str,
@@ -4216,9 +4353,9 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
     if action == "rebase":
         allowed.update({"publication", "constraints", "domainsRequired"})
     if action == "publish":
-        allowed.update({"constraints", "domainsRequired"})
+        allowed.update({"constraints", "domainsRequired", "gates"})
     if action == "merge":
-        allowed.add("integration")
+        allowed.update({"integration", "domainsRequired"})
     data = object_exact(brief, allowed, f"{action} brief")
     config = repo_config(data.get("repositoryConfig"))
     workspace = object_exact(
@@ -4315,6 +4452,9 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
 def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
     data, config, worktree = publication_identity(brief, "publish")
     constraints = normalize_constraint_results(data.get("constraints"), "publish constraints")
+    enforce_configured_gates(
+        constraints, normalize_campaign_gates(data.get("gates"), "publish gates")
+    )
     workspace = data["workspace"]
     task_id = required_string(workspace.get("taskId"), "workspace.taskId")
     local_branch = required_string(workspace.get("branch"), "workspace.branch")
@@ -4340,6 +4480,7 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         data.get("task"),
         task_id,
         data.get("domainsRequired"),
+        f"{config['remote']}/{config['baseBranch']}",
     )
     enforce_constraint_results(worktree, base_rev, head, constraints)
     git(worktree, "push", config["remote"], f"HEAD:refs/heads/{publish_branch}")
@@ -4983,6 +5124,23 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
             fail(f"cannot create immutable checkpoint ref {reference!r}: {detail}")
     if remote_ref_oid(worktree, remote, reference) != base_rev:
         fail("checkpoint completion ref did not expose the witnessed base revision")
+    if current_base != base_rev:
+        # The tested point is recorded first and stays recorded: the receipt is
+        # true, and nothing will ever re-test this revision. What it cannot do
+        # is complete the task. Reconciliation reads a checkpoint under the
+        # revision it reconciled, so a base that has already moved past the
+        # tested one leaves this receipt unread, the checkpoint incomplete, and
+        # the next pass re-executing it. Reporting that as progress is what let
+        # a base branch moving faster than the checkpoint runs keep a campaign
+        # "advanced" for ever. The lane fails instead, which spends a steering
+        # attempt and reaches escalation in a bounded number of passes. This
+        # only fires on movement from outside the pass: a campaign's own merges
+        # all land before its checkpoint lanes prepare.
+        fail(
+            f"checkpoint {task_id!r} recorded {base_rev} in {reference!r}, but the base "
+            f"branch has already advanced to {current_base}: the receipt cannot complete "
+            "the task and the base branch is moving faster than this checkpoint runs"
+        )
     if config["forge"] == "github" and not capabilities["subIssueWalk"]:
         github_checkpoint_progress_comment(data, reference, base_rev, source_sha256)
     return {"taskId": task_id, "ref": reference, "revision": base_rev}
@@ -5057,6 +5215,11 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
         },
         "integration",
     )
+    # The campaign's own parallelism decides whether domains are required. The
+    # receipt carries an upstream copy of that bit, and merge is the last node
+    # that can still refuse to act on it, so the two are compared here rather
+    # than normalized and trusted — the same repair #254 made elsewhere.
+    domains_required = required_bool(data.get("domainsRequired"), "domainsRequired")
     task_id = required_string(integration.get("taskId"), "integration.taskId")
     base_rev = full_git_oid(integration.get("baseRev"), "integration.baseRev")
     required_string(integration.get("branch"), "integration.branch")
@@ -5068,6 +5231,8 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
     )
     if ownership["taskId"] != task_id:
         fail("integration.ownership.taskId does not match integration.taskId")
+    if ownership["domainsRequired"] != domains_required:
+        fail("integration.ownership.domainsRequired does not match domainsRequired")
     if ownership["baseRev"] != base_rev:
         fail("integration.ownership.baseRev does not match integration.baseRev")
     if ownership["head"] != head:
