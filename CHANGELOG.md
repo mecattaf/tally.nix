@@ -6,6 +6,45 @@ authorized.
 
 ## [Unreleased]
 
+### Fixed
+
+- Repaired the two-repository campaign seam (#321): a split campaign could not
+  pass a checkpoint, and every pull request it opened published a wrong
+  cross-repository reference.
+
+  1. **A checkpoint task in a split campaign failed permanently, on every
+     pass.** The reconciler adds `source.repository` to its witness whenever the
+     campaign is split and forwards that object verbatim into the checkpoint
+     node, which re-validated it against a closed key set that was never
+     widened — so the extra key was a hard error. No receipt was written, the
+     frontier never advanced past the checkpoint, and each pass burned a
+     machinery retry and then escalated. Since a spec-corpus worklist phases
+     itself with checkpoints, this hit the exact shape the seam exists for. The
+     checkpoint node now admits the key it is sent (and validates its form), and
+     the seam's own fixture worklist carries a checkpoint task so the suite runs
+     the node end to end.
+  2. **Pull request bodies named the wrong repository.** The campaign
+     back-reference was rendered as `<code repo>#<campaign issue number>`, which
+     GitHub resolves against the *code* repository — an unrelated issue or pull
+     request there, cross-referenced once per task on a public surface. It is
+     now rendered against the repository the campaign issue actually lives on,
+     which for a single-repository campaign is the same string it always was.
+  3. **The closing summary cited a revision that does not exist in the
+     repository whose merges it lists.** A split campaign's worklist revision
+     resolves only in the spec repository while every merge and checkpoint row
+     beneath it names code-repository artifacts. The summary now says which
+     repository each revision belongs to and names the code base revision
+     alongside the worklist pin. A single-repository campaign has one history
+     and keeps its unqualified one-line form.
+
+  Also corrected two claims. The seam section of Flows → Campaigns and the
+  `#321` entry below now state that the full-form `Closes owner/name#<n>` and
+  the cross-repository completion narrowing are **staged, not reachable**: both
+  require tasks carrying their own sub-issues, which only the forge-native read
+  path produces, and a forge-native campaign refuses the roles. And the `#318`
+  entry's item 5 said the prep brief carries `source.revision`; the tree ships
+  `baseRevision`, and the entry now says that.
+
 ### Added
 
 - Landed the two-repository campaign seam (#321): a spec-corpus campaign can
@@ -23,12 +62,17 @@ authorized.
   the parent's `subIssuesSummary` advances across repositories, and
   `closedByPullRequestsReferences` still returns the merged pull request, so
   §9.1.2's oracle survives the split. The same probe's control showed a bare
-  `Closes #<n>` links and closes nothing across repositories, so the publish
-  node now emits the full `owner/name#<n>` form wherever the task sub-issue
-  lives on another repository. Because a closing reference can now name any
-  repository, the sub-issue walk reads each reference's own repository and
-  completion requires it to be on the campaign's `codeRepository` — a narrowing
-  of where proof may come from, never a widening of what counts as proof. The
+  `Closes #<n>` links and closes nothing across repositories, which is why every
+  `owner/name#<n>` a split campaign writes — starting with the campaign
+  back-reference in each pull request body — is rendered against the repository
+  it actually resolves in. Two further behaviours are **staged rather than
+  reachable**: the full-form `Closes owner/name#<n>` and the requirement that a
+  cross-repository closing reference be on the campaign's `codeRepository` both
+  need tasks that carry their own sub-issues, which only the forge-native read
+  path produces, and a forge-native campaign refuses the roles. A split campaign
+  therefore runs the degraded projection today; reconciling task sub-issues with
+  the worklist-artifact path is design work that has not been done, and the seam
+  section of Flows → Campaigns says so. The
   witness splits accordingly: the reconcile result reports the worklist's
   pinned spec revision (with `source.repository` when split) alongside
   `baseRevision`, the code base tip that lane bases, checkpoint receipts and
@@ -495,10 +539,11 @@ authorized.
      with nothing relating the two. Checkpoint lanes already asserted this
      relationship; implementation lanes asserted nothing, so a rewound or
      force-replaced remote silently produced lanes from an unrelated history.
-     The prep brief now carries the reconciliation's `source.revision`, and prep
-     fails closed after its fetch unless that revision is an ancestor of the
-     fetched base head, with the same legible error shape as the checkpoint
-     check.
+     The prep brief now carries the reconciliation's `baseRevision` — the code
+     revision the pass reasoned from, which equals the worklist revision unless
+     the campaign spans two repositories — and prep fails closed after its fetch
+     unless that revision is an ancestor of the fetched base head, with the same
+     legible error shape as the checkpoint check.
 
 - A slow storage tree walk can no longer overwrite a fresher free-space probe
   (#317, closing #292). Two writers update the monitor's view of filesystem

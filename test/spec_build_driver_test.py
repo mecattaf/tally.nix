@@ -995,6 +995,7 @@ class GitHubForgeTests(unittest.TestCase):
                 "campaign": "fixture",
                 "repository": "acme/spec",
                 "source": {"sha256": digest, "revision": "b" * 40},
+                "baseRevision": "b" * 40,
                 "tasks": [{"id": "task-1", "title": "Task 1"}],
                 "merged": [
                     {
@@ -2515,6 +2516,7 @@ class LaneLifecycleTests(unittest.TestCase):
                 "campaign": "fixture",
                 "repository": "acme/spec",
                 "source": {"sha256": "sha256:" + "a" * 64, "revision": "b" * 40},
+                "baseRevision": "b" * 40,
                 "tasks": [
                     {"id": "task-1", "title": "Task 1"},
                     {"id": "task-2", "title": "Task 2"},

@@ -549,7 +549,7 @@ work on another. Three roles bind to entries of the campaign's own
 |---|---|
 | `codeRepository` | Lanes, publish branches, pull requests, merges, merge and checkpoint receipts, and the merged-pull-request scan. |
 | `specRepository` | The worklist artifact, read at the revision each pass pins. |
-| `issueRepository` | The campaign issue thread, its task sub-issues, and every machine receipt: diagnoses, retries, escalation, the continuation receipt, and the closing summary. |
+| `issueRepository` | The campaign issue thread and every machine receipt: diagnoses, retries, escalation, the continuation receipt, and the closing summary. (Also task sub-issues, for the shape described under *staged, not yet reachable* below.) |
 
 Each defaults inward: `issueRepository` falls back to `specRepository`, and
 both `specRepository` and `codeRepository` fall back to the repository the
@@ -579,20 +579,42 @@ Two invariants change shape when the roles differ, and neither is optional:
   `source.revision` (plus `source.repository`, present only when split) and
   `baseRevision`, the code base tip the pass reasoned from. For a
   single-repository campaign the two are the same commit.
-- **Closing keywords take their full form.** `Closes #<n>` resolves inside the
-  pull request's own repository, so a code-repository pull request naming a
-  spec-repository sub-issue that way links nothing and closes nothing. When the
-  task sub-issue lives elsewhere the publish node emits
-  `Closes owner/name#<n>`, which GitHub does honour across repositories: the
-  sub-issue closes on merge, the parent's progress bar advances, and
-  `closedByPullRequestsReferences` still returns the merged pull request as the
-  completion oracle. Because that reference can now name any repository, the
-  completion path additionally requires it to be on the campaign's own
-  `codeRepository`.
+- **Every `owner/name#<n>` is rendered against the repository it resolves in.**
+  A short `#<n>` resolves inside the pull request's own repository, so a
+  code-repository pull request that writes one is naming a different object.
+  The campaign back-reference in each pull request body therefore names the
+  issue repository, not the code repository.
 
 An ad-hoc forge-native campaign cannot span repositories. Its worklist, briefs
 and receipts are the one issue thread by construction, so a brief carrying the
 roles is refused rather than partially honoured.
+
+#### Staged, not yet reachable: task sub-issues on a split campaign
+
+Two behaviours in the driver exist for a shape no campaign can currently be
+configured into, and it is worth being exact about which:
+
+- **The full-form closing keyword.** When a task carries its own sub-issue and
+  that sub-issue lives on another repository, the publish node emits
+  `Closes owner/name#<n>` rather than `Closes #<n>`. The
+  [probe on #321](https://github.com/mecattaf/tally.nix/issues/321) verified
+  live that GitHub honours the full form across repositories — the sub-issue
+  closes on merge, the parent's progress bar advances, and
+  `closedByPullRequestsReferences` still returns the merged pull request as the
+  oracle — and that the short form links and closes nothing.
+- **The cross-repository completion narrowing.** When a closing reference from
+  the sub-issue walk names a repository, completion requires it to be the
+  campaign's own `codeRepository`. This narrows where proof may come from; it
+  never widens what counts as proof.
+
+Neither fires today. A task carries a sub-issue only on the forge-native read
+path, and a forge-native campaign refuses the roles above, so the only campaign
+shape that can be split is the shape whose tasks never carry sub-issues; the
+sub-issue walk is likewise built only for forge-native campaigns. Reconciling
+task sub-issues with the worklist-artifact path is design work that has not
+been done. Until it is, a split campaign gets the degraded projection: no task
+sub-issues, no walk, and machine receipts as comments or refs on the issue
+repository.
 
 ## The recurring worklist node contract
 
