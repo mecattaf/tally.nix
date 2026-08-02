@@ -424,9 +424,11 @@ async fn run_producer_dispatch(
     let event: ProducerObservation = serde_json::from_str(&args.event)
         .context("--event must be a producer observation JSON object")?;
     let state_dir = args.state_dir.map_or_else(default_state_dir, Ok)?;
-    // Compatibility for direct calls to this hidden command; generated units
-    // always pass the daemon data directory explicitly.
-    let data_dir = args.data_dir.unwrap_or_else(|| state_dir.clone());
+    // Not optional: the brief store belongs to the daemon data directory, and
+    // defaulting it to the state directory recreated the split brief layout
+    // #271 retired. Generated units always pass the flag; a direct call must
+    // name it too.
+    let data_dir = args.data_dir;
     let events_dir = state_dir.join("events");
     let engine = ProducerEngine::new(&config.producers, &events_dir, &state_dir, &data_dir);
     let expected_kind = match &event {

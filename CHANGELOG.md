@@ -261,7 +261,51 @@ authorized.
   mutation detection, durable JSONL tail repair, and canonical pool-set and migration behavior.
 - Added flake-native rustfmt, Clippy, and repository-wide Nix formatting checks.
 
+### Changed
+
+- `retention.horizon` now doubles as the retry window for brief-bearing jobs.
+  This is not new behavior and not a regression, but it has never carried a
+  release note: once a job's brief has expired out of `<dataDir>/briefs`, that
+  job can no longer be retried, and `queue retry` refuses it with `job <uuid>
+  brief is no longer retained and cannot be retried; enqueue fresh work`. The
+  remedy is exactly what the message says — enqueue fresh work; there is no
+  flag that revives expired brief bytes. Operators who retry old campaign
+  runners will meet this refusal after an upgrade and should read it as the
+  horizon doing its job, not as breakage. Widen `retention.horizon` if the
+  operational retry window needs to be longer.
+- `tally gc` now prunes dead `unit-exit/<uuid>.capture.lock` files under
+  `captureArchiveHorizon` and reports `captureLocksExamined` and
+  `captureLocksPruned`. The failed-stderr reconciler re-mints one lock file per
+  historically failed task at every daemon startup, so the directory grew one
+  permanent file per dead task with no pruner to drain it. Two checks gate every
+  unlink, because neither is sufficient alone: `flock` does not refresh mtime,
+  so age alone cannot prove a lock is dead, and unlinking a held lock lets the
+  next locker create a fresh file and break the mutual exclusion. A lock is
+  removed only when it is both older than the horizon and provably unheld, via a
+  non-blocking exclusive lock the sweep takes and holds across the unlink. Exit
+  records and `<uuid>.capture.json` generations are untouched: they remain
+  durable recovery input with no age-based pruner.
+- `tally __producer-dispatch` now requires `--data-dir`. The hidden command used
+  to fall back to the state directory, which silently recreated the split brief
+  layout retired in #271 and wrote briefs into `<stateDir>/briefs` — a location
+  the retention sweep now treats as a legacy store to drain. Generated Home
+  Manager units always passed the flag, so only hand-run invocations were
+  affected; those must now name the daemon data directory.
+
 ### Fixed
+
+- A single corrupt or non-canonical `<64hex>.json` file in a brief store no
+  longer aborts the whole retention sweep. `managed_brief_files` propagated the
+  verification failure out of `run_gc`, which stopped it after GC-root pruning
+  but before the brief, state-directory, and projection-archive sweeps — so
+  capture-archive and producer-event pruning stopped too, and because GC never
+  removed the offending file, every subsequent timer run failed identically and
+  silently. Unverifiable files are now counted as `briefsUnverified` /
+  `legacyBriefsUnverified` and skipped. They are not pruned and not renamed: an
+  unverifiable file is unaddressable by any live brief hash, so it is inert, and
+  it is the one case the sweep cannot parse well enough to act on. The nonzero
+  count is reported on every run so the condition stays visible rather than
+  being announced once.
 
 - A campaign lane's prepared base is now derived from the lane's own history
   rather than recomputed from wherever the base branch points at prep time. When

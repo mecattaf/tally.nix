@@ -338,8 +338,12 @@ pub(super) struct ProducerDispatchArgs {
     pub(super) event: String,
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
+    /// Required. The brief store lives under the daemon data directory; the
+    /// former fallback to `--state-dir` silently recreated the split brief
+    /// layout #271 retired, and the sweep now treats that layout as a legacy
+    /// store to drain.
     #[arg(long, value_name = "PATH")]
-    pub(super) data_dir: Option<PathBuf>,
+    pub(super) data_dir: PathBuf,
     #[arg(long, hide = true)]
     pub(super) engine_only: bool,
 }

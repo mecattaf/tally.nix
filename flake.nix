@@ -4627,22 +4627,22 @@
                 rejected_event='{"kind":"gh","source":"search","repo":"agency-agency/spec","number":21,"htmlUrl":"https://github.com/agency-agency/spec/issues/21","itemType":"issue","nodeId":"I-self","itemAuthor":"tally-bot","triggerActor":"untrusted-user","selfActor":"tally-bot","triggerKind":"command-comment","eventId":"comment-43","commentId":"comment-43","triggerTimestamp":"2026-07-20T12:31:00Z","context":{"schemaVersion":2,"title":"Self-authored issue","body":"untrusted","state":"open","labels":["agency:codex-ready"],"assignees":["tally-bot"],"triggeringComment":{"id":"comment-43","author":"untrusted-user","body":"/tally run"}}}'
                 rejected="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch github --state-dir "$producer_state" --data-dir "$producer_data" --event "$rejected_event")"
                 test "$(printf '%s' "$rejected" | jq -r '.filtered.reason')" = trigger-actor-not-allowed
-                effect="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"
+                effect="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"
                 test "$(printf '%s' "$effect" | jq -r '.[0] | keys[0]')" = emitted
-                duplicate="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"
+                duplicate="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch effects --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"build-effect","storePath":"${pkgs.hello}"}')"
                 test "$(printf '%s' "$duplicate" | jq -r '.[0]')" = duplicate
                 for probe in 1 2; do
-                  lost="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --event '{"kind":"pool-reachability","reachable":false}')"
+                  lost="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"pool-reachability","reachable":false}')"
                   test "$(printf '%s' "$lost" | jq -r '.transition')" = null
                 done
-                lost="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --event '{"kind":"pool-reachability","reachable":false}')"
+                lost="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"pool-reachability","reachable":false}')"
                 test "$(printf '%s' "$lost" | jq -r '.transition')" = lost
                 test "$(printf '%s' "$lost" | jq -r '.emitted | length')" = 1
                 for probe in 1 2; do
-                  returned="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --event '{"kind":"pool-reachability","reachable":true}')"
+                  returned="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"pool-reachability","reachable":true}')"
                   test "$(printf '%s' "$returned" | jq -r '.transition')" = null
                 done
-                returned="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --event '{"kind":"pool-reachability","reachable":true}')"
+                returned="$(${tally}/bin/tally --config ${producerConfig} __producer-dispatch health --engine-only --state-dir "$producer_state" --data-dir "$producer_data" --event '{"kind":"pool-reachability","reachable":true}')"
                 test "$(printf '%s' "$returned" | jq -r '.transition')" = returned
                 test "$(printf '%s' "$returned" | jq -r '.emitted | length')" = 2
                 find "$producer_state/events" -maxdepth 1 -name '*.producer.json' -print0 \
