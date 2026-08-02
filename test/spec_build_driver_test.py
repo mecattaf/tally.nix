@@ -1413,7 +1413,9 @@ class GitHubForgeTests(unittest.TestCase):
         walk = {
             8: {
                 "number": 8,
-                "state": "open",
+                # A task pull request carries `Closes #<sub-issue>`, so the
+                # forge state after a merge is closed, not open.
+                "state": "closed",
                 "url": "https://github.com/acme/spec/issues/8",
                 "comments": [],
                 "pullRequests": [
@@ -1628,13 +1630,28 @@ class NativeSubIssueTests(unittest.TestCase):
         state: str = "OPEN",
         pulls: list[dict[str, object]] | None = None,
         comments: list[dict[str, object]] | None = None,
+        truncated: bool = False,
     ) -> dict[str, object]:
         return {
             "number": number,
             "state": state,
             "url": f"https://github.com/acme/spec/issues/{number}",
-            "closedByPullRequestsReferences": {"nodes": pulls or []},
+            "closedByPullRequestsReferences": {
+                "pageInfo": {"hasNextPage": truncated},
+                "nodes": pulls or [],
+            },
             "comments": {"nodes": comments or []},
+        }
+
+    @staticmethod
+    def merged_pull(url: str, body: str, branch: str, oid: str) -> dict[str, object]:
+        return {
+            "url": url,
+            "body": body,
+            "merged": True,
+            "baseRefName": "main",
+            "headRefName": branch,
+            "mergeCommit": {"oid": oid},
         }
 
     @staticmethod
@@ -1677,6 +1694,72 @@ class NativeSubIssueTests(unittest.TestCase):
             final = github.state()
             self.assertEqual(final["comments"], [])
             self.assertEqual(final["master"]["body"], state["master"]["body"])
+
+    def test_the_campaigns_own_closure_is_a_warning_not_an_anomaly(self) -> None:
+        """A graph edit must not turn every merged task into operator error.
+
+        A task pull request carries `Closes #<sub-issue>`, so the campaign
+        closes its own sub-issues as it merges. Editing one task brief and
+        re-arming rotates every task's revision, so every already-merged task
+        loses its proof while keeping a sub-issue the campaign closed. Those
+        are already named in the ignored-marker warnings; reporting them as
+        hand closures would fire the status verb's loudest surface once per
+        merged task on the campaign's own documented workflow.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            state, brief = self.fixture(checkout)
+            pre_edit = DRIVER.pull_request_marker(
+                "fixture", "7", "task-1", "sha256:" + "1" * 64
+            )
+            state["walk"] = [
+                self.walk_node(
+                    8,
+                    state="CLOSED",
+                    pulls=[
+                        self.merged_pull(
+                            "https://github.com/acme/spec/pull/8",
+                            pre_edit,
+                            "tally/fixture-issue-7/task-1-1111111111111111",
+                            "a" * 40,
+                        )
+                    ],
+                ),
+                # Task 2's sub-issue was closed by a human: no pull request of
+                # this campaign's ever touched it.
+                self.walk_node(9, state="CLOSED"),
+            ]
+            with FakeGitHub(root, state):
+                result = DRIVER.action_reconcile(brief)
+            self.assertEqual(result["merged"], [])
+            self.assertEqual(sorted(result["remaining"]), ["task-1", "task-2"])
+            self.assertEqual(
+                [anomaly["taskId"] for anomaly in result["anomalies"]], ["task-2"]
+            )
+            self.assertIn(
+                "ignored https://github.com/acme/spec/pull/8: its campaign marker "
+                "names no task in the witnessed worklist",
+                result["warnings"],
+            )
+
+    def test_a_truncated_reference_page_fails_the_pass(self) -> None:
+        """`first:` returns the oldest references, so truncation drops the newest.
+
+        Reading past that would let the walk narrow what counts as proof — the
+        one thing the issue says it must never do — and the task would then be
+        re-dispatched into a publish node that hits its own merged pull request.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            state, brief = self.fixture(checkout)
+            state["walk"] = [self.walk_node(8, truncated=True), self.walk_node(9)]
+            with FakeGitHub(root, state):
+                with self.assertRaisesRegex(
+                    DRIVER.DriverError, "truncated reference page"
+                ):
+                    DRIVER.action_reconcile(brief)
 
     def test_machine_receipts_follow_the_task_sub_issue_thread(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -664,6 +664,40 @@ fn probe_sub_issue_walk(locator: &IssueLocator) -> bool {
     sub_issue_threads(locator).is_ok()
 }
 
+const fn projection_label(sub_issue_walk: bool) -> &'static str {
+    if sub_issue_walk {
+        "native-sub-issues"
+    } else {
+        "degraded-checkboxes"
+    }
+}
+
+/// Say which projection the campaign just armed with, on every arm path.
+///
+/// A campaign that armed degraded behaves differently in ways an operator
+/// cannot see from the forge: no per-task steering threads, no merged-oracle
+/// walk, no anomalies, checkbox writes back on the master. Reporting it only
+/// on the `--no-enqueue` branch made the ordinary path silent about the one
+/// fact that explains all of that.
+fn armed_projection(result: &Value, sub_issue_walk: bool) -> Value {
+    let mut value = result.clone();
+    match value.as_object_mut() {
+        Some(object) => {
+            object.insert("subIssueWalk".to_owned(), json!(sub_issue_walk));
+            object.insert(
+                "projection".to_owned(),
+                json!(projection_label(sub_issue_walk)),
+            );
+            value
+        }
+        None => json!({
+            "result": value,
+            "subIssueWalk": sub_issue_walk,
+            "projection": projection_label(sub_issue_walk),
+        }),
+    }
+}
+
 /// Every steering surface a pass reads: the campaign-wide master thread, plus
 /// each task's own sub-issue thread where the forge serves one.
 #[derive(Debug, Clone, Default)]
@@ -1804,11 +1838,7 @@ async fn run_campaign_arm(
                 "graphDigest": graph.executable_digest,
                 "allowedActors": registration.allowed_actors,
                 "subIssueWalk": registration.sub_issue_walk,
-                "projection": if registration.sub_issue_walk {
-                    "native-sub-issues"
-                } else {
-                    "degraded-checkboxes"
-                },
+                "projection": projection_label(registration.sub_issue_walk),
                 "enqueued": false,
             }))?
         );
@@ -1828,7 +1858,10 @@ async fn run_campaign_arm(
     )
     .await?;
     write_registration(&state_dir, &registration)?;
-    println!("{}", serde_json::to_string(&result)?);
+    println!(
+        "{}",
+        serde_json::to_string(&armed_projection(&result, registration.sub_issue_walk))?
+    );
     if args.wait {
         let code = waited_exit_code(&result);
         if code != 0 {
@@ -3206,6 +3239,27 @@ mod tests {
             Some(value) => std::env::set_var("TALLY_GH_PROGRAM", value),
             None => std::env::remove_var("TALLY_GH_PROGRAM"),
         }
+    }
+
+    #[test]
+    fn every_arm_path_says_which_projection_it_recorded() {
+        // The enqueueing path prints the daemon's admission result, and a
+        // campaign that armed degraded is otherwise indistinguishable from one
+        // that armed native until an operator's sub-issue comment silently
+        // fails to reach its agent.
+        let admitted = json!({"task_uuid": "0198f000-0000-7000-8000-000000000002"});
+        let native = armed_projection(&admitted, true);
+        assert_eq!(native["projection"], json!("native-sub-issues"));
+        assert_eq!(native["subIssueWalk"], json!(true));
+        assert_eq!(native["task_uuid"], admitted["task_uuid"]);
+        let degraded = armed_projection(&admitted, false);
+        assert_eq!(degraded["projection"], json!("degraded-checkboxes"));
+        assert_eq!(degraded["subIssueWalk"], json!(false));
+        // A non-object admission result keeps its own shape rather than being
+        // silently dropped to make room for the annotation.
+        let wrapped = armed_projection(&json!("queued"), true);
+        assert_eq!(wrapped["result"], json!("queued"));
+        assert_eq!(wrapped["projection"], json!("native-sub-issues"));
     }
 
     #[test]

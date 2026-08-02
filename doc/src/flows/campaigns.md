@@ -165,24 +165,43 @@ the walk the native read path needs: parent → `subIssues` →
 `closedByPullRequestsReferences` → `pullRequest.merged`, in one bounded
 GraphQL query per pass, paginated within the 100-task cap. A forge that refuses
 the query is a capability answer, not a campaign failure — the campaign arms in
-degraded mode, `arm --no-enqueue` reports which mode it recorded, and every
-projection above falls back to checkboxes. Re-arm to re-probe.
+degraded mode and every projection above falls back to checkboxes. Every `arm`
+path reports which mode it recorded, as `subIssueWalk` and `projection`
+(`native-sub-issues` or `degraded-checkboxes`) alongside its ordinary output;
+`tally campaign list` shows the same field for an already-armed campaign. Read
+it: a degraded campaign is otherwise indistinguishable from a native one until
+an operator's comment on a task sub-issue silently fails to reach its agent.
+The probe answer is recorded once and never revisited, so re-arm to re-probe.
 
 The walk narrows **where** completion candidates come from; it never widens
 **what** counts as proof. A pull request reached through a task's sub-issue
 still completes that task only if its body carries the exact revision-bound
 marker for the admitted graph and it passes the same base branch, stable head
 branch, merge-commit and ancestry validation as before. A pull request from a
-pre-edit graph is named in the pass warnings and counts for nothing.
+pre-edit graph is named in the pass warnings and counts for nothing. It must not
+narrow proof either: a sub-issue that links more closing pull requests than one
+page returns fails the pass outright rather than reading completion from a
+truncated page whose newest reference — the likeliest current proof — is the one
+dropped.
 
 A sub-issue is human-clickable, so its closure carries no authority at all.
 `pullRequest.merged` remains the only oracle. When the walk finds a sub-issue
-closed while its task holds no revision-valid merged pull request (or, for a
-checkpoint, no completion ref), the task stays incomplete and in the frontier,
-and the pass records a typed `closed-without-merged-proof` anomaly.
+closed **by hand** while its task holds no revision-valid merged pull request
+(or, for a checkpoint, no completion ref), the task stays incomplete and in the
+frontier, and the pass records a typed `closed-without-merged-proof` anomaly.
 `tally query run RUN-UUID` prints those anomalies above the task board and puts
 the run in `needs-attention`; they are not filed with the reconciler's
 warnings, because a reader who misses one debugs the wrong surface.
+
+A closure the campaign caused itself is not that signal and is never reported as
+one. A task pull request carries `Closes #<sub-issue>`, so the campaign closes
+its own sub-issues as it merges; editing one task brief and re-arming then
+rotates *every* task's revision, so every already-merged task simultaneously
+loses its proof and keeps a sub-issue the campaign closed. Those pull requests
+are named in the ignored-marker warnings, where they belong. The discriminator
+is the marker prefix, read revision-blind: a sub-issue closed by a merged pull
+request carrying this campaign's marker at any revision was closed by the
+campaign, and a hand closure has no such pull request.
 
 ### Per-task steering threads
 
