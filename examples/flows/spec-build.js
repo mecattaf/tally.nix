@@ -466,7 +466,9 @@ const checkpointFactSchema = {
   required: ["taskId", "ref", "revision"],
   properties: {
     taskId: taskIdSchema,
-    ref: { type: "string", pattern: "^refs/tags/tally/spec-build/v1/" },
+    // New receipts land in the hidden state namespace; already-published
+    // visible tag receipts stay honored.
+    ref: { type: "string", pattern: "^refs/(tags/)?tally/spec-build/v1/" },
     revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
   },
   additionalProperties: false
@@ -758,7 +760,9 @@ const checkpointCompletionSchema = {
   required: ["taskId", "ref", "revision"],
   properties: {
     taskId: taskIdSchema,
-    ref: { type: "string", pattern: "^refs/tags/tally/spec-build/v1/" },
+    // New receipts land in the hidden state namespace; already-published
+    // visible tag receipts stay honored.
+    ref: { type: "string", pattern: "^refs/(tags/)?tally/spec-build/v1/" },
     revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
   },
   additionalProperties: false

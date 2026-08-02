@@ -25,7 +25,7 @@ Keep those roles separate:
 - **GitHub is intake, steering, state, and projection.** Manual `arm` is the
   explicit intent boundary for ad-hoc work; an exact mention is that boundary
   for a recurring campaign. Merged implementation pull requests and
-  content-and-exact-base-bound checkpoint tags are the completion facts read by
+  content-and-exact-base-bound checkpoint receipts are the completion facts read by
   every later pass. Only snapshotted comments authored by locally allowed actors
   steer an ad-hoc agent attempt; receipts and evidence project each
   reconciliation.
@@ -660,18 +660,33 @@ checkpoint command receives the corresponding structured retry brief but no
 implementation agent. Publication and integration remain separate deterministic
 nodes.
 
-A passed checkpoint is recorded as a lightweight Git tag below
-`refs/tags/tally/spec-build/v1/`. The expected ref includes the campaign, issue,
-checkpoint ID, full worklist SHA-256, and exact tested base revision. Changing
-the declared work graph or advancing the base requires a new pass.
-Reconciliation accepts the ref only when it points directly to that named base
-commit and every dependency's merge or checkpoint revision is its ancestor.
-An older green tag never certifies a later base, even when the later commit is
-unrelated to the checkpoint's declared dependencies: checkpoints ask questions
-about the accumulated repository state, not only their dependency closure.
+A passed checkpoint is recorded as a create-only ref below
+`refs/tally/spec-build/v1/<campaign-scope>/checkpoint/`. The expected ref
+includes the campaign-and-issue scope, checkpoint ID, full worklist SHA-256, and
+exact tested base revision. Changing the declared work graph or advancing the
+base requires a new pass. Reconciliation accepts the ref only when it points
+directly to that named base commit and every dependency's merge or checkpoint
+revision is its ancestor. An older green receipt never certifies a later base,
+even when the later commit is unrelated to the checkpoint's declared
+dependencies: checkpoints ask questions about the accumulated repository state,
+not only their dependency closure.
+
+That namespace is hidden, and deliberately so: it is the same one the
+campaign's diagnosis and escalation state already uses, and it is served only
+on request. Receipts were published as tags below
+`refs/tags/tally/spec-build/v1/` until #307, and **tags are auto-fetched by
+every clone** — a private campaign's checkpoint ledger became part of a public
+target repository's surface. Already-published tag receipts are still read and
+honored, so the move re-executes nothing; nothing new is ever written there.
+To clean a target that already carries them, list them with
+`git ls-remote --tags <remote> 'refs/tags/tally/spec-build/v1/*'`, confirm the
+campaigns they belong to are finished, and delete them under the repository's
+ordinary destructive-change procedure
+(`git push <remote> --delete <ref>`); the campaign will re-record any still-live
+checkpoint into the hidden namespace on its next pass.
 
 Checkpoint refs are immutable and create-only; the driver never force-moves a
-receipt. A tag ruleset should allow the tally forge identity to create refs in
+receipt. A ruleset should allow the tally forge identity to create refs in
 this namespace while denying other identities creation and denying updates or
 deletion. If protection denies that identity creation, recording fails closed.
 The credential allowed to create these refs is itself a trusted completion
@@ -683,10 +698,10 @@ from minting otherwise consistent ones.
 Old refs are retained as historical audit receipts. Worklist edits and base
 movement make them unreachable from the active completion calculation rather
 than deleting them. This deliberately preserves stateless recovery and works
-with update/delete-protected tags. When a campaign is permanently
+with update/delete-protected refs. When a campaign is permanently
 decommissioned, its campaign-and-issue namespace can be pruned under the
 repository's ordinary destructive-change procedure; there is no automatic
-campaign-lifetime inference or in-run tag garbage collection.
+campaign-lifetime inference or in-run receipt garbage collection.
 
 ## Reconciliation, parallelism, and the merge criterion
 

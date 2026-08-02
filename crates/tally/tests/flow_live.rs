@@ -3214,8 +3214,10 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 fixture_git(&checkout, &["rev-parse", "origin/main"])
             );
             let checkpoint_ref = checkpoint_value["checkpoints"][0]["ref"].as_str().unwrap();
-            assert!(checkpoint_ref.starts_with("refs/tags/tally/spec-build/v1/fixture-"));
-            assert!(checkpoint_ref.contains("-issue-7/phase-one-checkpoint-"));
+            // Hidden namespace, never a tag: a public target repository must
+            // not auto-fetch the campaign's checkpoint ledger.
+            assert!(checkpoint_ref.starts_with("refs/tally/spec-build/v1/"));
+            assert!(checkpoint_ref.contains("/checkpoint/phase-one-checkpoint-"));
             assert!(checkpoint_ref.ends_with(checkpoint_revision));
             assert_eq!(
                 fixture_git(&checkout, &["ls-remote", "origin", checkpoint_ref])
@@ -3224,6 +3226,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .unwrap(),
                 checkpoint_revision
             );
+            assert_eq!(fixture_git(&checkout, &["ls-remote", "--tags", "origin"]), "");
             let checkpoint_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_5, 7).await;
             assert_eq!(checkpoint_items.len(), 7);
             assert_eq!(

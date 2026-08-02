@@ -2521,7 +2521,11 @@ fn merged_project_tasks(
         if task.kind == "checkpoint" {
             let reference =
                 checkpoint_reference(&manifest.name, issue_number, &task.id, &graph_digest)?;
-            if projected_checkpoint_complete(manifest, &reference)? {
+            let legacy =
+                legacy_checkpoint_tag(&manifest.name, issue_number, &task.id, &graph_digest)?;
+            if projected_checkpoint_complete(manifest, &reference)?
+                || projected_checkpoint_complete(manifest, &legacy)?
+            {
                 merged.insert(task.id.clone());
             }
             continue;
@@ -2681,7 +2685,35 @@ fn stable_publish_branch(
     format!("tally/{slug}-issue-{issue_number}/{task_id}{suffix}")
 }
 
+/// Where new checkpoint receipts are published.
+///
+/// The pre-#307 namespace was `refs/tags/`, which every clone of a public
+/// target repository auto-fetches; a campaign's checkpoint ledger became part
+/// of that repository's public surface. Receipts now share the hidden
+/// namespace the campaign's other durable state already uses.
 fn checkpoint_reference(
+    campaign: &str,
+    issue_number: u64,
+    task_id: &str,
+    source: &str,
+) -> Result<String> {
+    let digest = source
+        .strip_prefix("sha256:")
+        .filter(|value| value.len() == 64)
+        .ok_or_else(|| invalid("checkpoint source is not a SHA-256 identity"))?;
+    let scope = format!(
+        "{:x}",
+        Sha256::digest(format!("{campaign}\0{issue_number}").as_bytes())
+    );
+    Ok(format!(
+        "refs/tally/spec-build/v1/{}/checkpoint/{task_id}-{digest}",
+        &scope[..24],
+    ))
+}
+
+/// The visible tag receipt published before the namespace moved. Read for
+/// compatibility so an existing campaign is never re-executed; never written.
+fn legacy_checkpoint_tag(
     campaign: &str,
     issue_number: u64,
     task_id: &str,

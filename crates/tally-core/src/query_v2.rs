@@ -3225,7 +3225,7 @@ mod tests {
                 "merged": [],
                 "checkpoints": [{
                     "taskId": "c01",
-                    "ref": "refs/tags/tally/spec-build/v1/crm/c01",
+                    "ref": "refs/tally/spec-build/v1/crm/c01",
                     "revision": "a".repeat(40)
                 }],
                 "frontier": [
@@ -3246,7 +3246,7 @@ mod tests {
         checkpoint.final_message = Some(
             serde_json::json!({
                 "taskId": "c02",
-                "ref": "refs/tags/tally/spec-build/v1/crm/c02",
+                "ref": "refs/tally/spec-build/v1/crm/c02",
                 "revision": "b".repeat(40)
             })
             .to_string(),

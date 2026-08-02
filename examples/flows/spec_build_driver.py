@@ -1444,6 +1444,16 @@ def pull_request_marker(
     )
 
 
+def checkpoint_identity(
+    campaign: str, task_id: str, source_sha256: str, base_rev: str
+) -> str:
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_sha256):
+        fail("worklist source digest is not a lowercase SHA-256 identity")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", base_rev):
+        fail("checkpoint base revision must be a full Git object ID")
+    return f"{task_id}-{source_sha256.removeprefix('sha256:')}/{base_rev}"
+
+
 def checkpoint_ref(
     campaign: str,
     issue_number: str,
@@ -1451,18 +1461,37 @@ def checkpoint_ref(
     source_sha256: str,
     base_rev: str,
 ) -> str:
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", source_sha256):
-        fail("worklist source digest is not a lowercase SHA-256 identity")
-    digest = source_sha256.removeprefix("sha256:")
-    if not re.fullmatch(r"[0-9a-f]{40,64}", base_rev):
-        fail("checkpoint base revision must be a full Git object ID")
+    """Where a new checkpoint receipt is published.
+
+    Receipts live in the same hidden namespace as the campaign's other durable
+    state. The pre-#307 namespace was `refs/tags/`, which every clone of a
+    public target repository auto-fetches: a private campaign's checkpoint
+    ledger became part of the target's public surface. Hidden refs are served
+    on request and cloned by nobody.
+    """
+    identity = checkpoint_identity(campaign, task_id, source_sha256, base_rev)
+    return f"{local_state_prefix(campaign, issue_number)}/checkpoint/{identity}"
+
+
+def legacy_checkpoint_tag(
+    campaign: str,
+    issue_number: str,
+    task_id: str,
+    source_sha256: str,
+    base_rev: str,
+) -> str:
+    """The visible tag receipt published before the namespace moved.
+
+    Read for compatibility so a campaign already carrying tag receipts is not
+    re-executed; never written again.
+    """
+    identity = checkpoint_identity(campaign, task_id, source_sha256, base_rev)
     readable = re.sub(r"[^a-z0-9]+", "-", campaign.casefold()).strip("-")
     readable = (readable or "campaign")[:24].rstrip("-") or "campaign"
     campaign_identity = hashlib.sha256(campaign.encode()).hexdigest()[:12]
     return (
         "refs/tags/tally/spec-build/v1/"
-        f"{readable}-{campaign_identity}-issue-{issue_number}/"
-        f"{task_id}-{digest}/{base_rev}"
+        f"{readable}-{campaign_identity}-issue-{issue_number}/{identity}"
     )
 
 
@@ -1878,6 +1907,14 @@ def completed_checkpoint_tasks(
             campaign, issue_number, task["id"], source["sha256"], base_rev
         )
         target = remote_ref_oid(checkout, remote, reference)
+        if target is None:
+            # Compatibility: a campaign that already published a visible tag
+            # receipt is honored where it stands, so the namespace move never
+            # re-executes a checkpoint that already passed.
+            reference = legacy_checkpoint_tag(
+                campaign, issue_number, task["id"], source["sha256"], base_rev
+            )
+            target = remote_ref_oid(checkout, remote, reference)
         if target is None:
             continue
         git(checkout, "fetch", "--no-tags", remote, reference)
@@ -4926,8 +4963,15 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
         check=False,
     ).returncode:
         fail("remote base diverged after the checkpoint command was witnessed")
-    reference = checkpoint_ref(
+    # A receipt already published under the pre-#307 visible tag namespace is
+    # honored where it stands; the hidden namespace is only ever written new.
+    legacy = legacy_checkpoint_tag(
         campaign, issue["number"], task_id, source_sha256, base_rev
+    )
+    reference = (
+        legacy
+        if remote_ref_oid(worktree, remote, legacy) == base_rev
+        else checkpoint_ref(campaign, issue["number"], task_id, source_sha256, base_rev)
     )
     existing = remote_ref_oid(worktree, remote, reference)
     if existing is not None and existing != base_rev:

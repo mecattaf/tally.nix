@@ -371,6 +371,13 @@ authorized.
   the parent's own progress bar is the projection and tally writes nothing —
   no comment and no checkbox edit; a degraded campaign still recomputes and
   repairs its checkboxes exactly as before.
+- Moved new checkpoint receipts from `refs/tags/tally/spec-build/v1/` to the
+  hidden `refs/tally/spec-build/v1/<scope>/checkpoint/` namespace the
+  campaign's other durable state already uses. Tags are auto-fetched by every
+  clone, so a private campaign's checkpoint ledger was becoming part of a
+  public target repository's surface. Already-published tag receipts are still
+  read and honored, so nothing is re-executed; `doc/src/flows/campaigns.md`
+  documents how to clean a target that carries them.
 - Campaigns now continue themselves through the events directory instead of a
   public `/tally reconcile <name>` comment. A pass that merged work, passed a
   checkpoint, or published machine steering writes one bounded JSON enqueue
