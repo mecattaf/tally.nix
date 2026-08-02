@@ -145,12 +145,23 @@ pub struct GhCompletedMutation {
     pub acceptance: Option<AcceptanceFact>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub request_review: bool,
+    /// The logins the review was actually requested from. Encoded beside the
+    /// boolean so the completion comment records who was asked, not merely
+    /// that someone was.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<String>,
     #[serde(skip)]
     pub assisted_by: Option<AssistedBy>,
 }
 
 pub trait GhMutationSink {
     fn post_evidence(&mut self, mutation: &GhCompletedMutation) -> Result<(), String>;
+    /// Actually ask the named humans to look. A pull request gets GitHub's own
+    /// `requestReviews` mutation; an issue has no review concept, so it gets
+    /// one fresh marker-idempotent comment that mentions them. Fresh, never
+    /// upserted: a request that nobody is notified of is the defect this
+    /// replaces.
+    fn request_reviews(&mut self, mutation: &GhCompletedMutation) -> Result<(), String>;
     fn close_item(&mut self, mutation: &GhCompletedMutation) -> Result<(), String>;
 }
 
@@ -179,6 +190,15 @@ pub(super) const GH_COMPLETION_ISSUE_GRAPHQL: &str = r#"mutation TallyCompletion
 }"#;
 pub(super) const GH_COMPLETION_PULL_REQUEST_GRAPHQL: &str = r#"mutation TallyCompletionPullRequest($itemId: ID!) {
   closePullRequest(input: {pullRequestId: $itemId}) { pullRequest { id state } }
+}"#;
+pub(super) const GH_REVIEWER_ID_GRAPHQL: &str = r#"query TallyReviewerId($login: String!) {
+  user(login: $login) { id }
+}"#;
+// `union: true` adds these reviewers to whoever is already requested. The
+// replacing form would let one tally completion silently cancel a review
+// request a human made.
+pub(super) const GH_REQUEST_REVIEWS_GRAPHQL: &str = r#"mutation TallyRequestReviews($itemId: ID!, $userIds: [ID!]!) {
+  requestReviews(input: {pullRequestId: $itemId, userIds: $userIds, union: true}) { pullRequest { id } }
 }"#;
 pub(super) const GH_PROCESS_TIMEOUT: Duration = Duration::from_secs(20);
 pub(super) const GH_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -1468,6 +1488,67 @@ impl GhMutationSink for GhCliMutationSink {
         Ok(())
     }
 
+    fn request_reviews(&mut self, mutation: &GhCompletedMutation) -> Result<(), String> {
+        if mutation.state != "COMPLETED" {
+            return Err(format!(
+                "refusing GitHub mutation state {:?}; expected COMPLETED",
+                mutation.state
+            ));
+        }
+        let completion_id = mutation
+            .completion_id
+            .as_deref()
+            .ok_or_else(|| "concrete GitHub mutation requires a durable completionId".to_owned())?;
+        if mutation.reviewers.is_empty() {
+            return Err(
+                "refusing to request a GitHub review without at least one reviewer".to_owned(),
+            );
+        }
+        let (kind, state) = self.item_state(&mutation.item_id)?;
+        if !matches!(state.as_str(), "OPEN" | "CLOSED" | "MERGED") {
+            return Err(format!(
+                "GitHub {kind} {:?} has unsupported state {state:?}",
+                mutation.item_id
+            ));
+        }
+        if kind == "PullRequest" {
+            let mut user_ids = Vec::with_capacity(mutation.reviewers.len());
+            for login in &mutation.reviewers {
+                user_ids.push(self.reviewer_node_id(login)?);
+            }
+            self.graphql(serde_json::json!({
+                "query": GH_REQUEST_REVIEWS_GRAPHQL,
+                "variables": {"itemId": mutation.item_id, "userIds": user_ids},
+            }))?;
+            return Ok(());
+        }
+        // An issue cannot carry a review request, so the notification is the
+        // mention itself. The marker scan makes a replay a no-op without
+        // turning the comment into an upsert: the operator has to be pinged
+        // once, and exactly once.
+        let review_key = stable_key(&["gh-review-request", completion_id]);
+        let review_marker = format!("<!-- tally-review-request:{review_key} -->");
+        let scan = self.completion_state(&mutation.item_id, &review_marker)?;
+        if matches!(scan.marker, GhMarkerMatch::Present(_)) {
+            return Ok(());
+        }
+        let mentions = mutation
+            .reviewers
+            .iter()
+            .map(|login| format!("@{login}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let body = format!(
+            "{review_marker}\n{mentions}: tally is requesting your review of this item. \
+             Its automated acceptance policy has not accepted the work."
+        );
+        self.graphql(serde_json::json!({
+            "query": GH_COMPLETION_COMMENT_GRAPHQL,
+            "variables": {"itemId": mutation.item_id, "body": body},
+        }))?;
+        Ok(())
+    }
+
     fn close_item(&mut self, mutation: &GhCompletedMutation) -> Result<(), String> {
         if mutation.state != "COMPLETED" {
             return Err(format!(
@@ -1655,6 +1736,22 @@ impl GhCliMutationSink {
             store.record(key, &comment_id)?;
         }
         Ok((scan.kind, scan.state))
+    }
+
+    /// Resolve one configured login to the node id `requestReviews` needs.
+    /// A login that does not resolve is a configuration error the operator has
+    /// to see, not a reviewer to quietly drop.
+    fn reviewer_node_id(&self, login: &str) -> Result<String, String> {
+        let response = self.graphql(serde_json::json!({
+            "query": GH_REVIEWER_ID_GRAPHQL,
+            "variables": {"login": login},
+        }))?;
+        response
+            .pointer("/data/user/id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| format!("GitHub login {login:?} does not resolve to a user"))
     }
 
     fn edit_comment(&self, comment_id: &str, body: &str) -> Result<(), String> {

@@ -1213,7 +1213,13 @@ let
           type = types.bool;
           default = false;
           example = true;
-          description = "Request human review while semantic acceptance remains pending or rejected.";
+          description = "Request human review while semantic acceptance remains pending or rejected. Requires a non-empty reviewers list.";
+        };
+        reviewers = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "octocat" ];
+          description = "GitHub logins to request review from. A pull request receives a real review request; an issue receives one fresh comment mentioning them.";
         };
         closeOnAcceptance = mkOption {
           type = types.bool;
@@ -1268,6 +1274,18 @@ let
           {
             assertion = !config.closeOnPass || config.postEvidence;
             message = "gh producer ${name} closeOnPass=true requires postEvidence=true";
+          }
+          {
+            assertion = !config.requestReview || config.reviewers != [ ];
+            message = "gh producer ${name} requestReview=true requires a non-empty reviewers list";
+          }
+          {
+            assertion =
+              builtins.length config.reviewers == builtins.length (unique config.reviewers)
+              && lib.all (
+                reviewer: builtins.match "[A-Za-z0-9]([A-Za-z0-9]|-[A-Za-z0-9])*" reviewer != null
+              ) config.reviewers;
+            message = "gh producer ${name} reviewers must be unique GitHub logins";
           }
           {
             assertion = !config.postFailureStderr || config.postFailureEvidence;
@@ -3102,6 +3120,7 @@ let
               postFailureStderr
               postGateSummary
               requestReview
+              reviewers
               closeOnAcceptance
               neverMutate
               closeOnPass

@@ -36,7 +36,7 @@ partial set.
 | [`predicate.windowed-consumption.windowSec`](core-options.md#servicestallypoolsnamepredicatewindowed-consumptionwindowsec) | Sets the rolling look-back interval for durable budget debits. |
 | [`predicate.windowed-consumption.consumptionCap`](core-options.md#servicestallypoolsnamepredicatewindowed-consumptionconsumptioncap) | Sets the spend ceiling in the pool's declared native unit. |
 | [`enforce`](core-options.md#servicestallypoolsnameenforce) | Selects the shipped enforcement implementation. Only cooperative enforcement exists; declaring a pool does not create a cgroup or patched-systemd boundary. |
-| [`hardPreempt`](core-options.md#servicestallypoolsnamehardpreempt) | Opts the pool into reclaiming a lower-priority holder that does not yield within the configured grace. |
+| [`hardPreempt`](core-options.md#servicestallypoolsnamehardpreempt) | Opts the pool into reclaiming a lower-priority holder that does not yield within the configured grace. A co-allocated victim is reclaimed only when every pool the same request asks it to yield in also opts in. |
 | [`autoResume`](core-options.md#servicestallypoolsnameautoresume) | Overrides resource-specific same-row recovery after a pool returns; leaving it unset uses tally's resource policy. |
 | [`priority`](core-options.md#servicestallypoolsnamepriority) | Orders pool consideration; lower ranks are considered first. It is separate from job priority. |
 | [`credentials`](core-options.md#servicestallypoolsnamecredentials) | Adds `LoadCredential` references to every job that leases this pool. Values are source paths, not secret contents. |
@@ -172,12 +172,21 @@ switches are [`postReceipt`](core-options.md#servicestallyproducersnamepostrecei
 [`postFailureStderr`](core-options.md#servicestallyproducersnamepostfailurestderr),
 [`postGateSummary`](core-options.md#servicestallyproducersnamepostgatesummary),
 [`requestReview`](core-options.md#servicestallyproducersnamerequestreview),
+[`reviewers`](core-options.md#servicestallyproducersnamereviewers),
 [`closeOnAcceptance`](core-options.md#servicestallyproducersnamecloseonacceptance),
 [`closeOnPass`](core-options.md#servicestallyproducersnamecloseonpass), and
 [`neverMutate`](core-options.md#servicestallyproducersnamenevermutate).
 `neverMutate` overrides every acknowledgement, comment, review request, and
 close. Gate summaries and acceptance-based closure require an enqueue
 `gateManifest`.
+
+`requestReview` requires a non-empty `reviewers` list of GitHub logins, and it
+notifies them for real: a pull request receives GitHub's own review request,
+and an issue — which has no review concept — receives one fresh comment
+mentioning them. That comment is marker-idempotent rather than upserted, so a
+replay does not repeat it and does not silently edit the ping out from under
+the reviewers. `closeOnPass` is an independent opt-in; leaving it unset never
+closes an item, whatever `postEvidence` is set to.
 
 `postReceipt` publishes one acknowledgement per accepted or filtered trigger.
 Re-observing a trigger the ledger already holds — what every producer restart

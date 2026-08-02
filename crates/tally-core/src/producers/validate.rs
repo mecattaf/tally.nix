@@ -68,6 +68,20 @@ pub fn validate_registry(
                     }
                 }
                 validate_gh_triggers(name, &config.triggers)?;
+                let mut reviewers = BTreeSet::new();
+                for reviewer in &config.reviewers {
+                    validate_gh_login(name, reviewer)?;
+                    if !reviewers.insert(reviewer) {
+                        return Err(ProducerError::InvalidConfig(format!(
+                            "gh producer {name:?} repeats reviewers entry {reviewer:?}"
+                        )));
+                    }
+                }
+                if config.request_review && config.reviewers.is_empty() {
+                    return Err(ProducerError::InvalidConfig(format!(
+                        "gh producer {name:?} requestReview=true requires a non-empty reviewers list"
+                    )));
+                }
                 if config.close_on_pass == Some(true) && !config.post_evidence {
                     return Err(ProducerError::InvalidConfig(format!(
                         "gh producer {name:?} closeOnPass=true requires postEvidence=true"
@@ -486,6 +500,26 @@ pub(super) fn validate_name(value: &str, label: &str) -> Result<(), ProducerErro
     {
         return Err(ProducerError::InvalidConfig(format!(
             "{label} must be non-empty, at most {MAX_GH_ORIGIN_FIELD_BYTES} bytes, and contain no control characters"
+        )));
+    }
+    Ok(())
+}
+
+/// A reviewer login is rendered straight into an `@mention` on a public issue
+/// and into a GraphQL user lookup, so it is held to GitHub's own login grammar
+/// rather than the permissive field bound: alphanumerics and interior hyphens,
+/// at most 39 characters. Nothing that could carry markdown, a second mention,
+/// or a query fragment gets past configuration validation.
+pub(super) fn validate_gh_login(producer: &str, login: &str) -> Result<(), ProducerError> {
+    let valid = !login.is_empty()
+        && login.len() <= 39
+        && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !login.starts_with('-')
+        && !login.ends_with('-')
+        && !login.contains("--");
+    if !valid {
+        return Err(ProducerError::InvalidConfig(format!(
+            "gh producer {producer:?} reviewers entry {login:?} is not a GitHub login"
         )));
     }
     Ok(())

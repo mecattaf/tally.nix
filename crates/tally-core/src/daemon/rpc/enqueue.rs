@@ -134,14 +134,14 @@ impl DaemonHandler {
                 &row.argv,
                 &ScrapeResult { captures },
                 &row.adapter_options,
-                row.cwd.as_deref(),
+                row.effective_cwd(),
             )
         } else {
             engine.launch_with_options(
                 &row.adapter,
                 &row.argv,
                 &row.adapter_options,
-                row.cwd.as_deref(),
+                row.effective_cwd(),
             )
         }
         .map_err(|error| WireError::invalid(error.to_string()))?;
@@ -538,7 +538,7 @@ impl DaemonHandler {
                     &resolved.argv,
                     &ScrapeResult { captures },
                     &resolved.adapter_options,
-                    resolved.cwd.as_deref(),
+                    resolved.effective_cwd(),
                 )
             }
         } else {
@@ -546,7 +546,7 @@ impl DaemonHandler {
                 &resolved.adapter,
                 &resolved.argv,
                 &resolved.adapter_options,
-                resolved.cwd.as_deref(),
+                resolved.effective_cwd(),
             )
         };
         let invocation = match rendered {

@@ -46,11 +46,15 @@ yield hook or `tally lease status`, saves whatever state its own protocol
 understands, and exits. tally does not infer a safe checkpoint from process
 state.
 
-Yield is initially cooperative. If every blocking pool involved in an
-interrupt request has `hardPreempt` enabled, a holder that has not yielded by
-the configured grace deadline becomes eligible for hard reclaim. With
-`hardPreempt` disabled, the request remains queued; tally does not kill the
-holder. Multi-pool requests choose blockers without releasing a partial set,
+Yield is initially cooperative. Hard reclaim is decided per victim, and the
+condition is conjunctive: a holder that has not yielded by the configured grace
+deadline becomes eligible for hard reclaim only when every pool that same
+interrupt request asks *it* to yield in has `hardPreempt` enabled. A victim
+co-allocated on one pool with `hardPreempt` and another without it is never
+killed — a pool's disabled `hardPreempt` is a promise to its own workloads, and
+a neighbouring pool's opt-in does not override it. Where the condition does not
+hold, the request remains queued; tally does not kill the holder. Multi-pool
+requests choose blockers without releasing a partial set,
 and a windowed budget that cannot admit the interrupt does not trigger
 unrelated yields.
 

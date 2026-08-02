@@ -1612,7 +1612,7 @@ pub(super) fn recovery_adapter_invocation(
                 &row.argv,
                 &captures,
                 &row.adapter_options,
-                row.cwd.as_deref(),
+                row.effective_cwd(),
             )?;
             Ok((invocation, Some(captures)))
         }
@@ -1636,7 +1636,7 @@ pub(super) fn recovery_adapter_invocation(
                         &row.argv,
                         &captures,
                         &row.adapter_options,
-                        row.cwd.as_deref(),
+                        row.effective_cwd(),
                     )?,
                     Some(captures),
                 ))
@@ -1646,7 +1646,7 @@ pub(super) fn recovery_adapter_invocation(
                         &row.adapter,
                         &row.argv,
                         &row.adapter_options,
-                        row.cwd.as_deref(),
+                        row.effective_cwd(),
                     )?,
                     None,
                 ))

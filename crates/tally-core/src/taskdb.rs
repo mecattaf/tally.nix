@@ -204,6 +204,21 @@ impl WorkspaceMetadata {
     }
 }
 
+/// The one working directory a submission actually executes in.
+///
+/// Flow node specs deliberately carry no raw `cwd`; they carry structured
+/// workspace metadata instead, and the lane's worktree is where the process
+/// must run. Every consumer -- the adapter argv render and the execution
+/// request alike -- resolves it through here, so the witnessed argv and the
+/// process cwd cannot drift apart the way they did when only the request had
+/// the workspace fallback. An explicit payload cwd always wins.
+pub fn effective_cwd<'a>(
+    cwd: Option<&'a Path>,
+    workspace: Option<&'a WorkspaceMetadata>,
+) -> Option<&'a Path> {
+    cwd.or_else(|| workspace.map(|workspace| workspace.worktree_path.as_path()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum GhItemType {
@@ -935,6 +950,12 @@ fn validate_absolute_path(path: &Path, label: &str) -> Result<(), TaskDbError> {
 }
 
 impl RowSeed {
+    /// See [`effective_cwd`]: the durable row's working directory, workspace
+    /// fallback included.
+    pub fn effective_cwd(&self) -> Option<&Path> {
+        effective_cwd(self.cwd.as_deref(), self.workspace.as_ref())
+    }
+
     pub fn validate(&self) -> Result<(), TaskDbError> {
         if self.row_version == 0 || self.row_version > CURRENT_ROW_VERSION {
             return Err(TaskDbError::InvalidSeed(format!(

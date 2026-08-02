@@ -404,6 +404,11 @@ pub struct GhProducer {
     pub post_gate_summary: bool,
     #[serde(default)]
     pub request_review: bool,
+    /// GitHub logins to request a review from when `requestReview` fires.
+    /// Validation requires this non-empty whenever `requestReview` is on:
+    /// a switch that claims to request a human review has to name the humans.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reviewers: Vec<String>,
     #[serde(default)]
     pub close_on_acceptance: bool,
     #[serde(default)]
@@ -414,11 +419,13 @@ pub struct GhProducer {
 }
 
 impl GhProducer {
-    /// Configurations serialized before `closeOnPass` existed retain the old
-    /// fused behavior. Nix-rendered current configurations always include the
-    /// field, so `false` is an explicit comment-only policy.
+    /// Absent means off. The Nix module has always rendered the field
+    /// explicitly, and pre-field serializations are not a supported input, so
+    /// nothing may close a GitHub item merely because evidence posting is on:
+    /// closing is its own opt-in. `closeOnPass = true` still requires
+    /// `postEvidence = true`, which validation enforces.
     pub fn close_on_pass(&self) -> bool {
-        self.close_on_pass.unwrap_or(self.post_evidence)
+        self.close_on_pass.unwrap_or(false)
     }
 }
 

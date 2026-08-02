@@ -3637,6 +3637,10 @@ mod tests {
                         "sources": [{"notifications": {"repo": "acme/widgets"}}],
                         "triggers": {"assignments": ["tally-bot"]},
                         "postEvidence": true,
+                        // Closing is its own opt-in: an absent `closeOnPass`
+                        // no longer inherits `postEvidence`, and this test
+                        // exercises the close half of the mutation too.
+                        "closeOnPass": true,
                         "enqueue": {"argv": ["true"], "pool": "slot"}
                     }
                 }))
@@ -4599,6 +4603,280 @@ mod tests {
                 let outcome = executor.execute(request).await.unwrap();
                 assert_eq!(outcome.backend, ExecutionBackend::Direct);
                 assert_eq!(outcome.termination, ExecutionTermination::Exited(0));
+            })
+            .await;
+    }
+
+    /// A codex-shaped adapter whose base prefix ends in `--` so the cwd argv
+    /// template has somewhere to render, and whose program simply fails: the
+    /// retry path needs a terminal witness, not a real agent.
+    fn cwd_argv_config(exit_code: u8) -> Config {
+        let mut config = one_pool_config();
+        config.adapters.insert(
+            "codex".to_owned(),
+            AdapterConfig {
+                argv: vec![
+                    "/bin/sh".to_owned(),
+                    "-c".to_owned(),
+                    format!("exit {exit_code}"),
+                    "--".to_owned(),
+                ],
+                launch: crate::adapters::AdapterLaunchConfig {
+                    cwd_argv: Some(vec!["-C".to_owned(), "%<cwd>%".to_owned()]),
+                    ..crate::adapters::AdapterLaunchConfig::default()
+                },
+                ..AdapterConfig::default()
+            },
+        );
+        config.validate().unwrap();
+        config
+    }
+
+    fn flow_cwd_payload(worktree: &Path, cwd: Option<&Path>) -> Value {
+        let mut payload = json!({
+            "argv": ["author wave 3"],
+            "pool": "slot",
+            "adapter": "codex",
+            "source": "orchestrator",
+            "dedupKey": "flow:cwd-argv:0",
+            "submission": {"mode": "full"},
+            "orchestration": {
+                "flowName": "cwd-argv",
+                "flowRunId": "00000000-0000-4000-8000-000000000318",
+                "scriptHash": "sha256:cwd-argv",
+                "nodeOrdinal": 0,
+                "maxNodes": 1
+            },
+            "workspace": {
+                "repo": "mecattaf/tally.nix",
+                "baseRev": "origin/main",
+                "branch": "issue-318",
+                "worktreePath": worktree.to_str().unwrap()
+            },
+            "evidence": [],
+            "noEnqueue": true,
+            "credentials": {},
+            "wait": false
+        });
+        if let Some(cwd) = cwd {
+            payload["cwd"] = json!(cwd.to_str().unwrap());
+        }
+        payload
+    }
+
+    fn rendered_cwd_argument(argv: &[String]) -> Option<&str> {
+        argv.windows(2)
+            .find(|pair| pair[0] == "-C")
+            .map(|pair| pair[1].as_str())
+    }
+
+    /// #232 gave a flow node the right *process* cwd by deriving it from the
+    /// workspace, but the adapter argv was rendered from the raw row cwd,
+    /// which a flow never submits. The witnessed argv therefore omitted
+    /// `-C <worktree>` while the process ran in it. Admission, recovery, and
+    /// the execution request now resolve one effective cwd, so they cannot
+    /// disagree; an explicit payload cwd still outranks the workspace.
+    #[tokio::test(flavor = "current_thread")]
+    async fn flow_workspace_without_cwd_renders_the_adapter_cwd_argv() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let worktree = temp.path().join("flow-worktree");
+                fs::create_dir(&worktree).unwrap();
+                let explicit = temp.path().join("explicit-cwd");
+                fs::create_dir(&explicit).unwrap();
+                let config = cwd_argv_config(0);
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    config.clone(),
+                    paths.clone(),
+                    settings(),
+                    executor.clone(),
+                )
+                .await
+                .unwrap();
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(flow_cwd_payload(&worktree, None)))
+                    .await
+                    .unwrap();
+                let job_id = Uuid::parse_str(admitted["job_id"].as_str().unwrap()).unwrap();
+                let job = daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&job_id)
+                    .cloned()
+                    .unwrap();
+                assert!(job.row.cwd.is_none(), "flows do not submit raw cwd");
+                assert_eq!(
+                    rendered_cwd_argument(&job.invocation.argv),
+                    worktree.to_str(),
+                    "the admission render must carry -C <worktreePath>"
+                );
+                let request = execution_request(
+                    &executor,
+                    &job,
+                    settings().unit_limits,
+                    ("/run/tally/tally.sock", None),
+                    &paths.data_dir,
+                    &GitAiConfig::default(),
+                    false,
+                )
+                .unwrap();
+                assert_eq!(request.cwd.as_deref(), Some(worktree.as_path()));
+                assert_eq!(
+                    rendered_cwd_argument(&request.argv),
+                    request.cwd.as_deref().and_then(Path::to_str),
+                    "the witnessed argv and the process cwd must be the same directory"
+                );
+
+                // An explicit payload cwd is still the submission's decision.
+                let with_cwd = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["author wave 3"],
+                        "pool": "slot",
+                        "adapter": "codex",
+                        "cwd": explicit.to_str().unwrap(),
+                        "workspace": {
+                            "repo": "mecattaf/tally.nix",
+                            "baseRev": "origin/main",
+                            "branch": "issue-318",
+                            "worktreePath": worktree.to_str().unwrap()
+                        }
+                    })))
+                    .await
+                    .unwrap();
+                let explicit_job_id =
+                    Uuid::parse_str(with_cwd["job_id"].as_str().unwrap()).unwrap();
+                let explicit_job = daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&explicit_job_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    rendered_cwd_argument(&explicit_job.invocation.argv),
+                    explicit.to_str()
+                );
+
+                // Recovery re-renders the invocation from the durable row
+                // alone. Before the shared helper it lost the -C argument the
+                // admitted job had.
+                drop(daemon);
+                let recovered = Daemon::open_with_executor(
+                    config,
+                    paths.clone(),
+                    settings(),
+                    executor.clone(),
+                )
+                .await
+                .unwrap();
+                let recovered_job = recovered
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&job_id)
+                    .cloned()
+                    .unwrap();
+                assert!(recovered_job.row.cwd.is_none());
+                assert_eq!(
+                    rendered_cwd_argument(&recovered_job.invocation.argv),
+                    worktree.to_str(),
+                    "the recovery render must carry -C <worktreePath>"
+                );
+            })
+            .await;
+    }
+
+    /// The retry path re-renders from the durable row too, so it is the third
+    /// site that used to drop the flow node's `-C <worktree>`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retried_flow_node_keeps_its_workspace_cwd_argv() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let worktree = temp.path().join("flow-worktree");
+                fs::create_dir(&worktree).unwrap();
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(paths.state_dir.join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    cwd_argv_config(3),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let handler = daemon.handler.clone();
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let admitted = client
+                    .call("queue.enqueue", Some(flow_cwd_payload(&worktree, None)))
+                    .await
+                    .unwrap();
+                assert_eq!(fs1_wait(&client, &admitted).await["verdict"], "failed");
+                client
+                    .call("queue.pause", Some(json!({"pool": "slot", "all": false})))
+                    .await
+                    .unwrap();
+                let retried = client
+                    .call(
+                        "queue.retry",
+                        Some(json!({"task_uuid": admitted["task_uuid"]})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(retried["retried"], true);
+                assert_eq!(retried["attempt"], 2);
+
+                let task_uuid =
+                    Uuid::parse_str(admitted["task_uuid"].as_str().unwrap()).unwrap();
+                let retried_job = handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&task_uuid)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(retried_job.row.attempt, 2);
+                assert!(retried_job.row.cwd.is_none());
+                assert_eq!(
+                    rendered_cwd_argument(&retried_job.invocation.argv),
+                    worktree.to_str(),
+                    "the retry render must carry -C <worktreePath>"
+                );
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
             })
             .await;
     }
