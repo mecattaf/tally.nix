@@ -356,7 +356,8 @@ adapter states which of its sandbox policies can commit in
 implementation node is refused at evaluation time and again when the campaign is
 armed, rather than three seconds into the first node. Prove the pairing against
 the real binary with `tally adapter smoke <adapter> --sandbox <policy>
---assert-commit` before deploying it.
+--assert-commit` before deploying it; that probe works under every `hardening`
+preset, and `--probe-root` points it at the campaign's own workspace root.
 
 The default `agentApprovalPolicy = "never"` follows from the same unattendedness:
 a campaign node runs with nobody present to grant an escalation, so asking for

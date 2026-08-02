@@ -159,6 +159,27 @@ authorized.
 
 ### Fixed
 
+- Fixed `tally adapter smoke --assert-commit`, which could never pass for an
+  adapter with `hardening` set — the configuration the hardening guide's only
+  worked example recommends for codex. The probe repository was created under
+  the system temporary directory, and a hardened adapter's transient unit runs
+  with `PrivateTmp=yes`, so the working directory did not exist inside the
+  unit's namespace and systemd killed it before the adapter ran. The operator
+  saw an empty capture and a `not-checked` probe, indistinguishable from "this
+  adapter cannot commit". The probe now lives under `adapter-smoke/` in the
+  state directory, is declared as the job's workspace the way a campaign
+  implementation node reaches its worktree — which is what places it in the
+  unit's `ReadWritePaths=` without weakening any hardening property — and takes
+  a `--probe-root` override so it can run where implementation nodes actually
+  do. Moving it off `$TMPDIR` also stops the probe from measuring a sandbox
+  inside a directory codex treats as a default writable root, where a confining
+  policy could pass a probe it should fail.
+- Fixed the `launch.approvalPolicies` option example, which published
+  `--ask-for-approval` — the exact argv `codex exec` rejects — as the only
+  worked example in the generated option reference, so a consumer declaring a
+  custom codex-family adapter by copying the documentation reproduced the
+  original defect. The documentation build now refuses to publish that flag in
+  any generated option page, closing the class rather than the one site.
 - Fixed the shipped codex adapter's approval policies, which rendered
   `--ask-for-approval` — a top-level codex flag that `codex exec` rejects
   outright, so every campaign codex node died in three seconds, exit 2, before

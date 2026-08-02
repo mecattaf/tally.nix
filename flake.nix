@@ -512,6 +512,17 @@
               cat ${nixosOptionsDoc.optionsCommonMark}
             } > src/configuration/nixos-options.md
 
+            # An option example is the worked example a consumer copies. One
+            # that renders argv the target binary rejects reproduces #244 in
+            # the consumer's tree and the module accepts it, so the published
+            # reference is guarded rather than fixed one declaration at a time.
+            for page in "''${generated_pages[@]}"; do
+              if grep -Fq -- '--ask-for-approval' "$page"; then
+                echo "generated option reference publishes --ask-for-approval, which codex exec rejects: $page" >&2
+                exit 1
+              fi
+            done
+
             core_json=${optionsJson coreOptionsDoc}
             home_json=${optionsJson homeManagerOptionsDoc}
             nixos_json=${optionsJson nixosOptionsDoc}

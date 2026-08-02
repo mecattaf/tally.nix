@@ -187,6 +187,7 @@ fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
                 sandbox: None,
                 approval_policy: None,
                 assert_commit: false,
+                probe_root: None,
             })
         }) if name == "codex"
     ));
@@ -215,6 +216,7 @@ fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
                 sandbox: None,
                 approval_policy: None,
                 assert_commit: false,
+                probe_root: None,
             })
         }) if name == "pi"
             && cwd == Path::new("worktree")
@@ -232,6 +234,8 @@ fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
         "--approval-policy",
         "never",
         "--assert-commit",
+        "--probe-root",
+        "/var/lib/tally/campaigns",
     ])
     .unwrap();
     assert!(matches!(
@@ -245,9 +249,24 @@ fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
                 sandbox: Some(sandbox),
                 approval_policy: Some(approval),
                 assert_commit: true,
+                probe_root: Some(probe_root),
             })
-        }) if name == "codex" && sandbox == "danger-full-access" && approval == "never"
+        }) if name == "codex"
+            && sandbox == "danger-full-access"
+            && approval == "never"
+            && probe_root == Path::new("/var/lib/tally/campaigns")
     ));
+
+    // A probe root without a probe would silently do nothing.
+    assert!(Opts::try_parse_from([
+        "tally",
+        "adapter",
+        "smoke",
+        "codex",
+        "--probe-root",
+        "/var/lib/tally/campaigns",
+    ])
+    .is_err());
 
     // A throwaway repository is the probe's whole point; naming another
     // directory would silently commit into it.
