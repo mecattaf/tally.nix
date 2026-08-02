@@ -2609,10 +2609,28 @@ mod tests {
         verdict: Verdict,
         orchestration: Orchestration,
     ) -> WitnessRecord {
+        chained_terminal_witness(
+            &ChainHead::default(),
+            task_uuid,
+            verdict,
+            "2026-08-01T10:00:12.000Z",
+            orchestration,
+        )
+    }
+
+    /// A terminal witness that continues an existing chain, so a fixture can
+    /// hold two witnesses for one attempt the way a re-emitted verdict does.
+    fn chained_terminal_witness(
+        head: &ChainHead,
+        task_uuid: &str,
+        verdict: Verdict,
+        transition_timestamp: &str,
+        orchestration: Orchestration,
+    ) -> WitnessRecord {
         build_record(
             WitnessBody {
                 task_uuid: Some(task_uuid.to_owned()),
-                transition_timestamp: "2026-08-01T10:00:12.000Z".to_owned(),
+                transition_timestamp: transition_timestamp.to_owned(),
                 verdict,
                 exit_code: if passing_verdict(verdict) { 0 } else { 17 },
                 artifact_content_hash: None,
@@ -2641,7 +2659,7 @@ mod tests {
                 authorship: None,
                 authorship_sessions: None,
             },
-            &ChainHead::default(),
+            head,
         )
         .unwrap()
     }
@@ -2832,6 +2850,119 @@ mod tests {
         let evidence_requested = collapse_lifecycle_echoes(raw, false);
         assert_eq!(evidence_requested.items.len(), 2);
         assert_eq!(evidence_requested.items[0].event, TallyEvent::EvidencePass);
+    }
+
+    /// Only the witness that is actually folded into the journal terminal may
+    /// disappear. A second witness sharing the same (task, attempt, epoch) key
+    /// is a distinct durable fact, and dropping it would delete a ledger row
+    /// from the operator's view of the attempt.
+    #[test]
+    fn a_second_witness_sharing_the_echo_key_survives_the_collapse() {
+        let flow_run = "00000000-0000-4000-8000-000000000249";
+        let mut detail = detail(RowStatus::Completed);
+        detail.orchestration = Some(flow_orchestration(
+            flow_run,
+            1,
+            "agent-t02",
+            Some("crm/t02"),
+        ));
+        let mut history = history();
+        history.records = vec![lifecycle_record(
+            1,
+            TallyEvent::Completed,
+            1,
+            7,
+            &detail.task_uuid,
+        )];
+        let orchestration = detail.orchestration.clone().unwrap();
+        let first = terminal_witness(&detail.task_uuid, Verdict::Pass, orchestration.clone());
+        let second = chained_terminal_witness(
+            &ChainHead {
+                seq: first.seq,
+                hash: first.hash.clone(),
+            },
+            &detail.task_uuid,
+            Verdict::Pass,
+            "2026-08-01T10:00:13.000Z",
+            orchestration,
+        );
+        assert_eq!((first.attempt, first.lease_epoch), (1, 7));
+        assert_eq!((second.attempt, second.lease_epoch), (1, 7));
+        assert_ne!(first.seq, second.seq);
+
+        let raw = query_lifecycle_log(
+            &[detail],
+            &history,
+            &[first.clone(), second.clone()],
+            &LifecycleLogFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(raw.items.len(), 3);
+
+        let compact = collapse_lifecycle_echoes(raw, true);
+        assert_eq!(compact.items.len(), 2, "{:#?}", compact.items);
+        // The journal terminal absorbed exactly one witness -- the first.
+        let merged = &compact.items[0];
+        assert_eq!(merged.origin, "journal+witness");
+        assert_eq!(merged.event, TallyEvent::Completed);
+        assert_eq!(merged.witness_seq, Some(first.seq));
+        // The other stayed a row of its own rather than being overwritten away.
+        let survivor = &compact.items[1];
+        assert_eq!(survivor.origin, "witness");
+        assert_eq!(survivor.event, TallyEvent::WitnessEmitted);
+        assert_eq!(survivor.witness_seq, Some(second.seq));
+        assert_eq!(survivor.terminal_verdict, Some(Verdict::Pass));
+    }
+
+    /// A key can carry more than one journal terminal -- `preempted` then
+    /// `failed`. Only the newest may absorb the canonical verdict; folding it
+    /// into the earlier one too would report the same outcome twice and dress
+    /// the preemption up as the terminal fact.
+    #[test]
+    fn only_the_newest_journal_terminal_absorbs_the_witness() {
+        let flow_run = "00000000-0000-4000-8000-000000000249";
+        let mut detail = detail(RowStatus::Completed);
+        detail.orchestration = Some(flow_orchestration(
+            flow_run,
+            1,
+            "agent-t02",
+            Some("crm/t02"),
+        ));
+        let mut history = history();
+        history.records = vec![
+            lifecycle_record(1, TallyEvent::Preempted, 1, 7, &detail.task_uuid),
+            lifecycle_record(2, TallyEvent::Failed, 1, 7, &detail.task_uuid),
+        ];
+        let witness = terminal_witness(
+            &detail.task_uuid,
+            Verdict::Failed,
+            detail.orchestration.clone().unwrap(),
+        );
+        let raw = query_lifecycle_log(
+            &[detail],
+            &history,
+            std::slice::from_ref(&witness),
+            &LifecycleLogFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(raw.items.len(), 3);
+
+        let compact = collapse_lifecycle_echoes(raw, true);
+        assert_eq!(compact.items.len(), 2, "{:#?}", compact.items);
+        let preempted = &compact.items[0];
+        assert_eq!(preempted.event, TallyEvent::Preempted);
+        assert_eq!(preempted.origin, "journal");
+        assert_eq!(preempted.terminal_verdict, None);
+        assert_eq!(preempted.witness_seq, None);
+        assert_eq!(
+            preempted.authority,
+            FactAuthority::TallyLifecycleObservation
+        );
+        let failed = &compact.items[1];
+        assert_eq!(failed.event, TallyEvent::Failed);
+        assert_eq!(failed.origin, "journal+witness");
+        assert_eq!(failed.terminal_verdict, Some(Verdict::Failed));
+        assert_eq!(failed.witness_seq, Some(witness.seq));
     }
 
     #[test]
