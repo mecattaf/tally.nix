@@ -2022,6 +2022,38 @@ let
             the writable local checkouts that contain their frozen specs.
           '';
         };
+        codeRepository = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "mecattaf/crm";
+          description = ''
+            Repository this campaign cuts lanes on, publishes branches to, and
+            merges pull requests into. Names an entry of `repositories`. Null
+            means the repository the campaign issue was read from, which is the
+            single-repository shape.
+          '';
+        };
+        specRepository = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "mecattaf/crm-spec";
+          description = ''
+            Repository the worklist artifact is read from, at the revision the
+            pass pins. Names an entry of `repositories`. Null means the
+            repository the campaign issue was read from.
+          '';
+        };
+        issueRepository = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "mecattaf/crm-spec";
+          description = ''
+            Repository carrying the campaign issue thread, its task sub-issues,
+            and every machine receipt. Names an entry of `repositories`. Null
+            means `specRepository`, which in turn defaults to the repository
+            the campaign issue was read from.
+          '';
+        };
         label = mkOption {
           type = types.str;
           default = "campaign";
@@ -2366,6 +2398,20 @@ let
           assertion = !config.enable || config.repositories != { };
           message = "enabled tally campaign ${name} requires at least one repository";
         }
+        # A role that names a repository the campaign never configured has no
+        # checkout to read or write, and would only be discovered on the first
+        # pass. Refuse it at evaluation instead.
+        (map
+          (role: {
+            assertion = config.${role} == null || builtins.hasAttr config.${role} config.repositories;
+            message = "tally campaign ${name} ${role} must name a configured repository";
+          })
+          [
+            "codeRepository"
+            "specRepository"
+            "issueRepository"
+          ]
+        )
         {
           assertion = !config.enable || config.gates != [ ];
           message = "enabled tally campaign ${name} requires at least one deterministic gate";
@@ -3399,65 +3445,80 @@ let
     in
     3 + preflightNodes + campaign.maxParallel * (11 + 2 * builtins.length campaign.gates);
 
-  mkCampaignArgs = cfg: name: campaign: repository: issueNumber: issueUrl: runId: {
-    campaign = name;
-    inherit repository runId;
-    issue = {
-      number = issueNumber;
-      url = issueUrl;
+  mkCampaignArgs =
+    cfg: name: campaign: repository: issueNumber: issueUrl: runId:
+    {
+      campaign = name;
+      inherit repository runId;
+      issue = {
+        number = issueNumber;
+        url = issueUrl;
+      };
+      repositories = renderCampaignRepositories campaign.repositories;
+      inherit (campaign) worklist maxTasks maxParallel;
+    }
+    # The two-repository seam. A role left null is absent from the args, so a
+    # single-repository campaign renders exactly the args it rendered before.
+    // optionalAttrs (campaign.codeRepository != null) {
+      inherit (campaign) codeRepository;
+    }
+    // optionalAttrs (campaign.specRepository != null) {
+      inherit (campaign) specRepository;
+    }
+    // optionalAttrs (campaign.issueRepository != null) {
+      inherit (campaign) issueRepository;
+    }
+    // {
+      # The machine's self-nudge is local: a pass that advanced writes this
+      # payload into the shipped events directory instead of posting a public
+      # `/tally reconcile` comment for a second GitHub producer to poll back.
+      # The argv is the one the deleted reconcile producer built.
+      continuation = {
+        argv = [
+          (lib.getExe cfg.package)
+          "flow"
+          "run"
+          (storePathWithContext specBuildFlow)
+          "--args-from-brief"
+          "--max-nodes"
+          (toString (campaignMaxNodes campaign))
+        ];
+        pool = [
+          "flow"
+          campaign.pool.name
+        ];
+        priority = "low";
+        inherit (campaign) runtimeMaxSec;
+        eventsDir = "${toString cfg.stateDir}/events";
+      };
+      workspaceRoot = "${toString cfg.stateDir}/campaigns/${name}";
+      tally = lib.getExe cfg.package;
+      driver = "${specBuildDriver}/bin/spec-build-driver";
+      inherit (campaign) driverRuntimeMaxSec;
+      inherit (campaign) mergeMethod;
+      inherit (campaign) gitAiBinding;
+      inherit (campaign) gitAiAwaitSec;
+      agent = {
+        adapter = campaign.agent;
+        argv = campaign.agentArgv;
+        model = campaign.agentModel;
+        priority = campaign.agentPriority;
+        runtimeMaxSec = campaign.agentRuntimeMaxSec;
+        approvalPolicy = campaign.agentApprovalPolicy;
+        sandboxPolicy = campaign.agentSandboxPolicy;
+        diagnosisSandboxPolicy = campaign.agentDiagnosisSandboxPolicy;
+      };
+      # The narrate slot rides the open adapter map: the campaign names a catalog
+      # role and the adapter entry supplies the argv and the environment that
+      # reach the model, so swapping narrators is an adapter change and never a
+      # driver change. The publish node runs this argv directly, which is what
+      # keeps the seam free of flow nodes -- and is also why the adapter's
+      # per-job launch policies, hardening, and writable paths cannot apply here.
+      # Declaring any of those on a steward adapter is refused rather than
+      # ignored; see the campaign assertions below.
+      steward = if campaign.steward == null then null else renderCampaignSteward cfg campaign;
+      gates = renderCampaignGates campaign.gates;
     };
-    repositories = renderCampaignRepositories campaign.repositories;
-    inherit (campaign) worklist maxTasks maxParallel;
-    # The machine's self-nudge is local: a pass that advanced writes this
-    # payload into the shipped events directory instead of posting a public
-    # `/tally reconcile` comment for a second GitHub producer to poll back.
-    # The argv is the one the deleted reconcile producer built.
-    continuation = {
-      argv = [
-        (lib.getExe cfg.package)
-        "flow"
-        "run"
-        (storePathWithContext specBuildFlow)
-        "--args-from-brief"
-        "--max-nodes"
-        (toString (campaignMaxNodes campaign))
-      ];
-      pool = [
-        "flow"
-        campaign.pool.name
-      ];
-      priority = "low";
-      inherit (campaign) runtimeMaxSec;
-      eventsDir = "${toString cfg.stateDir}/events";
-    };
-    workspaceRoot = "${toString cfg.stateDir}/campaigns/${name}";
-    tally = lib.getExe cfg.package;
-    driver = "${specBuildDriver}/bin/spec-build-driver";
-    inherit (campaign) driverRuntimeMaxSec;
-    inherit (campaign) mergeMethod;
-    inherit (campaign) gitAiBinding;
-    inherit (campaign) gitAiAwaitSec;
-    agent = {
-      adapter = campaign.agent;
-      argv = campaign.agentArgv;
-      model = campaign.agentModel;
-      priority = campaign.agentPriority;
-      runtimeMaxSec = campaign.agentRuntimeMaxSec;
-      approvalPolicy = campaign.agentApprovalPolicy;
-      sandboxPolicy = campaign.agentSandboxPolicy;
-      diagnosisSandboxPolicy = campaign.agentDiagnosisSandboxPolicy;
-    };
-    # The narrate slot rides the open adapter map: the campaign names a catalog
-    # role and the adapter entry supplies the argv and the environment that
-    # reach the model, so swapping narrators is an adapter change and never a
-    # driver change. The publish node runs this argv directly, which is what
-    # keeps the seam free of flow nodes -- and is also why the adapter's
-    # per-job launch policies, hardening, and writable paths cannot apply here.
-    # Declaring any of those on a steward adapter is refused rather than
-    # ignored; see the campaign assertions below.
-    steward = if campaign.steward == null then null else renderCampaignSteward cfg campaign;
-    gates = renderCampaignGates campaign.gates;
-  };
 
   mkCampaignFlow =
     cfg: name: campaign:

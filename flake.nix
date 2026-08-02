@@ -1280,6 +1280,28 @@
                   stewardRuntimeMaxSec = 45;
                   pool.name = "fixture-campaign";
                 };
+                # The two-repository seam, rendered: the worklist and the
+                # campaign thread live on the spec repository, the lanes and
+                # pull requests on the code repository. Each role names an
+                # entry of the campaign's own repositories map.
+                campaigns.split = {
+                  enable = true;
+                  repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
+                  repositories."acme/code".checkout = toString ./test/fixtures/spec-build/repo;
+                  codeRepository = "acme/code";
+                  specRepository = "acme/spec";
+                  maxTasks = 2;
+                  gates = [
+                    {
+                      kind = "command";
+                      id = "content";
+                      preflightArgv = [ "/bin/true" ];
+                      argv = [ "/bin/true" ];
+                    }
+                  ];
+                  agentArgv = [ "/bin/true" ];
+                  pool.name = "split-campaign";
+                };
                 campaigns.defaulted = {
                   enable = true;
                   repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
@@ -3646,6 +3668,7 @@
                 jq -e '
                   .producers["campaign-fixture"].enqueue.brief as $fixtureArgs |
                   .producers["campaign-defaulted"].enqueue.brief as $defaultedArgs |
+                  .producers["campaign-split"].enqueue.brief as $splitArgs |
                   .enqueue.fanoutCap == 64 and
                   .pools["fixture-campaign"].resource == "mutex" and
                   .pools["fixture-campaign"].capacity == 1 and
@@ -3691,6 +3714,17 @@
                   $fixtureArgs.steward.finalMessagePattern == "^NARRATOR_RESULT=(.*)$" and
                   .adapters["spec-build-driver"].scrape.finalMessage.pattern
                     == "^TALLY_FINAL_MESSAGE=(.*)$" and
+                  # The seam is rendered only where it is configured. A role
+                  # left null is absent from the args, so a single-repository
+                  # campaign carries the same brief it always did.
+                  $splitArgs.codeRepository == "acme/code" and
+                  $splitArgs.specRepository == "acme/spec" and
+                  ($splitArgs | has("issueRepository") | not) and
+                  ($splitArgs.repositories | keys) == ["acme/code", "acme/spec"] and
+                  ($defaultedArgs | has("codeRepository") | not) and
+                  ($defaultedArgs | has("specRepository") | not) and
+                  ($defaultedArgs | has("issueRepository") | not) and
+                  ($fixtureArgs | has("specRepository") | not) and
                   $defaultedArgs.mergeMethod == "squash" and
                   $defaultedArgs.gitAiBinding == "off" and
                   $defaultedArgs.gitAiAwaitSec == 60 and
@@ -3726,7 +3760,12 @@
                   .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "51"] and
                   ([.producers | keys[] | select(test("reconcile"))] == []) and
                   ([.producers | keys[] | select(startswith("campaign-"))]
-                    == ["campaign-continuation", "campaign-defaulted", "campaign-fixture"]) and
+                    == [
+                      "campaign-continuation",
+                      "campaign-defaulted",
+                      "campaign-fixture",
+                      "campaign-split"
+                    ]) and
                   .producers["campaign-continuation"].kind == "events-dir" and
                   .producers["campaign-continuation"].pollIntervalSec == 5 and
                   ($fixtureArgs.continuation.argv
@@ -4293,6 +4332,21 @@
               }
               ''
                 ${pkgs.python3}/bin/python3 ${./test/spec_build_conflict_domains_test.py}
+                touch "$out"
+              '';
+          spec-build-two-repo =
+            pkgs.runCommand "tally-spec-build-two-repo"
+              {
+                nativeBuildInputs = [
+                  pkgs.git
+                  pkgs.python3
+                ];
+                SPEC_BUILD_DRIVER = "${campaignDrivers}/spec_build_driver.py";
+              }
+              ''
+                export HOME="$TMPDIR/home"
+                mkdir -p "$HOME"
+                ${pkgs.python3}/bin/python3 ${./test/spec_build_two_repo_test.py}
                 touch "$out"
               '';
           spec-build-checkpoint-receipts =

@@ -539,6 +539,61 @@ validated before the worklist node is admitted.
 history to constrain. They begin in their declared position in the post-agent
 gate sequence and use their own `runtimeMaxSec` for the packaged driver node.
 
+### Spanning two repositories
+
+A spec-corpus campaign can read its worklist from one repository and land its
+work on another. Three roles bind to entries of the campaign's own
+`repositories` map:
+
+| Role | What lives there |
+|---|---|
+| `codeRepository` | Lanes, publish branches, pull requests, merges, merge and checkpoint receipts, and the merged-pull-request scan. |
+| `specRepository` | The worklist artifact, read at the revision each pass pins. |
+| `issueRepository` | The campaign issue thread, its task sub-issues, and every machine receipt: diagnoses, retries, escalation, the continuation receipt, and the closing summary. |
+
+Each defaults inward: `issueRepository` falls back to `specRepository`, and
+both `specRepository` and `codeRepository` fall back to the repository the
+campaign issue was read from. A campaign that sets none of them is a
+single-repository campaign and takes exactly the path it took before these
+options existed — its rendered arguments do not carry the roles at all.
+
+```nix
+services.tally.campaigns.crm = {
+  enable = true;
+  repositories."mecattaf/crm-spec".checkout = "/srv/spec-repositories/crm";
+  repositories."mecattaf/crm".checkout = "/srv/code/crm";
+  # The worklist and the campaign thread stay with the spec corpus; the
+  # lanes, branches and pull requests land on the product repository.
+  specRepository = "mecattaf/crm-spec";
+  codeRepository = "mecattaf/crm";
+  worklist = "specs/001-crm/tasks.json";
+  # ...
+};
+```
+
+Two invariants change shape when the roles differ, and neither is optional:
+
+- **The witness splits in two.** The worklist's pinned revision belongs to the
+  spec history; every lane base, checkpoint receipt and merged-commit ancestry
+  check belongs to the code history. The reconcile result reports both:
+  `source.revision` (plus `source.repository`, present only when split) and
+  `baseRevision`, the code base tip the pass reasoned from. For a
+  single-repository campaign the two are the same commit.
+- **Closing keywords take their full form.** `Closes #<n>` resolves inside the
+  pull request's own repository, so a code-repository pull request naming a
+  spec-repository sub-issue that way links nothing and closes nothing. When the
+  task sub-issue lives elsewhere the publish node emits
+  `Closes owner/name#<n>`, which GitHub does honour across repositories: the
+  sub-issue closes on merge, the parent's progress bar advances, and
+  `closedByPullRequestsReferences` still returns the merged pull request as the
+  completion oracle. Because that reference can now name any repository, the
+  completion path additionally requires it to be on the campaign's own
+  `codeRepository`.
+
+An ad-hoc forge-native campaign cannot span repositories. Its worklist, briefs
+and receipts are the one issue thread by construction, so a brief carrying the
+roles is refused rather than partially honoured.
+
 ## The recurring worklist node contract
 
 For a recurring campaign, `worklist` is a relative glob in the configured

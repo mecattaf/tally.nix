@@ -359,6 +359,84 @@ def repo_config(value: Any) -> dict[str, Any]:
     }
 
 
+# A campaign has three repository coordinates. `repository` and
+# `repositoryConfig` are the *code* coordinate: where lanes are cut, publish
+# branches live, pull requests are opened, and merges land. A spec-corpus
+# campaign may read its worklist from a second repository and keep its campaign
+# issue -- and therefore its machine receipts -- on a third. Both are optional
+# and both default inward: spec falls back to code, issue falls back to spec. A
+# campaign that configures neither resolves all three to the same pair, so
+# every read and write happens exactly where it did before this seam existed.
+SEAM_COORDINATES = ("specRepository", "issueRepository")
+
+
+def campaign_coordinate(value: Any, context: str) -> dict[str, Any]:
+    entry = object_exact(value, {"repository", "repositoryConfig"}, context)
+    repository = required_string(entry.get("repository"), f"{context}.repository")
+    if not REPOSITORY.fullmatch(repository):
+        fail(f"{context}.repository must use owner/name form")
+    return {
+        "repository": repository,
+        "config": repo_config(entry.get("repositoryConfig")),
+    }
+
+
+def seam_fields(brief: Any, fields: set[str]) -> set[str]:
+    """Admit whichever seam coordinates this brief actually carries.
+
+    A brief that names none of them is validated against exactly the field set
+    it was validated against before, so an unknown key is still refused.
+    """
+    if not isinstance(brief, dict):
+        return fields
+    return fields | {name for name in SEAM_COORDINATES if name in brief}
+
+
+def campaign_coordinates(
+    data: dict[str, Any], repository: str, config: dict[str, Any]
+) -> dict[str, dict[str, Any]]:
+    code = {"repository": repository, "config": config}
+    spec = (
+        campaign_coordinate(data["specRepository"], "specRepository")
+        if data.get("specRepository") is not None
+        else code
+    )
+    issue = (
+        campaign_coordinate(data["issueRepository"], "issueRepository")
+        if data.get("issueRepository") is not None
+        else spec
+    )
+    return {"code": code, "spec": spec, "issue": issue}
+
+
+def carried_coordinates(data: dict[str, Any]) -> dict[str, Any]:
+    """The seam block to forward verbatim into a nested brief."""
+    return {
+        name: data[name]
+        for name in SEAM_COORDINATES
+        if data.get(name) is not None
+    }
+
+
+def same_repository(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    return (
+        left["repository"] == right["repository"]
+        and left["config"]["checkout"] == right["config"]["checkout"]
+    )
+
+
+def observed_base_revision(config: dict[str, Any]) -> str:
+    """The base branch tip of one repository, taken from its remote."""
+    checkout: Path = config["checkout"]
+    git(checkout, "fetch", "--prune", "--no-tags", config["remote"])
+    return git(
+        checkout,
+        "rev-parse",
+        "--verify",
+        f"{config['remote']}/{config['baseBranch']}^{{commit}}",
+    ).stdout.strip()
+
+
 def merge_method(value: Any, context: str) -> str:
     """How the merge node integrates a task, defaulting to the campaign default.
 
@@ -656,13 +734,18 @@ def normalize_task(
 def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
         brief,
-        {"repository", "repositoryConfig", "worklist", "maxTasks", "maxParallel"},
+        seam_fields(
+            brief,
+            {"repository", "repositoryConfig", "worklist", "maxTasks", "maxParallel"},
+        ),
         "worklist brief",
     )
     repository = required_string(data.get("repository"), "repository")
     if not REPOSITORY.fullmatch(repository):
         fail("repository must use owner/name form")
     config = repo_config(data.get("repositoryConfig"))
+    coordinates = campaign_coordinates(data, repository, config)
+    spec = coordinates["spec"]
     pattern = required_string(data.get("worklist"), "worklist")
     pattern_path = Path(pattern)
     if pattern_path.is_absolute() or ".." in pattern_path.parts:
@@ -680,10 +763,13 @@ def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     if max_parallel > max_tasks:
         fail("maxParallel must not exceed maxTasks")
 
-    checkout: Path = config["checkout"]
-    remote = config["remote"]
+    # The worklist is read from the spec coordinate at a pinned revision. With
+    # no spec repository configured that is the code checkout and this is the
+    # same fetch, the same base ref, and the same revision as before.
+    checkout: Path = spec["config"]["checkout"]
+    remote = spec["config"]["remote"]
     git(checkout, "fetch", "--prune", "--no-tags", remote)
-    base_ref = f"{remote}/{config['baseBranch']}"
+    base_ref = f"{remote}/{spec['config']['baseBranch']}"
     base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
     pattern_parts = PurePosixPath(pattern).parts
     literal_prefix: list[str] = []
@@ -743,14 +829,19 @@ def action_worklist(brief: dict[str, Any]) -> dict[str, Any]:
             fail(f"worklist repeats task id {task['id']!r}")
         tasks.append(task)
         prior_ids.add(task["id"])
+    source = {
+        "path": source_path,
+        "sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
+        "revision": base_rev,
+    }
+    if not same_repository(spec, coordinates["code"]):
+        # Only a split campaign records this. With one repository the pinned
+        # revision is unambiguous and the witness stays byte-identical.
+        source["repository"] = spec["repository"]
     return {
         "schemaVersion": 1,
         "repository": repository,
-        "source": {
-            "path": source_path,
-            "sha256": "sha256:" + hashlib.sha256(raw).hexdigest(),
-            "revision": base_rev,
-        },
+        "source": source,
         "tasks": tasks,
     }
 
@@ -1972,6 +2063,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
               baseRefName
               headRefName
               mergeCommit { oid }
+              repository { nameWithOwner }
             }
           }
           comments(last: 100) {
@@ -2147,6 +2239,9 @@ def pull_requests_by_head(
     for value in listed:
         candidate = normalized_pull_request(value)
         if candidate is not None:
+            # This read is scoped to one repository by construction; naming it
+            # lets the completion path apply one rule to both read paths.
+            candidate["repository"] = {"nameWithOwner": repository}
             candidates.append(candidate)
     return candidates
 
@@ -2219,6 +2314,17 @@ def merged_github_tasks(
         problems: list[str] = []
         if not isinstance(url_value, str) or not url_value or any(ord(char) < 32 for char in url_value):
             problems.append("has no valid URL")
+        # With one repository this was implied. Once the task sub-issue lives
+        # somewhere else, `closedByPullRequestsReferences` hands back whatever
+        # repository referenced it, so completion asserts the pull request is
+        # on the campaign's own code repository. This narrows where proof may
+        # come from; it never widens what counts as proof.
+        origin = candidate.get("repository")
+        name_with_owner = origin.get("nameWithOwner") if isinstance(origin, dict) else None
+        if name_with_owner is not None and name_with_owner != repository:
+            problems.append(
+                f"lives on {name_with_owner!r}, not campaign code repository {repository!r}"
+            )
         if candidate.get("baseRefName") != base_branch:
             problems.append(
                 f"targets {candidate.get('baseRefName')!r}, not base {base_branch!r}"
@@ -2381,6 +2487,7 @@ def completed_checkpoint_tasks(
     tasks: list[dict[str, Any]],
     source: dict[str, str],
     merged: list[dict[str, str]],
+    base_rev: str | None = None,
 ) -> list[dict[str, str]]:
     checkpoints = [task for task in tasks if task["kind"] == "checkpoint"]
     if not checkpoints:
@@ -2388,9 +2495,16 @@ def completed_checkpoint_tasks(
     checkout: Path = config["checkout"]
     remote = config["remote"]
     git(checkout, "fetch", "--prune", "--no-tags", remote)
-    base_rev = required_string(source.get("revision"), "worklist source revision")
+    # A checkpoint receipt names a revision of the *code* repository. Where the
+    # worklist is read from a second repository those are two different
+    # histories, so the anchor is passed in; with one repository the caller
+    # passes the worklist revision and nothing moves.
+    base_rev = required_string(
+        source.get("revision") if base_rev is None else base_rev,
+        "campaign base revision",
+    )
     if not re.fullmatch(r"[0-9a-f]{40,64}", base_rev):
-        fail("worklist source revision must be a full Git object ID")
+        fail("campaign base revision must be a full Git object ID")
     facts: list[dict[str, str]] = []
     completed_revisions = {fact["taskId"]: fact["mergeCommit"] for fact in merged}
     for task in checkpoints:
@@ -2966,6 +3080,13 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     brief, capabilities = take_capabilities(brief)
     forge_native = isinstance(brief.get("worklist"), dict)
     if forge_native:
+        # A forge-native campaign *is* its issue: the worklist, the briefs, and
+        # the receipts are all that one thread. There is no second repository
+        # to bind, and pretending otherwise would put the worklist somewhere
+        # the campaign cannot read it.
+        for name in SEAM_COORDINATES:
+            if brief.get(name) is not None:
+                fail(f"a forge-native campaign cannot carry {name}")
         data = object_exact(brief, {"repository", "issue", "worklist"}, "reconcile brief")
         worklist = issue_graph_worklist(data)
         campaign = worklist["config"]["campaign"]
@@ -2973,18 +3094,22 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         repository = worklist["repository"]
         config = repo_config(worklist["config"]["repositoryConfig"])
         max_parallel = worklist["config"]["maxParallel"]
+        coordinates = campaign_coordinates({}, repository, config)
     else:
         data = object_exact(
             brief,
-            {
-                "campaign",
-                "repository",
-                "repositoryConfig",
-                "issue",
-                "worklist",
-                "maxTasks",
-                "maxParallel",
-            },
+            seam_fields(
+                brief,
+                {
+                    "campaign",
+                    "repository",
+                    "repositoryConfig",
+                    "issue",
+                    "worklist",
+                    "maxTasks",
+                    "maxParallel",
+                },
+            ),
             "reconcile brief",
         )
         campaign = required_string(data.get("campaign"), "campaign")
@@ -2998,37 +3123,50 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
                 "worklist": data.get("worklist"),
                 "maxTasks": data.get("maxTasks"),
                 "maxParallel": data.get("maxParallel"),
+                **carried_coordinates(data),
             }
         )
         repository = worklist["repository"]
         config = repo_config(data.get("repositoryConfig"))
         max_parallel = data["maxParallel"]
-    base_rev = required_string(
+        coordinates = campaign_coordinates(data, repository, config)
+    code = coordinates["code"]
+    issue_target = coordinates["issue"]
+    source_revision = required_string(
         worklist["source"].get("revision"), "worklist source revision"
+    )
+    # The worklist's pinned revision witnesses the *spec* history. Everything
+    # downstream -- merged pull requests, checkpoint receipts, lane bases -- is
+    # anchored in the *code* history. With one repository those are the same
+    # commit and this costs no extra fetch.
+    base_rev = (
+        source_revision
+        if same_repository(coordinates["spec"], code)
+        else observed_base_revision(code["config"])
     )
     # One bounded walk per pass feeds both halves of the forge read: which
     # pull requests may be considered, and which machine receipts each task
     # thread carries.
     walk = (
-        subissue_walk(repository, issue["number"])
+        subissue_walk(issue_target["repository"], issue["number"])
         if forge_native and config["forge"] == "github" and capabilities["subIssueWalk"]
         else None
     )
     if config["forge"] == "github":
         merged, warnings = merged_github_tasks(
-            repository,
-            config,
+            code["repository"],
+            code["config"],
             campaign,
             issue["number"],
-            config["baseBranch"],
+            code["config"]["baseBranch"],
             base_rev,
             worklist["tasks"],
             walk,
         )
     else:
         merged = merged_local_tasks(
-            repository,
-            config,
+            code["repository"],
+            code["config"],
             campaign,
             issue["number"],
             base_rev,
@@ -3036,12 +3174,13 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         )
         warnings = []
     checkpoints = completed_checkpoint_tasks(
-        config,
+        code["config"],
         campaign,
         issue["number"],
         worklist["tasks"],
         worklist["source"],
         merged,
+        base_rev,
     )
     merged_ids = {fact["taskId"] for fact in merged}
     completed_ids = {fact["taskId"] for fact in merged + checkpoints}
@@ -3066,8 +3205,8 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         else None
     )
     diagnoses, retries, escalation, state_warnings = forge_campaign_state(
-        repository,
-        config,
+        issue_target["repository"],
+        issue_target["config"],
         campaign,
         issue["number"],
         task_ids,
@@ -3115,7 +3254,7 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         # so tally stops writing one. Without that capability the recomputed
         # checkbox list is still the only progress a reader gets.
         sync_issue_checkboxes(
-            repository,
+            issue_target["repository"],
             issue["number"],
             worklist["masterBody"],
             worklist["tasks"],
@@ -3127,6 +3266,10 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         "campaign": campaign,
         "repository": repository,
         "source": worklist["source"],
+        # The code history this pass reasoned from. Equal to the worklist
+        # revision for a single-repository campaign; the code repository's own
+        # base tip once the worklist lives somewhere else.
+        "baseRevision": base_rev,
         "tasks": worklist["tasks"],
         "merged": merged,
         "checkpoints": checkpoints,
@@ -3150,15 +3293,15 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         # digest is rendered here, inside the node that already owned closing
         # the issue. No new flow node exists for it.
         result["closingSummary"] = publish_closing_summary(
-            repository,
-            config,
+            issue_target["repository"],
+            issue_target["config"],
             campaign,
             issue["number"],
             campaign_digest(result, "complete"),
         )
         if forge_native:
             close_completed_issue_campaign(
-                repository,
+                issue_target["repository"],
                 issue["number"],
                 worklist["tasks"],
             )
@@ -3276,14 +3419,20 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     }
     if "taskIssue" in brief:
         fields.add("taskIssue")
-    data = object_exact(brief, fields, "steer brief")
+    data = object_exact(brief, seam_fields(brief, fields), "steer brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
         fail("campaign is not a safe component")
-    repository = required_string(data.get("repository"), "repository")
-    if not REPOSITORY.fullmatch(repository):
+    code_repository = required_string(data.get("repository"), "repository")
+    if not REPOSITORY.fullmatch(code_repository):
         fail("repository must use owner/name form")
-    config = repo_config(data.get("repositoryConfig"))
+    # A machine receipt is campaign state, so it is posted where the campaign
+    # thread lives, not where the code is.
+    target = campaign_coordinates(
+        data, code_repository, repo_config(data.get("repositoryConfig"))
+    )["issue"]
+    repository = target["repository"]
+    config = target["config"]
     issue = campaign_issue(data.get("issue"))
     task_id = required_string(data.get("taskId"), "taskId")
     if not TASK_ID.fullmatch(task_id):
@@ -3392,14 +3541,18 @@ def action_retry(brief: dict[str, Any]) -> dict[str, Any]:
     }
     if "taskIssue" in brief:
         fields.add("taskIssue")
-    data = object_exact(brief, fields, "retry brief")
+    data = object_exact(brief, seam_fields(brief, fields), "retry brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
         fail("campaign is not a safe component")
-    repository = required_string(data.get("repository"), "repository")
-    if not REPOSITORY.fullmatch(repository):
+    code_repository = required_string(data.get("repository"), "repository")
+    if not REPOSITORY.fullmatch(code_repository):
         fail("repository must use owner/name form")
-    config = repo_config(data.get("repositoryConfig"))
+    target = campaign_coordinates(
+        data, code_repository, repo_config(data.get("repositoryConfig"))
+    )["issue"]
+    repository = target["repository"]
+    config = target["config"]
     issue = campaign_issue(data.get("issue"))
     task_id = required_string(data.get("taskId"), "taskId")
     if not TASK_ID.fullmatch(task_id):
@@ -3498,15 +3651,18 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
     else:
         data = object_exact(
             brief,
-            {
-                "campaign",
-                "repository",
-                "repositoryConfig",
-                "issue",
-                "worklist",
-                "maxTasks",
-                "maxParallel",
-            },
+            seam_fields(
+                brief,
+                {
+                    "campaign",
+                    "repository",
+                    "repositoryConfig",
+                    "issue",
+                    "worklist",
+                    "maxTasks",
+                    "maxParallel",
+                },
+            ),
             "escalate brief",
         )
     reconciliation = action_reconcile(capability_brief)
@@ -3521,14 +3677,18 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
             "retryCount": len(reconciliation["retries"]),
         }
     campaign = required_string(reconciliation.get("campaign"), "campaign")
-    repository = reconciliation["repository"]
     issue = campaign_issue(data.get("issue"))
     config_value = (
         reconciliation["config"]["repositoryConfig"]
         if forge_native
         else data.get("repositoryConfig")
     )
-    config = repo_config(config_value)
+    # Escalation is campaign-wide state: it belongs on the campaign thread.
+    target = campaign_coordinates(
+        data, reconciliation["repository"], repo_config(config_value)
+    )["issue"]
+    repository = target["repository"]
+    config = target["config"]
     direct = [
         fact["taskId"]
         for fact in reconciliation["blocked"]
@@ -3718,15 +3878,18 @@ def write_continuation_event(
 def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
     data = object_exact(
         brief,
-        {
-            "campaign",
-            "repository",
-            "repositoryConfig",
-            "issue",
-            "runId",
-            "continuation",
-            "brief",
-        },
+        seam_fields(
+            brief,
+            {
+                "campaign",
+                "repository",
+                "repositoryConfig",
+                "issue",
+                "runId",
+                "continuation",
+                "brief",
+            },
+        ),
         "continue brief",
     )
     campaign = required_string(data.get("campaign"), "campaign")
@@ -3735,7 +3898,12 @@ def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
     repository = required_string(data.get("repository"), "repository")
     if not REPOSITORY.fullmatch(repository):
         fail("repository must use owner/name form")
-    config = repo_config(data.get("repositoryConfig"))
+    # The dedup key is campaign identity and stays anchored to the code
+    # coordinate; only the durable receipt follows the campaign thread.
+    target = campaign_coordinates(
+        data, repository, repo_config(data.get("repositoryConfig"))
+    )["issue"]
+    config = target["config"]
     issue = campaign_issue(data.get("issue"))
     run_id = required_string(data.get("runId"), "runId", 512)
     spec = continuation_spec(data.get("continuation"))
@@ -3765,7 +3933,7 @@ def action_continue(brief: dict[str, Any]) -> dict[str, Any]:
         _, observed = write_local_blob(config, ref, expected)
         if observed != expected:
             fail(f"local forge continuation {ref!r} disagrees with this pass")
-        receipt = f"local://{repository}/{ref}"
+        receipt = f"local://{target['repository']}/{ref}"
     return {
         "event": str(path),
         "dedupKey": dedup_key,
@@ -5277,7 +5445,7 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
                 "assistedBy",
             }
         )
-    data = object_exact(brief, allowed, f"{action} brief")
+    data = object_exact(brief, seam_fields(brief, allowed), f"{action} brief")
     config = repo_config(data.get("repositoryConfig"))
     workspace = object_exact(
         data.get("workspace"),
@@ -5344,7 +5512,17 @@ def github_pull_request(
     closes = ""
     if isinstance(task.get("brief"), dict):
         task_issue = campaign_issue(task["brief"].get("issue"))
-        closes = f"\n\nCloses #{task_issue['number']}"
+        # `#<n>` resolves inside the pull request's own repository. Where the
+        # task sub-issue lives somewhere else that reference names a different
+        # issue, or none at all, and the merge silently closes nothing -- the
+        # probe recorded on #321 shows exactly that. So a split campaign emits
+        # the full `owner/name#<n>` form, which GitHub does honour across
+        # repositories; an unsplit one keeps the short form byte-for-byte.
+        issue_repository = campaign_coordinates(
+            data, repository, config
+        )["issue"]["repository"]
+        qualifier = "" if issue_repository == repository else issue_repository
+        closes = f"\n\nCloses {qualifier}#{task_issue['number']}"
     # Steward prose leads; the managed marker and the campaign's own identity
     # lines are appended by this node and are never model-authored. With no
     # steward the narration is the template and this body is byte-identical to
@@ -6422,14 +6600,19 @@ def merge_github(
 
 
 def github_checkpoint_progress_comment(
-    data: dict[str, Any], reference: str, revision: str, source_sha256: str
+    data: dict[str, Any],
+    reference: str,
+    revision: str,
+    source_sha256: str,
+    repository: str | None = None,
 ) -> None:
     """The degraded checkpoint projection: one comment plus the checkbox.
 
     Suppressed wherever the sub-issue walk is available, for the same reason
     the per-merge comment is: the parent renders its own progress.
     """
-    repository = required_string(data.get("repository"), "repository")
+    if repository is None:
+        repository = required_string(data.get("repository"), "repository")
     campaign = required_string(data.get("campaign"), "campaign")
     issue = campaign_issue(data.get("issue"))
     task = data["task"]
@@ -6506,19 +6689,18 @@ def github_checkpoint_progress_comment(
 
 def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     brief, capabilities = take_capabilities(brief)
-    data = object_exact(
-        brief,
-        {
-            "campaign",
-            "repository",
-            "repositoryConfig",
-            "issue",
-            "task",
-            "source",
-            "workspace",
-        },
-        "checkpoint brief",
-    )
+    fields = {
+        "campaign",
+        "repository",
+        "repositoryConfig",
+        "issue",
+        "task",
+        "source",
+        "workspace",
+    }
+    if "baseRevision" in brief:
+        fields.add("baseRevision")
+    data = object_exact(brief, seam_fields(brief, fields), "checkpoint brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
         fail("campaign is not a safe component")
@@ -6527,6 +6709,7 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
         fail("repository must use owner/name form")
     issue = campaign_issue(data.get("issue"))
     config = repo_config(data.get("repositoryConfig"))
+    coordinates = campaign_coordinates(data, repository, config)
     task = object_exact(
         data.get("task"),
         {
@@ -6564,6 +6747,15 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
     source_revision = required_string(source.get("revision"), "source.revision")
     if not re.fullmatch(r"[0-9a-f]{40,64}", source_revision):
         fail("source.revision must be a full Git object ID")
+    # The lineage assertion below reasons inside the *code* checkout. A split
+    # campaign's worklist revision is a commit of another history entirely, so
+    # the reconciler hands the code anchor down explicitly; unsplit campaigns
+    # send nothing and the worklist revision remains the anchor.
+    code_revision = source_revision
+    if data.get("baseRevision") is not None:
+        code_revision = required_string(data.get("baseRevision"), "baseRevision")
+        if not re.fullmatch(r"[0-9a-f]{40,64}", code_revision):
+            fail("baseRevision must be a full Git object ID")
     workspace = object_exact(
         data.get("workspace"),
         {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
@@ -6599,7 +6791,7 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
         checkout,
         "merge-base",
         "--is-ancestor",
-        source_revision,
+        code_revision,
         base_rev,
         check=False,
     ).returncode:
@@ -6651,7 +6843,13 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
             "the task and the base branch is moving faster than this checkpoint runs"
         )
     if config["forge"] == "github" and not capabilities["subIssueWalk"]:
-        github_checkpoint_progress_comment(data, reference, base_rev, source_sha256)
+        github_checkpoint_progress_comment(
+            data,
+            reference,
+            base_rev,
+            source_sha256,
+            coordinates["issue"]["repository"],
+        )
     return {"taskId": task_id, "ref": reference, "revision": base_rev}
 
 
