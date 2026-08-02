@@ -159,6 +159,17 @@ authorized.
 
 ### Fixed
 
+- Stop publishing a public "Tally already recorded this trigger" comment when a
+  GitHub producer re-observes a trigger that is already in its ledger — what
+  every producer restart does to every historical trigger on a campaign issue.
+  The duplicate outcome is producer-internal bookkeeping and is now never
+  posted, and the completion check that missed the existing acknowledgement
+  matches the receipt id rather than the decision suffix that wrote the marker,
+  so acknowledgements already on public threads still count as complete. Ledger
+  recording, trigger grammar, intake authorization, and enqueue dedup are
+  unchanged. With duplicates silent at the decision level and receipts
+  upserting, `postReceipt` deliberately stays one boolean: the proposed
+  accepted-versus-duplicate option split is unnecessary and does not ship.
 - Reject a spec-build task lane whose history contains a merge commit, naming
   the real cause: "rebase instead of merging the base into your lane". The
   ownership union walks lane history with `git log -m`, which splits a merge
@@ -409,6 +420,17 @@ authorized.
 
 ### Changed
 
+- GitHub receipt and evidence comments are now sticky. Tally stores the node id
+  `addComment` returns under the producer state directory, keyed by receipt or
+  completion id, and edits that comment in place on later publications instead
+  of paginating the whole thread looking for its marker. Markers stay in the
+  comment body as the recovery key: a thread whose comment predates the stored
+  id, or whose producer state was lost, is still recognized by one scan and
+  adopts the existing comment rather than duplicating it, and a remembered
+  comment that has since been deleted is forgotten and recreated once instead
+  of wedging the sink. Steering, escalation, and closing-summary comments are
+  deliberately outside this primitive and remain fresh comments, so the
+  operator is still notified.
 - Forge-native campaigns now read completion through one bounded GraphQL walk
   of the master issue's native sub-issues — parent → `subIssues` →
   `closedByPullRequestsReferences` → `pullRequest.merged` — instead of scanning

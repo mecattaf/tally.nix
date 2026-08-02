@@ -1481,6 +1481,315 @@ fn github_trigger_acknowledgement_marker_is_stable_and_remote_idempotent() {
     assert!(body.contains("tally query log --task"));
 }
 
+/// A scripted GraphQL transport that keeps the comment thread on disk: one
+/// `<node id>.body` file per comment, holding the tally marker the scan looks
+/// for. A test can seed a legacy comment, delete one behind the sink's back,
+/// or restart the sink, and then read back exactly which mutations were issued.
+const SCRIPTED_GRAPHQL: &str = r#"#!/bin/sh
+[ "$1 $2 $3 $4" = 'api graphql --input -' ] || exit 91
+request=$(cat)
+printf '%s\n' "$request" >> '@REQUESTS@'
+marker=$(printf '%s' "$request" | sed -n 's/.*\(<!-- tally-[^>]*-->\).*/\1/p')
+case "$request" in
+  *TallyCompletionState*)
+    nodes=''
+    separator=''
+    for comment in '@THREAD@'/*.body; do
+      [ -f "$comment" ] || continue
+      id=${comment##*/}
+      id=${id%.body}
+      nodes="$nodes$separator{\"id\":\"$id\",\"body\":\"$(cat "$comment")\"}"
+      separator=','
+    done
+    printf '{"data":{"node":{"__typename":"Issue","state":"OPEN","comments":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}' "$nodes"
+    ;;
+  *TallyItemState*)
+    printf '{"data":{"node":{"__typename":"Issue","state":"OPEN"}}}'
+    ;;
+  *TallyCompletionComment*)
+    sequence=$(cat '@THREAD@/sequence' 2>/dev/null || printf 1)
+    printf '%s' "$marker" > "@THREAD@/IC_$sequence.body"
+    printf '%s' "$((sequence + 1))" > '@THREAD@/sequence'
+    printf '{"data":{"addComment":{"commentEdge":{"node":{"id":"IC_%s"}}}}}' "$sequence"
+    ;;
+  *TallyStickyComment*)
+    id=$(printf '%s' "$request" | sed -n 's/.*"commentId":"\([^"]*\)".*/\1/p')
+    if [ ! -f "@THREAD@/$id.body" ]; then
+      printf '{"errors":[{"message":"Could not resolve to a node"}]}'
+      exit 0
+    fi
+    printf '%s' "$marker" > "@THREAD@/$id.body"
+    printf '{"data":{"updateIssueComment":{"issueComment":{"id":"%s"}}}}' "$id"
+    ;;
+  *) exit 92 ;;
+esac
+"#;
+
+fn install_scripted_graphql(gh: &Path, requests: &Path, thread: &Path) {
+    std::fs::create_dir_all(thread).unwrap();
+    crate::test_support::install_shell_program(
+        gh,
+        SCRIPTED_GRAPHQL
+            .replace("@REQUESTS@", &requests.display().to_string())
+            .replace("@THREAD@", &thread.display().to_string()),
+    );
+    File::open(gh).unwrap().sync_all().unwrap();
+    sync_directory(gh.parent().unwrap()).unwrap();
+}
+
+/// The GraphQL operations the sink issued, in order, since the last drain.
+fn scripted_operations(requests: &Path) -> Vec<String> {
+    let recorded = std::fs::read_to_string(requests).unwrap_or_default();
+    let _ = std::fs::remove_file(requests);
+    recorded
+        .lines()
+        .map(|line| {
+            let request: Value = serde_json::from_str(line).unwrap();
+            let query = request["query"].as_str().unwrap().to_owned();
+            [
+                "TallyCompletionState",
+                "TallyItemState",
+                "TallyCompletionComment",
+                "TallyStickyComment",
+            ]
+            .into_iter()
+            .find(|operation| query.contains(operation))
+            .unwrap_or_else(|| panic!("unexpected scripted GraphQL operation {query:?}"))
+            .to_owned()
+        })
+        .collect()
+}
+
+fn thread_comments(thread: &Path) -> Vec<String> {
+    let mut comments = std::fs::read_dir(thread)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension() == Some("body".as_ref()))
+        .map(|path| path.file_stem().unwrap().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    comments.sort();
+    comments
+}
+
+fn stored_sticky_comments(state_dir: &Path) -> Vec<(String, String)> {
+    let Ok(entries) = std::fs::read_dir(state_dir.join("producers/gh-comments")) else {
+        return Vec::new();
+    };
+    let mut stored = entries
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension() == Some("json".as_ref()))
+        .map(|path| {
+            let record: GhStickyComment =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(record.schema_version, 1);
+            assert_eq!(record.producer, "github");
+            assert_eq!(record.item_id, "I_widget_42");
+            (record.logical_id, record.comment_id)
+        })
+        .collect::<Vec<_>>();
+    stored.sort();
+    stored
+}
+
+fn trigger_acknowledgement(
+    receipt_id: &str,
+    decision: GhDecisionStatus,
+) -> GhTriggerAcknowledgement {
+    GhTriggerAcknowledgement {
+        schema_version: 1,
+        producer: "github".to_owned(),
+        receipt_id: receipt_id.to_owned(),
+        item_id: "I_widget_42".to_owned(),
+        decision,
+        rule: (decision == GhDecisionStatus::Filtered)
+            .then_some(GhFilterReason::TriggerActorNotAllowed),
+        task_uuid: Some("00000000-0000-5000-8000-000000000042".to_owned()),
+        status_pointer: Some(
+            "tally query log --task 00000000-0000-5000-8000-000000000042".to_owned(),
+        ),
+    }
+}
+
+/// #245: a producer restart re-scans every historical trigger, and each
+/// re-scan resolves to `Duplicate`. The old exact-marker check missed the
+/// `:accepted` marker already on the thread and published one "already
+/// recorded" comment per trigger.
+#[test]
+fn github_duplicate_trigger_acknowledgement_is_never_published() {
+    let temp = tempdir().unwrap();
+    let gh = temp.path().join("fake-gh");
+    let requests = temp.path().join("requests.jsonl");
+    let thread = temp.path().join("thread");
+    let state_dir = temp.path().join("state");
+    install_scripted_graphql(&gh, &requests, &thread);
+    std::fs::write(
+        thread.join("IC_7.body"),
+        "<!-- tally-trigger:receipt-42:accepted -->",
+    )
+    .unwrap();
+
+    let mut sink = GhCliAcknowledgementSink::with_program(&gh).with_state_dir(&state_dir);
+    sink.post_acknowledgement(&trigger_acknowledgement(
+        "receipt-42",
+        GhDecisionStatus::Duplicate,
+    ))
+    .unwrap();
+    assert_eq!(scripted_operations(&requests), Vec::<String>::new());
+    assert_eq!(thread_comments(&thread), ["IC_7"]);
+
+    // Not even on a thread that carries no marker at all.
+    std::fs::remove_file(thread.join("IC_7.body")).unwrap();
+    sink.post_acknowledgement(&trigger_acknowledgement(
+        "receipt-42",
+        GhDecisionStatus::Duplicate,
+    ))
+    .unwrap();
+    assert_eq!(scripted_operations(&requests), Vec::<String>::new());
+    assert_eq!(thread_comments(&thread), Vec::<String>::new());
+
+    // A legacy marker satisfies the completion check whatever decision wrote
+    // it: the check matches the receipt id, not the decision suffix.
+    std::fs::write(
+        thread.join("IC_7.body"),
+        "<!-- tally-trigger:receipt-42:filtered -->",
+    )
+    .unwrap();
+    sink.post_acknowledgement(&trigger_acknowledgement(
+        "receipt-42",
+        GhDecisionStatus::Accepted,
+    ))
+    .unwrap();
+    assert_eq!(scripted_operations(&requests), ["TallyCompletionState"]);
+    assert_eq!(thread_comments(&thread), ["IC_7"]);
+    assert_eq!(
+        stored_sticky_comments(&state_dir),
+        [("receipt-42".to_owned(), "IC_7".to_owned())]
+    );
+}
+
+/// §9.1.3: the receipt is one sticky comment. It is created once, remembered
+/// durably, and edited in place afterwards; a lost id recovers through the
+/// marker scan instead of duplicating the comment.
+#[test]
+fn github_receipt_comment_upserts_in_place_across_a_producer_restart() {
+    let temp = tempdir().unwrap();
+    let gh = temp.path().join("fake-gh");
+    let requests = temp.path().join("requests.jsonl");
+    let thread = temp.path().join("thread");
+    let state_dir = temp.path().join("state");
+    install_scripted_graphql(&gh, &requests, &thread);
+    let accepted = trigger_acknowledgement("receipt-42", GhDecisionStatus::Accepted);
+
+    let mut sink = GhCliAcknowledgementSink::with_program(&gh).with_state_dir(&state_dir);
+    sink.post_acknowledgement(&accepted).unwrap();
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyCompletionState", "TallyCompletionComment"]
+    );
+    assert_eq!(thread_comments(&thread), ["IC_1"]);
+    assert_eq!(
+        stored_sticky_comments(&state_dir),
+        [("receipt-42".to_owned(), "IC_1".to_owned())]
+    );
+
+    // A filtered receipt on the same thread is its own sticky comment.
+    sink.post_acknowledgement(&trigger_acknowledgement(
+        "receipt-43",
+        GhDecisionStatus::Filtered,
+    ))
+    .unwrap();
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyCompletionState", "TallyCompletionComment"]
+    );
+    assert_eq!(thread_comments(&thread), ["IC_1", "IC_2"]);
+
+    // The id is durable, not process memory: a restarted producer edits the
+    // comment it created before, and never paginates the thread again.
+    let mut restarted = GhCliAcknowledgementSink::with_program(&gh).with_state_dir(&state_dir);
+    restarted.post_acknowledgement(&accepted).unwrap();
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyStickyComment", "TallyItemState"]
+    );
+    assert_eq!(thread_comments(&thread), ["IC_1", "IC_2"]);
+
+    // State loss with a marker still on the thread: recover, adopt the
+    // existing comment, and post nothing.
+    std::fs::remove_dir_all(state_dir.join("producers/gh-comments")).unwrap();
+    restarted.post_acknowledgement(&accepted).unwrap();
+    assert_eq!(scripted_operations(&requests), ["TallyCompletionState"]);
+    assert_eq!(thread_comments(&thread), ["IC_1", "IC_2"]);
+    // Only the receipt that was re-posted re-adopts its comment; the other
+    // stays recoverable through its marker.
+    assert_eq!(
+        stored_sticky_comments(&state_dir),
+        [("receipt-42".to_owned(), "IC_1".to_owned())]
+    );
+
+    // A remembered comment that no longer exists must not wedge the sink: it
+    // forgets the id, recovers through the scan, and creates one fresh comment.
+    std::fs::remove_file(thread.join("IC_1.body")).unwrap();
+    restarted.post_acknowledgement(&accepted).unwrap();
+    assert_eq!(
+        scripted_operations(&requests),
+        [
+            "TallyStickyComment",
+            "TallyCompletionState",
+            "TallyCompletionComment"
+        ]
+    );
+    assert_eq!(thread_comments(&thread), ["IC_2", "IC_3"]);
+    assert_eq!(
+        stored_sticky_comments(&state_dir),
+        [("receipt-42".to_owned(), "IC_3".to_owned())]
+    );
+}
+
+/// The same primitive carries completion evidence: one comment per completion
+/// id, edited in place when the same completion is published again.
+#[test]
+fn github_completion_evidence_upserts_the_comment_it_already_created() {
+    let temp = tempdir().unwrap();
+    let gh = temp.path().join("fake-gh");
+    let requests = temp.path().join("requests.jsonl");
+    let thread = temp.path().join("thread");
+    let state_dir = temp.path().join("state");
+    install_scripted_graphql(&gh, &requests, &thread);
+    let mutation = GhCompletedMutation {
+        producer: "github".to_owned(),
+        source: "search".to_owned(),
+        item_id: "I_widget_42".to_owned(),
+        completion_id: Some("task-1:attempt-1:witness-5".to_owned()),
+        state: "COMPLETED".to_owned(),
+        evidence: Some(serde_json::json!({"witnessSeq": 5})),
+        gate_summary: None,
+        acceptance: None,
+        request_review: false,
+        assisted_by: None,
+    };
+
+    let mut sink = GhCliMutationSink::with_program(&gh).with_state_dir(&state_dir);
+    sink.post_evidence(&mutation).unwrap();
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyCompletionState", "TallyCompletionComment"]
+    );
+    assert_eq!(thread_comments(&thread), ["IC_1"]);
+    assert_eq!(
+        stored_sticky_comments(&state_dir),
+        [("task-1:attempt-1:witness-5".to_owned(), "IC_1".to_owned())]
+    );
+
+    let mut republished = GhCliMutationSink::with_program(&gh).with_state_dir(&state_dir);
+    republished.post_evidence(&mutation).unwrap();
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyStickyComment", "TallyItemState"]
+    );
+    assert_eq!(thread_comments(&thread), ["IC_1"]);
+}
+
 #[test]
 fn github_issue_21_repo_label_and_state_scope_admits_only_the_exact_match() {
     let temp = tempdir().unwrap();

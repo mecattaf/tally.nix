@@ -735,6 +735,97 @@ class GitHubForgeTests(unittest.TestCase):
                 self.assertEqual(repeated["comment"], escalated["comment"])
                 self.assertEqual(len(github.state()["comments"]), 2)
 
+    def test_steering_escalation_and_the_closing_summary_are_always_fresh(self) -> None:
+        """§9.1.3 holds a line: receipts upsert silently, these three never do.
+
+        A sticky comment is invisible to whoever is watching the thread, so the
+        three surfaces that exist to notify the operator must keep creating new
+        comments. None of them may acquire an edit-in-place path.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            worklist = checkout / "specs/campaign/tasks.json"
+            worklist.parent.mkdir(parents=True)
+            worklist.write_text(
+                json.dumps({"schemaVersion": 1, "tasks": [task("task-1")]}),
+                encoding="utf-8",
+            )
+            git(checkout, "add", "specs/campaign/tasks.json")
+            git(checkout, "commit", "--quiet", "-m", "add worklist")
+            git(checkout, "push", "--quiet", "origin", "main")
+            state = {
+                "actor": "tally-bot",
+                "merged": [],
+                "byHead": {},
+                "comments": [],
+                "issueComments": [],
+                "calls": [],
+            }
+            reconcile_brief = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "repositoryConfig": repository_config(checkout, "github"),
+                "issue": issue(),
+                "worklist": "specs/*/tasks.json",
+                "maxTasks": 1,
+                "maxParallel": 1,
+            }
+            with FakeGitHub(root, state) as github:
+                for attempt in (1, 2):
+                    steered = DRIVER.action_steer(
+                        {
+                            "campaign": "fixture",
+                            "repository": "acme/spec",
+                            "repositoryConfig": repository_config(checkout, "github"),
+                            "issue": issue(),
+                            "taskId": "task-1",
+                            "attempt": attempt,
+                            "diagnosis": f"Steering for attempt {attempt}.",
+                        }
+                    )
+                    self.assertTrue(steered["posted"])
+                escalated = DRIVER.action_escalate(reconcile_brief)
+                self.assertTrue(escalated["posted"])
+
+                published = github.state()
+                # Two steering notes and one escalation: three distinct
+                # comments, each created rather than edited.
+                self.assertEqual(len(published["comments"]), 3)
+                self.assertEqual(
+                    len({comment["html_url"] for comment in published["issueComments"]}),
+                    3,
+                )
+                creates = [
+                    call for call in published["calls"] if call[:2] == ["issue", "comment"]
+                ]
+                self.assertEqual(len(creates), 3)
+                self.assertFalse(
+                    any("--edit-last" in call for call in published["calls"])
+                )
+                self.assertFalse(
+                    any(
+                        "updateIssueComment" in argument
+                        for call in published["calls"]
+                        for argument in call
+                    )
+                )
+
+            # The closing summary publishes the same way: create, never edit.
+            completed = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(DRIVER, "run", return_value=completed) as run:
+                DRIVER.close_completed_issue_campaign(
+                    "acme/spec", "7", {"sha256": "sha256:" + "a" * 64}, []
+                )
+            commands = [call.args[0] for call in run.call_args_list]
+            summary = next(
+                command for command in commands if command[:3] == ["gh", "issue", "comment"]
+            )
+            self.assertIn("Campaign complete", summary[-1])
+            self.assertFalse(
+                any("--edit-last" in command or "updateIssueComment" in command for command in commands)
+            )
+
     def test_worklist_edits_degrade_receipts_instead_of_bricking_the_campaign(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

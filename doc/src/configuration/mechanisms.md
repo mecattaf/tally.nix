@@ -179,6 +179,17 @@ switches are [`postReceipt`](core-options.md#servicestallyproducersnamepostrecei
 close. Gate summaries and acceptance-based closure require an enqueue
 `gateManifest`.
 
+`postReceipt` publishes one acknowledgement per accepted or filtered trigger.
+Re-observing a trigger the ledger already holds — what every producer restart
+does to every historical trigger — is producer-internal bookkeeping and is
+never published, so `postReceipt` stays one switch rather than splitting by
+decision. Receipts and evidence comments are sticky: tally stores the node id
+of the comment it created under the producer state directory and edits that
+comment in place afterwards, falling back to the marker scan only for a thread
+whose comment predates the stored id or whose state was lost. Steering,
+escalation, and closing-summary comments are deliberately outside this
+primitive; they stay fresh comments so the operator is notified.
+
 `postEvidence` posts only passing and reused evidence, preserving its original
 operator-facing meaning. Failure evidence is a separate public side effect and
 is disabled by default. `postFailureEvidence` explicitly posts one idempotent

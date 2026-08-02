@@ -1183,7 +1183,7 @@ let
           type = types.bool;
           default = true;
           example = false;
-          description = "Post an idempotent acknowledgement for accepted, filtered, and duplicate triggers.";
+          description = "Post one sticky acknowledgement for an accepted or filtered trigger; re-observing a recorded trigger stays producer-internal and is never published.";
         };
         postEvidence = mkOption {
           type = types.bool;
