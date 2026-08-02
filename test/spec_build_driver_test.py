@@ -28,6 +28,9 @@ SPEC = importlib.util.spec_from_file_location("spec_build_driver", SOURCE)
 assert SPEC is not None and SPEC.loader is not None
 DRIVER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(DRIVER)
+# The shared worktree manager the driver resolves as a sibling module. Reading
+# lane identity back through it is what proves the round-trip.
+WORKTREES = DRIVER.worktrees
 
 
 def command(*arguments: str, cwd: Path | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -743,10 +746,21 @@ class GitHubForgeTests(unittest.TestCase):
                 escalated = DRIVER.action_escalate(reconcile_brief)
                 self.assertTrue(escalated["posted"])
                 self.assertEqual(escalated["diagnosisCount"], 2)
+                # The escalation carries a closing summary beside it: the
+                # campaign stopped, so the operator gets the digest of what it
+                # did manage to bind.
+                self.assertIsNotNone(escalated["summary"])
+                summary_body = github.state()["comments"][-1]
+                self.assertIn("Campaign closed at frontier quiescence", summary_body)
+                self.assertIn("`task-1`", summary_body)
+                self.assertNotIn("ghp_", summary_body)
                 repeated = DRIVER.action_escalate(reconcile_brief)
                 self.assertFalse(repeated["posted"])
+                self.assertIsNone(repeated["summary"])
                 self.assertEqual(repeated["comment"], escalated["comment"])
-                self.assertEqual(len(github.state()["comments"]), 2)
+                # One steering note, one escalation, one closing summary, and
+                # the repeat pass adds nothing.
+                self.assertEqual(len(github.state()["comments"]), 3)
 
     def test_steering_escalation_and_the_closing_summary_are_always_fresh(self) -> None:
         """§9.1.3 holds a line: receipts upsert silently, these three never do.
@@ -802,17 +816,18 @@ class GitHubForgeTests(unittest.TestCase):
                 self.assertTrue(escalated["posted"])
 
                 published = github.state()
-                # Two steering notes and one escalation: three distinct
-                # comments, each created rather than edited.
-                self.assertEqual(len(published["comments"]), 3)
+                # Two steering notes, one escalation, and the closing summary
+                # that rides with it: four distinct comments, each created
+                # rather than edited.
+                self.assertEqual(len(published["comments"]), 4)
                 self.assertEqual(
                     len({comment["html_url"] for comment in published["issueComments"]}),
-                    3,
+                    4,
                 )
                 creates = [
                     call for call in published["calls"] if call[:2] == ["issue", "comment"]
                 ]
-                self.assertEqual(len(creates), 3)
+                self.assertEqual(len(creates), 4)
                 self.assertFalse(
                     any("--edit-last" in call for call in published["calls"])
                 )
@@ -824,19 +839,69 @@ class GitHubForgeTests(unittest.TestCase):
                     )
                 )
 
-            # The closing summary publishes the same way: create, never edit.
-            completed = subprocess.CompletedProcess([], 0, "", "")
-            with mock.patch.object(DRIVER, "run", return_value=completed) as run:
-                DRIVER.close_completed_issue_campaign(
-                    "acme/spec", "7", {"sha256": "sha256:" + "a" * 64}, []
+            # The completion summary publishes the same way: create, never
+            # edit, and only once for a given worklist digest.
+            digest = "sha256:" + "a" * 64
+            reconciliation = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "source": {"sha256": digest, "revision": "b" * 40},
+                "tasks": [{"id": "task-1", "title": "Task 1"}],
+                "merged": [
+                    {
+                        "taskId": "task-1",
+                        "pullRequest": "https://github.com/acme/spec/pull/4",
+                        "mergeCommit": "c" * 40,
+                    }
+                ],
+                "checkpoints": [],
+                "remaining": [],
+                "diagnoses": [],
+                "retries": [],
+                "deferrals": [],
+                "blocked": [],
+                "anomalies": [],
+                "warnings": [],
+            }
+            posted = subprocess.CompletedProcess(
+                [], 0, "https://github.com/acme/spec/issues/7#issuecomment-1\n", ""
+            )
+            empty = subprocess.CompletedProcess([], 0, "", "")
+            with mock.patch.object(
+                DRIVER, "run", side_effect=[empty, posted]
+            ) as run:
+                DRIVER.publish_closing_summary(
+                    "acme/spec",
+                    repository_config(checkout, "github"),
+                    "fixture",
+                    "7",
+                    DRIVER.campaign_digest(reconciliation, "complete"),
                 )
             commands = [call.args[0] for call in run.call_args_list]
             summary = next(
                 command for command in commands if command[:3] == ["gh", "issue", "comment"]
             )
             self.assertIn("Campaign complete", summary[-1])
+            self.assertIn(f"tally:campaign-complete:v1 source={digest}", summary[-1])
+            self.assertIn("https://github.com/acme/spec/pull/4", summary[-1])
             self.assertFalse(
                 any("--edit-last" in command or "updateIssueComment" in command for command in commands)
+            )
+            # A repeated terminal pass finds its own marker and stays quiet.
+            seen = subprocess.CompletedProcess([], 0, summary[-1], "")
+            with mock.patch.object(DRIVER, "run", side_effect=[seen]) as run:
+                DRIVER.publish_closing_summary(
+                    "acme/spec",
+                    repository_config(checkout, "github"),
+                    "fixture",
+                    "7",
+                    DRIVER.campaign_digest(reconciliation, "complete"),
+                )
+            self.assertFalse(
+                any(
+                    call.args[0][:3] == ["gh", "issue", "comment"]
+                    for call in run.call_args_list
+                )
             )
 
     def test_worklist_edits_degrade_receipts_instead_of_bricking_the_campaign(self) -> None:
@@ -1603,21 +1668,21 @@ class GitHubForgeTests(unittest.TestCase):
         self.assertIn("- [ ] <!-- tally:campaign-task:v1 id=second -->", edited)
         self.assertTrue(edited.startswith("operator prose\n"))
 
-        digest = "sha256:" + "a" * 64
         with mock.patch.object(
             DRIVER,
             "github_json",
             side_effect=[{"state": "open"}, {"state": "closed"}],
         ), mock.patch.object(DRIVER, "run", return_value=completed) as run:
-            DRIVER.close_completed_issue_campaign(
-                "acme/spec", "1", {"sha256": digest}, tasks
-            )
+            DRIVER.close_completed_issue_campaign("acme/spec", "1", tasks)
         commands = [call.args[0] for call in run.call_args_list]
         self.assertIn(["gh", "issue", "close", "2", "--repo", "acme/spec"], commands)
         self.assertNotIn(["gh", "issue", "close", "3", "--repo", "acme/spec"], commands)
         self.assertIn(["gh", "issue", "close", "1", "--repo", "acme/spec"], commands)
-        comment = next(command for command in commands if command[:3] == ["gh", "issue", "comment"])
-        self.assertIn(digest, comment[-1])
+        # Closing is closing. The summary comment is the closing summary's job,
+        # published before this runs.
+        self.assertFalse(
+            any(command[:3] == ["gh", "issue", "comment"] for command in commands)
+        )
 
 
 class NativeSubIssueTests(unittest.TestCase):
@@ -2031,6 +2096,114 @@ class NativeSubIssueTests(unittest.TestCase):
 
 
 class LaneLifecycleTests(unittest.TestCase):
+    def test_a_killed_lane_resumes_the_same_branch_and_worktree(self) -> None:
+        """The resume invariant both managers promised, now proven once.
+
+        A lane killed mid-task keeps its branch and its committed work, and the
+        next prep in the same pass adopts it rather than refusing it or
+        starting a second one. That holds whether the worktree survived the
+        kill or only its branch did.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            brief = prep_brief(checkout, workspace_root, "killed-pass")
+
+            prepared = DRIVER.action_prep(brief)
+            worktree = Path(prepared["worktreePath"])
+            (worktree / "lane-work.txt").write_text("in flight\n", encoding="utf-8")
+            git(worktree, "add", "lane-work.txt")
+            git(worktree, "commit", "--quiet", "-m", "task-1: in flight")
+            in_flight = git(worktree, "rev-parse", "HEAD")
+
+            # The lane is still there: resume adopts it, work and all.
+            resumed = DRIVER.action_prep(brief)
+            self.assertEqual(resumed, prepared)
+            self.assertEqual(git(worktree, "rev-parse", "HEAD"), in_flight)
+
+            # The runner died hard enough to lose the directory. The branch is
+            # the lane's durable half, so the rebuilt lane is the same lane.
+            command("git", "-C", str(checkout), "worktree", "remove", "--force", str(worktree))
+            self.assertFalse(worktree.exists())
+            rebuilt = DRIVER.action_prep(brief)
+            self.assertEqual(rebuilt["branch"], prepared["branch"])
+            self.assertEqual(rebuilt["worktreePath"], prepared["worktreePath"])
+            self.assertEqual(git(worktree, "rev-parse", "HEAD"), in_flight)
+            self.assertEqual(
+                WORKTREES.read_identity(worktree)["runid"], "killed-pass"
+            )
+
+    def test_a_foreign_lane_at_the_same_path_is_a_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            prepared = DRIVER.action_prep(
+                prep_brief(checkout, workspace_root, "first-pass")
+            )
+            worktree = Path(prepared["worktreePath"])
+            # Another campaign's identity on this campaign's path is not
+            # something to clobber.
+            WORKTREES.write_identity(worktree, {"campaign": "other"})
+            with self.assertRaises(DRIVER.DriverError) as raised:
+                DRIVER.action_prep(prep_brief(checkout, workspace_root, "first-pass"))
+            self.assertIn("different lane identity", str(raised.exception))
+            self.assertIn("campaign", str(raised.exception))
+
+    def test_local_forge_closing_summary_is_a_durable_blob(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout))
+            reconciliation = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "source": {"sha256": "sha256:" + "a" * 64, "revision": "b" * 40},
+                "tasks": [
+                    {"id": "task-1", "title": "Task 1"},
+                    {"id": "task-2", "title": "Task 2"},
+                ],
+                "merged": [
+                    {
+                        "taskId": "task-1",
+                        "pullRequest": "local://acme/spec/task-1",
+                        "mergeCommit": "c" * 40,
+                    }
+                ],
+                "checkpoints": [],
+                "remaining": ["task-2"],
+                "diagnoses": [
+                    {"taskId": "task-2", "attempt": 1, "diagnosis": "the gate stayed red"},
+                    {"taskId": "task-2", "attempt": 2, "diagnosis": "still red"},
+                ],
+                "retries": [],
+                "deferrals": [],
+                "blocked": [{"taskId": "task-2", "blockedBy": ["task-2"]}],
+                "anomalies": [],
+                "warnings": [],
+            }
+            digest = DRIVER.campaign_digest(reconciliation, "quiescent")
+            self.assertEqual(digest["blocked"][0]["attempts"], 2)
+            self.assertEqual(digest["outstanding"], [])
+            receipt = DRIVER.publish_closing_summary(
+                "acme/spec", config, "fixture", "7", digest
+            )
+            self.assertTrue(receipt.endswith("/summary/quiescent"))
+            ref = receipt.split("acme/spec/", 1)[1]
+            stored = DRIVER.read_local_blob(config, ref)
+            self.assertEqual(stored["kind"], "closing-summary")
+            self.assertIn("Campaign closed at frontier quiescence", stored["body"])
+            self.assertIn("1 of 2 task(s)", stored["body"])
+            self.assertIn("local://acme/spec/task-1", stored["body"])
+            self.assertIn("the gate stayed red", stored["body"])
+            # A second terminal pass writes no second summary.
+            self.assertEqual(
+                DRIVER.publish_closing_summary("acme/spec", config, "fixture", "7", digest),
+                receipt,
+            )
+            self.assertEqual(DRIVER.read_local_blob(config, ref), stored)
+
     def test_conflicting_published_head_is_aborted_abandoned_and_rebuilt(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2205,7 +2378,7 @@ class LaneLifecycleTests(unittest.TestCase):
                 0,
             )
 
-    def test_next_pass_sweeps_old_worktree_branch_and_state_marker(self) -> None:
+    def test_next_pass_sweeps_old_worktree_and_its_branch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
@@ -2221,7 +2394,40 @@ class LaneLifecycleTests(unittest.TestCase):
                 )
                 worktree = Path(prepared["worktreePath"])
                 self.assertTrue(worktree.is_dir())
-                self.assertTrue(any(DRIVER.task_state_markers(workspace_root / ".state")))
+                # Lane identity lives in git's own per-worktree configuration,
+                # and nothing else: no bespoke marker file is written.
+                self.assertEqual(
+                    WORKTREES.read_identity(worktree),
+                    {
+                        "driver": "spec-build",
+                        "campaign": "fixture",
+                        "repository": "acme/spec",
+                        "runid": "dead-pass",
+                        "taskid": "task-1",
+                        "taskkind": "implementation",
+                        "branch": prepared["branch"],
+                        "publishbranch": prepared["publishBranch"],
+                        "baserev": prepared["baseRev"],
+                    },
+                )
+                self.assertEqual(
+                    sorted(
+                        path
+                        for path in (workspace_root / ".state").glob("*/*.json")
+                        if path.parent.name != "passes"
+                    ),
+                    [],
+                )
+                # The enumeration round-trips: the lane git lists is the lane
+                # whose identity the driver wrote.
+                enumerated = [
+                    lane
+                    for lane in WORKTREES.lanes(checkout)
+                    if lane["identity"].get("taskid") == "task-1"
+                ]
+                self.assertEqual(len(enumerated), 1)
+                self.assertEqual(enumerated[0]["worktree"].resolve(), worktree.resolve())
+                self.assertEqual(enumerated[0]["branch"], prepared["branch"])
                 tally.update(currentFlowRunId=live_flow, flows={dead_flow: []})
                 swept = DRIVER.action_sweep(
                     sweep_brief(checkout, workspace_root, "live-pass", tally.program)
@@ -2240,7 +2446,6 @@ class LaneLifecycleTests(unittest.TestCase):
                 ).returncode,
                 0,
             )
-            self.assertFalse(any(DRIVER.task_state_markers(workspace_root / ".state")))
             self.assertFalse(
                 DRIVER.pass_record_path(
                     workspace_root,
@@ -2257,7 +2462,13 @@ class LaneLifecycleTests(unittest.TestCase):
             self.assertEqual(swept["liveRuns"], [])
             self.assertEqual(swept["warnings"], [])
 
-    def test_next_pass_sweeps_identity_validated_unregistered_lane(self) -> None:
+    def test_next_pass_sweeps_a_lane_git_never_registered(self) -> None:
+        """A directory git never adopted still belongs to a proven-dead run.
+
+        Its authority to be deleted is the campaign's own lane layout --
+        `<repositoryRoot>/<runHash>/<lane>` -- which is derived, not stored, so
+        removing the marker files removed nothing the sweep needed.
+        """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout, _ = initialize_repository(root, remote=True)
@@ -2275,27 +2486,11 @@ class LaneLifecycleTests(unittest.TestCase):
                 (worktree / "uncommitted.txt").write_text("stale\n", encoding="utf-8")
                 branch = f"tally-work/fixture-{run_hash}/task-1"
                 git(checkout, "branch", branch)
-                marker = workspace_root / ".state" / "marker-directory" / "task-1.json"
-                marker.parent.mkdir(parents=True)
-                marker.write_text(
-                    json.dumps(
-                        {
-                            "campaign": "fixture",
-                            "repository": "acme/spec",
-                            "runId": run_id,
-                            "taskId": "task-1",
-                            "branch": branch,
-                            "worktreePath": str(worktree),
-                        }
-                    ),
-                    encoding="utf-8",
-                )
                 tally.update(currentFlowRunId=live_flow, flows={dead_flow: []})
                 swept = DRIVER.action_sweep(
                     sweep_brief(checkout, workspace_root, "live-pass", tally.program)
                 )
             self.assertFalse(worktree.exists())
-            self.assertFalse(marker.exists())
             self.assertNotEqual(
                 command(
                     "git",

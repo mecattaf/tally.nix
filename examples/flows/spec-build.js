@@ -647,7 +647,8 @@ const reconcileSchema = {
     "escalation",
     "complete",
     "anomalies",
-    "warnings"
+    "warnings",
+    "closingSummary"
   ],
   properties: {
     schemaVersion: { const: 1 },
@@ -677,6 +678,9 @@ const reconcileSchema = {
     complete: { type: "boolean" },
     anomalies: { type: "array", maxItems: 128, items: anomalyFactSchema },
     warnings: stringList,
+    // Where the completion path published this campaign's closing summary, or
+    // null on any pass that was not the terminal one.
+    closingSummary: { type: ["string", "null"], minLength: 1 },
     config: effectiveConfigSchema
   },
   additionalProperties: false
@@ -992,10 +996,13 @@ const steeringSchema = {
 
 const escalationSchema = {
   type: "object",
-  required: ["posted", "comment", "diagnosisCount", "retryCount"],
+  required: ["posted", "comment", "summary", "diagnosisCount", "retryCount"],
   properties: {
     posted: { type: "boolean" },
     comment: { type: "string", minLength: 1 },
+    // The closing summary posted beside the escalation, reflecting partial
+    // state. Null only when this pass found an escalation already posted.
+    summary: { type: ["string", "null"], minLength: 1 },
     diagnosisCount: { type: "integer", minimum: 1, maximum: 256 },
     retryCount: { type: "integer", minimum: 0, maximum: 256 }
   },
@@ -1301,6 +1308,7 @@ function reconciledProjection(reconciliation) {
     blocked: reconciliation.blocked,
     quiescent: reconciliation.quiescent,
     escalation: reconciliation.escalation,
+    closingSummary: reconciliation.closingSummary,
     warnings: reconciliation.warnings
   };
 }

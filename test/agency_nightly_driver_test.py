@@ -180,6 +180,50 @@ else:
         git("commit", "-m", f"implement {task_id} ({revision})", cwd=worktree)
         return git("rev-parse", "HEAD", cwd=worktree)
 
+    def test_lanes_carry_git_native_identity_from_the_shared_manager(self) -> None:
+        """Both drivers cut lanes through one manager, so both record identity.
+
+        The nightly wave is not a campaign, but its lanes answer the same
+        question -- whose is this, and may it be resumed -- from the same place
+        git keeps its own per-worktree state.
+        """
+        wave = self.wave(2)
+        worklist = self.invoke("worklist", self.worklist_brief(wave))
+        for workspace in worklist["workspaces"]:
+            worktree = Path(str(workspace["worktreePath"]))
+            self.assertEqual(
+                driver.worktrees.read_identity(worktree),
+                {
+                    "driver": "agency-nightly",
+                    "repository": "agency/example",
+                    "taskid": str(workspace["taskId"]),
+                    "branch": str(workspace["branch"]),
+                },
+            )
+        enumerated = {
+            lane["identity"]["taskid"]: lane["branch"]
+            for lane in driver.worktrees.lanes(self.checkout)
+            if lane["identity"].get("driver") == "agency-nightly"
+        }
+        self.assertEqual(
+            enumerated,
+            {
+                str(workspace["taskId"]): str(workspace["branch"])
+                for workspace in worklist["workspaces"]
+            },
+        )
+
+    def test_a_foreign_worktree_at_a_lane_path_is_a_typed_conflict(self) -> None:
+        wave = self.wave(1)
+        worklist = self.invoke("worklist", self.worklist_brief(wave))
+        worktree = Path(str(worklist["workspaces"][0]["worktreePath"]))
+        # Another wave's lane sitting at this task's path is a conflict the
+        # driver reports, never something it clobbers.
+        driver.worktrees.write_identity(worktree, {"taskid": "someone-else"})
+        error = self.invoke("worklist", self.worklist_brief(wave), expect_ok=False)
+        self.assertEqual(error["code"], "worklist-worktree-conflict")
+        self.assertIn("different lane identity", error["message"])
+
     def test_six_worktrees_and_pull_requests_reach_the_morning_report(self) -> None:
         wave = self.wave()
         worklist = self.invoke("worklist", self.worklist_brief(wave))

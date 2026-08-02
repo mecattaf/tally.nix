@@ -70,6 +70,7 @@
             ./examples/flows/academic-ocr.js
             ./examples/flows/agency-nightly.js
             ./examples/flows/monthly-review.js
+            ./examples/flows/campaign_worktrees.py
             ./examples/flows/spec-build.js
             ./examples/flows/spec_build_driver.py
             ./test/fixtures/flows
@@ -604,6 +605,7 @@
             exec ${pkgs.bash}/bin/bash ${./doc/publish.sh} ${documentation} "$@"
           '';
         };
+        campaignDrivers = import ./nix/lib/campaign-drivers.nix { inherit pkgs; };
         agencyNightlyDriver = pkgs.writeShellApplication {
           name = "agency-nightly-driver";
           runtimeInputs = [
@@ -612,7 +614,7 @@
             pkgs.python3
           ];
           text = ''
-            exec ${pkgs.python3}/bin/python3 ${./examples/flows/agency_nightly_driver.py} "$@"
+            exec ${pkgs.python3}/bin/python3 ${campaignDrivers}/agency_nightly_driver.py "$@"
           '';
         };
         specBuildDriver = import ./nix/lib/spec-build-driver.nix { inherit pkgs; };
@@ -1288,6 +1290,17 @@
                   ];
                   agentArgv = [ "/bin/true" ];
                   pool.name = "default-campaign";
+                };
+                # The generated campaign producer's projection literals are
+                # mkDefault, so an estate tunes one campaign's public surface
+                # with an ordinary override: no mkForce, no forked producer
+                # builder. The sibling campaign keeps the shipped defaults, so
+                # this also proves the override is scoped to one producer.
+                # `kind` is the producer registry's discriminator, so an
+                # override states it; nothing else here is mkForce.
+                producers.campaign-defaulted = {
+                  kind = "gh";
+                  postEvidence = false;
                 };
               };
             }
@@ -3278,6 +3291,18 @@
           # sides must land on 51. Drift on either side breaks a test rather
           # than silently capping a run below its own worst case.
           assert campaignHome.config.services.tally.flows.fixture.maxNodes == 51;
+          # The generated producer's projection literals are mkDefault: an
+          # ordinary estate override wins without mkForce, and every campaign
+          # that states no opinion keeps the shipped defaults bit for bit.
+          assert campaignHome.config.services.tally.producers.campaign-defaulted.postEvidence == false;
+          assert campaignHome.config.services.tally.producers.campaign-defaulted.postReceipt == true;
+          assert campaignHome.config.services.tally.producers.campaign-fixture.postEvidence == true;
+          assert campaignHome.config.services.tally.producers.campaign-fixture.postReceipt == true;
+          assert campaignHome.config.services.tally.producers.campaign-fixture.postGateSummary == false;
+          assert campaignHome.config.services.tally.producers.campaign-fixture.requestReview == false;
+          assert campaignHome.config.services.tally.producers.campaign-fixture.closeOnAcceptance == false;
+          assert campaignHome.config.services.tally.producers.campaign-fixture.closeOnPass == false;
+          assert campaignHome.config.services.tally.producers.campaign-fixture.neverMutate == false;
           assert systemServices ? tally-drain;
           assert systemTimers ? tally-drain;
           assert systemTimers.tally-drain.timerConfig.OnActiveSec == "1s";
@@ -3565,7 +3590,7 @@
               ''
                 export HOME="$TMPDIR/home"
                 mkdir -p "$HOME"
-                export SPEC_BUILD_DRIVER_SOURCE=${./examples/flows/spec_build_driver.py}
+                export SPEC_BUILD_DRIVER_SOURCE=${campaignDrivers}/spec_build_driver.py
                 export SPEC_BUILD_REDACTION_VECTORS=${./test/fixtures/redaction/vectors.json}
                 python3 ${./test/spec_build_driver_test.py}
                 touch "$out"
@@ -4172,7 +4197,7 @@
                   pkgs.git
                   pkgs.python3
                 ];
-                AGENCY_NIGHTLY_DRIVER = ./examples/flows/agency_nightly_driver.py;
+                AGENCY_NIGHTLY_DRIVER = "${campaignDrivers}/agency_nightly_driver.py";
               }
               ''
                 export HOME="$TMPDIR/home"
@@ -4242,7 +4267,7 @@
                   pkgs.git
                   pkgs.python3
                 ];
-                SPEC_BUILD_DRIVER = ./examples/flows/spec_build_driver.py;
+                SPEC_BUILD_DRIVER = "${campaignDrivers}/spec_build_driver.py";
               }
               ''
                 ${pkgs.python3}/bin/python3 ${./test/spec_build_conflict_domains_test.py}
@@ -4255,7 +4280,7 @@
                   pkgs.git
                   pkgs.python3
                 ];
-                SPEC_BUILD_DRIVER = ./examples/flows/spec_build_driver.py;
+                SPEC_BUILD_DRIVER = "${campaignDrivers}/spec_build_driver.py";
               }
               ''
                 ${pkgs.python3}/bin/python3 ${./test/spec_build_checkpoint_receipts_test.py}

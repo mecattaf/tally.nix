@@ -8,6 +8,22 @@ authorized.
 
 ### Added
 
+- Added a run-scoped campaign digest and its markdown renderer, published as a
+  closing summary on **both** terminal outcomes: completion and escalation at
+  frontier quiescence. The completion path took over the existing
+  `tally:campaign-complete:v1` comment — a campaign still posts exactly one
+  machine comment before it closes the issue, and that comment is now the
+  digest — and a quiescent campaign gets the same digest beside its escalation,
+  reflecting partial state. The digest is derived from facts the pass already
+  witnessed (merged pull requests, checkpoint receipts, diagnosis/retry
+  receipts, the reconciler's own arithmetic) and adds no state store. Both
+  summaries are always fresh comments, never an upsert, and both render inside
+  the existing reconcile and escalate nodes: `spec-build.js` node count is
+  unchanged and `max_flow_nodes` still asserts 51. On a local forge the summary
+  is a durable blob under `refs/tally/spec-build/v1/<scope>/summary/<outcome>`.
+  The reconcile result carries `closingSummary` and the escalate result carries
+  `summary`.
+
 - Added `services.tally.campaigns.<name>.gitAiAwaitSec` (default 60), the merge
   node's budget for git-ai's settlement barrier, and an evaluated assertion
   relating it to that node's own deadline: while `gitAiBinding` is not `off`,
@@ -616,6 +632,31 @@ authorized.
 
 ### Changed
 
+- Campaign lane identity moved out of bespoke JSON marker files and into git's
+  own per-worktree configuration (`extensions.worktreeConfig` plus
+  `git config --worktree tally.*`). The markers under
+  `<workspaceRoot>/.state/<runHash>/<taskId>.json` were a second copy of the
+  truth that could outlive its lane or go missing while the lane survived; git
+  creates the metadata with `git worktree add` and destroys it with
+  `git worktree remove`, so lane enumeration and lane validation now read one
+  source. No marker files are written any more, and the sweep authorizes
+  deleting a lane git never registered from the campaign's own derived lane
+  layout instead. The run-scoped pass record under `.state/passes/` is
+  unaffected.
+- `spec_build_driver.py` and `agency_nightly_driver.py` now create, resume, and
+  validate worktrees through one shared manager, `campaign_worktrees.py`, which
+  ships beside them in a single store directory. The two drivers previously
+  implemented the same job twice with different invariants; resume now means
+  the same thing in both — a lane whose recorded identity matches is adopted
+  work and all, an existing branch with no worktree is re-adopted rather than
+  refused, and anything else in the way is a typed conflict. The nightly
+  driver's morning report is unchanged.
+- The generated campaign producer's projection literals (`postReceipt`,
+  `postEvidence`, `postGateSummary`, `requestReview`, `closeOnAcceptance`,
+  `closeOnPass`, `neverMutate`) are now `lib.mkDefault`, so an estate can tune
+  one campaign's public surface with an ordinary override instead of forking
+  the producer builder or reaching for `mkForce`. Rendered defaults are
+  unchanged.
 - `tally witness verify-authorship` now compares the notes-ref target by
   ancestry instead of by equality. A notes ref grows whenever any commit in the
   repository is annotated — including a campaign merge node binding its squash
