@@ -380,6 +380,7 @@ $ tally query run RUN-UUID
 --until
 --limit
 --cursor
+--json
 ```
 
 `--flow-run` matches the witnessed/durable `orchestration.flowRunId` and is the supported way to
@@ -387,6 +388,14 @@ group a runner's nodes; `--flow-run-id` is an accepted alias, so the spelling `t
 uses works here too. Each item carries the node's `dedupKey` and the `disposition` that wrote its
 row. Pagination cursors are daemon-memory snapshots: repeat the same filters, and restart from the
 beginning if the daemon or cursor snapshot is gone.
+
+By default `query jobs` follows the cursor to the end of the window inside the one invocation and
+prints a single merged envelope; `--json` or an explicit `--cursor` keeps single-page semantics
+and hands the cursor back to the caller. `--limit` sizes a page, not the result set — when the
+command is following cursors it changes how many round trips the window takes, not how much of
+the window you see. Narrow the window with the filters, not with `--limit`. Either way the envelope carries `truncated` and
+`elidedItems`, and anything that stops the output from being the whole window is stated on
+stderr.
 
 ### Run status, proof, log, and trace
 
@@ -403,6 +412,7 @@ $ tally query log --task TASK-UUID --attempt 2 --event completed
 $ tally query log --flow-run RUN-UUID
 $ tally query log --flow-run RUN-UUID --json
 $ tally query log --flow-run RUN-UUID --json --provenance
+$ tally query log --flow-run RUN-UUID --after 'log-v1:00000000000000000041:00000000000000000007'
 $ tally query trace --task TASK-UUID --attempt 2 --limit 100
 ```
 
@@ -432,8 +442,20 @@ journal, evidence, and witness record. An explicit `--event evidence_pass` or
 `--provenance`.
 
 `query log` additionally filters by `--session`, `--source`, `--since`, and `--until`, and
-supports `--cursor`; the human renderer writes a continuation hint to stderr when another page
-exists. `query trace` also supports page cursors. Proof is not just a witness
+supports `--cursor` and `--after`. The human renderer follows the cursor to the end of the window
+inside the one invocation, so it prints the whole filtered window rather than the first capped
+page; it writes one unambiguous stderr line for anything that stops the window from being
+complete — an expired cursor (it restarts once and says so), elided oversized fields, or a
+position that predates retained history — and reports the current stream position. `--json` keeps
+single-page semantics and marks the page with `truncated`, `nextCursor`, and `elidedItems`.
+
+`--after` takes a durable lifecycle-stream position, `log-v1:<lifecycle>:<witness>`, taken from
+the `position` field of a previous response. It is not `--since`, which remains a wall-clock time
+filter, and it is not `--cursor`, which is an ephemeral page offset; a page or watch cursor
+handed to `--after` is refused rather than misread. `--after` plus empty `items` and an unchanged
+`position` is a proof that the run is quiet. See [Poll a flow run
+correctly](observability.md#poll-a-flow-run-correctly) for the full monitoring contract.
+`query trace` also supports page cursors. Proof is not just a witness
 lookup: it reports whether a witness is expected, returns the canonical record when present,
 separates advisory attestations, and includes ledger verification state.
 

@@ -581,6 +581,11 @@ impl DaemonHandler {
             limit: Option<usize>,
             #[serde(default)]
             cursor: Option<String>,
+            /// Durable lifecycle-stream position. Distinct from `since`, which
+            /// is a wall-clock time filter, and from `cursor`, which is an
+            /// ephemeral page offset.
+            #[serde(default)]
+            after: Option<String>,
             #[serde(default)]
             provenance: Option<bool>,
         }
@@ -594,6 +599,7 @@ impl DaemonHandler {
             "source": params.source.clone(),
             "since": params.since.clone(),
             "until": params.until.clone(),
+            "after": params.after.clone(),
             "provenance": params.provenance,
         }))
         .map_err(internal_wire)?;
@@ -630,6 +636,22 @@ impl DaemonHandler {
         if params.provenance == Some(false) {
             result = collapse_lifecycle_echoes(result, !explicit_event);
         }
+        // The durable position is applied after echo collapse so a terminal
+        // transition is still merged with its witness before the window is
+        // narrowed; collapse semantics stay exactly as they were.
+        let head = log_position_head(&history, &witness);
+        if let Some(after) = params.after.as_deref() {
+            let after = LogPosition::parse(after).map_err(observability_wire)?;
+            result.items.retain(|item| after.precedes(&item.cursor));
+            let floor = log_position_floor(&history, &witness);
+            if after.lifecycle < floor.lifecycle || after.witness < floor.witness {
+                result.position_gap = Some(PositionGap {
+                    requested: after.render(),
+                    earliest_available: floor.render(),
+                });
+            }
+        }
+        result.position = Some(head.render());
         let envelope = Some(serde_json::to_value(result).map_err(internal_wire)?);
         self.pages
             .borrow_mut()
@@ -714,7 +736,9 @@ fn query_wire(error: crate::query::QueryError) -> WireError {
 
 fn observability_wire(error: ObservabilityError) -> WireError {
     match error {
-        ObservabilityError::InvalidTimestamp(_) => WireError::invalid(error.to_string()),
+        ObservabilityError::InvalidTimestamp(_) | ObservabilityError::InvalidPosition(_) => {
+            WireError::invalid(error.to_string())
+        }
         ObservabilityError::UnknownJob(_) | ObservabilityError::UnknownAttempt { .. } => {
             WireError::not_found(error.to_string())
         }

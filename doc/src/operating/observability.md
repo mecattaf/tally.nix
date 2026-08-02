@@ -78,15 +78,22 @@ $ tally query job <task-or-live-job-uuid>
 
 `query jobs` can filter by verdict, pool, executor, adapter, source, origin,
 parent, flow run, session, and time. Its JSON response contains `items`,
-`nextCursor`, and immutable snapshot metadata. When `nextCursor` is non-null,
-pass it back with the same filters:
+`nextCursor`, `truncated`, `elidedItems`, and immutable snapshot metadata.
+
+By default the command follows the cursor to the end of the window and prints
+one merged envelope, so what you get is the whole filtered set. Pass `--json`
+to take single-page semantics and own the cursor yourself, then pass
+`nextCursor` back with the same filters:
 
 ```console
+$ tally query jobs --source orchestrator --limit 100 --json
 $ tally query jobs --source orchestrator --limit 100 --cursor '<opaque-cursor>'
 ```
 
 A cursor is bound to its original method, filters, and snapshot. Do not edit it
-or reuse it with a different query.
+or reuse it with a different query, and do not try to hold one between polls —
+it is an ephemeral snapshot offset. For incremental polling see [Poll a flow
+run correctly](#poll-a-flow-run-correctly).
 
 ## Follow a flow
 
@@ -218,6 +225,7 @@ Lifecycle events and provider output are separate:
 $ tally query log --task <task-uuid> --attempt 2 --limit 100
 $ tally query log --task <task-uuid> --attempt 2 --json
 $ tally query log --task <task-uuid> --attempt 2 --json --provenance
+$ tally query log --task <task-uuid> --after 'log-v1:00000000000000000041:00000000000000000007'
 $ tally query trace --task <task-uuid> --attempt 2 --limit 100
 ```
 
@@ -254,6 +262,79 @@ Query reads at most 16 MiB from one capture generation. Larger local capture
 files remain on disk, but the trace reports
 `query-read-truncated-at-16777216-bytes`. Remote capture transfer is also
 bounded to 16 MiB per stream.
+
+## Poll a flow run correctly
+
+This is the contract a monitor must follow. It exists because a monitor that
+cannot tell "no new events" from "you are looking at a capped or stale page"
+reports silence during an incident — the failure recorded in #247, where a
+`query log --flow-run` window sat unchanged for three hours while thirteen
+tasks merged.
+
+Three facts drive the contract:
+
+- The lifecycle window is ordered **oldest first**. Page one of a long run is
+  therefore permanently stale by construction: it never changes no matter how
+  far the run advances.
+- Page cursors (`--cursor`, `page-v1:…`) are ephemeral snapshot offsets. Only
+  32 snapshots are retained, and a daemon restart drops all of them, so a
+  poller cannot hold one between polls.
+- `--since` is a wall-clock **time filter**. It is not a stream position and
+  never was.
+
+### For a human at a terminal
+
+```console
+$ tally query log --flow-run <flow-run-uuid>
+```
+
+The human view follows the cursor to the end of the window inside the one
+invocation, so it prints the whole filtered window rather than the first
+capped page. Anything that stops it from being whole is one unambiguous line
+on stderr: a page cursor that expired mid-window (the query restarts once and
+says so), items whose oversized fields had to be elided, or a requested
+position that predates retained history. Silence on stderr means you are
+looking at all of it. The current stream position is printed there too.
+
+### For an unattended monitor
+
+```console
+$ position=$(tally query log --flow-run <id> --json | jq -r .position)
+$ tally query log --flow-run <id> --after "$position" --json
+```
+
+`--after` takes a **durable** lifecycle-stream position, `log-v1:<lifecycle>:<witness>`,
+reported as `position` on every `query log` response. It survives daemon
+restarts and page-cache eviction. `position` is the head of the stream at
+projection time, not the newest matched item, so:
+
+> `--after <position>` returning empty `items` and the same `position` is a
+> *proof* that nothing happened, not merely an absence of matches.
+
+Two successive polls over a quiet run are identical apart from
+`snapshot.createdAt`, which dates the projection rather than the stream.
+
+Rules for the loop:
+
+1. Advance the held position only from a response whose `truncated` is
+   `false`. A truncated response has not shown you everything before the head
+   it reports; page it out with `--cursor` first, or re-issue with a larger
+   `--limit`.
+2. `--json` deliberately keeps single-page semantics: the caller owns the
+   cursor. `truncated`, `nextCursor`, and `elidedItems` are all in the
+   envelope, so nothing is withheld silently.
+3. `positionGap` in a response means the held position predates retained
+   lifecycle history. Events before that boundary are gone. Treat it the way
+   you treat a `query watch` gap: take a fresh whole-window read, then resume.
+4. An item too large for the 48 KiB response cap is served with its largest
+   text fields cut down and an `elided` object naming what was cut. A campaign
+   runner whose argv embeds an issue body no longer makes its run
+   unmonitorable. Only an item too large because of its *structure* is still
+   an error, and that error names itself.
+
+`--since`/`--until` continue to filter by wall clock and compose with
+`--after` unchanged. Use `--since` to bound a window in time; use `--after` to
+resume a stream.
 
 ## Resume a watch
 

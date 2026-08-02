@@ -866,6 +866,10 @@ pub(super) enum QueryCommand {
         limit: Option<usize>,
         #[arg(long)]
         cursor: Option<String>,
+        /// Emit a single page verbatim; the caller owns `nextCursor`. Without
+        /// it the command follows the cursor and prints the whole window.
+        #[arg(long)]
+        json: bool,
     },
     Job {
         id: String,
@@ -905,6 +909,12 @@ pub(super) enum QueryCommand {
         limit: Option<usize>,
         #[arg(long)]
         cursor: Option<String>,
+        /// Durable lifecycle-stream position, taken from the `position` field
+        /// of a previous response. Returns only events after it. This is a
+        /// stream coordinate, not a time filter (`--since`) and not an
+        /// ephemeral page cursor (`--cursor`).
+        #[arg(long, value_name = "POSITION")]
+        after: Option<String>,
         /// Emit the structured lifecycle envelope instead of human lines.
         #[arg(long)]
         json: bool,

@@ -8,6 +8,38 @@ authorized.
 
 ### Added
 
+- Made flow-run-scoped truncation legible, and gave `query log` a durable
+  incremental position (#316, closing #247). Human `tally query log` and
+  `tally query jobs` now follow the page cursor to the end of the filtered
+  window inside the one invocation instead of printing the first capped page,
+  which was permanently stale by construction: the lifecycle window is ordered
+  oldest-first, so page one of a long run never changes however far the run
+  advances, and the only truncation signal went to stderr where a monitor
+  diffing stdout never saw it. Anything that stops the output from being the
+  whole window is now one unambiguous stderr line — a page cursor that expired
+  mid-window (the query restarts once and says so), elided oversized fields, or
+  a position that predates retained history. Every paginated envelope carries
+  `truncated` and `elidedItems`; `--json` and an explicit `--cursor` keep
+  single-page semantics, so a caller that owns the cursor still cannot mistake
+  a page for a window, and `query jobs` gained `--json` for that purpose.
+  `query log --after <position>` takes a durable `log-v1:<lifecycle>:<witness>`
+  coordinate, reported as `position` on every response and distinct from both
+  the `--since` time filter (unchanged) and the ephemeral `--cursor`; because
+  the reported position is the stream head, `--after` plus empty items is a
+  proof that a run is quiet rather than an absence of matches. A position that
+  predates retained lifecycle history is reported as `positionGap` rather than
+  served as a silent partial continuation. An item that alone exceeds the
+  48 KiB response cap no longer fails the whole query: its largest string
+  fields are truncated and the item is marked with an `elided` object naming
+  the JSON Pointers that were cut, so a campaign runner whose argv embeds an
+  issue body cannot make its run unmonitorable. Only an item oversized because
+  of its structure remains a hard error, and that error now names itself. Every
+  new print on these paths goes through the panic-safe `outln!`/`errln!` and
+  compacts the daemon-sourced values it echoes, so a walked window is a quiet
+  exit 0 for a reader that hangs up mid-window and carries no terminal control
+  on either surface. The monitoring contract is documented in Operating →
+  Observability.
+
 - Added a run-scoped campaign digest and its markdown renderer, published as a
   closing summary on **both** terminal outcomes: completion and escalation at
   frontier quiescence. The completion path took over the existing

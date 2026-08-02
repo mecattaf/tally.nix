@@ -133,7 +133,7 @@ The table between the markers is checked against the daemon's `RPC_METHODS` cons
 | `query.run` | `{id: string}` | Compact flow-run status |
 | `query.status` | `{pool?: string}` | Status view |
 | `query.storage` | `{}` | Daemon-owned storage metrics and intake state |
-| `query.log` | Lifecycle filters plus `limit` and `cursor` | Paginated lifecycle collection |
+| `query.log` | Lifecycle filters plus `limit`, `cursor`, and `after` | Paginated lifecycle collection |
 | `query.proof` | `{task: string, attempt?: integer}` or `{flowRun: string}` | Proof view, or a proof collection for a flow run |
 | `query.trace` | `{task: string, attempt?: integer, limit?: integer, cursor?: string}` | Paginated trace view |
 | `query.producers` | `{name?: string, kind?: string}` | Producer inventory |
@@ -318,7 +318,8 @@ the single `flow` pool.
 All query objects currently report `schemaVersion: 1` and `protocolVersion: 4`. Important common
 shapes are:
 
-- collection: `{schemaVersion, protocolVersion, items, nextCursor, snapshot}`;
+- collection: `{schemaVersion, protocolVersion, items, nextCursor, truncated, elidedItems,
+  snapshot}`, plus `position` and optional `positionGap` on `query.log`;
 - snapshot: `{createdAt, cursor, history, witnessHead:{seq,hash}}`;
 - job detail: `{schemaVersion, protocolVersion, job, attempts, snapshot}`;
 - run status: `{schemaVersion, protocolVersion, flowRunId, flowName?, campaign?, repository?,
@@ -357,7 +358,10 @@ receive current nodes and failures but have an empty task table; for those runs 
 `complete` when every admitted node holds a passing terminal verdict on its current attempt.
 
 `query.log` filters by `task`, `flowRun`, `attempt`, `session`, lifecycle `event`, `source`,
-`since`, and `until`, and accepts optional `provenance`. Lifecycle items expose `taskRef` when their durable row/witness did. A lifecycle event carries no orchestration capsule, so `flowRun` is resolved
+`since`, and `until`, and accepts optional `provenance` and `after`. `after` is a durable
+lifecycle-stream position, described under [Lifecycle stream
+positions](#lifecycle-stream-positions) below; it is not `since`, which remains a wall-clock time
+filter, and it is not `cursor`, which is an ephemeral page offset. Lifecycle items expose `taskRef` when their durable row/witness did. A lifecycle event carries no orchestration capsule, so `flowRun` is resolved
 to the run's task UUIDs through the durable rows and the witness chain. A `failed` lifecycle item
 includes `stderrTail` and `stderrTruncated`, bounded as described for terminal waits above.
 Omitting `provenance` preserves the original RPC behavior and returns the source provenance
@@ -408,8 +412,27 @@ cancelled entry includes optional `taskRef`.
 ### Pagination cursors
 
 Only `query.jobs`, `query.log`, and `query.trace` use page cursors. The default limit is 100 and
-the allowed range is 1–1,000. A page result is capped at 48 KiB; an individual item too large to
-fit is an `internal` error.
+the allowed range is 1–1,000. A page result is capped at 48 KiB.
+
+Every page carries two completeness fields alongside `nextCursor`:
+
+| Field | Meaning |
+|---|---|
+| `truncated` | `true` exactly when this response is not the whole filtered window. A reader that checks nothing else still cannot mistake a capped page for a quiet run. |
+| `elidedItems` | How many items on this page were served with fields cut down to fit. |
+
+An item that alone exceeds the 48 KiB cap is not an error and does not end the query. Its largest
+string fields are truncated — largest first, 256 bytes retained, the remainder replaced by
+`…<N bytes elided>` — and the item gains an `elided` object naming what was cut:
+
+```json
+{"fields": ["/argv/3"], "originalBytes": 208913, "reason": "item exceeded the bounded response size"}
+```
+
+`fields` are JSON Pointers into the item. Only a page's leading item can be elided, so
+`elidedItems` is never more than one per page. An item that is oversized because of its
+*structure* rather than its text cannot be shrunk this way and is still an `internal`
+`one collection item exceeds the bounded response size` error.
 
 The first call creates an in-memory snapshot. Subsequent calls must repeat the same method and
 filters with the returned cursor; `limit` may change. A cursor:
@@ -420,6 +443,34 @@ filters with the returned cursor; `limit` may change. A cursor:
 - yields `not_found` when its snapshot expired.
 
 There is no durable recovery for a page cursor. Start the query again.
+
+### Lifecycle stream positions
+
+`query.log` additionally reports `position`, a **durable** coordinate in the lifecycle stream:
+
+```text
+log-v1:<lifecycle-sequence>:<witness-sequence>
+```
+
+Both components are zero-padded to 20 digits, and both name append-only durable sequences — the
+lifecycle history and the witness ledger. Unlike a page cursor, a position survives a daemon
+restart and page-cache eviction, so an external poller can hold one between polls. Unlike a watch
+cursor it names the lifecycle stream, not the change feed; feeding a page or watch cursor to
+`after` is rejected as `invalid lifecycle stream position` rather than being misread.
+
+`position` is the **head** of the stream at projection time, not the newest matched item, so
+`after: <position>` with an empty `items` array is a proof of quiet for that filter rather than
+merely an absence of matches. Advance the held position only from a response whose `truncated` is
+`false`; a truncated response has not shown you everything before the head it reports.
+
+If the requested position predates what durable history still retains, the response carries
+
+```text
+positionGap: {requested, earliestAvailable}
+```
+
+and the window is a partial continuation: events between the retained floor and the request are
+gone.
 
 ### Watch cursors
 

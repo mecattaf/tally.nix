@@ -9203,6 +9203,242 @@ mod tests {
             .await;
     }
 
+    fn monitor_node_payload(flow_run_id: &str, ordinal: usize) -> Value {
+        let mut payload = fs1_full_payload(
+            &format!("flow:{flow_run_id}:{ordinal}"),
+            &["true"],
+            ["exit:0".to_owned()],
+        );
+        payload["source"] = json!("orchestrator");
+        payload["orchestration"] = json!({
+            "flowName": "monitor-contract",
+            "flowRunId": flow_run_id,
+            "scriptHash": "sha256-monitor-contract",
+            "nodeOrdinal": ordinal,
+            "nodeLabel": format!("node-{ordinal}"),
+            "maxNodes": 8,
+            "selection": {"selector": "pooled-fast", "members": ["worker-a"]},
+        });
+        payload
+    }
+
+    /// #247/#316: a monitor watching a live flow run must be able to tell "no
+    /// new events" from "you are looking at a stale or capped page". The
+    /// reported symptom was a `query log --flow-run` window that stayed frozen
+    /// at the first node with `nextCursor: null` while the run advanced. Every
+    /// poll here must surface the events the run just produced.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_316_repeated_polls_surface_new_lifecycle_events_on_a_live_run() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                // Paused: admission still writes lifecycle history, so the
+                // stream advances deterministically without racing execution.
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let flow_run_id = Uuid::new_v4().to_string();
+
+                let mut seen = 0_usize;
+                let mut positions = Vec::new();
+                for ordinal in 0..6 {
+                    daemon
+                        .handler
+                        .enqueue_as_client(Some(monitor_node_payload(&flow_run_id, ordinal)))
+                        .await
+                        .unwrap();
+                    let window = daemon
+                        .handler
+                        .query(
+                            "query.log",
+                            Some(json!({"flowRun": flow_run_id, "limit": 1000})),
+                        )
+                        .await
+                        .unwrap();
+                    let items = window["items"].as_array().unwrap().len();
+                    assert!(
+                        items > seen,
+                        "poll after node {ordinal} returned the same {items}-item window while \
+                         the run advanced"
+                    );
+                    seen = items;
+                    assert_eq!(window["truncated"], false, "the window was capped silently");
+                    positions.push(window["position"].as_str().unwrap().to_owned());
+                }
+                // The durable position is monotone across the run: a monitor
+                // holding it can tell motion from silence.
+                let mut sorted = positions.clone();
+                sorted.sort();
+                sorted.dedup();
+                assert_eq!(sorted, positions, "positions did not advance monotonically");
+
+                // The #247 symptom itself, pinned. The lifecycle window is
+                // ordered oldest-first, so page one is *permanently* stale by
+                // construction: a reader who only ever sees page one watches
+                // an advancing run without observing a single new event. The
+                // one signal that this is not the whole window is `truncated`
+                // / `nextCursor` -- which is why the human path now follows
+                // the cursor to the end instead of stopping here.
+                let first_page = |ordinal: usize| {
+                    let handler = &daemon.handler;
+                    let flow_run_id = flow_run_id.clone();
+                    async move {
+                        let page = handler
+                            .query("query.log", Some(json!({"flowRun": flow_run_id, "limit": 2})))
+                            .await
+                            .unwrap();
+                        assert_eq!(
+                            page["truncated"], true,
+                            "poll {ordinal} hid its truncation"
+                        );
+                        page["items"].clone()
+                    }
+                };
+                let stale = first_page(0).await;
+                daemon
+                    .handler
+                    .enqueue_as_client(Some(monitor_node_payload(&flow_run_id, 6)))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    first_page(1).await,
+                    stale,
+                    "page one is expected to be frozen; if it moved, the window is not \
+                     oldest-first and the #247 diagnosis needs revisiting"
+                );
+                let whole = daemon
+                    .handler
+                    .query(
+                        "query.log",
+                        Some(json!({"flowRun": flow_run_id, "limit": 1000})),
+                    )
+                    .await
+                    .unwrap();
+                assert!(whole["items"].as_array().unwrap().len() > seen);
+                assert_eq!(whole["truncated"], false);
+            })
+            .await;
+    }
+
+    /// `--after` is a durable stream coordinate, not a page cursor and not the
+    /// `--since` time filter. Two successive polls over a quiet run must be
+    /// byte-identical apart from the timestamp that dates the projection.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_316_after_is_a_durable_position_and_since_stays_a_time_filter() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let flow_run_id = Uuid::new_v4().to_string();
+                for ordinal in 0..3 {
+                    daemon
+                        .handler
+                        .enqueue_as_client(Some(monitor_node_payload(&flow_run_id, ordinal)))
+                        .await
+                        .unwrap();
+                }
+                let filter = json!({"flowRun": flow_run_id, "limit": 1000});
+                let seed = daemon
+                    .handler
+                    .query("query.log", Some(filter.clone()))
+                    .await
+                    .unwrap();
+                assert!(!seed["items"].as_array().unwrap().is_empty());
+                let position = seed["position"].as_str().unwrap().to_owned();
+                assert!(position.starts_with("log-v1:"), "{position}");
+
+                let poll = |after: String| {
+                    let mut params = filter.clone();
+                    params["after"] = json!(after);
+                    let handler = &daemon.handler;
+                    async move { handler.query("query.log", Some(params)).await.unwrap() }
+                };
+                let strip = |mut value: Value| {
+                    value["snapshot"]["createdAt"] = Value::Null;
+                    value
+                };
+
+                // Quiet run: empty items, unchanged position, and the two
+                // responses differ only in the timestamp that dates the
+                // projection -- what a poller diffs is identical.
+                let first = poll(position.clone()).await;
+                let second = poll(position.clone()).await;
+                assert!(first["items"].as_array().unwrap().is_empty());
+                assert_eq!(first["position"], json!(position));
+                assert_eq!(second["position"], json!(position));
+                assert_eq!(strip(first), strip(second));
+
+                // One more node: `--after` returns only what is new.
+                daemon
+                    .handler
+                    .enqueue_as_client(Some(monitor_node_payload(&flow_run_id, 3)))
+                    .await
+                    .unwrap();
+                let incremental = poll(position.clone()).await;
+                let fresh = incremental["items"].as_array().unwrap();
+                assert!(!fresh.is_empty(), "the new node produced no visible events");
+                let already_seen = seed["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["eventId"].as_str().unwrap().to_owned())
+                    .collect::<BTreeSet<_>>();
+                assert!(
+                    fresh
+                        .iter()
+                        .all(|item| !already_seen.contains(item["eventId"].as_str().unwrap())),
+                    "an event at or before the held position was replayed: {fresh:?}"
+                );
+                assert!(
+                    fresh.iter().all(|item| item["nodeLabel"] == "node-3"),
+                    "--after leaked events from nodes the caller had already seen: {fresh:?}"
+                );
+                assert_ne!(incremental["position"], json!(position));
+
+                // `--since` is untouched: still a wall-clock filter, and it
+                // composes with `--after` rather than replacing it.
+                let mut future = filter.clone();
+                future["since"] = json!("2099-01-01T00:00:00Z");
+                let future = daemon
+                    .handler
+                    .query("query.log", Some(future))
+                    .await
+                    .unwrap();
+                assert!(future["items"].as_array().unwrap().is_empty());
+                let mut past = filter.clone();
+                past["since"] = json!("2000-01-01T00:00:00Z");
+                let past = daemon.handler.query("query.log", Some(past)).await.unwrap();
+                assert!(past["items"].as_array().unwrap().len() > 3);
+
+                // A page cursor is not a position: feeding one back must be
+                // refused by name, not silently misread as a stream offset.
+                let mut confused = filter.clone();
+                confused["after"] = json!("page-v1:00000000000000000001:00000000000000000000");
+                let error = daemon
+                    .handler
+                    .query("query.log", Some(confused))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    format!("{error:?}").contains("invalid lifecycle stream position"),
+                    "{error:?}"
+                );
+            })
+            .await;
+    }
+
     #[test]
     fn daemon_paths_create_no_docs_or_deferred_scope() {
         let temp = tempdir().unwrap();

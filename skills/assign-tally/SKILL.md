@@ -69,10 +69,16 @@ re-mention is always safe and always cheap.
 Start an operator check with `tally query run <runner-task-uuid>`; it projects
 the reconciled task table, current-node elapsed/budget state, and failure
 pointers. For persistent monitoring, still corroborate ground truth: merged
-PRs, capture `.err` files, and runner-unit liveness. Do not treat a quiet
-`tally query log --flow-run` as progress — it freezes silently between
-transitions on long runs (DEBT: #247). Silence is not success: any watcher must
-fire on every terminal state, including "runner gone with work remaining."
+PRs, capture `.err` files, and runner-unit liveness.
+
+`tally query log --flow-run` is safe to poll: the human view walks the whole
+window rather than the first (permanently stale) page, and says on stderr when
+it cannot show all of it. For an unattended monitor, hold the `position` a
+response reports and poll with `--after <position>`; empty items plus an
+unchanged position is a proof that the run is quiet, not merely an absence of
+matches. The contract is in Operating → Observability, "Poll a flow run
+correctly". Silence is still not success: any watcher must fire on every
+terminal state, including "runner gone with work remaining."
 
 Known adapter noise such as "Reading additional input from stdin..." is retained
 in `.adapter.err`. The conventional `.err` path is an atomic, bounded
