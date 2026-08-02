@@ -738,6 +738,7 @@ fn parse_node_result(value: &Value, disposition: Disposition) -> Result<NodeResu
         optional_str(value, &["stderrExcerpt", "stderr_excerpt"]).map(str::to_owned);
     let stderr_truncated = optional_bool(value, &["stderrTruncated", "stderr_truncated"])?;
     let witness_seq = required_u64(value, &["witnessSeq", "witness_seq", "witness_lsn"])?;
+    let model = optional_str(value, &["model"]).map(str::to_owned);
     let completion = value.get("completion");
     let gates = value
         .get("gates")
@@ -763,6 +764,7 @@ fn parse_node_result(value: &Value, disposition: Disposition) -> Result<NodeResu
         stderr_truncated,
         witness_seq,
         disposition,
+        model,
         result,
         gates,
         error,
@@ -1078,6 +1080,7 @@ mod tests {
                 env: Default::default(),
                 approval_policy: None,
                 sandbox_policy: None,
+                model: None,
                 result_schema: None,
                 adapter_options: Some(json!({
                     "prePromptArgv": [],
@@ -1148,6 +1151,7 @@ mod tests {
                     stderr_truncated: None,
                     witness_seq: 1,
                     disposition: Disposition::Created,
+                    model: None,
                     result: Some(json!({"ok": true})),
                     gates: None,
                     error: None,
@@ -2069,6 +2073,7 @@ export const meta = {
             stderr_truncated: None,
             witness_seq: 1,
             disposition: Disposition::Created,
+            model: None,
             result: None,
             gates: None,
             error: None,

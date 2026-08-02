@@ -139,6 +139,11 @@ pub struct NodeResult {
     pub stderr_truncated: Option<bool>,
     pub witness_seq: u64,
     pub disposition: Disposition,
+    /// The canonical model the daemon recorded for this execution, when the
+    /// adapter declared one or scraped one. Absent means the estate never
+    /// named a model; a script must not invent one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -225,6 +230,7 @@ mod tests {
             env: BTreeMap::from([("SAFE".to_owned(), "yes".to_owned())]),
             approval_policy: Some("on-request".to_owned()),
             sandbox_policy: Some("workspace-write".to_owned()),
+            model: Some("provider/model".to_owned()),
             result_schema: Some(json!({"type": "object"})),
             adapter_options: Some(json!({"model": "provider/model"})),
             selection: Some(SelectionProvenance {
@@ -271,6 +277,7 @@ mod tests {
                 "env",
                 "approvalPolicy",
                 "sandboxPolicy",
+                "model",
                 "resultSchema",
             ]
         );
@@ -295,6 +302,7 @@ mod tests {
                 "env",
                 "approvalPolicy",
                 "sandboxPolicy",
+                "model",
                 "resultSchema",
             ]
         );
@@ -778,6 +786,17 @@ define_node_spec! {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     sandbox_policy: Option<String> => {
         json: "sandboxPolicy", job: true, sugar: true,
+        wire: NodeWireProjection::NormalizedInto("adapterOptions"),
+        canonical: NodeCanonicalProjection::NormalizedInto("adapterOptions")
+    },
+    // The adapter still decides whether a model may be requested at all and
+    // how it renders: an adapter with no authorized model override refuses
+    // this outright. Catalog members already reach the same kernel field
+    // through their `launch` object; a plain `job()` could not, which left a
+    // flow unable to name the model its own node ran under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String> => {
+        json: "model", job: true, sugar: true,
         wire: NodeWireProjection::NormalizedInto("adapterOptions"),
         canonical: NodeCanonicalProjection::NormalizedInto("adapterOptions")
     },

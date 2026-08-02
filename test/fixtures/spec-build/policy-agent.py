@@ -21,9 +21,14 @@ expected_prefix = [
     'approval_policy="never"',
     "--sandbox",
     expected_sandbox,
+    # The campaign's configured model, rendered through the adapter's own
+    # authorized override. It is what the daemon records as this job's
+    # canonical model and therefore what the merge node may name.
+    "--model",
+    "fixture/policy-agent-1",
     "--",
 ]
-if launch[:5] != expected_prefix or len(launch) != 6 or "TALLY_BRIEF" not in launch[5]:
+if launch[:7] != expected_prefix or len(launch) != 8 or "TALLY_BRIEF" not in launch[7]:
     detail = f"adapter policy launch was not preserved: {launch!r}\n"
     (control / "policy-error.log").write_text(detail, encoding="utf-8")
     raise SystemExit(detail)

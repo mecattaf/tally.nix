@@ -87,6 +87,7 @@ impl FlowClient for TestClient {
             stderr_truncated: None,
             witness_seq: u64::try_from(index + 1).expect("test ordinal fits u64"),
             disposition: reply.disposition,
+            model: None,
             result: reply.result,
             gates: None,
             error: (!reply.verdict.is_pass()).then(|| NodeFailure {

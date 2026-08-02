@@ -956,6 +956,70 @@ node budget is the same with a steward as without one. With no steward
 configured the narration is the template, and the published text is byte for
 byte what it was before the seam existed.
 
+### The provenance trailer and the post-merge git-ai binding
+
+The squash commit is where a campaign's authorship becomes repository-native
+(`AUGUST-01-DESIGN.md` §7). Two separate things land there, and only one of
+them is proof.
+
+The **`Assisted-by:` trailer** is the pointer. The merge node appends
+`Assisted-by: <adapter>:<model> (tally:<taskUuid> witness:<seq>)` to the squash
+message, byte-identical to what the gh producer already publishes on a
+completion comment. Every component comes from the settled implementation node:
+the campaign's agent adapter, the canonical model the daemon recorded for that
+execution, and the task UUID and witness sequence of the attempt that produced
+the head being merged. When the estate never named a model — `agentModel` is
+null and the adapter declares no model override — there is no canonical model
+to name and the node writes **no trailer** rather than a plausible one. A
+narrator that proposes an `Assisted-by:` line is refused for the same reason it
+is refused a closing keyword: that authority belongs to the node. A `merge`
+integration gets no trailer, because git writes its own message there and the
+working commits it collects keep their own notes.
+
+The **note on `refs/notes/ai`** is the proof, and reaching it takes deliberate
+work. `gitAiBinding` selects the posture: `off` (the shipped state), `advisory`,
+or `required`. `doc/src/flows/git-ai-squash-fidelity.md` records the
+measurement the binding is built on — attribution is re-minted per line, by
+git-ai's background service, at `git commit` time, and only in the repository
+that made the commit. A forge-side squash therefore arrives unbound, and
+nothing about fetching or reading it recovers the attribution.
+
+So under `advisory` and `required` the merge node, after the merge is proven,
+mints the same integration a second time: a detached worktree of the campaign
+checkout — the one place that still holds the task branch's checkpoints and
+shares its `refs/notes/ai` — squashes the same head onto the same base,
+commits, and waits on `git-ai await`. It then proves the reconstruction is the
+integrated commit's content, not merely something like it: the merged commit's
+first parent must be the gated base, and the reconstructed tree must equal the
+merged tree. Only then is the note copied onto the integrated commit's object
+ID, and `refs/notes/ai` pushed to the campaign remote. The push is
+fast-forward-only; a remote carrying notes this checkout has not seen is folded
+in with git's own `cat_sort_uniq` strategy and retried once. It is never
+forced, because forcing would delete another lane's bindings to publish this
+one.
+
+Every outcome is journaled with the merge node as an `authorship` receipt
+naming the binding posture, a status (`bound`, `unavailable`, `missing-note`,
+`mismatch`, or `error`), the bound revision, the notes-ref target, the SHA-256
+of the exact note bytes, whether the push succeeded, and a typed reason. Under
+`advisory` that receipt is the whole consequence: a missing binary, an
+unsettled note, or a tree that does not match is a loud warning and the
+campaign proceeds. Under `required` any status other than a published `bound`
+fails the merge node.
+
+Arm `advisory` first, and not as caution theatre: an unprovisioned host and a
+squash that lost its attribution produce byte-identical evidence — no note — so
+only real squash merges can show that the binding works. `required` also
+couples every campaign merge to one externally provisioned binary version,
+which tally.nix does not ship. The binding adds no flow node; it is a step
+inside the merge action that already existed.
+
+The daemon-side `services.tally.gitAi` settlement barrier is a separate
+mechanism with a separate switch. It binds the code result's own revision at
+completion; this binds the commit the campaign integrated. Neither implies the
+other, and `services.tally.gitAi.globalAwaitOk` stays `false` under parallel
+lanes because that barrier is process-wide.
+
 If the published head conflicts with current base, the driver aborts the rebase
 and deletes only that exact leased remote head. Pass-exit cleanup removes the
 failed lane. The next reconcile attempt therefore prepares the task from

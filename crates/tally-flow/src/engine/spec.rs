@@ -40,6 +40,7 @@ pub(super) fn validate_node_spec_shape(
         ("executor", spec.executor.as_deref()),
         ("approvalPolicy", spec.approval_policy.as_deref()),
         ("sandboxPolicy", spec.sandbox_policy.as_deref()),
+        ("model", spec.model.as_deref()),
     ] {
         if value.is_some_and(|value| value.is_empty() || value.chars().any(char::is_control)) {
             return Err(FlowError::new(
@@ -435,6 +436,7 @@ pub(super) fn normalize_adapter_options(
     for (field, policy) in [
         ("approvalPolicy", spec.approval_policy.take()),
         ("sandboxPolicy", spec.sandbox_policy.take()),
+        ("model", spec.model.take()),
     ] {
         let Some(policy) = policy else {
             continue;

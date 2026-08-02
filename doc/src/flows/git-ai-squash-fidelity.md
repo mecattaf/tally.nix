@@ -72,24 +72,46 @@ a.txt
    pushed by default, so publication is an explicit `git push <remote>
    refs/notes/ai:refs/notes/ai`.
 
-## Consequences for the publish-node binding (car F)
+## What the binding built on this (car F)
 
-This spike is consumed by the git-ai binding work, which owns the following and
-is not implemented here:
+These findings are the whole design of the merge node's post-merge binding,
+which `gitAiBinding` arms (`doc/src/flows/campaigns.md`). Point by point:
 
-- The GitHub merge path needs an **explicit bind/rebind step** on the fetched
-  squash commit. Nothing about it is automatic. The `local-squash` result shows
-  what a correct binding looks like; the `remote-squash` result shows that
-  reaching it from a forge-side squash requires deliberate work.
-- The binding must run in a checkout that still holds the working branch's
-  checkpoints. Campaign lanes are `git worktree`s of the campaign checkout and
-  therefore share one object store and one `refs/notes/ai`, so the campaign
-  checkout is the right place to bind. `pruned-source` is what a binding that
-  runs after branch cleanup gets: nothing.
-- `mode = "required"` must stay off until the bind step exists. An unarmed host
-  and a squash that lost its attribution produce byte-identical evidence — no
-  note — so a `required` binding cannot distinguish a real authorship failure
-  from a host that never had the trace2 target installed.
+- Finding 3 is why the binding **re-mints the squash locally instead of asking
+  for it**. Nothing recovers attribution from a commit made elsewhere, so the
+  merge node squashes the same head onto the same base a second time in a
+  detached worktree of the campaign checkout, and copies the resulting note
+  onto the integrated commit's object ID.
+- The consequence of copying is that the reconstruction must be proven to be
+  the same content, not merely similar work. The node requires the integrated
+  commit's first parent to be the gated base and its tree to equal the
+  reconstruction's tree before any note is copied; a mismatch is refused with
+  that status and nothing is written. Finding 1 is what makes the copy honest:
+  the note names exact lines against an exact tree, and an identical tree on an
+  identical parent has an identical diff.
+- Finding 2 is why the reconstruction happens in a worktree of the campaign
+  checkout. The service observes `git commit` through a global
+  `trace2.eventTarget`, and it recovers attribution by content-matching against
+  checkpoints it already holds. `pruned-source` is what a binding that runs
+  after branch cleanup gets: nothing. Lanes are `git worktree`s of the campaign
+  checkout and share one object store and one `refs/notes/ai`, so that is where
+  the binding runs.
+- Finding 4 is why publication is an explicit `git push <remote>
+  refs/notes/ai:refs/notes/ai` step, and why it is worth doing: the note
+  travels, and a clone with only the base branch and the notes ref reads full
+  per-line attribution.
+- The unarmed-host ambiguity is why `mode = "required"` and
+  `gitAiBinding = "required"` both stay off for this wave. A host that never
+  had the trace2 target installed and a squash that lost its attribution
+  produce the same evidence, so `required` cannot tell a real authorship
+  failure from an unprovisioned host until real squash merges have shown the
+  binding working.
 - The `Assisted-by: <adapter>:<model> (tally:<taskUuid> witness:<seq>)` trailer
   stays a pointer. The note is the proof, and per finding 4 the proof publishes
   independently of the trailer.
+
+One operational number, measured on the same host: `git-ai await` costs roughly
+18 seconds on a repository with nothing outstanding, because it waits on the
+background service rather than on the note. That is spent inside the merge node
+on every bound task, and it is a reason the posture is per-campaign rather than
+fleet-wide.

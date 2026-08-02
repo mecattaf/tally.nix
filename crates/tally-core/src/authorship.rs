@@ -245,10 +245,42 @@ pub fn verify_authorship(
         ));
         return Ok(report);
     }
+    // A notes ref is an ordinary commit history that grows every time any
+    // commit in the repository is annotated -- including the campaign merge
+    // node's own post-merge binding on the squash commit. Requiring byte
+    // equality with the witnessed target therefore reported a mismatch for
+    // every repository that stayed in use after the binding, which is every
+    // live repository. What the witness can honestly assert is that the ref
+    // only ever moved forward: the witnessed target must still be an ancestor
+    // of the observed one. A ref that was rewritten, rolled back, or replaced
+    // is not an ancestor and still reports the typed mismatch. The proof
+    // itself is unchanged and remains exact -- the note blob for the witnessed
+    // revision must hash to the witnessed digest, which is checked above.
     if target_after != expected_target {
-        report.status = AuthorshipVerificationStatus::NotesRefTargetMismatch;
+        let appended = match git(
+            repository,
+            [
+                "merge-base",
+                "--is-ancestor",
+                expected_target,
+                target_after.as_str(),
+            ],
+        ) {
+            Ok(output) => output.status.success(),
+            Err(reason) => return Ok(error_report(report, reason)),
+        };
+        if !appended {
+            report.status = AuthorshipVerificationStatus::NotesRefTargetMismatch;
+            report.reason = Some(format!(
+                "{} resolves to {target_after}, which does not descend from the witnessed target {expected_target}",
+                authorship.note_ref
+            ));
+            return Ok(report);
+        }
+        report.ok = true;
+        report.status = AuthorshipVerificationStatus::Match;
         report.reason = Some(format!(
-            "{} resolves to {target_after}, expected {expected_target}",
+            "the result revision and exact Git AI note binding match; {} has advanced to {target_after} since the witnessed target {expected_target}",
             authorship.note_ref
         ));
         return Ok(report);
@@ -501,7 +533,7 @@ mod tests {
     }
 
     #[test]
-    fn unrelated_note_change_reports_notes_ref_target_mismatch() {
+    fn an_appended_note_keeps_the_binding_green_and_a_rewritten_ref_does_not() {
         let temp = tempdir().unwrap();
         let repository = temp.path().join("repo");
         let ledger = temp.path().join("witness.jsonl");
@@ -512,6 +544,10 @@ mod tests {
         let task_uuid = "00000000-0000-4000-8000-000000000053";
         append_witness(&ledger, task_uuid, &revision, &target, note);
 
+        // The campaign merge node binds the squash commit on the same notes
+        // ref after this result was witnessed. That is an append, so the
+        // witnessed proof -- the exact note bytes for the witnessed revision
+        // -- is untouched and the binding stays green.
         fs::write(repository.join("other.txt"), "other\n").unwrap();
         run_git(&repository, &["add", "other.txt"]);
         run_git(&repository, &["commit", "-qm", "other"]);
@@ -520,21 +556,48 @@ mod tests {
             .trim()
             .to_owned();
         install_note(&repository, &other, b"unrelated note\n");
+        let advanced = ref_target(&repository);
 
         let report = verify_authorship(&ledger, &repository, task_uuid, Some(1), Some(1)).unwrap();
-        assert_eq!(
-            report.status,
-            AuthorshipVerificationStatus::NotesRefTargetMismatch
-        );
+        assert!(report.ok, "{:?}", report.reason);
+        assert_eq!(report.status, AuthorshipVerificationStatus::Match);
         assert_eq!(
             report.observed_note_content_sha256,
             report.expected_note_content_sha256
+        );
+        assert_eq!(
+            report.observed_notes_ref_target.as_deref(),
+            Some(advanced.as_str())
         );
         assert_ne!(
             report.observed_notes_ref_target,
             report.expected_notes_ref_target
         );
+        assert!(report.reason.unwrap().contains("has advanced to"));
         assert!(report.ledger.ok);
+
+        // A ref that was rebuilt rather than appended to does not descend from
+        // the witnessed target, and that is still the typed mismatch even when
+        // the note bytes happen to hash the same.
+        run_git(&repository, &["update-ref", "-d", "refs/notes/ai"]);
+        install_note(&repository, &other, b"unrelated note\n");
+        install_note(&repository, &revision, note);
+        assert_ne!(ref_target(&repository), advanced);
+        let rebuilt = verify_authorship(&ledger, &repository, task_uuid, Some(1), Some(1)).unwrap();
+        assert!(!rebuilt.ok);
+        assert_eq!(
+            rebuilt.status,
+            AuthorshipVerificationStatus::NotesRefTargetMismatch
+        );
+        assert_eq!(
+            rebuilt.observed_note_content_sha256,
+            rebuilt.expected_note_content_sha256
+        );
+        assert!(rebuilt
+            .reason
+            .unwrap()
+            .contains("does not descend from the witnessed target"));
+        assert!(rebuilt.ledger.ok);
     }
 
     #[test]

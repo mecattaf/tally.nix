@@ -2120,6 +2120,39 @@ let
             makes an ancestor of the base branch.
           '';
         };
+        gitAiBinding = mkOption {
+          type = types.enum [
+            "off"
+            "advisory"
+            "required"
+          ];
+          default = "off";
+          example = "advisory";
+          description = ''
+            Whether the merge node binds Git AI authorship on the commit it
+            just integrated. A squash mints a commit the forge authored, and
+            authorship notes are minted where a commit is made, so a
+            forge-side squash arrives with no note at all. Under `advisory`
+            and `required` the merge node reconstructs that squash in the
+            campaign checkout -- the one place that still holds the task
+            branch's checkpoints -- proves the reconstruction is the same tree
+            on the same parent, copies the minted note onto the integrated
+            commit, and publishes refs/notes/ai to the campaign remote.
+
+            `off` is the shipped state and binds nothing. `advisory` records
+            every outcome as a merge receipt and never fails the node, which
+            is the posture to arm first: an unprovisioned host and a squash
+            that lost its attribution produce identical evidence, so only real
+            squash merges can show that the binding works. `required` turns
+            any outcome other than a bound note into a failed merge node and
+            couples every campaign merge to the externally provisioned
+            binary's version, which tally.nix does not ship.
+
+            This is the merge node's own posture and is independent of
+            services.tally.gitAi, which governs the daemon's settlement
+            barrier at code-result completion.
+          '';
+        };
         agent = mkOption {
           type = types.str;
           default = "codex";
@@ -2184,6 +2217,21 @@ let
             and diagnosis. Agent adapters should keep the default
             structured-brief sentinel; a shell fixture may name its executable
             directly.
+          '';
+        };
+        agentModel = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "provider/model-1";
+          description = ''
+            Model this campaign dispatches its implementation and diagnosis
+            nodes with, rendered as the job's adapter model option. Null leaves
+            the adapter's own resolution alone.
+
+            It is also the only model the campaign can honestly name: the merge
+            node's `Assisted-by:` trailer points at the canonical model the
+            daemon recorded for the witnessed attempt, and with no model
+            recorded the node writes no trailer rather than inventing one.
           '';
         };
         agentPriority = mkOption {
@@ -3329,9 +3377,11 @@ let
     driver = "${specBuildDriver}/bin/spec-build-driver";
     inherit (campaign) driverRuntimeMaxSec;
     inherit (campaign) mergeMethod;
+    inherit (campaign) gitAiBinding;
     agent = {
       adapter = campaign.agent;
       argv = campaign.agentArgv;
+      model = campaign.agentModel;
       priority = campaign.agentPriority;
       runtimeMaxSec = campaign.agentRuntimeMaxSec;
       approvalPolicy = campaign.agentApprovalPolicy;
