@@ -202,6 +202,29 @@ authorized.
   budget and reaches escalation instead. Only movement from outside the pass
   can trip it, since a campaign's own merges land before its checkpoint lanes
   prepare.
+- Fixed the campaign anomaly surface firing on the campaign's own work. A task
+  pull request carries `Closes #<sub-issue>`, so the campaign closes its own
+  sub-issues as it merges; editing one task brief and re-arming rotates every
+  task's revision, so every already-merged task simultaneously lost its proof
+  and kept a sub-issue the campaign had closed. Each of those was reported as a
+  `closed-without-merged-proof` anomaly asserting that a human had closed it,
+  and `tally query run` pinned the run in `needs-attention` — one false alarm
+  per merged task, on the campaign's own documented edit-and-re-arm workflow,
+  exactly when the board most needs to be readable. A sub-issue closed by a
+  merged pull request carrying this campaign's marker at any revision is now
+  recognised as the campaign's own closure and stays in the reconciler's
+  ignored-marker warnings; only a hand closure is an anomaly.
+- Fixed the sub-issue walk silently reading completion from a truncated page of
+  closing pull-request references. `first:` returns the oldest references, so
+  the dropped one was the newest — the likeliest current proof — and the task
+  would then be re-dispatched into a publish node that hits its own merged pull
+  request. The walk now requests `pageInfo` on that connection and fails the
+  pass rather than narrowing what counts as proof.
+- `tally campaign arm` now reports `subIssueWalk` and `projection` on its
+  enqueueing path as well as under `--no-enqueue`. A campaign that armed
+  degraded — no per-task steering threads, no merged-oracle walk, no anomalies —
+  was otherwise indistinguishable from a native one until an operator's comment
+  on a task sub-issue silently failed to reach its agent.
 - Fixed `tally adapter smoke --assert-commit`, which could never pass for an
   adapter with `hardening` set — the configuration the hardening guide's only
   worked example recommends for codex. The probe repository was created under

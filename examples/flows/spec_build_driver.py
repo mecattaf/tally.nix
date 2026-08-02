@@ -1521,6 +1521,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
           state
           url
           closedByPullRequestsReferences(first: 20, includeClosedPrs: true) {
+            pageInfo { hasNextPage }
             nodes {
               url
               body
@@ -1544,6 +1545,11 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 # A third page means the parent grew outside the campaign and the pass refuses
 # to reason from a partial walk.
 MAX_SUBISSUE_WALK_PAGES = 2
+# `first:` returns the oldest references, so a truncated page drops the newest
+# closing pull request — the one most likely to be the current proof. Silently
+# reading past that would let the walk narrow what counts as proof, which is
+# the one thing it must never do, so a full page fails the pass instead.
+MAX_SUBISSUE_PULL_REQUESTS = 20
 
 
 def subissue_walk(repository: str, issue_number: str) -> dict[int, dict[str, Any]]:
@@ -1602,6 +1608,17 @@ def subissue_walk(repository: str, issue_number: str) -> dict[int, dict[str, Any
             )
             if not isinstance(reference_nodes, list):
                 fail(f"campaign sub-issue #{number} returned malformed pull requests")
+            reference_page = (
+                references.get("pageInfo") if isinstance(references, dict) else None
+            )
+            if not isinstance(reference_page, dict):
+                fail(f"campaign sub-issue #{number} returned no reference page information")
+            if reference_page.get("hasNextPage") is True:
+                fail(
+                    f"campaign sub-issue #{number} links more than "
+                    f"{MAX_SUBISSUE_PULL_REQUESTS} closing pull requests; the walk refuses "
+                    "to read completion from a truncated reference page"
+                )
             for reference in reference_nodes:
                 if not isinstance(reference, dict):
                     fail(f"campaign sub-issue #{number} returned a malformed reference")
@@ -1691,6 +1708,20 @@ def pull_requests_by_head(
     return candidates
 
 
+def campaign_marker_prefixes(campaign: str, issue_number: str) -> tuple[str, ...]:
+    """Every pull-request marker this campaign has ever written, revision-blind.
+
+    Matching the prefix identifies a pull request as *this campaign's own work*
+    without saying anything about whether it still proves a task. That is a
+    different question from completion, and conflating the two is what made an
+    ordinary graph edit look like operator error.
+    """
+    return (
+        f"<!-- tally:spec-build:v1 campaign={campaign} issue={issue_number} task=",
+        f"<!-- tally:spec-build:v2 campaign={campaign} issue={issue_number} task=",
+    )
+
+
 def merged_github_tasks(
     repository: str,
     config: dict[str, Any],
@@ -1712,10 +1743,7 @@ def merged_github_tasks(
         if task["kind"] == "implementation"
     }
     revisions = {task["id"]: task_revision(task) for task in tasks}
-    campaign_marker_prefixes = (
-        f"<!-- tally:spec-build:v1 campaign={campaign} issue={issue_number} task=",
-        f"<!-- tally:spec-build:v2 campaign={campaign} issue={issue_number} task=",
-    )
+    prefixes = campaign_marker_prefixes(campaign, issue_number)
 
     def unnamed_marker_warning(candidate: dict[str, Any]) -> str | None:
         # A pull request carrying this campaign's marker for a revision the
@@ -1724,7 +1752,7 @@ def merged_github_tasks(
         body = candidate.get("body")
         if not isinstance(body, str):
             return None
-        if not any(prefix in body for prefix in campaign_marker_prefixes):
+        if not any(prefix in body for prefix in prefixes):
             return None
         if any(marker in body for marker in markers.values()):
             return None
@@ -2148,17 +2176,44 @@ def checkpoint_deferrals(
     return deferrals
 
 
+def closed_by_this_campaign(node: dict[str, Any], prefixes: tuple[str, ...]) -> bool:
+    """Did this campaign's own merged pull request close the sub-issue?
+
+    A task PR carries `Closes #<sub-issue>`, so the campaign closes its own
+    sub-issues as it merges. When a later graph edit rotates every task
+    revision, those merged pull requests stop proving anything — but the
+    closure they caused is still the campaign's, not a human's. The marker
+    prefix is revision-blind on purpose: it answers "did we do this?", which is
+    exactly the question the anomaly must not get wrong.
+    """
+    for candidate in node["pullRequests"]:
+        body = candidate.get("body")
+        if candidate.get("merged") is True and isinstance(body, str):
+            if any(prefix in body for prefix in prefixes):
+                return True
+    return False
+
+
 def closed_subissue_anomalies(
     walk: dict[int, dict[str, Any]],
     tasks: list[dict[str, Any]],
     completed_ids: set[str],
+    prefixes: tuple[str, ...],
 ) -> list[dict[str, Any]]:
-    """A sub-issue closed with no merged proof is a loud anomaly, not progress.
+    """A sub-issue closed *by hand* with no merged proof is a loud anomaly.
 
     A sub-issue is human-clickable, so closure carries no authority at all;
     `pullRequest.merged` (or the checkpoint completion ref) stays the only
     oracle. The task remains incomplete and the closure is surfaced rather than
     filed as a reconciler warning nobody reads.
+
+    A closure the campaign caused itself is not that signal. Editing one task
+    brief and re-arming rotates every task's revision, so every already-merged
+    task simultaneously loses its proof and keeps a sub-issue the campaign
+    closed. Reporting those as operator error would fire the loudest surface in
+    the status verb on the campaign's own documented workflow, once per merged
+    task, exactly when the board most needs to stay readable. Those pull
+    requests are already named in the reconciler's ignored-marker warnings.
     """
     anomalies: list[dict[str, Any]] = []
     for task in tasks:
@@ -2166,6 +2221,8 @@ def closed_subissue_anomalies(
             continue
         node = walk.get(subissue_number(task))
         if node is None or node["state"] != "closed":
+            continue
+        if closed_by_this_campaign(node, prefixes):
             continue
         anomalies.append(
             {
@@ -2268,7 +2325,12 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
     completed_ids = {fact["taskId"] for fact in merged + checkpoints}
     task_ids = {task["id"] for task in worklist["tasks"]}
     anomalies = (
-        closed_subissue_anomalies(walk, worklist["tasks"], completed_ids)
+        closed_subissue_anomalies(
+            walk,
+            worklist["tasks"],
+            completed_ids,
+            campaign_marker_prefixes(campaign, issue["number"]),
+        )
         if walk is not None
         else []
     )

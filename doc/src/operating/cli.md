@@ -412,7 +412,10 @@ to one of those states while the summary counts stay whole-run, which is how a 1
 board stays readable. Campaign anomalies print above the board, never inside it, and put the run
 in `needs-attention`: a sub-issue closed by hand while its task holds no revision-valid merged
 pull request completes nothing, and a reader who misses that debugs the wrong surface. Each
-anomaly line names the task, the sub-issue URL, and what is missing. A flow with no reconciled task table reaches `complete` once every one of
+anomaly line names the task, the sub-issue URL, and what is missing. A sub-issue the campaign
+closed itself — by merging a pull request that carried `Closes #<sub-issue>` — is never reported
+here, however stale that pull request's revision marker has since become; it is a pass warning,
+not operator error. A flow with no reconciled task table reaches `complete` once every one of
 its nodes holds a passing terminal verdict. Its current-node section includes elapsed time and
 the remaining `runtimeMaxSec` budget, negative when a node has run past that budget; its failure
 section prints the retained failure capture path — or `<not retained>` when none exists — and
