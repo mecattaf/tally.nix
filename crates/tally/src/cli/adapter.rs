@@ -195,7 +195,7 @@ async fn run_adapter_smoke(
             "not-checked",
             probe.as_ref().map(CommitProbe::not_checked),
         )?;
-        print_captured_stderr(&args.name, &terminal);
+        print_captured_stderr(&args.name, &terminal)?;
         let verdict = terminal
             .get("verdict")
             .and_then(Value::as_str)
@@ -427,7 +427,7 @@ pub(super) fn run_adapter_smoke_commit() -> Result<()> {
         &cwd,
         &["commit", "--quiet", "--message", COMMIT_PROBE_MESSAGE],
     )?;
-    println!("ok");
+    outln!("ok");
     Ok(())
 }
 
@@ -549,7 +549,7 @@ fn print_smoke_result(
             .cloned()
             .unwrap_or(Value::Null)
     };
-    println!(
+    outln!(
         "{}",
         serde_json::to_string(&json!({
             "schemaVersion": 1,
@@ -573,7 +573,7 @@ fn print_smoke_result(
     Ok(())
 }
 
-fn print_captured_stderr(adapter: &str, terminal: &Value) {
+fn print_captured_stderr(adapter: &str, terminal: &Value) -> Result<()> {
     let excerpt = terminal
         .get("stderr_excerpt")
         .or_else(|| terminal.get("stderrExcerpt"))
@@ -581,15 +581,16 @@ fn print_captured_stderr(adapter: &str, terminal: &Value) {
         .filter(|excerpt| !excerpt.is_empty());
     match excerpt {
         Some(excerpt) => {
-            eprintln!("adapter smoke {adapter:?} captured stderr:");
+            errln!("adapter smoke {adapter:?} captured stderr:");
             // The excerpt is whatever the adapter wrote; printing it verbatim
             // hands control of the operator's terminal to a failing job.
             for line in excerpt.lines() {
-                eprintln!("{}", sanitize_line(line));
+                errln!("{}", sanitize_line(line));
             }
         }
-        None => eprintln!("adapter smoke {adapter:?} captured stderr was empty"),
+        None => errln!("adapter smoke {adapter:?} captured stderr was empty"),
     }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -203,6 +203,10 @@ pub enum ExecRunError {
 /// Run a child with inherited stdio, environment, and cwd, then append exactly
 /// one advisory terminal attestation.  A ledger/hostname failure is logged but
 /// never changes the child's propagated exit code.
+// `tally __exec` is a helper mode whose stderr is the job's captured failure
+// stream, not an operator pipeline; an advisory append failure is logged there
+// unconditionally (#315).
+#[allow(clippy::disallowed_macros)]
 pub fn run_exec(request: ExecRunRequest) -> Result<ExecRunOutcome, ExecRunError> {
     validate_run_request(&request)?;
     let evidence = parse_evidence_specs(&request.evidence)?;

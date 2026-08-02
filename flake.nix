@@ -65,6 +65,9 @@
           fileset = pkgs.lib.fileset.unions [
             ./Cargo.lock
             ./Cargo.toml
+            # The clippy check runs from this source tree, so the disallowed
+            # macro list has to travel with it or the lint silently weakens.
+            ./clippy.toml
             ./crates
             ./doc/src/reference/rpc-protocol.md
             ./examples/flows/academic-ocr.js

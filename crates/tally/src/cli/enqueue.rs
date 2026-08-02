@@ -146,11 +146,11 @@ pub(super) async fn submit_payload(
         .call(method, Some(serde_json::to_value(payload)?))
         .await?;
     if !wait {
-        println!("{}", serde_json::to_string(&result)?);
+        outln!("{}", serde_json::to_string(&result)?);
         return Ok(());
     }
     if let Some(verdict) = result.get("verdict").and_then(Value::as_str) {
-        println!("{}", serde_json::to_string(&result)?);
+        outln!("{}", serde_json::to_string(&result)?);
         let code = verdict_exit_code(verdict);
         if code != 0 {
             return Err(anyhow::Error::new(ExitFailure {
@@ -166,7 +166,7 @@ pub(super) async fn submit_payload(
         .filter(|task_uuid| !task_uuid.is_empty())
         .ok_or_else(|| invalid(format!("{method} returned no task_uuid for --wait")))?;
     let waited = await_job_with_rearm(client, socket, task_uuid, rearm_window).await?;
-    println!("{}", serde_json::to_string(&waited)?);
+    outln!("{}", serde_json::to_string(&waited)?);
     let code = waited_exit_code(&waited);
     if code == 0 {
         Ok(())

@@ -1,0 +1,14 @@
+# `println!` and `eprintln!` panic when the reader hangs up: that is how
+# `tally query run <id> | head -1` used to die with `failed printing to stdout:
+# Broken pipe` instead of printing its line (#315). The CLI prints through
+# `cli::out` instead, which maps a closed reader onto a quiet exit and keeps
+# every other write failure an error with its message. This list is what stops
+# the stock macros creeping back into a converted file.
+#
+# Writers that must not take that mapping — the daemon's own log surface, test
+# harness output, and the last-resort printers that have no `Result` to return
+# — carry an explicit `#[allow(clippy::disallowed_macros)]` with its reason.
+disallowed-macros = [
+  { path = "std::println", reason = "human output goes through cli::out (outln!), which does not panic on a hung-up reader" },
+  { path = "std::eprintln", reason = "human output goes through cli::out (errln!), which does not panic on a hung-up reader" },
+]

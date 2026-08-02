@@ -1,3 +1,6 @@
+// A test-harness skip notice; the cargo test runner owns this stream.
+#![allow(clippy::disallowed_macros)]
+
 pub const REMOTE_HOST_ENV: &str = "TALLY_TEST_REMOTE_HOST";
 
 pub fn require_remote_host(test_name: &str) -> Option<String> {
