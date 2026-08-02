@@ -17,6 +17,7 @@ export const meta = {
       "issue",
       "runId",
       "worklist",
+      "continuation",
       "workspaceRoot",
       "tally",
       "driver",
@@ -74,7 +75,32 @@ export const meta = {
       },
       maxTasks: { type: "integer", minimum: 1, maximum: 128 },
       maxParallel: { type: "integer", minimum: 1, maximum: 128 },
-      reconcileCommand: { type: "string", pattern: "^/[^\\r\\n]+$", maxLength: 300 },
+      // The machine's self-continuation. A pass that advanced writes this
+      // bounded enqueue payload into the daemon's events directory; the 5 s
+      // drain admits the next pass. No forge round-trip, no public comment.
+      continuation: {
+        type: "object",
+        required: ["argv", "pool", "priority", "eventsDir"],
+        properties: {
+          argv: {
+            type: "array",
+            minItems: 1,
+            maxItems: 64,
+            items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
+          },
+          pool: {
+            type: "array",
+            minItems: 1,
+            maxItems: 8,
+            uniqueItems: true,
+            items: { type: "string", minLength: 1, maxLength: 128 }
+          },
+          priority: { enum: ["interrupt", "high", "medium", "low"] },
+          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
+          eventsDir: { type: "string", pattern: "^/" }
+        },
+        additionalProperties: false
+      },
       workspaceRoot: { type: "string", pattern: "^/" },
       tally: { type: "string", pattern: "^/" },
       driver: { type: "string", pattern: "^/" },
@@ -176,7 +202,6 @@ export const meta = {
           "repositories",
           "maxTasks",
           "maxParallel",
-          "reconcileCommand",
           "agent",
           "gates"
         ]
@@ -420,8 +445,7 @@ const effectiveConfigSchema = {
     "repositoryConfig",
     "maxParallel",
     "agent",
-    "gates",
-    "reconcileCommand"
+    "gates"
   ],
   properties: {
     campaign: {
@@ -442,8 +466,7 @@ const effectiveConfigSchema = {
     },
     maxParallel: { type: "integer", minimum: 1, maximum: 128 },
     agent: { type: "object" },
-    gates: { type: "array", minItems: 1, maxItems: 16 },
-    reconcileCommand: { type: ["string", "null"] }
+    gates: { type: "array", minItems: 1, maxItems: 16 }
   },
   additionalProperties: false
 };
@@ -792,10 +815,16 @@ const escalationSchema = {
 
 const continuationSchema = {
   type: "object",
-  required: ["command", "posted"],
+  required: ["event", "dedupKey", "runId", "created"],
   properties: {
-    command: { type: "string", pattern: "^/[^\\r\\n]+$", maxLength: 300 },
-    posted: { const: true }
+    event: { type: "string", pattern: "^/" },
+    dedupKey: { type: "string", minLength: 1, maxLength: 512 },
+    runId: { type: "string", minLength: 1, maxLength: 512 },
+    // False when an identical, not-yet-drained event is already queued. The
+    // pass still advanced; a second identical file would only be collapsed by
+    // the enqueue kernel, so refusing to write it is the same outcome sooner.
+    created: { type: "boolean" },
+    receipt: { type: ["string", "null"] }
   },
   additionalProperties: false
 };
@@ -1182,8 +1211,7 @@ function sweepDeferral(sweepNode) {
         repositoryConfig: args.repositories[args.repository],
         maxParallel: args.maxParallel,
         agent: diagnosisSandboxed(args.agent),
-        gates: args.gates,
-        reconcileCommand: args.reconcileCommand
+        gates: args.gates
       };
   let sweepNode = null;
   if (!forgeNative) {
@@ -1938,11 +1966,14 @@ function sweepDeferral(sweepNode) {
     terminalError = error;
   }
 
-  // The continuation is posted even when the steering lane threw. A transient
+  // The continuation is written even when the steering lane threw. A transient
   // adapter fault must not leave the campaign stopped with neither steering nor
-  // a mention to resume from.
+  // a mention to resume from. Both campaign classes take this node: a
+  // forge-native pass re-enters through a registry scan carrying no brief, a
+  // module-declared pass re-enters through its own flow-run argv, whose brief
+  // is this pass's arguments under a derived run identity.
   let continuation = null;
-  if (advanced && effective.reconcileCommand !== null) {
+  if (advanced) {
     const continued = await driverNode(
       "continue",
       {
@@ -1951,7 +1982,8 @@ function sweepDeferral(sweepNode) {
         repositoryConfig,
         issue: args.issue,
         runId: args.runId,
-        reconcileCommand: effective.reconcileCommand
+        continuation: args.continuation,
+        brief: forgeNative ? null : args
       },
       "continue",
       "spec-build-continue",

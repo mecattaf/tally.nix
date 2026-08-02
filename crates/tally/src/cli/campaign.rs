@@ -1357,15 +1357,60 @@ fn max_flow_nodes(manifest: &CampaignManifest) -> u32 {
     (3 + preflight + manifest.max_parallel * (11 + 2 * manifest.gates.len())) as u32
 }
 
-async fn dispatch_campaign(
-    socket: &Path,
-    config_path: Option<&Path>,
+/// Argv the pass writes into the events directory to admit its own successor.
+///
+/// It is the poll the timer already runs: one registry scan that refetches the
+/// issue graph, recomputes the observation revision, and dispatches through
+/// `dispatch_campaign`, so the next pass inherits the `campaign:<repo>:<number>:<revision>`
+/// dedup identity. A duplicate event, or a race with `tally-campaign-poll.timer`,
+/// therefore collapses in the enqueue kernel instead of starting a second pass.
+/// The host bindings every dispatch needs: where the daemon listens, which
+/// configuration it was started from, and which registry the pass belongs to.
+#[derive(Clone, Copy)]
+struct CampaignHost<'a> {
+    socket: &'a Path,
+    config_path: Option<&'a Path>,
+    state_dir: &'a Path,
     rpc_timeout: Duration,
+}
+
+impl CampaignHost<'_> {
+    fn continuation_argv(&self, executable: &Path) -> Vec<String> {
+        let mut argv = vec![executable.display().to_string()];
+        if let Some(config) = self.config_path {
+            argv.push("--config".to_owned());
+            argv.push(config.display().to_string());
+        }
+        argv.extend([
+            "--socket".to_owned(),
+            self.socket.display().to_string(),
+            "campaign".to_owned(),
+            "poll".to_owned(),
+            "--once".to_owned(),
+            "--state-dir".to_owned(),
+            self.state_dir.display().to_string(),
+        ]);
+        argv
+    }
+
+    fn events_dir(&self) -> PathBuf {
+        self.state_dir.join("events")
+    }
+}
+
+async fn dispatch_campaign(
+    host: CampaignHost<'_>,
     graph: &CampaignGraph,
     steering: &[Value],
     registration: &mut CampaignRegistration,
     wait: bool,
 ) -> Result<Value> {
+    let CampaignHost {
+        socket,
+        config_path,
+        rpc_timeout,
+        ..
+    } = host;
     if graph.executable_digest != registration.approved_graph_digest {
         bail!(
             "campaign executable graph changed from admitted {} to {}; inspect the issue graph and run `tally campaign arm {}` to approve it",
@@ -1400,6 +1445,16 @@ async fn dispatch_campaign(
         "tally": &executable,
         "driver": &registration.driver,
         "driverRuntimeMaxSec": graph.manifest.driver_runtime_max_sec,
+        "continuation": {
+            "argv": host.continuation_argv(&executable),
+            // The control pool, not the campaign mutex: the scan must be free
+            // to run while this pass finishes its cleanup. Its dispatch still
+            // queues behind the capacity-1 runner mutex, so passes serialize.
+            "pool": ["campaign-control"],
+            "priority": "low",
+            "runtimeMaxSec": graph.manifest.driver_runtime_max_sec,
+            "eventsDir": host.events_dir(),
+        },
     });
     let payload = EnqueuePayload {
         invocation: None,
@@ -1551,9 +1606,12 @@ async fn run_campaign_arm(
         return Ok(());
     }
     let result = dispatch_campaign(
-        socket,
-        config_path,
-        rpc_timeout,
+        CampaignHost {
+            socket,
+            config_path,
+            state_dir: &state_dir,
+            rpc_timeout,
+        },
         &graph,
         &steering,
         &mut registration,
@@ -1615,9 +1673,12 @@ async fn run_campaign_poll(
                 return Ok((false, false));
             }
             let result = dispatch_campaign(
-                socket,
-                config_path,
-                rpc_timeout,
+                CampaignHost {
+                    socket,
+                    config_path,
+                    state_dir: &state_dir,
+                    rpc_timeout,
+                },
                 &graph,
                 &steering,
                 &mut registration,
@@ -2932,6 +2993,46 @@ mod tests {
             "examples/flows/spec-build.js",
         )
         .is_err());
+    }
+
+    #[test]
+    fn forge_native_continuation_re_enters_through_the_registry_scan() {
+        let host = CampaignHost {
+            socket: Path::new("/run/user/1000/tally/tally.sock"),
+            config_path: Some(Path::new("/home/operator/.config/tally/config.json")),
+            state_dir: Path::new("/home/operator/.local/state/tally"),
+            rpc_timeout: Duration::from_secs(30),
+        };
+        // Byte-for-byte the invocation tally-campaign-poll.service runs, so a
+        // continuation event and a timer firing produce the same observation
+        // revision and therefore the same dispatch dedup key.
+        assert_eq!(
+            host.continuation_argv(Path::new("/nix/store/tally/bin/tally")),
+            vec![
+                "/nix/store/tally/bin/tally",
+                "--config",
+                "/home/operator/.config/tally/config.json",
+                "--socket",
+                "/run/user/1000/tally/tally.sock",
+                "campaign",
+                "poll",
+                "--once",
+                "--state-dir",
+                "/home/operator/.local/state/tally",
+            ]
+        );
+        assert_eq!(
+            host.events_dir(),
+            Path::new("/home/operator/.local/state/tally/events")
+        );
+        let without_config = CampaignHost {
+            config_path: None,
+            ..host
+        };
+        assert_eq!(
+            without_config.continuation_argv(Path::new("/nix/store/tally/bin/tally"))[1],
+            "--socket"
+        );
     }
 
     #[test]

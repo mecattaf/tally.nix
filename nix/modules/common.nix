@@ -3170,8 +3170,6 @@ let
     // optionalAttrs (gate.kind == "forbidPaths") { inherit (gate) forbidPaths; }
   );
 
-  campaignReconcileCommand = name: "/tally reconcile ${name}";
-
   # Sweep, reconcile, one optional pass-level continuation, optional
   # pristine-base preflight prep/gates/cleanup, and one frontier's worst-case
   # implementation lanes: prep, agent, ownership check, initial gates,
@@ -3199,7 +3197,28 @@ let
     };
     repositories = renderCampaignRepositories campaign.repositories;
     inherit (campaign) worklist maxTasks maxParallel;
-    reconcileCommand = campaignReconcileCommand name;
+    # The machine's self-nudge is local: a pass that advanced writes this
+    # payload into the shipped events directory instead of posting a public
+    # `/tally reconcile` comment for a second GitHub producer to poll back.
+    # The argv is the one the deleted reconcile producer built.
+    continuation = {
+      argv = [
+        (lib.getExe cfg.package)
+        "flow"
+        "run"
+        (storePathWithContext specBuildFlow)
+        "--args-from-brief"
+        "--max-nodes"
+        (toString (campaignMaxNodes campaign))
+      ];
+      pool = [
+        "flow"
+        campaign.pool.name
+      ];
+      priority = "low";
+      inherit (campaign) runtimeMaxSec;
+      eventsDir = "${toString cfg.stateDir}/events";
+    };
     workspaceRoot = "${toString cfg.stateDir}/campaigns/${name}";
     tally = lib.getExe cfg.package;
     driver = "${specBuildDriver}/bin/spec-build-driver";
@@ -3285,64 +3304,6 @@ let
       };
     };
 
-  mkCampaignReconcileProducer =
-    cfg: name: campaign:
-    let
-      runtimeArgs =
-        mkCampaignArgs cfg name campaign "\${gh.repo}" "\${gh.number}" "\${gh.url}"
-          "\${gh.eventId}";
-    in
-    {
-      kind = "gh";
-      enable = true;
-      sources = [
-        {
-          search = {
-            repositories = builtins.attrNames campaign.repositories;
-            labels = [ campaign.label ];
-            state = "open";
-            kinds = [ "issue" ];
-          };
-        }
-      ];
-      triggers.commandComments = [ (campaignReconcileCommand name) ];
-      # One pass-level node posts this finite, event-id-deduplicated command
-      # after any merge, checkpoint, or machine steering receipt.
-      # Authenticated self-trigger permission is separate from the external
-      # actor allowlist, so an operator-only list cannot silence continuation.
-      allowSelfTriggered = true;
-      inherit (campaign) allowedActors pollIntervalSec;
-      postReceipt = false;
-      postEvidence = true;
-      inherit (campaign) postFailureEvidence postFailureStderr;
-      postGateSummary = false;
-      requestReview = false;
-      closeOnAcceptance = false;
-      closeOnPass = false;
-      neverMutate = false;
-      enqueue = {
-        argv = [
-          (lib.getExe cfg.package)
-          "flow"
-          "run"
-          (storePathWithContext specBuildFlow)
-          "--args-from-brief"
-          "--max-nodes"
-          (toString (campaignMaxNodes campaign))
-        ];
-        adapter = "shell";
-        brief = runtimeArgs;
-        pool = [
-          "flow"
-          campaign.pool.name
-        ];
-        priority = "low";
-        runtimeMaxSec = campaign.runtimeMaxSec;
-        evidence = [ "exit:0" ];
-        noEnqueue = false;
-      };
-    };
-
   mkCampaignConfig =
     cfg:
     let
@@ -3380,14 +3341,27 @@ let
     {
       enqueue.fanoutCap = lib.mkDefault requiredFanout;
       flows = mapAttrs (name: campaign: mkCampaignFlow cfg name campaign) enabled;
-      producers = lib.foldl' (
-        producers: name:
-        producers
-        // {
-          "campaign-${name}" = mkCampaignProducer cfg name enabled.${name};
-          "campaign-${name}-reconcile" = mkCampaignReconcileProducer cfg name enabled.${name};
-        }
-      ) { } (builtins.attrNames enabled);
+      producers =
+        lib.foldl'
+          (
+            producers: name:
+            producers
+            // {
+              "campaign-${name}" = mkCampaignProducer cfg name enabled.${name};
+            }
+          )
+          {
+            # One generic drain for every campaign's machine self-continuation,
+            # installed once and unconditionally like the forge-native `campaign`
+            # pool, so arming a campaign still needs no Nix change. Both campaign
+            # classes write their next-pass payload here; the frozen enqueue
+            # kernel collapses a duplicate against `tally-campaign-poll.timer`.
+            campaign-continuation = {
+              kind = "events-dir";
+              pollIntervalSec = lib.mkDefault 5;
+            };
+          }
+          (builtins.attrNames enabled);
       pools = mutexPools // {
         flow = flowPoolDefaults;
         campaign-control = {
@@ -3592,20 +3566,6 @@ let
         {
           assertion = !campaign.enable || cfg.enqueue.fanoutCap >= campaignMaxNodes campaign;
           message = "tally campaign ${name} requires services.tally.enqueue.fanoutCap >= ${toString (campaignMaxNodes campaign)}";
-        }
-        {
-          assertion =
-            !campaign.enable
-            || (
-              builtins.hasAttr "campaign-${name}-reconcile" cfg.producers
-              && cfg.producers."campaign-${name}-reconcile".enable
-              && cfg.producers."campaign-${name}-reconcile".kind == "gh"
-              && cfg.producers."campaign-${name}-reconcile".allowSelfTriggered
-              &&
-                builtins.elem (campaignReconcileCommand name)
-                  cfg.producers."campaign-${name}-reconcile".triggers.commandComments
-            );
-          message = "tally campaign ${name} continuation producer must stay enabled for its exact command and allow authenticated self triggers";
         }
         {
           assertion =
