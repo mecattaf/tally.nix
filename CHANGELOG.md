@@ -336,6 +336,27 @@ authorized.
 
 ### Fixed
 
+- A human query whose reader hangs up now ends quietly instead of panicking.
+  `tally query run <id> | head -1` printed through stock `println!`, so the
+  first write after the pipe closed panicked with `failed printing to stdout:
+  Broken pipe` and a failing exit status. Every human-facing print on the
+  queue, lease, and query surface now writes through a helper that reports a
+  closed reader as exit 0 with no message; any other write failure is still an
+  error with its message. The process-wide SIGPIPE disposition is untouched, so
+  `daemon run`, `__remote-executor`, and `__record-unit-exit` keep seeing a
+  closed socket as an error to report rather than a reason to die mid-write.
+
+- Terminal-output sanitization now covers the remaining daemon-sourced strings
+  in `tally query run` and `tally query log`: flow name, campaign, flow-run id,
+  run state, task status, transition timestamp, adapter, pool set, provenance,
+  and the `--cursor` continuation hint on stderr. These fields are
+  trusted-source today, so this is defense in depth rather than a live hole —
+  but the renderer is no longer what makes that load-bearing. `compact_text`
+  additionally drops U+061C ARABIC LETTER MARK, which reorders a line exactly
+  as the already-filtered LRM and RLM do, and an unterminated CSI scan now
+  stops at an embedded C0 control instead of eliding text up to the next
+  `0x40-0x7e` byte, so malformed adapter output loses less legitimate text.
+
 - A single corrupt or non-canonical `<64hex>.json` file in a brief store no
   longer aborts the whole retention sweep. `managed_brief_files` propagated the
   verification failure out of `run_gc`, which stopped it after GC-root pruning

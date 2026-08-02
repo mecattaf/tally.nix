@@ -55,8 +55,15 @@ fn skip_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     };
     match introducer {
         '[' => {
-            // CSI: parameter and intermediate bytes, then one final byte.
+            // CSI: parameter and intermediate bytes, then one final byte. A C0
+            // control inside the sequence aborts it, as it does on a real
+            // terminal: without the bail-out an adapter line that happens to
+            // contain a bare `ESC [` swallows everything up to the next
+            // 0x40-0x7e byte, which is usually legitimate text.
             while let Some(&ch) = chars.peek() {
+                if ch < ' ' || ch == '\u{7f}' {
+                    return;
+                }
                 chars.next();
                 if ('\u{40}'..='\u{7e}').contains(&ch) {
                     break;
@@ -84,7 +91,14 @@ fn skip_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
 const fn is_bidi_control(ch: char) -> bool {
     matches!(
         ch,
-        '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        // ARABIC LETTER MARK is an implicit directional mark like LRM/RLM and
+        // reorders a line the same way; it sits outside the general-punctuation
+        // block, which is the only reason it is listed apart.
+        '\u{61c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
     )
 }
 
@@ -109,6 +123,19 @@ mod tests {
         assert_eq!(compact_text("a\u{7}b\u{8}c"), "abc");
         assert_eq!(compact_text("\u{202e}drowssap"), "drowssap");
         assert_eq!(compact_text("c1\u{9b}2Jtail"), "c12Jtail");
+        // U+061C ARABIC LETTER MARK reorders a line like LRM and RLM do.
+        assert_eq!(compact_text("\u{61c}x"), "x");
+        assert_eq!(compact_text("left\u{61c}right"), "leftright");
+    }
+
+    #[test]
+    fn an_unterminated_csi_stops_at_a_control_instead_of_eating_the_line() {
+        // The scan ends at the newline rather than running on to the first
+        // 0x40-0x7e byte, which would have swallowed "g" of "gate".
+        assert_eq!(compact_text("\u{1b}[3\ngate failed"), "gate failed");
+        assert_eq!(sanitize_line("\u{1b}[3"), "");
+        // A well-formed sequence is still consumed whole.
+        assert_eq!(compact_text("\u{1b}[3mgate failed"), "gate failed");
     }
 
     #[test]

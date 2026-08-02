@@ -5,6 +5,7 @@ mod daemon;
 mod enqueue;
 mod exit;
 mod flow;
+mod out;
 mod queue;
 mod text;
 

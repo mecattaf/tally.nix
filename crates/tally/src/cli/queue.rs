@@ -1,3 +1,4 @@
+use super::out::{errln, outln};
 use super::text::{compact_text, sanitize_line};
 use super::*;
 
@@ -110,7 +111,7 @@ pub(super) async fn run_queue(
         QueueCommand::AwaitJob { job } => {
             let client = connect_rpc(socket, config_path).await?;
             let result = await_job_with_rearm(client, socket, &job, rpc_timeout).await?;
-            println!("{}", serde_json::to_string(&result)?);
+            outln!("{}", serde_json::to_string(&result)?);
             Ok(())
         }
         QueueCommand::AwaitBarrier { barrier } => {
@@ -243,7 +244,7 @@ pub(super) async fn run_query(
                 .call_with_deadline("query.run", Some(json!({"id": id})), rpc_timeout)
                 .await?;
             if json {
-                println!("{}", serde_json::to_string(&result)?);
+                outln!("{}", serde_json::to_string(&result)?);
                 Ok(())
             } else {
                 print_run_human(&result, status.map(RunTaskFilter::as_str))
@@ -304,7 +305,7 @@ pub(super) async fn run_query(
                 )
                 .await?;
             if json {
-                println!("{}", serde_json::to_string(&result)?);
+                outln!("{}", serde_json::to_string(&result)?);
                 Ok(())
             } else {
                 print_lifecycle_human(&result, provenance)
@@ -367,14 +368,14 @@ pub(super) async fn run_query(
                 .call("query.render", Some(json!({"format": format.clone()})))
                 .await?;
             if format == "text" {
-                println!(
+                outln!(
                     "{}",
                     result
                         .as_str()
                         .ok_or_else(|| anyhow::anyhow!("daemon returned non-text render output"))?
                 );
             } else {
-                println!("{}", serde_json::to_string(&result)?);
+                outln!("{}", serde_json::to_string(&result)?);
             }
             Ok(())
         }
@@ -407,7 +408,7 @@ fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid lifecycle log response"))?;
     if items.is_empty() {
-        println!("No lifecycle transitions.");
+        outln!("No lifecycle transitions.");
     }
     for item in items {
         let timestamp = item["timestamp"].as_str().unwrap_or("unknown-time");
@@ -422,10 +423,14 @@ fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
         let mut detail = Vec::new();
         if matches!(item["event"].as_str(), Some("started" | "dispatched")) {
             if let Some(adapter) = item["adapter"].as_str() {
-                detail.push(format!("adapter={adapter}"));
+                detail.push(format!("adapter={}", compact_text(adapter)));
             }
             if let Some(pools) = item["pool"].as_array() {
-                let pools = pools.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+                let pools = pools
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(compact_text)
+                    .collect::<Vec<_>>();
                 if !pools.is_empty() {
                     detail.push(format!("pool={}", pools.join(",")));
                 }
@@ -447,8 +452,8 @@ fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
             detail.push(format!("attempt={attempt}"));
         }
         if provenance {
-            let origin = item["origin"].as_str().unwrap_or("unknown");
-            let source = item["provenance"].as_str().unwrap_or("unknown");
+            let origin = compact_text(item["origin"].as_str().unwrap_or("unknown"));
+            let source = compact_text(item["provenance"].as_str().unwrap_or("unknown"));
             detail.push(format!("provenance={origin}:{source}"));
         }
         let suffix = if detail.is_empty() {
@@ -456,9 +461,9 @@ fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
         } else {
             format!("  {}", detail.join(" "))
         };
-        println!(
+        outln!(
             "{}  {:<14}  {:<24}  {}{}",
-            timestamp,
+            compact_text(timestamp),
             compact_text(&identity),
             compact_text(label),
             compact_text(state),
@@ -466,7 +471,10 @@ fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
         );
     }
     if let Some(cursor) = envelope["nextCursor"].as_str() {
-        eprintln!("More transitions are available; continue with --cursor {cursor}");
+        errln!(
+            "More transitions are available; continue with --cursor {}",
+            compact_text(cursor)
+        );
     }
     Ok(())
 }
@@ -478,16 +486,16 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
     let state = run["state"].as_str().unwrap_or("unknown");
     let flow_name = run["flowName"].as_str().unwrap_or("flow");
     let campaign = run["campaign"].as_str();
-    println!(
+    outln!(
         "{}{}  {}  {}",
-        flow_name,
-        campaign.map_or_else(String::new, |value| format!(" {value}")),
-        flow_run_id,
-        state
+        compact_text(flow_name),
+        campaign.map_or_else(String::new, |value| format!(" {}", compact_text(value))),
+        compact_text(flow_run_id),
+        compact_text(state)
     );
 
     let counts = &run["counts"];
-    println!(
+    outln!(
         "Tasks: {} done, {} running, {} blocked, {} pending",
         counts["done"].as_u64().unwrap_or(0),
         counts["running"].as_u64().unwrap_or(0),
@@ -501,13 +509,13 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
     // surface.
     let anomalies = run["anomalies"].as_array().map_or(&[][..], Vec::as_slice);
     if !anomalies.is_empty() {
-        println!();
-        println!(
+        outln!();
+        outln!(
             "!! ANOMALIES: {} closed sub-issue(s) hold no merged proof; those tasks are NOT done",
             anomalies.len()
         );
         for anomaly in anomalies {
-            println!(
+            outln!(
                 "  !! {}  {}  {}",
                 compact_text(anomaly["taskRef"].as_str().unwrap_or("-")),
                 compact_text(anomaly["url"].as_str().unwrap_or("-")),
@@ -524,17 +532,19 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
         .filter(|task| status_filter.is_none_or(|status| task["status"] == status))
         .collect::<Vec<_>>();
     if tasks.is_empty() {
-        println!("No reconciled task table is available for this run.");
+        outln!("No reconciled task table is available for this run.");
     } else if shown.is_empty() {
-        println!(
+        outln!(
             "No task is {}.",
             status_filter.unwrap_or("in the requested state")
         );
     } else {
-        println!();
-        println!(
+        outln!();
+        outln!(
             "{:<9}  {:<18}  {:<24}  TITLE",
-            "STATUS", "TASK", "CURRENT / BLOCKED BY"
+            "STATUS",
+            "TASK",
+            "CURRENT / BLOCKED BY"
         );
         for task in shown {
             let task_ref = task["taskRef"].as_str().unwrap_or("-");
@@ -552,9 +562,9 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
                 })
                 .or_else(|| task["pullRequest"].as_str().map(ToOwned::to_owned))
                 .unwrap_or_else(|| "-".to_owned());
-            println!(
+            outln!(
                 "{:<9}  {:<18}  {:<24}  {}",
-                task["status"].as_str().unwrap_or("unknown"),
+                compact_text(task["status"].as_str().unwrap_or("unknown")),
                 compact_text(task_ref),
                 compact_text(&context),
                 compact_text(task["title"].as_str().unwrap_or("-"))
@@ -566,8 +576,8 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid current-node table"))?;
     if !current_nodes.is_empty() {
-        println!();
-        println!("Current nodes");
+        outln!();
+        outln!("Current nodes");
         for node in current_nodes {
             let identity = node["taskRef"]
                 .as_str()
@@ -583,7 +593,7 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
                 .as_i64()
                 .map(human_seconds_signed)
                 .unwrap_or_else(|| "unbounded".to_owned());
-            println!(
+            outln!(
                 "  {:<18}  {:<24}  {:<10}  elapsed={} budget={}",
                 compact_text(&identity),
                 compact_text(node["label"].as_str().unwrap_or("-")),
@@ -598,8 +608,8 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
         .as_array()
         .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid failure table"))?;
     if !failures.is_empty() {
-        println!();
-        println!("Failures");
+        outln!();
+        outln!("Failures");
         for failure in failures {
             let identity = failure["taskRef"]
                 .as_str()
@@ -607,7 +617,7 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
                 .unwrap_or_else(|| {
                     short_identity(failure["taskUuid"].as_str().unwrap_or("unknown"))
                 });
-            println!(
+            outln!(
                 "  {}  {}  {}",
                 compact_text(&identity),
                 compact_text(failure["stage"].as_str().unwrap_or("unknown-stage")),
@@ -617,19 +627,19 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
             // capture first, and a silently omitted pointer cannot be told
             // apart from a capture that exists but failed to resolve.
             match failure["capturePath"].as_str() {
-                Some(path) => println!("    capture: {}", compact_text(path)),
-                None => println!("    capture: <not retained>"),
+                Some(path) => outln!("    capture: {}", compact_text(path)),
+                None => outln!("    capture: <not retained>"),
             }
             if let Some(stderr) = failure["stderrTail"].as_str() {
                 let truncated = failure["stderrTruncated"].as_bool().unwrap_or(false);
-                println!(
+                outln!(
                     "    stderr tail{}:",
                     if truncated { " (truncated)" } else { "" }
                 );
                 // Indentation is the structure of a stack trace or a diff, so
                 // the tail keeps it; only terminal control is stripped.
                 for line in stderr.lines() {
-                    println!("      {}", sanitize_line(line));
+                    outln!("      {}", sanitize_line(line));
                 }
             }
         }
@@ -695,7 +705,7 @@ pub(super) async fn print_rpc(
             .call_with_deadline(method, params, rpc_timeout)
             .await?
     };
-    println!("{}", serde_json::to_string(&result)?);
+    outln!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
 
@@ -730,7 +740,7 @@ pub(super) async fn run_query_watch(
             )
             .await?;
         if result["status"] == "cursor-expired" {
-            println!("{}", serde_json::to_string(&result)?);
+            outln!("{}", serde_json::to_string(&result)?);
             return Err(invalid(format!(
                 "query watch cursor expired; earliest available is {}",
                 result["earliestAvailableCursor"]
@@ -740,7 +750,7 @@ pub(super) async fn run_query_watch(
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("daemon returned an invalid watch response"))?;
         for item in items {
-            println!("{}", serde_json::to_string(item)?);
+            outln!("{}", serde_json::to_string(item)?);
         }
         after = result["nextCursor"].as_str().map(ToOwned::to_owned);
         if once {

@@ -1,11 +1,13 @@
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 use tally_client::{RequestFrame, WireError};
 use tally_core::wire::{serve_connection, RpcHandler};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
 
@@ -351,6 +353,125 @@ impl RpcHandler for HumanQueryHandler {
                 })),
                 method => panic!("unexpected method {method}"),
             }
+        })
+    }
+}
+
+/// Every daemon-sourced string the human renderers touch, with terminal
+/// control planted in it. The fields are trusted-source today; the renderer
+/// must not be what makes that load-bearing.
+#[derive(Clone, Copy)]
+struct HostileQueryHandler;
+
+impl RpcHandler for HostileQueryHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        Box::pin(async move {
+            match request.method.as_str() {
+                "query.log" => Ok(serde_json::json!({
+                    "schemaVersion": 1,
+                    "protocolVersion": 4,
+                    "items": [
+                        {
+                            "origin": "jour\u{1b}[2Jnal", "eventId": "event:1", "cursor": "event:1",
+                            "timestamp": "\u{1b}[2J2026-08-01T10:00:01.000Z", "event": "started",
+                            "taskUuid": "00000000-0000-4000-8000-000000000261",
+                            "taskRef": "crm/t07", "nodeLabel": "agent-t07",
+                            "attempt": 1, "leaseEpoch": 7,
+                            "adapter": "co\u{1b}[2Jdex",
+                            "pool": ["camp\u{1b}]0;pwned\u{7}aign-agent", "sl\u{9b}2Jot"],
+                            "authority": "tally-lifecycle-observation",
+                            "provenance": "durable-lifecycle\u{1b}[2J-history"
+                        },
+                        {
+                            "origin": "journal+witness", "eventId": "event:4", "cursor": "event:4",
+                            "timestamp": "2026-08-01T10:00:03.000Z\u{202e}", "event": "completed",
+                            "taskUuid": "00000000-0000-4000-8000-000000000261",
+                            "taskRef": "crm/t07", "nodeLabel": "agent-t07",
+                            "attempt": 1, "leaseEpoch": 7, "exitCode": 0,
+                            "terminalVerdict": "pa\u{1b}[31mss", "witnessSeq": 11,
+                            "authority": "canonical-witness-fact",
+                            "provenance": "durable-lifecycle-history+witness-ledger"
+                        }
+                    ],
+                    "nextCursor": "\u{1b}[2Jpage-v1:log",
+                    "snapshot": {}
+                })),
+                "query.run" => Ok(serde_json::json!({
+                    "schemaVersion": 1,
+                    "protocolVersion": 4,
+                    "flowRunId": "\u{1b}[2J00000000-0000-4000-8000-000000000262",
+                    "flowName": "\u{1b}[2Jspec-build",
+                    "campaign": "c\u{1b}]0;pwned\u{7}rm",
+                    "state": "needs-\u{1b}[31mattention",
+                    "counts": {"done": 0, "running": 1, "blocked": 0, "pending": 0},
+                    "tasks": [{
+                        "taskRef": "crm/t02", "title": "Hostile task",
+                        "status": "bl\u{1b}[2Jocked", "blockedBy": [],
+                        "failureStage": "agent\u{9b}2J-t02"
+                    }],
+                    "anomalies": [],
+                    "currentNodes": [{
+                        "taskUuid": "00000000-0000-4000-8000-000000000263",
+                        "taskRef": "crm/t02", "ordinal": 3,
+                        "label": "clean\u{1b}[2Jup-t02", "state": "run\u{1b}[2Jning",
+                        "startedAt": "2026-08-01T10:00:00Z", "elapsedSeconds": 9
+                    }],
+                    "failures": [{
+                        "taskUuid": "00000000-0000-4000-8000-000000000264",
+                        "taskRef": "crm/t02", "ordinal": 2,
+                        "stage": "agent\u{1b}[2J-t02", "verdict": "fail\u{1b}[2Jed",
+                        "attempt": 1, "leaseEpoch": 4, "timestamp": "2026-08-01T10:00:03Z",
+                        "capturePath": "/tmp/tally/\u{1b}[2Jcrm.t02.err",
+                        "stderrTail": "\u{1b}[2Jactionable failure\n",
+                        "stderrTruncated": false
+                    }],
+                    "snapshot": {}
+                })),
+                method => panic!("unexpected method {method}"),
+            }
+        })
+    }
+}
+
+/// A run board far larger than a pipe buffer, so a reader that takes one line
+/// and leaves is guaranteed to hang up mid-write rather than after the last
+/// byte already fit.
+#[derive(Clone, Copy)]
+struct FloodQueryHandler;
+
+impl RpcHandler for FloodQueryHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        Box::pin(async move {
+            assert_eq!(request.method, "query.run");
+            let tasks = (0..4_000)
+                .map(|index| {
+                    serde_json::json!({
+                        "taskRef": format!("crm/t{index:04}"),
+                        "title": "A task with a title long enough to fill a pipe buffer",
+                        "status": "pending",
+                        "blockedBy": []
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(serde_json::json!({
+                "schemaVersion": 1,
+                "protocolVersion": 4,
+                "flowRunId": "00000000-0000-4000-8000-000000000262",
+                "flowName": "spec-build",
+                "state": "running",
+                "counts": {"done": 0, "running": 0, "blocked": 0, "pending": 4000},
+                "tasks": tasks,
+                "anomalies": [],
+                "currentNodes": [],
+                "failures": [],
+                "snapshot": {}
+            }))
         })
     }
 }
@@ -1073,6 +1194,146 @@ async fn query_run_status_filter_narrows_the_board_but_not_the_counts() {
             assert!(text.contains("1 done, 0 running, 1 blocked, 0 pending"));
             assert!(text.contains("crm/t02"), "{text}");
             assert!(!text.contains("crm/t01"), "{text}");
+            server.await.unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn human_query_output_carries_no_daemon_sourced_terminal_control() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(stream, HostileQueryHandler).await.unwrap();
+                }
+            });
+
+            let run = run_tally(
+                &socket,
+                &["query", "run", "00000000-0000-4000-8000-000000000262"],
+            )
+            .await;
+            assert!(run.status.success(), "{run:?}");
+            let stdout = String::from_utf8(run.stdout).unwrap();
+            let stderr = String::from_utf8(run.stderr).unwrap();
+            for (surface, text) in [("stdout", &stdout), ("stderr", &stderr)] {
+                assert!(
+                    !text.contains(['\u{1b}', '\u{9b}', '\u{7}', '\u{202e}']),
+                    "terminal control reached {surface}:\n{text:?}"
+                );
+            }
+            // The identity fields survive as readable text rather than being
+            // dropped along with the control they carried.
+            for expected in [
+                "spec-build",
+                "crm",
+                "00000000-0000-4000-8000-000000000262",
+                "needs-attention",
+                "blocked",
+                "agent2J-t02",
+                "cleanup-t02",
+                "running",
+                "/tmp/tally/crm.t02.err",
+                "actionable failure",
+            ] {
+                assert!(
+                    stdout.contains(expected),
+                    "missing {expected:?} in:\n{stdout}"
+                );
+            }
+
+            let log = run_tally(&socket, &["query", "log"]).await;
+            assert!(log.status.success(), "{log:?}");
+            let stdout = String::from_utf8(log.stdout).unwrap();
+            let stderr = String::from_utf8(log.stderr).unwrap();
+            for (surface, text) in [("stdout", &stdout), ("stderr", &stderr)] {
+                assert!(
+                    !text.contains(['\u{1b}', '\u{9b}', '\u{7}', '\u{202e}']),
+                    "terminal control reached {surface}:\n{text:?}"
+                );
+            }
+            for expected in [
+                "2026-08-01T10:00:01.000Z",
+                "adapter=codex",
+                "pool=campaign-agent,sl2Jot",
+                "pass",
+            ] {
+                assert!(
+                    stdout.contains(expected),
+                    "missing {expected:?} in:\n{stdout}"
+                );
+            }
+            // The pagination hint is an operator instruction on stderr and is
+            // sanitized on the same terms as the rows.
+            assert!(
+                stderr.contains("--cursor page-v1:log"),
+                "missing the cursor hint in:\n{stderr}"
+            );
+            server.await.unwrap();
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_human_query_whose_reader_hangs_up_exits_without_a_panic() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                // The client dies mid-response-consumption; the connection
+                // ending under the server is the point of the test.
+                let _ = serve_connection(stream, FloodQueryHandler).await;
+            });
+
+            let mut child = Command::new(env!("CARGO_BIN_EXE_tally"))
+                .arg("--socket")
+                .arg(&socket)
+                .args(["query", "run", "00000000-0000-4000-8000-000000000262"])
+                .env_remove("TALLY_JOB_ID")
+                .env_remove("TALLY_JOB_TOKEN")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+
+            // `head -1`: read one line, then close the read end.
+            let mut reader = BufReader::new(child.stdout.take().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).await.unwrap();
+            assert!(first.starts_with("spec-build"), "{first:?}");
+            drop(reader);
+
+            let output = child.wait_with_output().await.unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                !stderr.contains("panicked"),
+                "a hung-up reader panicked the CLI:\n{stderr}"
+            );
+            assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+            // Exit 0 from the mapped BrokenPipe, and — the other half of the
+            // contract — no signal. The CLI leaves the process-wide SIGPIPE
+            // disposition ignored exactly as the runtime set it, which is what
+            // `daemon run`, `__remote-executor`, and `__record-unit-exit`
+            // depend on: had this path restored SIG_DFL for the process, the
+            // kernel would have killed this write and the status below would
+            // read signal 13 rather than code 0.
+            let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
+            assert_eq!(
+                (output.status.code(), signal),
+                (Some(0), None),
+                "a hung-up reader must end the command quietly: {:?}",
+                output.status
+            );
             server.await.unwrap();
         })
         .await;
