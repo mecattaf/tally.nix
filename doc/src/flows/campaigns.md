@@ -53,10 +53,12 @@ its own successor through the events directory, so the timer is the recovery
 path for a lost continuation event and the way an outside change to the issue
 graph is noticed, not the ordinary way a campaign reaches its next pass. It
 scans every `services.tally.campaignPoll.interval` (60s by default). A scan that
-finds nothing moved costs two REST reads per armed campaign: it compares the
-master and sub-issue timestamps that fetch already returned before it decides
-whether to run the bounded GraphQL steering walk at all, so an idle campaign no
-longer pays for a full sub-issue traversal every tick. A scan holds the registry
+finds nothing moved costs three REST reads per armed campaign — the
+authenticated actor, the master issue, and its sub-issue list — and no GraphQL
+at all: it compares the master and sub-issue timestamps that fetch already
+returned before it decides whether to run the bounded GraphQL steering walk or
+the paginated master-comment read, so an idle campaign no longer pays for a
+full sub-issue traversal every tick. A scan holds the registry
 lock exclusively across its forge
 round-trips, which blocks an interactive `tally campaign arm`, `disarm`, or
 `list` for its duration; `services.tally.campaignPoll.timeout` caps that hold.
@@ -174,7 +176,12 @@ arms in degraded mode and every projection above falls back to checkboxes. Only
 a schema refusal counts: a transport error, a rate limit, or a 502 says nothing
 about the forge and fails the arm loudly instead, because degrading on one bad
 minute would silently cost the campaign its per-task steering threads, its
-merged-oracle walk, and its anomaly surface for the rest of its life. Every `arm`
+merged-oracle walk, and its anomaly surface for the rest of its life. A refusal
+is read from the response's own typed `errors[]` entry, or — only on a call that
+failed — from `errors[].message` and `gh`'s stderr. It is never read from the
+response body: that body carries every comment on every task thread, and a
+comment is writable by any account, so scanning it would let a stranger answer
+the capability gate. Every `arm`
 path reports which mode it recorded, as `subIssueWalk` and `projection`
 (`native-sub-issues` or `degraded-checkboxes`) alongside its ordinary output;
 `tally campaign list` shows the same field for an already-armed campaign. Read
@@ -219,7 +226,10 @@ thread. A machine diagnosis or machinery-retry receipt for task `T` is posted on
 `T`'s sub-issue and read back from there, so `T`'s retry brief carries `T`'s
 history and no other task's. A comment by an allowed actor on `T`'s sub-issue
 reaches `T`'s agent as `steering.authorizedComments` and advances the
-observation revision exactly like a master comment does. The master issue stays
+observation revision exactly like a master comment does. That read takes the
+newest 100 comments on the thread; a thread that exceeds it logs a warning
+naming the sub-issue, because an approved comment older than the window stops
+reaching its task and nothing else would say so. The master issue stays
 the campaign-wide channel: campaign-level human steering reaches every task, and
 escalation and the closing summary are always posted there.
 

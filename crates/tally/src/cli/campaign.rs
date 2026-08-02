@@ -639,6 +639,7 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
             nodes { url merged }
           }
           comments(last: 100) {
+            pageInfo { hasPreviousPage }
             nodes { databaseId url body createdAt updatedAt author { login } }
           }
         }
@@ -650,6 +651,13 @@ query($owner: String!, $name: String!, $number: Int!, $cursor: String) {
 /// The parent's sub-issue ceiling is 100 and a manifest caps at that number,
 /// so two pages of 50 always cover an admitted graph.
 const MAX_SUB_ISSUE_PAGES: usize = 2;
+/// This is the window `SUB_ISSUE_THREAD_QUERY` asks for, and it is the steering
+/// read: what survives it is what an agent is allowed to be steered by. `last:`
+/// returns the newest, so an exhausted window drops the *oldest* comments —
+/// `hasPreviousPage`, not `hasNextPage`. A thread long enough to exhaust it is
+/// ordinary human discussion, which must not halt a campaign, so the truncation
+/// is reported rather than refused.
+const MAX_SUB_ISSUE_COMMENTS: usize = 100;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -685,12 +693,24 @@ fn sub_issue_walk_arguments(
     arguments
 }
 
-fn sub_issue_threads(locator: &IssueLocator) -> Result<BTreeMap<u64, Vec<GraphqlComment>>> {
+/// One bounded walk of the parent's sub-issue threads, plus the numbers whose
+/// comment window the forge truncated.
+#[derive(Debug, Clone, Default)]
+struct SubIssueThreads {
+    threads: BTreeMap<u64, Vec<GraphqlComment>>,
+    /// Sub-issues carrying more than `MAX_SUB_ISSUE_COMMENTS` comments. The
+    /// oldest fell out of the window this walk read, so an approved steering
+    /// comment on one of them can no longer reach its task.
+    truncated: BTreeSet<u64>,
+}
+
+fn sub_issue_threads(locator: &IssueLocator) -> Result<SubIssueThreads> {
     let (owner, name) = locator
         .repository
         .split_once('/')
         .ok_or_else(|| invalid("campaign repository is not in owner/name form"))?;
-    let mut threads = BTreeMap::new();
+    let mut walked = SubIssueThreads::default();
+    let threads = &mut walked.threads;
     let mut cursor: Option<String> = None;
     for _ in 0..MAX_SUB_ISSUE_PAGES {
         let arguments = sub_issue_walk_arguments(owner, name, locator.number, cursor.as_deref());
@@ -708,6 +728,9 @@ fn sub_issue_threads(locator: &IssueLocator) -> Result<BTreeMap<u64, Vec<Graphql
                 .and_then(Value::as_u64)
                 .filter(|number| *number > 0)
                 .ok_or_else(|| invalid("campaign sub-issue walk returned an invalid number"))?;
+            if node.pointer("/comments/pageInfo/hasPreviousPage") == Some(&Value::Bool(true)) {
+                walked.truncated.insert(number);
+            }
             let comments = node
                 .pointer("/comments/nodes")
                 .cloned()
@@ -719,7 +742,7 @@ fn sub_issue_threads(locator: &IssueLocator) -> Result<BTreeMap<u64, Vec<Graphql
             }
         }
         if connection.pointer("/pageInfo/hasNextPage") != Some(&Value::Bool(true)) {
-            return Ok(threads);
+            return Ok(walked);
         }
         cursor = Some(
             connection
@@ -734,40 +757,59 @@ fn sub_issue_threads(locator: &IssueLocator) -> Result<BTreeMap<u64, Vec<Graphql
     ))
 }
 
-/// Did the forge answer "my schema has no such field", or did the call simply
-/// fail?
+/// Did the forge answer "my schema has no such field" in a typed `errors[]`
+/// entry?
 ///
-/// Only a GraphQL schema refusal is a capability answer. GitHub reports one as
-/// an `errors[]` entry typed `UNDEFINED_FIELD` — older responses spell the same
-/// thing as `extensions.code = "undefinedField"` — with a message naming the
-/// field and the type. A transport error, a rate limit, or a 502 says nothing
-/// about the forge's schema and will very likely be gone a minute later.
-fn undefined_field_refusal(output: &str) -> bool {
-    if let Ok(value) = serde_json::from_str::<Value>(output) {
-        let typed = value
-            .get("errors")
-            .and_then(Value::as_array)
-            .is_some_and(|errors| {
-                errors.iter().any(|error| {
-                    error
-                        .get("type")
+/// This reads the response's own top-level `errors` array and nothing else.
+/// GitHub types a schema refusal `UNDEFINED_FIELD`; older responses spell the
+/// same thing as `extensions.code = "undefinedField"`.
+fn typed_undefined_field(payload: &Value) -> bool {
+    payload
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|errors| {
+            errors.iter().any(|error| {
+                error
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|kind| kind.eq_ignore_ascii_case("UNDEFINED_FIELD"))
+                    || error
+                        .pointer("/extensions/code")
                         .and_then(Value::as_str)
-                        .is_some_and(|kind| kind.eq_ignore_ascii_case("UNDEFINED_FIELD"))
-                        || error
-                            .pointer("/extensions/code")
-                            .and_then(Value::as_str)
-                            .is_some_and(|code| code.eq_ignore_ascii_case("undefinedField"))
-                })
-            });
-        if typed {
-            return true;
-        }
-    }
-    let lowered = output.to_ascii_lowercase();
+                        .is_some_and(|code| code.eq_ignore_ascii_case("undefinedField"))
+            })
+        })
+}
+
+/// Does one line of forge-authored *error* text name a missing schema field?
+///
+/// Only ever applied to `errors[].message` and to `gh`'s own stderr, and only
+/// on a call that actually failed. It must never see a response body: the walk
+/// payload carries `comments { nodes { body } }`, and a comment body on a
+/// public repository is writable by any account — including, through the
+/// machine diagnosis receipts tally posts to task threads, by the campaign's
+/// own agents. Scanning the whole payload made a stranger quoting an ordinary
+/// GraphQL error (or quoting issue #334, which contains the literal string
+/// `UNDEFINED_FIELD`) enough to answer the capability gate, and the gate fails
+/// *open into degraded mode*: a campaign armed with no per-task steering
+/// threads and no merged-oracle walk for the life of that arm.
+fn undefined_field_message(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
     lowered.contains("undefined_field")
         || lowered.contains("undefinedfield")
         || lowered.contains("doesn't exist on type")
         || lowered.contains("does not exist on type")
+}
+
+/// The `message` of every entry in a GraphQL response's `errors` array.
+fn graphql_error_messages(payload: &Value) -> impl Iterator<Item = &str> {
+    payload
+        .get("errors")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|error| error.get("message").and_then(Value::as_str))
 }
 
 /// Probe whether this forge serves the sub-issue walk the native read path
@@ -788,10 +830,21 @@ fn probe_sub_issue_walk(locator: &IssueLocator) -> Result<bool> {
     let output = run_gh_output(&arguments, None)?;
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    if undefined_field_refusal(&stdout) || undefined_field_refusal(&stderr) {
+    let payload = serde_json::from_str::<Value>(&stdout).ok();
+    // The typed answer is safe to read whatever the exit status was: it looks
+    // at the response's own `errors` array, which no comment body can occupy.
+    if payload.as_ref().is_some_and(typed_undefined_field) {
         return Ok(false);
     }
     if !output.status.success() {
+        // Only now, and only over text the forge produced as an error.
+        let refused = payload
+            .as_ref()
+            .is_some_and(|payload| graphql_error_messages(payload).any(undefined_field_message))
+            || undefined_field_message(&stderr);
+        if refused {
+            return Ok(false);
+        }
         let detail = if stderr.trim().is_empty() {
             stdout.trim()
         } else {
@@ -808,8 +861,9 @@ fn probe_sub_issue_walk(locator: &IssueLocator) -> Result<bool> {
             }
         );
     }
-    let payload: Value = serde_json::from_str(&stdout)
-        .context("campaign sub-issue capability probe returned invalid JSON")?;
+    // A call that succeeded and carries no typed refusal served the walk. What
+    // its payload happens to *say* is not a capability answer.
+    let payload = payload.context("campaign sub-issue capability probe returned invalid JSON")?;
     payload
         .pointer("/data/repository/issue/subIssues")
         .ok_or_else(|| {
@@ -884,7 +938,22 @@ fn task_steering(
     allowed: &[String],
     subissues: &[u64],
 ) -> Result<BTreeMap<String, Vec<Value>>> {
-    let threads = sub_issue_threads(locator)?;
+    let walked = sub_issue_threads(locator)?;
+    // Reported, never refused. The window is exhausted by ordinary human
+    // discussion, and halting a campaign over that would be worse than the
+    // truncation; but a steering comment that scrolled out of it silently
+    // stops reaching its agent, and nothing else on this path would say so.
+    for number in subissues {
+        if walked.truncated.contains(number) {
+            errln!(
+                "tally: campaign sub-issue #{number} carries more than \
+                 {MAX_SUB_ISSUE_COMMENTS} comments; the steering read sees only the newest \
+                 {MAX_SUB_ISSUE_COMMENTS} and an approved comment older than that can no \
+                 longer reach this task"
+            );
+        }
+    }
+    let threads = walked.threads;
     let allowed = allowed.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let mut steering = BTreeMap::new();
     for number in subissues {
@@ -1257,6 +1326,15 @@ fn validate_conflict_domains(domains: &[String], required: bool) -> Result<()> {
 
 fn fetch_campaign_graph(locator: &IssueLocator) -> Result<CampaignGraph> {
     let master = fetch_issue(locator)?;
+    campaign_graph_from(locator, master)
+}
+
+/// Build the graph from a master issue the caller has already read.
+///
+/// The poll reads it first anyway, because a closed master prunes the
+/// registration rather than failing the scan, and re-reading it here made every
+/// idle tick pay for the same issue twice.
+fn campaign_graph_from(locator: &IssueLocator, master: GithubIssue) -> Result<CampaignGraph> {
     if master.state != "open" {
         return Err(invalid("campaign master issue must be open"));
     }
@@ -2145,7 +2223,7 @@ async fn run_campaign_poll(
                 fs::remove_file(&path)?;
                 return Ok((false, true));
             }
-            let graph = fetch_campaign_graph(&locator)?;
+            let graph = campaign_graph_from(&locator, master)?;
             require_allowed_issue_authors(&graph, &registration.allowed_actors)?;
             if graph.executable_digest != registration.approved_graph_digest {
                 bail!(
@@ -3501,6 +3579,42 @@ mod tests {
         })
     }
 
+    /// `TALLY_GH_PROGRAM` is process-global, so every test that swaps the
+    /// `gh` binary has to hold this. Without it a sibling test's fake `gh`
+    /// answers this one's calls, which is a flake, not a finding.
+    static GH_PROGRAM_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Restores whatever `TALLY_GH_PROGRAM` was on drop, panic or not.
+    struct GhProgramGuard {
+        previous: Option<OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl GhProgramGuard {
+        fn acquire() -> Self {
+            let lock = GH_PROGRAM_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self {
+                previous: std::env::var_os("TALLY_GH_PROGRAM"),
+                _lock: lock,
+            }
+        }
+
+        fn use_program(&self, program: &Path) {
+            std::env::set_var("TALLY_GH_PROGRAM", program);
+        }
+    }
+
+    impl Drop for GhProgramGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("TALLY_GH_PROGRAM", value),
+                None => std::env::remove_var("TALLY_GH_PROGRAM"),
+            }
+        }
+    }
+
     fn fake_gh(directory: &Path, name: &str, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
         let path = directory.join(name);
@@ -3513,7 +3627,7 @@ mod tests {
         "pageInfo":{"hasNextPage":false,"endCursor":null},
         "nodes":[{"number":8,
           "closedByPullRequestsReferences":{"nodes":[]},
-          "comments":{"nodes":[
+          "comments":{"pageInfo":{"hasPreviousPage":false},"nodes":[
             {"databaseId":11,"url":"https://github.com/acme/widgets/issues/8#c11",
              "body":"rerun the gate with the fixture regenerated",
              "createdAt":"2026-08-01T10:00:00Z","updatedAt":"2026-08-01T10:00:00Z",
@@ -3528,11 +3642,31 @@ mod tests {
              "author":{"login":"stranger"}}
           ]}}]}}}}}"#;
 
+    /// A walk the forge served in full, whose comment bodies happen to quote a
+    /// GraphQL schema error. Comment bodies are writable by any account on a
+    /// public repository — and by the campaign's own agents through the machine
+    /// receipts tally posts to task threads — so nothing in here may reach the
+    /// capability decision.
+    const HOSTILE_WALK_PAYLOAD: &str = r#"{"data":{"repository":{"issue":{"subIssues":{
+        "pageInfo":{"hasNextPage":false,"endCursor":null},
+        "nodes":[{"number":8,
+          "closedByPullRequestsReferences":{"nodes":[]},
+          "comments":{"pageInfo":{"hasPreviousPage":true},"nodes":[
+            {"databaseId":11,"url":"https://github.com/acme/widgets/issues/8#c11",
+             "body":"CI says: Field 'foo' doesn't exist on type 'Bar' -- please fix",
+             "createdAt":"2026-08-01T10:00:00Z","updatedAt":"2026-08-01T10:00:00Z",
+             "author":{"login":"operator"}},
+            {"databaseId":12,"url":"https://github.com/acme/widgets/issues/8#c12",
+             "body":"see issue #334, which quotes UNDEFINED_FIELD verbatim",
+             "createdAt":"2026-08-01T10:01:00Z","updatedAt":"2026-08-01T10:01:00Z",
+             "author":{"login":"stranger"}}
+          ]}}]}}}}}"#;
+
     #[test]
     fn the_arm_probe_answers_degraded_instead_of_failing_the_campaign() {
         let temporary = tempfile::tempdir().unwrap();
         let locator = parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap();
-        let previous = std::env::var_os("TALLY_GH_PROGRAM");
+        let gh_program = GhProgramGuard::acquire();
 
         let refusing = fake_gh(
             temporary.path(),
@@ -3541,7 +3675,7 @@ mod tests {
              \"message\":\"Field '\\''subIssues'\\'' doesn'\\''t exist on type '\\''Issue'\\''\"}]}'; \
              echo \"gh: Field 'subIssues' doesn't exist on type 'Issue'\" >&2; exit 1",
         );
-        std::env::set_var("TALLY_GH_PROGRAM", &refusing);
+        gh_program.use_program(&refusing);
         // A forge whose schema has no such field is a capability answer, not an
         // error: the campaign still arms, in degraded mode.
         assert!(!probe_sub_issue_walk(&locator).unwrap());
@@ -3555,7 +3689,7 @@ mod tests {
             "gh-flaky",
             "echo 'gh: HTTP 502: Bad gateway (https://api.github.com/graphql)' >&2; exit 1",
         );
-        std::env::set_var("TALLY_GH_PROGRAM", &flaky);
+        gh_program.use_program(&flaky);
         let failure = probe_sub_issue_walk(&locator).unwrap_err().to_string();
         assert!(failure.contains("capability probe failed"), "{failure}");
         assert!(failure.contains("502"), "{failure}");
@@ -3565,16 +3699,11 @@ mod tests {
             "gh-serving",
             &format!("cat <<'TALLY_WALK'\n{WALK_PAYLOAD}\nTALLY_WALK"),
         );
-        std::env::set_var("TALLY_GH_PROGRAM", &serving);
+        gh_program.use_program(&serving);
         assert!(probe_sub_issue_walk(&locator).unwrap());
-        assert_eq!(
-            sub_issue_threads(&locator)
-                .unwrap()
-                .keys()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![8]
-        );
+        let walked = sub_issue_threads(&locator).unwrap();
+        assert_eq!(walked.threads.keys().copied().collect::<Vec<_>>(), vec![8]);
+        assert!(walked.truncated.is_empty());
         // The task thread carries human steering under the same contract the
         // master thread has always used: allowed actors only, machine
         // receipts excluded.
@@ -3582,11 +3711,92 @@ mod tests {
         assert_eq!(steering["8"].len(), 1);
         assert_eq!(steering["8"][0]["id"], json!(11));
         assert_eq!(steering["8"][0]["author"], json!("operator"));
+    }
 
-        match previous {
-            Some(value) => std::env::set_var("TALLY_GH_PROGRAM", value),
-            None => std::env::remove_var("TALLY_GH_PROGRAM"),
-        }
+    /// A capability gate must not be answerable by an input a stranger writes.
+    ///
+    /// The first fix read the whole probe response for four phrases before it
+    /// checked whether the call had even failed, and the response carries every
+    /// comment body on every task thread. Quoting an ordinary CI error — or
+    /// quoting issue #334, which contains the literal `UNDEFINED_FIELD` — was
+    /// enough to answer "this forge has no sub-issue API", and the gate fails
+    /// open into degraded mode for the life of the arm.
+    #[test]
+    fn a_served_walk_is_never_a_capability_refusal_whatever_its_comments_say() {
+        let temporary = tempfile::tempdir().unwrap();
+        let locator = parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap();
+        let gh_program = GhProgramGuard::acquire();
+
+        let hostile = fake_gh(
+            temporary.path(),
+            "gh-hostile",
+            &format!("cat <<'TALLY_WALK'\n{HOSTILE_WALK_PAYLOAD}\nTALLY_WALK"),
+        );
+        gh_program.use_program(&hostile);
+        // The same payload walks successfully, which is the whole point: the
+        // forge served the field, so the answer is native.
+        let walked = sub_issue_threads(&locator).unwrap();
+        assert_eq!(walked.threads.keys().copied().collect::<Vec<_>>(), vec![8]);
+        assert!(
+            probe_sub_issue_walk(&locator).unwrap(),
+            "a served walk must arm native whatever its comment bodies quote"
+        );
+
+        // A genuine schema refusal still degrades even when GitHub types the
+        // error only in the message, with no `type` or `extensions.code`.
+        let untyped = fake_gh(
+            temporary.path(),
+            "gh-untyped-refusal",
+            "echo '{\"errors\":[{\"message\":\"Field '\\''subIssues'\\'' doesn'\\''t exist on type '\\''Issue'\\''\"}]}'; exit 1",
+        );
+        gh_program.use_program(&untyped);
+        assert!(!probe_sub_issue_walk(&locator).unwrap());
+
+        // And a failure whose *body* merely quotes the phrase, with no such
+        // message of its own, is a failure — not an answer.
+        let quoting_failure = fake_gh(
+            temporary.path(),
+            "gh-quoting-failure",
+            "echo '{\"data\":{\"note\":\"undefined_field\"}}';              echo 'gh: HTTP 502: Bad gateway' >&2; exit 1",
+        );
+        gh_program.use_program(&quoting_failure);
+        let failure = probe_sub_issue_walk(&locator).unwrap_err().to_string();
+        assert!(failure.contains("capability probe failed"), "{failure}");
+    }
+
+    /// The steering read's own comment window, on the surface that produces the
+    /// steering an agent is briefed with. `last:` returns the newest, so an
+    /// exhausted window drops the oldest approved comment silently.
+    #[test]
+    fn a_truncated_steering_window_is_reported_by_the_walk_that_reads_it() {
+        let temporary = tempfile::tempdir().unwrap();
+        let locator = parse_issue_url("https://github.com/acme/widgets/issues/42").unwrap();
+        let gh_program = GhProgramGuard::acquire();
+
+        let truncated = fake_gh(
+            temporary.path(),
+            "gh-truncated",
+            &format!("cat <<'TALLY_WALK'\n{HOSTILE_WALK_PAYLOAD}\nTALLY_WALK"),
+        );
+        gh_program.use_program(&truncated);
+        let walked = sub_issue_threads(&locator).unwrap();
+        assert_eq!(
+            walked.truncated.iter().copied().collect::<Vec<_>>(),
+            vec![8]
+        );
+        // Reported, never refused: the walk still returns its threads and the
+        // steering it did read.
+        assert_eq!(walked.threads.keys().copied().collect::<Vec<_>>(), vec![8]);
+        let steering = task_steering(&locator, &["operator".to_owned()], &[8]).unwrap();
+        assert_eq!(steering["8"].len(), 1);
+
+        let untruncated = fake_gh(
+            temporary.path(),
+            "gh-untruncated",
+            &format!("cat <<'TALLY_WALK'\n{WALK_PAYLOAD}\nTALLY_WALK"),
+        );
+        gh_program.use_program(&untruncated);
+        assert!(sub_issue_threads(&locator).unwrap().truncated.is_empty());
     }
 
     #[test]

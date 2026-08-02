@@ -8,6 +8,51 @@ authorized.
 
 ### Fixed
 
+- Repaired the wave-3 residue sweep (#332 repair): the capability probe read
+  untrusted comment bodies, and the comment-window fix landed on the wrong walk.
+
+  **A served sub-issue walk is never a capability refusal.** The probe's
+  substring fallback ran before it checked whether the call had even failed, and
+  it scanned the whole response — which carries every comment body on every task
+  thread. A comment on a public repository is writable by any account, and by
+  the campaign's own agents through the machine receipts tally posts to task
+  threads, so quoting an ordinary GraphQL error (or quoting issue #334, whose
+  body contains the literal string `UNDEFINED_FIELD`) was enough to answer the
+  capability gate — and the gate fails *open* into degraded mode, for the life
+  of that arm, with the projection label as the only evidence. That is the exact
+  outcome #334 item 2 was filed to remove, reached by a new door. The typed
+  `errors[]` check is unchanged and still runs on any exit status; the textual
+  fallback now runs only on a failed call and only over `errors[].message` and
+  `gh`'s own stderr. A response body is never scanned.
+
+  **The comment window was guarded on the receipt walk, not the steering read.**
+  Two walks in this tree ask for `comments(last: 100)`. The one repaired
+  previously is the driver's, whose comments are machine-authored-filtered and
+  feed the diagnosis and retry ledger. The steering an agent is briefed with
+  comes from the CLI's `SUB_ISSUE_THREAD_QUERY`, which was untouched — so the
+  harm the bullet named, an operator's steering comment scrolling out of the
+  window and never reaching the agent, was still live. That query now requests
+  `pageInfo { hasPreviousPage }` and the steering read warns, per sub-issue,
+  when the window was exhausted. Reported, never refused: the window is
+  exhausted by ordinary human discussion. The driver walk's warning is reworded
+  to name the consequence that actually follows *there* — a task's oldest
+  receipts falling out of the ledger and its attempt budget resetting, which is
+  #334 item 6's harm arriving through a second door — instead of sending an
+  operator to look for a lost steering comment.
+
+  **The idle poll no longer reads the master issue twice.** `run_campaign_poll`
+  reads the master first, because a closed master prunes the registration rather
+  than failing the scan, and then `fetch_campaign_graph` read it again. An idle
+  tick now costs three REST reads per armed campaign — the authenticated actor,
+  the master, and its sub-issue list — and the option description and the
+  campaigns page say three instead of the two they claimed.
+
+  Also corrected `ingest`'s docstring in the spec-build driver, which stated the
+  opposite receipt precedence to its own code, its call-site comment and its
+  tests: task threads are ingested first, so where both surfaces carry the same
+  `(kind, task, attempt)` the **thread** copy is counted and the master copy is
+  reported as the duplicate.
+
 - Swept the campaign-wave residue (#332, #334, #337, #340), plus one finding
   routed from the #318 evaluation.
 

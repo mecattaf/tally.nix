@@ -3000,10 +3000,12 @@ let
               example = "5min";
               description = ''
                 Systemd timespan between poll scans. A scan that finds nothing
-                moved costs two REST reads per armed campaign: it compares the
-                master and sub-issue timestamps it already fetched before it
-                decides whether to run the bounded GraphQL steering walk at
-                all. Short intervals are affordable on that budget; raise it to
+                moved costs three REST reads per armed campaign — the
+                authenticated actor, the master issue, and its sub-issue list —
+                and no GraphQL at all: it compares the master and sub-issue
+                timestamps that fetch already returned before deciding whether
+                to run the bounded steering walk or the paginated master-comment
+                read. Short intervals are affordable on that budget; raise it to
                 reduce forge API traffic further.
               '';
             };

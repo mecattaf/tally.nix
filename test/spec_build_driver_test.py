@@ -2177,9 +2177,12 @@ class NativeSubIssueTests(unittest.TestCase):
     def test_a_truncated_comment_window_is_reported_not_refused(self) -> None:
         """#334 item 1: `comments(last: 100)` silently dropped the oldest.
 
-        A long human discussion on a task thread must not halt the campaign,
-        but an operator whose steering comment scrolled out of the window has
-        to be able to see why it never reached the agent.
+        These comments are machine-authored-filtered and feed the diagnosis and
+        retry ledger, not steering -- the steering read is the CLI's own walk.
+        So the warning has to name the consequence that actually follows here: a
+        task's oldest receipts fall out of the ledger and its attempt budget can
+        reset, which is #334 item 6's harm arriving through a second door. A
+        long thread must not halt the campaign, so it is reported, not refused.
         """
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -2194,7 +2197,17 @@ class NativeSubIssueTests(unittest.TestCase):
             self.assertTrue(
                 any(
                     "campaign sub-issue #8 carries more than 100 comments" in warning
+                    and "receipt ledger" in warning
+                    and "attempt budget" in warning
                     for warning in result["warnings"]
+                ),
+                result["warnings"],
+            )
+            # It must not send an operator looking for a lost steering comment:
+            # steering does not come from this walk.
+            self.assertTrue(
+                all(
+                    "steering read" not in warning for warning in result["warnings"]
                 ),
                 result["warnings"],
             )

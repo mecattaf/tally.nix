@@ -1777,8 +1777,10 @@ def forge_campaign_state(
         and discarding them reset every task's diagnosis and retry counters, so
         a task got one attempt more than its budget allows and re-posted a
         public comment it had already made. A receipt is counted once per
-        (kind, task, attempt); the master copy wins because it is the one that
-        was published first, and the duplicate is dropped rather than counted.
+        (kind, task, attempt). Task threads are ingested first, so where both
+        surfaces carry the same attempt the thread copy is the one counted --
+        it is where the current receipt lives and where a reader should be
+        pointed -- and the master copy is reported as the duplicate.
         """
         expected_escalation = escalation_marker(campaign, issue_number)
         for comment in comments:
@@ -2111,11 +2113,14 @@ MAX_SUBISSUE_WALK_PAGES = 2
 # the one thing it must never do, so a full page fails the pass instead.
 MAX_SUBISSUE_PULL_REQUESTS = 20
 # `last:` returns the newest comments, so a truncated window drops the oldest.
-# Unlike the reference page this is not a proof surface — it is the steering
-# read — and a task thread long enough to exhaust it is ordinary human
-# discussion, which must not halt a campaign. The truncation is therefore
-# reported rather than refused, so an operator whose steering comment scrolled
-# out of the window can see why it never reached the agent.
+# These comments are machine-authored-filtered below and feed the diagnosis and
+# retry ledger, not steering: the steering read is the CLI's own walk. So the
+# consequence of exhausting *this* window is that a task's oldest receipts fall
+# out of the ledger and its attempt counters reset -- exactly the harm #334
+# item 6 closed, arriving through a second door. Unlike the reference page it
+# is not a proof surface, and a thread long enough to exhaust it is ordinary
+# human discussion that must not halt a campaign, so it is reported rather than
+# refused.
 MAX_SUBISSUE_COMMENTS = 100
 
 
@@ -2203,9 +2208,10 @@ def subissue_walk(
             if comment_page.get("hasPreviousPage") is True:
                 warnings.append(
                     f"campaign sub-issue #{number} carries more than "
-                    f"{MAX_SUBISSUE_COMMENTS} comments; the steering read sees only the "
-                    f"newest {MAX_SUBISSUE_COMMENTS} and older comments on that thread "
-                    "cannot reach this task"
+                    f"{MAX_SUBISSUE_COMMENTS} comments; the receipt ledger reads only "
+                    f"the newest {MAX_SUBISSUE_COMMENTS}, so a diagnosis or retry receipt "
+                    "older than that no longer counts and this task's attempt budget "
+                    "may have reset"
                 )
             machine: list[dict[str, Any]] = []
             for comment in comment_nodes:
