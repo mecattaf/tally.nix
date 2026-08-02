@@ -16,11 +16,21 @@ control = Path(sys.argv[1])
 worktree = Path.cwd()
 launch = sys.argv[2:]
 expected_sandbox = "read-only" if role == "diagnosis" else "danger-full-access"
+# A submission that carries a working directory -- every lane node, through its
+# flow workspace -- renders the adapter's own "-C <cwd>" argument. The witnessed
+# argv and the process working directory are one derived value, so wherever the
+# argument appears it must name the directory this process is actually in.
+cwd_argv = launch[4:6] if launch[4:5] == ["-C"] else []
+if cwd_argv and Path(cwd_argv[1]).resolve() != worktree.resolve():
+    detail = f"adapter cwd argv {cwd_argv[1]!r} is not the process cwd {str(worktree)!r}\n"
+    (control / "policy-error.log").write_text(detail, encoding="utf-8")
+    raise SystemExit(detail)
 expected_prefix = [
     "-c",
     'approval_policy="never"',
     "--sandbox",
     expected_sandbox,
+    *cwd_argv,
     # The campaign's configured model, rendered through the adapter's own
     # authorized override. It is what the daemon records as this job's
     # canonical model and therefore what the merge node may name.
@@ -28,7 +38,11 @@ expected_prefix = [
     "fixture/policy-agent-1",
     "--",
 ]
-if launch[:7] != expected_prefix or len(launch) != 8 or "TALLY_BRIEF" not in launch[7]:
+if (
+    launch[: len(expected_prefix)] != expected_prefix
+    or len(launch) != len(expected_prefix) + 1
+    or "TALLY_BRIEF" not in launch[-1]
+):
     detail = f"adapter policy launch was not preserved: {launch!r}\n"
     (control / "policy-error.log").write_text(detail, encoding="utf-8")
     raise SystemExit(detail)

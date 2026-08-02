@@ -712,12 +712,7 @@ pub(super) fn execution_request(
         brief_hash: job.row.brief_hash.clone(),
         brief_path,
         brief_document: None,
-        cwd: job.row.cwd.clone().or_else(|| {
-            job.row
-                .workspace
-                .as_ref()
-                .map(|workspace| workspace.worktree_path.clone())
-        }),
+        cwd: job.row.effective_cwd().map(Path::to_path_buf),
         workspace: job.row.workspace.clone(),
         gate_manifest,
         git_ai,

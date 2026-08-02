@@ -23,7 +23,7 @@ use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::provenance::Orchestration;
 use crate::taskdb::{
-    gh_trigger_task_uuid, AdmissionOrigin, EnqueueSource, GhOrigin, RelatedTrigger,
+    effective_cwd, gh_trigger_task_uuid, AdmissionOrigin, EnqueueSource, GhOrigin, RelatedTrigger,
     WorkspaceMetadata,
 };
 use crate::witness::Derivation;
@@ -575,6 +575,17 @@ pub struct ResolvedEnqueue {
     pub related_trigger: Option<RelatedTrigger>,
     pub depth: u32,
     pub wait: bool,
+}
+
+impl ResolvedEnqueue {
+    /// See [`effective_cwd`]: the admission's working directory, workspace
+    /// fallback included. This deliberately does not feed
+    /// [`canonical_payload`] -- the payload hash covers the submitted `cwd`,
+    /// and the enqueue kernel's dedup arithmetic must not shift because a
+    /// render site learned to read the workspace.
+    pub fn effective_cwd(&self) -> Option<&Path> {
+        effective_cwd(self.cwd.as_deref(), self.workspace.as_ref())
+    }
 }
 
 // Kernel-side counterpart to tally_flow's NodeSpec canonical field contract.
