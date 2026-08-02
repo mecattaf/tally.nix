@@ -111,6 +111,15 @@ distinguishes `match`, `revision-missing`, `missing-note`, `note-content-mismatc
 prints the note body. A later repository mutation can make this external check red while the
 historical witness chain remains independently green.
 
+The verifier has a second mode. `--revision <oid> --note-sha256 <digest>`
+checks one repository-native note directly instead of a witnessed task lane,
+and it is how a campaign's post-merge binding is verified: that binding is on
+the commit the forge minted when it squashed, which the witness ledger never
+names, and its claim lives in the merge node's journaled receipt. The digest is
+required, so a pass is always a comparison. `--revision` and `--task` are
+mutually exclusive; in revision mode no ledger is read and the report omits
+`ledgerPath`, `ledger`, and `taskUuid`.
+
 The notes-ref target is checked by ancestry, not by equality. A notes ref is an ordinary commit
 history that grows whenever any commit in the repository is annotated — including a campaign merge
 node binding its squash commit — so equality would report a mismatch for every repository that

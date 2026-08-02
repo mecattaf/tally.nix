@@ -8,11 +8,13 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+from typing import Any
 from unittest import mock
 
 
@@ -3445,6 +3447,41 @@ class GitAiBindingTests(unittest.TestCase):
         "witnessSeq": 42,
     }
 
+    def spy_on_reconstruction(self) -> tuple[Any, list[str]]:
+        """Capture the object ID the binding actually copies from.
+
+        A reconstruction that collides with the integrated commit turns
+        `git notes copy` into a no-op onto itself, so a test that never looks
+        cannot tell whether the copy path ran at all.
+        """
+        seen: list[str] = []
+        original = DRIVER.reconstruct_squash
+
+        def spy(*arguments: Any, **keywords: Any) -> tuple[str | None, str | None]:
+            local, reason = original(*arguments, **keywords)
+            seen.append(local)
+            return local, reason
+
+        return mock.patch.object(DRIVER, "reconstruct_squash", spy), seen
+
+    def second_publisher(self, root: Path, remote: Path, revision: str, body: str) -> None:
+        """Another lane publishes its own note for the same commit."""
+        clone = root / f"other-{len(list(root.glob('other-*')))}"
+        command("git", "clone", "--quiet", str(remote), str(clone))
+        git(clone, "config", "user.name", "Other Lane")
+        git(clone, "config", "user.email", "other@invalid")
+        git(clone, "fetch", "--quiet", "origin", "refs/notes/ai:refs/notes/ai", check=False)
+        git(clone, "notes", "--ref", "refs/notes/ai", "add", "-f", "-m", body, revision)
+        git(clone, "push", "--quiet", "origin", "refs/notes/ai:refs/notes/ai")
+
+    @staticmethod
+    def remote_notes(remote: Path) -> list[str]:
+        listing = command(
+            "git", "-C", str(remote), "notes", "--ref", "refs/notes/ai", "list",
+            check=False,
+        ).stdout.strip()
+        return sorted(line.split()[1] for line in listing.splitlines() if line.strip())
+
     def test_a_forge_side_squash_is_bound_and_the_note_reaches_the_remote(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -3466,9 +3503,17 @@ class GitAiBindingTests(unittest.TestCase):
                     ).returncode,
                     0,
                 )
-                receipt = DRIVER.bind_authorship(
-                    data, config, integration, "squash", merge_commit, "advisory", message
-                )
+                patched, reconstructions = self.spy_on_reconstruction()
+                with patched:
+                    receipt = DRIVER.bind_authorship(
+                        data, config, integration, "squash", merge_commit, "advisory", message
+                    )
+            # The reconstruction is a distinct object, so the copy the whole
+            # binding turns on is genuinely exercised rather than a no-op onto
+            # itself.
+            self.assertEqual(len(reconstructions), 1)
+            reconstruction = reconstructions[0]
+            self.assertNotEqual(reconstruction, merge_commit)
             self.assertEqual(receipt["status"], "bound")
             self.assertEqual(receipt["binding"], "advisory")
             self.assertEqual(receipt["revision"], merge_commit)
@@ -3486,11 +3531,21 @@ class GitAiBindingTests(unittest.TestCase):
                 receipt["noteSha256"],
                 "sha256:" + hashlib.sha256(published.encode("utf-8")).hexdigest(),
             )
+            # The receipt names what the campaign remote resolves to, because
+            # that is what a reader fetching the notes ref will see.
             self.assertEqual(
-                receipt["notesRefTarget"], git(checkout, "rev-parse", "refs/notes/ai")
+                receipt["notesRefTarget"], git(remote, "rev-parse", "refs/notes/ai")
             )
-            self.assertEqual(
-                git(remote, "rev-parse", "refs/notes/ai"), receipt["notesRefTarget"]
+            # Exactly one entry is published: the integrated commit's. The
+            # throwaway reconstruction's note is removed rather than left to
+            # accumulate one dead entry per merged task on a public forge.
+            self.assertEqual(self.remote_notes(remote), [merge_commit])
+            self.assertNotEqual(
+                command(
+                    "git", "-C", str(checkout), "notes", "--ref", "refs/notes/ai",
+                    "show", reconstruction, check=False,
+                ).returncode,
+                0,
             )
             # The squash message on base carries the node's trailer, and the
             # trailer is exactly what the gh producer publishes.
@@ -3505,13 +3560,14 @@ class GitAiBindingTests(unittest.TestCase):
             self.assertNotIn(
                 "git-ai-bind-", git(checkout, "worktree", "list", "--porcelain")
             )
-            self.assertNotEqual(
-                command(
-                    "git", "-C", str(checkout), "rev-parse", "--verify",
-                    DRIVER.GIT_AI_REMOTE_REF, check=False,
-                ).returncode,
-                0,
-            )
+            for scratch in (DRIVER.GIT_AI_REMOTE_REF, DRIVER.GIT_AI_PUBLISH_REF):
+                self.assertNotEqual(
+                    command(
+                        "git", "-C", str(checkout), "rev-parse", "--verify", scratch,
+                        check=False,
+                    ).returncode,
+                    0,
+                )
 
     def test_an_absent_binary_is_advisory_and_never_blocks_but_fails_required(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3547,6 +3603,197 @@ class GitAiBindingTests(unittest.TestCase):
                 ).returncode,
                 0,
             )
+
+    def test_a_second_pass_over_an_already_merged_task_binds_again(self) -> None:
+        """A campaign pass is re-enterable, so the binding must be too.
+
+        A later reconcile can dispatch the merge node again for a task whose
+        pull request is already MERGED. That pass reconstructs the identical
+        commit, and git-ai does not re-annotate an object its service already
+        processed -- so the copy has no source, and the binding has to recognise
+        that the integrated commit already carries the note it would have
+        produced instead of reporting the note missing.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self.arm(root, provisioned=True)
+            checkout, remote, config, data, integration, head = self.campaign(root)
+            message = DRIVER.merge_commit_message(self.NARRATION, None)
+            with mock.patch.dict(os.environ, environment):
+                merge_commit = DRIVER.merge_local(
+                    data, config, integration, "squash", self.NARRATION
+                )
+                first = DRIVER.bind_authorship(
+                    data, config, integration, "squash", merge_commit, "advisory", message
+                )
+                # The shim mints a note only for a commit it has not seen, the
+                # way the real service does.
+                shim = Path(environment["PATH"].split(os.pathsep)[0]) / "git-ai"
+                shim.write_text(
+                    shim.read_text(encoding="utf-8").replace(
+                        'git("notes", "--ref", "refs/notes/ai", "add", "-f", "-m", body, head)',
+                        'raise SystemExit(0)',
+                    ),
+                    encoding="utf-8",
+                )
+                second = DRIVER.bind_authorship(
+                    data, config, integration, "squash", merge_commit, "advisory", message
+                )
+            self.assertEqual(first["status"], "bound")
+            self.assertEqual(second["status"], "bound")
+            self.assertTrue(second["published"])
+            self.assertEqual(second["noteSha256"], first["noteSha256"])
+            self.assertEqual(self.remote_notes(remote), [merge_commit])
+
+    def test_a_diverged_remote_note_is_refused_and_the_witnessed_note_survives(self) -> None:
+        """Two authorship records for one commit cannot be merged, only chosen.
+
+        A `cat_sort_uniq` fold is line-oriented; a git-ai `authorship/3.0.0`
+        note is a two-section record whose line order is semantic. Folding two
+        of them publishes a structurally invalid note under a schema version it
+        no longer satisfies -- and, because `git notes merge` writes into the
+        *local* ref, rewrites the daemon's witnessed code-result bindings in the
+        campaign checkout at the same time.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self.arm(root, provisioned=True)
+            checkout, remote, config, data, integration, head = self.campaign(root)
+            message = DRIVER.merge_commit_message(self.NARRATION, None)
+            # What the daemon's settlement barrier bound at code-result
+            # completion, in the shared checkout that the merge node also uses.
+            witnessed = "coder.txt\n  s_coder0000001::t_coder01 1-2\n---\n{}\n"
+            git(checkout, "notes", "--ref", "refs/notes/ai", "add", "-f", "-m", witnessed, head)
+            witnessed_digest = hashlib.sha256(
+                (
+                    command(
+                        "git", "-C", str(checkout), "notes", "--ref", "refs/notes/ai",
+                        "show", head,
+                    ).stdout
+                ).encode("utf-8")
+            ).hexdigest()
+            with mock.patch.dict(os.environ, environment):
+                merge_commit = DRIVER.merge_local(
+                    data, config, integration, "squash", self.NARRATION
+                )
+                # Another publisher of refs/notes/ai got there first with its
+                # own record for the same commit.
+                self.second_publisher(
+                    root,
+                    remote,
+                    merge_commit,
+                    "delivered.txt\n  s_otherlane0000::t_other01 1\n---\n{}\n",
+                )
+                receipt = DRIVER.bind_authorship(
+                    data, config, integration, "squash", merge_commit, "advisory", message
+                )
+            self.assertEqual(receipt["status"], "conflict")
+            self.assertFalse(receipt["published"])
+            self.assertIn("refusing to merge two authorship records", receipt["reason"])
+            self.assertIsNone(receipt["noteSha256"])
+            # The other lane's record is intact, not mashed together with this
+            # lane's.
+            published = command(
+                "git", "-C", str(remote), "notes", "--ref", "refs/notes/ai",
+                "show", merge_commit,
+            ).stdout
+            self.assertEqual(
+                published, "delivered.txt\n  s_otherlane0000::t_other01 1\n---\n{}\n"
+            )
+            # And the witnessed binding the daemon recorded is byte-identical,
+            # so `tally witness verify-authorship` still passes for that task.
+            after = command(
+                "git", "-C", str(checkout), "notes", "--ref", "refs/notes/ai", "show", head,
+            ).stdout
+            self.assertEqual(hashlib.sha256(after.encode("utf-8")).hexdigest(), witnessed_digest)
+
+    def test_only_the_integrated_commit_s_note_reaches_the_public_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self.arm(root, provisioned=True)
+            checkout, remote, config, data, integration, head = self.campaign(root)
+            message = DRIVER.merge_commit_message(self.NARRATION, None)
+            # A note the shared campaign checkout holds for work that never
+            # left the host: an abandoned attempt, a diagnosis commit, any
+            # commit the campaign did not choose to publish.
+            git(checkout, "switch", "--quiet", "--detach", "origin/main")
+            (checkout / "private.txt").write_text("private\n", encoding="utf-8")
+            git(checkout, "add", "private.txt")
+            git(checkout, "commit", "--quiet", "-m", "wip: never published")
+            private = git(checkout, "rev-parse", "HEAD")
+            git(
+                checkout, "notes", "--ref", "refs/notes/ai", "add", "-f", "-m",
+                "private.txt\n  s_localonly0001::t_local01 1\n---\n{}\n", private,
+            )
+            git(checkout, "switch", "--quiet", "main")
+            with mock.patch.dict(os.environ, environment):
+                merge_commit = DRIVER.merge_local(
+                    data, config, integration, "squash", self.NARRATION
+                )
+                receipt = DRIVER.bind_authorship(
+                    data, config, integration, "squash", merge_commit, "advisory", message
+                )
+            self.assertEqual(receipt["status"], "bound")
+            self.assertEqual(self.remote_notes(remote), [merge_commit])
+            self.assertNotIn(private, self.remote_notes(remote))
+            # The local note is untouched: scoping the publication is not
+            # deleting the checkout's own bookkeeping.
+            self.assertEqual(
+                command(
+                    "git", "-C", str(checkout), "notes", "--ref", "refs/notes/ai",
+                    "show", private, check=False,
+                ).returncode,
+                0,
+            )
+
+    def test_advisory_cannot_raise_even_when_the_remote_vanishes(self) -> None:
+        """The merge has already landed; an advisory subsystem may not fail it.
+
+        Reporting a merged task as failed is worse than reporting an unbound
+        one, so `advisory` turns every outcome -- including an unexpected
+        one -- into a typed receipt.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self.arm(root, provisioned=True)
+            checkout, remote, config, data, integration, head = self.campaign(root)
+            message = DRIVER.merge_commit_message(self.NARRATION, None)
+            with mock.patch.dict(os.environ, environment):
+                merge_commit = DRIVER.merge_local(
+                    data, config, integration, "squash", self.NARRATION
+                )
+                shutil.rmtree(remote)
+                receipt = DRIVER.bind_authorship(
+                    data, config, integration, "squash", merge_commit, "advisory", message
+                )
+                with self.assertRaisesRegex(DRIVER.DriverError, "under required mode"):
+                    DRIVER.bind_authorship(
+                        data, config, integration, "squash", merge_commit, "required", message
+                    )
+            self.assertEqual(receipt["status"], "error")
+            self.assertFalse(receipt["published"])
+            self.assertIn("cannot refresh origin", receipt["reason"])
+            # The reason is quotable in a public failure report, so it names
+            # the remote and the exit status, never the transport's own stderr.
+            self.assertNotIn(str(remote), receipt["reason"])
+
+    def test_an_unusable_campaign_workspace_is_a_receipt_not_a_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            environment = self.arm(root, provisioned=True)
+            checkout, remote, config, data, integration, head = self.campaign(root)
+            message = DRIVER.merge_commit_message(self.NARRATION, None)
+            with mock.patch.dict(os.environ, environment):
+                merge_commit = DRIVER.merge_local(
+                    data, config, integration, "squash", self.NARRATION
+                )
+                blocked = {**data, "workspaceRoot": str(checkout / "root.go" / "nested")}
+                receipt = DRIVER.bind_authorship(
+                    blocked, config, integration, "squash", merge_commit, "advisory", message
+                )
+            self.assertEqual(receipt["status"], "error")
+            self.assertFalse(receipt["published"])
+            self.assertIn("campaign workspace", receipt["reason"])
 
     def test_a_reconstruction_that_is_not_the_integrated_tree_copies_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3621,17 +3868,34 @@ class GitAiBindingTests(unittest.TestCase):
                 DRIVER.assisted_by_record(broken, "assistedBy")
         # The provenance line is the node's authority. A narrator proposing one
         # is proposing a claim nothing witnessed, in a commit that lands on the
-        # default branch.
+        # default branch. Git matches trailer keys case-insensitively, so the
+        # refusal has to as well: `assisted-by:` is the same trailer to every
+        # git-native reader, and with the shipped `agentModel = null` default
+        # the node appends nothing after it, leaving the forged line as the
+        # message's entire trailer block.
+        for spelling in ("Assisted-by", "assisted-by", "ASSISTED-BY", "AsSiStEd-By"):
+            forged = f"{spelling}: someone:something (tally:x witness:1)"
+            narration, reason = DRIVER.validated_narration(
+                {
+                    "type": "feat",
+                    "scope": "fixture",
+                    "subject": "deliver the task",
+                    "body": forged,
+                }
+            )
+            self.assertIsNone(narration, spelling)
+            self.assertEqual(reason, "proposal contains an Assisted-by trailer", spelling)
+        # A subject that merely mentions the words is prose, not a trailer.
         narration, reason = DRIVER.validated_narration(
             {
-                "type": "feat",
+                "type": "docs",
                 "scope": "fixture",
-                "subject": "deliver the task",
-                "body": "Assisted-by: someone:something (tally:x witness:1)",
+                "subject": "explain the assisted-by pointer",
+                "body": "The trailer is a pointer, never the proof.",
             }
         )
-        self.assertIsNone(narration)
-        self.assertEqual(reason, "proposal contains an Assisted-by trailer")
+        self.assertIsNotNone(narration)
+        self.assertIsNone(reason)
         # The template path keeps its byte-for-byte message when no trailer is
         # available, so an unarmed campaign commits exactly what it used to.
         self.assertEqual(
@@ -3647,6 +3911,13 @@ class GitAiBindingTests(unittest.TestCase):
             DRIVER.DriverError, "must be off, advisory, or required"
         ):
             DRIVER.git_ai_binding("on", "gitAiBinding")
+        # The settlement barrier's budget is the campaign's, not a constant the
+        # module cannot see; absent is the shipped default.
+        self.assertEqual(DRIVER.git_ai_await_sec(None, "gitAiAwaitSec"), 60)
+        self.assertEqual(DRIVER.git_ai_await_sec(12, "gitAiAwaitSec"), 12)
+        for broken in (0, -1, "60"):
+            with self.assertRaises(DRIVER.DriverError):
+                DRIVER.git_ai_await_sec(broken, "gitAiAwaitSec")
 
 
 if __name__ == "__main__":

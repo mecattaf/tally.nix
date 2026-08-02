@@ -972,9 +972,13 @@ the head being merged. When the estate never named a model — `agentModel` is
 null and the adapter declares no model override — there is no canonical model
 to name and the node writes **no trailer** rather than a plausible one. A
 narrator that proposes an `Assisted-by:` line is refused for the same reason it
-is refused a closing keyword: that authority belongs to the node. A `merge`
-integration gets no trailer, because git writes its own message there and the
-working commits it collects keep their own notes.
+is refused a closing keyword: that authority belongs to the node. The refusal
+matches the way git reads the line, not the way the node spells it — git
+matches trailer keys case-insensitively, so `assisted-by:` is the same trailer
+and is refused too. That matters most under the shipped default: with no model
+named the node appends nothing, so a forged line would be the message's entire
+trailer block. A `merge` integration gets no trailer, because git writes its
+own message there and the working commits it collects keep their own notes.
 
 The **note on `refs/notes/ai`** is the proof, and reaching it takes deliberate
 work. `gitAiBinding` selects the posture: `off` (the shipped state), `advisory`,
@@ -988,24 +992,68 @@ So under `advisory` and `required` the merge node, after the merge is proven,
 mints the same integration a second time: a detached worktree of the campaign
 checkout — the one place that still holds the task branch's checkpoints and
 shares its `refs/notes/ai` — squashes the same head onto the same base,
-commits, and waits on `git-ai await`. It then proves the reconstruction is the
-integrated commit's content, not merely something like it: the merged commit's
-first parent must be the gated base, and the reconstructed tree must equal the
-merged tree. Only then is the note copied onto the integrated commit's object
-ID, and `refs/notes/ai` pushed to the campaign remote. The push is
-fast-forward-only; a remote carrying notes this checkout has not seen is folded
-in with git's own `cat_sort_uniq` strategy and retried once. It is never
-forced, because forcing would delete another lane's bindings to publish this
-one.
+commits under its own identity, and waits on `git-ai await` for
+`gitAiAwaitSec`. It then proves the reconstruction is the integrated commit's
+content, not merely something like it: the merged commit's first parent must be
+the gated base, and the reconstructed tree must equal the merged tree. Only
+then is the note copied onto the integrated commit's object ID. The
+reconstruction's own entry is then removed — a notes entry is keyed by commit
+id as a path in the notes tree, so it outlives the commit it annotates, and
+leaving it would accumulate one dead note per merged task.
+
+Publication is scoped to that one entry. The campaign checkout's
+`refs/notes/ai` accumulates a note for every commit the shared checkout has
+ever made, including abandoned attempts and diagnosis commits, and none of that
+was ever chosen for a public forge — so the node assembles a scratch ref from
+the remote's own tip plus the integrated commit's note and pushes *that*. It is
+never forced, and two notes for one commit are never merged: a remote already
+carrying a **different** record for this revision is reported as a typed
+`conflict` and nothing is written or pushed. `cat_sort_uniq` — git's own
+line-oriented note-merge strategy — cannot be used here, because a git-ai
+`authorship/3.0.0` note is a two-section record whose line order is semantic;
+folding two of them yields a structurally invalid note under a schema version
+it no longer satisfies, and because `git notes merge` writes into the *local*
+ref it would rewrite the daemon's witnessed code-result bindings in the
+campaign checkout at the same time.
+
+Scoping what tally publishes is not the same as controlling what the remote
+carries: git-ai publishes `refs/notes/ai` itself on an ordinary `git push`,
+measured in `doc/src/flows/git-ai-squash-fidelity.md`. The merge node's
+contribution is exactly one entry; the rest is the estate's own tool.
+
+The barrier runs inside the merge node, so `gitAiAwaitSec` and
+`driverRuntimeMaxSec` are not independent: evaluation refuses a deadline below
+twice the budget whenever the binding is armed. A campaign whose node deadline
+does not comfortably exceed the barrier is killed mid-wait on every task and
+reports a node timeout instead of a binding receipt.
 
 Every outcome is journaled with the merge node as an `authorship` receipt
 naming the binding posture, a status (`bound`, `unavailable`, `missing-note`,
-`mismatch`, or `error`), the bound revision, the notes-ref target, the SHA-256
-of the exact note bytes, whether the push succeeded, and a typed reason. Under
-`advisory` that receipt is the whole consequence: a missing binary, an
-unsettled note, or a tree that does not match is a loud warning and the
-campaign proceeds. Under `required` any status other than a published `bound`
-fails the merge node.
+`mismatch`, `conflict`, or `error`), the bound revision, the campaign remote's
+`refs/notes/ai` target after publication, the SHA-256 of the exact note bytes
+**read back from the remote**, whether the push succeeded, and a typed reason.
+Under `advisory` that receipt is the whole consequence, and that is enforced
+rather than promised: the merge has already landed irreversibly by the time the
+binding runs, so an advisory subsystem that raised would report a merged task as
+failed. Every outcome — including an unexpected one — becomes a typed receipt.
+Under `required` any status other than a published `bound` fails the merge node.
+
+That receipt is also the verification handle. The witness ledger records the
+daemon's settlement-barrier binding on the *coder's* result revision; the merge
+node binds a different object, the commit the forge minted, and writes nothing
+to the ledger. The two mechanisms attest different commits and never meet, so
+`verify-authorship` takes a revision mode:
+
+```console
+$ tally witness verify-authorship \
+    --repository /path/to/checkout \
+    --revision <authorship.revision> \
+    --note-sha256 <authorship.noteSha256>
+```
+
+It re-derives the digest from the repository and compares it against the claim
+the receipt recorded. The digest is required, so a pass is always a comparison
+and never a vacuous "a note exists".
 
 Arm `advisory` first, and not as caution theatre: an unprovisioned host and a
 squash that lost its attribution produce byte-identical evidence — no note — so

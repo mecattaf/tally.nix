@@ -63,15 +63,94 @@ fn authorship_verifier_cli_selects_an_exact_witness_lane() {
             command: WitnessCommand::VerifyAuthorship {
                 ledger: Some(ledger),
                 repository,
-                task,
+                task: Some(task),
                 attempt: Some(2),
                 lease_epoch: Some(7),
+                revision: None,
+                note_sha256: None,
+                note_ref,
                 format: WitnessVerifyFormat::Json,
             }
         }) if ledger == Path::new("/tmp/witness.jsonl")
             && repository == Path::new("/tmp/repository")
             && task == "00000000-0000-4000-8000-000000000053"
+            && note_ref == "refs/notes/ai"
     ));
+}
+
+#[test]
+fn authorship_verifier_cli_reaches_a_bare_revision_binding() {
+    // The campaign merge node's binding is on a commit the witness ledger
+    // never names, so the verifier has to be pointable at the receipt's own
+    // revision and digest instead of at a task lane.
+    let options = Opts::try_parse_from([
+        "tally",
+        "witness",
+        "verify-authorship",
+        "--repository",
+        "/tmp/repository",
+        "--revision",
+        "b5c5135bca2752b872deb1d8d74e30330762cf0e",
+        "--note-sha256",
+        "sha256:a00cd0bc7edd780fffdf0263d822a9c1a049e44cdb0a6c8b8751d09db27cae58",
+    ])
+    .unwrap();
+    assert!(matches!(
+        options.command,
+        Some(Command::Witness {
+            command: WitnessCommand::VerifyAuthorship {
+                ledger: None,
+                repository,
+                task: None,
+                attempt: None,
+                lease_epoch: None,
+                revision: Some(revision),
+                note_sha256: Some(digest),
+                note_ref,
+                format: WitnessVerifyFormat::Text,
+            }
+        }) if repository == Path::new("/tmp/repository")
+            && revision == "b5c5135bca2752b872deb1d8d74e30330762cf0e"
+            && digest.starts_with("sha256:")
+            && note_ref == "refs/notes/ai"
+    ));
+
+    // The two modes are mutually exclusive, and a revision without a digest
+    // would "pass" without comparing anything.
+    for arguments in [
+        vec![
+            "tally",
+            "witness",
+            "verify-authorship",
+            "--repository",
+            "/tmp/repository",
+            "--task",
+            "00000000-0000-4000-8000-000000000053",
+            "--revision",
+            "b5c5135bca2752b872deb1d8d74e30330762cf0e",
+        ],
+        vec![
+            "tally",
+            "witness",
+            "verify-authorship",
+            "--repository",
+            "/tmp/repository",
+            "--revision",
+            "b5c5135bca2752b872deb1d8d74e30330762cf0e",
+        ],
+        vec![
+            "tally",
+            "witness",
+            "verify-authorship",
+            "--repository",
+            "/tmp/repository",
+        ],
+    ] {
+        assert!(
+            Opts::try_parse_from(arguments.clone()).is_err(),
+            "{arguments:?}"
+        );
+    }
 }
 
 #[test]
