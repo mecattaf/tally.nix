@@ -170,6 +170,29 @@ authorized.
   unchanged. With duplicates silent at the decision level and receipts
   upserting, `postReceipt` deliberately stays one boolean: the proposed
   accepted-versus-duplicate option split is unnecessary and does not ship.
+- Read a spec-build lane's path union, and the merge commits it rejects, from
+  the base branch commit the lane actually sits on — the merge base of the lane
+  head with the current base — rather than from the current tip or the stale
+  prepared base. Every campaign merge is `--no-ff`, so a base branch that has
+  integrated anything is full of merge commits and a lane that rebases onto it
+  inherits them; resolving from the prepared base rejected that lane for
+  "merging the base into your lane" when it had done the opposite. Resolving
+  from the current tip held only until the base advanced once more behind the
+  lane. The merge base holds in both cases and does not move as the base
+  advances, so a gate receipt and the publication that re-checks it count the
+  same paths.
+- Take the current base branch tip from a fetch in the lane rather than from
+  `refs/remotes/<remote>/<baseBranch>`. A lane worktree is a linked worktree of
+  the campaign checkout, so that ref lives in the shared common Git directory
+  and the agent can write it; pointing it at the lane head collapsed the
+  ownership union to nothing, made every declared conflict domain vacuously
+  satisfied, and published an ownership receipt claiming `ownedPaths: []` for a
+  branch carrying unowned work. Integration still refused to merge it, but the
+  branch and its pull request had already reached the public forge.
+- Resolve the `forbidPaths` gate node and publication's re-check of its receipt
+  against that same base. A lane that took the documented rebase remediation
+  passed ownership and then went red at the gate on a mainline path a sibling
+  had landed — the same spurious red the ownership fix removes, one node later.
 - Reject a spec-build task lane whose history contains a merge commit, naming
   the real cause: "rebase instead of merging the base into your lane". The
   ownership union walks lane history with `git log -m`, which splits a merge

@@ -816,19 +816,38 @@ the prepared base. Ownership validation then fails before the more expensive
 project gates if any commit touched an undeclared path. Publication independently
 refuses dirty, empty, non-descendant, or newly unowned work.
 
-The path union walks lane history with `git log -m`, which splits a merge
-commit and attributes both of its sides to the lane. A lane that merged the
-base branch instead of rebasing onto it would therefore claim every path its
-siblings landed. Such a lane is rejected by its real cause — "rebase instead of
-merging the base into your lane" — rather than reported as an ownership
-violation on paths no task commit touched; `--first-parent` would hide the
-false positive and reopen the transient-path hole with it. A lane that did
-rebase onto the advanced base, the documented remediation for a red constraint,
-is resolved against that current base rather than the stale prepared one, so it
-owns only its own commits. The receipt keeps naming the base the lane was
-prepared and gated on, and the union narrows only onto a current base the lane
-demonstrably already contains, so nothing this resolution does widens what a
-lane may touch.
+Ownership validation and every `forbidPaths` gate read the same range: from the
+base branch commit this lane sits on to its head. That start is the merge base
+of the lane head with the current base branch. It equals the prepared base for
+a lane that never moved, and the rebased-onto revision for a lane that took the
+documented remediation for a red constraint, so a rebased lane owns only its
+own commits instead of every mainline path landed since it was prepared. Unlike
+the current tip, it does not move when the base advances again behind the lane,
+so a gate receipt and the publication that re-checks it count the same paths.
+The receipt keeps naming the base the lane was prepared and gated on, and the
+start can only move forward from that base, so nothing this resolution does
+widens what a lane may touch.
+
+The current base branch tip is read by fetching it in the lane and resolving
+`FETCH_HEAD`, never by reading `refs/remotes/<remote>/<baseBranch>`. A lane
+worktree is a linked worktree of the campaign checkout, so that ref lives in
+the shared common Git directory and anything running in the lane can write it —
+including the agent whose ownership is about to be validated. Pointing it at
+the lane head would otherwise collapse the range to nothing and satisfy every
+declared domain vacuously, in the one check that exists because the agent is
+not trusted to stay inside its lane.
+
+The union walks that range with `git log -m`, which splits a merge commit and
+attributes both of its sides to the lane. A lane that merged the base branch
+instead of rebasing onto it would therefore claim every path its siblings
+landed. Such a lane is rejected by its real cause — "rebase instead of merging
+the base into your lane" — rather than reported as an ownership violation on
+paths no task commit touched; `--first-parent` would hide the false positive
+and reopen the transient-path hole with it. Only merges the lane itself
+authored are read: every campaign merge is `--no-ff`, so a base branch that has
+integrated anything is full of merge commits, and a lane that rebases onto it
+inherits them. Reading from the stale prepared base would reject that lane for
+doing exactly what the steering text tells it to do.
 
 Publication answers to the campaign's configured gates, not to the receipts it
 is handed: the witnessed `forbidPaths` sets are cross-checked by gate id

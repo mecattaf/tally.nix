@@ -1190,6 +1190,9 @@ async function runGate(task, gate, workspace, prefix) {
     "constraint",
     {
       gate,
+      // The gate resolves the lane's own history against the current base
+      // branch, so it needs the repository the campaign is configured with.
+      repositoryConfig: effective.repositoryConfig,
       workspace: {
         taskId: task.id,
         baseRev: workspace.baseRev,
