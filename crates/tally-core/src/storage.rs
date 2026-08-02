@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use chrono::{SecondsFormat, Utc};
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -415,6 +415,24 @@ impl StorageMonitor {
             state_dir_bytes: state_usage.allocated,
         };
 
+        // The walk captures availability when it starts, not when it lands. A cheap
+        // free-space probe that ran while the walk was in flight therefore holds the
+        // newer view, and reinstalling the walk's figures would move
+        // `freeSpaceCheckedAt` backwards and re-evaluate the free-space thresholds
+        // against pre-probe numbers — a spurious transition pair, with its durable
+        // warning record and campaign receipt. Keep the probe's figures in that case;
+        // tree sizes, growth, and `sampledAt` still come from the walk.
+        let fresher_probe = self
+            .snapshot
+            .data_dir
+            .filesystem_available_bytes
+            .zip(self.snapshot.state_dir.filesystem_available_bytes)
+            .filter(|_| is_after(&self.snapshot.free_space_checked_at, &sampled_at));
+        let (data_available, state_available, free_space_checked_at) = match fresher_probe {
+            Some((data, state)) => (data, state, self.snapshot.free_space_checked_at.clone()),
+            None => (data_available, state_available, sampled_at.clone()),
+        };
+
         let previous = self.state.as_ref().and_then(|state| {
             if completion_count > state.current.completion_count {
                 Some(state.current.clone())
@@ -445,8 +463,8 @@ impl StorageMonitor {
 
         self.snapshot = StorageMetrics {
             schema_version: STORAGE_METRICS_SCHEMA_VERSION,
-            sampled_at: sampled_at.clone(),
-            free_space_checked_at: sampled_at,
+            sampled_at,
+            free_space_checked_at,
             completion_count,
             intake,
             data_dir: store_metrics(
@@ -709,6 +727,19 @@ fn budget_decision(
     BudgetDecision {
         level: BudgetLevel::Ok,
         pressures: Vec::new(),
+    }
+}
+
+/// True when `left` is strictly later than `right`. An unparsable stamp is never
+/// treated as newer, so a malformed timestamp degrades to the pre-guard behavior
+/// rather than freezing the free-space view.
+fn is_after(left: &str, right: &str) -> bool {
+    match (
+        DateTime::parse_from_rfc3339(left),
+        DateTime::parse_from_rfc3339(right),
+    ) {
+        (Ok(left), Ok(right)) => left > right,
+        _ => false,
     }
 }
 
@@ -1537,5 +1568,279 @@ mod tests {
         let vanished = root.path().join("vanished");
         assert_eq!(directory_usage(&vanished).unwrap().allocated, 0);
         assert!(filesystem_available(&vanished).unwrap() > 0);
+    }
+
+    /// Comfortably above `free_recovery(100)`, so a probe at this level clears both
+    /// the warning and the hard recovery band from any previous level.
+    const ROOMY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    /// Below `minimum_free_bytes` in `free_space_policy`, so it is a hard floor breach.
+    const TIGHT_BYTES: u64 = 10;
+
+    /// Size budgets that can never fire, so only the free-space axis moves.
+    fn free_space_policy() -> StorageConfig {
+        let mut policy = config(u64::MAX - 1, u64::MAX);
+        for budget in [&mut policy.data_dir, &mut policy.state_dir] {
+            budget.warning_free_bytes = 100;
+            budget.minimum_free_bytes = 50;
+        }
+        policy
+    }
+
+    fn storage_dirs(root: &TempDir) -> (PathBuf, PathBuf) {
+        let data = root.path().join("data");
+        let state = root.path().join("state");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        (data, state)
+    }
+
+    fn measurement(
+        sampled_at: &str,
+        completion_count: u64,
+        allocated: u64,
+        available: u64,
+    ) -> StorageMeasurement {
+        let usage = || DirectoryUsage {
+            allocated,
+            apparent: allocated,
+            files: 1,
+        };
+        StorageMeasurement {
+            sampled_at: sampled_at.to_owned(),
+            completion_count,
+            data_usage: usage(),
+            state_usage: usage(),
+            data_available: available,
+            state_available: available,
+        }
+    }
+
+    fn shift(stamp: &str, millis: i64) -> String {
+        let parsed = DateTime::parse_from_rfc3339(stamp).unwrap();
+        (parsed + chrono::Duration::milliseconds(millis))
+            .to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
+    fn now_stamp() -> String {
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    }
+
+    /// The stamp format is millisecond-resolution; step past it so successive
+    /// real-clock observations are strictly ordered.
+    fn tick() {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    fn warning_lines(data: &Path) -> usize {
+        std::fs::read_to_string(data.join(STORAGE_WARNING_FILE))
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    #[test]
+    fn stale_walk_does_not_overwrite_a_fresher_free_space_probe() {
+        let root = TempDir::new().unwrap();
+        let (data, state) = storage_dirs(&root);
+        let mut monitor = StorageMonitor::open(&data, &state, free_space_policy(), 0);
+        monitor.take_warnings();
+
+        monitor.set_free_space_override(ROOMY_BYTES, ROOMY_BYTES);
+        monitor.refresh_free_space().unwrap();
+        let probed_at = monitor.snapshot().free_space_checked_at.clone();
+        assert_eq!(monitor.snapshot().data_dir.level, BudgetLevel::Ok);
+        monitor.take_warnings();
+        let durable_before = warning_lines(&data);
+
+        // A walk that started 30s before the probe lands after it, still carrying the
+        // availability it read at walk start.
+        let stale_at = shift(&probed_at, -30_000);
+        monitor
+            .apply_measurement_result(Ok(measurement(&stale_at, 1, 4_096, TIGHT_BYTES)))
+            .unwrap();
+
+        let snapshot = monitor.snapshot();
+        assert_eq!(
+            snapshot.data_dir.filesystem_available_bytes,
+            Some(ROOMY_BYTES)
+        );
+        assert_eq!(
+            snapshot.state_dir.filesystem_available_bytes,
+            Some(ROOMY_BYTES)
+        );
+        assert_eq!(snapshot.free_space_checked_at, probed_at);
+        assert_eq!(snapshot.data_dir.level, BudgetLevel::Ok);
+        assert_eq!(snapshot.state_dir.level, BudgetLevel::Ok);
+        assert!(snapshot.intake.accepting);
+        assert!(snapshot.active_warnings.is_empty());
+
+        // Tree-size fields, growth, and sampledAt still come from the walk.
+        assert_eq!(snapshot.sampled_at, stale_at);
+        assert_eq!(snapshot.data_dir.size_bytes, 4_096);
+        assert_eq!(snapshot.state_dir.size_bytes, 4_096);
+        assert_eq!(snapshot.data_dir.file_count, 1);
+        assert_eq!(
+            snapshot
+                .growth_per_completion
+                .as_ref()
+                .unwrap()
+                .completion_delta,
+            1
+        );
+
+        assert!(monitor.take_warnings().is_empty());
+        assert_eq!(warning_lines(&data), durable_before);
+    }
+
+    #[test]
+    fn walk_newer_than_the_last_probe_still_installs_its_own_free_space_view() {
+        let root = TempDir::new().unwrap();
+        let (data, state) = storage_dirs(&root);
+        let mut monitor = StorageMonitor::open(&data, &state, free_space_policy(), 0);
+        monitor.take_warnings();
+
+        monitor.set_free_space_override(ROOMY_BYTES, ROOMY_BYTES);
+        monitor.refresh_free_space().unwrap();
+        let probed_at = monitor.snapshot().free_space_checked_at.clone();
+        monitor.take_warnings();
+
+        // This walk started after the probe, so its figures are the newer view.
+        let fresh_at = shift(&probed_at, 30_000);
+        monitor
+            .apply_measurement_result(Ok(measurement(&fresh_at, 1, 4_096, TIGHT_BYTES)))
+            .unwrap();
+
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.sampled_at, fresh_at);
+        assert_eq!(snapshot.free_space_checked_at, fresh_at);
+        assert_eq!(
+            snapshot.data_dir.filesystem_available_bytes,
+            Some(TIGHT_BYTES)
+        );
+        assert_eq!(
+            snapshot.state_dir.filesystem_available_bytes,
+            Some(TIGHT_BYTES)
+        );
+        assert_eq!(snapshot.data_dir.level, BudgetLevel::Hard);
+        assert_eq!(snapshot.state_dir.level, BudgetLevel::Hard);
+        assert!(!snapshot.intake.accepting);
+
+        let warnings = monitor.take_warnings();
+        assert_eq!(warnings.len(), 2);
+        assert!(warnings
+            .iter()
+            .all(|warning| warning.level == BudgetLevel::Hard));
+        assert_eq!(warning_lines(&data), 2);
+    }
+
+    #[test]
+    fn stale_walk_after_recovery_emits_no_spurious_transition_pair() {
+        let root = TempDir::new().unwrap();
+        let (data, state) = storage_dirs(&root);
+        let mut monitor = StorageMonitor::open(&data, &state, free_space_policy(), 0);
+        monitor.take_warnings();
+
+        // The filesystem fills: both stores breach the hard floor.
+        monitor.set_free_space_override(TIGHT_BYTES, TIGHT_BYTES);
+        monitor.refresh_free_space().unwrap();
+        assert_eq!(monitor.snapshot().data_dir.level, BudgetLevel::Hard);
+        assert!(!monitor.snapshot().intake.accepting);
+        assert_eq!(monitor.take_warnings().len(), 2);
+
+        // An operator frees space; the next probe witnesses full recovery.
+        tick();
+        monitor.set_free_space_override(ROOMY_BYTES, ROOMY_BYTES);
+        monitor.refresh_free_space().unwrap();
+        let recovered_at = monitor.snapshot().free_space_checked_at.clone();
+        assert_eq!(monitor.snapshot().data_dir.level, BudgetLevel::Ok);
+        assert!(monitor.snapshot().intake.accepting);
+        assert_eq!(monitor.take_warnings().len(), 2);
+        let durable_after_recovery = warning_lines(&data);
+        assert_eq!(durable_after_recovery, 4);
+
+        // The tree walk that was already running when space was freed now lands,
+        // carrying pre-recovery availability. Without the staleness guard this is an
+        // Ok -> Hard -> (next probe) Ok pair: two durable warning records, two journal
+        // lines, and two campaign receipts, for nothing that happened.
+        let stale_at = shift(&recovered_at, -500);
+        monitor
+            .apply_measurement_result(Ok(measurement(&stale_at, 1, 4_096, TIGHT_BYTES)))
+            .unwrap();
+
+        assert_eq!(
+            monitor.take_warnings(),
+            Vec::new(),
+            "a stale walk must emit no transition"
+        );
+        assert_eq!(
+            warning_lines(&data),
+            durable_after_recovery,
+            "a stale walk must append no durable warning record"
+        );
+        let snapshot = monitor.snapshot();
+        assert_eq!(snapshot.data_dir.level, BudgetLevel::Ok);
+        assert_eq!(snapshot.state_dir.level, BudgetLevel::Ok);
+        assert!(snapshot.intake.accepting);
+        assert!(snapshot.active_warnings.is_empty());
+        assert_eq!(snapshot.free_space_checked_at, recovered_at);
+    }
+
+    #[test]
+    fn free_space_checked_at_is_monotonic_across_interleaved_probes_and_walks() {
+        let root = TempDir::new().unwrap();
+        let (data, state) = storage_dirs(&root);
+        let mut monitor = StorageMonitor::open(&data, &state, free_space_policy(), 0);
+        monitor.take_warnings();
+        let mut high_water = monitor.snapshot().free_space_checked_at.clone();
+        let observe = |monitor: &StorageMonitor, high_water: &mut String, step: &str| {
+            let observed = monitor.snapshot().free_space_checked_at.clone();
+            assert!(
+                !is_after(high_water, &observed),
+                "freeSpaceCheckedAt moved backwards at {step}: {high_water} -> {observed}"
+            );
+            *high_water = observed;
+        };
+
+        // A walk starts here; the probe below finishes before it does.
+        tick();
+        let early_walk_at = now_stamp();
+
+        tick();
+        monitor.set_free_space_override(ROOMY_BYTES, ROOMY_BYTES);
+        monitor.refresh_free_space().unwrap();
+        observe(&monitor, &mut high_water, "first probe");
+        let first_probe_at = high_water.clone();
+
+        // Out of order: the older walk is applied after the newer probe.
+        monitor
+            .apply_measurement_result(Ok(measurement(&early_walk_at, 1, 4_096, TIGHT_BYTES)))
+            .unwrap();
+        observe(&monitor, &mut high_water, "stale walk");
+        assert_eq!(high_water, first_probe_at);
+
+        // A walk that genuinely started after the probe advances the stamp.
+        tick();
+        let late_walk_at = now_stamp();
+        monitor
+            .apply_measurement_result(Ok(measurement(&late_walk_at, 2, 4_096, ROOMY_BYTES)))
+            .unwrap();
+        observe(&monitor, &mut high_water, "fresh walk");
+        assert_eq!(high_water, late_walk_at);
+
+        tick();
+        monitor.set_free_space_override(ROOMY_BYTES, ROOMY_BYTES);
+        monitor.refresh_free_space().unwrap();
+        observe(&monitor, &mut high_water, "second probe");
+        let second_probe_at = high_water.clone();
+        assert!(is_after(&second_probe_at, &late_walk_at));
+
+        // The oldest walk in the test, replayed last.
+        monitor
+            .apply_measurement_result(Ok(measurement(&early_walk_at, 3, 4_096, TIGHT_BYTES)))
+            .unwrap();
+        observe(&monitor, &mut high_water, "replayed stale walk");
+        assert_eq!(high_water, second_probe_at);
+        assert!(monitor.snapshot().intake.accepting);
+        assert!(monitor.take_warnings().is_empty());
     }
 }

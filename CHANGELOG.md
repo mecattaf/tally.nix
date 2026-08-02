@@ -295,6 +295,19 @@ authorized.
 
 ### Changed
 
+- **Upgrade consideration — the free-space floor moved from 256 MiB to 8 GiB.**
+  The `storage.dataDir`/`storage.stateDir` defaults are now
+  `minimumFreeBytes = 8589934592` (8 GiB, the hard admission floor) and
+  `warningFreeBytes = 17179869184` (16 GiB, the durable warning threshold),
+  replacing the former 256 MiB floor, which covered only a few pathological
+  replica rewrites. On an existing deployment whose host has less than 8 GiB
+  free, the first daemon start after the upgrade refuses all new intake
+  immediately — legibly, with an explicit refusal reason naming the observed and
+  minimum bytes, and with already-admitted work left to finish — but with no
+  other warning. Check free space before upgrading, or set `minimumFreeBytes`
+  and `warningFreeBytes` explicitly; the recovery band is at least 1 GiB above
+  whatever floor you choose, so intake stays closed until availability clears
+  that band. Sizing guidance is in Operating → Retention and growth.
 - Capture locks moved out of the job-writable `unit-exit/` directory and the
   daemon no longer blocks on one. New locks live at
   `<stateDir>/capture-lock/<uuid>.capture.lock`, a sibling that neither `strict`
@@ -367,6 +380,22 @@ authorized.
   affected; those must now name the daemon data directory.
 
 ### Fixed
+
+- A slow storage tree walk can no longer overwrite a fresher free-space probe
+  (#317, closing #292). Two writers update the monitor's view of filesystem
+  availability: the cheap per-intake/periodic probe, and the periodic tree walk,
+  which reads availability when it *starts* and installs it when it *lands*. A
+  walk that finished after a probe therefore reinstalled pre-probe availability
+  and moved `freeSpaceCheckedAt` backwards; if availability crossed the hard
+  recovery band during that walk, the monitor emitted an Ok→Hard transition pair
+  for nothing that happened — a fsynced warning record, a journal line, and a
+  GitHub campaign receipt each way. The walk now keeps the probe's availability
+  figures, the per-store level derived from them, and `freeSpaceCheckedAt`
+  whenever the snapshot's probe is newer than the walk's sample stamp; tree
+  sizes, growth per completion, and `sampledAt` still come from the walk.
+  `freeSpaceCheckedAt` is now monotonic across interleaved probe and walk
+  applications. Admission math is unaffected either way — every admission
+  re-probes before deciding — so this changes receipts, not who gets in.
 
 - A command whose reader hangs up now ends quietly instead of panicking.
   `tally query run <id> | head -1` printed through stock `println!`, so the
