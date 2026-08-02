@@ -186,9 +186,12 @@ never published, so `postReceipt` stays one switch rather than splitting by
 decision. Receipts and evidence comments are sticky: tally stores the node id
 of the comment it created under the producer state directory and edits that
 comment in place afterwards, falling back to the marker scan only for a thread
-whose comment predates the stored id or whose state was lost. Steering,
-escalation, and closing-summary comments are deliberately outside this
-primitive; they stay fresh comments so the operator is notified.
+whose comment predates the stored id or whose state was lost. That fallback
+publishes into the comment it finds rather than merely adopting it, and a
+publication the forge refuses fails the mutation instead of reporting success,
+so a receipt on the thread is never silently stale. Steering, escalation, and
+closing-summary comments are deliberately outside this primitive; they stay
+fresh comments so the operator is notified.
 
 `postEvidence` posts only passing and reused evidence, preserving its original
 operator-facing meaning. Failure evidence is a separate public side effect and
