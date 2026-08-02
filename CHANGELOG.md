@@ -8,6 +8,35 @@ authorized.
 
 ### Added
 
+- Added `services.tally.campaigns.<name>.mergeMethod`, an enum of `merge` and
+  `squash` that defaults to `squash`. A squashed campaign leaves one commit per
+  task on the base branch instead of a merge commit carrying a template
+  message. Under `squash` the GitHub merge node runs
+  `gh pr merge --squash --match-head-commit <head> --subject <subject>
+  --body <body>` and proves completion from the pull request's merge commit
+  rather than from the task head, which a squash never makes an ancestor of the
+  base branch; the `merge` path is unchanged. On a `forge = "local"` campaign
+  the merge node commits a single squash on base and publishes a receipt ref in
+  the campaign's hidden state namespace, which reconciliation reads alongside
+  the existing branch-head ancestry proof.
+- Added the steward's narrate slot at the publication boundary.
+  `services.tally.campaigns.<name>.steward` binds an adapter from the open
+  adapter map as a catalog role and `stewardArgv` is appended to that adapter's
+  argv; the publish node runs it, hands it a JSON narration request on stdin,
+  and reads its proposal back from a `TALLY_FINAL_MESSAGE=` line. A
+  deterministic commitlint-shaped validator accepts or refuses the proposed
+  conventional-commit text, re-requests once on refusal, and falls back to the
+  brief-derived template on a second failure. The narration governs the pull
+  request title and prose and the squash commit message; the node executes git
+  and the model never does. The seam adds no flow node, so the campaign node
+  budget is unchanged.
+- Added `test/git-ai-squash-fidelity.sh` and its recorded findings under
+  `doc/src/flows/git-ai-squash-fidelity.md`: the empirical check of what git-ai
+  authorship survives a squash. Attribution re-mints **per-line** on a squash
+  executed locally by a trace2-armed git, and does not appear at all on a
+  squash performed by the forge and merely fetched. The spike skips when the
+  externally provisioned `git-ai` binary is absent and is not part of any gate.
+
 - Added `launch.commitCapableSandboxPolicies` to the adapter surface: the
   subset of an adapter's sandbox policies under which its agent can create a
   commit. Naming any other policy for a campaign implementation node is now

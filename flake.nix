@@ -1191,6 +1191,17 @@
                   interval = "4min";
                   timeout = "2min";
                 };
+                adapters.narrator = {
+                  argv = [
+                    "/bin/sh"
+                    "/srv/campaign-fixtures/narrate"
+                  ];
+                  scrape.finalMessage = {
+                    stream = "stdout";
+                    mode = "regex";
+                    pattern = "^TALLY_FINAL_MESSAGE=(.*)$";
+                  };
+                };
                 campaigns.fixture = {
                   enable = true;
                   repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
@@ -1235,6 +1246,15 @@
                   agentDiagnosisSandboxPolicy = null;
                   agentRuntimeMaxSec = 120;
                   driverRuntimeMaxSec = 30;
+                  mergeMethod = "merge";
+                  # The narrate seam is config-only: an adapter the estate adds
+                  # to the open map, named as this campaign's catalog role. The
+                  # rendered narration argv is the adapter's own argv with this
+                  # campaign's stewardArgv appended, so swapping narrators is an
+                  # adapter change and never a driver change.
+                  steward = "narrator";
+                  stewardArgv = [ "--narrate" ];
+                  stewardRuntimeMaxSec = 45;
                   pool.name = "fixture-campaign";
                 };
                 campaigns.defaulted = {
@@ -3590,6 +3610,16 @@
                   ($fixtureArgs.gates[1] | has("preflightArgv") | not) and
                   ($fixtureArgs.gates[1] | has("argv") | not) and
                   $fixtureArgs.gates[1].runtimeMaxSec == 11 and
+                  $fixtureArgs.mergeMethod == "merge" and
+                  $fixtureArgs.steward.adapter == "narrator" and
+                  $fixtureArgs.steward.argv == [
+                    "/bin/sh", "/srv/campaign-fixtures/narrate", "--narrate"
+                  ] and
+                  $fixtureArgs.steward.runtimeMaxSec == 45 and
+                  .adapters.narrator.scrape.finalMessage.pattern
+                    == "^TALLY_FINAL_MESSAGE=(.*)$" and
+                  $defaultedArgs.mergeMethod == "squash" and
+                  $defaultedArgs.steward == null and
                   $defaultedArgs.agent.adapter == "codex" and
                   $defaultedArgs.agent.approvalPolicy == "never" and
                   $defaultedArgs.agent.sandboxPolicy == "danger-full-access" and
