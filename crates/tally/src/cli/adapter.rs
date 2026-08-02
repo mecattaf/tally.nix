@@ -9,7 +9,6 @@ const CAPTURE_PROJECTION_POLL: Duration = Duration::from_millis(100);
 const DEFAULT_SMOKE_PROMPT: &str = "Reply with the single word ok.";
 pub(super) const COMMIT_PROBE_FILE: &str = "tally-commit-probe.txt";
 pub(super) const COMMIT_PROBE_MESSAGE: &str = "tally commit probe";
-const COMMIT_PROBE_DIRECTORY: &str = "adapter-smoke";
 const COMMIT_PROBE_BRANCH: &str = "adapter-smoke-probe";
 const COMMIT_PROBE_REPO: &str = "tally/adapter-smoke";
 const COMMIT_PROBE_PROMPT: &str = concat!(
@@ -86,6 +85,13 @@ async fn run_adapter_smoke(
         }
     }
     let pool = resolve_smoke_pool(&args.name, args.pool.as_deref(), &config.pools)?;
+    // Connect before seeding. Everything up to here — an unknown adapter, an
+    // undeclared policy, an unresolvable pool, an unreachable daemon — has
+    // nothing to say about the adapter under test, and a probe repository
+    // created before those checks is a git tree nobody asked for and nobody
+    // reaps. Seeding after the connect means the whole class of "could not even
+    // reach the daemon" failures leaves nothing behind.
+    let client = connect_rpc(socket, config_path).await?;
     let probe = if args.assert_commit {
         let parent = match args.probe_root {
             Some(root) => root,
@@ -94,6 +100,18 @@ async fn run_adapter_smoke(
         Some(CommitProbe::seed(&parent)?)
     } else {
         None
+    };
+    // Past this point a failure has left a repository on disk. Retaining it is
+    // deliberate — a failed probe is the evidence — but the same retention
+    // applies to failures that say nothing about the adapter, and an operator
+    // cannot collect evidence they were never told the location of. Every error
+    // from here down names the path.
+    let retained = |error: anyhow::Error| match &probe {
+        Some(probe) => error.context(format!(
+            "commit probe repository retained at {}",
+            probe.root.display()
+        )),
+        None => error,
     };
     let cwd = match &probe {
         Some(probe) => probe.root.clone(),
@@ -167,10 +185,13 @@ async fn run_adapter_smoke(
         wait: true,
     };
 
-    let client = connect_rpc(socket, config_path).await?;
     let admitted = client
-        .call("queue.enqueue", Some(serde_json::to_value(payload)?))
-        .await?;
+        .call(
+            "queue.enqueue",
+            Some(serde_json::to_value(payload).map_err(|error| retained(error.into()))?),
+        )
+        .await
+        .map_err(|error| retained(error.into()))?;
     let terminal = if admitted.get("verdict").and_then(Value::as_str).is_some() {
         admitted
     } else {
@@ -178,8 +199,14 @@ async fn run_adapter_smoke(
             .get("task_uuid")
             .and_then(Value::as_str)
             .filter(|task_uuid| !task_uuid.is_empty())
-            .ok_or_else(|| invalid("queue.enqueue returned no task_uuid for adapter smoke"))?;
-        await_job_with_rearm(client, socket, task_uuid, rpc_timeout).await?
+            .ok_or_else(|| {
+                retained(invalid(
+                    "queue.enqueue returned no task_uuid for adapter smoke",
+                ))
+            })?;
+        await_job_with_rearm(client, socket, task_uuid, rpc_timeout)
+            .await
+            .map_err(|error| retained(error.into()))?
     };
 
     let exit_code = waited_exit_code(&terminal);
@@ -194,23 +221,26 @@ async fn run_adapter_smoke(
             &BTreeMap::new(),
             "not-checked",
             probe.as_ref().map(CommitProbe::not_checked),
-        )?;
-        print_captured_stderr(&args.name, &terminal)?;
+        )
+        .map_err(&retained)?;
+        print_captured_stderr(&args.name, &terminal).map_err(&retained)?;
         let verdict = terminal
             .get("verdict")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        return Err(exit_failure(
+        return Err(retained(exit_failure(
             exit_code,
             format!(
                 "adapter smoke {:?} finished with verdict {verdict}",
                 args.name
             ),
-        ));
+        )));
     }
 
     let (captures, missing) =
-        await_declared_captures(socket, config_path, &terminal, &required_captures).await?;
+        await_declared_captures(socket, config_path, &terminal, &required_captures)
+            .await
+            .map_err(&retained)?;
     let capture_status = if required_captures.is_empty() {
         "not-declared"
     } else if missing.is_empty() {
@@ -218,7 +248,11 @@ async fn run_adapter_smoke(
     } else {
         "missing"
     };
-    let outcome = probe.as_ref().map(CommitProbe::evaluate).transpose()?;
+    let outcome = probe
+        .as_ref()
+        .map(CommitProbe::evaluate)
+        .transpose()
+        .map_err(&retained)?;
     print_smoke_result(
         &args.name,
         &label,
@@ -229,7 +263,9 @@ async fn run_adapter_smoke(
         &captures,
         capture_status,
         outcome.clone(),
-    )?;
+    )
+    .map_err(&retained)?;
+    let mut discarded = false;
     if let (Some(probe), Some(outcome)) = (&probe, &outcome) {
         let status = outcome["status"].as_str().unwrap_or("unknown");
         if status != "verified" {
@@ -244,11 +280,12 @@ async fn run_adapter_smoke(
             ));
         }
         probe.discard();
+        discarded = true;
     }
     if missing.is_empty() {
         Ok(())
     } else {
-        Err(exit_failure(
+        let error = exit_failure(
             1,
             format!(
                 "adapter smoke {:?} passed execution but did not project declared capture(s) {} within {} seconds",
@@ -256,7 +293,10 @@ async fn run_adapter_smoke(
                 missing.join(", "),
                 CAPTURE_PROJECTION_TIMEOUT.as_secs()
             ),
-        ))
+        );
+        // A verified probe has already been removed, so there is no path left to
+        // name; an unverified one returned above with its own message.
+        Err(if discarded { error } else { retained(error) })
     }
 }
 
@@ -284,7 +324,7 @@ impl CommitProbe {
     /// hardened adapter's transient unit gets a private `/tmp` it cannot chdir
     /// into, and an agent sandbox may treat `$TMPDIR` as writable by default.
     fn root_under(state_dir: &Path) -> PathBuf {
-        state_dir.join(COMMIT_PROBE_DIRECTORY)
+        state_dir.join(tally_core::retention::ADAPTER_SMOKE_DIRECTORY)
     }
 
     fn default_root() -> Result<PathBuf> {
@@ -301,7 +341,8 @@ impl CommitProbe {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("cannot create commit probe root {}", parent.display()))?;
         let root = parent.join(format!(
-            "probe-{}-{}",
+            "{}{}-{}",
+            tally_core::retention::ADAPTER_SMOKE_PROBE_PREFIX,
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

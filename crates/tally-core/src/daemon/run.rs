@@ -564,7 +564,7 @@ impl Daemon {
         // Ordinary waiters become runnable immediately after the only terminal ack
         // dependency: the witness fsync above. An automatic bounded requeue holds
         // the same stable waiter until the replacement attempt is terminal. Lease
-        // release, scrape, attestations, replica commit, and journald are post-ack.
+        // release, scrape, attestations, and journald are post-ack.
         tokio::task::yield_now().await;
         let stable = job.stable_key();
         let terminal_value = result.value();

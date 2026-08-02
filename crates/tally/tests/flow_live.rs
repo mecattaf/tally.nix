@@ -42,7 +42,30 @@ mod shell_program;
 #[path = "support/timeout_scale.rs"]
 mod timeout_scale;
 
-use timeout_scale::scaled;
+use timeout_scale::{effective_scale, scaled, TIMEOUT_SCALE_ENV};
+
+/// The wall-clock budget every polling wait in this suite gets. It is routed
+/// through [`scaled`] like every `tokio::time::timeout` budget here, so widening
+/// the gate on a loaded host widens the tight waits and not only the loose ones.
+const POLL_BUDGET: Duration = Duration::from_secs(10);
+const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// A scaled deadline plus the text that names the knob when it expires.
+///
+/// A fixed iteration count is not a budget: it drifts with however long each
+/// probe's RPC took, so the same loop is a 10-second wait on an idle host and an
+/// unbounded one under load. A deadline is honest about what it is waiting for,
+/// and reports the multiplier that produced it.
+fn poll_deadline() -> (tokio::time::Instant, String) {
+    let budget = scaled(POLL_BUDGET);
+    (
+        tokio::time::Instant::now() + budget,
+        format!(
+            "within {budget:.1?} ({TIMEOUT_SCALE_ENV}={})",
+            effective_scale()
+        ),
+    )
+}
 
 const CONCURRENT_RUN: &str = "00000000-0000-4000-8000-000000000501";
 const KILLED_RUN: &str = "00000000-0000-4000-8000-000000000502";
@@ -859,24 +882,35 @@ async fn flow_items(client: &RpcClient, flow_run_id: &str) -> Vec<Value> {
 }
 
 async fn wait_for_flow_items(client: &RpcClient, flow_run_id: &str, expected: usize) -> Vec<Value> {
-    for _ in 0..400 {
+    let (deadline, budget) = poll_deadline();
+    loop {
         let items = flow_items(client, flow_run_id).await;
         if items.len() == expected {
             return items;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "flow run {flow_run_id} did not reach {expected} durable rows {budget}; \
+             observed {}",
+            items.len()
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
-    panic!("flow run {flow_run_id} did not reach {expected} durable rows");
 }
 
 async fn wait_for_path(path: &Path) {
-    for _ in 0..400 {
+    let (deadline, budget) = poll_deadline();
+    loop {
         if path.exists() {
             return;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "path did not appear {budget}: {}",
+            path.display()
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
-    panic!("path did not appear: {}", path.display());
 }
 
 async fn wait_for_flow_state(
@@ -885,16 +919,20 @@ async fn wait_for_flow_state(
     expected_items: usize,
     expected_state: &str,
 ) -> Vec<Value> {
-    for _ in 0..400 {
+    let (deadline, budget) = poll_deadline();
+    loop {
         let items = flow_items(client, flow_run_id).await;
         if items.len() == expected_items
             && items.iter().all(|item| item["liveState"] == expected_state)
         {
             return items;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "flow run {flow_run_id} did not reach {expected_state} state {budget}"
+        );
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
-    panic!("flow run {flow_run_id} did not reach {expected_state} state");
 }
 
 async fn await_items(client: &RpcClient, items: &[Value]) {
@@ -1224,7 +1262,8 @@ async fn fs5_live_acceptance_matrix() {
             assert!(durable_children[0].row.gh_origin.is_none());
 
             let completed_dir = paths.state_dir.join("producers/gh-completed");
-            for _ in 0..400 {
+            let (completed_deadline, _) = poll_deadline();
+            loop {
                 let completed = fs::read_dir(&completed_dir)
                     .ok()
                     .into_iter()
@@ -1232,10 +1271,10 @@ async fn fs5_live_acceptance_matrix() {
                     .filter_map(Result::ok)
                     .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
                     .count();
-                if completed == 1 {
+                if completed == 1 || tokio::time::Instant::now() >= completed_deadline {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
             let gh_requests = fs::read_to_string(&gh_requests)
                 .unwrap()
@@ -3707,14 +3746,16 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             attached_second_command
                 .stdout(Stdio::from(fs::File::create(&attached_stdout).unwrap()));
             let attached_second = attached_second_command.spawn().unwrap();
-            for _ in 0..400 {
+            let (attached_deadline, _) = poll_deadline();
+            loop {
                 if fs::read_to_string(&attached_stdout)
                     .unwrap_or_default()
                     .contains("\"disposition\":\"attached\"")
+                    || tokio::time::Instant::now() >= attached_deadline
                 {
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(25)).await;
+                tokio::time::sleep(POLL_INTERVAL).await;
             }
             let attached_log = fs::read_to_string(&attached_stdout).unwrap();
             assert!(

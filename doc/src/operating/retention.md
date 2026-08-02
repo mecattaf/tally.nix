@@ -106,12 +106,20 @@ else announces it, so it arrives as a surprise on a constrained host that was ru
 under the 256 MiB floor.
 
 Check available free space on the `dataDir` and `stateDir` filesystems before upgrading. If it
-is below the new floor, either free space or set the two options explicitly:
+is below the new floor, either free space or set the options explicitly on **both** stores.
+Intake closes when *either* store is Hard, so on a single-filesystem host — the usual case —
+lowering only `dataDir` leaves intake refused through `stateDir`:
 
 ```nix
-services.tally.storage.dataDir = {
-  warningFreeBytes = 2147483648;   # 2 GiB
-  minimumFreeBytes = 1073741824;   # 1 GiB
+services.tally.storage = {
+  dataDir = {
+    warningFreeBytes = 2147483648;   # 2 GiB
+    minimumFreeBytes = 1073741824;   # 1 GiB
+  };
+  stateDir = {
+    warningFreeBytes = 2147483648;   # 2 GiB
+    minimumFreeBytes = 1073741824;   # 1 GiB
+  };
 };
 ```
 
@@ -150,8 +158,9 @@ The GC command:
    from the corresponding live set;
 7. prunes coordinator-side per-attempt capture archives, dead
    `<uuid>.capture.lock` files in both `capture-lock/` and the legacy
-   `unit-exit/` location, and consumed/rejected producer-event files according
-   to their independent policies; and
+   `unit-exit/` location, retained `adapter-smoke/probe-*` commit-probe
+   repositories, and consumed/rejected producer-event files according to their
+   independent policies; and
 8. with `--collect`, runs `nix store gc`.
 
 A brief file whose bytes do not verify against the hash in its own name is
@@ -258,6 +267,7 @@ The current storage story is intentionally uneven:
 | Producer markers (`producers/gh-triggers`, `gh-completed`, `gh-comments`, `gh-storage-warnings`) | One `<key>.json` per dispatch making a forge mutation idempotent; expires under `producerMarkerHorizon` (180 days by default) | Automatic through `tally gc`. Collecting a marker costs at most a re-publication that the thread's own marker scan already collapses. A per-marker `<key>.lock` is collected only together with its marker and only when no writer holds it; the directory-wide `mutations.lock` is never collected. |
 | Inert `taskdata/` and `taskdata.pre-rebuild-*` directories | Left in place by the TaskChampion delete; no pruner reads or writes them | Nothing depends on them. Delete them by hand to reclaim the space. |
 | Unit-exit state | Durable recovery input; no general pruner. One exception: legacy `<uuid>.capture.lock` files expire under `captureArchiveHorizon` | Do not prune exit records or `<uuid>.capture.json` generations by age. `tally gc` removes only a `.capture.lock` that is both older than the horizon and unheld, proven by a non-blocking `flock` it takes before unlinking. Nothing creates a lock here any more, so this population only drains. |
+| Retained commit probes (`adapter-smoke/probe-*`) | One throwaway git repository per failed `tally adapter smoke --assert-commit`; expires under `captureArchiveHorizon` | A verified probe deletes itself; a failed one is the evidence and is kept. `tally gc` removes only `probe-*` directories older than the horizon and reports `adapterProbesExamined`/`adapterProbesPruned`. Anything else under `adapter-smoke/` is left for an operator. |
 | Capture locks (`capture-lock/`) | One `<uuid>.capture.lock` per dispatched execution; expires under `captureArchiveHorizon` | Same two-check rule as above. The daemon no longer mints a lock for a task whose capture generation is already gone, so a swept lock stays swept instead of being re-created at the next startup reconcile. |
 | In-memory barrier tracker | At most 64 unclaimed drain snapshots; connected waits scale with active calls, and disconnected waiters are evicted on the next tracker operation | Automatic and restart-local. |
 | In-memory parent guardrails | Terminal parents retire after their outstanding-child count reaches zero | Automatic; rebuilt from active durable rows. |

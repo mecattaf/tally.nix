@@ -1359,49 +1359,12 @@ impl DurableEnqueueEvent {
     }
 }
 
-/// The row dispositions tally itself can express.
-///
-/// Until the TaskChampion projection was deleted this was `taskchampion::Status`,
-/// which additionally carried `Recurring` and an open `Unknown(String)` — states
-/// tally never produced, because recurrence is tombstoned and every row tally
-/// wrote came from one of the three arms below. The query wire enum
-/// (`crate::query::RowStatus`) keeps its wider shape; this one does not.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum TaskStatus {
-    Pending,
-    Completed,
-    Deleted,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TaskRow {
-    pub uuid: Uuid,
-    pub description: String,
-    pub status: TaskStatus,
-    pub priority: String,
-    pub uda: BTreeMap<String, String>,
-}
-
-impl TaskRow {
-    pub fn value(&self, name: &str) -> Option<&str> {
-        self.uda.get(name).map(String::as_str)
-    }
-
-    pub fn argv(&self) -> Result<Vec<String>, TaskDbError> {
-        let json = self
-            .value("argv_json")
-            .ok_or_else(|| TaskDbError::InvalidRow("argv_json is absent".to_owned()))?;
-        serde_json::from_str(json).map_err(TaskDbError::Json)
-    }
-
-    pub fn evidence(&self) -> Result<Vec<String>, TaskDbError> {
-        let json = self
-            .value("evidence_json")
-            .ok_or_else(|| TaskDbError::InvalidRow("evidence_json is absent".to_owned()))?;
-        serde_json::from_str(json).map_err(TaskDbError::Json)
-    }
-}
+// `TaskStatus`, `TaskRow`, and `impl From<&TaskRow> for RowFact` stood here until
+// the TaskChampion projection was deleted. Nothing in the workspace ever
+// constructed them afterwards — query rows are built exclusively from `RowSeed`
+// through `daemon/rpc/query.rs` and `daemon/startup.rs` — and `pub` in a library
+// crate means `dead_code` never fired on them. An unexercised row type next to
+// the durable event types reads as a live contract; it was not one.
 
 #[derive(Debug, Error)]
 pub enum TaskDbError {
@@ -1416,8 +1379,6 @@ pub enum TaskDbError {
     },
     #[error("invalid durable row seed: {0}")]
     InvalidSeed(String),
-    #[error("invalid durable row: {0}")]
-    InvalidRow(String),
     #[error("event {path} has unsupported schema version {version}")]
     EventVersion { path: PathBuf, version: u32 },
     #[error("invalid durable event at {path}: {reason}")]

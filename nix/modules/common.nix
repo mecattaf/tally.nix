@@ -22,6 +22,8 @@ let
 
   priorityRanks = import ../lib/priority-ranks.nix;
 
+  ghLogin = import ../lib/gh-login.nix;
+
   specBuildFlow = ../../examples/flows/spec-build.js;
   specBuildDriver = import ../lib/spec-build-driver.nix { inherit pkgs; };
   briefSentinel = "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.";
@@ -1295,11 +1297,12 @@ let
             message = "gh producer ${name} requestReview=true requires a non-empty reviewers list";
           }
           {
+            # The same grammar the daemon enforces at config load, length bound
+            # included. A login this accepted but the daemon rejected deployed
+            # green and then killed the daemon it was deployed for.
             assertion =
               builtins.length config.reviewers == builtins.length (unique config.reviewers)
-              && lib.all (
-                reviewer: builtins.match "[A-Za-z0-9]([A-Za-z0-9]|-[A-Za-z0-9])*" reviewer != null
-              ) config.reviewers;
+              && lib.all ghLogin.isValid config.reviewers;
             message = "gh producer ${name} reviewers must be unique GitHub logins";
           }
           {

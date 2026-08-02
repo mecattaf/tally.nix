@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::completion::{GateSummaryStatus, SemanticCompletion};
 use crate::journal::{JournalEntry, TallyEvent};
 use crate::provenance::{Orchestration, TaskRef};
-use crate::taskdb::{GhOrigin, RelatedTrigger, TaskRow, TaskStatus, WorkspaceMetadata};
+use crate::taskdb::{GhOrigin, RelatedTrigger, WorkspaceMetadata};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
 pub const QUERY_SCHEMA_VERSION: u32 = 1;
@@ -85,51 +85,6 @@ pub struct RowFact {
 
 const fn default_query_attempt() -> u32 {
     1
-}
-
-impl From<&TaskRow> for RowFact {
-    fn from(row: &TaskRow) -> Self {
-        Self {
-            task_uuid: row.uuid.to_string(),
-            description: row.description.clone(),
-            argv: row.argv().unwrap_or_default(),
-            brief_hash: row.value("brief_hash").map(ToOwned::to_owned),
-            orchestration: row
-                .value("orchestration_json")
-                .and_then(|value| serde_json::from_str(value).ok()),
-            status: match row.status {
-                TaskStatus::Pending => RowStatus::Pending,
-                TaskStatus::Completed => RowStatus::Completed,
-                TaskStatus::Deleted => RowStatus::Deleted,
-            },
-            priority: row.priority.clone(),
-            pools: row.value("pool").map(|value| {
-                crate::poolset::decoded(value).unwrap_or_else(|_| vec![value.to_owned()])
-            }),
-            executor: row.value("executor").map(ToOwned::to_owned),
-            source: row.value("source").map(ToOwned::to_owned),
-            session_ref: row.value("session_ref").map(ToOwned::to_owned),
-            final_message: row.value("final_message").map(ToOwned::to_owned),
-            cwd: row.value("cwd").map(ToOwned::to_owned),
-            workspace: row
-                .value("workspace_json")
-                .and_then(|workspace| serde_json::from_str(workspace).ok()),
-            resumed_from: row.value("resumed_from").map(ToOwned::to_owned),
-            attempt: row
-                .value("attempt")
-                .and_then(|attempt| attempt.parse().ok())
-                .unwrap_or(1),
-            model: row.value("model").map(ToOwned::to_owned),
-            gh_origin: row
-                .value("gh_origin_json")
-                .and_then(|origin| serde_json::from_str::<GhOrigin>(origin).ok())
-                .as_ref()
-                .and_then(GhOriginProjection::from_origin),
-            related_trigger: row
-                .value("related_trigger_json")
-                .and_then(|related| serde_json::from_str(related).ok()),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

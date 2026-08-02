@@ -203,6 +203,16 @@ run_changelog_stage() {
 run_ladder() {
   cd "$worktree"
 
+  local -a timeout_scale_env
+  local timeout_scale_note
+  if [[ -n "$gate_timeout_scale" ]]; then
+    timeout_scale_env=("TALLY_TEST_TIMEOUT_SCALE=$gate_timeout_scale")
+    timeout_scale_note="$gate_timeout_scale (TALLY_GATE_TIMEOUT_SCALE; wait budgets deliberately widened)"
+  else
+    timeout_scale_env=(-u TALLY_TEST_TIMEOUT_SCALE)
+    timeout_scale_note='1 (unscaled; any ambient TALLY_TEST_TIMEOUT_SCALE is scrubbed)'
+  fi
+
   printf 'tally fleet gate transcript\n'
   printf 'repository: %s\n' "$gate_repo"
   printf 'commit: %s\n' "$gate_sha"
@@ -210,9 +220,11 @@ run_ladder() {
   printf 'started-at: %s\n' "$(date --utc '+%Y-%m-%dT%H:%M:%SZ')"
   printf 'worktree-head: %s\n' "$(git rev-parse HEAD)"
   printf 'changelog-subject: %s (pinned at script start)\n' "$gate_changelog_subject"
+  printf 'timeout-scale: %s\n' "$timeout_scale_note"
 
   run_step "cargo fmt" nix develop --command cargo fmt --all --check
-  run_step "cargo test" nix develop --command env -u TALLY_TEST_REMOTE_HOST cargo test --workspace
+  run_step "cargo test" nix develop --command env -u TALLY_TEST_REMOTE_HOST \
+    "${timeout_scale_env[@]}" cargo test --workspace
   run_step "cargo clippy" \
     nix develop --command cargo clippy --workspace --all-targets --all-features -- -D warnings
   run_cargo_deny_stage
@@ -244,6 +256,18 @@ gate_remote="${TALLY_GATE_REMOTE_URL:-$default_remote}"
 state_dir="${TALLY_GATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/tally-fleet-gate}"
 cache_dir="${TALLY_GATE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/tally-fleet-gate}"
 pristine_clone="$cache_dir/pristine.git"
+
+# Widening the suite's wait budgets is a deliberate act of this gate, never an
+# inherited one. `nix develop` is not `--ignore-environment`, so an ambient
+# TALLY_TEST_TIMEOUT_SCALE left over from a reproduce run would otherwise reach
+# the ladder's own `cargo test` and make a 10x-budget run byte-indistinguishable
+# from an honest one in the transcript. The ladder scrubs that variable and
+# honours this one instead, and records the decision in the transcript header.
+gate_timeout_scale="${TALLY_GATE_TIMEOUT_SCALE:-}"
+if [[ -n "$gate_timeout_scale" ]]; then
+  [[ "$gate_timeout_scale" =~ ^([1-9][0-9]{0,2}|1000)(\.[0-9]+)?$ ]] \
+    || fail "TALLY_GATE_TIMEOUT_SCALE must be a multiplier between 1 and 1000: $gate_timeout_scale"
+fi
 
 require_command date
 require_command find

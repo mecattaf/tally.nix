@@ -346,6 +346,98 @@ async fn commit_probe_asserts_a_publishable_commit_under_the_named_policies() {
         .await;
 }
 
+/// The probe repository is seeded only after the enqueue RPC has a connection,
+/// so a failure that says nothing about the adapter — here, a daemon that is not
+/// listening — leaves no git repository behind. Nothing but `tally gc` knows the
+/// `adapter-smoke/probe-*` prefix, so an unreaped one is an operator's problem
+/// for as long as they never notice it.
+#[tokio::test(flavor = "current_thread")]
+async fn an_unreachable_daemon_seeds_no_commit_probe_repository() {
+    let temp = tempfile::tempdir().unwrap();
+    let config = smoke_config(temp.path());
+    let config_path = temp.path().join("config.json");
+    std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+    let unreachable = run_tally(
+        &config_path,
+        &temp.path().join("run/nothing-is-listening.sock"),
+        &[
+            "adapter",
+            "smoke",
+            "committing",
+            "--pool",
+            "stock",
+            "--approval-policy",
+            "never",
+            "--sandbox",
+            "full",
+            "--assert-commit",
+        ],
+    )
+    .await;
+    let stderr = String::from_utf8_lossy(&unreachable.stderr).into_owned();
+    assert_eq!(unreachable.status.code(), Some(3), "{stderr}");
+    let probe_root = temp.path().join("xdg-state/tally/adapter-smoke");
+    assert!(
+        !probe_root.exists(),
+        "an unreachable daemon left {} behind",
+        probe_root.display()
+    );
+}
+
+/// Retaining a probe repository on failure is deliberate, but retention that
+/// never names the path is not evidence an operator can collect. Every failure
+/// after the seed names it, including the ones that have nothing to do with the
+/// commit assertion.
+#[tokio::test(flavor = "current_thread")]
+async fn a_failure_unrelated_to_the_commit_assertion_still_names_the_retained_repository() {
+    LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = daemon_paths(temp.path());
+            let config = smoke_config(temp.path());
+            let config_path = temp.path().join("config.json");
+            std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let daemon = start_daemon(&paths, config).await;
+
+            // This adapter fails before it produces any output, so the run never
+            // reaches the commit evaluation at all.
+            let failed = run_tally(
+                &config_path,
+                &paths.socket,
+                &[
+                    "adapter",
+                    "smoke",
+                    "pre-output-failure",
+                    "--pool",
+                    "stock",
+                    "--assert-commit",
+                ],
+            )
+            .await;
+            let stderr = String::from_utf8_lossy(&failed.stderr).into_owned();
+            assert_eq!(failed.status.code(), Some(1), "{stderr}");
+            assert!(stderr.contains("finished with verdict failed"), "{stderr}");
+            assert!(
+                stderr.contains("commit probe repository retained at"),
+                "{stderr}"
+            );
+
+            let reported = parse_stdout(&failed);
+            let retained = PathBuf::from(reported["commitProbe"]["repository"].as_str().unwrap());
+            assert_eq!(reported["commitProbe"]["status"], "not-checked");
+            assert!(
+                stderr.contains(retained.to_str().unwrap()),
+                "the retained path in the message is the one on disk: {stderr}"
+            );
+            assert!(retained.join(".git").is_dir(), "{}", retained.display());
+            std::fs::remove_dir_all(&retained).unwrap();
+
+            daemon.stop().await;
+        })
+        .await;
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn smoke_runs_real_jobs_parses_declared_captures_and_surfaces_pre_output_stderr() {
     LocalSet::new()

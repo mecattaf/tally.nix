@@ -505,14 +505,23 @@ pub(super) fn validate_name(value: &str, label: &str) -> Result<(), ProducerErro
     Ok(())
 }
 
+/// The GitHub login length bound, shared with `nix/lib/gh-login.nix` through the
+/// pinned corpus at `test/fixtures/gh-login/vectors.json`.
+pub(super) const MAX_GH_LOGIN_LENGTH: usize = 39;
+
 /// A reviewer login is rendered straight into an `@mention` on a public issue
 /// and into a GraphQL user lookup, so it is held to GitHub's own login grammar
 /// rather than the permissive field bound: alphanumerics and interior hyphens,
 /// at most 39 characters. Nothing that could carry markdown, a second mention,
 /// or a query fragment gets past configuration validation.
+///
+/// The Nix modules gate the same list at evaluation. Both sides run the pinned
+/// corpus below, because a login one side accepts and the other rejects is a
+/// deployment that goes green through `nixos-rebuild` or Home Manager and then
+/// fails at daemon config load — a green deploy with a dead daemon.
 pub(super) fn validate_gh_login(producer: &str, login: &str) -> Result<(), ProducerError> {
     let valid = !login.is_empty()
-        && login.len() <= 39
+        && login.len() <= MAX_GH_LOGIN_LENGTH
         && login.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
         && !login.starts_with('-')
         && !login.ends_with('-')
@@ -760,4 +769,59 @@ pub(super) fn expand_dedup_key(
         ));
     }
     Ok(expanded)
+}
+
+#[cfg(test)]
+mod gh_login_vector_tests {
+    use super::{validate_gh_login, MAX_GH_LOGIN_LENGTH};
+    use serde_json::Value;
+
+    /// `nix/lib/gh-login.nix` gates the same reviewer list at module evaluation
+    /// and runs this corpus from `checks.gh-login-grammar`. Both sides assert
+    /// against the committed vector so neither can drift alone: a login the
+    /// module accepts and the daemon rejects deploys green and then dies at
+    /// config load.
+    const VECTORS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/gh-login/vectors.json"
+    ));
+
+    #[test]
+    fn shared_gh_login_vector_holds_for_reviewer_validation() {
+        let corpus: Value = serde_json::from_str(VECTORS).unwrap();
+        assert_eq!(
+            corpus["maxLength"].as_u64().unwrap() as usize,
+            MAX_GH_LOGIN_LENGTH,
+            "the corpus and the Rust bound must name the same length"
+        );
+        let cases = corpus["cases"].as_array().unwrap();
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let login = case["login"].as_str().unwrap();
+            let expected = case["valid"].as_bool().unwrap();
+            assert_eq!(
+                validate_gh_login("vector", login).is_ok(),
+                expected,
+                "verdict for {name}"
+            );
+        }
+    }
+
+    /// The bound is the half the Nix side used to be missing, so it gets its own
+    /// witness rather than living only inside the loop above.
+    #[test]
+    fn the_corpus_pins_both_sides_of_the_length_bound() {
+        let corpus: Value = serde_json::from_str(VECTORS).unwrap();
+        let cases = corpus["cases"].as_array().unwrap();
+        let at_bound = cases.iter().any(|case| {
+            case["login"].as_str().unwrap().len() == MAX_GH_LOGIN_LENGTH
+                && case["valid"].as_bool().unwrap()
+        });
+        let past_bound = cases.iter().any(|case| {
+            case["login"].as_str().unwrap().len() == MAX_GH_LOGIN_LENGTH + 1
+                && !case["valid"].as_bool().unwrap()
+        });
+        assert!(at_bound && past_bound);
+    }
 }
