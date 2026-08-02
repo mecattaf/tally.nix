@@ -749,16 +749,32 @@ pub(super) enum WitnessCommand {
         format: WitnessVerifyFormat,
     },
     VerifyAuthorship {
-        #[arg(long, value_name = "PATH")]
+        #[arg(long, value_name = "PATH", conflicts_with = "revision")]
         ledger: Option<PathBuf>,
         #[arg(long, alias = "repo", value_name = "DIR")]
         repository: PathBuf,
-        #[arg(long, value_name = "UUID")]
-        task: String,
-        #[arg(long)]
+        #[arg(long, value_name = "UUID", required_unless_present = "revision")]
+        task: Option<String>,
+        #[arg(long, conflicts_with = "revision")]
         attempt: Option<u32>,
-        #[arg(long)]
+        #[arg(long, conflicts_with = "revision")]
         lease_epoch: Option<u64>,
+        /// Verify one repository-native note directly instead of a witnessed
+        /// task lane. This is how a campaign's post-merge binding on the
+        /// squash commit is checked: the merge receipt records the revision
+        /// and the note digest, and the witness ledger records neither.
+        #[arg(
+            long,
+            value_name = "OID",
+            conflicts_with = "task",
+            requires = "note_sha256"
+        )]
+        revision: Option<String>,
+        /// The note digest the binding claimed, as `sha256:<64 hex>`.
+        #[arg(long, value_name = "DIGEST", requires = "revision")]
+        note_sha256: Option<String>,
+        #[arg(long, value_name = "REF", default_value = "refs/notes/ai")]
+        note_ref: String,
         #[arg(long, value_enum, default_value = "text")]
         format: WitnessVerifyFormat,
     },

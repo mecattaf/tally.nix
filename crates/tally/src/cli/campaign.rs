@@ -136,6 +136,11 @@ struct CampaignManifest {
     /// as a merge receipt and never fails the node; `required` fails it.
     #[serde(default = "default_git_ai_binding")]
     git_ai_binding: String,
+    /// How long the merge node may wait on git-ai's settlement barrier. The
+    /// barrier runs inside that node, so a deadline that does not comfortably
+    /// exceed this budget is refused while the binding is armed.
+    #[serde(default = "default_git_ai_await_sec")]
+    git_ai_await_sec: u64,
     agent: CampaignAgent,
     /// The steward bound as a catalog role. Absent leaves the narrate slot
     /// empty: publication text stays the brief-derived template.
@@ -311,6 +316,10 @@ fn default_merge_method() -> String {
 
 fn default_git_ai_binding() -> String {
     "off".to_owned()
+}
+
+const fn default_git_ai_await_sec() -> u64 {
+    60
 }
 
 fn default_runner_pool() -> String {
@@ -899,6 +908,17 @@ fn validate_manifest(manifest: &CampaignManifest) -> Result<()> {
         return Err(invalid(
             "campaign gitAiBinding must be off, advisory, or required",
         ));
+    }
+    if manifest.git_ai_await_sec == 0 {
+        return Err(invalid("campaign gitAiAwaitSec must be positive"));
+    }
+    if manifest.git_ai_binding != "off"
+        && manifest.driver_runtime_max_sec < 2 * manifest.git_ai_await_sec
+    {
+        return Err(invalid(format!(
+            "campaign driverRuntimeMaxSec must be at least twice gitAiAwaitSec ({}) while gitAiBinding is not off",
+            2 * manifest.git_ai_await_sec
+        )));
     }
     validate_agent(&manifest.agent)?;
     if let Some(steward) = &manifest.steward {
@@ -3766,6 +3786,42 @@ mod tests {
             error.contains("gitAiBinding must be off, advisory, or required"),
             "{error}"
         );
+
+        // The settlement barrier runs inside the merge node, so its budget and
+        // that node's deadline are not independent numbers. A pairing that
+        // would kill the node mid-await on every task is refused at arm time
+        // rather than presenting later as a timeout.
+        let mut value = manifest_value_for_test(tasks.clone());
+        let object = value.as_object_mut().unwrap();
+        object.insert("gitAiBinding".into(), json!("advisory"));
+        object.insert("gitAiAwaitSec".into(), json!(60));
+        object.insert("driverRuntimeMaxSec".into(), json!(90));
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        let error = validate_manifest(&manifest).unwrap_err().to_string();
+        assert!(
+            error.contains("driverRuntimeMaxSec must be at least twice gitAiAwaitSec (120)"),
+            "{error}"
+        );
+
+        let mut value = manifest_value_for_test(tasks.clone());
+        let object = value.as_object_mut().unwrap();
+        object.insert("gitAiBinding".into(), json!("advisory"));
+        object.insert("gitAiAwaitSec".into(), json!(12));
+        object.insert("driverRuntimeMaxSec".into(), json!(30));
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        validate_manifest(&manifest).unwrap();
+        assert_eq!(manifest.git_ai_await_sec, 12);
+
+        // With the binding off the two numbers are unrelated again, which is
+        // what keeps the shipped default from constraining anyone.
+        let mut value = manifest_value_for_test(tasks.clone());
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("driverRuntimeMaxSec".into(), json!(5));
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        validate_manifest(&manifest).unwrap();
+        assert_eq!(manifest.git_ai_await_sec, 60);
 
         // An empty model would render a job asking the adapter for nothing at
         // all, and a trailer naming nothing at all.

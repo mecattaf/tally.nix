@@ -1259,6 +1259,11 @@
                   # externally provisioned binary is absent from this fixture,
                   # so what it records here is that fact.
                   gitAiBinding = "advisory";
+                  # driverRuntimeMaxSec is 30 here, and the settlement barrier
+                  # runs inside that node. The evaluated assertion requires the
+                  # deadline to be at least twice this budget, so the fixture
+                  # states a budget its own node can actually host.
+                  gitAiAwaitSec = 12;
                   # The narrate seam is config-only: an adapter the estate adds
                   # to the open map, named as this campaign's catalog role. The
                   # rendered narration argv is the adapter's own argv with this
@@ -3624,6 +3629,8 @@
                   $fixtureArgs.gates[1].runtimeMaxSec == 11 and
                   $fixtureArgs.mergeMethod == "merge" and
                   $fixtureArgs.gitAiBinding == "advisory" and
+                  $fixtureArgs.gitAiAwaitSec == 12 and
+                  ($fixtureArgs.driverRuntimeMaxSec >= 2 * $fixtureArgs.gitAiAwaitSec) and
                   $fixtureArgs.steward.adapter == "narrator" and
                   $fixtureArgs.steward.argv == [
                     "/bin/sh", "/srv/campaign-fixtures/narrate", "--narrate"
@@ -3639,6 +3646,7 @@
                     == "^TALLY_FINAL_MESSAGE=(.*)$" and
                   $defaultedArgs.mergeMethod == "squash" and
                   $defaultedArgs.gitAiBinding == "off" and
+                  $defaultedArgs.gitAiAwaitSec == 60 and
                   $defaultedArgs.steward == null and
                   $defaultedArgs.agent.adapter == "codex" and
                   $defaultedArgs.agent.approvalPolicy == "never" and

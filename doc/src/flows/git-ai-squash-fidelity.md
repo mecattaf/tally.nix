@@ -96,10 +96,15 @@ which `gitAiBinding` arms (`doc/src/flows/campaigns.md`). Point by point:
   after branch cleanup gets: nothing. Lanes are `git worktree`s of the campaign
   checkout and share one object store and one `refs/notes/ai`, so that is where
   the binding runs.
-- Finding 4 is why publication is an explicit `git push <remote>
-  refs/notes/ai:refs/notes/ai` step, and why it is worth doing: the note
-  travels, and a clone with only the base branch and the notes ref reads full
-  per-line attribution.
+- Finding 4 is why publication is an explicit push at all, and why it is worth
+  doing: the note travels, and a clone with only the base branch and the notes
+  ref reads full per-line attribution. It is not a push of the whole ref. The
+  campaign checkout's `refs/notes/ai` holds a note for every commit that
+  checkout ever made, so the node assembles a scratch ref from the remote's tip
+  plus the integrated commit's entry and pushes that. Two records for one
+  commit are refused rather than merged: `cat_sort_uniq` is line-oriented and
+  a note under this schema is a two-section record whose line order is
+  semantic.
 - The unarmed-host ambiguity is why `mode = "required"` and
   `gitAiBinding = "required"` both stay off for this wave. A host that never
   had the trace2 target installed and a squash that lost its attribution
@@ -110,8 +115,27 @@ which `gitAiBinding` arms (`doc/src/flows/campaigns.md`). Point by point:
   stays a pointer. The note is the proof, and per finding 4 the proof publishes
   independently of the trailer.
 
+One boundary worth stating, measured on the same host while validating the
+binding: **git-ai publishes `refs/notes/ai` itself.** `git-ai install-hooks`
+arms a global `trace2.eventTarget`, and the background service behind it pushes
+the notes ref alongside an ordinary `git push`. A campaign remote observed
+carrying notes for commits tally never published had them put there by the
+externally provisioned binary, not by the merge node:
+
+```console
+$ git -C <remote.git> notes --ref refs/notes/ai list   # before any tally binding
+703760051ba712d9d91534f99a7e40aee53b6d02 96eed6faabb7e5cd49066ae4bbf331cacbc4b10f
+```
+
+Tally's own publication is scoped to the integrated commit's entry and nothing
+else, which is all tally controls. What the estate's tool publishes on its own
+is the estate's policy, and an operator arming the binding on a public forge
+should know that the notes ref there is not a tally-curated artifact.
+
 One operational number, measured on the same host: `git-ai await` costs roughly
 18 seconds on a repository with nothing outstanding, because it waits on the
 background service rather than on the note. That is spent inside the merge node
-on every bound task, and it is a reason the posture is per-campaign rather than
-fleet-wide.
+on every bound task, which is why the posture is per-campaign rather than
+fleet-wide and why `gitAiAwaitSec` and `driverRuntimeMaxSec` are related by an
+evaluated assertion instead of by nothing: a barrier that outlives its own node
+is a timeout, not a receipt.

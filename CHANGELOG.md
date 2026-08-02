@@ -8,6 +8,24 @@ authorized.
 
 ### Added
 
+- Added `services.tally.campaigns.<name>.gitAiAwaitSec` (default 60), the merge
+  node's budget for git-ai's settlement barrier, and an evaluated assertion
+  relating it to that node's own deadline: while `gitAiBinding` is not `off`,
+  `driverRuntimeMaxSec` must be at least twice the budget. The barrier runs
+  inside the merge node, so a campaign that paired a short deadline with a long
+  barrier was killed mid-wait on every task and reported a node timeout instead
+  of a binding receipt.
+- Added a revision mode to `tally witness verify-authorship`:
+  `--revision <oid> --note-sha256 <digest>` verifies one repository-native note
+  directly instead of a witnessed task lane. The campaign merge node binds the
+  commit the forge minted when it squashed, which the witness ledger never
+  names, so the ledger mode could not reach it at all; the merge receipt records
+  the revision and the digest and this re-derives the digest from the
+  repository. The digest is required, so a pass is always a comparison.
+  `--revision` and `--task` are mutually exclusive, and the report's schema
+  version moves to 2: `ledgerPath`, `ledger`, and `taskUuid` are omitted in
+  revision mode.
+
 - Added `services.tally.campaigns.<name>.gitAiBinding`, an enum of `off`
   (default), `advisory`, and `required`, arming the fourth proof axis on the
   commit a campaign integrates. A forge-side squash arrives with no authorship
@@ -224,6 +242,54 @@ authorized.
 - Added flake-native rustfmt, Clippy, and repository-wide Nix formatting checks.
 
 ### Fixed
+
+- The campaign merge node's `Assisted-by:` forgery guard now matches the way git
+  reads a trailer. Git matches trailer keys case-insensitively, so a steward
+  proposing `assisted-by:` passed validation and its line landed verbatim in a
+  squash commit on the default branch of a public repository, where every
+  git-native consumer reads it as an `Assisted-by` trailer. With the shipped
+  `agentModel = null` default the node appends no trailer of its own, so the
+  forged line was the message's entire trailer block — a provenance pointer to a
+  task UUID and witness sequence nobody executed.
+- The campaign merge node no longer folds diverged authorship notes together,
+  and no longer pushes the campaign checkout's whole `refs/notes/ai`. The
+  previous publication path used git's line-oriented `cat_sort_uniq` note-merge
+  strategy on a `authorship/3.0.0` record whose line order is semantic, which
+  published a structurally invalid note and — because `git notes merge` writes
+  into the *local* ref — rewrote the daemon's witnessed code-result bindings in
+  the campaign checkout, turning those tasks into a permanent
+  `note-content-mismatch`. Publication now assembles a scratch ref from the
+  remote's own tip plus the integrated commit's entry and pushes that, so only
+  the integrated commit's note is published; a remote already carrying a
+  different record for that revision is reported as a typed `conflict` and
+  nothing is written. The receipt's `noteSha256` is read back from the remote
+  after the push instead of being computed before it, and `notesRefTarget` names
+  the campaign remote's ref rather than the checkout's. What the remote carries
+  beyond that entry is not tally's: git-ai publishes `refs/notes/ai` itself on
+  an ordinary `git push`, which is now measured and recorded in
+  `doc/src/flows/git-ai-squash-fidelity.md`.
+- The campaign binding is re-enterable. A later reconcile pass can dispatch the
+  merge node again for a task whose pull request is already merged; that pass
+  reconstructs the identical commit, which git-ai will not re-annotate, so the
+  copy had no source and the binding regressed to `missing-note`. An integrated
+  commit that already carries the note the step would have produced is now a
+  completed binding.
+- The campaign merge node removes the throwaway reconstruction's note after
+  copying it onto the integrated commit. A notes entry is keyed by commit id as
+  a path in the notes tree, so it outlived the unreachable commit it annotated
+  and accumulated one dead note per merged task on a public forge.
+- `gitAiBinding = "advisory"` can no longer fail a merge node. The binding runs
+  after the merge has landed irreversibly, so a raised error reported a merged
+  task as failed; the unguarded `git fetch --prune` and the workspace-root and
+  temporary-directory setup could all raise. Every outcome, including an
+  unexpected one, is now a typed receipt, and the reason names the remote and
+  the git exit status rather than echoing transport stderr into a report that is
+  quotable in public.
+- The campaign binding's reconstruction now commits under its own identity. A
+  local-forge merge that shared the merge node's identity, tree, parent, message
+  and committer second produced the same object ID as the integrated commit, so
+  `git notes copy` was a no-op onto itself and the copy path the whole binding
+  turns on went unexercised by its own regression test.
 
 - Make the sticky-comment recovery path publish what it was asked to publish.
   When no stored comment id was available and the marker scan found the comment

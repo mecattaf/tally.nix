@@ -163,6 +163,10 @@ export const meta = {
       // Whether the merge node binds Git AI authorship on the commit it
       // integrated. Absent means `off`: the shipped state binds nothing.
       gitAiBinding: { enum: ["off", "advisory", "required"] },
+      // How long the merge node may wait on git-ai's settlement barrier. The
+      // module derives it from this campaign's own node deadline; absent is
+      // the driver's default.
+      gitAiAwaitSec: { type: "integer", minimum: 1 },
       // The steward bound as a catalog role. Null, or absent, is the
       // shipped state: template narration and no model call at publication.
       steward: {
@@ -521,6 +525,7 @@ const effectiveConfigSchema = {
     "maxParallel",
     "mergeMethod",
     "gitAiBinding",
+    "gitAiAwaitSec",
     "agent",
     "gates"
   ],
@@ -544,6 +549,7 @@ const effectiveConfigSchema = {
     maxParallel: { type: "integer", minimum: 1, maximum: 128 },
     mergeMethod: { enum: ["merge", "squash"] },
     gitAiBinding: { enum: ["off", "advisory", "required"] },
+    gitAiAwaitSec: { type: "integer", minimum: 1 },
     agent: { type: "object" },
     steward: { type: ["object", "null"] },
     gates: { type: "array", minItems: 1, maxItems: 16 }
@@ -899,11 +905,16 @@ const authorshipReceiptSchema = {
   required: ["binding", "status", "revision", "noteRef", "published", "reason"],
   properties: {
     binding: { enum: ["advisory", "required"] },
+    // Exactly what `bind_authorship` can settle on. `conflict` is the remote
+    // already carrying a different authorship record for this revision, which
+    // is refused rather than merged.
     status: {
-      enum: ["bound", "unsupported", "unavailable", "missing-note", "mismatch", "error"]
+      enum: ["bound", "unavailable", "missing-note", "mismatch", "conflict", "error"]
     },
     revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
     noteRef: { const: "refs/notes/ai" },
+    // The campaign remote's refs/notes/ai after publication -- what a reader
+    // fetching the notes ref will resolve, not what the checkout holds.
     notesRefTarget: { type: ["string", "null"], pattern: "^[0-9a-f]{40,64}$" },
     noteSha256: { type: ["string", "null"], pattern: "^sha256:[0-9a-f]{64}$" },
     published: { type: "boolean" },
@@ -1431,6 +1442,7 @@ function sweepDeferral(sweepNode) {
         maxParallel: args.maxParallel,
         mergeMethod: args.mergeMethod || "squash",
         gitAiBinding: args.gitAiBinding || "off",
+        gitAiAwaitSec: args.gitAiAwaitSec || 60,
         agent: diagnosisSandboxed(args.agent),
         steward: args.steward || null,
         gates: args.gates
@@ -1998,6 +2010,7 @@ function sweepDeferral(sweepNode) {
         domainsRequired,
         mergeMethod: effective.mergeMethod,
         gitAiBinding: effective.gitAiBinding,
+        gitAiAwaitSec: effective.gitAiAwaitSec,
         assistedBy: lane.assistedBy || null,
         workspace: lane.prepared,
         integration: integration.result
