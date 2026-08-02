@@ -87,6 +87,7 @@ fn registry(watch_path: &Path) -> BTreeMap<String, ProducerConfig> {
                 post_failure_stderr: false,
                 post_gate_summary: false,
                 request_review: false,
+                reviewers: Vec::new(),
                 close_on_acceptance: false,
                 never_mutate: false,
                 close_on_pass: Some(true),
@@ -495,10 +496,67 @@ fn registry_is_strict_open_by_name_and_closed_over_the_in_scope_kinds() {
     .unwrap_err()
     .to_string()
     .contains("postFailureStderr=true requires postFailureEvidence=true"));
+
+    // A switch that claims to request a human review has to name the humans.
+    let mut invalid_reviewers = invalid_failure_stderr;
+    let ProducerConfig::Gh(github) = invalid_reviewers.get_mut("github").unwrap() else {
+        unreachable!()
+    };
+    github.post_failure_stderr = false;
+    github.request_review = true;
+    assert!(validate_registry(
+        &invalid_reviewers,
+        &BTreeSet::from(["slot".to_owned()]),
+        &BTreeSet::from(["shell".to_owned()]),
+        &BTreeSet::new(),
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("requestReview=true requires a non-empty reviewers list"));
+
+    let ProducerConfig::Gh(github) = invalid_reviewers.get_mut("github").unwrap() else {
+        unreachable!()
+    };
+    github.reviewers = vec!["not a login".to_owned()];
+    assert!(validate_registry(
+        &invalid_reviewers,
+        &BTreeSet::from(["slot".to_owned()]),
+        &BTreeSet::from(["shell".to_owned()]),
+        &BTreeSet::new(),
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("is not a GitHub login"));
+
+    let ProducerConfig::Gh(github) = invalid_reviewers.get_mut("github").unwrap() else {
+        unreachable!()
+    };
+    github.reviewers = vec!["octocat".to_owned(), "octocat".to_owned()];
+    assert!(validate_registry(
+        &invalid_reviewers,
+        &BTreeSet::from(["slot".to_owned()]),
+        &BTreeSet::from(["shell".to_owned()]),
+        &BTreeSet::new(),
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("repeats reviewers entry"));
+
+    let ProducerConfig::Gh(github) = invalid_reviewers.get_mut("github").unwrap() else {
+        unreachable!()
+    };
+    github.reviewers = vec!["octocat".to_owned()];
+    validate_registry(
+        &invalid_reviewers,
+        &BTreeSet::from(["slot".to_owned()]),
+        &BTreeSet::from(["shell".to_owned()]),
+        &BTreeSet::new(),
+    )
+    .unwrap();
 }
 
 #[test]
-fn serialized_github_config_preserves_legacy_close_and_accepts_explicit_comment_only() {
+fn serialized_github_config_treats_an_absent_close_on_pass_as_off() {
     let config = |close_on_pass: Option<bool>| {
         let mut value = serde_json::json!({
             "kind": "gh",
@@ -518,14 +576,19 @@ fn serialized_github_config_preserves_legacy_close_and_accepts_explicit_comment_
         config
     };
 
-    let legacy = config(None);
-    assert!(!legacy.post_failure_evidence);
-    assert!(!legacy.post_failure_stderr);
-    assert_eq!(legacy.close_on_pass, None);
-    assert!(legacy.close_on_pass());
+    // Absent no longer inherits `postEvidence`: closing is its own opt-in,
+    // and this configuration has evidence posting on.
+    let absent = config(None);
+    assert!(!absent.post_failure_evidence);
+    assert!(!absent.post_failure_stderr);
+    assert!(absent.post_evidence);
+    assert_eq!(absent.close_on_pass, None);
+    assert!(!absent.close_on_pass());
     let comment_only = config(Some(false));
     assert_eq!(comment_only.close_on_pass, Some(false));
     assert!(!comment_only.close_on_pass());
+    let closing = config(Some(true));
+    assert!(closing.close_on_pass());
 }
 
 #[test]
@@ -874,6 +937,7 @@ fn rendered_producer_brief_enforces_the_canonical_size_limit() {
 
 struct RecordingMutation {
     comments: Vec<GhCompletedMutation>,
+    reviews: Vec<GhCompletedMutation>,
     closes: Vec<GhCompletedMutation>,
     item_open: bool,
 }
@@ -882,6 +946,7 @@ impl Default for RecordingMutation {
     fn default() -> Self {
         Self {
             comments: Vec::new(),
+            reviews: Vec::new(),
             closes: Vec::new(),
             item_open: true,
         }
@@ -891,6 +956,11 @@ impl Default for RecordingMutation {
 impl GhMutationSink for RecordingMutation {
     fn post_evidence(&mut self, mutation: &GhCompletedMutation) -> Result<(), String> {
         self.comments.push(mutation.clone());
+        Ok(())
+    }
+
+    fn request_reviews(&mut self, mutation: &GhCompletedMutation) -> Result<(), String> {
+        self.reviews.push(mutation.clone());
         Ok(())
     }
 
@@ -984,6 +1054,7 @@ fn github_gate_failure_and_not_run_remain_open_and_never_mutate_wins() {
     };
     github.post_gate_summary = true;
     github.request_review = true;
+    github.reviewers = vec!["octocat".to_owned()];
     github.close_on_acceptance = true;
     github.close_on_pass = Some(true);
     let observation = gh_observation("PR_policy", "author", "contributor");
@@ -1011,6 +1082,9 @@ fn github_gate_failure_and_not_run_remain_open_and_never_mutate_wins() {
             .unwrap());
         assert_eq!(sink.comments.len(), 1);
         assert!(sink.comments[0].request_review);
+        // The boolean is provenance; the review request is its own mutation.
+        assert_eq!(sink.reviews.len(), 1);
+        assert_eq!(sink.reviews[0].reviewers, ["octocat"]);
         assert!(sink.closes.is_empty());
         assert!(sink.item_open);
     }
@@ -1030,6 +1104,7 @@ fn github_gate_failure_and_not_run_remain_open_and_never_mutate_wins() {
         .unwrap());
     assert_eq!(accepted_sink.closes.len(), 1);
     assert!(!accepted_sink.comments[0].request_review);
+    assert!(accepted_sink.reviews.is_empty());
 
     let mut inert_registry = registry;
     let ProducerConfig::Gh(github) = inert_registry.get_mut("github").unwrap() else {
@@ -1525,14 +1600,20 @@ fn github_trigger_acknowledgement_marker_is_stable_and_remote_idempotent() {
 /// limit does, and then read back both the operations issued and what the
 /// thread actually says.
 ///
-/// Two control files, both outside the `*.body` set: `refuse-edits` makes
-/// `updateIssueComment` fail while the comment stays present, and `hide-ids`
-/// serves matched comments without a node id.
+/// Three control files, all outside the `*.body` set: `refuse-edits` makes
+/// `updateIssueComment` fail while the comment stays present, `hide-ids`
+/// serves matched comments without a node id, and `pull-request` makes the
+/// item resolve as a `PullRequest` instead of an `Issue`.
 const SCRIPTED_GRAPHQL: &str = r#"#!/bin/sh
 [ "$1 $2 $3 $4" = 'api graphql --input -' ] || exit 91
 request=$(cat)
 printf '%s\n' "$request" >> '@REQUESTS@'
 body=$(printf '%s' "$request" | sed -n 's/.*"body":"\(.*\)"}}$/\1/p')
+if [ -e '@THREAD@/pull-request' ]; then
+  typename=PullRequest
+else
+  typename=Issue
+fi
 case "$request" in
   *TallyCompletionState*)
     nodes=''
@@ -1549,10 +1630,23 @@ case "$request" in
       nodes="$nodes$separator$node"
       separator=','
     done
-    printf '{"data":{"node":{"__typename":"Issue","state":"OPEN","comments":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}' "$nodes"
+    printf '{"data":{"node":{"__typename":"%s","state":"OPEN","comments":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}' "$typename" "$nodes"
     ;;
   *TallyItemState*)
-    printf '{"data":{"node":{"__typename":"Issue","state":"OPEN"}}}'
+    printf '{"data":{"node":{"__typename":"%s","state":"OPEN"}}}' "$typename"
+    ;;
+  *TallyReviewerId*)
+    login=$(printf '%s' "$request" | sed -n 's/.*"login":"\([^"]*\)".*/\1/p')
+    if [ "$login" = "ghost" ]; then
+      printf '{"data":{"user":null}}'
+    else
+      printf '{"data":{"user":{"id":"U_%s"}}}' "$login"
+    fi
+    ;;
+  *TallyRequestReviews*)
+    printf '%s' "$request" | sed -n 's/.*"userIds":\(\[[^]]*\]\).*/\1/p' \
+      >> '@THREAD@/requested-reviews'
+    printf '{"data":{"requestReviews":{"pullRequest":{"id":"PR_widget_42"}}}}'
     ;;
   *TallyCompletionComment*)
     sequence=$(cat '@THREAD@/sequence' 2>/dev/null || printf 1)
@@ -1603,6 +1697,8 @@ fn scripted_operations(requests: &Path) -> Vec<String> {
                 "TallyItemState",
                 "TallyCompletionComment",
                 "TallyStickyComment",
+                "TallyReviewerId",
+                "TallyRequestReviews",
             ]
             .into_iter()
             .find(|operation| query.contains(operation))
@@ -1814,6 +1910,179 @@ fn github_receipt_comment_upserts_in_place_across_a_producer_restart() {
     );
 }
 
+/// `requestReview` used to serialize `"requestReview":true` into the machine
+/// completion comment and stop there: the producer's whole mutation vocabulary
+/// was comment / closeIssue / closePullRequest, so no review was ever
+/// requested and no human was ever notified. A pull request now receives
+/// GitHub's own `requestReviews` mutation, once, with the configured logins
+/// resolved to user ids.
+#[test]
+fn request_review_sends_a_real_review_request_for_a_pull_request() {
+    let temp = tempdir().unwrap();
+    let gh = temp.path().join("fake-gh");
+    let requests = temp.path().join("requests.jsonl");
+    let thread = temp.path().join("thread");
+    let state_dir = temp.path().join("state");
+    install_scripted_graphql(&gh, &requests, &thread);
+    std::fs::write(thread.join("pull-request"), "").unwrap();
+
+    let mut registry = registry(&temp.path().join("effects.jsonl"));
+    let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+        unreachable!()
+    };
+    github.request_review = true;
+    github.reviewers = vec!["octocat".to_owned(), "hubot".to_owned()];
+    github.close_on_pass = Some(false);
+    let observation = gh_observation("PR_widget_42", "author", "contributor");
+    let origin = gh_origin("github", github, &observation);
+    let engine = ProducerEngine::new(
+        &registry,
+        temp.path().join("events"),
+        state_dir.clone(),
+        temp.path(),
+    );
+    let mut sink = GhCliMutationSink::with_program(&gh).with_state_dir(&state_dir);
+
+    assert!(engine
+        .complete_gh_once(
+            &origin,
+            "task-1:attempt-1:witness-5",
+            Verdict::Pass,
+            Some(serde_json::json!({"witnessSeq": 5})),
+            &mut sink,
+        )
+        .unwrap());
+    assert_eq!(
+        scripted_operations(&requests),
+        [
+            "TallyCompletionState",
+            "TallyCompletionComment",
+            "TallyItemState",
+            "TallyReviewerId",
+            "TallyReviewerId",
+            "TallyRequestReviews",
+        ]
+    );
+    assert_eq!(
+        std::fs::read_to_string(thread.join("requested-reviews")).unwrap(),
+        "[\"U_octocat\",\"U_hubot\"]"
+    );
+
+    // A replay of the same completion is refused by the durable marker, so the
+    // reviewers are asked exactly once.
+    assert!(!engine
+        .complete_gh_once(
+            &origin,
+            "task-1:attempt-1:witness-5",
+            Verdict::Pass,
+            Some(serde_json::json!({"witnessSeq": 5})),
+            &mut sink,
+        )
+        .unwrap());
+    assert_eq!(scripted_operations(&requests), Vec::<String>::new());
+    assert_eq!(
+        std::fs::read_to_string(thread.join("requested-reviews")).unwrap(),
+        "[\"U_octocat\",\"U_hubot\"]"
+    );
+}
+
+/// An issue has no review concept, so the notification has to be the mention
+/// itself: one fresh comment, marker-guarded so a re-publication of the same
+/// completion neither repeats it nor silently edits the ping away.
+#[test]
+fn request_review_mentions_the_reviewers_once_on_an_issue() {
+    let temp = tempdir().unwrap();
+    let gh = temp.path().join("fake-gh");
+    let requests = temp.path().join("requests.jsonl");
+    let thread = temp.path().join("thread");
+    let state_dir = temp.path().join("state");
+    install_scripted_graphql(&gh, &requests, &thread);
+
+    let mutation = GhCompletedMutation {
+        producer: "github".to_owned(),
+        source: "search".to_owned(),
+        item_id: "I_widget_42".to_owned(),
+        completion_id: Some("task-1:attempt-1:witness-5".to_owned()),
+        state: "COMPLETED".to_owned(),
+        evidence: None,
+        gate_summary: None,
+        acceptance: None,
+        request_review: true,
+        reviewers: vec!["octocat".to_owned()],
+        assisted_by: None,
+    };
+
+    let mut sink = GhCliMutationSink::with_program(&gh).with_state_dir(&state_dir);
+    sink.request_reviews(&mutation).unwrap();
+    assert_eq!(
+        scripted_operations(&requests),
+        [
+            "TallyItemState",
+            "TallyCompletionState",
+            "TallyCompletionComment"
+        ]
+    );
+    assert_eq!(thread_comments(&thread), ["IC_1"]);
+    let body = thread_body(&thread, "IC_1");
+    assert!(body.contains("<!-- tally-review-request:"), "{body}");
+    assert!(body.contains("@octocat"), "{body}");
+
+    // Replayed: the marker is on the thread, so nothing new is published and
+    // the existing comment is left exactly as it is.
+    sink.request_reviews(&mutation).unwrap();
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyItemState", "TallyCompletionState"]
+    );
+    assert_eq!(thread_comments(&thread), ["IC_1"]);
+    assert_eq!(thread_body(&thread, "IC_1"), body);
+
+    // A login that does not resolve is a configuration error the operator has
+    // to see, not a reviewer to drop quietly.
+    std::fs::write(thread.join("pull-request"), "").unwrap();
+    let error = sink
+        .request_reviews(&GhCompletedMutation {
+            reviewers: vec!["ghost".to_owned()],
+            ..mutation
+        })
+        .unwrap_err();
+    assert!(error.contains("does not resolve to a user"), "{error}");
+}
+
+/// `closeOnPass` unset used to fall back to `postEvidence`, so a producer that
+/// only published evidence also closed the item. Absent now means off.
+#[test]
+fn unset_close_on_pass_posts_evidence_and_closes_nothing() {
+    let temp = tempdir().unwrap();
+    let mut registry = registry(&temp.path().join("effects.jsonl"));
+    let ProducerConfig::Gh(github) = registry.get_mut("github").unwrap() else {
+        unreachable!()
+    };
+    assert!(github.post_evidence);
+    github.close_on_pass = None;
+    let observation = gh_observation("PR_unset_close", "author", "contributor");
+    let origin = gh_origin("github", github, &observation);
+    let engine = ProducerEngine::new(
+        &registry,
+        temp.path().join("events"),
+        temp.path().join("state"),
+        temp.path(),
+    );
+
+    let mut sink = RecordingMutation::default();
+    assert!(engine
+        .complete_gh(
+            &origin,
+            Verdict::Pass,
+            Some(serde_json::json!({"witnessSeq": 5})),
+            &mut sink,
+        )
+        .unwrap());
+    assert_eq!(sink.comments.len(), 1);
+    assert!(sink.closes.is_empty(), "evidence posting must not close");
+    assert!(sink.item_open);
+}
+
 /// The same primitive carries completion evidence: one comment per completion
 /// id, edited in place when the same completion is published again.
 #[test]
@@ -1834,6 +2103,7 @@ fn github_completion_evidence_upserts_the_comment_it_already_created() {
         gate_summary: None,
         acceptance: None,
         request_review: false,
+        reviewers: Vec::new(),
         assisted_by: None,
     };
 
@@ -1880,6 +2150,7 @@ fn github_refused_sticky_edit_fails_the_publication_instead_of_reporting_success
         gate_summary: None,
         acceptance: None,
         request_review: false,
+        reviewers: Vec::new(),
         assisted_by: None,
     };
 

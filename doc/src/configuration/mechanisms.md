@@ -172,12 +172,21 @@ switches are [`postReceipt`](core-options.md#servicestallyproducersnamepostrecei
 [`postFailureStderr`](core-options.md#servicestallyproducersnamepostfailurestderr),
 [`postGateSummary`](core-options.md#servicestallyproducersnamepostgatesummary),
 [`requestReview`](core-options.md#servicestallyproducersnamerequestreview),
+[`reviewers`](core-options.md#servicestallyproducersnamereviewers),
 [`closeOnAcceptance`](core-options.md#servicestallyproducersnamecloseonacceptance),
 [`closeOnPass`](core-options.md#servicestallyproducersnamecloseonpass), and
 [`neverMutate`](core-options.md#servicestallyproducersnamenevermutate).
 `neverMutate` overrides every acknowledgement, comment, review request, and
 close. Gate summaries and acceptance-based closure require an enqueue
 `gateManifest`.
+
+`requestReview` requires a non-empty `reviewers` list of GitHub logins, and it
+notifies them for real: a pull request receives GitHub's own review request,
+and an issue — which has no review concept — receives one fresh comment
+mentioning them. That comment is marker-idempotent rather than upserted, so a
+replay does not repeat it and does not silently edit the ping out from under
+the reviewers. `closeOnPass` is an independent opt-in; leaving it unset never
+closes an item, whatever `postEvidence` is set to.
 
 `postReceipt` publishes one acknowledgement per accepted or filtered trigger.
 Re-observing a trigger the ledger already holds — what every producer restart

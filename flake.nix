@@ -1118,6 +1118,7 @@
                     triggers.commandComments = [ "/tally run" ];
                     postGateSummary = true;
                     requestReview = true;
+                    reviewers = [ "tally-reviewer" ];
                     closeOnAcceptance = true;
                     enqueue = {
                       argv = [ "Review \${gh.url}" ];
@@ -1785,6 +1786,23 @@
                 bad-failure-stderr = {
                   kind = "gh";
                   postFailureStderr = true;
+                  enqueue = {
+                    argv = [ "gh-job" ];
+                    pool = "slot";
+                  };
+                };
+                bad-review = {
+                  kind = "gh";
+                  requestReview = true;
+                  enqueue = {
+                    argv = [ "gh-job" ];
+                    pool = "slot";
+                  };
+                };
+                bad-reviewer-login = {
+                  kind = "gh";
+                  requestReview = true;
+                  reviewers = [ "not a login" ];
                   enqueue = {
                     argv = [ "gh-job" ];
                     pool = "slot";
@@ -3518,6 +3536,7 @@
               .producers.github.postFailureStderr == false and
               .producers.github.postGateSummary == true and
               .producers.github.requestReview == true and
+              .producers.github.reviewers == ["tally-reviewer"] and
               .producers.github.closeOnAcceptance == true and
               .producers.github.neverMutate == false and
               .producers.github.closeOnPass == false and
@@ -4446,6 +4465,10 @@
               invalidProducerMessages;
             assert builtins.elem
               "gh producer bad-failure-stderr postFailureStderr=true requires postFailureEvidence=true"
+              invalidProducerMessages;
+            assert builtins.elem "gh producer bad-review requestReview=true requires a non-empty reviewers list"
+              invalidProducerMessages;
+            assert builtins.elem "gh producer bad-reviewer-login reviewers must be unique GitHub logins"
               invalidProducerMessages;
             assert !invalidProducerAttempt.success;
             pkgs.runCommand "tally-producer-kind-required" { } ''

@@ -3637,6 +3637,10 @@ mod tests {
                         "sources": [{"notifications": {"repo": "acme/widgets"}}],
                         "triggers": {"assignments": ["tally-bot"]},
                         "postEvidence": true,
+                        // Closing is its own opt-in: an absent `closeOnPass`
+                        // no longer inherits `postEvidence`, and this test
+                        // exercises the close half of the mutation too.
+                        "closeOnPass": true,
                         "enqueue": {"argv": ["true"], "pool": "slot"}
                     }
                 }))

@@ -727,6 +727,7 @@ impl<'a> ProducerEngine<'a> {
             gate_summary: None,
             acceptance: None,
             request_review: false,
+            reviewers: Vec::new(),
             assisted_by: None,
         })
         .map_err(ProducerError::Mutation)?;
@@ -820,10 +821,22 @@ impl<'a> ProducerEngine<'a> {
             gate_summary,
             acceptance,
             request_review,
+            reviewers: if request_review {
+                config.reviewers.clone()
+            } else {
+                Vec::new()
+            },
             assisted_by,
         };
         if should_post {
             sink.post_evidence(&mutation)
+                .map_err(ProducerError::Mutation)?;
+        }
+        // The review request is its own mutation, published before any close:
+        // encoding the boolean into a comment notified nobody, and asking for
+        // a review after closing the item asks it of a shut thread.
+        if request_review {
+            sink.request_reviews(&mutation)
                 .map_err(ProducerError::Mutation)?;
         }
         if close_on_pass || close_on_acceptance {
