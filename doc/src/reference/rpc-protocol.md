@@ -305,9 +305,13 @@ and the successor is not created — only the relationship between them becomes 
 
 | Field | Type | Meaning |
 |---|---|---|
-| `flowRunId` | UUID | The terminal run being retired. |
+| `flowRunId` | UUID | The terminal run being retired. Must have at least one durable node carrying an `orchestration.scriptHash`; otherwise the call is `not_found`. |
 | `successorFlowRunId` | UUID | The fresh run that replaces it. Must differ, and must have no nodes yet. |
 | `reason` | `generation-change`, `script-changed`, `args-changed`, `catalog-changed`, or `operator` | Recorded durably for later audit. |
+
+Both IDs are canonicalized to hyphenated lowercase before they are stored or looked up, so the
+upper-case, unhyphenated, and braced renderings `Uuid::parse_str` accepts all name one run. Records
+written by an earlier tally in another rendering are absorbed by the same canonicalization on read.
 
 The result is `{ok: true, disposition, record}`. `disposition` is `recorded` when a new line was
 appended and `reused` when the identical `(flowRunId, successorFlowRunId, reason)` triple was
@@ -323,7 +327,13 @@ These are refused with `flow-lineage-conflict`:
 - a successor already claimed by another predecessor;
 - a rollover that would close a cycle in the chain;
 - a predecessor with unfinished nodes (cancel the run first);
-- a successor that already has nodes.
+- a successor that already has nodes;
+- a predecessor whose own rows disagree about a pinned hash.
+
+`query.lineage` requires a UUID and answers `invalid_params` otherwise, so a mis-rendered lookup
+cannot read as a well-formed "not superseded". Both it and `query.run` fail with
+`flow-lineage-unusable` when the durable index holds a complete record that cannot be decoded; an
+interrupted final append is skipped instead, and truncated by the next write.
 
 `query.lineage` answers the read side for any run, including one with no recorded rollover:
 
@@ -576,6 +586,6 @@ the log is `invalid_params`. Watch records are typed as `job`, `lifecycle`, `tra
 
 Every declared wire code, its current emission status, and CLI mapping is listed in
 [Exit codes and error taxonomy](errors.md). In particular, do not collapse
-`dedup-key-conflict`, `flow-node-cap`, `flow-lineage-conflict`, `storage-budget-exceeded`,
-`storage-monitor-unavailable`, or `not_found` into a generic retry: each carries a different
-recovery decision.
+`dedup-key-conflict`, `flow-node-cap`, `flow-lineage-conflict`, `flow-lineage-unusable`,
+`storage-budget-exceeded`, `storage-monitor-unavailable`, or `not_found` into a generic retry:
+each carries a different recovery decision.

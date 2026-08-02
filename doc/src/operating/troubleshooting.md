@@ -328,7 +328,51 @@ above its task board.
 A supersede that contradicts durable lineage — a different second successor, a
 successor already claimed, a cycle, a predecessor with unfinished nodes, or a
 successor that has already started — is refused with `flow-lineage-conflict` and
-exits 1. Cancel a live predecessor first; pick a fresh UUID for a successor.
+exits 1. Cancel a live predecessor first; pick a fresh UUID for a successor. On
+that conflict, read `tally query lineage <OLD>` and adopt `supersededBy`: a
+supervisor that crashed after calling and before persisting its successor finds
+the answer already durable there.
+
+A supersede naming a run with no durable node exits 4 (`not_found`). That run
+never recorded a script hash, so it can never trip an identity pin and never
+needs retiring — check the run ID for a typo. Renderings do not matter: upper
+case, unhyphenated, and braced UUIDs are all canonicalized to the hyphenated
+lowercase form on both write and read.
+
+## `flow-lineage-unusable`
+
+Every flow start reads `<dataDir>/flow-lineage.jsonl`, so a damaged record there
+stops flow runs that have no rollover of their own:
+
+```text
+flow lineage ledger <PATH> line <N> is unusable: <reason>
+```
+
+The RPC code is `flow-lineage-unusable`, the CLI exits 1, and the error carries
+`transient: false` with `resolution: "repair-lineage-ledger"` so automation
+escalates instead of retrying it every pass.
+
+An *interrupted* append — a crash, a power loss, or a short write under ENOSPC —
+never causes this: an unterminated final line is skipped on read and truncated by
+the next write. This message means a **complete** record cannot be decoded or
+validated, which in practice means a hand edit or bit rot. Failing closed is
+deliberate: skipping the line could resurrect a run an operator durably retired.
+
+Repair it with the daemon stopped. The file is a plain JSONL index, not a hash
+chain, so removing the offending line is sufficient and nothing downstream needs
+re-verifying:
+
+```console
+$ systemctl --user stop tally
+$ sed -n '<N>p' ~/.local/share/tally/flow-lineage.jsonl   # inspect it first
+$ sed -i '<N>d' ~/.local/share/tally/flow-lineage.jsonl
+$ systemctl --user start tally
+```
+
+Removing a line forgets that one rollover: the run it retired is no longer
+refused on replay, and its successor is no longer reachable through
+`tally query lineage`. Re-record it with `tally flow supersede` if it still
+applies.
 
 ## Oversized wire frame
 

@@ -37,7 +37,8 @@ The wire error object is:
 | `epoch_changed` | Declared transient lease-generation code used by the flow client's retry classification; current daemon lease errors are mapped differently and do not emit it. | 1 |
 | `dedup-key-conflict` | Full-mode dedup key already governs a different canonical payload. | 1 |
 | `flow-node-cap` | Admitting the node would exceed the capsule's run-scoped `maxNodes`. | 1 |
-| `flow-lineage-conflict` | A `flow.supersede` call contradicts durable lineage: the run already has a different successor, the successor already has a predecessor, the rollover would close a cycle, the predecessor still has unfinished nodes, or the successor has already started. | 1 |
+| `flow-lineage-conflict` | A `flow.supersede` call contradicts durable lineage: the run already has a different successor, the successor already has a predecessor, the rollover would close a cycle, the predecessor still has unfinished nodes, the successor has already started, or the predecessor's own rows disagree about a pinned hash. | 1 |
+| `flow-lineage-unusable` | The durable lineage index holds a complete record that cannot be decoded or validated. Every flow start reads that index, so this blocks flow runs until the file is repaired. Carries `data.transient: false` and `data.resolution: "repair-lineage-ledger"`. | 1 |
 | `storage-budget-exceeded` | A daemon-owned store crossed its allocated-byte hard limit or its filesystem fell below `minimumFreeBytes`. New intake is refused; admitted work and queries continue. | 1 |
 | `storage-monitor-unavailable` | The cached monitor reports an I/O or state failure and cannot make a safe budget decision. New intake is refused; admitted work and queries continue. | 1 |
 
@@ -154,42 +155,70 @@ same run would contradict already recorded identity: the same ordinal resolved t
 canonical work, or the script, arguments, or catalog identity changed after the run began.
 Automation should stop and investigate rather than retry either class in place.
 
-### Branching on exit 20 without reading prose
+### Branching on a failure without reading prose
 
-Exit 20 is a family, and an unattended supervisor must be able to tell a permanent identity
-refusal from a transient daemon or transport failure without parsing a message. The three
-startup identity pins carry these `details` alongside `recordedHash` and `currentHash`:
+An unattended supervisor must be able to tell a permanent refusal from a transient daemon or
+transport failure without parsing a message. Every classified flow error carries two `details`
+fields for exactly that:
 
-| Field | Value |
+| Field | Meaning |
 |---|---|
-| `flowRunId` | The run that was refused. |
-| `divergentInput` | `script`, `args`, or `catalog`. |
-| `transient` | `false`. Retrying the same command reproduces this exactly. |
-| `resolution` | `supersede`. The operation that clears it is `tally flow supersede`, not a retry. |
+| `transient` | `true` when repeating the identical command can produce a different answer; `false` when it cannot. |
+| `resolution` | The bounded operation that clears it: `retry`, `supersede`, `run-successor`, `investigate`, or `repair-lineage-ledger`. |
 
-`flow-run-superseded` is the one exit-20 code that names its own remedy. It is raised at startup,
-before any hash comparison, when a durable rollover already retired the run ID:
+The classification is fixed per code and is the same wherever the error was raised — the
+runner's own startup scan, a daemon refusal handed back mid-run, or the client's translation of
+an RPC code. One wire code never has two `details` contracts.
 
-| Field | Value |
-|---|---|
-| `flowRunId` | The retired run. |
-| `successorFlowRunId` | The run to start instead. |
-| `reason`, `recordedAt` | The recorded rollover reason and timestamp. |
-| `transient` | `false`. |
-| `resolution` | `run-successor`. |
+| Code | `transient` | `resolution` | Also carries |
+|---|---|---|---|
+| `script-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "script"`, `recordedHash`, `currentHash` |
+| `args-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "args"`, `recordedHash`, `currentHash` |
+| `catalog-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "catalog"`, `recordedHash`, `currentHash` |
+| `flow-run-superseded` | `false` | `run-successor` | `flowRunId`, `successorFlowRunId`, `reason`, `recordedAt` |
+| `replay-divergence` | `false` | `investigate` | `expectedHash`, `recordedHash`, labels. A rollover does **not** clear it: the same ordinal re-derived different work, which is a question about the script or the configuration. |
+| `script-history-conflict`, `args-history-conflict`, `catalog-history-conflict` | `false` | `investigate` | The run's own history already holds more than one hash. |
+| `flow-lineage-conflict` | `false` | `investigate` | The supersede contradicts durable lineage. |
+| `flow-lineage-unusable` | `false` | `repair-lineage-ledger` | The durable lineage index holds an undecodable complete record. |
+| `daemon-unreachable`, `daemon-timeout`, `daemon-epoch-changed` | `true` | `retry` | The codes the flow client's own re-arm classification already retries. |
 
-A supervisor that persists one run ID per work item can therefore recover on its own: on a
-`transient: false` identity refusal it calls `flow.supersede` with a fresh UUID, and on
-`flow-run-superseded` it adopts `successorFlowRunId` — including after its own restart, because
-both operations are idempotent. Nothing else about exit 20 changed: replay is still refused, and
-neither the old run nor its history is ever rewritten.
+**A code carrying neither field is unclassified — not transient.** Absence means tally has no
+recommendation for that code, so treat it as an escalation rather than assuming a retry is safe.
 
-Two edges of that mapping are worth knowing before you build automation on it.
+#### The recipe that actually works
+
+A supervisor that persists one run ID per work item can recover unattended, but two details of
+the real behaviour matter and are easy to get wrong:
+
+1. **Persist the successor UUID before calling `flow.supersede`.** Idempotency is keyed on the
+   identical `(flowRunId, successorFlowRunId, reason)` triple. Minting a *fresh* UUID on every
+   attempt is not idempotent: the second call is a `flow-lineage-conflict`, because the run
+   already has a durable successor and a rollover is never rewritten. Mint the successor once,
+   write it down, then call.
+2. **On `flow-lineage-conflict`, read `query.lineage` and adopt `supersededBy`.** That is the
+   recovery for a supervisor that crashed after calling but before persisting: the answer is
+   already durable, and `currentFlowRunId` names the run to start.
+3. **Cancel a live predecessor first.** The incident shape is a runner stopped *mid-flow*, so its
+   run usually still has unfinished nodes. `flow.supersede` refuses those with
+   `flow-lineage-conflict` rather than stranding them; issue `queue.cancel` with the `flowRunId`
+   and then supersede.
+4. **A run with no durable node is refused as `not_found`.** Such a run never recorded a script
+   hash, so it can never trip an identity pin and never needs retiring; the refusal is how a
+   typo'd or mis-rendered run ID is caught instead of being recorded against nothing.
+
+Run IDs are canonicalized to hyphenated lowercase on both write and read, so an upper-case,
+unhyphenated, or braced rendering names the same run everywhere.
+
+Nothing else about exit 20 changed: replay is still refused, and neither the old run nor its
+history is ever rewritten.
+
+Two edges of the exit mapping are worth knowing before you build automation on it.
 
 `script-history-conflict`, `args-history-conflict`, and `catalog-history-conflict` are raised when
 a run's own recorded history already contains more than one hash. They carry the `FlowReplayError`
 name, so they read like the exit-20 family, but they are not in the exit-20 list and **exit 1**.
-Branch on the `code`, not on the `name` and not on the exit code alone.
+Branch on the `code`, not on the `name` and not on the exit code alone. Their `transient` /
+`resolution` pair says the same thing the exit code does not: permanent, and not a supersede.
 
 `runtime-limit` is assigned to every `RangeError`, including one the script threw itself. A
 deliberate `throw new RangeError("page out of range")` is therefore reported as a runtime-limit

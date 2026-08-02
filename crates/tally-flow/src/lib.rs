@@ -23,7 +23,7 @@ pub use catalog::{
 pub use client::{FlowClient, FlowFuture};
 pub use dialect::{check_script, validate_flow_pool_predicates, CheckOptions, CheckedFlow, Meta};
 pub use engine::{run_script, LifecycleSink, RunOptions, VecLifecycleSink};
-pub use error::{FlowError, SourceLocation};
+pub use error::{with_recovery_facts, FlowError, SourceLocation};
 pub use model::{
     flow_canonical_payload_fields, node_spec_fields, sugar_reserved_fields, Admission, ClientError,
     Derivation, DerivationOutput, Disposition, FlowEnqueueFieldDisposition, FlowEnqueueFieldParity,

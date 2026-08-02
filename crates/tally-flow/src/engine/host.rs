@@ -582,6 +582,7 @@ impl HostShared {
                     admission.recorded_label.clone().unwrap_or_default(),
                 )
             };
+            let error = crate::error::with_recovery_facts(error);
             self.set_fatal(error.clone());
             return Err(error);
         }

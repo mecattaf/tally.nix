@@ -594,10 +594,16 @@ $ tally flow supersede \
 `catalog-changed`, or `operator`. The old run keeps every row, witness, and history record it
 had; only the relationship becomes durable. Repeating the identical command answers
 `disposition: "reused"` and writes nothing, so an unattended supervisor may retry it after its
-own restart. Afterwards, replaying the old ID exits 20 with `flow-run-superseded` naming the
-successor, and the successor — which must not have started yet — runs as an ordinary fresh run.
-A supersede that contradicts durable lineage, or that would strand unfinished nodes, is refused
-with `flow-lineage-conflict` and exits 1.
+own restart — but idempotency is keyed on the whole triple, so persist the successor UUID before
+calling rather than minting a fresh one each attempt. Afterwards, replaying the old ID exits 20
+with `flow-run-superseded` naming the successor, and the successor — which must not have started
+yet — runs as an ordinary fresh run.
+
+Run IDs are canonicalized to hyphenated lowercase, so a pasted upper-case or unhyphenated UUID
+names the same run as the runner's own rendering. `--flow-run-id` must name a run that already
+has a durable node; anything else exits 4 (`not_found`), which is how a typo is caught rather
+than recorded against nothing. A supersede that contradicts durable lineage, or that would
+strand unfinished nodes, is refused with `flow-lineage-conflict` and exits 1.
 
 ### Catalog is flag-only
 
