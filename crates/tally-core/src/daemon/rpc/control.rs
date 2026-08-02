@@ -60,19 +60,18 @@ impl DaemonHandler {
             } else {
                 (
                     None,
-                    Some(reconstruct_job_result(
-                        &mut context,
-                        &self.executor,
-                        &stable,
-                        resolved_attempt,
-                    )),
+                    Some(terminal_witness(&mut context, &stable, resolved_attempt)),
                 )
             }
         };
         if let Some(registration) = registration {
             return await_registration(registration).await;
         }
-        witness_lookup.expect("terminal witness lookup was selected above")
+        project_job_result(
+            witness_lookup.expect("terminal witness lookup was selected above"),
+            self.executor.clone(),
+        )
+        .await
     }
 
     pub(crate) async fn await_barrier(&self, params: Option<Value>) -> Result<Value, WireError> {
@@ -124,12 +123,7 @@ impl DaemonHandler {
             } else {
                 (
                     None,
-                    Some(reconstruct_job_result(
-                        &mut context,
-                        &self.executor,
-                        &stable,
-                        Some(attempt),
-                    )),
+                    Some(terminal_witness(&mut context, &stable, Some(attempt))),
                     stable.clone(),
                 )
             }
@@ -137,7 +131,11 @@ impl DaemonHandler {
         let result = if let Some(registration) = registration {
             await_registration(registration).await?
         } else {
-            witness_lookup.expect("terminal barrier lookup was selected above")?
+            project_job_result(
+                witness_lookup.expect("terminal barrier lookup was selected above"),
+                self.executor.clone(),
+            )
+            .await?
         };
         Ok(single_job_barrier_value(&params.barrier, &stable, result))
     }
@@ -624,21 +622,41 @@ pub(crate) fn lease_wire(error: LeaseError) -> WireError {
     }
 }
 
-fn reconstruct_job_result(
+/// Resolve the terminal witness a durable wait must answer from.
+///
+/// Deliberately stops at the record. Projecting it into a `JobResult` reads
+/// retained capture files and takes the per-unit capture lock, and this runs
+/// under the daemon's context write lock on the single-threaded RPC runtime —
+/// so the file work is handed to [`project_job_result`] once that lock is
+/// released.
+fn terminal_witness(
     context: &mut Context,
-    executor: &Executor,
     stable: &str,
     attempt: Option<u32>,
-) -> Result<Value, WireError> {
-    let record = context
+) -> Result<WitnessRecord, WireError> {
+    context
         .witness_view
         .latest_for_task(stable, attempt)
         .map_err(internal_wire)?
         .ok_or_else(|| {
             let suffix = attempt.map_or_else(String::new, |attempt| format!(" attempt {attempt}"));
             WireError::not_found(format!("job {stable}{suffix} has no terminal witness"))
-        })?;
-    Ok(job_result_from_witness(&record, executor).value())
+        })
+}
+
+/// Project a terminal witness into a wire `JobResult` off the async runtime.
+///
+/// `job_result_from_witness` materializes the failure-stderr projection, which
+/// opens files and blocks on `flock`. Neither belongs on an async worker thread,
+/// and the callers below have already dropped the context write lock.
+async fn project_job_result(
+    record: Result<WitnessRecord, WireError>,
+    executor: Executor,
+) -> Result<Value, WireError> {
+    let record = record?;
+    tokio::task::spawn_blocking(move || job_result_from_witness(&record, &executor).value())
+        .await
+        .map_err(|error| internal_wire(error.to_string()))
 }
 
 fn job_result_from_witness(record: &WitnessRecord, executor: &Executor) -> JobResult {

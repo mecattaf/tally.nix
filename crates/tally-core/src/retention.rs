@@ -10,7 +10,10 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::brief::{self, BriefError};
-use crate::executor::{Uuid, CAPTURE_ARCHIVE_DIRECTORY, UNIT_EXIT_DIRECTORY};
+use crate::executor::{
+    Uuid, CAPTURE_ARCHIVE_DIRECTORY, CAPTURE_LOCK_DIRECTORY, CAPTURE_LOCK_SUFFIX,
+    LEGACY_CAPTURE_LOCK_DIRECTORY,
+};
 use crate::nix_store::GcRootBackend;
 use crate::producers::{pending_ingress_brief_paths, ProducerError, INGRESS_LOCK_FILE_NAME};
 use crate::taskdb::{read_acknowledged_events, TaskDbError};
@@ -18,7 +21,6 @@ use crate::witness::{is_nix_store_path, read_verified_records, WitnessError, Wit
 
 const ROOT_DIRECTORY_PREFIX: &str = "witness-";
 const EVENTS_DIRECTORY: &str = "events";
-const CAPTURE_LOCK_SUFFIX: &str = ".capture.lock";
 
 /// Ratified state-directory retention envelope.
 ///
@@ -716,11 +718,12 @@ struct StateSweep {
 /// additionally guarded by the producer ingress lock, because the daemon renames
 /// consumed event files into `done`/`rejected` while holding it.
 ///
-/// `unit-exit/` is swept for `<uuid>.capture.lock` files only. The exit records
-/// beside them are durable recovery input and keep their "no pruner, do not
-/// prune by age" envelope; the lock files are pure mutual-exclusion state that
-/// the failed-stderr reconciler re-mints for every historically failed task at
-/// every startup, so they accumulate one per dead task forever.
+/// Capture locks are swept in both places they can be found: the live
+/// `capture-lock/` directory, and `unit-exit/`, where they lived before the
+/// relocation off the job-writable path. Nothing mints a lock in `unit-exit/`
+/// any more, so that population only drains. In `unit-exit/` the sweep touches
+/// `<uuid>.capture.lock` names only — the exit records beside them are durable
+/// recovery input and keep their "no pruner, do not prune by age" envelope.
 fn sweep_state_directory(
     state_dir: &Path,
     policy: &StateRetentionPolicy,
@@ -731,12 +734,9 @@ fn sweep_state_directory(
     let archive_root = state_dir.join(CAPTURE_ARCHIVE_DIRECTORY);
     let capture_cutoff = mtime_cutoff(now, policy.capture_archive_max_age)?;
     prune_capture_archives(&archive_root, capture_cutoff, dry_run, &mut sweep)?;
-    prune_capture_locks(
-        &state_dir.join(UNIT_EXIT_DIRECTORY),
-        capture_cutoff,
-        dry_run,
-        &mut sweep,
-    )?;
+    for locks in [CAPTURE_LOCK_DIRECTORY, LEGACY_CAPTURE_LOCK_DIRECTORY] {
+        prune_capture_locks(&state_dir.join(locks), capture_cutoff, dry_run, &mut sweep)?;
+    }
 
     let events_dir = state_dir.join(EVENTS_DIRECTORY);
     if !events_dir.is_dir() {
@@ -838,12 +838,13 @@ fn prune_capture_archives(
     Ok(())
 }
 
-/// Prunes dead `<uuid>.capture.lock` files from the daemon's `unit-exit/`
-/// directory under the capture-archive horizon.
+/// Prunes dead `<uuid>.capture.lock` files from one directory under the
+/// capture-archive horizon.
 ///
-/// Only the lock files are candidates. The exit records beside them are durable
-/// recovery input and keep their standing "do not prune by age" envelope; this
-/// pruner never opens, examines, or removes one.
+/// Only the lock files are candidates. In the legacy `unit-exit/` location the
+/// exit records sit beside them; those are durable recovery input and keep their
+/// standing "do not prune by age" envelope, so this pruner never opens,
+/// examines, or removes one.
 ///
 /// Two independent checks gate every unlink, because neither is sufficient
 /// alone. `flock` does not touch mtime, and re-opening an existing lock file
@@ -855,19 +856,23 @@ fn prune_capture_archives(
 /// must be both older than the cutoff *and* provably free right now, where
 /// "free" is proven by the non-blocking exclusive lock this sweep takes itself
 /// and holds across the unlink. A held lock is skipped whatever its mtime says.
+///
+/// The remaining window — a locker blocked on the lock while the sweep unlinks
+/// it — is closed on the locker's side: it re-stats after `flock` returns and
+/// reopens if the name no longer resolves to the inode it holds.
 fn prune_capture_locks(
-    unit_exit_dir: &Path,
+    lock_dir: &Path,
     cutoff: SystemTime,
     dry_run: bool,
     sweep: &mut StateSweep,
 ) -> Result<(), RetentionError> {
-    if !unit_exit_dir.is_dir() {
+    if !lock_dir.is_dir() {
         return Ok(());
     }
-    let mut entries = std::fs::read_dir(unit_exit_dir)
-        .map_err(|source| io_error(unit_exit_dir, source))?
+    let mut entries = std::fs::read_dir(lock_dir)
+        .map_err(|source| io_error(lock_dir, source))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|source| io_error(unit_exit_dir, source))?;
+        .map_err(|source| io_error(lock_dir, source))?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
     for entry in entries {
         let path = entry.path();
@@ -1562,17 +1567,24 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
         ledger_only_state(&data, now);
 
-        let unit_exit = state.join(UNIT_EXIT_DIRECTORY);
+        // The live location plus the pre-relocation one: the sweep drains both,
+        // and the legacy population only ever shrinks because nothing mints
+        // there any more.
+        let unit_exit = state.join(LEGACY_CAPTURE_LOCK_DIRECTORY);
+        let live_locks = state.join(CAPTURE_LOCK_DIRECTORY);
         let dead = Uuid::new_v4();
         let held = Uuid::new_v4();
         let young = Uuid::new_v4();
+        let live_dead = Uuid::new_v4();
         let dead_lock = unit_exit.join(format!("{dead}{CAPTURE_LOCK_SUFFIX}"));
         let held_lock = unit_exit.join(format!("{held}{CAPTURE_LOCK_SUFFIX}"));
         let young_lock = unit_exit.join(format!("{young}{CAPTURE_LOCK_SUFFIX}"));
+        let live_dead_lock = live_locks.join(format!("{live_dead}{CAPTURE_LOCK_SUFFIX}"));
         write_aged(&dead_lock, chrono::TimeDelta::days(31), now);
         // Older than the dead one and still live: mtime alone would condemn it.
         write_aged(&held_lock, chrono::TimeDelta::days(40), now);
         write_aged(&young_lock, chrono::TimeDelta::days(29), now);
+        write_aged(&live_dead_lock, chrono::TimeDelta::days(31), now);
 
         // Exit records and capture generations are durable recovery input.
         let exit_record = unit_exit.join(format!("{dead}.json"));
@@ -1599,9 +1611,10 @@ mod tests {
             collect: false,
         };
         let dry = run_gc(request.clone(), &FakeBackend::default()).unwrap();
-        assert_eq!(dry.capture_locks_examined, 3);
-        assert_eq!(dry.capture_locks_pruned, 1);
+        assert_eq!(dry.capture_locks_examined, 4);
+        assert_eq!(dry.capture_locks_pruned, 2);
         assert!(dead_lock.exists());
+        assert!(live_dead_lock.exists());
 
         let report = run_gc(
             GcRequest {
@@ -1611,9 +1624,10 @@ mod tests {
             &FakeBackend::default(),
         )
         .unwrap();
-        assert_eq!(report.capture_locks_examined, 3);
-        assert_eq!(report.capture_locks_pruned, 1);
+        assert_eq!(report.capture_locks_examined, 4);
+        assert_eq!(report.capture_locks_pruned, 2);
         assert!(!dead_lock.exists());
+        assert!(!live_dead_lock.exists());
         assert!(held_lock.exists());
         assert!(young_lock.exists());
         assert!(exit_record.exists());

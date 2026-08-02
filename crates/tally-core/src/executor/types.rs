@@ -2,6 +2,24 @@ use super::*;
 
 pub const CAPTURE_DIRECTORY: &str = "capture";
 pub const CAPTURE_ARCHIVE_DIRECTORY: &str = "capture/archive";
+/// Where per-unit capture mutual-exclusion locks live.
+///
+/// A sibling of `unit-exit/`, deliberately not inside it: the `strict` and
+/// `production` hardening presets grant a job write access to that whole
+/// directory, because its `ExecStopPost` recorder writes the exit record there.
+/// The presets grant the two current capture streams by name and no capture
+/// directory at all, so a top-level sibling is outside every one of them. A lock
+/// the daemon may have to wait on must not be a file a job can create, replace,
+/// or hold.
+pub const CAPTURE_LOCK_DIRECTORY: &str = "capture-lock";
+/// Where capture locks lived before they moved to [`CAPTURE_LOCK_DIRECTORY`].
+///
+/// Nothing takes a lock here any more. The single remaining reader is the
+/// retention sweep, which drains the historical population; keeping the old
+/// location spelled exactly once stops the sweep and the relocation drifting
+/// apart.
+pub const LEGACY_CAPTURE_LOCK_DIRECTORY: &str = UNIT_EXIT_DIRECTORY;
+pub const CAPTURE_LOCK_SUFFIX: &str = ".capture.lock";
 pub const UNIT_EXIT_DIRECTORY: &str = "unit-exit";
 pub const UNIT_EXIT_SCHEMA_VERSION: u32 = 2;
 pub(super) const OPTIONAL_TALLY_ENVIRONMENT: [&str; 15] = [

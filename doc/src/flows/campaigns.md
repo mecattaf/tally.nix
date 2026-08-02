@@ -373,7 +373,10 @@ once, without widening external campaign admission.
 
 `postFailureEvidence` posts one comment for each failed attempt, so retries can
 accumulate several receipts. `postFailureStderr` requires it and adds only the
-bounded, conservatively redacted tail. Redaction cannot recognize every
+bounded, conservatively redacted tail. The receipt states how much redaction
+removed: `stderrRedacted` says whether anything was dropped and
+`stderrRedactions` counts the replacements, so one dropped token reads
+differently from forty dropped lines. Redaction cannot recognize every
 application secret; leave both defaults off for a public repository unless the
 publication policy has been deliberately reviewed. Both the mention and
 pass-continuation producers inherit these settings.
