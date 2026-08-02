@@ -6,6 +6,46 @@ authorized.
 
 ## [Unreleased]
 
+### Added
+
+- **A witnessed successor path for fatal replay divergence (#251).** Replay
+  identity refusals are correct, but a refusal alone was not a recovery: a
+  supervised runner that persists one `flowRunId` per work item and retries it
+  across Nix/Home Manager activations could only re-observe
+  `script-changed-mid-run` or `args-changed-mid-run` forever, because the old
+  generation's script or `args.tools` store path no longer existed and nothing
+  durable said the run had been abandoned. Three such items adjacent in a
+  worklist tripped a supervisor's failure fuse on every pass and starved
+  thousands of independent later items.
+
+  `tally flow supersede --flow-run-id OLD --new-flow-run-id NEW --reason
+  generation-change` (RPC `flow.supersede`) records that transition durably in
+  `<dataDir>/flow-lineage.jsonl`. The old run is preserved unchanged — same
+  rows, witnesses, and history; the successor is not created and inherits
+  nothing, so reusing application artifacts across the boundary remains the
+  consumer's concern. Reasons are closed (`generation-change`, `script-changed`,
+  `args-changed`, `catalog-changed`, `operator`), and the daemon records the
+  abandoned generation's own script/args/catalog hashes from its rows rather
+  than trusting the caller. Repeating the identical call answers
+  `disposition: "reused"` and writes nothing, so an unattended supervisor may
+  issue it, crash, and issue it again. Contradictions fail closed with the new
+  `flow-lineage-conflict` wire code: a second different successor, a successor
+  already claimed by another predecessor, a rollover that would close a cycle, a
+  predecessor with unfinished nodes, or a successor that already started.
+
+  Replaying a superseded ID is refused before any hash comparison with the new
+  `flow-run-superseded` code (exit 20), which names `successorFlowRunId`, the
+  reason, and the timestamp. The three startup identity pins now also carry
+  `flowRunId`, `divergentInput`, `transient: false`, and `resolution`, so a
+  supervisor distinguishes a permanent identity refusal from a transient daemon
+  or transport failure without parsing prose.
+
+  New `query.lineage` / `tally query lineage RUN` reports `superseded`,
+  `supersededBy`, `supersedes`, the whole `chain` oldest-first, and
+  `currentFlowRunId`; a run with no rollover answers an empty lineage rather
+  than `not_found`. `query.run` gained `supersededBy`/`supersedes` and the new
+  `superseded` state, which the human rendering prints above the task board.
+
 ### Fixed
 
 - Repaired the wave-3 residue sweep (#332 repair): the capability probe read

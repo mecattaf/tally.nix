@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::flow_lineage::{FlowLineage, FlowSupersedeRecord};
 use crate::history::{LifecycleRecord, LifecycleSnapshot, RetentionMetadata};
 use crate::journal::TallyEvent;
 use crate::provenance::{Orchestration, TaskRef};
@@ -929,6 +930,9 @@ pub enum RunState {
     Advanced,
     NeedsAttention,
     Idle,
+    /// A durable rollover named a successor for this run. It is terminal:
+    /// replaying it is refused, and nothing will advance it again.
+    Superseded,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1033,6 +1037,12 @@ pub struct RunView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository: Option<String>,
     pub state: RunState,
+    /// The rollover that made this run terminal, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<FlowSupersedeRecord>,
+    /// The rollover that created this run, when it is itself a successor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<FlowSupersedeRecord>,
     pub counts: RunTaskCounts,
     pub tasks: Vec<RunTaskProjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1468,6 +1478,8 @@ pub fn query_run(
             .as_ref()
             .map(|result| result.repository.clone()),
         state,
+        superseded_by: None,
+        supersedes: None,
         counts,
         tasks,
         anomalies,
@@ -1475,6 +1487,20 @@ pub fn query_run(
         failures,
         snapshot: snapshot_metadata(history, witness),
     })
+}
+
+/// Overlay durable generation lineage onto a projected run view.
+///
+/// Kept out of [`query_run`] because lineage is a different durable store from
+/// the rows, history, and witness the projection reads; the handler joins them.
+/// A superseded run's state is unconditional: it has an explicit, durable
+/// successor, so it is terminal no matter what its own rows say.
+pub fn apply_run_lineage(view: &mut RunView, lineage: &FlowLineage) {
+    view.superseded_by = lineage.superseded_by(&view.flow_run_id).cloned();
+    view.supersedes = lineage.supersedes(&view.flow_run_id).cloned();
+    if view.superseded_by.is_some() {
+        view.state = RunState::Superseded;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3246,6 +3272,74 @@ mod tests {
         .unwrap();
         assert!(finished.tasks.is_empty());
         assert_eq!(finished.state, RunState::Complete);
+    }
+
+    #[test]
+    fn a_superseded_run_reads_as_terminal_and_names_both_ends_of_the_boundary() {
+        let old_run = "00000000-0000-4000-8000-000000000249";
+        let new_run = "00000000-0000-4000-8000-00000000024a";
+        let node = flow_node_detail(old_run, RowStatus::Completed);
+        let witness = terminal_witness(
+            &node.task_uuid,
+            Verdict::Pass,
+            node.orchestration.clone().unwrap(),
+        );
+        let now = parse_timestamp("2026-08-01T10:00:12.000Z").unwrap();
+        let project = |flow_run: &str| {
+            query_run(
+                flow_run,
+                std::slice::from_ref(&node),
+                &[],
+                &history(),
+                std::slice::from_ref(&witness),
+                now,
+            )
+            .unwrap()
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(crate::flow_lineage::FLOW_LINEAGE_FILE);
+        crate::flow_lineage::record_supersede(
+            &path,
+            old_run,
+            new_run,
+            crate::flow_lineage::SupersedeReason::GenerationChange,
+            &crate::flow_lineage::PredecessorPins::default(),
+        )
+        .unwrap();
+        let lineage = FlowLineage::read(&path).unwrap();
+
+        // Every node passed, so without lineage this run reads Complete. The
+        // durable rollover outranks that: it is retired, not finished.
+        let mut retired = project(old_run);
+        assert_eq!(retired.state, RunState::Complete);
+        apply_run_lineage(&mut retired, &lineage);
+        assert_eq!(retired.state, RunState::Superseded);
+        assert_eq!(
+            retired
+                .superseded_by
+                .as_ref()
+                .unwrap()
+                .successor_flow_run_id,
+            new_run
+        );
+        assert!(retired.supersedes.is_none());
+
+        // The successor points back without inheriting terminality.
+        let mut successor = project(old_run);
+        successor.flow_run_id = new_run.to_owned();
+        apply_run_lineage(&mut successor, &lineage);
+        assert_eq!(successor.state, RunState::Complete);
+        assert!(successor.superseded_by.is_none());
+        assert_eq!(successor.supersedes.as_ref().unwrap().flow_run_id, old_run);
+
+        // A run outside the chain gains nothing.
+        let mut unrelated = project(old_run);
+        unrelated.flow_run_id = "00000000-0000-4000-8000-00000000024b".to_owned();
+        apply_run_lineage(&mut unrelated, &lineage);
+        assert_eq!(unrelated.state, RunState::Complete);
+        assert!(unrelated.superseded_by.is_none());
+        assert!(unrelated.supersedes.is_none());
     }
 
     #[test]

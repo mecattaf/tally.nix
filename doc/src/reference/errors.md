@@ -37,6 +37,7 @@ The wire error object is:
 | `epoch_changed` | Declared transient lease-generation code used by the flow client's retry classification; current daemon lease errors are mapped differently and do not emit it. | 1 |
 | `dedup-key-conflict` | Full-mode dedup key already governs a different canonical payload. | 1 |
 | `flow-node-cap` | Admitting the node would exceed the capsule's run-scoped `maxNodes`. | 1 |
+| `flow-lineage-conflict` | A `flow.supersede` call contradicts durable lineage: the run already has a different successor, the successor already has a predecessor, the rollover would close a cycle, the predecessor still has unfinished nodes, or the successor has already started. | 1 |
 | `storage-budget-exceeded` | A daemon-owned store crossed its allocated-byte hard limit or its filesystem fell below `minimumFreeBytes`. New intake is refused; admitted work and queries continue. | 1 |
 | `storage-monitor-unavailable` | The cached monitor reports an I/O or state failure and cannot make a safe budget decision. New intake is refused; admitted work and queries continue. | 1 |
 
@@ -145,13 +146,43 @@ Exit classification uses the stable `code` field, not `name`:
 | 2 | `flow-run-id-missing`, `flow-run-id-invalid`, `runner-identity-invalid`, `runner-identity-incomplete`, `workload-mutex-parent-required` |
 | 4 | `flow-cancelled` |
 | 10 | `script-syntax`, `script-encoding`, `script-evaluation`, `script-exception`, `unhandled-rejection`, `determinism-violation`, `iteration-cap`, `runtime-limit`, `microtask-budget`, `wall-clock-budget` |
-| 20 | `replay-divergence`, `script-changed-mid-run`, `args-changed-mid-run`, `catalog-changed-mid-run` |
+| 20 | `replay-divergence`, `script-changed-mid-run`, `args-changed-mid-run`, `catalog-changed-mid-run`, `flow-run-superseded` |
 | 1 | Every other flow error code, including admission, catalog, schema, node, capture, and client failures |
 
 Exit 10 groups bugs or bounded failures in the script/evaluator. Exit 20 means continuing the
 same run would contradict already recorded identity: the same ordinal resolved to different
 canonical work, or the script, arguments, or catalog identity changed after the run began.
 Automation should stop and investigate rather than retry either class in place.
+
+### Branching on exit 20 without reading prose
+
+Exit 20 is a family, and an unattended supervisor must be able to tell a permanent identity
+refusal from a transient daemon or transport failure without parsing a message. The three
+startup identity pins carry these `details` alongside `recordedHash` and `currentHash`:
+
+| Field | Value |
+|---|---|
+| `flowRunId` | The run that was refused. |
+| `divergentInput` | `script`, `args`, or `catalog`. |
+| `transient` | `false`. Retrying the same command reproduces this exactly. |
+| `resolution` | `supersede`. The operation that clears it is `tally flow supersede`, not a retry. |
+
+`flow-run-superseded` is the one exit-20 code that names its own remedy. It is raised at startup,
+before any hash comparison, when a durable rollover already retired the run ID:
+
+| Field | Value |
+|---|---|
+| `flowRunId` | The retired run. |
+| `successorFlowRunId` | The run to start instead. |
+| `reason`, `recordedAt` | The recorded rollover reason and timestamp. |
+| `transient` | `false`. |
+| `resolution` | `run-successor`. |
+
+A supervisor that persists one run ID per work item can therefore recover on its own: on a
+`transient: false` identity refusal it calls `flow.supersede` with a fresh UUID, and on
+`flow-run-superseded` it adopts `successorFlowRunId` — including after its own restart, because
+both operations are idempotent. Nothing else about exit 20 changed: replay is still refused, and
+neither the old run nor its history is ever rewritten.
 
 Two edges of that mapping are worth knowing before you build automation on it.
 

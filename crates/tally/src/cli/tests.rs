@@ -234,6 +234,7 @@ fn flow_failure_taxonomy_has_distinguished_exit_codes() {
     assert_eq!(exit_code("script-changed-mid-run"), 20);
     assert_eq!(exit_code("args-changed-mid-run"), 20);
     assert_eq!(exit_code("catalog-changed-mid-run"), 20);
+    assert_eq!(exit_code("flow-run-superseded"), 20);
     assert_eq!(exit_code("flow-run-id-missing"), 2);
     assert_eq!(exit_code("runner-identity-incomplete"), 2);
     assert_eq!(exit_code("workload-mutex-parent-required"), 2);

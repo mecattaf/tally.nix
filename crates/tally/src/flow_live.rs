@@ -6,11 +6,12 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use tally_client::{is_rearmable_rpc_error, RpcClient, WireErrorCode, WireIoError};
+use tally_core::flow_lineage::FLOW_LINEAGE_SCHEMA_VERSION;
 use tally_core::query::QUERY_PROTOCOL_VERSION;
 use tally_core::taskdb::RelatedTrigger;
 use tally_flow::{
     Admission, ClientError, Disposition, FlowClient, FlowFuture, FlowSubmission, LifecycleSink,
-    NodeFailure, NodeResult, RunInspection, TaskRef, Verdict,
+    NodeFailure, NodeResult, RunInspection, RunSupersede, TaskRef, Verdict,
 };
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -115,6 +116,43 @@ impl LiveFlowClient {
         let related_trigger = parse_runner_related_trigger(&response, &task_uuid)?;
         self.runner.lock().await.related_trigger = related_trigger;
         Ok(())
+    }
+
+    /// Ask the daemon whether this run ID was durably retired.
+    ///
+    /// The lineage ledger has its own `schemaVersion`, not the paginated query
+    /// envelope's, so this reads the record directly.
+    async fn inspect_supersede(
+        &self,
+        flow_run_id: &str,
+    ) -> Result<Option<RunSupersede>, ClientError> {
+        let response = self
+            .call("query.lineage", json!({"flowRun": flow_run_id}))
+            .await
+            .map_err(client_error)?;
+        if required_u32(&response, &["schemaVersion"])? != FLOW_LINEAGE_SCHEMA_VERSION {
+            return Err(protocol_error(
+                "query.lineage returned an unsupported schemaVersion",
+            ));
+        }
+        let Some(record) = response
+            .get("supersededBy")
+            .filter(|value| !value.is_null())
+        else {
+            return Ok(None);
+        };
+        let field = |name: &str| {
+            record
+                .get(name)
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+                .ok_or_else(|| protocol_error(format!("query.lineage supersededBy omitted {name}")))
+        };
+        Ok(Some(RunSupersede {
+            successor_flow_run_id: field("successorFlowRunId")?,
+            reason: field("reason")?,
+            recorded_at: field("recordedAt")?,
+        }))
     }
 
     async fn connection(&self) -> Result<(u64, RpcClient), WireIoError> {
@@ -288,6 +326,15 @@ impl FlowClient for LiveFlowClient {
     ) -> FlowFuture<'a, Result<RunInspection, ClientError>> {
         Box::pin(async move {
             self.resolve_runner_related_trigger().await?;
+            // Lineage first. A superseded run is terminal by durable decision,
+            // and answering that before the row scan means the supervisor is
+            // told which run to start rather than which hash moved.
+            if let Some(supersede) = self.inspect_supersede(flow_run_id).await? {
+                return Ok(RunInspection {
+                    supersede: Some(supersede),
+                    ..RunInspection::default()
+                });
+            }
             'snapshot: loop {
                 let mut cursor: Option<String> = None;
                 let mut script_hashes = BTreeSet::new();
@@ -401,6 +448,7 @@ impl FlowClient for LiveFlowClient {
                     script_hash: script_hashes.into_iter().next(),
                     args_hash: args_hashes.into_iter().next(),
                     catalog_hash: catalog_hashes.into_iter().next().flatten(),
+                    supersede: None,
                 });
             }
         })
@@ -890,6 +938,7 @@ fn client_error(error: WireIoError) -> ClientError {
             let stable_code = match code {
                 WireErrorCode::DedupKeyConflict => "dedup-key-conflict",
                 WireErrorCode::FlowNodeCap => "flow-node-cap",
+                WireErrorCode::FlowLineageConflict => "flow-lineage-conflict",
                 WireErrorCode::StorageBudgetExceeded => "storage-budget-exceeded",
                 WireErrorCode::StorageMonitorUnavailable => "storage-monitor-unavailable",
                 WireErrorCode::InvalidParams | WireErrorCode::NotFound => "admission-denied",

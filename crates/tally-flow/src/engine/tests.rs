@@ -276,6 +276,7 @@ impl FlowClient for BudgetContinuationClient {
                     script_hash: Some(node.script_hash.clone()),
                     args_hash: Some(node.args_hash.clone()),
                     catalog_hash: node.catalog_hash.clone(),
+                    supersede: None,
                 });
         Box::pin(std::future::ready(Ok(inspection)))
     }
@@ -619,6 +620,51 @@ fn a_flow_run_refuses_a_changed_script_before_submission() {
 }
 
 #[test]
+fn a_superseded_run_refuses_to_start_and_names_its_successor() {
+    let source = format!("{}\n42;", meta(&["cpu"], &[]));
+    // The script identity also diverges. The rollover is the operator's
+    // explicit decision, so it outranks the hash comparison and the supervisor
+    // is told which run to start instead of which hash moved.
+    let client = MockClient::with_inspection(RunInspection {
+        script_hash: Some("sha256:previous-script".to_owned()),
+        args_hash: None,
+        catalog_hash: None,
+        supersede: Some(RunSupersede {
+            successor_flow_run_id: "00000000-0000-4000-8000-0000000000b2".to_owned(),
+            reason: "generation-change".to_owned(),
+            recorded_at: "2026-08-02T04:05:06.000Z".to_owned(),
+        }),
+    });
+    let error = run(&source, client.clone()).unwrap_err();
+    assert_eq!(error.name, "FlowReplayError");
+    assert_eq!(error.code, "flow-run-superseded");
+    assert_eq!(
+        error.details["successorFlowRunId"],
+        "00000000-0000-4000-8000-0000000000b2"
+    );
+    assert_eq!(error.details["reason"], "generation-change");
+    assert_eq!(error.details["recordedAt"], "2026-08-02T04:05:06.000Z");
+    assert_eq!(error.details["transient"], false);
+    assert_eq!(error.details["resolution"], "run-successor");
+    assert!(client.submissions.borrow().is_empty());
+}
+
+#[test]
+fn identity_divergence_carries_machine_readable_recovery_facts() {
+    let source = format!("{}\n42;", meta(&["cpu"], &[]));
+    let client = MockClient::with_script_hash("sha256:previous-script");
+    let error = run(&source, client).unwrap_err();
+    assert_eq!(error.code, "script-changed-mid-run");
+    assert_eq!(error.details["divergentInput"], "script");
+    assert_eq!(error.details["flowRunId"], "run-1");
+    // A supervisor branches on these two rather than on the message text: this
+    // failure will never resolve itself, and the operation that resolves it is
+    // a supersede, not a retry.
+    assert_eq!(error.details["transient"], false);
+    assert_eq!(error.details["resolution"], "supersede");
+}
+
+#[test]
 fn a_flow_run_pins_args_then_catalog_before_submission() {
     let source = format!("{}\n42;", meta(&["cpu"], &[]));
     let script_hash = sha256(source.as_bytes());
@@ -629,6 +675,7 @@ fn a_flow_run_pins_args_then_catalog_before_submission() {
         script_hash: Some(script_hash.clone()),
         args_hash: Some("sha256:previous-args".to_owned()),
         catalog_hash: None,
+        supersede: None,
     });
     let error = run_script(
         &source,
@@ -646,6 +693,7 @@ fn a_flow_run_pins_args_then_catalog_before_submission() {
         script_hash: Some(script_hash),
         args_hash: Some(args_hash),
         catalog_hash: Some("sha256:previous-catalog".to_owned()),
+        supersede: None,
     });
     let mut options = RunOptions::new("run-1", args);
     options.catalog = Some(catalog());

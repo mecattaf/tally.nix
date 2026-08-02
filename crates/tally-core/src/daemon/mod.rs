@@ -32,7 +32,7 @@ use completion::{
     substituted_witness, GhTerminalWork, TerminalWork,
 };
 pub(crate) use notify::watchdog_tick;
-use rpc::control::{find_job, lease_request, lease_wire, state_name};
+use rpc::control::{find_job, lease_request, lease_wire, lineage_wire, state_name};
 #[cfg(test)]
 use rpc::producer::{pool_loss_intent_directory, read_pool_loss_intent, write_pool_loss_intent};
 use rpc::producer::{reconcile_pool_loss_intents, PoolTransitionTask};
@@ -101,6 +101,9 @@ use crate::executor::{
     ExecutionIdentity, ExecutionOutcome, ExecutionRequest, ExecutionTermination, Executor,
     ExecutorError, UnitLimits, Uuid,
 };
+use crate::flow_lineage::{
+    record_supersede, FlowLineage, FlowLineageError, PredecessorPins, SupersedeReason,
+};
 use crate::git_ai::GitAiExecution;
 use crate::history::{HistoryError, LifecycleStore};
 use crate::journal::{EmitEvent, JournalEmitter, JournalEntry, TallyEvent};
@@ -121,10 +124,10 @@ use crate::query::{
     RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
 };
 use crate::query_v2::{
-    collapse_lifecycle_echoes, log_position_floor, log_position_head, query_flow_proofs,
-    query_job as query_job_v2, query_jobs as query_jobs_v2, query_lifecycle_log, query_proof,
-    query_run, snapshot_metadata, JobsFilter, LifecycleLogFilter, LiveJobFact, LogPosition,
-    ObservabilityError, PositionGap, RowDetailFact,
+    apply_run_lineage, collapse_lifecycle_echoes, log_position_floor, log_position_head,
+    query_flow_proofs, query_job as query_job_v2, query_jobs as query_jobs_v2, query_lifecycle_log,
+    query_proof, query_run, snapshot_metadata, JobsFilter, LifecycleLogFilter, LiveJobFact,
+    LogPosition, ObservabilityError, PositionGap, RowDetailFact,
 };
 use crate::recovery::{
     collect_durable_recovery_facts, collect_local_unit_facts, recover, DurableRecoveryFacts,
@@ -251,6 +254,13 @@ impl DaemonPaths {
 
     pub fn gcroots_dir(&self) -> PathBuf {
         self.data_dir.join("gcroots")
+    }
+
+    /// Durable predecessor/successor lineage for flow runs. Data, not state:
+    /// a rollover recorded here outlives every restart and reinstall of the
+    /// supervisor that asked for it.
+    pub fn flow_lineage_path(&self) -> PathBuf {
+        self.data_dir.join(crate::flow_lineage::FLOW_LINEAGE_FILE)
     }
 
     pub fn lifecycle_path(&self) -> PathBuf {
@@ -605,6 +615,7 @@ enum DispatchMethod {
     Pause,
     Resume,
     Cancel,
+    Supersede,
     PoolTransition,
     ProducerRuntimeObserved,
     Acquire,
@@ -623,6 +634,7 @@ const DISPATCHER_METHODS: &[(&str, DispatchMethod)] = &[
     ("queue.pause", DispatchMethod::Pause),
     ("queue.resume", DispatchMethod::Resume),
     ("queue.cancel", DispatchMethod::Cancel),
+    ("flow.supersede", DispatchMethod::Supersede),
     ("__producer.pool-transition", DispatchMethod::PoolTransition),
     (
         "__producer.runtime-observed",
@@ -634,6 +646,7 @@ const DISPATCHER_METHODS: &[(&str, DispatchMethod)] = &[
     ("query.jobs", DispatchMethod::Query),
     ("query.job", DispatchMethod::Query),
     ("query.run", DispatchMethod::Query),
+    ("query.lineage", DispatchMethod::Query),
     ("query.status", DispatchMethod::Query),
     ("query.storage", DispatchMethod::Query),
     ("query.log", DispatchMethod::Query),
@@ -669,6 +682,7 @@ impl RpcHandler for DaemonHandler {
                 Some(DispatchMethod::Pause) => self.pause(request.params).await,
                 Some(DispatchMethod::Resume) => self.resume(request.params).await,
                 Some(DispatchMethod::Cancel) => self.cancel(request.params).await,
+                Some(DispatchMethod::Supersede) => self.supersede_flow(request.params).await,
                 Some(DispatchMethod::PoolTransition) => self.pool_transition(request.params).await,
                 Some(DispatchMethod::ProducerRuntimeObserved) => {
                     self.producer_runtime_observed(request.params).await

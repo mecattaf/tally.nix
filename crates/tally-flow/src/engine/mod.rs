@@ -21,7 +21,7 @@ use crate::dialect::validate_instance;
 use crate::executor::FlowJobExecutor;
 use crate::model::{
     flow_canonical_payload_fields, is_nix_store_path, node_spec_fields, sugar_reserved_fields,
-    NodeSpecSurface, SubmissionPlan, NODE_SPEC_INTEGER_FIELDS,
+    NodeSpecSurface, RunSupersede, SubmissionPlan, NODE_SPEC_INTEGER_FIELDS,
 };
 use crate::{
     check_script, resolve_members, Admission, Catalog, CheckOptions, Derivation, Disposition,
@@ -100,10 +100,17 @@ pub fn run_script(
     })?);
     let inspection = futures_lite::future::block_on(client.inspect_run(&options.flow_run_id))
         .map_err(|error| error.into_flow(RUNTIME_ERROR_LOCATION, 0))?;
+    // A recorded rollover outranks every hash comparison below. The run was
+    // abandoned by an explicit, durable decision, so the honest answer names its
+    // successor instead of re-litigating which input moved.
+    if let Some(supersede) = inspection.supersede.as_ref() {
+        return Err(superseded_error(&options.flow_run_id, supersede));
+    }
     let recorded_run = inspection.script_hash.is_some();
     if let Some(recorded_hash) = inspection.script_hash.as_deref() {
         validate_startup_hash(
             "script-changed-mid-run",
+            "script",
             &options.flow_run_id,
             recorded_hash,
             &script_hash,
@@ -112,6 +119,7 @@ pub fn run_script(
     if let Some(recorded_hash) = inspection.args_hash.as_deref() {
         validate_startup_hash(
             "args-changed-mid-run",
+            "args",
             &options.flow_run_id,
             recorded_hash,
             &args_hash,
@@ -284,8 +292,23 @@ pub fn run_script(
     Ok(report)
 }
 
+/// Structured facts a supervisor branches on without reading prose.
+///
+/// A run-identity refusal and a lost daemon connection both stop a runner, but
+/// only one of them can ever be resolved by retrying. These fields say which is
+/// which, and what the machine-actionable next step is, so an unattended queue
+/// does not spend a night re-observing a permanent answer.
+fn replay_facts(error: FlowError, flow_run_id: &str, divergent_input: &str) -> FlowError {
+    error
+        .detail("flowRunId", flow_run_id)
+        .detail("divergentInput", divergent_input)
+        .detail("transient", false)
+        .detail("resolution", "supersede")
+}
+
 fn validate_startup_hash(
     code: &str,
+    divergent_input: &str,
     flow_run_id: &str,
     recorded_hash: &str,
     current_hash: &str,
@@ -293,14 +316,18 @@ fn validate_startup_hash(
     if recorded_hash == current_hash {
         return Ok(());
     }
-    Err(FlowError::new(
-        "FlowReplayError",
-        code,
-        format!("flow run {flow_run_id} is pinned to {recorded_hash}, not {current_hash}"),
-    )
-    .at(RUNTIME_ERROR_LOCATION)
-    .detail("recordedHash", recorded_hash)
-    .detail("currentHash", current_hash))
+    Err(replay_facts(
+        FlowError::new(
+            "FlowReplayError",
+            code,
+            format!("flow run {flow_run_id} is pinned to {recorded_hash}, not {current_hash}"),
+        )
+        .at(RUNTIME_ERROR_LOCATION)
+        .detail("recordedHash", recorded_hash)
+        .detail("currentHash", current_hash),
+        flow_run_id,
+        divergent_input,
+    ))
 }
 
 fn changed_catalog_error(
@@ -310,14 +337,45 @@ fn changed_catalog_error(
 ) -> FlowError {
     let rendered_recorded = recorded_hash.unwrap_or("<none>");
     let rendered_current = current_hash.unwrap_or("<none>");
+    replay_facts(
+        FlowError::new(
+            "FlowReplayError",
+            "catalog-changed-mid-run",
+            format!(
+                "flow run {flow_run_id} is pinned to {rendered_recorded}, not {rendered_current}"
+            ),
+        )
+        .at(RUNTIME_ERROR_LOCATION)
+        .detail("recordedHash", recorded_hash)
+        .detail("currentHash", current_hash),
+        flow_run_id,
+        "catalog",
+    )
+}
+
+/// Refuse to start a run that a durable rollover already retired.
+///
+/// This is the one replay refusal that carries its own remedy: the successor is
+/// named, so a supervisor switches to it instead of escalating to a human.
+fn superseded_error(flow_run_id: &str, supersede: &RunSupersede) -> FlowError {
     FlowError::new(
         "FlowReplayError",
-        "catalog-changed-mid-run",
-        format!("flow run {flow_run_id} is pinned to {rendered_recorded}, not {rendered_current}"),
+        "flow-run-superseded",
+        format!(
+            "flow run {flow_run_id} was superseded by {} ({}) at {}; run the successor",
+            supersede.successor_flow_run_id, supersede.reason, supersede.recorded_at
+        ),
     )
     .at(RUNTIME_ERROR_LOCATION)
-    .detail("recordedHash", recorded_hash)
-    .detail("currentHash", current_hash)
+    .detail("flowRunId", flow_run_id)
+    .detail(
+        "successorFlowRunId",
+        supersede.successor_flow_run_id.as_str(),
+    )
+    .detail("reason", supersede.reason.as_str())
+    .detail("recordedAt", supersede.recorded_at.as_str())
+    .detail("transient", false)
+    .detail("resolution", "run-successor")
 }
 
 fn evaluate_script(source: &str, path: Option<&Path>, context: &mut Context) -> JsResult<JsValue> {

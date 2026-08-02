@@ -42,12 +42,14 @@ pub const RPC_METHODS: &[&str] = &[
     "queue.drain",
     "queue.await_job",
     "queue.await_barrier",
+    "flow.supersede",
     "lease.acquire",
     "lease.release",
     "lease.status",
     "query.jobs",
     "query.job",
     "query.run",
+    "query.lineage",
     "query.status",
     "query.storage",
     "query.log",
@@ -80,6 +82,7 @@ pub fn method_class(method: &str) -> Option<MethodClass> {
         | "query.jobs"
         | "query.job"
         | "query.run"
+        | "query.lineage"
         | "query.status"
         | "query.storage"
         | "query.log"
@@ -92,9 +95,8 @@ pub fn method_class(method: &str) -> Option<MethodClass> {
         | "query.pools" => Some(MethodClass::Client),
         "lease.acquire" | "lease.release" | "lease.status" => Some(MethodClass::Job),
         "__producer.pool-transition" | "__producer.runtime-observed" => Some(MethodClass::Producer),
-        "queue.pause" | "queue.resume" | "queue.cancel" | "queue.retry" | "queue.drain" => {
-            Some(MethodClass::Admin)
-        }
+        "queue.pause" | "queue.resume" | "queue.cancel" | "queue.retry" | "queue.drain"
+        | "flow.supersede" => Some(MethodClass::Admin),
         _ => None,
     }
 }

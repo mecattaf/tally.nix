@@ -45,7 +45,9 @@ fn serve_empty_flow_history(
             }
         };
         let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let request_count = usize::from(runner_task_uuid.is_some()) + 1;
+        // Optional runner-identity lookup, then the lineage question, then the
+        // durable-row scan.
+        let request_count = usize::from(runner_task_uuid.is_some()) + 2;
         for _ in 0..request_count {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
@@ -63,6 +65,15 @@ fn serve_empty_flow_history(
                         }
                     })
                 }
+                // Every run is asked whether a durable rollover retired it,
+                // before its rows are scanned. These fixtures never supersede.
+                "query.lineage" => json!({
+                    "schemaVersion": 1,
+                    "flowRunId": request["params"]["flowRun"],
+                    "superseded": false,
+                    "chain": [request["params"]["flowRun"]],
+                    "currentFlowRunId": request["params"]["flowRun"]
+                }),
                 "query.jobs" => json!({
                     "schemaVersion": 1,
                     "protocolVersion": 4,

@@ -412,6 +412,7 @@ $ tally query storage
 $ tally query run RUN-UUID
 $ tally query run RUN-UUID --status blocked
 $ tally query run RUN-UUID --json
+$ tally query lineage RUN-UUID
 $ tally query proof --task TASK-UUID --attempt 2
 $ tally query proof --flow-run RUN-UUID
 $ tally query log --task TASK-UUID --attempt 2 --event completed
@@ -437,7 +438,13 @@ the remaining `runtimeMaxSec` budget, negative when a node has run past that bud
 section prints the retained failure capture path — or `<not retained>` when none exists — and
 the bounded stderr tail with its indentation intact. Terminal escape sequences written by an
 adapter are stripped from every human rendering. `--json` emits the same compact projection as a
-structured object.
+structured object. A run retired by `tally flow supersede` reads `superseded` whatever its own
+node verdicts say, and names its successor above the board — a reader who misses that would wait
+for progress that can never come.
+
+`query lineage` answers the generation question for any run, including one that has never been
+superseded: `superseded`, `supersededBy`, `supersedes`, the whole `chain` oldest-first, and
+`currentFlowRunId` — the run that should actually be started.
 
 `query log` prints terse human transition lines by default. Evidence observations and the
 second journal/witness representation of a terminal fact are collapsed, so a node normally
@@ -557,6 +564,24 @@ and a `node-terminal` object when its result is observed; both carry the node's 
 `dedupKey`, and `disposition`, and neither is suppressed on replay. Script/determinism errors exit 10; replay divergence or a changed script in the
 same run exits 20; flow-scoped cancellation exits 4 unless the cancelled node used
 `settle: true`. See the [full mapping](../reference/errors.md#structured-flow-errors).
+
+Retire a run that can no longer be replayed, and name what replaces it:
+
+```console
+$ tally flow supersede \
+    --flow-run-id 018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321 \
+    --new-flow-run-id 019a1c33-64d8-7f02-9b41-5b0d2e7c8a55 \
+    --reason generation-change
+```
+
+`--reason` is required and closed: `generation-change`, `script-changed`, `args-changed`,
+`catalog-changed`, or `operator`. The old run keeps every row, witness, and history record it
+had; only the relationship becomes durable. Repeating the identical command answers
+`disposition: "reused"` and writes nothing, so an unattended supervisor may retry it after its
+own restart. Afterwards, replaying the old ID exits 20 with `flow-run-superseded` naming the
+successor, and the successor — which must not have started yet — runs as an ordinary fresh run.
+A supersede that contradicts durable lineage, or that would strand unfinished nodes, is refused
+with `flow-lineage-conflict` and exits 1.
 
 ### Catalog is flag-only
 
