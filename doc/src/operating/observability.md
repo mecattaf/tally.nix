@@ -271,7 +271,7 @@ reports silence during an incident — the failure recorded in #247, where a
 `query log --flow-run` window sat unchanged for three hours while thirteen
 tasks merged.
 
-Three facts drive the contract:
+Four facts drive the contract:
 
 - The lifecycle window is ordered **oldest first**. Page one of a long run is
   therefore permanently stale by construction: it never changes no matter how
@@ -281,6 +281,11 @@ Three facts drive the contract:
   poller cannot hold one between polls.
 - `--since` is a wall-clock **time filter**. It is not a stream position and
   never was.
+- **Run membership is recomputed per call, and not every node a run submitted
+  is a member of it.** See [When a run's window is not evidence about the
+  run](#when-a-runs-window-is-not-evidence-about-the-run) below. This is the
+  one failure mode where an empty window is not a fact about the run, and it
+  is the mechanism behind the original #247 report.
 
 ### For a human at a terminal
 
@@ -305,13 +310,19 @@ $ tally query log --flow-run <id> --after "$position" --json
 
 `--after` takes a **durable** lifecycle-stream position, `log-v1:<lifecycle>:<witness>`,
 reported as `position` on every `query log` response. It survives daemon
-restarts and page-cache eviction. `position` is the head of the stream at
-projection time, not the newest matched item, so:
+restarts and page-cache eviction, so a poller can hold one between polls.
 
-> `--after <position>` returning empty `items` and the same `position` is a
-> *proof* that nothing happened, not merely an absence of matches.
+> `--after <position>` returning empty `items` means no event **after that
+> position** matched your filter. That is the signal to act on, and it is
+> sound: the filter runs on durable per-stream sequence numbers, so an
+> out-of-order timestamp cannot hide an event behind it.
 
-Two successive polls over a quiet run are identical apart from
+Read `items`, not `position`, to decide whether anything happened. `position`
+is the head of the **whole** lifecycle stream at projection time, not of your
+filter, so on any daemon doing other work — the normal case for a campaign,
+whose runner node emits lifecycle events of its own — it advances between
+polls while your filtered `items` stay empty. It is what you *hold*, not what
+you *check*. Two successive polls over an idle daemon are identical apart from
 `snapshot.createdAt`, which dates the projection rather than the stream.
 
 Rules for the loop:
@@ -330,11 +341,61 @@ Rules for the loop:
    text fields cut down and an `elided` object naming what was cut. A campaign
    runner whose argv embeds an issue body no longer makes its run
    unmonitorable. Only an item too large because of its *structure* is still
-   an error, and that error names itself.
+   an error, and that error names itself. On the default walked output the
+   `elidedItems` counter is summed across every page the command walked, so it
+   can exceed the per-page maximum of one.
+5. A terminal transition is delivered once, at the position its **journal**
+   record occupies. Tally retains two representations of a terminal fact — the
+   journal record and the canonical witness — and collapses them into one item
+   carrying the journal's cursor. If the witness lands after you have already
+   polled past that cursor, you keep the bare `completed`/`failed` transition
+   you were given and never receive the enriched row that would have carried
+   `terminalVerdict`, `exitCode`, `artifactHash`, and `laborClass`. Both
+   records are written in the same terminal handling, so the window is narrow,
+   but it is real: **do not read a terminal verdict off the incremental
+   stream.** Take it from `query proof` or a whole-window `query log`, which
+   rebuild the projection from scratch and always collapse correctly.
 
 `--since`/`--until` continue to filter by wall clock and compose with
 `--after` unchanged. Use `--since` to bound a window in time; use `--after` to
 resume a stream.
+
+### When a run's window is not evidence about the run
+
+A `--flow-run` filter does not select on a durable property of the run. Tally
+recomputes membership on every call by scanning durable rows and witness
+records for an orchestration capsule naming that run ID, and an event whose
+task is not in the resulting set is dropped outright.
+
+Three admissions write no durable row: `attached`, and full-mode `reused` and
+`terminal`. Each hands the caller a task UUID for work that is real and
+running, while the row — and therefore the membership — stays with whichever
+run first created it. A re-triggered campaign that attaches to nodes still in
+flight from its previous run is the ordinary way to land here.
+
+The result is a window that shows the same items forever, with `nextCursor:
+null` and nothing elided, while the run executes. No page cap is involved, so
+none of the truncation machinery above fires. This is the shape the #247
+report described.
+
+Every `query log` response scoped to a run therefore reports how many tasks
+that run resolved to:
+
+```console
+$ tally query log --flow-run <id> --json | jq .flowRunTasks
+0
+```
+
+**`flowRunTasks: 0` means the window is not evidence about the run.** The
+human path says so on stderr rather than making you look. A non-zero count
+below the number of nodes the runner reports submitting means the difference
+was admitted without a row and is invisible here.
+
+When the count does not match what you expect, corroborate against ground
+truth rather than trusting the window: `tally query run <id>` for the
+reconciled task table, the runner unit's own liveness, or `tally query log
+--task <uuid>` for a specific node, which does not go through run membership
+at all.
 
 ## Resume a watch
 

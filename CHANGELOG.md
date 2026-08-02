@@ -8,6 +8,31 @@ authorized.
 
 ### Added
 
+- Repaired #316: reproduced the #247 frozen window, and made a `--flow-run`
+  window say when it is not evidence about the run. `--flow-run` membership is
+  not a durable property — tally recomputes it on every call by scanning
+  durable rows and witness records for an orchestration capsule naming the run,
+  and an admission that writes no row (`attached`, and full-mode `reused` and
+  `terminal`) leaves the submitting run holding a task UUID that is not one of
+  its members. Its events are then filtered out of that run's own window with
+  no page cap involved: **same items, `nextCursor: null`, while the work
+  runs** — exactly the reported #247 shape, which the earlier stale-page-one
+  diagnosis could not produce, because a null cursor means the page is the
+  window. `repro_247_an_attached_node_is_invisible_to_the_run_that_submitted_it`
+  pins it against a live daemon. The seam itself is **not fixed**: closing it
+  needs durable per-run membership for row-less admissions, which is the
+  enqueue kernel's frozen surface. Instead every run-scoped `query.log`
+  response now reports `flowRunTasks`, the number of task UUIDs the filter
+  resolved to, and `flowRunTasks: 0` — an empty window that is not a fact about
+  the run — is called out on stderr rather than left to look like quiet. The
+  monitoring contract in Operating → Observability gains a section on the
+  membership seam, a rule that a terminal verdict must not be read off the
+  incremental stream (a journal terminal whose witness lands after you polled
+  past its cursor is never re-delivered enriched), and a corrected proof of
+  quiet: read `items`, not `position`, because `position` is the head of the
+  whole lifecycle stream and advances whenever anything else on the daemon
+  does.
+
 - Made flow-run-scoped truncation legible, and gave `query log` a durable
   incremental position (#316, closing #247). Human `tally query log` and
   `tally query jobs` now follow the page cursor to the end of the filtered
@@ -294,6 +319,14 @@ authorized.
 - Added flake-native rustfmt, Clippy, and repository-wide Nix formatting checks.
 
 ### Changed
+
+- **`--limit` on the default `tally query jobs` / `tally query log` now sizes a
+  page, not the result set** (#316). Those commands walk the cursor to the end
+  of the filtered window inside one invocation, so `--limit 10` returns the
+  whole window in pages of ten rather than at most ten items. Scripts that used
+  `--limit` as an output bound should narrow with the filters instead, or pass
+  `--json` (or an explicit `--cursor`) to keep single-page semantics and own
+  the cursor.
 
 - **Upgrade consideration — the free-space floor moved from 256 MiB to 8 GiB.**
   The `storage.dataDir`/`storage.stateDir` defaults are now

@@ -1879,3 +1879,131 @@ async fn a_walked_window_whose_reader_hangs_up_exits_quietly_without_notices() {
         })
         .await;
 }
+
+/// #316 acceptance bullet 2's second half, which had no CLI-level coverage: an
+/// item too large to *elide* — its bulk is structure, not text — is still a
+/// hard failure, and the CLI must name it rather than passing the daemon's
+/// opaque internal error through. Anything less and an operator cannot tell
+/// this apart from a dead daemon.
+#[tokio::test(flavor = "current_thread")]
+async fn query_jobs_names_the_item_it_cannot_render_and_exits_nonzero() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    // Twenty thousand small objects: far past the 48 KiB cap, and with no
+    // string leaf long enough for elision to reach.
+    let structural = (0..20_000)
+        .map(|index| serde_json::json!({"n": index}))
+        .collect::<Vec<_>>();
+    let envelope = serde_json::json!({
+        "schemaVersion": 1,
+        "protocolVersion": 4,
+        "items": [{"anchor": "00000000-0000-4000-8000-000000000045", "rows": structural}],
+        "nextCursor": null,
+        "snapshot": {"createdAt": "2026-08-01T10:30:00.000Z"},
+    });
+    let handler = PagedLogHandler::new(envelope, None);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_connection(stream, handler).await.unwrap();
+            });
+            let output = run_tally(
+                &socket,
+                &[
+                    "query",
+                    "jobs",
+                    "--flow-run",
+                    "00000000-0000-4000-8000-000000000045",
+                ],
+            )
+            .await;
+            let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+            assert!(
+                !output.status.success(),
+                "an unrenderable item must not be reported as success: {stderr}"
+            );
+            assert_eq!(output.status.code(), Some(1), "{stderr}");
+            for expected in [
+                "query.jobs",
+                "could not render one item within the bounded response size",
+                "eliding its largest text fields",
+                "--limit 1",
+            ] {
+                assert!(
+                    stderr.contains(expected),
+                    "missing {expected:?} in:\n{stderr}"
+                );
+            }
+            assert!(
+                output.stdout.is_empty(),
+                "a failed query printed a partial envelope: {:?}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+            server.await.unwrap();
+        })
+        .await;
+}
+
+/// #247 repair, at the surface an operator actually reads: a `--flow-run`
+/// window that resolved to no member tasks must say so. Without the notice the
+/// output is indistinguishable from a quiet run, which is precisely the
+/// ambiguity #316 exists to remove.
+#[tokio::test(flavor = "current_thread")]
+async fn an_empty_flow_run_window_says_the_run_resolved_to_no_members() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let envelope = serde_json::json!({
+        "schemaVersion": 1,
+        "protocolVersion": 4,
+        "items": [],
+        "nextCursor": null,
+        "position": "log-v1:00000000000000000041:00000000000000000007",
+        "flowRunTasks": 0,
+        "snapshot": {"createdAt": "2026-08-01T10:30:00.000Z"},
+    });
+    let handler = PagedLogHandler::new(envelope, None);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                for _ in 0..2 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(stream, handler.clone()).await.unwrap();
+                }
+            });
+            for args in [
+                vec![
+                    "query",
+                    "log",
+                    "--flow-run",
+                    "00000000-0000-4000-8000-000000000045",
+                ],
+                // The single-page surface owes the reader the same warning.
+                vec![
+                    "query",
+                    "log",
+                    "--flow-run",
+                    "00000000-0000-4000-8000-000000000045",
+                    "--json",
+                ],
+            ] {
+                let output = run_tally(&socket, &args).await;
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert!(output.status.success(), "{args:?}: {stderr}");
+                assert!(
+                    stderr.contains("resolves to NO member tasks"),
+                    "{args:?} presented an empty window as authoritative:\n{stderr}"
+                );
+                assert!(
+                    stderr.contains("attached/reused/terminal"),
+                    "{args:?} did not name the seam:\n{stderr}"
+                );
+            }
+            server.await.unwrap();
+        })
+        .await;
+}

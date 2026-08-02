@@ -442,6 +442,7 @@ impl PagedWindow {
             );
         }
         report_position_gap(&self.envelope)?;
+        report_empty_flow_run(&self.envelope)?;
         if self.pages > 1 {
             errln!(
                 "notice: this window was assembled from {} pages; it is complete as of snapshot {}",
@@ -474,7 +475,25 @@ fn report_page_completeness(envelope: &Value) -> Result<()> {
             envelope["elidedItems"].as_u64().unwrap_or(0)
         );
     }
-    report_position_gap(envelope)
+    report_position_gap(envelope)?;
+    report_empty_flow_run(envelope)
+}
+
+/// A `--flow-run` window that resolved to no member tasks is not evidence
+/// about the run. Run membership is recomputed per call from durable rows and
+/// witness records, and an admission that wrote no row — `attached`, and
+/// full-mode `reused` and `terminal` — leaves the run holding a task UUID that
+/// is not a member of it. Reading that empty window as "quiet" is #247.
+fn report_empty_flow_run(envelope: &Value) -> Result<()> {
+    if envelope["flowRunTasks"].as_u64() == Some(0) {
+        errln!(
+            "notice: this flow run resolves to NO member tasks, so an empty window here says \
+             nothing about whether it is running; a node admitted as attached/reused/terminal \
+             writes no row and never joins the run that submitted it. Corroborate with \
+             `tally query run <id>`, the runner unit, or the node's own task UUID."
+        );
+    }
+    Ok(())
 }
 
 fn report_position_gap(envelope: &Value) -> Result<()> {
