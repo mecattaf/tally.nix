@@ -748,12 +748,16 @@ class GitHubForgeTests(unittest.TestCase):
                 self.assertEqual(escalated["diagnosisCount"], 2)
                 # The escalation carries a closing summary beside it: the
                 # campaign stopped, so the operator gets the digest of what it
-                # did manage to bind.
+                # did manage to bind. The digest is published *first*, because
+                # the escalation is what every later pass reads back to decide
+                # this node never runs again -- so a summary that failed after
+                # it could never be retried.
                 self.assertIsNotNone(escalated["summary"])
-                summary_body = github.state()["comments"][-1]
+                summary_body, escalation_body = github.state()["comments"][-2:]
                 self.assertIn("Campaign closed at frontier quiescence", summary_body)
                 self.assertIn("`task-1`", summary_body)
                 self.assertNotIn("ghp_", summary_body)
+                self.assertIn("Spec-build escalation", escalation_body)
                 repeated = DRIVER.action_escalate(reconcile_brief)
                 self.assertFalse(repeated["posted"])
                 self.assertIsNone(repeated["summary"])
@@ -761,6 +765,146 @@ class GitHubForgeTests(unittest.TestCase):
                 # One steering note, one escalation, one closing summary, and
                 # the repeat pass adds nothing.
                 self.assertEqual(len(github.state()["comments"]), 3)
+
+    def test_a_completed_file_worklist_campaign_summarises_and_leaves_the_issue_open(
+        self,
+    ) -> None:
+        """The spec-corpus class gets its digest; tally still never closes that issue.
+
+        A file-worklist campaign's master issue is a projection tally does not
+        own the lifecycle of -- only the forge-native issue graph is closed by
+        the reconciler. Publishing the closing summary there and stopping is
+        the deliberate shape: the operator learns the campaign finished, and
+        the issue stays theirs to close.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            worklist = checkout / "specs/campaign/tasks.json"
+            worklist.parent.mkdir(parents=True)
+            worklist.write_text(
+                json.dumps({"schemaVersion": 1, "tasks": [task("task-1")]}),
+                encoding="utf-8",
+            )
+            git(checkout, "add", str(worklist.relative_to(checkout)))
+            git(checkout, "commit", "--quiet", "-m", "add worklist")
+            git(checkout, "push", "--quiet", "origin", "main")
+            base_rev = git(checkout, "rev-parse", "HEAD")
+            state = {
+                "actor": "tally-bot",
+                "merged": [
+                    {
+                        "url": "https://github.com/acme/spec/pull/1",
+                        "body": DRIVER.pull_request_marker("fixture", "7", "task-1"),
+                        "baseRefName": "main",
+                        "headRefName": "tally/fixture-issue-7/task-1",
+                        "mergeCommit": {"oid": base_rev},
+                    }
+                ],
+                "byHead": {},
+                "comments": [],
+                "issueComments": [],
+                "calls": [],
+            }
+            with FakeGitHub(root, state) as github:
+                result = DRIVER.action_reconcile(
+                    {
+                        "campaign": "fixture",
+                        "repository": "acme/spec",
+                        "repositoryConfig": repository_config(checkout, "github"),
+                        "issue": issue(),
+                        "worklist": "specs/*/tasks.json",
+                        "maxTasks": 1,
+                        "maxParallel": 1,
+                    }
+                )
+            self.assertTrue(result["complete"])
+            self.assertIsNotNone(result["closingSummary"])
+            published = github.state()
+            self.assertEqual(len(published["comments"]), 1)
+            self.assertIn("### Campaign complete", published["comments"][0])
+            self.assertIn("tally:campaign-complete:v1", published["comments"][0])
+            self.assertFalse(
+                any(call[:2] == ["issue", "close"] for call in published["calls"]),
+                published["calls"],
+            )
+
+    def test_a_failed_quiescent_summary_leaves_the_whole_act_retryable(self) -> None:
+        """The escalation is the thing every later pass reads back to stop.
+
+        So it must be the *last* thing published on the quiescent path. If the
+        summary went second and failed once -- a rate limit, a transient
+        network error -- the escalation would already be on the issue, every
+        later pass would return early, and the campaign would silently lose the
+        only artifact that says what it managed to bind.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            worklist = checkout / "specs/campaign/tasks.json"
+            worklist.parent.mkdir(parents=True)
+            worklist.write_text(
+                json.dumps({"schemaVersion": 1, "tasks": [task("task-1")]}),
+                encoding="utf-8",
+            )
+            git(checkout, "add", str(worklist.relative_to(checkout)))
+            git(checkout, "commit", "--quiet", "-m", "add worklist")
+            git(checkout, "push", "--quiet", "origin", "main")
+
+            def diagnosis_body(attempt: int) -> str:
+                return (
+                    f"{DRIVER.diagnosis_marker('fixture', '7', 'task-1', attempt)}\n\n"
+                    f"{DRIVER.diagnosis_heading('task-1', attempt)}\n\nsteering {attempt}"
+                )
+
+            state = {
+                "actor": "tally-bot",
+                "merged": [],
+                "byHead": {},
+                "comments": [],
+                "issueComments": [
+                    {
+                        "body": diagnosis_body(attempt),
+                        "html_url": f"https://github.com/acme/spec/issues/7#a{attempt}",
+                        "user": {"login": "tally-bot"},
+                    }
+                    for attempt in (1, 2)
+                ],
+                "calls": [],
+            }
+            reconcile_brief = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "repositoryConfig": repository_config(checkout, "github"),
+                "issue": issue(),
+                "worklist": "specs/*/tasks.json",
+                "maxTasks": 1,
+                "maxParallel": 1,
+            }
+            with FakeGitHub(root, state) as github:
+                published = DRIVER.publish_closing_summary
+                attempts: list[int] = []
+
+                def flaky(*arguments: object, **keywords: object) -> str:
+                    attempts.append(1)
+                    if len(attempts) == 1:
+                        raise DRIVER.DriverError("gh: API rate limit exceeded")
+                    return published(*arguments, **keywords)  # type: ignore[arg-type]
+
+                with mock.patch.object(DRIVER, "publish_closing_summary", flaky):
+                    with self.assertRaisesRegex(DRIVER.DriverError, "rate limit"):
+                        DRIVER.action_escalate(reconcile_brief)
+                    # Nothing was published, so nothing tells a later pass to
+                    # stop: the terminal act is retried whole.
+                    self.assertEqual(github.state()["comments"], [])
+
+                    escalated = DRIVER.action_escalate(reconcile_brief)
+                self.assertEqual(len(attempts), 2)
+                self.assertTrue(escalated["posted"])
+                self.assertIsNotNone(escalated["summary"])
+                summary_body, escalation_body = github.state()["comments"]
+                self.assertIn("Campaign closed at frontier quiescence", summary_body)
+                self.assertIn("Spec-build escalation", escalation_body)
 
     def test_steering_escalation_and_the_closing_summary_are_always_fresh(self) -> None:
         """§9.1.3 holds a line: receipts upsert silently, these three never do.
@@ -1240,7 +1384,10 @@ class GitHubForgeTests(unittest.TestCase):
                 escalated = DRIVER.action_escalate(reconcile_brief)
                 self.assertTrue(escalated["posted"])
                 self.assertEqual(escalated["diagnosisCount"], 2)
-                self.assertIn("frontier quiescent", github.state()["comments"][0])
+                # Closing summary first, escalation second.
+                summary_body, escalation_body = github.state()["comments"]
+                self.assertIn("Campaign closed at frontier quiescence", summary_body)
+                self.assertIn("frontier quiescent", escalation_body)
 
     def test_pr_reopen_progress_and_one_pass_continuation_use_fake_gh(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2122,17 +2269,141 @@ class LaneLifecycleTests(unittest.TestCase):
             self.assertEqual(resumed, prepared)
             self.assertEqual(git(worktree, "rev-parse", "HEAD"), in_flight)
 
-            # The runner died hard enough to lose the directory. The branch is
-            # the lane's durable half, so the rebuilt lane is the same lane.
+            # The runner died hard enough to lose the directory, and the base
+            # branch moved on meanwhile. The branch is the lane's durable half,
+            # so the rebuilt lane is the same lane -- and its prepared base is
+            # where *its own history* forks from base, never wherever base
+            # happens to point now. A base that is not an ancestor of the lane
+            # head makes ownership fail and feeds the diagnosing agent a patch
+            # that reverses commits the task never touched.
             command("git", "-C", str(checkout), "worktree", "remove", "--force", str(worktree))
             self.assertFalse(worktree.exists())
+            (checkout / "moved-on.txt").write_text("main moved\n", encoding="utf-8")
+            git(checkout, "add", "moved-on.txt")
+            git(checkout, "commit", "--quiet", "-m", "main: independent change")
+            git(checkout, "push", "--quiet", "origin", "main")
+
             rebuilt = DRIVER.action_prep(brief)
             self.assertEqual(rebuilt["branch"], prepared["branch"])
             self.assertEqual(rebuilt["worktreePath"], prepared["worktreePath"])
             self.assertEqual(git(worktree, "rev-parse", "HEAD"), in_flight)
+            self.assertEqual(WORKTREES.read_identity(worktree)["runid"], "killed-pass")
             self.assertEqual(
-                WORKTREES.read_identity(worktree)["runid"], "killed-pass"
+                command(
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "merge-base",
+                    "--is-ancestor",
+                    rebuilt["baseRev"],
+                    in_flight,
+                    check=False,
+                ).returncode,
+                0,
+                "the adopted lane's base must be an ancestor of its own head",
             )
+            self.assertEqual(rebuilt["baseRev"], prepared["baseRev"])
+            self.assertEqual(
+                command(
+                    "git",
+                    "-C",
+                    str(worktree),
+                    "diff",
+                    "--name-only",
+                    f"{rebuilt['baseRev']}..{in_flight}",
+                ).stdout.split(),
+                ["lane-work.txt"],
+                "an adopted lane must not diff as though it deleted base's own files",
+            )
+            self.assertEqual(
+                WORKTREES.read_identity(worktree)["baserev"], rebuilt["baseRev"]
+            )
+
+            # The other way a lane directory disappears: removed underneath
+            # git, so the lane is still registered and has to be pruned first.
+            shutil.rmtree(worktree)
+            pruned = DRIVER.action_prep(brief)
+            self.assertEqual(pruned, rebuilt)
+            self.assertEqual(git(worktree, "rev-parse", "HEAD"), in_flight)
+
+    def test_a_lane_that_lost_its_identity_is_healed_not_cemented(self) -> None:
+        """A lane whose identity write was interrupted must still resume.
+
+        Identity is written in one atomic act now, so this state can only be
+        reached by upgrading a tally across #312 over a live lane -- but that
+        is exactly the upgrade path, and the lane must recover rather than
+        acquire a complete-looking identity it can never answer `baserev` for.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            brief = prep_brief(checkout, workspace_root, "crash-pass")
+
+            prepared = DRIVER.action_prep(brief)
+            worktree = Path(prepared["worktreePath"])
+            (worktree / "lane-work.txt").write_text("in flight\n", encoding="utf-8")
+            git(worktree, "add", "lane-work.txt")
+            git(worktree, "commit", "--quiet", "-m", "task-1: in flight")
+            in_flight = git(worktree, "rev-parse", "HEAD")
+
+            # The pre-#312 lane: registered by git, carrying no tally identity.
+            command(
+                "git",
+                "-C",
+                str(worktree),
+                "config",
+                "--worktree",
+                "--remove-section",
+                "tally",
+            )
+            self.assertEqual(WORKTREES.read_identity(worktree), {})
+
+            healed = DRIVER.action_prep(brief)
+            self.assertEqual(healed["branch"], prepared["branch"])
+            self.assertEqual(healed["worktreePath"], prepared["worktreePath"])
+            self.assertEqual(healed["baseRev"], prepared["baseRev"])
+            self.assertEqual(git(worktree, "rev-parse", "HEAD"), in_flight)
+            recorded = WORKTREES.read_identity(worktree)
+            self.assertEqual(recorded["baserev"], prepared["baseRev"])
+            self.assertEqual(recorded["runid"], "crash-pass")
+            # And the healed lane resumes normally from here on.
+            self.assertEqual(DRIVER.action_prep(brief), healed)
+
+    def test_lane_identity_is_written_in_one_atomic_act(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            prepared = DRIVER.action_prep(
+                prep_brief(checkout, workspace_root, "atomic-pass")
+            )
+            worktree = Path(prepared["worktreePath"])
+            config_path = WORKTREES.worktree_config_path(worktree)
+            self.assertTrue(config_path.is_file())
+
+            # A per-worktree key this driver does not own survives a rewrite,
+            # and the rewrite replaces the whole tally section rather than
+            # accumulating stale keys.
+            command(
+                "git", "-C", str(worktree), "config", "--worktree", "other.key", "keep me"
+            )
+            WORKTREES.write_identity(worktree, {"campaign": "fixture", "taskid": "task-1"})
+            self.assertEqual(
+                WORKTREES.read_identity(worktree),
+                {"campaign": "fixture", "taskid": "task-1"},
+            )
+            self.assertEqual(
+                command(
+                    "git", "-C", str(worktree), "config", "--worktree", "--get", "other.key"
+                ).stdout.strip(),
+                "keep me",
+            )
+            # Lane identity is never recorded on the main worktree, where
+            # `git config --worktree` means the shared config instead.
+            with self.assertRaises(DRIVER.worktrees.WorktreeError) as raised:
+                WORKTREES.write_identity(checkout, {"campaign": "fixture"})
+            self.assertIn("main worktree", str(raised.exception))
 
     def test_a_foreign_lane_at_the_same_path_is_a_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2507,6 +2778,67 @@ class LaneLifecycleTests(unittest.TestCase):
             self.assertIn(f"worktree:{worktree}", swept["cleaned"])
             self.assertEqual(swept["liveRuns"], [])
             self.assertEqual(swept["warnings"], [])
+
+    def test_sweep_reclaims_lane_markers_left_by_a_pre_upgrade_tally(self) -> None:
+        """Nothing writes these any more, so the sweep is the only thing that can.
+
+        An estate that upgrades across #312 keeps whatever its last pre-upgrade
+        pass left under `.state/<runHash>/`. Left alone that is a directory
+        tree nobody will ever explain, so the sweep reclaims it on exactly the
+        authority it already established for the run: same campaign, same
+        repository, a run hash that is neither this pass's nor protected.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            dead_flow = "00000000-0000-4000-8000-000000000940"
+            live_flow = "00000000-0000-4000-8000-000000000941"
+            state_root = workspace_root / ".state"
+            legacy = state_root / hashlib.sha256(b"dead-pass").hexdigest()[:16] / "task-9.json"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(
+                json.dumps(
+                    {
+                        "campaign": "fixture",
+                        "repository": "acme/spec",
+                        "runId": "dead-pass",
+                        "taskId": "task-9",
+                        "branch": "tally-work/fixture-abcdefabcdef/task-9",
+                        "worktreePath": str(workspace_root / "spec/abcdefabcdef/task-9"),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            foreign = state_root / "0123456789abcdef" / "task-1.json"
+            foreign.parent.mkdir(parents=True)
+            foreign.write_text(
+                json.dumps(
+                    {
+                        "campaign": "other-campaign",
+                        "repository": "acme/spec",
+                        "runId": "other-pass",
+                        "taskId": "task-1",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with FakeTally(root, dead_flow) as tally:
+                DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "dead-pass", tally.program)
+                )
+                # This pass owns `dead-pass`, so its own marker is untouched.
+                self.assertTrue(legacy.is_file())
+                tally.update(currentFlowRunId=live_flow, flows={dead_flow: []})
+                swept = DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "live-pass", tally.program)
+                )
+            self.assertFalse(legacy.exists())
+            self.assertFalse(legacy.parent.exists())
+            self.assertIn(f"marker:{legacy}", swept["cleaned"])
+            self.assertEqual(swept["warnings"], [])
+            # Another campaign's marker belongs to that campaign's sweep.
+            self.assertTrue(foreign.is_file())
 
     def test_sweep_defers_and_preserves_every_lane_while_an_old_flow_job_is_live(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

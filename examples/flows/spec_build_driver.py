@@ -2701,6 +2701,12 @@ def render_campaign_summary(digest: dict[str, Any]) -> str:
             summary_rows(digest["outstanding"], lambda task_id: f"- `{task_id}`")
         )
         lines.append("")
+    if digest["deferrals"]:
+        lines.extend(["#### Checkpoints deferred by outstanding work", ""])
+        lines.extend(
+            summary_rows(digest["deferrals"], lambda task_id: f"- `{task_id}`")
+        )
+        lines.append("")
     if digest["steering"]:
         lines.extend(["#### Steering notes issued", ""])
         lines.extend(
@@ -3562,6 +3568,20 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
     body = "\n".join(lines)
     if len(body) > 60_000:
         fail("machine escalation exceeds the bounded GitHub comment size")
+    # Quiescence is the campaign's other terminal outcome, and the escalation
+    # is what proves it was reached: every later pass reads that comment back
+    # and stops before this node runs again. So the digest is published first,
+    # exactly as the completion path publishes before it closes the issue. A
+    # summary that failed after the escalation had landed could never be
+    # retried; a summary that fails before it means the whole terminal act is
+    # retried on the next pass, and the marker makes the retry idempotent.
+    summary = publish_closing_summary(
+        repository,
+        config,
+        campaign,
+        issue["number"],
+        campaign_digest(reconciliation, "quiescent"),
+    )
     if config["forge"] == "github":
         posted = run(
             [
@@ -3595,16 +3615,6 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
         if not created:
             fail(f"local forge escalation {ref!r} appeared concurrently")
         comment = f"local://{repository}/{ref}"
-    # Quiescence is the campaign's other terminal outcome. The operator gets
-    # the escalation that says the campaign stopped, and beside it the same
-    # digest a completed campaign renders -- reflecting partial state.
-    summary = publish_closing_summary(
-        repository,
-        config,
-        campaign,
-        issue["number"],
-        campaign_digest(reconciliation, "quiescent"),
-    )
     return {
         "posted": True,
         "comment": comment,
@@ -4049,6 +4059,68 @@ def query_live_campaign_jobs(
     return sorted(live, key=lambda item: (item["flowRunId"], item["anchor"]))
 
 
+def legacy_state_markers(state_root: Path) -> list[Path]:
+    """The per-lane JSON markers a tally from before #312 wrote.
+
+    Lane identity lives in git's own worktree config now and nothing writes
+    these again, but an estate that upgraded across #312 keeps whatever its
+    last pre-upgrade pass left behind. They are enumerated only so the sweep
+    can reclaim them once; `passes/` is this driver's own run-scoped record and
+    is never a lane marker.
+    """
+    if not state_root.is_dir() or state_root.is_symlink():
+        return []
+    return sorted(
+        marker
+        for marker in state_root.glob("*/*.json")
+        if marker.parent != state_root / "passes" and marker.is_file() and not marker.is_symlink()
+    )
+
+
+def reclaim_legacy_markers(
+    state_root: Path,
+    campaign: str,
+    repository: str,
+    current_hash: str,
+    protected_hashes: set[str],
+    cleaned: list[str],
+    warnings: list[str],
+) -> None:
+    """Delete this campaign's pre-#312 lane markers for runs already proved dead.
+
+    The marker is no longer read by anything, so leaving it costs only disk --
+    but leaving it silently means an upgraded estate keeps a directory tree
+    nobody will ever explain. A marker is reclaimed on exactly the authority
+    the sweep already established for its run: same campaign, same repository,
+    and a run hash that is neither this pass's nor protected.
+    """
+    for marker in legacy_state_markers(state_root):
+        try:
+            saved = json.loads(marker.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            warnings.append(f"left unreadable campaign state marker untouched: {marker}: {error}")
+            continue
+        if not isinstance(saved, dict):
+            warnings.append(f"left non-object campaign state marker untouched: {marker}")
+            continue
+        if saved.get("campaign") != campaign or saved.get("repository") != repository:
+            continue
+        saved_run_id = saved.get("runId")
+        if not isinstance(saved_run_id, str) or not saved_run_id:
+            warnings.append(f"left identity-less campaign state marker untouched: {marker}")
+            continue
+        saved_hash = hashlib.sha256(saved_run_id.encode()).hexdigest()[:12]
+        if saved_hash == current_hash or saved_hash in protected_hashes:
+            continue
+        try:
+            marker.unlink()
+        except OSError as error:
+            warnings.append(f"could not reclaim campaign state marker {marker}: {error}")
+            continue
+        prune_empty_ancestors(marker.parent, state_root)
+        cleaned.append(f"marker:{marker}")
+
+
 def validated_pass_record(
     workspace_root: Path,
     run_hash: str,
@@ -4384,6 +4456,10 @@ def action_sweep_locked(brief: dict[str, Any]) -> dict[str, Any]:
                     check=False,
                 )
 
+    reclaim_legacy_markers(
+        state_root, campaign, repository, current_hash, protected_hashes, cleaned, warnings
+    )
+
     if repository_root.is_dir():
         for child in repository_root.iterdir():
             if child.is_dir():
@@ -4468,11 +4544,13 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
         publish_branch,
     )
 
-    resumed = worktree_call(worktrees.resume, checkout, worktree, expected)
-    if resumed is not None:
+    resumed = worktree_call(
+        worktrees.resume, checkout, worktree, expected, required=("baserev",)
+    )
+    if resumed is not None and resumed["complete"]:
         return {
             "taskId": identity["taskId"],
-            "baseRev": required_string(resumed.get("baserev"), "lane baseRev"),
+            "baseRev": required_string(resumed["identity"].get("baserev"), "lane baseRev"),
             "branch": branch,
             "publishBranch": publish_branch,
             "worktreePath": str(worktree),
@@ -4480,31 +4558,42 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
 
     git(checkout, "fetch", "--prune", remote)
     base_ref = f"{remote}/{base_branch}"
-    base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
-    publish_ref = f"refs/remotes/{remote}/{publish_branch}"
-    published = identity["taskKind"] == "implementation" and git(
-        checkout,
-        "show-ref",
-        "--verify",
-        "--quiet",
-        publish_ref,
-        check=False,
-    ).returncode == 0
-    if published:
-        start_rev = git(
-            checkout, "rev-parse", "--verify", f"{publish_ref}^{{commit}}"
-        ).stdout.strip()
-        base_rev = git(checkout, "merge-base", start_rev, base_rev).stdout.strip()
+    base_tip = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
+    if resumed is not None:
+        # A lane git registered whose identity is short a field: a lane cut by
+        # a tally from before identity moved into git, or a runner killed
+        # before it was recorded. The lane's own history is the authority for
+        # where it forks from base, so it is healed rather than refused.
+        lane_head = resumed["head"]
     else:
-        start_rev = base_rev
-    worktree_call(
-        worktrees.create,
-        checkout,
-        worktree,
-        branch,
-        start_rev,
-        {**expected, "baserev": base_rev},
-    )
+        publish_ref = f"refs/remotes/{remote}/{publish_branch}"
+        published = identity["taskKind"] == "implementation" and git(
+            checkout,
+            "show-ref",
+            "--verify",
+            "--quiet",
+            publish_ref,
+            check=False,
+        ).returncode == 0
+        if worktrees.branch_exists(checkout, branch):
+            # The lane branch outlived its worktree. Adopting it means adopting
+            # where it sits, not where a fresh lane would have started.
+            start_rev = f"refs/heads/{branch}"
+        elif published:
+            start_rev = publish_ref
+        else:
+            start_rev = base_tip
+        lane_head = worktree_call(worktrees.add, checkout, worktree, branch, start_rev)
+    # The prepared base is where the lane's history forks from the base branch,
+    # derived from the lane rather than from whatever the base branch happens
+    # to point at now. On a fresh lane that is the base tip (or the published
+    # head's merge base) exactly as before; on an adopted one it is an ancestor
+    # of the lane head by construction, which is what every downstream node --
+    # ownership, diff, rebase -- requires of it.
+    base_rev = git(checkout, "merge-base", lane_head, base_tip).stdout.strip()
+    if not GIT_OID.fullmatch(base_rev):
+        fail(f"cannot derive a base revision for campaign lane {branch!r}")
+    worktree_call(worktrees.write_identity, worktree, {**expected, "baserev": base_rev})
     return {
         "taskId": identity["taskId"],
         "baseRev": base_rev,
@@ -4552,11 +4641,15 @@ def action_preflight(brief: dict[str, Any]) -> dict[str, Any]:
         campaign, repository, run_id, task_id, "preflight", branch, branch
     )
 
-    resumed = worktree_call(worktrees.resume, checkout, worktree, expected)
-    if resumed is not None:
+    resumed = worktree_call(
+        worktrees.resume, checkout, worktree, expected, required=("baserev",)
+    )
+    if resumed is not None and resumed["complete"]:
         return {
             "taskId": task_id,
-            "baseRev": required_string(resumed.get("baserev"), "preflight lane baseRev"),
+            "baseRev": required_string(
+                resumed["identity"].get("baserev"), "preflight lane baseRev"
+            ),
             "branch": branch,
             "publishBranch": branch,
             "worktreePath": str(worktree),
@@ -4564,15 +4657,18 @@ def action_preflight(brief: dict[str, Any]) -> dict[str, Any]:
 
     git(checkout, "fetch", "--prune", config["remote"])
     base_ref = f"{config['remote']}/{config['baseBranch']}"
-    base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
-    worktree_call(
-        worktrees.create,
-        checkout,
-        worktree,
-        branch,
-        base_rev,
-        {**expected, "baserev": base_rev},
-    )
+    base_tip = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
+    if resumed is not None:
+        lane_head = resumed["head"]
+    else:
+        start_rev = (
+            f"refs/heads/{branch}" if worktrees.branch_exists(checkout, branch) else base_tip
+        )
+        lane_head = worktree_call(worktrees.add, checkout, worktree, branch, start_rev)
+    base_rev = git(checkout, "merge-base", lane_head, base_tip).stdout.strip()
+    if not GIT_OID.fullmatch(base_rev):
+        fail(f"cannot derive a base revision for campaign lane {branch!r}")
+    worktree_call(worktrees.write_identity, worktree, {**expected, "baserev": base_rev})
     return {
         "taskId": task_id,
         "baseRev": base_rev,

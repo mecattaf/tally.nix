@@ -22,7 +22,11 @@ authorized.
   unchanged and `max_flow_nodes` still asserts 51. On a local forge the summary
   is a durable blob under `refs/tally/spec-build/v1/<scope>/summary/<outcome>`.
   The reconcile result carries `closingSummary` and the escalate result carries
-  `summary`.
+  `summary`. A forge-native campaign posts the completion summary and then
+  closes its sub-issues and master issue; a file-worklist campaign posts the
+  same summary on its master issue and leaves it open, because that issue is a
+  projection whose lifecycle tally has never owned. That path previously
+  published nothing at all on completion.
 
 - Added `services.tally.campaigns.<name>.gitAiAwaitSec` (default 60), the merge
   node's budget for git-ai's settlement barrier, and an evaluated assertion
@@ -259,6 +263,42 @@ authorized.
 
 ### Fixed
 
+- A campaign lane's prepared base is now derived from the lane's own history
+  rather than recomputed from wherever the base branch points at prep time. When
+  a lane directory disappeared but its branch survived, the driver adopted the
+  branch and handed the flow a `baseRev` taken from the current
+  `origin/<baseBranch>` — a commit the lane's head does not descend from. The
+  ownership node then failed the task with `task head is not descended from its
+  prepared base revision` for the rest of the pass, and the failure path fed the
+  diagnosing steward a patch that appeared to delete files owned by the base
+  branch which the task never touched — a wrong steering note, posted publicly.
+  The base is now `git merge-base <lane head> <base tip>`, which is the same
+  value as before on a fresh or published lane and an ancestor of the lane head
+  by construction on an adopted one.
+- Campaign lane identity is now written in one atomic act — a replacement
+  `config.worktree` built with `git config --file` and renamed into place —
+  instead of one `git config --worktree` call per field. A runner killed part way
+  through the old sequence left a lane holding some of its identity, and
+  `resume()` then wrote back only the fields it happened to know: the lane looked
+  valid to every later pass while being permanently unable to answer for
+  `baseRev`, so every prep in that pass failed with an error naming nothing an
+  operator could act on. `resume()` now reports an incomplete lane as incomplete
+  and the caller re-derives the missing fields from the lane itself, which is
+  also the path an estate takes when it upgrades across the identity move over a
+  live lane.
+- The closing summary at frontier quiescence is now published before the
+  escalation comment rather than after it. The escalation is what every later
+  pass reads back to decide the campaign has already stopped, so a summary that
+  failed after it had landed — a rate limit, a transient network error — was
+  never retried by any later pass and the campaign silently lost its quiescent
+  digest for good. Publishing the digest first means one transient failure
+  retries the whole terminal act, and the summary's marker makes that retry
+  idempotent.
+- The campaign sweep now reclaims the pre-#312 `.state/<runHash>/<taskId>.json`
+  lane markers belonging to its campaign once the run they name is proved dead,
+  and reports each one in `cleaned`. Nothing writes those markers any more, so an
+  estate that upgraded across the identity move kept them and their directories
+  for ever with nothing able to explain them.
 - The campaign merge node's `Assisted-by:` forgery guard now matches the way git
   reads a trailer. Git matches trailer keys case-insensitively, so a steward
   proposing `assisted-by:` passed validation and its line landed verbatim in a
