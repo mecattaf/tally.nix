@@ -157,6 +157,17 @@ class PublicationConflictDomainTests(unittest.TestCase):
             "constraints": [],
         }
 
+    def publish_brief(
+        self,
+        conflict_domains: object = MISSING,
+        *,
+        domains_required: bool = True,
+        gates: object = MISSING,
+    ) -> dict[str, Any]:
+        brief = self.brief(conflict_domains, domains_required=domains_required)
+        brief["gates"] = [] if gates is MISSING else gates
+        return brief
+
     def ownership_brief(
         self, conflict_domains: object = MISSING, *, domains_required: bool = True
     ) -> dict[str, Any]:
@@ -166,8 +177,27 @@ class PublicationConflictDomainTests(unittest.TestCase):
         return {
             "task": publication_brief["task"],
             "domainsRequired": publication_brief["domainsRequired"],
+            "repositoryConfig": publication_brief["repositoryConfig"],
             "workspace": publication_brief["workspace"],
         }
+
+    def advance_base(self, path: str, content: str, message: str) -> str:
+        """Land a mainline commit the way a sibling lane's merge would."""
+        advancer = self.root / "advancer"
+        if not advancer.exists():
+            git("clone", str(self.remote), str(advancer))
+            git("config", "user.name", "Base Advance", cwd=advancer)
+            git("config", "user.email", "base-advance@example.invalid", cwd=advancer)
+        else:
+            git("pull", "--ff-only", cwd=advancer)
+        target = advancer / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        git("add", "--all", cwd=advancer)
+        git("commit", "-m", message, cwd=advancer)
+        git("push", "origin", "main", cwd=advancer)
+        git("fetch", "origin", cwd=self.checkout)
+        return git("rev-parse", "HEAD", cwd=advancer)
 
     def assert_not_published(self) -> None:
         result = subprocess.run(
@@ -195,7 +225,7 @@ class PublicationConflictDomainTests(unittest.TestCase):
 
         domains = ["internal/contacts", "internal/cli/root.go"]
         prechecked = driver.action_ownership(self.ownership_brief(domains))
-        published = driver.action_publish(self.brief(domains))
+        published = driver.action_publish(self.publish_brief(domains))
 
         self.assertEqual(published["head"], head)
         self.assertEqual(published["ownership"], prechecked)
@@ -227,7 +257,7 @@ class PublicationConflictDomainTests(unittest.TestCase):
             driver.DriverError,
             r'outside its declared conflictDomains: "internal/cli/root\.go"',
         ):
-            driver.action_publish(self.brief(["internal/contacts"]))
+            driver.action_publish(self.publish_brief(["internal/contacts"]))
         self.assert_not_published()
 
     def test_transient_unowned_path_in_commit_history_is_rejected(self) -> None:
@@ -242,7 +272,7 @@ class PublicationConflictDomainTests(unittest.TestCase):
         self.commit("fixture: delete transient path and keep owned work")
 
         with self.assertRaisesRegex(driver.DriverError, r'"other/x\.txt"'):
-            driver.action_publish(self.brief(["internal/contacts"]))
+            driver.action_publish(self.publish_brief(["internal/contacts"]))
         self.assert_not_published()
 
     def test_option_shaped_base_revision_fails_closed_without_git_side_effects(self) -> None:
@@ -268,7 +298,7 @@ class PublicationConflictDomainTests(unittest.TestCase):
         with self.assertRaisesRegex(
             driver.DriverError, r"task\.conflictDomains must be a non-empty array"
         ):
-            driver.action_publish(self.brief([]))
+            driver.action_publish(self.publish_brief([]))
         self.assert_not_published()
 
     def test_deletion_outside_the_domain_is_rejected_before_push(self) -> None:
@@ -276,7 +306,7 @@ class PublicationConflictDomainTests(unittest.TestCase):
         self.commit("fixture: delete unowned registration file")
 
         with self.assertRaisesRegex(driver.DriverError, r'"internal/cli/root\.go"'):
-            driver.action_publish(self.brief(["internal/contacts"]))
+            driver.action_publish(self.publish_brief(["internal/contacts"]))
         self.assert_not_published()
 
     def test_type_change_outside_the_domain_is_rejected_before_push(self) -> None:
@@ -286,7 +316,7 @@ class PublicationConflictDomainTests(unittest.TestCase):
         self.commit("fixture: change unowned registration file type")
 
         with self.assertRaisesRegex(driver.DriverError, r'"internal/cli/root\.go"'):
-            driver.action_publish(self.brief(["internal/contacts"]))
+            driver.action_publish(self.publish_brief(["internal/contacts"]))
         self.assert_not_published()
 
     def test_rename_requires_ownership_of_both_source_and_destination(self) -> None:
@@ -301,7 +331,7 @@ class PublicationConflictDomainTests(unittest.TestCase):
         self.commit("fixture: move unowned registration file")
 
         with self.assertRaisesRegex(driver.DriverError, r'"internal/cli/root\.go"'):
-            driver.action_publish(self.brief(["internal/contacts"]))
+            driver.action_publish(self.publish_brief(["internal/contacts"]))
         self.assert_not_published()
 
     def test_case_only_rename_witnesses_both_endpoints(self) -> None:
@@ -309,7 +339,7 @@ class PublicationConflictDomainTests(unittest.TestCase):
         git("mv", "internal/cli/root.go", str(destination.relative_to(self.checkout)), cwd=self.checkout)
         head = self.commit("fixture: case-only rename")
 
-        published = driver.action_publish(self.brief(["internal/cli/root.go"]))
+        published = driver.action_publish(self.publish_brief(["internal/cli/root.go"]))
 
         self.assertEqual(published["head"], head)
         self.assertEqual(
@@ -382,8 +412,8 @@ class PublicationConflictDomainTests(unittest.TestCase):
         contact.parent.mkdir(parents=True)
         contact.write_text("package contacts\n", encoding="utf-8")
         self.commit("fixture: fast-path task")
+        published = driver.action_publish(self.publish_brief(["internal/contacts"]))
         brief = self.brief(["internal/contacts"])
-        published = driver.action_publish(brief)
         brief.update({"publication": published, "constraints": []})
 
         integrated = driver.action_rebase(brief)
@@ -392,13 +422,184 @@ class PublicationConflictDomainTests(unittest.TestCase):
         self.assertEqual(integrated["head"], published["head"])
         self.assertEqual(integrated["ownership"], published["ownership"])
 
+    def test_a_lane_that_merged_the_base_is_rejected_by_its_real_cause(self) -> None:
+        """A merge commit makes every mainline path look authored by the task.
+
+        The union walks lane history with `git log -m`, so a lane that merged
+        the base branch instead of rebasing onto it claims every path its
+        siblings landed. The lane is named for what it actually did rather than
+        failed on paths nobody in the task touched.
+        """
+        contact = self.checkout / "internal/contacts/model.go"
+        contact.parent.mkdir(parents=True)
+        contact.write_text("package contacts\n", encoding="utf-8")
+        self.commit("fixture: owned work")
+
+        # A merge-free lane on this exact fixture is admitted.
+        self.assertEqual(
+            driver.action_ownership(self.ownership_brief(["internal/contacts"]))[
+                "ownedPaths"
+            ],
+            ["internal/contacts/model.go"],
+        )
+
+        self.advance_base(
+            "internal/cli/root.go",
+            "package cli\n// sibling lane merged\n",
+            "fixture: sibling lane merges",
+        )
+        git("merge", "--no-edit", "origin/main", cwd=self.checkout)
+
+        with self.assertRaisesRegex(
+            driver.DriverError,
+            "rebase instead of merging the base into your lane",
+        ):
+            driver.action_ownership(self.ownership_brief(["internal/contacts"]))
+        with self.assertRaisesRegex(
+            driver.DriverError,
+            "rebase instead of merging the base into your lane",
+        ):
+            driver.action_publish(self.publish_brief(["internal/contacts"]))
+        self.assert_not_published()
+
+    def test_a_lane_rebased_onto_an_advanced_base_owns_only_its_own_commits(self) -> None:
+        """Rebasing onto the current base is the documented remediation.
+
+        Resolving the union against the prepared base turns that remediation
+        into a spurious ownership failure on every mainline path a sibling lane
+        landed while the task was live.
+        """
+        contact = self.checkout / "internal/contacts/model.go"
+        contact.parent.mkdir(parents=True)
+        contact.write_text("package contacts\n", encoding="utf-8")
+        self.commit("fixture: owned work")
+        advanced = self.advance_base(
+            "internal/cli/root.go",
+            "package cli\n// sibling lane merged\n",
+            "fixture: sibling lane merges outside the domain",
+        )
+        git("rebase", "origin/main", cwd=self.checkout)
+        head = git("rev-parse", "HEAD", cwd=self.checkout)
+
+        ownership = driver.action_ownership(self.ownership_brief(["internal/contacts"]))
+
+        self.assertEqual(ownership["ownedPaths"], ["internal/contacts/model.go"])
+        # The receipt still names the base this lane was prepared and gated on;
+        # only the union narrowed.
+        self.assertEqual(ownership["baseRev"], self.base_rev)
+        self.assertEqual(ownership["head"], head)
+        self.assertNotEqual(advanced, self.base_rev)
+        published = driver.action_publish(self.publish_brief(["internal/contacts"]))
+        self.assertEqual(published["ownership"], ownership)
+
+    def test_publication_answers_to_configured_gates_not_to_the_receipt(self) -> None:
+        """A receipt re-run against itself proves nothing about today's gate."""
+        contact = self.checkout / "internal/contacts/model.go"
+        contact.parent.mkdir(parents=True)
+        contact.write_text("package contacts\n", encoding="utf-8")
+        head = self.commit("fixture: owned work")
+        witnessed = {
+            "gateId": "no-secrets",
+            "kind": "forbidPaths",
+            "patterns": ["secrets/**"],
+            "checkedPaths": 1,
+            "baseRev": self.base_rev,
+            "head": head,
+        }
+        configured = {
+            "kind": "forbidPaths",
+            "id": "no-secrets",
+            "forbidPaths": ["secrets/**"],
+            "runtimeMaxSec": 60,
+        }
+        widened = {**configured, "forbidPaths": ["secrets/**", "vault/**"]}
+
+        drifted = self.publish_brief(["internal/contacts"], gates=[widened])
+        drifted["constraints"] = [witnessed]
+        with self.assertRaisesRegex(
+            driver.DriverError,
+            r"forbidPaths gate 'no-secrets' was witnessed against patterns",
+        ):
+            driver.action_publish(drifted)
+        self.assert_not_published()
+
+        missing = self.publish_brief(["internal/contacts"], gates=[configured])
+        missing["constraints"] = []
+        with self.assertRaisesRegex(
+            driver.DriverError,
+            r"forbidPaths gate 'no-secrets' is configured .* no witnessed receipt",
+        ):
+            driver.action_publish(missing)
+        self.assert_not_published()
+
+        unconfigured = self.publish_brief(["internal/contacts"], gates=[])
+        unconfigured["constraints"] = [witnessed]
+        with self.assertRaisesRegex(
+            driver.DriverError,
+            r"forbidPaths gate 'no-secrets' presented a receipt",
+        ):
+            driver.action_publish(unconfigured)
+        self.assert_not_published()
+
+        matching = self.publish_brief(["internal/contacts"], gates=[configured])
+        matching["constraints"] = [witnessed]
+        published = driver.action_publish(matching)
+        self.assertEqual(published["head"], head)
+
+    def test_merge_refuses_an_ownership_receipt_that_disagrees_on_domains(self) -> None:
+        """The merge action stops trusting the receipt's own domainsRequired."""
+        contact = self.checkout / "internal/contacts/model.go"
+        contact.parent.mkdir(parents=True)
+        contact.write_text("package contacts\n", encoding="utf-8")
+        self.commit("fixture: owned work")
+        brief = self.publish_brief(["internal/contacts"])
+        published = driver.action_publish(brief)
+        rebase_brief = self.brief(["internal/contacts"])
+        rebase_brief.update({"publication": published, "constraints": []})
+        integrated = driver.action_rebase(rebase_brief)
+        self.assertTrue(integrated["ownership"]["domainsRequired"])
+
+        def merge_brief(domains_required: bool) -> dict[str, Any]:
+            source = self.brief(["internal/contacts"])
+            return {
+                "campaign": source["campaign"],
+                "repository": source["repository"],
+                "repositoryConfig": source["repositoryConfig"],
+                "issue": source["issue"],
+                "runId": source["runId"],
+                "workspaceRoot": source["workspaceRoot"],
+                "task": source["task"],
+                "domainsRequired": domains_required,
+                "workspace": source["workspace"],
+                "integration": integrated,
+            }
+
+        with self.assertRaisesRegex(
+            driver.DriverError,
+            "integration.ownership.domainsRequired does not match domainsRequired",
+        ):
+            driver.action_merge(merge_brief(False))
+        self.assertEqual(
+            git("--git-dir", str(self.remote), "rev-parse", "refs/heads/main"),
+            self.base_rev,
+        )
+
+        merged = driver.action_merge(merge_brief(True))
+
+        self.assertEqual(merged["taskId"], "conflict-domain")
+        self.assertEqual(merged["ownership"], integrated["ownership"])
+        self.assertNotEqual(
+            git("--git-dir", str(self.remote), "rev-parse", "refs/heads/main"),
+            self.base_rev,
+        )
+
     def test_serial_task_without_domains_preserves_the_existing_contract(self) -> None:
         (self.checkout / "internal/cli/root.go").write_text(
             "package cli\n// serial campaign\n", encoding="utf-8"
         )
         head = self.commit("fixture: serial task")
 
-        published = driver.action_publish(self.brief(domains_required=False))
+        published = driver.action_publish(self.publish_brief(domains_required=False))
 
         self.assertEqual(published["head"], head)
         self.assertFalse(published["ownership"]["domainsRequired"])

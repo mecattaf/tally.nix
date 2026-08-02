@@ -159,6 +159,49 @@ authorized.
 
 ### Fixed
 
+- Reject a spec-build task lane whose history contains a merge commit, naming
+  the real cause: "rebase instead of merging the base into your lane". The
+  ownership union walks lane history with `git log -m`, which splits a merge
+  and attributes both of its sides to the lane, so a lane that merged the base
+  branch claimed every path its siblings had landed and failed on paths no task
+  commit touched — with an ownership receipt that misattributed authorship to
+  match.
+- Resolve a spec-build lane's ownership union against the current base branch
+  rather than the base the lane was prepared on, whenever the lane already
+  contains that current base. Rebasing onto the advanced base is the documented
+  remediation for a red constraint, and it used to pull every mainline commit
+  landed since prep into the union and go spuriously red on paths outside the
+  task. The receipt still names the base the lane was prepared and gated on,
+  and the union narrows only onto a base the lane demonstrably contains, so
+  nothing about this widens what a lane may touch.
+- Cross-check spec-build publication against the campaign's configured
+  `forbidPaths` gates instead of re-running the pattern set stored in the
+  constraint receipt. Replaying a receipt against itself proved only that the
+  receipt was self-consistent, so a campaign whose patterns were widened
+  between the gate run and publication published against the superseded set.
+  Drift now fails by gate id, as does a configured gate that reached
+  publication with no witnessed receipt.
+- Compare the ownership receipt's `domainsRequired` against the campaign's own
+  parallelism at merge. The merge brief did not carry the campaign's value at
+  all, so the last node that can still refuse to act on an upstream flag
+  normalized it and trusted it — the pattern the rest of the integration path
+  had already stopped using.
+- Schedule spec-build checkpoint lanes after the pass's own merges. A
+  checkpoint sharing a frontier with a mergeable implementation task had its
+  fresh receipt invalidated by that same pass: the receipt is bound to the
+  exact revision tested, the merges moved the base out from under it, and the
+  next reconciliation found nothing and re-ran the whole checkpoint. Prepared
+  after the merges, the tested revision is the one the next pass reconciles.
+- Bound the checkpoint re-validation loop under a moving base. A checkpoint
+  whose base advanced during validation still records its truthful receipt for
+  the revision tested, but the lane now fails instead of reporting an advance,
+  because that receipt names a revision the next reconciliation will not read.
+  A base branch moving faster than a checkpoint runs used to re-execute it for
+  ever while every pass reported `advanced`, posted a continuation, and never
+  escalated; the failure spends the checkpoint's ordinary retry and steering
+  budget and reaches escalation instead. Only movement from outside the pass
+  can trip it, since a campaign's own merges land before its checkpoint lanes
+  prepare.
 - Fixed `tally adapter smoke --assert-commit`, which could never pass for an
   adapter with `hardening` set — the configuration the hardening guide's only
   worked example recommends for codex. The probe repository was created under

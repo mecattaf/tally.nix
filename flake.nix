@@ -3913,6 +3913,12 @@
                       "build/LATE.SQLite"
                     ]),
                     domainsRequired: true,
+                    gates: [{
+                      kind: "forbidPaths",
+                      id: "no-db-artifacts",
+                      forbidPaths: ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"],
+                      runtimeMaxSec: 11
+                    }],
                     workspace: {
                       taskId: "task-1",
                       baseRev: $base,
