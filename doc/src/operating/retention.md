@@ -93,6 +93,33 @@ defaults replace the former 256 MiB floor, which represented only a few patholog
 rewrites. Lower them only when the largest admitted wave and measured write amplification fit
 comfortably below the replacement floor.
 
+**Upgrade consideration — the free-space floor moved from 256 MiB to 8 GiB.**
+The defaults changed, not just the documentation. `minimumFreeBytes` went from 256 MiB to
+8 GiB (`8589934592`) and `warningFreeBytes` to 16 GiB (`17179869184`). An existing deployment
+that never set these options inherits the new floor at its first daemon start after the
+upgrade.
+
+On a host with less than 8 GiB free that is an immediate, total intake refusal. It is legible
+— `tally query storage` and the refusal reason on every rejected submission name the observed
+available bytes and the minimum, and already-admitted work is left to finish — but nothing
+else announces it, so it arrives as a surprise on a constrained host that was running fine
+under the 256 MiB floor.
+
+Check available free space on the `dataDir` and `stateDir` filesystems before upgrading. If it
+is below the new floor, either free space or set the two options explicitly:
+
+```nix
+services.tally.storage.dataDir = {
+  warningFreeBytes = 2147483648;   # 2 GiB
+  minimumFreeBytes = 1073741824;   # 1 GiB
+};
+```
+
+Size any replacement from the guidance above rather than from the old default. Note also that
+recovery is hysteretic: once intake closes, it reopens only when availability rises at least
+1 GiB above the configured floor, so restoring intake takes more free space than the floor
+alone suggests.
+
 The timer runs this command:
 
 ```console
