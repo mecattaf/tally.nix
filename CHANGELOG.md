@@ -8,6 +8,34 @@ authorized.
 
 ### Added
 
+- Landed the two-repository campaign seam (#321): a spec-corpus campaign can
+  now read its worklist from one repository, land its lanes, publish branches
+  and pull requests on a second, and keep its campaign issue thread — and every
+  machine receipt — on a third. Three campaign options, `codeRepository`,
+  `specRepository` and `issueRepository`, bind those roles to entries of the
+  campaign's existing `repositories` map, and each defaults inward (issue → spec
+  → the repository the campaign issue was read from). A campaign that sets none
+  of them renders arguments that do not carry the roles at all and takes exactly
+  the pre-seam path, so single-repository behaviour is unchanged. The empirical
+  probe recorded on the issue verified cross-repository closure live before any
+  of this was written: a code-repository pull request carrying
+  `Closes owner/spec#<n>` closes the spec-repository sub-issue on squash merge,
+  the parent's `subIssuesSummary` advances across repositories, and
+  `closedByPullRequestsReferences` still returns the merged pull request, so
+  §9.1.2's oracle survives the split. The same probe's control showed a bare
+  `Closes #<n>` links and closes nothing across repositories, so the publish
+  node now emits the full `owner/name#<n>` form wherever the task sub-issue
+  lives on another repository. Because a closing reference can now name any
+  repository, the sub-issue walk reads each reference's own repository and
+  completion requires it to be on the campaign's `codeRepository` — a narrowing
+  of where proof may come from, never a widening of what counts as proof. The
+  witness splits accordingly: the reconcile result reports the worklist's
+  pinned spec revision (with `source.repository` when split) alongside
+  `baseRevision`, the code base tip that lane bases, checkpoint receipts and
+  merged-commit ancestry are anchored to. An ad-hoc forge-native campaign is
+  single-repository by construction and refuses the roles rather than partially
+  honouring them. Adds no flow node; the `campaignMaxNodes` pin is untouched.
+
 - Repaired #316: reproduced the #247 frozen window, and made a `--flow-run`
   window say when it is not evidence about the run. `--flow-run` membership is
   not a durable property — tally recomputes it on every call by scanning

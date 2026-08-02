@@ -34,6 +34,12 @@ export const meta = {
         pattern: "^[0-9a-fA-F-]{36}$"
       },
       repository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
+      // The two-repository seam. Each names an entry of `repositories`. A
+      // campaign that sets none of them resolves every coordinate to
+      // `repository` and runs the single-repository path unchanged.
+      codeRepository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
+      specRepository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
+      issueRepository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" },
       issue: {
         type: "object",
         required: ["number", "url"],
@@ -474,7 +480,10 @@ const sourceSchema = {
       properties: {
         path: { type: "string", minLength: 1 },
         sha256: { type: "string", pattern: "^sha256:[0-9a-f]{64}$" },
-        revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" }
+        revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
+        // Present only when the worklist was read from a spec repository
+        // that is not the repository the campaign lands its work on.
+        repository: { type: "string", pattern: "^[^/ \\t]+/[^/ \\t]+$" }
       },
       additionalProperties: false
     },
@@ -634,6 +643,7 @@ const reconcileSchema = {
     "campaign",
     "repository",
     "source",
+    "baseRevision",
     "tasks",
     "merged",
     "checkpoints",
@@ -659,6 +669,9 @@ const reconcileSchema = {
     },
     repository: { type: "string", minLength: 1 },
     source: sourceSchema,
+    // The code revision this pass reasoned from: the worklist revision for a
+    // single-repository campaign, the code repository's base tip for a split.
+    baseRevision: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
     tasks: {
       type: "array",
       minItems: 1,
@@ -1082,13 +1095,57 @@ function driverNode(
 let effective = null;
 let campaignTaskIdentity = null;
 
+// The campaign's three repository coordinates, resolved once. `code` is where
+// lanes, publish branches, pull requests and merges live; `spec` is where the
+// worklist artifact is read from; `issue` is where the campaign thread and
+// every machine receipt live. Each defaults inward -- issue to spec, spec and
+// code to the repository the campaign issue was read from -- so a campaign
+// that names none of them resolves all three to the same repository and takes
+// exactly the pre-seam path.
+const codeRepository = args.codeRepository || args.repository;
+const specRepository = args.specRepository || args.repository;
+const issueRepository = args.issueRepository || specRepository;
+const seamSplit =
+  specRepository !== codeRepository || issueRepository !== codeRepository;
+
+function repositoryConfigFor(repository) {
+  const configured = args.repositories === undefined ? undefined : args.repositories[repository];
+  if (!configured) {
+    const error = new Error(`campaign repository ${repository} is not configured`);
+    error.name = "SpecBuildConfigurationError";
+    error.code = "repository-not-configured";
+    throw error;
+  }
+  return configured;
+}
+
+// The seam block a brief carries. Omitted entirely when the campaign is
+// single-repository, so its briefs -- and therefore their payload hashes --
+// are byte-identical to the ones minted before the seam existed.
+function withSeam(brief) {
+  if (!seamSplit) {
+    return brief;
+  }
+  return {
+    ...brief,
+    specRepository: {
+      repository: specRepository,
+      repositoryConfig: repositoryConfigFor(specRepository)
+    },
+    issueRepository: {
+      repository: issueRepository,
+      repositoryConfig: repositoryConfigFor(issueRepository)
+    }
+  };
+}
+
 function taskRefFor(taskId) {
   return `${campaignTaskIdentity}/${taskId}`;
 }
 
 function workspaceFor(prepared, baseRev) {
   return {
-    repo: args.repository,
+    repo: codeRepository,
     baseRev: baseRev || prepared.baseRev,
     branch: prepared.branch,
     worktreePath: prepared.worktreePath
@@ -1119,7 +1176,7 @@ function failureReport(task, stage, node) {
 function cleanupBrief(repositoryConfig, taskId, workspace) {
   const brief = {
     campaign: effective.campaign,
-    repository: args.repository,
+    repository: codeRepository,
     repositoryConfig,
     runId: args.runId,
     workspaceRoot: args.workspaceRoot,
@@ -1184,7 +1241,7 @@ function implementationBrief(task, prepared, reconciliation) {
       : `Implement only spec-build task ${task.id}: ${task.title}. Commit the complete result on the assigned branch. Do not push, open a pull request, merge, or read another task from the worklist; deterministic campaign nodes own those operations. The declared conflictDomains are an enforced ownership boundary: every path touched by any task commit, including a path later deleted or renamed, must remain inside them. Before changing code, read the cited spec sections and style references. Read the campaign issue comments and the machineDiagnoses below for steering at the start of this attempt. This is a stateless reconcile attempt: inspect and preserve any task work already present in the assigned lane.`,
     campaign: {
       name: effective.campaign,
-      repository: args.repository,
+      repository: codeRepository,
       issue: args.issue,
       runId: args.runId
     },
@@ -1197,8 +1254,10 @@ function implementationBrief(task, prepared, reconciliation) {
           machineDiagnoses: machineDiagnoses(reconciliation, task.id)
         }
       : {
+          // The steering channel is the campaign thread, which is not
+          // necessarily the repository the agent is working in.
           channel: "github-issue-comments",
-          repository: args.repository,
+          repository: issueRepository,
           issueNumber: args.issue.number,
           issueUrl: args.issue.url,
           machineDiagnoses: machineDiagnoses(reconciliation, task.id)
@@ -1214,7 +1273,7 @@ function checkpointBrief(task, prepared, reconciliation) {
       : `Run automated checkpoint ${task.id}: ${task.title}. The command is fixed by the worklist. Read the campaign issue comments and the machineDiagnoses below as the durable failure history for this retry. Do not modify the repository.`,
     campaign: {
       name: effective.campaign,
-      repository: args.repository,
+      repository: codeRepository,
       issue: args.issue,
       runId: args.runId
     },
@@ -1227,8 +1286,10 @@ function checkpointBrief(task, prepared, reconciliation) {
           machineDiagnoses: machineDiagnoses(reconciliation, task.id)
         }
       : {
+          // The steering channel is the campaign thread, which is not
+          // necessarily the repository the agent is working in.
           channel: "github-issue-comments",
-          repository: args.repository,
+          repository: issueRepository,
           issueNumber: args.issue.number,
           issueUrl: args.issue.url,
           machineDiagnoses: machineDiagnoses(reconciliation, task.id)
@@ -1381,7 +1442,7 @@ async function sweepCampaign(repositoryConfig) {
     {
       campaign: effective.campaign,
       campaignIdentity: campaignTaskIdentity,
-      repository: args.repository,
+      repository: codeRepository,
       repositoryConfig,
       runId: args.runId,
       workspaceRoot: args.workspaceRoot,
@@ -1417,7 +1478,7 @@ function sweepDeferral(sweepNode) {
   }
   return {
     campaign: effective.campaign,
-    repository: args.repository,
+    repository: codeRepository,
     issue: args.issue,
     state: "deferred-live-jobs",
     maintenance: sweepNode.result,
@@ -1429,6 +1490,20 @@ function sweepDeferral(sweepNode) {
 
 (async () => {
   const forgeNative = typeof args.worklist === "object";
+  if (forgeNative && seamSplit) {
+    // A forge-native campaign *is* its issue: worklist, briefs and receipts
+    // are all that one thread, so there is no second repository to bind.
+    const error = new Error("a forge-native campaign cannot span repositories");
+    error.name = "SpecBuildConfigurationError";
+    error.code = "forge-native-two-repo";
+    throw error;
+  }
+  if (seamSplit) {
+    // Fail before the first node rather than at the first read.
+    repositoryConfigFor(codeRepository);
+    repositoryConfigFor(specRepository);
+    repositoryConfigFor(issueRepository);
+  }
   campaignTaskIdentity = forgeNative ? args.campaignIdentity : args.campaign;
   if (!forgeNative) {
     const configuredGateIds = [];
@@ -1446,7 +1521,7 @@ function sweepDeferral(sweepNode) {
     ? null
     : {
         campaign: args.campaign,
-        repositoryConfig: args.repositories[args.repository],
+        repositoryConfig: args.repositories[codeRepository],
         maxParallel: args.maxParallel,
         mergeMethod: args.mergeMethod || "squash",
         gitAiBinding: args.gitAiBinding || "off",
@@ -1458,7 +1533,7 @@ function sweepDeferral(sweepNode) {
   let sweepNode = null;
   if (!forgeNative) {
     if (!effective.repositoryConfig) {
-      const error = new Error(`campaign repository ${args.repository} is not configured`);
+      const error = new Error(`campaign repository ${codeRepository} is not configured`);
       error.name = "SpecBuildConfigurationError";
       error.code = "repository-not-configured";
       throw error;
@@ -1471,19 +1546,19 @@ function sweepDeferral(sweepNode) {
   }
   const reconcileBrief = forgeNative
     ? withCapabilities({
-        repository: args.repository,
+        repository: codeRepository,
         issue: args.issue,
         worklist: args.worklist
       })
-    : {
+    : withSeam({
         campaign: args.campaign,
-        repository: args.repository,
-        repositoryConfig: args.repositories[args.repository],
+        repository: codeRepository,
+        repositoryConfig: args.repositories[codeRepository],
         issue: args.issue,
         worklist: args.worklist,
         maxTasks: args.maxTasks,
         maxParallel: args.maxParallel
-      };
+      });
   const reconciliationNode = await driverNode(
     "reconcile",
     reconcileBrief,
@@ -1499,7 +1574,7 @@ function sweepDeferral(sweepNode) {
     effective = reconciliation.config;
   }
   if (!effective || !effective.repositoryConfig) {
-    const error = new Error(`campaign repository ${args.repository} is not configured`);
+    const error = new Error(`campaign repository ${codeRepository} is not configured`);
     error.name = "SpecBuildConfigurationError";
     error.code = "repository-not-configured";
     throw error;
@@ -1527,7 +1602,7 @@ function sweepDeferral(sweepNode) {
   if (reconciliation.complete) {
     return {
       campaign: effective.campaign,
-      repository: args.repository,
+      repository: codeRepository,
       issue: args.issue,
       worklist: reconciliation.source,
       state: "complete",
@@ -1561,7 +1636,7 @@ function sweepDeferral(sweepNode) {
     }
     return {
       campaign: effective.campaign,
-      repository: args.repository,
+      repository: codeRepository,
       issue: args.issue,
       worklist: reconciliation.source,
       state: "blocked",
@@ -1593,7 +1668,7 @@ function sweepDeferral(sweepNode) {
         "preflight",
         {
           campaign: effective.campaign,
-          repository: args.repository,
+          repository: codeRepository,
           repositoryConfig,
           issue: args.issue,
           runId: args.runId,
@@ -1651,7 +1726,7 @@ function sweepDeferral(sweepNode) {
     const taskRef = taskRefFor(task.id);
     const prepBrief = {
       campaign: effective.campaign,
-      repository: args.repository,
+      repository: codeRepository,
       repositoryConfig,
       issue: args.issue,
       runId: args.runId,
@@ -1661,7 +1736,9 @@ function sweepDeferral(sweepNode) {
       // lane from whatever the remote base resolves to at its own later fetch;
       // carrying the witnessed revision lets it refuse a base that does not
       // descend from the history the worklist described.
-      sourceRevision: reconciliation.source.revision
+      // A lane forks from the code history, which is the worklist revision
+      // only while the campaign lives in one repository.
+      sourceRevision: reconciliation.baseRevision
     };
     const prepared = await driverNode(
       "prep",
@@ -1716,15 +1793,30 @@ function sweepDeferral(sweepNode) {
       }
       const recorded = await driverNode(
         "checkpoint",
-        withCapabilities({
-          campaign: effective.campaign,
-          repository: args.repository,
-          repositoryConfig,
-          issue: args.issue,
-          task,
-          source: reconciliation.source,
-          workspace: prepared.result
-        }),
+        withCapabilities(
+          withSeam(
+            seamSplit
+              ? {
+                  campaign: effective.campaign,
+                  repository: codeRepository,
+                  repositoryConfig,
+                  issue: args.issue,
+                  task,
+                  source: reconciliation.source,
+                  baseRevision: reconciliation.baseRevision,
+                  workspace: prepared.result
+                }
+              : {
+                  campaign: effective.campaign,
+                  repository: codeRepository,
+                  repositoryConfig,
+                  issue: args.issue,
+                  task,
+                  source: reconciliation.source,
+                  workspace: prepared.result
+                }
+          )
+        ),
         `checkpoint-record-${task.id}`,
         `checkpoint-record-${task.id}`,
         checkpointCompletionSchema,
@@ -1845,9 +1937,9 @@ function sweepDeferral(sweepNode) {
 
     const publication = await driverNode(
       "publish",
-      {
+      withSeam({
         campaign: effective.campaign,
-        repository: args.repository,
+        repository: codeRepository,
         repositoryConfig,
         issue: args.issue,
         runId: args.runId,
@@ -1858,7 +1950,7 @@ function sweepDeferral(sweepNode) {
         steward: effective.steward || null,
         workspace: prepared.result,
         constraints: constraintResults
-      },
+      }),
       `publish-${task.id}`,
       `publish-${task.id}`,
       publicationSchema,
@@ -1949,7 +2041,7 @@ function sweepDeferral(sweepNode) {
       "rebase",
       {
         campaign: effective.campaign,
-        repository: args.repository,
+        repository: codeRepository,
         repositoryConfig,
         issue: args.issue,
         runId: args.runId,
@@ -2014,7 +2106,7 @@ function sweepDeferral(sweepNode) {
       "merge",
       withCapabilities({
         campaign: effective.campaign,
-        repository: args.repository,
+        repository: codeRepository,
         repositoryConfig,
         issue: args.issue,
         runId: args.runId,
@@ -2088,9 +2180,9 @@ function sweepDeferral(sweepNode) {
   const retryOutcomes = await parallel(
     machineryFaults.map(failure => () => (async () => {
       const task = failure.task;
-      const retryBrief = withCapabilities({
+      const retryBrief = withCapabilities(withSeam({
         campaign: effective.campaign,
-        repository: args.repository,
+        repository: codeRepository,
         repositoryConfig,
         issue: args.issue,
         taskId: task.id,
@@ -2099,7 +2191,7 @@ function sweepDeferral(sweepNode) {
           failure.node && failure.node.error ? failure.node.error : failure.node,
           1500
         )
-      });
+      }));
       const retryThread = taskThread(task);
       if (retryThread !== null) {
         retryBrief.taskIssue = retryThread;
@@ -2174,7 +2266,7 @@ function sweepDeferral(sweepNode) {
         mission: `Diagnose failed spec-build task ${task.id}. Return only concise, actionable steering for the next task attempt. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`,
         campaign: {
           name: effective.campaign,
-          repository: args.repository,
+          repository: codeRepository,
           issue: args.issue,
           runId: args.runId
         },
@@ -2228,15 +2320,15 @@ function sweepDeferral(sweepNode) {
       }
       const diagnosed = await job(diagnosisSpec, { settle: false });
       const attempt = previousDiagnoses.length + 1;
-      const steerBrief = withCapabilities({
+      const steerBrief = withCapabilities(withSeam({
         campaign: effective.campaign,
-        repository: args.repository,
+        repository: codeRepository,
         repositoryConfig,
         issue: args.issue,
         taskId: task.id,
         attempt,
         diagnosis: diagnosed.result
-      });
+      }));
       const steerThread = taskThread(task);
       if (steerThread !== null) {
         steerBrief.taskIssue = steerThread;
@@ -2285,15 +2377,15 @@ function sweepDeferral(sweepNode) {
   if (advanced) {
     const continued = await driverNode(
       "continue",
-      {
+      withSeam({
         campaign: effective.campaign,
-        repository: args.repository,
+        repository: codeRepository,
         repositoryConfig,
         issue: args.issue,
         runId: args.runId,
         continuation: args.continuation,
         brief: forgeNative ? null : args
-      },
+      }),
       "continue",
       "spec-build-continue",
       continuationSchema,
@@ -2347,7 +2439,7 @@ function sweepDeferral(sweepNode) {
 
   return {
     campaign: effective.campaign,
-    repository: args.repository,
+    repository: codeRepository,
     issue: args.issue,
     worklist: reconciliation.source,
     // The frontier-without-outcome invariant above has already thrown unless
