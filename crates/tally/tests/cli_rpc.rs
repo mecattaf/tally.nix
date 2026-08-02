@@ -152,6 +152,12 @@ impl RpcHandler for CliHandler {
                     assert_eq!(params["until"], "2026-07-25T00:00:00Z");
                     assert_eq!(params["limit"], 23);
                     assert_eq!(params["cursor"], "page-v1:log");
+                    // The durable position rides its own parameter: `since`
+                    // stays a wall-clock time filter.
+                    assert_eq!(
+                        params["after"],
+                        "log-v1:00000000000000000041:00000000000000000007"
+                    );
                     assert_eq!(params["provenance"], false);
                     Ok(serde_json::json!({
                         "schemaVersion": 1,
@@ -370,7 +376,18 @@ impl RpcHandler for HostileQueryHandler {
     ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
         Box::pin(async move {
             match request.method.as_str() {
-                "query.log" => Ok(serde_json::json!({
+                "query.log" => {
+                    // The human path follows the cursor to the end of the
+                    // window, so the hostile page must terminate: a
+                    // continuation request gets the same control-laden rows
+                    // and a null cursor. Both pages stay hostile, so the
+                    // sanitization assertions cover the walk, not just its
+                    // first step.
+                    let continuation = request
+                        .params
+                        .as_ref()
+                        .is_some_and(|params| params["cursor"].is_string());
+                    Ok(serde_json::json!({
                     "schemaVersion": 1,
                     "protocolVersion": 4,
                     "items": [
@@ -396,9 +413,10 @@ impl RpcHandler for HostileQueryHandler {
                             "provenance": "durable-lifecycle-history+witness-ledger"
                         }
                     ],
-                    "nextCursor": "\u{1b}[2Jpage-v1:log",
+                    "nextCursor": if continuation { Value::Null } else { Value::String("\u{1b}[2Jpage-v1:log".to_owned()) },
                     "snapshot": {}
-                })),
+                    }))
+                }
                 "query.run" => Ok(serde_json::json!({
                     "schemaVersion": 1,
                     "protocolVersion": 4,
@@ -1004,6 +1022,8 @@ async fn query_v4_cli_forwards_all_durable_observability_commands() {
                         "23",
                         "--cursor",
                         "page-v1:log",
+                        "--after",
+                        "log-v1:00000000000000000041:00000000000000000007",
                         "--json",
                     ],
                 )
@@ -1208,7 +1228,7 @@ async fn human_query_output_carries_no_daemon_sourced_terminal_control() {
     local
         .run_until(async {
             let server = tokio::task::spawn_local(async move {
-                for _ in 0..2 {
+                for _ in 0..3 {
                     let (stream, _) = listener.accept().await.unwrap();
                     serve_connection(stream, HostileQueryHandler).await.unwrap();
                 }
@@ -1269,8 +1289,23 @@ async fn human_query_output_carries_no_daemon_sourced_terminal_control() {
                     "missing {expected:?} in:\n{stdout}"
                 );
             }
+            // The human path follows the cursor rather than handing one over,
+            // so both hostile pages land here and neither is announced as
+            // unfinished business.
+            assert_eq!(stdout.lines().count(), 4, "{stdout}");
+            assert!(!stderr.contains("--cursor"), "{stderr}");
+
             // The pagination hint is an operator instruction on stderr and is
-            // sanitized on the same terms as the rows.
+            // sanitized on the same terms as the rows. It now lives on the
+            // single-page surface, where the caller owns the cursor: the
+            // control-laden cursor reaches the reader compacted or not at all.
+            let json = run_tally(&socket, &["query", "log", "--json"]).await;
+            assert!(json.status.success(), "{json:?}");
+            let stderr = String::from_utf8(json.stderr).unwrap();
+            assert!(
+                !stderr.contains(['\u{1b}', '\u{9b}', '\u{7}', '\u{202e}']),
+                "terminal control reached stderr:\n{stderr:?}"
+            );
             assert!(
                 stderr.contains("--cursor page-v1:log"),
                 "missing the cursor hint in:\n{stderr}"
@@ -1387,4 +1422,326 @@ async fn witness_verify_json_is_complete_and_red_exits_nonzero() {
         .is_some_and(|problems| problems
             .iter()
             .any(|problem| { problem["kind"] == "schema-version-invalid" })));
+}
+
+/// A daemon stand-in that pages a synthetic lifecycle window through the real
+/// `PageCache`, so the CLI faces exactly the byte cap, page cursors, and
+/// expiry the daemon produces. `expire_after` drops the snapshot cache after
+/// N page calls to force a mid-window `CursorExpired`.
+#[derive(Clone)]
+struct PagedLogHandler {
+    envelope: Value,
+    cache: Arc<Mutex<tally_core::pagination::PageCache>>,
+    calls: Arc<Mutex<usize>>,
+    expire_after: Option<usize>,
+}
+
+impl PagedLogHandler {
+    fn new(envelope: Value, expire_after: Option<usize>) -> Self {
+        Self {
+            envelope,
+            cache: Arc::new(Mutex::new(tally_core::pagination::PageCache::default())),
+            calls: Arc::new(Mutex::new(0)),
+            expire_after,
+        }
+    }
+}
+
+impl RpcHandler for PagedLogHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        Box::pin(async move {
+            let params = request.params.unwrap_or_default();
+            let cursor = params["cursor"].as_str().map(ToOwned::to_owned);
+            let served = {
+                let mut calls = self.calls.lock().unwrap();
+                *calls += 1;
+                *calls
+            };
+            let page = self.cache.lock().unwrap().page(
+                &request.method,
+                "fixture",
+                params["limit"].as_u64().map(|limit| limit as usize),
+                cursor.as_deref(),
+                cursor.is_none().then(|| self.envelope.clone()),
+            );
+            if self.expire_after == Some(served) {
+                // Evicting every snapshot is what the daemon does under
+                // pressure; the next continuation must fail, not lie.
+                *self.cache.lock().unwrap() = tally_core::pagination::PageCache::default();
+            }
+            page.map_err(|error| match error {
+                tally_core::pagination::PaginationError::CursorExpired => {
+                    WireError::not_found(error.to_string())
+                }
+                other => WireError::new(tally_client::WireErrorCode::Internal, other.to_string()),
+            })
+        })
+    }
+}
+
+fn synthetic_lifecycle_window(items: usize) -> Value {
+    let items = (0..items)
+        .map(|index| {
+            serde_json::json!({
+                "origin": "journal",
+                "eventId": format!("lifecycle:{index:020}"),
+                "cursor": format!("lifecycle:{index:020}"),
+                "timestamp": format!("2026-08-01T10:{:02}:{:02}.000Z", index / 60, index % 60),
+                "event": "heartbeat",
+                "taskUuid": format!("00000000-0000-4000-8000-{index:012}"),
+                "taskRef": format!("crm/t{index:03}"),
+                "nodeLabel": format!("agent-t{index:03}"),
+                "attempt": 1,
+                "authority": "tally-lifecycle-observation",
+                "provenance": "durable-lifecycle-history",
+                // Padding sized so the 48 KiB response cap, not the item
+                // limit, decides where pages break.
+                "stderrTail": "s".repeat(1_024),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "schemaVersion": 1,
+        "protocolVersion": 4,
+        "items": items,
+        "nextCursor": null,
+        "position": "log-v1:00000000000000000600:00000000000000000000",
+        "snapshot": {"createdAt": "2026-08-01T10:30:00.000Z"},
+    })
+}
+
+/// #316/#247: the human view of a long flow run must show the whole window,
+/// not the first capped page with no indication that anything was withheld.
+#[tokio::test(flavor = "current_thread")]
+async fn human_query_log_follows_cursors_across_the_byte_cap_and_prints_the_whole_window() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let handler = PagedLogHandler::new(synthetic_lifecycle_window(600), None);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_connection(stream, handler).await.unwrap();
+            });
+            let output = run_tally(
+                &socket,
+                &[
+                    "query",
+                    "log",
+                    "--flow-run",
+                    "00000000-0000-4000-8000-000000000045",
+                ],
+            )
+            .await;
+            assert!(output.status.success(), "{output:?}");
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert_eq!(
+                stdout.lines().count(),
+                600,
+                "the human window was short:\n{stderr}"
+            );
+            assert!(stdout.contains("crm/t000"));
+            assert!(
+                stdout.contains("crm/t599"),
+                "the tail of the window is missing"
+            );
+            // More than one page was needed, and the reader is told so rather
+            // than being handed a cursor to chase.
+            assert!(
+                stderr.contains("assembled from") && stderr.contains("pages"),
+                "{stderr}"
+            );
+            assert!(!stderr.contains("continue with --cursor"), "{stderr}");
+            assert!(!stderr.contains("INCOMPLETE"), "{stderr}");
+            assert!(stderr.contains("position: log-v1:"), "{stderr}");
+            server.await.unwrap();
+        })
+        .await;
+}
+
+/// Killing completeness mid-window must produce an explicit notice, never a
+/// silently short list.
+#[tokio::test(flavor = "current_thread")]
+async fn human_query_log_restarts_once_and_says_so_when_the_page_cursor_expires() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let handler = PagedLogHandler::new(synthetic_lifecycle_window(200), Some(1));
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_connection(stream, handler).await.unwrap();
+            });
+            let output = run_tally(&socket, &["query", "log"]).await;
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "stdout={stdout} stderr={stderr}");
+            assert!(
+                stderr.contains("the page cursor expired mid-window"),
+                "the restart was silent:\n{stderr}"
+            );
+            assert_eq!(stdout.lines().count(), 200, "{stderr}");
+            server.await.unwrap();
+        })
+        .await;
+}
+
+/// The oversized-item case: `query jobs` on a run holding one monstrous row
+/// succeeds, marks the elision, and exits 0. Before #316 the same input was a
+/// hard `one collection item exceeds the bounded response size` failure.
+#[tokio::test(flavor = "current_thread")]
+async fn query_jobs_serves_an_oversized_item_with_a_marked_elision_and_exits_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let envelope = serde_json::json!({
+        "schemaVersion": 1,
+        "protocolVersion": 4,
+        "items": [
+            {
+                "anchor": "00000000-0000-4000-8000-000000000045",
+                "liveState": "running",
+                "argv": ["tally", "campaign", "run", "--brief", "b".repeat(120 * 1024)],
+            },
+            {"anchor": "00000000-0000-4000-8000-000000000046", "liveState": "queued"},
+        ],
+        "nextCursor": null,
+        "snapshot": {"createdAt": "2026-08-01T10:30:00.000Z"},
+    });
+    let handler = PagedLogHandler::new(envelope, None);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_connection(stream, handler).await.unwrap();
+            });
+            let output = run_tally(
+                &socket,
+                &[
+                    "query",
+                    "jobs",
+                    "--flow-run",
+                    "00000000-0000-4000-8000-000000000045",
+                ],
+            )
+            .await;
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(output.status.success(), "{stderr}");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            let items = value["items"].as_array().unwrap();
+            assert_eq!(items.len(), 2, "the oversized row destroyed the page");
+            assert_eq!(items[0]["anchor"], "00000000-0000-4000-8000-000000000045");
+            assert_eq!(items[0]["liveState"], "running");
+            assert_eq!(items[0]["elided"]["fields"], serde_json::json!(["/argv/4"]));
+            assert_eq!(value["elidedItems"], 1);
+            assert_eq!(value["truncated"], false);
+            assert!(value["nextCursor"].is_null());
+            assert!(
+                stderr.contains("exceeded the bounded response size"),
+                "{stderr}"
+            );
+            server.await.unwrap();
+        })
+        .await;
+}
+
+/// `--json` keeps single-page semantics — the caller owns the cursor — but the
+/// envelope and stderr both say the page is not the window.
+#[tokio::test(flavor = "current_thread")]
+async fn json_query_log_keeps_one_page_and_marks_it_truncated() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let handler = PagedLogHandler::new(synthetic_lifecycle_window(600), None);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_connection(stream, handler).await.unwrap();
+            });
+            let output = run_tally(&socket, &["query", "log", "--json"]).await;
+            assert!(output.status.success(), "{output:?}");
+            let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert!(value["items"].as_array().unwrap().len() < 600);
+            assert_eq!(value["truncated"], true);
+            assert!(value["nextCursor"].is_string());
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(stderr.contains("one page of a larger window"), "{stderr}");
+            server.await.unwrap();
+        })
+        .await;
+}
+
+/// The intersection of #315 and #316: the window-walking human path buffers
+/// every page and then prints hundreds of lines at once, so it is exactly the
+/// shape that turns a hung-up reader into a panic. It must stay a quiet exit
+/// 0, and the stderr notices that follow the rows must not start speaking
+/// after the reader has gone.
+#[tokio::test(flavor = "current_thread")]
+async fn a_walked_window_whose_reader_hangs_up_exits_quietly_without_notices() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let handler = PagedLogHandler::new(synthetic_lifecycle_window(600), None);
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                // The client dies mid-window; the connection ending under the
+                // server is part of what is being exercised.
+                let _ = serve_connection(stream, handler).await;
+            });
+
+            let mut child = Command::new(env!("CARGO_BIN_EXE_tally"))
+                .arg("--socket")
+                .arg(&socket)
+                .args([
+                    "query",
+                    "log",
+                    "--flow-run",
+                    "00000000-0000-4000-8000-000000000045",
+                ])
+                .env_remove("TALLY_JOB_ID")
+                .env_remove("TALLY_JOB_TOKEN")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+
+            let mut reader = BufReader::new(child.stdout.take().unwrap());
+            let mut first = String::new();
+            reader.read_line(&mut first).await.unwrap();
+            assert!(first.contains("crm/t000"), "{first:?}");
+            drop(reader);
+
+            let output = child.wait_with_output().await.unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+            assert!(
+                !stderr.contains("panicked"),
+                "a hung-up reader panicked the CLI:\n{stderr}"
+            );
+            // Not even the multi-page notice: the reader stopped reading, so
+            // the command stops talking on both surfaces.
+            assert!(stderr.is_empty(), "unexpected stderr:\n{stderr}");
+            let signal = std::os::unix::process::ExitStatusExt::signal(&output.status);
+            assert_eq!(
+                (output.status.code(), signal),
+                (Some(0), None),
+                "a hung-up reader must end the command quietly: {:?}",
+                output.status
+            );
+            server.await.unwrap();
+        })
+        .await;
 }

@@ -6,6 +6,12 @@ use thiserror::Error;
 pub const DEFAULT_PAGE_ITEMS: usize = 100;
 pub const MAX_PAGE_ITEMS: usize = 1_000;
 const PAGE_RESULT_CAP_BYTES: usize = 48 * 1024;
+/// Bytes of an over-large string field retained when the field has to be
+/// elided so its item can be served at all. Enough to keep an argv element or
+/// a brief-derived field recognisable to a reader.
+const ELISION_KEEP_BYTES: usize = 256;
+/// Key the elision marker is written under on an elided item.
+pub const ELISION_MARKER_KEY: &str = "elided";
 const MAX_SNAPSHOTS: usize = 32;
 // Total approximate bytes of retained snapshots. The count cap alone lets 32
 // arbitrarily large result sets pin unbounded memory; the byte budget evicts
@@ -133,15 +139,24 @@ impl PageCache {
         // one comma separator per item after the first. This keeps page
         // boundaries byte-identical to full re-serialization while assembling
         // each page in O(page) instead of O(page^2) bytes.
+        //
+        // `truncated` and `elidedItems` are part of that fixed overhead. Only
+        // a page's leading item can ever be elided, so `elidedItems` is 0 or 1
+        // and its width never changes; `truncated: false` co-occurs only with
+        // a null `nextCursor`, which is 47 bytes shorter than the fixed-width
+        // cursor the sizing render carries, so the final render is never
+        // larger than the one this accounting priced.
         let empty_render = render(
             &snapshot.template,
             &[],
             Some(page_cursor(snapshot.id, offset)),
+            0,
         )?;
         let mut used = serde_json::to_vec(&empty_render)
             .map_err(|_| PaginationError::InvalidEnvelope)?
             .len();
         let mut page_items = Vec::new();
+        let mut elided = 0_usize;
         let mut next_offset = offset;
         while next_offset < snapshot.items.len() && page_items.len() < limit {
             let item_bytes = approximate_size(&snapshot.items[next_offset])?;
@@ -150,7 +165,18 @@ impl PageCache {
                 .saturating_add(usize::from(!page_items.is_empty()));
             if candidate > PAGE_RESULT_CAP_BYTES {
                 if page_items.is_empty() {
-                    return Err(PaginationError::ItemTooLarge);
+                    // One monstrous item must not destroy the page: a campaign
+                    // runner whose argv embeds an issue body would otherwise
+                    // make the whole run unmonitorable. Elide its largest
+                    // string fields, mark the elision on the item, and serve
+                    // it. Only an item that cannot be shrunk this way is still
+                    // a hard error.
+                    let room = PAGE_RESULT_CAP_BYTES.saturating_sub(used);
+                    let shrunk = elide_to_fit(&snapshot.items[next_offset], room)
+                        .ok_or(PaginationError::ItemTooLarge)?;
+                    page_items.push(shrunk);
+                    elided += 1;
+                    next_offset += 1;
                 }
                 break;
             }
@@ -160,7 +186,7 @@ impl PageCache {
         }
         let next_cursor =
             (next_offset < snapshot.items.len()).then(|| page_cursor(snapshot.id, next_offset));
-        render(&snapshot.template, &page_items, next_cursor)
+        render(&snapshot.template, &page_items, next_cursor, elided)
     }
 }
 
@@ -174,17 +200,97 @@ fn render(
     template: &Value,
     items: &[Value],
     next_cursor: Option<String>,
+    elided: usize,
 ) -> Result<Value, PaginationError> {
     let mut result = template.clone();
     let object = result
         .as_object_mut()
         .ok_or(PaginationError::InvalidEnvelope)?;
     object.insert("items".to_owned(), Value::Array(items.to_vec()));
+    // `truncated` is the field a reader can trust without reasoning about
+    // cursors: it is true exactly when this response is not the whole window.
+    object.insert("truncated".to_owned(), Value::Bool(next_cursor.is_some()));
+    object.insert("elidedItems".to_owned(), Value::from(elided));
     object.insert(
         "nextCursor".to_owned(),
         next_cursor.map_or(Value::Null, Value::String),
     );
     Ok(result)
+}
+
+/// Shrink `item` until it serializes within `room` bytes by truncating its
+/// largest string leaves, largest first, and recording what was cut on the
+/// item itself. Returns `None` when no amount of string elision gets there —
+/// an item whose bulk is structure rather than text.
+fn elide_to_fit(item: &Value, room: usize) -> Option<Value> {
+    if !item.is_object() {
+        return None;
+    }
+    let original_bytes = serde_json::to_vec(item).ok()?.len();
+    let mut candidates = Vec::new();
+    collect_string_leaves(item, &mut String::new(), &mut candidates);
+    // Largest first, path order breaking ties so the result is deterministic.
+    candidates.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let mut work = item.clone();
+    let mut cut = Vec::new();
+    for (pointer, length) in candidates {
+        if length <= ELISION_KEEP_BYTES {
+            break;
+        }
+        elide_at(&mut work, &pointer)?;
+        cut.push(Value::String(pointer));
+        let marker = serde_json::json!({
+            "fields": Value::Array(cut.clone()),
+            "originalBytes": original_bytes,
+            "reason": "item exceeded the bounded response size",
+        });
+        work.as_object_mut()?
+            .insert(ELISION_MARKER_KEY.to_owned(), marker);
+        if serde_json::to_vec(&work).ok()?.len() <= room {
+            return Some(work);
+        }
+    }
+    None
+}
+
+fn collect_string_leaves(value: &Value, pointer: &mut String, out: &mut Vec<(String, usize)>) {
+    match value {
+        Value::String(text) => out.push((pointer.clone(), text.len())),
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let mark = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&index.to_string());
+                collect_string_leaves(item, pointer, out);
+                pointer.truncate(mark);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, field) in fields {
+                if key == ELISION_MARKER_KEY {
+                    continue;
+                }
+                let mark = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                collect_string_leaves(field, pointer, out);
+                pointer.truncate(mark);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn elide_at(value: &mut Value, pointer: &str) -> Option<()> {
+    let target = value.pointer_mut(pointer)?;
+    let text = target.as_str()?;
+    let mut keep = ELISION_KEEP_BYTES.min(text.len());
+    while keep > 0 && !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    let dropped = text.len() - keep;
+    *target = Value::String(format!("{}…<{dropped} bytes elided>", &text[..keep]));
+    Some(())
 }
 
 fn page_cursor(snapshot: u64, offset: usize) -> String {
@@ -474,6 +580,107 @@ mod tests {
             }
         }
         assert_eq!(consumed, items.len());
+    }
+
+    /// #316: a campaign runner row whose argv embeds an issue body used to
+    /// make `query jobs --flow-run` fail outright with `ItemTooLarge`, which
+    /// made the whole run unmonitorable. The oversized field is elided and
+    /// marked; the page is served.
+    #[test]
+    fn an_oversized_item_is_elided_and_marked_instead_of_destroying_the_page() {
+        let monstrous = serde_json::json!({
+            "anchor": "00000000-0000-4000-8000-000000000001",
+            "argv": ["tally", "campaign", "run", "x".repeat(200 * 1024)],
+            "liveState": "running",
+        });
+        let envelope = serde_json::json!({
+            "schemaVersion": 1,
+            "items": [monstrous, serde_json::json!({"anchor": "second"})],
+            "nextCursor": null,
+        });
+        let mut cache = PageCache::default();
+        let page = cache
+            .page("query.jobs", "oversized", Some(100), None, Some(envelope))
+            .expect("an oversized item must not fail the query");
+        assert!(serde_json::to_vec(&page).unwrap().len() <= PAGE_RESULT_CAP_BYTES);
+        assert_eq!(page["elidedItems"], 1);
+        assert_eq!(page["truncated"], true);
+        let item = &page["items"][0];
+        assert_eq!(item["anchor"], "00000000-0000-4000-8000-000000000001");
+        assert_eq!(item["liveState"], "running", "unrelated fields survive");
+        assert_eq!(
+            item[ELISION_MARKER_KEY]["fields"],
+            serde_json::json!(["/argv/3"])
+        );
+        assert!(item[ELISION_MARKER_KEY]["originalBytes"].as_u64().unwrap() > 200 * 1024);
+        let elided = item["argv"][3].as_str().unwrap();
+        assert!(elided.starts_with(&"x".repeat(ELISION_KEEP_BYTES)));
+        assert!(elided.ends_with("bytes elided>"));
+
+        // The rest of the window still pages normally behind it.
+        let cursor = page["nextCursor"].as_str().unwrap().to_owned();
+        let rest = cache
+            .page("query.jobs", "oversized", Some(100), Some(&cursor), None)
+            .unwrap();
+        assert_eq!(rest["items"][0]["anchor"], "second");
+        assert_eq!(rest["elidedItems"], 0);
+        assert_eq!(rest["truncated"], false);
+    }
+
+    /// Elision shrinks text, not structure. An item that is huge because of
+    /// its shape cannot be rescued, and that stays a hard error rather than a
+    /// silently short page.
+    #[test]
+    fn an_item_too_large_to_elide_is_still_a_hard_error() {
+        let structural = Value::Array(
+            (0..20_000)
+                .map(|index| serde_json::json!({"n": index}))
+                .collect(),
+        );
+        let envelope = serde_json::json!({
+            "items": [serde_json::json!({"rows": structural})],
+            "nextCursor": null,
+        });
+        let mut cache = PageCache::default();
+        assert_eq!(
+            cache
+                .page("query.jobs", "structural", Some(100), None, Some(envelope))
+                .unwrap_err(),
+            PaginationError::ItemTooLarge
+        );
+    }
+
+    /// `truncated` is the field a monitor can read without reasoning about
+    /// cursors: the #247 report was a reader who could not tell a capped page
+    /// from a quiet run.
+    #[test]
+    fn truncated_marks_every_incomplete_page_and_only_those() {
+        let envelope = serde_json::json!({
+            "items": (0..5).map(|index| serde_json::json!({"index": index})).collect::<Vec<_>>(),
+            "nextCursor": null,
+        });
+        let mut cache = PageCache::default();
+        let first = cache
+            .page("query.log", "flags", Some(2), None, Some(envelope))
+            .unwrap();
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["elidedItems"], 0);
+        let mut cursor = first["nextCursor"].as_str().unwrap().to_owned();
+        loop {
+            let page = cache
+                .page("query.log", "flags", Some(2), Some(&cursor), None)
+                .unwrap();
+            match page["nextCursor"].as_str() {
+                Some(next) => {
+                    assert_eq!(page["truncated"], true);
+                    cursor = next.to_owned();
+                }
+                None => {
+                    assert_eq!(page["truncated"], false);
+                    break;
+                }
+            }
+        }
     }
 
     #[test]

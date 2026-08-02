@@ -203,30 +203,37 @@ pub(super) async fn run_query(
             until,
             limit,
             cursor,
+            json,
         } => {
-            print_rpc(
-                socket,
-                config_path,
-                rpc_timeout,
-                "query.jobs",
-                Some(json!({
-                    "liveState": state,
-                    "terminalVerdict": verdict,
-                    "pool": pool,
-                    "executor": executor,
-                    "adapter": adapter,
-                    "source": source,
-                    "origin": origin,
-                    "parent": parent,
-                    "flowRun": flow_run,
-                    "session": session,
-                    "since": since,
-                    "until": until,
-                    "limit": limit,
-                    "cursor": cursor,
-                })),
-            )
-            .await
+            let params = json!({
+                "liveState": state,
+                "terminalVerdict": verdict,
+                "pool": pool,
+                "executor": executor,
+                "adapter": adapter,
+                "source": source,
+                "origin": origin,
+                "parent": parent,
+                "flowRun": flow_run,
+                "session": session,
+                "since": since,
+                "until": until,
+                "limit": limit,
+                "cursor": cursor,
+            });
+            let client = connect_rpc(socket, config_path).await?;
+            // A caller that supplied its own cursor, or asked for `--json`,
+            // owns pagination. Everyone else gets the whole window.
+            if json || cursor.is_some() {
+                let result = call_page(&client, rpc_timeout, "query.jobs", params).await?;
+                report_page_completeness(&result)?;
+                outln!("{}", serde_json::to_string(&result)?);
+                return Ok(());
+            }
+            let window = collect_window(&client, rpc_timeout, "query.jobs", &params).await?;
+            window.report()?;
+            outln!("{}", serde_json::to_string(&window.envelope)?);
+            Ok(())
         }
         QueryCommand::Job { id } => {
             print_rpc(
@@ -281,35 +288,38 @@ pub(super) async fn run_query(
             until,
             limit,
             cursor,
+            after,
             json,
             provenance,
         } => {
+            let params = json!({
+                "task": task,
+                "flowRun": flow_run,
+                "attempt": attempt,
+                "session": session,
+                "event": event,
+                "source": source,
+                "since": since,
+                "until": until,
+                "limit": limit,
+                "cursor": cursor,
+                "after": after,
+                "provenance": provenance,
+            });
             let client = connect_rpc(socket, config_path).await?;
-            let result = client
-                .call_with_deadline(
-                    "query.log",
-                    Some(json!({
-                    "task": task,
-                    "flowRun": flow_run,
-                    "attempt": attempt,
-                    "session": session,
-                    "event": event,
-                    "source": source,
-                    "since": since,
-                    "until": until,
-                    "limit": limit,
-                    "cursor": cursor,
-                    "provenance": provenance,
-                    })),
-                    rpc_timeout,
-                )
-                .await?;
-            if json {
+            // `--json` and an explicit `--cursor` keep single-page semantics:
+            // the caller owns the cursor. The human view owns it instead, so
+            // it walks to the end of the window before printing anything.
+            if json || cursor.is_some() {
+                let result = call_page(&client, rpc_timeout, "query.log", params).await?;
+                report_page_completeness(&result)?;
                 outln!("{}", serde_json::to_string(&result)?);
-                Ok(())
-            } else {
-                print_lifecycle_human(&result, provenance)
+                return Ok(());
             }
+            let window = collect_window(&client, rpc_timeout, "query.log", &params).await?;
+            print_lifecycle_human(&window.envelope, provenance)?;
+            window.report()?;
+            Ok(())
         }
         QueryCommand::Proof {
             task,
@@ -402,6 +412,200 @@ pub(super) async fn run_query(
     }
 }
 
+/// One filtered window, assembled by following page cursors within a single
+/// invocation. `envelope` is the last page's envelope with every page's items
+/// merged back in, so its `snapshot` and `position` still describe the one
+/// frozen projection all the pages came from.
+pub(super) struct PagedWindow {
+    envelope: Value,
+    pages: usize,
+    elided: usize,
+    restarted: bool,
+}
+
+impl PagedWindow {
+    /// Say, on stderr, everything that stops this from being the whole window.
+    /// Silence here means the reader is looking at all of it — that is the
+    /// entire point of the line.
+    fn report(&self) -> Result<()> {
+        if self.restarted {
+            errln!(
+                "notice: the page cursor expired mid-window; the query was restarted once and \
+                 this window was re-read from the beginning"
+            );
+        }
+        if self.elided > 0 {
+            errln!(
+                "notice: {} item(s) exceeded the bounded response size; their largest fields were \
+                 elided and marked with an `elided` object on the item",
+                self.elided
+            );
+        }
+        report_position_gap(&self.envelope)?;
+        if self.pages > 1 {
+            errln!(
+                "notice: this window was assembled from {} pages; it is complete as of snapshot {}",
+                self.pages,
+                compact_text(
+                    self.envelope["snapshot"]["createdAt"]
+                        .as_str()
+                        .unwrap_or("unknown")
+                )
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Report what a single page cannot show. `--json` and an explicit `--cursor`
+/// hand pagination to the caller, but the caller still has to be told when the
+/// page in front of them is not the whole window.
+fn report_page_completeness(envelope: &Value) -> Result<()> {
+    if envelope["truncated"].as_bool() == Some(true) || envelope["nextCursor"].is_string() {
+        errln!(
+            "notice: this response is one page of a larger window; continue with --cursor {}",
+            compact_text(envelope["nextCursor"].as_str().unwrap_or("<missing>"))
+        );
+    }
+    if envelope["elidedItems"].as_u64().unwrap_or(0) > 0 {
+        errln!(
+            "notice: {} item(s) exceeded the bounded response size; their largest fields were \
+             elided and marked with an `elided` object on the item",
+            envelope["elidedItems"].as_u64().unwrap_or(0)
+        );
+    }
+    report_position_gap(envelope)
+}
+
+fn report_position_gap(envelope: &Value) -> Result<()> {
+    if let Some(gap) = envelope.get("positionGap").filter(|gap| gap.is_object()) {
+        errln!(
+            "notice: --after {} predates retained lifecycle history (earliest available is {}); \
+             events before that boundary are gone and this window is not a complete continuation",
+            compact_text(gap["requested"].as_str().unwrap_or("<unknown>")),
+            compact_text(gap["earliestAvailable"].as_str().unwrap_or("<unknown>"))
+        );
+    }
+    Ok(())
+}
+
+async fn call_page(
+    client: &RpcClient,
+    rpc_timeout: Duration,
+    method: &str,
+    params: Value,
+) -> Result<Value> {
+    client
+        .call_with_deadline(method, Some(params), rpc_timeout)
+        .await
+        .map_err(|error| annotate_page_error(method, error))
+}
+
+/// Turn the daemon's bounded-response errors into something a reader can act
+/// on. The oversized-item failure in particular used to surface as an opaque
+/// internal error with no hint that the query itself was still answerable.
+fn annotate_page_error(method: &str, error: WireIoError) -> anyhow::Error {
+    if let WireIoError::Rpc(WireErrorCode::Internal, message, _) = &error {
+        if message.contains("exceeds the bounded response size") {
+            return anyhow::anyhow!(
+                "{method} could not render one item within the bounded response size even after \
+                 eliding its largest text fields; narrow the query (for example with --task or \
+                 --limit 1) to see the rest"
+            );
+        }
+    }
+    error.into()
+}
+
+fn is_cursor_expired(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<WireIoError>(),
+        Some(WireIoError::Rpc(WireErrorCode::NotFound, message, _))
+            if message.contains("cursor expired")
+    )
+}
+
+/// Follow `nextCursor` to the end of the filtered window inside one
+/// invocation. A page cursor is an ephemeral snapshot offset, so the walk can
+/// lose its snapshot mid-window; that is recoverable exactly once, by starting
+/// the window over, and it is never silent.
+async fn collect_window(
+    client: &RpcClient,
+    rpc_timeout: Duration,
+    method: &str,
+    params: &Value,
+) -> Result<PagedWindow> {
+    match collect_window_once(client, rpc_timeout, method, params).await {
+        Ok(mut window) => {
+            window.restarted = false;
+            Ok(window)
+        }
+        Err(error) if is_cursor_expired(&error) => {
+            let mut window = collect_window_once(client, rpc_timeout, method, params)
+                .await
+                .map_err(|second| {
+                    second.context(
+                        "the page cursor expired twice while assembling this window; the daemon \
+                         is evicting snapshots faster than this query can be read",
+                    )
+                })?;
+            window.restarted = true;
+            Ok(window)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn fetch_page(
+    client: &RpcClient,
+    rpc_timeout: Duration,
+    method: &str,
+    params: &Value,
+    cursor: Option<String>,
+) -> Result<Value> {
+    let mut call_params = params.clone();
+    call_params["cursor"] = cursor.map_or(Value::Null, Value::String);
+    call_page(client, rpc_timeout, method, call_params).await
+}
+
+async fn collect_window_once(
+    client: &RpcClient,
+    rpc_timeout: Duration,
+    method: &str,
+    params: &Value,
+) -> Result<PagedWindow> {
+    let mut items = Vec::new();
+    let mut pages = 0_usize;
+    let mut elided = 0_usize;
+    let mut envelope = fetch_page(client, rpc_timeout, method, params, None).await?;
+    loop {
+        pages += 1;
+        elided += usize::try_from(envelope["elidedItems"].as_u64().unwrap_or(0)).unwrap_or(0);
+        match envelope["items"].take() {
+            Value::Array(page_items) => items.extend(page_items),
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "daemon returned an invalid {method} response with no items array"
+                ))
+            }
+        }
+        let Some(cursor) = envelope["nextCursor"].as_str().map(ToOwned::to_owned) else {
+            break;
+        };
+        envelope = fetch_page(client, rpc_timeout, method, params, Some(cursor)).await?;
+    }
+    envelope["items"] = Value::Array(items);
+    envelope["nextCursor"] = Value::Null;
+    envelope["truncated"] = Value::Bool(false);
+    envelope["elidedItems"] = Value::from(elided);
+    Ok(PagedWindow {
+        envelope,
+        pages,
+        elided,
+        restarted: false,
+    })
+}
+
 fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
     let items = envelope
         .get("items")
@@ -470,11 +674,17 @@ fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
             suffix
         );
     }
+    // A non-null cursor here would mean the window was still short: the human
+    // path follows cursors to the end, so reaching this line with one left is
+    // a defect, not a hint to hand the reader.
     if let Some(cursor) = envelope["nextCursor"].as_str() {
         errln!(
-            "More transitions are available; continue with --cursor {}",
+            "notice: this listing is INCOMPLETE; more transitions remain after --cursor {}",
             compact_text(cursor)
         );
+    }
+    if let Some(position) = envelope["position"].as_str() {
+        errln!("position: {}", compact_text(position));
     }
     Ok(())
 }

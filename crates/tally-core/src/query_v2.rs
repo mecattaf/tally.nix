@@ -359,7 +359,127 @@ pub struct CollectionEnvelope<T> {
     pub protocol_version: u32,
     pub items: Vec<T>,
     pub next_cursor: Option<String>,
+    /// Durable stream position of this response, for collections that have
+    /// one. Unlike `next_cursor` it survives daemon restarts and page-cache
+    /// eviction, so a monitor can hold it between polls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    /// Set when a requested `after` position predates what durable history
+    /// still retains: events between the retained floor and the request are
+    /// gone, and the response is therefore not a complete continuation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position_gap: Option<PositionGap>,
     pub snapshot: QuerySnapshotMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct PositionGap {
+    pub requested: String,
+    pub earliest_available: String,
+}
+
+/// A durable coordinate in the lifecycle log stream.
+///
+/// `query.log` merges two append-only durable streams — the lifecycle history
+/// (`history.rs`) and the witness ledger — so one sequence number cannot name
+/// a position in it. Both components are monotone, which is what makes the
+/// position durable where a page cursor is not: it survives a daemon restart
+/// and page-cache eviction, and an external monitor can hold it between polls.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogPosition {
+    pub lifecycle: u64,
+    pub witness: u64,
+}
+
+pub const LOG_POSITION_PREFIX: &str = "log-v1";
+
+impl LogPosition {
+    #[must_use]
+    pub fn render(&self) -> String {
+        format!(
+            "{LOG_POSITION_PREFIX}:{:020}:{:020}",
+            self.lifecycle, self.witness
+        )
+    }
+
+    /// Parse a position emitted by a previous response. Page cursors and watch
+    /// cursors are rejected by name rather than silently misread: they are
+    /// ephemeral and would make a monitor's window wrong.
+    pub fn parse(value: &str) -> Result<Self, ObservabilityError> {
+        let mut parts = value.split(':');
+        let version = parts.next();
+        let lifecycle = parts.next().and_then(|part| part.trim().parse().ok());
+        let witness = parts.next().and_then(|part| part.trim().parse().ok());
+        if version != Some(LOG_POSITION_PREFIX)
+            || lifecycle.is_none()
+            || witness.is_none()
+            || parts.next().is_some()
+        {
+            return Err(ObservabilityError::InvalidPosition(value.to_owned()));
+        }
+        Ok(Self {
+            lifecycle: lifecycle.unwrap(),
+            witness: witness.unwrap(),
+        })
+    }
+
+    /// Whether a lifecycle item, identified by its durable `cursor`, is newer
+    /// than this position. An unrecognised cursor is treated as newer: a
+    /// monitor may then see an item twice, never miss one.
+    #[must_use]
+    pub fn precedes(&self, cursor: &str) -> bool {
+        match sequence_after_prefix(cursor, "lifecycle:") {
+            Some(sequence) => return sequence > self.lifecycle,
+            None => {
+                if let Some(sequence) = sequence_after_prefix(cursor, "witness:") {
+                    return sequence > self.witness;
+                }
+            }
+        }
+        true
+    }
+}
+
+fn sequence_after_prefix(cursor: &str, prefix: &str) -> Option<u64> {
+    cursor.strip_prefix(prefix)?.trim().parse().ok()
+}
+
+/// The head of the lifecycle log stream at projection time. Reporting the head
+/// rather than the newest matched item is what makes `--after` + empty items
+/// mean "provably quiet" for a filtered query.
+#[must_use]
+pub fn log_position_head(history: &LifecycleSnapshot, witness: &[WitnessRecord]) -> LogPosition {
+    LogPosition {
+        lifecycle: history
+            .records
+            .last()
+            .map(|record| record.sequence)
+            .or_else(|| {
+                history
+                    .retention
+                    .latest_cursor
+                    .as_deref()
+                    .and_then(|cursor| sequence_after_prefix(cursor, "lifecycle:"))
+            })
+            .unwrap_or(0),
+        witness: witness.last().map_or(0, |record| record.seq),
+    }
+}
+
+/// The oldest position a caller can resume from without a gap: one below the
+/// earliest record each durable stream still retains.
+#[must_use]
+pub fn log_position_floor(history: &LifecycleSnapshot, witness: &[WitnessRecord]) -> LogPosition {
+    LogPosition {
+        lifecycle: history
+            .records
+            .first()
+            .map_or(0, |record| record.sequence.saturating_sub(1)),
+        witness: witness
+            .first()
+            .map_or(0, |record| record.seq.saturating_sub(1)),
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -388,6 +508,11 @@ pub enum ObservabilityError {
     UnknownAttempt { task: String, attempt: u32 },
     #[error("flow run {0:?} has an invalid reconciliation projection")]
     InvalidRunProjection(String),
+    #[error(
+        "invalid lifecycle stream position {0:?}; use the `position` field of a previous \
+         query.log response, not a page or watch cursor"
+    )]
+    InvalidPosition(String),
 }
 
 pub fn query_jobs(
@@ -457,6 +582,8 @@ pub fn query_jobs(
         protocol_version: QUERY_PROTOCOL_VERSION,
         items,
         next_cursor: None,
+        position: None,
+        position_gap: None,
         snapshot: snapshot_metadata(history, witness),
     })
 }
@@ -682,6 +809,8 @@ pub fn query_lifecycle_log(
             .map(|(_, _, _, projection)| projection)
             .collect(),
         next_cursor: None,
+        position: None,
+        position_gap: None,
         snapshot: snapshot_metadata(history, witness),
     })
 }
@@ -1561,6 +1690,8 @@ pub fn query_flow_proofs(
         protocol_version: QUERY_PROTOCOL_VERSION,
         items,
         next_cursor: None,
+        position: None,
+        position_gap: None,
         snapshot: snapshot_metadata(history, witness),
     })
 }
