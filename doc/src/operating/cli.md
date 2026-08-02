@@ -409,7 +409,10 @@ $ tally query trace --task TASK-UUID --attempt 2 --limit 100
 `query run` prints the flow state and a per-task table. A spec-build pass shows every
 `campaign/task-id` as done, running, blocked, or pending; `--status <state>` narrows that table
 to one of those states while the summary counts stay whole-run, which is how a 128-task campaign
-board stays readable. A flow with no reconciled task table reaches `complete` once every one of
+board stays readable. Campaign anomalies print above the board, never inside it, and put the run
+in `needs-attention`: a sub-issue closed by hand while its task holds no revision-valid merged
+pull request completes nothing, and a reader who misses that debugs the wrong surface. Each
+anomaly line names the task, the sub-issue URL, and what is missing. A flow with no reconciled task table reaches `complete` once every one of
 its nodes holds a passing terminal verdict. Its current-node section includes elapsed time and
 the remaining `runtimeMaxSec` budget, negative when a node has run past that budget; its failure
 section prints the retained failure capture path — or `<not retained>` when none exists — and

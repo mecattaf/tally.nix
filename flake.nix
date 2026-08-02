@@ -4125,6 +4125,31 @@
                 fi
                 touch "$out"
               '';
+          spec-build-task-steering-threads =
+            pkgs.runCommand "tally-spec-build-task-steering-threads" { nativeBuildInputs = [ pkgs.ripgrep ]; }
+              ''
+                # A task brief's authorizedComments must be composed by
+                # authorizedComments(task): the campaign-wide master thread
+                # plus that task's own sub-issue thread. Passing args.steering
+                # straight through silently drops per-task steering, and the
+                # failure is invisible until an operator's comment on a task
+                # sub-issue never reaches its agent.
+                if rg -n 'authorizedComments: args\.steering' \
+                  ${./examples/flows/spec-build.js}; then
+                  echo "spec-build.js must compose authorizedComments with authorizedComments(task)" >&2
+                  exit 1
+                fi
+                # Every brief that reads or writes a forge surface carries the
+                # arm-time capability record, so one pass cannot mix the native
+                # and degraded projections: the helper itself plus the
+                # reconcile, checkpoint, merge, retry, and steer briefs.
+                wrapped="$(rg -c 'withCapabilities\(' ${./examples/flows/spec-build.js})"
+                if [ "$wrapped" -lt 6 ]; then
+                  echo "spec-build.js dropped a capability-carrying brief (found $wrapped)" >&2
+                  exit 1
+                fi
+                touch "$out"
+              '';
           campaign-timer-doc-drift =
             pkgs.runCommand "tally-campaign-timer-doc-drift" { nativeBuildInputs = [ pkgs.ripgrep ]; }
               ''
