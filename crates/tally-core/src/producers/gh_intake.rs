@@ -1584,10 +1584,13 @@ pub(super) fn created_comment_id(response: &Value) -> Option<String> {
 impl GhCliMutationSink {
     /// Publish one sticky comment (§9.1.3): edit the comment this producer
     /// already created for the logical id where it remembers one, otherwise
-    /// recover through the marker scan and create it at most once. Returns the
-    /// item's node kind and state. Steering, escalation, and the closing
-    /// summary deliberately do not come through here — they must stay fresh
-    /// comments so the operator is actually notified.
+    /// recover through the marker scan and publish into the comment already on
+    /// the thread, creating one only when there is none. Returns the item's
+    /// node kind and state. Every path either writes `body` somewhere or
+    /// fails: a publication that did not happen must never be reported as
+    /// success. Steering, escalation, and the closing summary deliberately do
+    /// not come through here — they must stay fresh comments so the operator
+    /// is actually notified.
     fn upsert_sticky_comment(
         &self,
         key: &GhStickyKey,
@@ -1595,22 +1598,22 @@ impl GhCliMutationSink {
         marker: &str,
         body: &str,
     ) -> Result<(String, String), String> {
+        let mut failed_edit = None;
         if let Some(store) = &self.sticky {
             if let Some(comment_id) = store.lookup(key) {
-                match self.graphql(serde_json::json!({
-                    "query": GH_STICKY_COMMENT_GRAPHQL,
-                    "variables": {"commentId": comment_id, "body": body},
-                })) {
-                    Ok(_) => return self.item_state(item_id),
-                    // The remembered comment is gone or no longer writable.
-                    // Forget it and recover through the marker scan; retrying
-                    // an edit that can never succeed would wedge the caller.
-                    Err(error) => store.forget(key).map_err(|forget| {
-                        format!(
-                            "cannot edit GitHub comment {comment_id:?} ({error}); \
-                             cannot forget it either: {forget}"
-                        )
-                    })?,
+                match self.edit_comment(&comment_id, body) {
+                    Ok(()) => return self.item_state(item_id),
+                    // The remembered comment may simply be gone, which the
+                    // marker scan below recovers from by creating a new one.
+                    // Forget the id so the next attempt does not repeat a
+                    // doomed edit, and keep the error: until something is
+                    // actually published this call has not succeeded.
+                    Err(error) => {
+                        store.forget(key).map_err(|forget| {
+                            format!("{error}; cannot forget the stored id either: {forget}")
+                        })?;
+                        failed_edit = Some((comment_id, error));
+                    }
                 }
             }
         }
@@ -1620,14 +1623,47 @@ impl GhCliMutationSink {
                 "query": GH_COMPLETION_COMMENT_GRAPHQL,
                 "variables": {"itemId": item_id, "body": body},
             }))?),
-            // A comment posted before this producer stored ids, or before the
-            // state was lost. Adopt it so the next publication edits in place.
-            GhMarkerMatch::Present(comment_id) => comment_id,
+            // A comment posted before this producer stored ids, or before its
+            // state was lost. Publish into it: adopting the id without writing
+            // would discard the body the caller asked to publish and report
+            // success for a publication that never happened.
+            GhMarkerMatch::Present(Some(comment_id)) => {
+                if let Some((unwritable, error)) = failed_edit {
+                    if unwritable == comment_id {
+                        // The scan found the very comment whose edit just
+                        // failed, so the failure was not a deleted comment and
+                        // re-issuing the identical mutation would only repeat
+                        // it. Report why nothing was published.
+                        return Err(error);
+                    }
+                }
+                self.edit_comment(&comment_id, body)?;
+                Some(comment_id)
+            }
+            // The marker is on the thread but the comment carrying it has no
+            // node id to edit. Creating a second comment would duplicate the
+            // one already there, so refuse rather than silently publish
+            // nothing.
+            GhMarkerMatch::Present(None) => {
+                return Err(format!(
+                    "GitHub item {item_id:?} carries {marker:?} on a comment with no node id; \
+                     refusing to publish a duplicate"
+                ))
+            }
         };
         if let (Some(store), Some(comment_id)) = (&self.sticky, comment_id) {
             store.record(key, &comment_id)?;
         }
         Ok((scan.kind, scan.state))
+    }
+
+    fn edit_comment(&self, comment_id: &str, body: &str) -> Result<(), String> {
+        self.graphql(serde_json::json!({
+            "query": GH_STICKY_COMMENT_GRAPHQL,
+            "variables": {"commentId": comment_id, "body": body},
+        }))
+        .map(|_| ())
+        .map_err(|error| format!("cannot edit GitHub comment {comment_id:?}: {error}"))
     }
 
     /// The item's node kind and state alone. The sticky path knows which

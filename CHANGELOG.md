@@ -188,6 +188,15 @@ authorized.
 
 ### Fixed
 
+- Make the sticky-comment recovery path publish what it was asked to publish.
+  When no stored comment id was available and the marker scan found the comment
+  already on the thread, the sink adopted that comment's id, issued no mutation,
+  and returned success — so the body it was given was discarded and a forge-side
+  refusal of the edit (secondary rate limit, 502, a locked comment) degraded
+  "edit in place" into "do nothing, silently, and report success". The recovered
+  comment is now written to, and a refused edit fails the publication with the
+  forge's own error instead of being swallowed. A marker found on a comment with
+  no node id refuses rather than publishing a duplicate.
 - Stop publishing a public "Tally already recorded this trigger" comment when a
   GitHub producer re-observes a trigger that is already in its ledger — what
   every producer restart does to every historical trigger on a campaign issue.

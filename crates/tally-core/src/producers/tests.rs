@@ -1271,10 +1271,11 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
                     "printf x >> '{}'\n",
                     "case \"$request\" in\n",
                     "  *TallyCompletionState*)\n",
-                    "    if test -e '{}'; then comments='[{{\"body\":\"<!-- tally-completion:{} -->\"}}]'; else comments='[]'; fi\n",
+                    "    if test -e '{}'; then comments='[{{\"id\":\"IC_1\",\"body\":\"<!-- tally-completion:{} -->\"}}]'; else comments='[]'; fi\n",
                     "    printf '{{\"data\":{{\"node\":{{\"__typename\":\"PullRequest\",\"state\":\"OPEN\",\"comments\":{{\"nodes\":%s,\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}}}}}}}}}}' \"$comments\"\n",
                     "    ;;\n",
                     "  *TallyCompletionComment*) touch '{}'; printf '{{\"data\":{{\"addComment\":{{}}}}}}' ;;\n",
+                    "  *TallyStickyComment*) printf '{{\"data\":{{\"updateIssueComment\":{{}}}}}}' ;;\n",
                     "  *TallyCompletionPullRequest*)\n",
                     "    if test ! -e '{}'; then touch '{}'; printf close-failed >&2; exit 92; fi\n",
                     "    printf '{{\"data\":{{\"closePullRequest\":{{}}}}}}'\n",
@@ -1327,7 +1328,12 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
             &mut cli,
         )
         .unwrap());
-    assert_eq!(std::fs::read(&calls).unwrap(), b"xxxxxxx");
+    // Eight calls: scan + create + scan + failed close, then scan + edit +
+    // scan + close. This sink stores no comment ids, so the retry recovers
+    // through the marker scan and publishes into the comment it finds rather
+    // than adopting it silently; the third call is stopped by the durable
+    // completion marker before it reaches the forge at all.
+    assert_eq!(std::fs::read(&calls).unwrap(), b"xxxxxxxx");
     let requests = std::fs::read_to_string(requests)
         .unwrap()
         .lines()
@@ -1430,10 +1436,11 @@ fn github_trigger_acknowledgement_marker_is_stable_and_remote_idempotent() {
                     "printf '%s\\n' \"$request\" >> '{}'\n",
                     "case \"$request\" in\n",
                     "  *TallyCompletionState*)\n",
-                    "    if test -e '{}'; then comments='[{{\"body\":\"<!-- tally-trigger:receipt-42:accepted -->\"}}]'; else comments='[]'; fi\n",
+                    "    if test -e '{}'; then comments='[{{\"id\":\"IC_1\",\"body\":\"<!-- tally-trigger:receipt-42:accepted -->\"}}]'; else comments='[]'; fi\n",
                     "    printf '{{\"data\":{{\"node\":{{\"__typename\":\"Issue\",\"state\":\"OPEN\",\"comments\":{{\"nodes\":%s,\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}}}}}}}}}}' \"$comments\"\n",
                     "    ;;\n",
                     "  *TallyCompletionComment*) touch '{}'; printf '{{\"data\":{{\"addComment\":{{}}}}}}' ;;\n",
+                    "  *TallyStickyComment*) printf '{{\"data\":{{\"updateIssueComment\":{{}}}}}}' ;;\n",
                     "  *) exit 92 ;;\n",
                     "esac\n"
                 ),
@@ -1482,14 +1489,20 @@ fn github_trigger_acknowledgement_marker_is_stable_and_remote_idempotent() {
 }
 
 /// A scripted GraphQL transport that keeps the comment thread on disk: one
-/// `<node id>.body` file per comment, holding the tally marker the scan looks
-/// for. A test can seed a legacy comment, delete one behind the sink's back,
-/// or restart the sink, and then read back exactly which mutations were issued.
+/// `<node id>.body` file per comment, holding the exact body that was
+/// published to it. A test can seed a legacy comment, delete one behind the
+/// sink's back, restart the sink, or refuse edits the way a secondary rate
+/// limit does, and then read back both the operations issued and what the
+/// thread actually says.
+///
+/// Two control files, both outside the `*.body` set: `refuse-edits` makes
+/// `updateIssueComment` fail while the comment stays present, and `hide-ids`
+/// serves matched comments without a node id.
 const SCRIPTED_GRAPHQL: &str = r#"#!/bin/sh
 [ "$1 $2 $3 $4" = 'api graphql --input -' ] || exit 91
 request=$(cat)
 printf '%s\n' "$request" >> '@REQUESTS@'
-marker=$(printf '%s' "$request" | sed -n 's/.*\(<!-- tally-[^>]*-->\).*/\1/p')
+body=$(printf '%s' "$request" | sed -n 's/.*"body":"\(.*\)"}}$/\1/p')
 case "$request" in
   *TallyCompletionState*)
     nodes=''
@@ -1498,7 +1511,12 @@ case "$request" in
       [ -f "$comment" ] || continue
       id=${comment##*/}
       id=${id%.body}
-      nodes="$nodes$separator{\"id\":\"$id\",\"body\":\"$(cat "$comment")\"}"
+      if [ -e '@THREAD@/hide-ids' ]; then
+        node="{\"body\":\"$(cat "$comment")\"}"
+      else
+        node="{\"id\":\"$id\",\"body\":\"$(cat "$comment")\"}"
+      fi
+      nodes="$nodes$separator$node"
       separator=','
     done
     printf '{"data":{"node":{"__typename":"Issue","state":"OPEN","comments":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}' "$nodes"
@@ -1508,7 +1526,7 @@ case "$request" in
     ;;
   *TallyCompletionComment*)
     sequence=$(cat '@THREAD@/sequence' 2>/dev/null || printf 1)
-    printf '%s' "$marker" > "@THREAD@/IC_$sequence.body"
+    printf '%s' "$body" > "@THREAD@/IC_$sequence.body"
     printf '%s' "$((sequence + 1))" > '@THREAD@/sequence'
     printf '{"data":{"addComment":{"commentEdge":{"node":{"id":"IC_%s"}}}}}' "$sequence"
     ;;
@@ -1518,7 +1536,11 @@ case "$request" in
       printf '{"errors":[{"message":"Could not resolve to a node"}]}'
       exit 0
     fi
-    printf '%s' "$marker" > "@THREAD@/$id.body"
+    if [ -e '@THREAD@/refuse-edits' ]; then
+      printf '{"errors":[{"message":"You have exceeded a secondary rate limit"}]}'
+      exit 0
+    fi
+    printf '%s' "$body" > "@THREAD@/$id.body"
     printf '{"data":{"updateIssueComment":{"issueComment":{"id":"%s"}}}}' "$id"
     ;;
   *) exit 92 ;;
@@ -1558,6 +1580,13 @@ fn scripted_operations(requests: &Path) -> Vec<String> {
             .to_owned()
         })
         .collect()
+}
+
+/// What the thread actually says on one comment, decoded from the transport's
+/// stored JSON string.
+fn thread_body(thread: &Path, comment_id: &str) -> String {
+    let stored = std::fs::read_to_string(thread.join(format!("{comment_id}.body"))).unwrap();
+    serde_json::from_str::<String>(&format!("\"{stored}\"")).unwrap()
 }
 
 fn thread_comments(thread: &Path) -> Vec<String> {
@@ -1648,7 +1677,8 @@ fn github_duplicate_trigger_acknowledgement_is_never_published() {
     assert_eq!(thread_comments(&thread), Vec::<String>::new());
 
     // A legacy marker satisfies the completion check whatever decision wrote
-    // it: the check matches the receipt id, not the decision suffix.
+    // it: the check matches the receipt id, not the decision suffix. The
+    // comment it found is published into, not merely adopted.
     std::fs::write(
         thread.join("IC_7.body"),
         "<!-- tally-trigger:receipt-42:filtered -->",
@@ -1659,8 +1689,12 @@ fn github_duplicate_trigger_acknowledgement_is_never_published() {
         GhDecisionStatus::Accepted,
     ))
     .unwrap();
-    assert_eq!(scripted_operations(&requests), ["TallyCompletionState"]);
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyCompletionState", "TallyStickyComment"]
+    );
     assert_eq!(thread_comments(&thread), ["IC_7"]);
+    assert!(thread_body(&thread, "IC_7").contains("Tally accepted this trigger."));
     assert_eq!(
         stored_sticky_comments(&state_dir),
         [("receipt-42".to_owned(), "IC_7".to_owned())]
@@ -1687,6 +1721,7 @@ fn github_receipt_comment_upserts_in_place_across_a_producer_restart() {
         ["TallyCompletionState", "TallyCompletionComment"]
     );
     assert_eq!(thread_comments(&thread), ["IC_1"]);
+    assert!(thread_body(&thread, "IC_1").contains("Tally accepted this trigger."));
     assert_eq!(
         stored_sticky_comments(&state_dir),
         [("receipt-42".to_owned(), "IC_1".to_owned())]
@@ -1714,11 +1749,14 @@ fn github_receipt_comment_upserts_in_place_across_a_producer_restart() {
     );
     assert_eq!(thread_comments(&thread), ["IC_1", "IC_2"]);
 
-    // State loss with a marker still on the thread: recover, adopt the
-    // existing comment, and post nothing.
+    // State loss with a marker still on the thread: recover, publish into the
+    // comment already there, and create nothing.
     std::fs::remove_dir_all(state_dir.join("producers/gh-comments")).unwrap();
     restarted.post_acknowledgement(&accepted).unwrap();
-    assert_eq!(scripted_operations(&requests), ["TallyCompletionState"]);
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyCompletionState", "TallyStickyComment"]
+    );
     assert_eq!(thread_comments(&thread), ["IC_1", "IC_2"]);
     // Only the receipt that was re-posted re-adopts its comment; the other
     // stays recoverable through its marker.
@@ -1788,6 +1826,107 @@ fn github_completion_evidence_upserts_the_comment_it_already_created() {
         ["TallyStickyComment", "TallyItemState"]
     );
     assert_eq!(thread_comments(&thread), ["IC_1"]);
+}
+
+/// A forge that refuses the edit — a secondary rate limit, a 502, a comment
+/// locked by an org setting — must not be reported as a successful
+/// publication. Adopting the comment and returning `Ok(())` would leave a
+/// stale public body behind and destroy the reason.
+#[test]
+fn github_refused_sticky_edit_fails_the_publication_instead_of_reporting_success() {
+    let temp = tempdir().unwrap();
+    let gh = temp.path().join("fake-gh");
+    let requests = temp.path().join("requests.jsonl");
+    let thread = temp.path().join("thread");
+    let state_dir = temp.path().join("state");
+    install_scripted_graphql(&gh, &requests, &thread);
+    let published = |note: &str| GhCompletedMutation {
+        producer: "github".to_owned(),
+        source: "search".to_owned(),
+        item_id: "I_widget_42".to_owned(),
+        completion_id: Some("task-1:attempt-1:witness-5".to_owned()),
+        state: "COMPLETED".to_owned(),
+        evidence: Some(serde_json::json!({"witnessSeq": 5, "note": note})),
+        gate_summary: None,
+        acceptance: None,
+        request_review: false,
+        assisted_by: None,
+    };
+
+    let mut sink = GhCliMutationSink::with_program(&gh).with_state_dir(&state_dir);
+    sink.post_evidence(&published("first")).unwrap();
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyCompletionState", "TallyCompletionComment"]
+    );
+
+    // The remembered comment is still there, but the forge refuses the edit.
+    std::fs::write(thread.join("refuse-edits"), "").unwrap();
+    let error = sink.post_evidence(&published("second")).unwrap_err();
+    assert!(error.contains("secondary rate limit"), "{error}");
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyStickyComment", "TallyCompletionState"]
+    );
+    assert_eq!(thread_comments(&thread), ["IC_1"]);
+    assert!(thread_body(&thread, "IC_1").contains("first"));
+    assert!(!thread_body(&thread, "IC_1").contains("second"));
+
+    // It stays loud on the next attempt rather than silently converging on a
+    // stale comment, and it never creates a duplicate to escape the refusal.
+    let error = sink.post_evidence(&published("second")).unwrap_err();
+    assert!(error.contains("secondary rate limit"), "{error}");
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyCompletionState", "TallyStickyComment"]
+    );
+    assert_eq!(thread_comments(&thread), ["IC_1"]);
+
+    // Once the forge accepts writes again, the pending body is published into
+    // the comment that was already there.
+    std::fs::remove_file(thread.join("refuse-edits")).unwrap();
+    sink.post_evidence(&published("second")).unwrap();
+    assert_eq!(
+        scripted_operations(&requests),
+        ["TallyCompletionState", "TallyStickyComment"]
+    );
+    assert_eq!(thread_comments(&thread), ["IC_1"]);
+    assert!(thread_body(&thread, "IC_1").contains("second"));
+    assert_eq!(
+        stored_sticky_comments(&state_dir),
+        [("task-1:attempt-1:witness-5".to_owned(), "IC_1".to_owned())]
+    );
+}
+
+/// The marker is on the thread but the comment carrying it has no node id to
+/// edit. Creating a second comment would duplicate it and returning `Ok(())`
+/// would report a publication that never happened, so the sink refuses.
+#[test]
+fn github_matched_comment_without_a_node_id_refuses_to_publish() {
+    let temp = tempdir().unwrap();
+    let gh = temp.path().join("fake-gh");
+    let requests = temp.path().join("requests.jsonl");
+    let thread = temp.path().join("thread");
+    let state_dir = temp.path().join("state");
+    install_scripted_graphql(&gh, &requests, &thread);
+    std::fs::write(
+        thread.join("IC_7.body"),
+        "<!-- tally-trigger:receipt-42:accepted -->",
+    )
+    .unwrap();
+    std::fs::write(thread.join("hide-ids"), "").unwrap();
+
+    let mut sink = GhCliAcknowledgementSink::with_program(&gh).with_state_dir(&state_dir);
+    let error = sink
+        .post_acknowledgement(&trigger_acknowledgement(
+            "receipt-42",
+            GhDecisionStatus::Accepted,
+        ))
+        .unwrap_err();
+    assert!(error.contains("refusing to publish a duplicate"), "{error}");
+    assert_eq!(scripted_operations(&requests), ["TallyCompletionState"]);
+    assert_eq!(thread_comments(&thread), ["IC_7"]);
+    assert_eq!(stored_sticky_comments(&state_dir), Vec::new());
 }
 
 #[test]
