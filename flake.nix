@@ -1286,11 +1286,21 @@
                 # entry of the campaign's own repositories map.
                 campaigns.split = {
                   enable = true;
+                  # The spec corpus is the fixture repository that actually
+                  # holds the worklist; the code repository is a separate
+                  # operational checkout, which is what makes this a split.
+                  # `checkout` is operational state rather than a store source,
+                  # so the code role names a plain path the way an estate would.
                   repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
-                  repositories."acme/code".checkout = toString ./test/fixtures/spec-build/repo;
+                  repositories."acme/code".checkout = "/srv/campaign-fixtures/split-code";
                   codeRepository = "acme/code";
                   specRepository = "acme/spec";
-                  maxTasks = 2;
+                  # The worklist this glob resolves to carries seven tasks, so
+                  # maxTasks admits seven. A fixture whose own bounds refuse
+                  # its own worklist describes a configuration that could never
+                  # run a pass.
+                  worklist = "specs/001-toy/tasks.json";
+                  maxTasks = 7;
                   gates = [
                     {
                       kind = "command";
@@ -3721,6 +3731,10 @@
                   $splitArgs.specRepository == "acme/spec" and
                   ($splitArgs | has("issueRepository") | not) and
                   ($splitArgs.repositories | keys) == ["acme/code", "acme/spec"] and
+                  ($splitArgs.repositories["acme/code"].checkout
+                    != $splitArgs.repositories["acme/spec"].checkout) and
+                  $splitArgs.worklist == "specs/001-toy/tasks.json" and
+                  $splitArgs.maxTasks == 7 and
                   ($defaultedArgs | has("codeRepository") | not) and
                   ($defaultedArgs | has("specRepository") | not) and
                   ($defaultedArgs | has("issueRepository") | not) and

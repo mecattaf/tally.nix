@@ -2682,6 +2682,10 @@ def campaign_digest(reconciliation: dict[str, Any], outcome: str) -> dict[str, A
         "repository": reconciliation["repository"],
         "outcome": outcome,
         "source": reconciliation["source"],
+        # The code anchor every merge and checkpoint row below is a fact about.
+        # Equal to the worklist revision unless the campaign is split, in which
+        # case the two name commits in two different histories.
+        "baseRevision": reconciliation["baseRevision"],
         "taskCount": len(reconciliation["tasks"]),
         "merged": [
             {
@@ -2754,10 +2758,28 @@ def render_campaign_summary(digest: dict[str, Any]) -> str:
         else "### Campaign closed at frontier quiescence"
     )
     settled = len(digest["merged"]) + len(digest["checkpoints"])
+    # A split campaign's worklist revision resolves only in the spec
+    # repository, while every merge and checkpoint row below names code
+    # repository artifacts. Saying which repository each revision belongs to is
+    # the difference between evidence and a revision that looks like a lie to
+    # anyone who tries to check it out. An unsplit campaign has one history and
+    # keeps the one-line form it always had.
+    worklist_source = digest["source"]
+    worklist_repository = worklist_source.get("repository")
     lines = [
         heading,
         "",
-        f"Worklist `{digest['source']['sha256']}` at `{digest['source']['revision']}`.",
+        (
+            f"Worklist `{worklist_source['sha256']}` at "
+            f"`{worklist_source['revision']}`."
+            if worklist_repository is None
+            else (
+                f"Worklist `{worklist_source['sha256']}` at "
+                f"`{worklist_source['revision']}` in `{worklist_repository}`; "
+                f"code base `{digest['baseRevision']}` in "
+                f"`{digest['repository']}`."
+            )
+        ),
         f"{settled} of {digest['taskCount']} task(s) are bound to durable "
         "merge/checkpoint facts.",
         "",
@@ -5509,19 +5531,26 @@ def github_pull_request(
         return url
     campaign = required_string(data.get("campaign"), "campaign")
     task_ref = f"{campaign}/{task['id']}"
+    # Every `owner/name#<n>` this body writes resolves in the repository it
+    # names, so both the campaign back-reference and the closing keyword are
+    # rendered against the repository the campaign issue actually lives on.
+    # For an unsplit campaign that is the pull request's own repository and
+    # every line below is byte-identical to the pre-seam one.
+    issue_repository = campaign_coordinates(data, repository, config)["issue"][
+        "repository"
+    ]
+    qualifier = "" if issue_repository == repository else issue_repository
     closes = ""
     if isinstance(task.get("brief"), dict):
         task_issue = campaign_issue(task["brief"].get("issue"))
-        # `#<n>` resolves inside the pull request's own repository. Where the
-        # task sub-issue lives somewhere else that reference names a different
-        # issue, or none at all, and the merge silently closes nothing -- the
-        # probe recorded on #321 shows exactly that. So a split campaign emits
-        # the full `owner/name#<n>` form, which GitHub does honour across
-        # repositories; an unsplit one keeps the short form byte-for-byte.
-        issue_repository = campaign_coordinates(
-            data, repository, config
-        )["issue"]["repository"]
-        qualifier = "" if issue_repository == repository else issue_repository
+        # `#<n>` alone resolves inside the pull request's own repository. Where
+        # the task sub-issue lives somewhere else that reference names a
+        # different issue, or none at all, and the merge silently closes
+        # nothing -- the probe recorded on #321 shows exactly that. So a split
+        # campaign emits the full `owner/name#<n>` form, which GitHub does
+        # honour across repositories. No campaign shape that can currently be
+        # split carries task sub-issues, so this branch is staged rather than
+        # exercised; see the seam section of doc/src/flows/campaigns.md.
         closes = f"\n\nCloses {qualifier}#{task_issue['number']}"
     # Steward prose leads; the managed marker and the campaign's own identity
     # lines are appended by this node and are never model-authored. With no
@@ -5531,7 +5560,7 @@ def github_pull_request(
     body = (
         f"{marker}\n"
         f"{prose}"
-        f"Spec-build campaign progress for {repository}#{issue['number']}.\n\n"
+        f"Spec-build campaign progress for {issue_repository}#{issue['number']}.\n\n"
         f"Task `{task['id']}`: {task['title']}\n\n"
         f"Task ref: `{task_ref}`\n\n"
         f"Witnessed gates are the merge criterion. Campaign issue: {issue['url']}\n"
@@ -6741,8 +6770,22 @@ def action_checkpoint(brief: dict[str, Any]) -> dict[str, Any]:
         if revision is None:
             fail("issue-backed checkpoint task must carry its admitted revision")
     else:
-        source = object_exact(source_value, {"path", "sha256", "revision"}, "source")
+        # `repository` is present exactly when the worklist was read from a
+        # spec repository that is not the code repository. The reconciler
+        # forwards its witness verbatim, so this node has to admit the same
+        # shape the reconciler emits -- refusing it made every checkpoint task
+        # in every split campaign fail permanently.
+        artifact_fields = {"path", "sha256", "revision"}
+        if isinstance(source_value, dict) and "repository" in source_value:
+            artifact_fields.add("repository")
+        source = object_exact(source_value, artifact_fields, "source")
         required_string(source.get("path"), "source.path")
+        if "repository" in source:
+            source_repository = required_string(
+                source.get("repository"), "source.repository"
+            )
+            if not REPOSITORY.fullmatch(source_repository):
+                fail("source.repository must use owner/name form")
     source_sha256 = required_string(source.get("sha256"), "source.sha256")
     source_revision = required_string(source.get("revision"), "source.revision")
     if not re.fullmatch(r"[0-9a-f]{40,64}", source_revision):
