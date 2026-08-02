@@ -3478,14 +3478,18 @@ let
       ];
       triggers.mentions = [ campaign.mention ];
       inherit (campaign) allowSelfTriggered allowedActors pollIntervalSec;
-      postReceipt = true;
-      postEvidence = true;
+      # The projection literals are defaults, not decisions. An estate tuning
+      # one campaign's public surface -- a quiet profile, a louder receipt --
+      # then does it with an ordinary override instead of forking this builder
+      # or reaching for mkForce. The rendered defaults are unchanged.
+      postReceipt = lib.mkDefault true;
+      postEvidence = lib.mkDefault true;
       inherit (campaign) postFailureEvidence postFailureStderr;
-      postGateSummary = false;
-      requestReview = false;
-      closeOnAcceptance = false;
-      closeOnPass = false;
-      neverMutate = false;
+      postGateSummary = lib.mkDefault false;
+      requestReview = lib.mkDefault false;
+      closeOnAcceptance = lib.mkDefault false;
+      closeOnPass = lib.mkDefault false;
+      neverMutate = lib.mkDefault false;
       enqueue = {
         argv = [
           (lib.getExe cfg.package)

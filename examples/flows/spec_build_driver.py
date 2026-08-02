@@ -18,6 +18,11 @@ import tempfile
 from typing import Any
 import uuid
 
+# The unified worktree manager ships beside this driver, so both campaign
+# drivers create, resume, validate, and clean lanes through one implementation.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import campaign_worktrees as worktrees  # noqa: E402
+
 
 TASK_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 COMPONENT = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]*$")
@@ -51,6 +56,9 @@ RETRY_MARKER = re.compile(
 # back from the forge: past it, the fault is treated as a failed attempt.
 MAX_MACHINE_RETRIES = 2
 MAX_RETRY_CHARS = 2_000
+# The closing summary is a bounded rendering of a bounded digest: past this
+# many rows a section says how many it dropped instead of growing without end.
+MAX_SUMMARY_ROWS = 40
 MAX_DIAGNOSIS_CHARS = 12_000
 MAX_DIFF_CHARS = 128 * 1024
 # The daemon rejects an ingress file above 1 MiB. Refuse to write one instead
@@ -2491,9 +2499,13 @@ def sync_issue_checkboxes(
 def close_completed_issue_campaign(
     repository: str,
     issue_number: str,
-    source: dict[str, str],
     tasks: list[dict[str, Any]],
 ) -> None:
+    """Close every open task sub-issue, then the campaign issue itself.
+
+    The closing summary is published before this runs, so a reader who opens
+    the closed issue finds the digest as its last comment.
+    """
     for task in tasks:
         task_issue = campaign_issue(task["brief"].get("issue"))
         viewed = github_json(
@@ -2513,20 +2525,253 @@ def close_completed_issue_campaign(
                     repository,
                 ]
             )
-    digest = required_string(source.get("sha256"), "source.sha256")
-    marker = f"<!-- tally:campaign-complete:v1 source={digest} -->"
-    comments = run(
-        [
-            "gh",
-            "api",
-            "--paginate",
-            f"repos/{repository}/issues/{issue_number}/comments?per_page=100",
-            "--jq",
-            ".[] | .body",
-        ]
-    ).stdout
-    if marker not in comments:
-        run(
+    run(["gh", "issue", "close", issue_number, "--repo", repository])
+
+
+def closing_summary_marker(
+    campaign: str, issue_number: str, outcome: str, source_sha256: str
+) -> str:
+    """The idempotence marker one terminal outcome's summary carries.
+
+    Completion keeps the pre-summary `campaign-complete` marker: the summary
+    took over that comment rather than adding a second one beside it, so a
+    campaign still ends with exactly one machine comment before it closes.
+    """
+    if outcome == "complete":
+        return f"<!-- tally:campaign-complete:v1 source={source_sha256} -->"
+    return (
+        "<!-- tally:campaign-summary:v1 "
+        f"campaign={campaign} issue={issue_number} outcome={outcome} -->"
+    )
+
+
+def campaign_digest(reconciliation: dict[str, Any], outcome: str) -> dict[str, Any]:
+    """One run-scoped digest of a campaign's terminal state.
+
+    Every field is a projection of facts this pass already witnessed -- merged
+    pull requests, checkpoint receipts, diagnosis and retry receipts read back
+    from the forge, and the reconciler's own set arithmetic. Nothing here reads
+    or writes a state store the campaign did not already have.
+    """
+    titles = {task["id"]: task["title"] for task in reconciliation["tasks"]}
+    merged_ids = {fact["taskId"] for fact in reconciliation["merged"]}
+    checkpoint_ids = {fact["taskId"] for fact in reconciliation["checkpoints"]}
+    blocked = {fact["taskId"]: fact["blockedBy"] for fact in reconciliation["blocked"]}
+    attempts: dict[str, int] = {}
+    for diagnosis in reconciliation["diagnoses"]:
+        attempts[diagnosis["taskId"]] = max(
+            attempts.get(diagnosis["taskId"], 0), diagnosis["attempt"]
+        )
+    return {
+        "schemaVersion": 1,
+        "campaign": reconciliation["campaign"],
+        "repository": reconciliation["repository"],
+        "outcome": outcome,
+        "source": reconciliation["source"],
+        "taskCount": len(reconciliation["tasks"]),
+        "merged": [
+            {
+                "taskId": fact["taskId"],
+                "title": titles.get(fact["taskId"], fact["taskId"]),
+                "pullRequest": fact["pullRequest"],
+                "mergeCommit": fact["mergeCommit"],
+            }
+            for fact in reconciliation["merged"]
+        ],
+        "checkpoints": [
+            {
+                "taskId": fact["taskId"],
+                "title": titles.get(fact["taskId"], fact["taskId"]),
+                "revision": fact["revision"],
+            }
+            for fact in reconciliation["checkpoints"]
+        ],
+        "blocked": [
+            {
+                "taskId": task_id,
+                "title": titles.get(task_id, task_id),
+                "blockedBy": blocked[task_id],
+                "attempts": attempts.get(task_id, 0),
+            }
+            for task_id in reconciliation["remaining"]
+            if task_id in blocked
+        ],
+        "outstanding": [
+            task_id
+            for task_id in reconciliation["remaining"]
+            if task_id not in blocked and task_id not in merged_ids | checkpoint_ids
+        ],
+        "steering": [
+            {
+                "taskId": diagnosis["taskId"],
+                "attempt": diagnosis["attempt"],
+                "summary": compact_summary(diagnosis["diagnosis"], 160),
+            }
+            for diagnosis in reconciliation["diagnoses"]
+        ],
+        "retries": [
+            {
+                "taskId": retry["taskId"],
+                "attempt": retry["attempt"],
+                "summary": compact_summary(retry["reason"], 160),
+            }
+            for retry in reconciliation["retries"]
+        ],
+        "deferrals": [deferral["taskId"] for deferral in reconciliation["deferrals"]],
+        "anomalies": [anomaly["detail"] for anomaly in reconciliation["anomalies"]],
+        "warnings": list(reconciliation["warnings"]),
+    }
+
+
+def summary_rows(rows: list[Any], render: Any, limit: int = MAX_SUMMARY_ROWS) -> list[str]:
+    """Render a bounded list and say plainly when it was truncated."""
+    lines = [render(row) for row in rows[:limit]]
+    if len(rows) > limit:
+        lines.append(f"- …and {len(rows) - limit} more")
+    return lines
+
+
+def render_campaign_summary(digest: dict[str, Any]) -> str:
+    """The closing summary a reader of the campaign issue actually gets."""
+    complete = digest["outcome"] == "complete"
+    heading = (
+        "### Campaign complete"
+        if complete
+        else "### Campaign closed at frontier quiescence"
+    )
+    settled = len(digest["merged"]) + len(digest["checkpoints"])
+    lines = [
+        heading,
+        "",
+        f"Worklist `{digest['source']['sha256']}` at `{digest['source']['revision']}`.",
+        f"{settled} of {digest['taskCount']} task(s) are bound to durable "
+        "merge/checkpoint facts.",
+        "",
+    ]
+    if not complete:
+        lines.extend(
+            [
+                f"Blocked: {len(digest['blocked'])} · "
+                f"Outstanding: {len(digest['outstanding'])} · "
+                f"Steering notes issued: {len(digest['steering'])} · "
+                f"Machinery retries: {len(digest['retries'])}",
+                "",
+            ]
+        )
+    if digest["merged"]:
+        lines.extend(["#### Merged", ""])
+        lines.extend(
+            summary_rows(
+                digest["merged"],
+                lambda fact: (
+                    f"- `{fact['taskId']}` — {compact_summary(fact['title'], 80)} "
+                    f"({fact['pullRequest']})"
+                ),
+            )
+        )
+        lines.append("")
+    if digest["checkpoints"]:
+        lines.extend(["#### Checkpoints passed", ""])
+        lines.extend(
+            summary_rows(
+                digest["checkpoints"],
+                lambda fact: (
+                    f"- `{fact['taskId']}` — {compact_summary(fact['title'], 80)} "
+                    f"at `{fact['revision']}`"
+                ),
+            )
+        )
+        lines.append("")
+    if digest["blocked"]:
+        lines.extend(["#### Blocked", ""])
+        lines.extend(
+            summary_rows(
+                digest["blocked"],
+                lambda fact: (
+                    f"- `{fact['taskId']}` — {compact_summary(fact['title'], 80)}; "
+                    f"blocked by {', '.join(f'`{item}`' for item in fact['blockedBy'])}; "
+                    f"{fact['attempts']} steered attempt(s)"
+                ),
+            )
+        )
+        lines.append("")
+    if digest["outstanding"]:
+        lines.extend(["#### Not attempted", ""])
+        lines.extend(
+            summary_rows(digest["outstanding"], lambda task_id: f"- `{task_id}`")
+        )
+        lines.append("")
+    if digest["steering"]:
+        lines.extend(["#### Steering notes issued", ""])
+        lines.extend(
+            summary_rows(
+                digest["steering"],
+                lambda note: (
+                    f"- `{note['taskId']}` attempt {note['attempt']}: {note['summary']}"
+                ),
+            )
+        )
+        lines.append("")
+    if digest["retries"]:
+        lines.extend(["#### Campaign machinery faults", ""])
+        lines.extend(
+            summary_rows(
+                digest["retries"],
+                lambda retry: (
+                    f"- `{retry['taskId']}` fault {retry['attempt']}: {retry['summary']}"
+                ),
+            )
+        )
+        lines.append("")
+    if digest["anomalies"]:
+        lines.extend(["#### Anomalies", ""])
+        lines.extend(summary_rows(digest["anomalies"], lambda detail: f"- {detail}"))
+        lines.append("")
+    if digest["warnings"]:
+        lines.extend(["#### Reconciler warnings", ""])
+        lines.extend(
+            summary_rows(
+                digest["warnings"], lambda warning: f"- {compact_summary(warning, 200)}", 12
+            )
+        )
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def publish_closing_summary(
+    repository: str,
+    config: dict[str, Any],
+    campaign: str,
+    issue_number: str,
+    digest: dict[str, Any],
+) -> str:
+    """Post one closing summary on the terminal path that produced this digest.
+
+    Always a fresh comment, never an upsert: a summary the operator does not
+    get notified about is not a summary. The marker makes a repeated terminal
+    pass idempotent rather than chatty.
+    """
+    outcome = digest["outcome"]
+    marker = closing_summary_marker(
+        campaign, issue_number, outcome, digest["source"]["sha256"]
+    )
+    body = f"{marker}\n\n{render_campaign_summary(digest)}"
+    if len(body) > 60_000:
+        fail("campaign closing summary exceeds the bounded GitHub comment size")
+    if config["forge"] == "github":
+        comments = run(
+            [
+                "gh",
+                "api",
+                "--paginate",
+                f"repos/{repository}/issues/{issue_number}/comments?per_page=100",
+                "--jq",
+                ".[] | .body",
+            ]
+        ).stdout
+        if marker in comments:
+            return f"https://github.com/{repository}/issues/{issue_number}"
+        posted = run(
             [
                 "gh",
                 "issue",
@@ -2535,13 +2780,27 @@ def close_completed_issue_campaign(
                 "--repo",
                 repository,
                 "--body",
-                (
-                    f"{marker}\nCampaign complete: {len(tasks)} task(s) are bound to "
-                    f"durable merge/checkpoint facts for `{digest}`."
-                ),
+                body,
             ]
         )
-    run(["gh", "issue", "close", issue_number, "--repo", repository])
+        return required_string(
+            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
+            "campaign closing summary comment URL",
+        )
+    ref = f"{local_state_prefix(campaign, issue_number)}/summary/{outcome}"
+    write_local_blob(
+        config,
+        ref,
+        {
+            "schemaVersion": 1,
+            "kind": "closing-summary",
+            "campaign": campaign,
+            "issueNumber": issue_number,
+            "outcome": outcome,
+            "body": body,
+        },
+    )
+    return f"local://{repository}/{ref}"
 
 
 def parallelism_warnings(
@@ -2845,27 +3104,19 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
             break
         if not task_conflicts(task, frontier):
             frontier.append(task)
-    if forge_native:
+    if forge_native and walk is None:
         # Native sub-issues make the parent's own progress bar the projection,
         # so tally stops writing one. Without that capability the recomputed
         # checkbox list is still the only progress a reader gets.
-        if walk is None:
-            sync_issue_checkboxes(
-                repository,
-                issue["number"],
-                worklist["masterBody"],
-                worklist["tasks"],
-                completed_ids,
-            )
-        if not remaining:
-            close_completed_issue_campaign(
-                repository,
-                issue["number"],
-                worklist["source"],
-                worklist["tasks"],
-            )
+        sync_issue_checkboxes(
+            repository,
+            issue["number"],
+            worklist["masterBody"],
+            worklist["tasks"],
+            completed_ids,
+        )
     warnings.extend(parallelism_warnings(ready, frontier, max_parallel))
-    result = {
+    result: dict[str, Any] = {
         "schemaVersion": 1,
         "campaign": campaign,
         "repository": repository,
@@ -2884,9 +3135,27 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         "complete": not remaining,
         "anomalies": anomalies,
         "warnings": warnings,
+        "closingSummary": None,
     }
     if forge_native:
         result["config"] = worklist["config"]
+    if not remaining:
+        # Completion is one of the campaign's two terminal outcomes, so the
+        # digest is rendered here, inside the node that already owned closing
+        # the issue. No new flow node exists for it.
+        result["closingSummary"] = publish_closing_summary(
+            repository,
+            config,
+            campaign,
+            issue["number"],
+            campaign_digest(result, "complete"),
+        )
+        if forge_native:
+            close_completed_issue_campaign(
+                repository,
+                issue["number"],
+                worklist["tasks"],
+            )
     return result
 
 
@@ -3241,6 +3510,7 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
         return {
             "posted": False,
             "comment": reconciliation["escalation"],
+            "summary": None,
             "diagnosisCount": len(reconciliation["diagnoses"]),
             "retryCount": len(reconciliation["retries"]),
         }
@@ -3325,9 +3595,20 @@ def action_escalate(brief: dict[str, Any]) -> dict[str, Any]:
         if not created:
             fail(f"local forge escalation {ref!r} appeared concurrently")
         comment = f"local://{repository}/{ref}"
+    # Quiescence is the campaign's other terminal outcome. The operator gets
+    # the escalation that says the campaign stopped, and beside it the same
+    # digest a completed campaign renders -- reflecting partial state.
+    summary = publish_closing_summary(
+        repository,
+        config,
+        campaign,
+        issue["number"],
+        campaign_digest(reconciliation, "quiescent"),
+    )
     return {
         "posted": True,
         "comment": comment,
+        "summary": summary,
         "diagnosisCount": len(reconciliation["diagnoses"]),
         "retryCount": len(reconciliation["retries"]),
     }
@@ -3532,21 +3813,14 @@ def prep_identity(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
     return data, config, identity
 
 
-def marker_path(identity: dict[str, Any]) -> Path:
-    run_hash = hashlib.sha256(identity["runId"].encode()).hexdigest()[:16]
-    return identity["workspaceRoot"] / ".state" / run_hash / f"{identity['taskId']}.json"
-
-
 def pass_record_path(workspace_root: Path, run_hash: str) -> Path:
+    """Where the pass's daemon-liveness record lives.
+
+    This one is genuinely run-scoped rather than worktree-scoped -- it names a
+    flow run, not a lane -- so it stays a file under `.state` while lane
+    identity moved into git's own per-worktree configuration.
+    """
     return workspace_root / ".state" / "passes" / f"{run_hash}.json"
-
-
-def task_state_markers(state_root: Path) -> list[Path]:
-    return [
-        marker
-        for marker in state_root.glob("*/*.json")
-        if marker.parent != state_root / "passes"
-    ]
 
 
 def prune_empty_ancestors(path: Path, stop: Path) -> None:
@@ -3559,49 +3833,47 @@ def prune_empty_ancestors(path: Path, stop: Path) -> None:
         current = current.parent
 
 
-def remove_prep_markers(
-    workspace_root: Path,
+def lane_identity(
     campaign: str,
     repository: str,
     run_id: str,
     task_id: str,
-    worktree: Path,
-) -> None:
-    state_root = workspace_root / ".state"
-    if not state_root.is_dir():
-        return
-    for marker in task_state_markers(state_root):
-        try:
-            saved = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
-        if not isinstance(saved, dict):
-            continue
-        if (
-            saved.get("campaign") == campaign
-            and saved.get("repository") == repository
-            and saved.get("runId") == run_id
-            and saved.get("taskId") == task_id
-            and saved.get("worktreePath") == str(worktree)
-        ):
-            marker.unlink(missing_ok=True)
-            prune_empty_ancestors(marker.parent, state_root)
+    task_kind: str,
+    branch: str,
+    publish_branch: str,
+    base_rev: str | None = None,
+) -> dict[str, str]:
+    """The identity fields git carries for one campaign lane.
+
+    Everything the prep marker used to hold, in the place git already keeps
+    per-worktree state. `git worktree add` creates it and `git worktree remove`
+    destroys it, so the lane set and the lane identities cannot disagree.
+    """
+    identity = {
+        "driver": "spec-build",
+        "campaign": campaign,
+        "repository": repository,
+        "runid": run_id,
+        "taskid": task_id,
+        "taskkind": task_kind,
+        "branch": branch,
+        "publishbranch": publish_branch,
+    }
+    if base_rev is not None:
+        identity["baserev"] = base_rev
+    return identity
 
 
 def parse_worktrees(checkout: Path) -> list[dict[str, str]]:
-    records: list[dict[str, str]] = []
-    current: dict[str, str] = {}
-    for line in git(checkout, "worktree", "list", "--porcelain").stdout.splitlines():
-        if not line:
-            if current:
-                records.append(current)
-                current = {}
-            continue
-        key, _, value = line.partition(" ")
-        current[key] = value
-    if current:
-        records.append(current)
-    return records
+    return worktree_call(worktrees.parse_worktrees, checkout)
+
+
+def worktree_call(operation: Any, *arguments: Any, **keywords: Any) -> Any:
+    """Run one unified-manager operation in this driver's error vocabulary."""
+    try:
+        return operation(*arguments, **keywords)
+    except worktrees.WorktreeError as error:
+        fail(error.message)
 
 
 def tally_executable(value: Any) -> Path:
@@ -3913,6 +4185,9 @@ def action_sweep_locked(brief: dict[str, Any]) -> dict[str, Any]:
     )
     blocking_jobs = query_live_campaign_jobs(tally, campaign_identity, flow_run_id)
 
+    # One enumeration, straight from git: the registered worktree set and the
+    # lane identity each worktree carries in its own configuration.
+    registered_lanes = worktree_call(worktrees.lanes, checkout)
     worktree_records = parse_worktrees(checkout)
     listed = git(
         checkout,
@@ -3920,7 +4195,6 @@ def action_sweep_locked(brief: dict[str, Any]) -> dict[str, Any]:
         "--format=%(refname:short)",
         f"refs/heads/tally-work/{campaign_slug}-",
     ).stdout.splitlines()
-    state_markers = task_state_markers(state_root) if state_root.is_dir() else []
     candidate_hashes: set[str] = set()
     for record in worktree_records:
         raw_path = record.get("worktree")
@@ -3936,19 +4210,16 @@ def action_sweep_locked(brief: dict[str, Any]) -> dict[str, Any]:
         matched = branch_pattern.fullmatch(branch)
         if matched is not None:
             candidate_hashes.add(matched.group(1))
-    for marker in state_markers:
-        try:
-            saved = json.loads(marker.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            continue
+    for lane in registered_lanes:
+        identity = lane["identity"]
         if (
-            isinstance(saved, dict)
-            and saved.get("campaign") == campaign
-            and saved.get("repository") == repository
-            and isinstance(saved.get("runId"), str)
-            and saved["runId"]
+            identity.get("campaign") == campaign
+            and identity.get("repository") == repository
+            and identity.get("runid")
         ):
-            candidate_hashes.add(hashlib.sha256(saved["runId"].encode()).hexdigest()[:12])
+            candidate_hashes.add(
+                hashlib.sha256(identity["runid"].encode()).hexdigest()[:12]
+            )
     if passes_root.is_dir() and not passes_root.is_symlink():
         for record in passes_root.glob("*.json"):
             if re.fullmatch(r"[0-9a-f]{12}\.json", record.name):
@@ -4060,77 +4331,58 @@ def action_sweep_locked(brief: dict[str, Any]) -> dict[str, Any]:
             detail = deleted.stderr.strip() or deleted.stdout.strip() or "no output"
             warnings.append(f"could not sweep branch {branch!r}: {detail}")
 
-    if state_root.is_dir():
-        for marker in state_markers:
-            try:
-                saved = json.loads(marker.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                warnings.append(f"left unreadable campaign state marker untouched: {marker}: {error}")
+    # A lane git never registered -- the runner died inside `git worktree add`,
+    # or its administrative directory was lost -- leaves a directory git will
+    # not remove. Its authority to be deleted is the campaign's own lane
+    # layout: `<repositoryRoot>/<runHash>/<lane>` under this campaign's
+    # workspace, for a run this pass already proved dead. That is exactly the
+    # authority the marker file used to carry, read from the path the driver
+    # itself derived rather than from a second copy of the truth.
+    registered_paths = {
+        Path(record["worktree"]).resolve()
+        for record in parse_worktrees(checkout)
+        if record.get("worktree")
+    }
+    if repository_root.is_dir():
+        for run_directory in sorted(repository_root.iterdir()):
+            if not run_directory.is_dir() or run_directory.is_symlink():
                 continue
-            if not isinstance(saved, dict):
-                warnings.append(f"left non-object campaign state marker untouched: {marker}")
+            lane_hash = run_directory.name
+            if not re.fullmatch(r"[0-9a-f]{12}", lane_hash):
                 continue
-            if saved.get("campaign") != campaign or saved.get("repository") != repository:
+            if lane_hash == current_hash or lane_hash in protected_hashes:
                 continue
-            saved_run_id = saved.get("runId")
-            if saved_run_id == run_id:
-                continue
-            if not isinstance(saved_run_id, str) or not saved_run_id:
-                warnings.append(f"left identity-less campaign state marker untouched: {marker}")
-                continue
-            saved_hash = hashlib.sha256(saved_run_id.encode()).hexdigest()[:12]
-            if saved_hash in protected_hashes:
-                continue
-            saved_worktree_value = saved.get("worktreePath")
-            saved_branch = saved.get("branch")
-            if not isinstance(saved_worktree_value, str) or not isinstance(saved_branch, str):
-                warnings.append(f"left incomplete campaign state marker untouched: {marker}")
-                continue
-            saved_worktree = Path(saved_worktree_value).resolve()
-            try:
-                relative = saved_worktree.relative_to(repository_root)
-            except ValueError:
-                warnings.append(f"left out-of-root campaign state marker untouched: {marker}")
-                continue
-            if len(relative.parts) != 2 or relative.parts[0] != saved_hash:
-                warnings.append(f"left mismatched campaign state marker untouched: {marker}")
-                continue
-            saved_task_id = saved.get("taskId")
-            saved_lane = (
-                "_campaign-preflight"
-                if saved_task_id == "campaign-preflight"
-                else saved_task_id
-            )
-            if not isinstance(saved_lane, str) or relative.parts[1] != saved_lane:
-                warnings.append(f"left mismatched campaign task marker untouched: {marker}")
-                continue
-            matched = branch_pattern.fullmatch(saved_branch)
-            if (
-                matched is None
-                or matched.group(1) != saved_hash
-                or matched.group(2) != relative.parts[1]
-            ):
-                warnings.append(f"left mismatched campaign branch marker untouched: {marker}")
-                continue
-            if saved_worktree.exists():
-                if not saved_worktree.is_dir():
+            for lane_directory in sorted(run_directory.iterdir()):
+                resolved = lane_directory.resolve()
+                if resolved in registered_paths:
+                    continue
+                lane_name = lane_directory.name
+                if lane_name != "_campaign-preflight" and not TASK_ID.fullmatch(lane_name):
                     warnings.append(
-                        f"left non-directory campaign worktree path untouched: {saved_worktree}"
+                        f"left unexpected campaign workspace entry untouched: {lane_directory}"
+                    )
+                    continue
+                if lane_directory.is_symlink() or not lane_directory.is_dir():
+                    warnings.append(
+                        f"left non-directory campaign worktree path untouched: {lane_directory}"
                     )
                     continue
                 try:
-                    shutil.rmtree(saved_worktree)
+                    shutil.rmtree(lane_directory)
                 except OSError as error:
                     warnings.append(
                         f"could not sweep unregistered campaign worktree "
-                        f"{saved_worktree}: {error}"
+                        f"{lane_directory}: {error}"
                     )
                     continue
-                cleaned.append(f"worktree:{saved_worktree}")
-            git(checkout, "branch", "-D", saved_branch, check=False)
-            marker.unlink(missing_ok=True)
-            prune_empty_ancestors(marker.parent, state_root)
-            cleaned.append(f"marker:{marker}")
+                cleaned.append(f"worktree:{lane_directory}")
+                git(
+                    checkout,
+                    "branch",
+                    "-D",
+                    f"tally-work/{campaign_slug}-{lane_hash}/{lane_name}",
+                    check=False,
+                )
 
     if repository_root.is_dir():
         for child in repository_root.iterdir():
@@ -4206,27 +4458,21 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     worktree = (
         identity["workspaceRoot"] / repository_slug / run_hash / identity["taskId"]
     ).resolve()
-    marker = marker_path(identity)
+    expected = lane_identity(
+        identity["campaign"],
+        identity["repository"],
+        identity["runId"],
+        identity["taskId"],
+        identity["taskKind"],
+        branch,
+        publish_branch,
+    )
 
-    if marker.exists():
-        saved = json.loads(marker.read_text(encoding="utf-8"))
-        expected = {
-            "campaign": identity["campaign"],
-            "repository": identity["repository"],
-            "runId": identity["runId"],
-            "taskId": identity["taskId"],
-            "taskKind": identity["taskKind"],
-            "branch": branch,
-            "publishBranch": publish_branch,
-            "worktreePath": str(worktree),
-        }
-        if any(saved.get(key) != value for key, value in expected.items()):
-            fail(f"existing prep marker {marker} does not match this task")
-        if not worktree.is_dir():
-            fail(f"prepared worktree {worktree} is missing")
+    resumed = worktree_call(worktrees.resume, checkout, worktree, expected)
+    if resumed is not None:
         return {
             "taskId": identity["taskId"],
-            "baseRev": required_string(saved.get("baseRev"), "prep marker baseRev"),
+            "baseRev": required_string(resumed.get("baserev"), "lane baseRev"),
             "branch": branch,
             "publishBranch": publish_branch,
             "worktreePath": str(worktree),
@@ -4251,25 +4497,14 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
         base_rev = git(checkout, "merge-base", start_rev, base_rev).stdout.strip()
     else:
         start_rev = base_rev
-    if git(checkout, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
-        fail(f"branch {branch!r} exists without its prep marker")
-    if worktree.exists():
-        fail(f"worktree path already exists without its prep marker: {worktree}")
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    git(checkout, "worktree", "add", "--detach", str(worktree), start_rev)
-    git(worktree, "switch", "-c", branch)
-    saved = {
-        "campaign": identity["campaign"],
-        "repository": identity["repository"],
-        "runId": identity["runId"],
-        "taskId": identity["taskId"],
-        "taskKind": identity["taskKind"],
-        "baseRev": base_rev,
-        "branch": branch,
-        "publishBranch": publish_branch,
-        "worktreePath": str(worktree),
-    }
-    write_atomic(marker, saved)
+    worktree_call(
+        worktrees.create,
+        checkout,
+        worktree,
+        branch,
+        start_rev,
+        {**expected, "baserev": base_rev},
+    )
     return {
         "taskId": identity["taskId"],
         "baseRev": base_rev,
@@ -4313,26 +4548,15 @@ def action_preflight(brief: dict[str, Any]) -> dict[str, Any]:
     worktree = (
         workspace_root / repository_slug / run_hash / "_campaign-preflight"
     ).resolve()
-    marker = workspace_root / ".state" / run_hash / "_campaign-preflight.json"
+    expected = lane_identity(
+        campaign, repository, run_id, task_id, "preflight", branch, branch
+    )
 
-    if marker.exists():
-        saved = json.loads(marker.read_text(encoding="utf-8"))
-        expected = {
-            "campaign": campaign,
-            "repository": repository,
-            "runId": run_id,
-            "taskId": task_id,
-            "branch": branch,
-            "publishBranch": branch,
-            "worktreePath": str(worktree),
-        }
-        if any(saved.get(key) != value for key, value in expected.items()):
-            fail(f"existing preflight marker {marker} does not match this pass")
-        if not worktree.is_dir():
-            fail(f"prepared preflight worktree {worktree} is missing")
+    resumed = worktree_call(worktrees.resume, checkout, worktree, expected)
+    if resumed is not None:
         return {
             "taskId": task_id,
-            "baseRev": required_string(saved.get("baseRev"), "preflight marker baseRev"),
+            "baseRev": required_string(resumed.get("baserev"), "preflight lane baseRev"),
             "branch": branch,
             "publishBranch": branch,
             "worktreePath": str(worktree),
@@ -4341,31 +4565,14 @@ def action_preflight(brief: dict[str, Any]) -> dict[str, Any]:
     git(checkout, "fetch", "--prune", config["remote"])
     base_ref = f"{config['remote']}/{config['baseBranch']}"
     base_rev = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
-    if git(
+    worktree_call(
+        worktrees.create,
         checkout,
-        "show-ref",
-        "--verify",
-        "--quiet",
-        f"refs/heads/{branch}",
-        check=False,
-    ).returncode == 0:
-        fail(f"preflight branch {branch!r} exists without its marker")
-    if worktree.exists():
-        fail(f"preflight worktree exists without its marker: {worktree}")
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    git(checkout, "worktree", "add", "--detach", str(worktree), base_rev)
-    git(worktree, "switch", "-c", branch)
-    saved = {
-        "campaign": campaign,
-        "repository": repository,
-        "runId": run_id,
-        "taskId": task_id,
-        "baseRev": base_rev,
-        "branch": branch,
-        "publishBranch": branch,
-        "worktreePath": str(worktree),
-    }
-    write_atomic(marker, saved)
+        worktree,
+        branch,
+        base_rev,
+        {**expected, "baserev": base_rev},
+    )
     return {
         "taskId": task_id,
         "baseRev": base_rev,
@@ -5344,25 +5551,7 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
 
 
 def cleanup_worktree(checkout: Path, worktree: Path, branch: str) -> None:
-    removed = git(checkout, "worktree", "remove", "--force", str(worktree), check=False)
-    if removed.returncode != 0 and worktree.exists():
-        detail = removed.stderr.strip() or removed.stdout.strip() or "no output"
-        fail(f"cannot remove campaign worktree {worktree}: {detail}")
-    deleted = git(checkout, "branch", "-D", branch, check=False)
-    if (
-        deleted.returncode != 0
-        and git(
-            checkout,
-            "show-ref",
-            "--verify",
-            "--quiet",
-            f"refs/heads/{branch}",
-            check=False,
-        ).returncode
-        == 0
-    ):
-        detail = deleted.stderr.strip() or deleted.stdout.strip() or "no output"
-        fail(f"cannot remove campaign branch {branch!r}: {detail}")
+    worktree_call(worktrees.remove, checkout, worktree, branch)
 
 
 def action_cleanup(brief: dict[str, Any]) -> dict[str, Any]:
@@ -5452,14 +5641,6 @@ def action_cleanup(brief: dict[str, Any]) -> dict[str, Any]:
             except OSError as error:
                 fail(f"cannot remove partial campaign worktree {worktree}: {error}")
     cleanup_worktree(config["checkout"], worktree, branch)
-    remove_prep_markers(
-        workspace_root,
-        campaign,
-        repository,
-        run_id,
-        task_id,
-        expected_worktree,
-    )
     prune_empty_ancestors(expected_worktree.parent, repository_root)
     return {"taskId": task_id, "cleaned": True}
 
@@ -6546,6 +6727,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except DriverError as error:
+    except (DriverError, worktrees.WorktreeError) as error:
         print(f"spec-build-driver: {error}", file=sys.stderr)
         raise SystemExit(1)

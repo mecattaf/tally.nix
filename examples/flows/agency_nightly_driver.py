@@ -32,6 +32,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+# One worktree manager serves both campaign drivers. This file used to carry
+# its own create/resume/validate logic with its own invariants; the shared
+# module is now the single implementation, and lane identity lives in git's own
+# per-worktree configuration rather than in either driver's bespoke files.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import campaign_worktrees as worktrees  # noqa: E402
+
 FINAL_MESSAGE_PREFIX = "TALLY_FINAL_MESSAGE="
 TASK_ID = re.compile(r"^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$")
 ISSUE_ID = re.compile(r"^[1-9][0-9]*$")
@@ -202,18 +209,25 @@ def read_wave(brief: dict[str, Any]) -> list[dict[str, Any]]:
     return tasks
 
 
-def same_repository(checkout: Path, worktree: Path) -> bool:
-    checkout_common = command(
-        ["git", "-C", str(checkout), "rev-parse", "--git-common-dir"],
-        error_code="worklist-worktree-invalid",
-    ).stdout.strip()
-    worktree_common = command(
-        ["git", "-C", str(worktree), "rev-parse", "--git-common-dir"],
-        error_code="worklist-worktree-invalid",
-    ).stdout.strip()
-    checkout_path = (checkout / checkout_common).resolve()
-    worktree_path = (worktree / worktree_common).resolve()
-    return checkout_path == worktree_path
+# The manager's error vocabulary, mapped onto the codes this driver's contract
+# already publishes to the flow.
+WORKTREE_ERROR_CODES = {
+    "worktree-conflict": "worklist-worktree-conflict",
+    "worktree-invalid": "worklist-worktree-invalid",
+    "worktree-create-failed": "worklist-worktree-create-failed",
+    "branch-invalid": "worklist-branch-invalid",
+}
+
+
+def worktree_call(operation: Any, *arguments: Any, **keywords: Any) -> Any:
+    try:
+        return operation(*arguments, **keywords)
+    except worktrees.WorktreeError as error:
+        raise DriverError(
+            WORKTREE_ERROR_CODES.get(error.code, "worklist-worktree-invalid"),
+            error.message,
+            error.details,
+        ) from error
 
 
 def prepare_workspace(
@@ -221,64 +235,28 @@ def prepare_workspace(
     worktree_root: Path,
     branch_prefix: str,
     base_rev: str,
+    repository: str,
     task_id: str,
 ) -> dict[str, str]:
     """One worktree and one branch per task, and never a shared one.
 
-    Re-running against an existing worktree is the resume path: the same branch
-    on the same repository is adopted as-is, work and all. Anything else in the
-    way is a conflict rather than something to clobber.
+    Re-running against an existing worktree is the resume path: the same lane
+    identity on the same repository is adopted as-is, work and all. Anything
+    else in the way is a conflict rather than something to clobber. Both halves
+    are the shared manager's, so the campaign driver and this one now promise
+    the same thing.
     """
     branch = f"{branch_prefix.rstrip('/')}/{task_id}"
-    command(
-        ["git", "check-ref-format", "--branch", branch],
-        error_code="worklist-branch-invalid",
-    )
     worktree = worktree_root / task_id
-    if worktree.exists():
-        if not worktree.is_dir() or not same_repository(checkout, worktree):
-            raise DriverError(
-                "worklist-worktree-conflict",
-                f"existing path for task {task_id!r} is not a worktree of the configured checkout",
-                {"taskId": task_id, "worktreePath": str(worktree)},
-            )
-        actual_branch = command(
-            ["git", "-C", str(worktree), "symbolic-ref", "--short", "HEAD"],
-            error_code="worklist-worktree-invalid",
-        ).stdout.strip()
-        if actual_branch != branch:
-            raise DriverError(
-                "worklist-worktree-conflict",
-                f"existing worktree for task {task_id!r} is on a different branch",
-                {
-                    "taskId": task_id,
-                    "worktreePath": str(worktree),
-                    "expectedBranch": branch,
-                    "actualBranch": actual_branch,
-                },
-            )
-    else:
-        branch_exists = (
-            command(
-                [
-                    "git",
-                    "-C",
-                    str(checkout),
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    f"refs/heads/{branch}",
-                ],
-                check=False,
-            ).returncode
-            == 0
-        )
-        argv = ["git", "-C", str(checkout), "worktree", "add"]
-        if not branch_exists:
-            argv.extend(["-b", branch])
-        argv.append(str(worktree))
-        argv.append(branch if branch_exists else base_rev)
-        command(argv, error_code="worklist-worktree-create-failed")
+    identity = {
+        "driver": "agency-nightly",
+        "repository": repository,
+        "taskid": task_id,
+        "branch": branch,
+    }
+    resumed = worktree_call(worktrees.resume, checkout, worktree, identity)
+    if resumed is None:
+        worktree_call(worktrees.create, checkout, worktree, branch, base_rev, identity)
     return {
         "taskId": task_id,
         "branch": branch,
@@ -315,7 +293,7 @@ def worklist(brief: dict[str, Any]) -> dict[str, Any]:
     worktree_root.mkdir(parents=True, exist_ok=True)
     workspaces = [
         prepare_workspace(
-            checkout, worktree_root, branch_prefix, base_rev, task["taskId"]
+            checkout, worktree_root, branch_prefix, base_rev, repository, task["taskId"]
         )
         for task in tasks
     ]

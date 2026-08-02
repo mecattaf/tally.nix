@@ -248,8 +248,24 @@ is a mechanism-test mode and has no autonomous continuation contract.
 Merge/checkpoint projection changes and allowed steering comments advance the
 observation revision, so the poller submits a fresh pass behind the capacity-one
 campaign mutex. When every task has durable proof, reconcile repairs all boxes,
-closes task issues, posts one digest-bound summary, and closes the master. The
-next poll prunes that registration. Operators can remove an open registration
+closes task issues, posts one digest-bound closing summary, and closes the
+master. The next poll prunes that registration.
+
+A campaign has two terminal outcomes and both render the same closing summary:
+completion, and escalation at frontier quiescence. The summary is markdown
+rendered from a run-scoped digest — merged tasks with their pull requests,
+checkpoints with the revision they bound, blocked tasks with what blocks them
+and how many steered attempts they spent, tasks never attempted, every steering
+note and machinery fault, anomalies, and reconciler warnings. Every field is a
+projection of facts the pass already witnessed; the digest is not a state
+store. On completion the summary is the campaign's single
+`tally:campaign-complete:v1` comment, posted before the issue closes; at
+quiescence it is posted beside the escalation and reflects partial state.
+Neither is ever an upsert — a summary the operator is not notified about is not
+a summary — and both are idempotent: a repeated terminal pass finds its own
+marker and stays quiet. Both render inside nodes the campaign already had, so
+neither adds a flow node. On a local forge the summary is a durable blob at
+`refs/tally/spec-build/v1/<scope>/summary/<outcome>`. Operators can remove an open registration
 without changing forge state with `tally campaign disarm ISSUE-URL`; registry
 read/modify/write operations are file-locked against timer and re-arm races.
 `tally campaign list` inspects registrations, while `tally campaign poll --once`
@@ -648,8 +664,24 @@ reconciliation. This includes a still-running prep node that has not created or
 attached workspace metadata yet. A legacy or malformed lane without a validated
 run-to-flow record is left as a safe leak with a witnessed warning; absence of
 proof is never interpreted as proof of death. Once an older flow has no live
-jobs, the sweep may reclaim its worktrees, local branches, task markers, and
-pass record.
+jobs, the sweep may reclaim its worktrees, local branches, and pass record.
+
+Lane identity is git's own per-worktree configuration, not a file tally keeps
+beside it. Preparing a lane enables `extensions.worktreeConfig` on the campaign
+checkout and records the campaign, repository, run, task, branch, publish
+branch, and base revision under `tally.*` in that worktree's config; the
+enumeration a later pass reads is `git worktree list --porcelain` plus that
+config. `git worktree add` creates the record and `git worktree remove`
+destroys it, so the lane set and the lane identities cannot drift apart the way
+the pre-#312 JSON markers under `<workspaceRoot>/.state/` could. Resuming a
+lane means finding a recorded identity that matches; a lane whose branch
+outlived its worktree is re-adopted with its work, and a foreign identity at a
+lane path is a refusal, never a clobber. A directory git never registered — a
+runner killed inside `git worktree add` — is reclaimed by the sweep from the
+campaign's own derived lane layout. The run-scoped pass record under
+`.state/passes/` is not lane state and stays where it is. The same manager
+serves the agency-nightly driver, so both drivers promise one set of
+create/resume/validate semantics.
 
 The reconcile node fetches the configured remote and reads the matching
 worklist blob from the exact remote base commit. Uncommitted files and the

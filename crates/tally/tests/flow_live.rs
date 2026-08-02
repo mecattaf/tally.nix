@@ -78,6 +78,8 @@ const SPEC_BUILD_RUN_RENAMED: &str = "00000000-0000-4000-8000-000000000531";
 const SPEC_BUILD_RUN_MACHINERY: &str = "00000000-0000-4000-8000-000000000532";
 const SPEC_BUILD_RUN_RECOVERED: &str = "00000000-0000-4000-8000-000000000533";
 const SPEC_BUILD_RUN_HALTED: &str = "00000000-0000-4000-8000-000000000534";
+const SPEC_BUILD_RUN_LAST_TASK: &str = "00000000-0000-4000-8000-000000000535";
+const SPEC_BUILD_RUN_COMPLETE: &str = "00000000-0000-4000-8000-000000000536";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -3561,6 +3563,56 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert!(escalation_body.contains("`phase-one-checkpoint` attempt 1"));
             assert!(escalation_body.contains("`task-2` attempt 1"));
             assert!(escalation_body.contains("`task-2` attempt 2"));
+
+            // Quiescence is a terminal outcome, so the escalation carries a
+            // closing summary beside it: the same digest a completed campaign
+            // renders, reflecting partial state.
+            assert!(eighth_value["escalation"]["summary"]
+                .as_str()
+                .unwrap()
+                .ends_with("/summary/quiescent"));
+            let quiescent_summary_ref = fixture_git(
+                &checkout,
+                &[
+                    "ls-remote",
+                    "origin",
+                    "refs/tally/spec-build/v1/*/summary/quiescent",
+                ],
+            );
+            let quiescent_summary_oid = quiescent_summary_ref
+                .split_whitespace()
+                .next()
+                .expect("local forge omitted the quiescent closing summary");
+            let quiescent_summary: Value = serde_json::from_str(&fixture_git(
+                &checkout,
+                &["cat-file", "blob", quiescent_summary_oid],
+            ))
+            .unwrap();
+            assert_eq!(quiescent_summary["kind"], "closing-summary");
+            assert_eq!(quiescent_summary["outcome"], "quiescent");
+            let quiescent_body = quiescent_summary["body"].as_str().unwrap();
+            assert!(
+                quiescent_body.contains("Campaign closed at frontier quiescence"),
+                "{quiescent_body}"
+            );
+            // Partial state, from witnessed facts only: what merged, what a
+            // checkpoint bound, what is blocked, and every steering note.
+            assert!(quiescent_body.contains("5 of 7 task(s)"), "{quiescent_body}");
+            for fragment in [
+                "#### Merged",
+                "#### Checkpoints passed",
+                "#### Blocked",
+                "#### Steering notes issued",
+                "`task-1`",
+                "`task-6`",
+                "`phase-one-checkpoint`",
+                "`task-2` attempt 2",
+            ] {
+                assert!(
+                    quiescent_body.contains(fragment),
+                    "closing summary is missing {fragment}: {quiescent_body}"
+                );
+            }
             let task_1_diagnosis_ref = fixture_git(
                 &checkout,
                 &[
@@ -3998,6 +4050,127 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert!(
                 !continuation_ref.trim().is_empty(),
                 "the campaign must carry a durable continuation receipt"
+            );
+
+            // The operator drops the task no agent in this fixture can build.
+            // That is an ordinary worklist edit, and it leaves the campaign one
+            // checkpoint short of done -- so the next two passes walk the other
+            // terminal outcome: completion, and the closing summary it renders.
+            fixture_git(&checkout, &["fetch", "origin"]);
+            fixture_git(&checkout, &["reset", "--hard", "origin/main"]);
+            let dropped_worklist: Value =
+                serde_json::from_str(&fs::read_to_string(&worklist_path).unwrap()).unwrap();
+            let dropped_tasks = dropped_worklist["tasks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|task| task["id"] != "task-5")
+                .cloned()
+                .collect::<Vec<_>>();
+            fs::write(
+                &worklist_path,
+                serde_json::to_string_pretty(&json!({
+                    "schemaVersion": dropped_worklist["schemaVersion"],
+                    "tasks": dropped_tasks,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+            fixture_git(&checkout, &["add", "specs/001-toy/tasks.json"]);
+            fixture_git(&checkout, &["commit", "-m", "operator: drop the unbuildable task"]);
+            fixture_git(&checkout, &["push", "origin", "main"]);
+
+            // Editing the worklist rotates its digest, so the checkpoint must
+            // rebind to the edited worklist before the campaign can be done.
+            let last_task = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_LAST_TASK,
+                &arguments("fixture-comment-19-last-task", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let last_task = runner_output(last_task).await;
+            assert!(
+                last_task.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&last_task.stdout),
+                String::from_utf8_lossy(&last_task.stderr)
+            );
+            let last_task_value = &flow_report(&last_task)["report"]["finalValue"];
+            assert_eq!(last_task_value["state"], "advanced");
+            assert_eq!(
+                last_task_value["checkpoints"][0]["taskId"],
+                "phase-one-checkpoint"
+            );
+            assert_eq!(
+                last_task_value["reconciled"]["closingSummary"],
+                Value::Null,
+                "a pass that still has work is not a terminal pass"
+            );
+
+            let completed = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RUN_COMPLETE,
+                &arguments("fixture-comment-20-complete", "low"),
+                32,
+            )
+            .spawn()
+            .unwrap();
+            let completed = runner_output(completed).await;
+            assert!(
+                completed.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&completed.stdout),
+                String::from_utf8_lossy(&completed.stderr)
+            );
+            let completed_value = &flow_report(&completed)["report"]["finalValue"];
+            assert_eq!(completed_value["state"], "complete");
+            assert_eq!(completed_value["reconciled"]["remaining"], json!([]));
+            assert!(completed_value["reconciled"]["closingSummary"]
+                .as_str()
+                .unwrap()
+                .ends_with("/summary/complete"));
+
+            let complete_summary_ref = fixture_git(
+                &checkout,
+                &[
+                    "ls-remote",
+                    "origin",
+                    "refs/tally/spec-build/v1/*/summary/complete",
+                ],
+            );
+            let complete_summary_oid = complete_summary_ref
+                .split_whitespace()
+                .next()
+                .expect("local forge omitted the completion closing summary");
+            let complete_summary: Value = serde_json::from_str(&fixture_git(
+                &checkout,
+                &["cat-file", "blob", complete_summary_oid],
+            ))
+            .unwrap();
+            assert_eq!(complete_summary["kind"], "closing-summary");
+            assert_eq!(complete_summary["outcome"], "complete");
+            let complete_body = complete_summary["body"].as_str().unwrap();
+            assert!(
+                complete_body.contains("tally:campaign-complete:v1 source=sha256:"),
+                "{complete_body}"
+            );
+            assert!(complete_body.contains("### Campaign complete"), "{complete_body}");
+            assert!(complete_body.contains("6 of 6 task(s)"), "{complete_body}");
+            for fragment in ["`task-1`", "`task-2b`", "`task-6`", "`phase-one-checkpoint`"] {
+                assert!(
+                    complete_body.contains(fragment),
+                    "closing summary is missing {fragment}: {complete_body}"
+                );
+            }
+            assert!(
+                !complete_body.contains("#### Blocked"),
+                "a completed campaign has nothing blocked: {complete_body}"
             );
 
             daemon.stop().await;
