@@ -2709,3 +2709,229 @@ async fn direct_fallback_times_out_and_refuses_credentials() {
         Err(ExecutorError::CredentialedFallback)
     ));
 }
+
+#[test]
+fn the_capture_lock_lives_outside_every_job_writable_directory() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    let request = request();
+    let lock = executor.capture_lock_path(&request.identity);
+    assert_eq!(
+        lock,
+        temp.path()
+            .join(CAPTURE_LOCK_DIRECTORY)
+            .join(format!("{}.capture.lock", request.identity.unit_uuid()))
+    );
+    // The naming stays greppable, and the directory is neither the one the
+    // ExecStopPost recorder writes nor one holding a granted capture file.
+    assert!(lock.to_str().unwrap().ends_with(CAPTURE_LOCK_SUFFIX));
+    assert_ne!(
+        lock.parent().unwrap(),
+        temp.path().join(UNIT_EXIT_DIRECTORY)
+    );
+
+    executor.prepare_paths(&request.identity).unwrap();
+    assert!(lock.exists());
+    assert!(!temp
+        .path()
+        .join(UNIT_EXIT_DIRECTORY)
+        .join(format!("{}.capture.lock", request.identity.unit_uuid()))
+        .exists());
+}
+
+#[test]
+fn a_legacy_unit_exit_lock_is_never_taken_by_the_new_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    let request = request();
+    let paths = executor.prepare_paths(&request.identity).unwrap();
+    write_capture_generation(
+        &paths.capture_generation,
+        CaptureGeneration {
+            attempt: request.attempt,
+            lease_epoch: request.lease_epoch,
+        },
+    )
+    .unwrap();
+    std::fs::write(&paths.stderr, b"legacy lock ignored\n").unwrap();
+
+    // A lock left behind by a pre-relocation daemon, held exclusively. If the
+    // new path still consulted it this call would hit the deadline and error.
+    let legacy = temp
+        .path()
+        .join(UNIT_EXIT_DIRECTORY)
+        .join(format!("{}.capture.lock", request.identity.unit_uuid()));
+    std::fs::write(&legacy, b"").unwrap();
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&legacy)
+        .unwrap();
+    FileExt::lock_exclusive(&holder).unwrap();
+
+    let excerpt = executor
+        .persist_failure_stderr(&request.identity, request.attempt, request.lease_epoch)
+        .unwrap()
+        .unwrap();
+    assert_eq!(excerpt.text, "legacy lock ignored\n");
+    drop(holder);
+}
+
+#[test]
+fn a_held_capture_lock_fails_the_projection_inside_the_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    let request = request();
+    let paths = executor.prepare_paths(&request.identity).unwrap();
+    write_capture_generation(
+        &paths.capture_generation,
+        CaptureGeneration {
+            attempt: request.attempt,
+            lease_epoch: request.lease_epoch,
+        },
+    )
+    .unwrap();
+    std::fs::write(&paths.stderr, b"blocked failure\n").unwrap();
+
+    let holder = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(executor.capture_lock_path(&request.identity))
+        .unwrap();
+    FileExt::lock_exclusive(&holder).unwrap();
+
+    let started = std::time::Instant::now();
+    let error = executor
+        .persist_failure_stderr(&request.identity, request.attempt, request.lease_epoch)
+        .unwrap_err();
+    let waited = started.elapsed();
+    assert!(
+        matches!(error, ExecutorError::CaptureLockContended { .. }),
+        "unexpected error {error:?}"
+    );
+    assert!(
+        waited >= CAPTURE_LOCK_DEADLINE,
+        "returned too early: {waited:?}"
+    );
+    assert!(
+        waited < CAPTURE_LOCK_DEADLINE * 4,
+        "waited past the bound: {waited:?}"
+    );
+    // The projection is refused, not silently stale.
+    assert!(!paths.failure_stderr.exists());
+
+    // Once the holder lets go the same call succeeds.
+    drop(holder);
+    let excerpt = executor
+        .persist_failure_stderr(&request.identity, request.attempt, request.lease_epoch)
+        .unwrap()
+        .unwrap();
+    assert_eq!(excerpt.text, "blocked failure\n");
+}
+
+#[test]
+fn a_dead_generation_never_mints_a_capture_lock() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    let request = request();
+    // Exactly what the startup reconciler does for a historically failed task:
+    // no capture generation survives, so there is nothing to project and no
+    // reason to leave a lock file behind for the retention sweep to chase.
+    assert!(executor
+        .persist_failure_stderr(&request.identity, request.attempt, request.lease_epoch)
+        .unwrap()
+        .is_none());
+    let lock = executor.capture_lock_path(&request.identity);
+    assert!(!lock.exists());
+    assert!(!temp.path().join(CAPTURE_LOCK_DIRECTORY).exists());
+}
+
+#[test]
+fn a_capture_lock_detached_from_its_name_is_never_accepted() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    let request = request();
+    let path = executor.capture_lock_path(&request.identity);
+    let held = executor.lock_capture(&request.identity).unwrap();
+    // The postcondition every acquisition now carries: the fd under the lock is
+    // still what the path resolves to.
+    assert!(capture_lock_still_named(&held, &path).unwrap());
+
+    // Model the state the sweep can leave behind: the name is gone while a
+    // holder still owns the inode and its exclusive lock. That is the state in
+    // which an unrevalidated acquisition would have believed it held the
+    // capture lock while a second holder ran concurrently on a fresh inode.
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(held.metadata().unwrap().nlink(), 0);
+    assert!(!capture_lock_still_named(&held, &path).unwrap());
+
+    // The next acquisition creates and locks a live inode, and its own
+    // postcondition holds — so mutual exclusion is restored on the name rather
+    // than silently split across two inodes.
+    let fresh = executor.lock_capture(&request.identity).unwrap();
+    assert_eq!(fresh.metadata().unwrap().nlink(), 1);
+    assert!(capture_lock_still_named(&fresh, &path).unwrap());
+    assert_ne!(
+        fresh.metadata().unwrap().ino(),
+        held.metadata().unwrap().ino()
+    );
+    // And the live lock does exclude: a further attempt hits the deadline.
+    let contended = std::thread::scope(|scope| {
+        scope
+            .spawn(|| executor.lock_capture(&request.identity).map(|_| ()))
+            .join()
+            .unwrap()
+    });
+    assert!(
+        matches!(contended, Err(ExecutorError::CaptureLockContended { .. })),
+        "unexpected result {contended:?}"
+    );
+}
+
+#[test]
+fn no_hardening_preset_grants_a_job_the_capture_lock_directory() {
+    let state_dir = Path::new("/state tree");
+    let executor = executor(state_dir);
+    let lock_dir = state_dir.join(CAPTURE_LOCK_DIRECTORY);
+    let lock = executor.capture_lock_path(&request().identity);
+    assert!(lock.starts_with(&lock_dir));
+
+    for hardening in [AdapterHardening::Strict, AdapterHardening::Production] {
+        let mut request = request();
+        request.hardening = hardening;
+        request.workspace = Some(WorkspaceMetadata {
+            repo: "acme/widgets".to_owned(),
+            base_rev: "origin/main".to_owned(),
+            branch: "tally/work".to_owned(),
+            worktree_path: PathBuf::from("/work tree"),
+        });
+        let mut args = Vec::new();
+        executor
+            .push_hardening_properties(&mut args, &request)
+            .unwrap();
+        let writable = strings(&args)
+            .into_iter()
+            .find(|value| value.starts_with("ReadWritePaths="))
+            .expect("a preset always states its writable set");
+        assert!(
+            !writable.contains(lock_dir.to_str().unwrap()),
+            "{hardening:?} grants the capture lock directory: {writable}"
+        );
+        // `unit-exit` is granted whole — that is exactly why the lock left it.
+        assert!(writable.contains(state_dir.join(UNIT_EXIT_DIRECTORY).to_str().unwrap()));
+        // No granted path is an ancestor of the lock either: a job that could
+        // write `capture/` could create the directory itself.
+        for granted in writable
+            .trim_start_matches("ReadWritePaths=")
+            .split("\" \"")
+        {
+            let granted = Path::new(granted.trim_matches('"'));
+            assert!(
+                !lock.starts_with(granted),
+                "{hardening:?} grants {} which contains {}",
+                granted.display(),
+                lock.display()
+            );
+        }
+    }
+}

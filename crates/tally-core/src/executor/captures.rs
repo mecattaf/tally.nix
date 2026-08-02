@@ -3,6 +3,18 @@ use super::*;
 pub const CAPTURE_EXCERPT_MAX_BYTES: usize = 2 * 1024;
 const CAPTURE_EXCERPT_TRUNCATION_MARKER: &str = "[... earlier captured stderr omitted ...]\n";
 
+/// How long a caller will wait for the per-unit capture lock before giving up.
+///
+/// Every critical section this lock guards is a bounded local file operation —
+/// archiving one generation, writing one projection — so a wait beyond this is
+/// evidence of a stuck holder, not of honest contention. Waiting forever is the
+/// one outcome that is never acceptable: the failure-projection path is reached
+/// from the durable-wait RPC handlers, and a daemon that blocks there stops
+/// answering.
+pub const CAPTURE_LOCK_DEADLINE: Duration = Duration::from_secs(5);
+const CAPTURE_LOCK_FIRST_BACKOFF: Duration = Duration::from_millis(1);
+const CAPTURE_LOCK_MAX_BACKOFF: Duration = Duration::from_millis(50);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureExcerpt {
     pub text: String,
@@ -10,35 +22,83 @@ pub struct CaptureExcerpt {
 }
 
 impl Executor {
+    pub fn capture_lock_path(&self, identity: &ExecutionIdentity) -> PathBuf {
+        self.state_dir
+            .join(CAPTURE_LOCK_DIRECTORY)
+            .join(format!("{}{CAPTURE_LOCK_SUFFIX}", identity.unit_uuid()))
+    }
+
     pub(super) fn lock_capture(&self, identity: &ExecutionIdentity) -> Result<File, ExecutorError> {
-        let path = self
-            .state_dir
-            .join(UNIT_EXIT_DIRECTORY)
-            .join(format!("{}.capture.lock", identity.unit_uuid()));
+        self.lock_capture_within(identity, CAPTURE_LOCK_DEADLINE)
+    }
+
+    /// Take the per-unit capture lock, or give up inside `budget`.
+    ///
+    /// Two properties beyond "hold an exclusive `flock`" are load-bearing here.
+    ///
+    /// The wait is bounded. `lock_exclusive` is a blocking syscall on a file
+    /// that used to live in a job-writable directory; the relocation removes the
+    /// hostile holder, but a wedged daemon-side holder would still stall every
+    /// caller, including the RPC failure-projection path. Callers already treat
+    /// a failure here as "no excerpt", which is strictly better than not
+    /// answering.
+    ///
+    /// The acquisition is revalidated. `flock` follows the inode, not the name,
+    /// so a lock granted after the retention sweep unlinked the path guards
+    /// nothing: the next caller creates a fresh file and locks it immediately,
+    /// and two holders run at once. Re-stat after the lock is granted and, if
+    /// the name no longer resolves to the inode under the lock, drop it and open
+    /// again.
+    fn lock_capture_within(
+        &self,
+        identity: &ExecutionIdentity,
+        budget: Duration,
+    ) -> Result<File, ExecutorError> {
+        let path = self.capture_lock_path(identity);
         let parent = path
             .parent()
             .expect("capture lock path always has a parent");
         create_private_directory(parent)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-            .map_err(|source| io_error(&path, source))?;
-        let metadata = file.metadata().map_err(|source| io_error(&path, source))?;
-        if !metadata.file_type().is_file() || metadata.nlink() != 1 {
-            return Err(ExecutorError::InvalidRequest(format!(
-                "capture lock {} is not a private regular file",
-                path.display()
-            )));
+        let started = Instant::now();
+        let mut backoff = CAPTURE_LOCK_FIRST_BACKOFF;
+        loop {
+            let file = OpenOptions::new()
+                .create(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(&path)
+                .map_err(|source| io_error(&path, source))?;
+            let metadata = file.metadata().map_err(|source| io_error(&path, source))?;
+            if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+                return Err(ExecutorError::InvalidRequest(format!(
+                    "capture lock {} is not a private regular file",
+                    path.display()
+                )));
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|source| io_error(&path, source))?;
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(()) => {
+                    if capture_lock_still_named(&file, &path)? {
+                        return Ok(file);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(source) => return Err(io_error(&path, source)),
+            }
+            drop(file);
+            let waited = started.elapsed();
+            if waited >= budget {
+                return Err(ExecutorError::CaptureLockContended {
+                    path,
+                    waited_ms: budget.as_millis(),
+                });
+            }
+            std::thread::sleep(backoff.min(budget - waited));
+            backoff = (backoff * 2).min(CAPTURE_LOCK_MAX_BACKOFF);
         }
-        file.set_permissions(std::fs::Permissions::from_mode(0o600))
-            .map_err(|source| io_error(&path, source))?;
-        file.lock_exclusive()
-            .map_err(|source| io_error(&path, source))?;
-        Ok(file)
     }
 
     pub fn capture_generation_matches(
@@ -241,12 +301,23 @@ impl Executor {
     /// identified failed generation. The same lock guards retry preparation,
     /// so a late terminal handler can neither inspect one generation and copy
     /// another nor stamp a failure signal onto a newer healthy attempt.
+    ///
+    /// The generation is checked twice on purpose. The cheap read before the
+    /// lock decides nothing about the projection — the read under the lock
+    /// does — but it keeps this call from minting a lock file for a task whose
+    /// capture generation is already gone. The startup reconciler replays every
+    /// failed witness in the ledger at every daemon start; locking first left one
+    /// permanent lock file per historically failed task, with a freshly stamped
+    /// mtime that the retention sweep could never age out.
     pub fn persist_failure_stderr(
         &self,
         identity: &ExecutionIdentity,
         attempt: u32,
         lease_epoch: u64,
     ) -> Result<Option<CaptureExcerpt>, ExecutorError> {
+        if !self.capture_generation_matches(identity, attempt, lease_epoch)? {
+            return Ok(None);
+        }
         let _capture_lock = self.lock_capture(identity)?;
         if !self.capture_generation_matches(identity, attempt, lease_epoch)? {
             return Ok(None);
@@ -277,6 +348,24 @@ impl Executor {
                 .parent()
                 .expect("capture stream always has a parent"),
         )
+    }
+}
+
+/// Does the locked file still answer to the name it was opened under?
+///
+/// A false answer means somebody unlinked or replaced the path while this
+/// caller was waiting for the lock, so the granted lock excludes nobody.
+pub(super) fn capture_lock_still_named(file: &File, path: &Path) -> Result<bool, ExecutorError> {
+    let held = file.metadata().map_err(|source| io_error(path, source))?;
+    if held.nlink() != 1 {
+        return Ok(false);
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(named) => Ok(named.file_type().is_file()
+            && named.ino() == held.ino()
+            && named.dev() == held.dev()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(io_error(path, source)),
     }
 }
 

@@ -121,8 +121,9 @@ The GC command:
 6. removes expired brief bytes and an expired witness's root only when absent
    from the corresponding live set;
 7. prunes coordinator-side per-attempt capture archives, dead
-   `unit-exit/<uuid>.capture.lock` files, and consumed/rejected producer-event
-   files according to their independent policies; and
+   `<uuid>.capture.lock` files in both `capture-lock/` and the legacy
+   `unit-exit/` location, and consumed/rejected producer-event files according
+   to their independent policies; and
 8. with `--collect`, runs `nix store gc`.
 
 A brief file whose bytes do not verify against the hash in its own name is
@@ -227,7 +228,8 @@ The current storage story is intentionally uneven:
 | Ordinary `artifact:<path>` files | Owned by the workload; no tally GC root | Apply a workload-specific policy only after accepting the reuse and audit consequences below. |
 | Producer events | Pending files are durable recovery inputs; consumed `events/done` defaults to 180 days, rejected files to 30 days/10,000 | Let `tally gc` prune only the managed done/rejected sets. |
 | Inert `taskdata/` and `taskdata.pre-rebuild-*` directories | Left in place by the TaskChampion delete; no pruner reads or writes them | Nothing depends on them. Delete them by hand to reclaim the space. |
-| Unit-exit state | Durable recovery input; no general pruner. One exception: `<uuid>.capture.lock` files expire under `captureArchiveHorizon` | Do not prune exit records or `<uuid>.capture.json` generations by age. `tally gc` removes only a `.capture.lock` that is both older than the horizon and unheld, proven by a non-blocking `flock` it takes before unlinking. |
+| Unit-exit state | Durable recovery input; no general pruner. One exception: legacy `<uuid>.capture.lock` files expire under `captureArchiveHorizon` | Do not prune exit records or `<uuid>.capture.json` generations by age. `tally gc` removes only a `.capture.lock` that is both older than the horizon and unheld, proven by a non-blocking `flock` it takes before unlinking. Nothing creates a lock here any more, so this population only drains. |
+| Capture locks (`capture-lock/`) | One `<uuid>.capture.lock` per dispatched execution; expires under `captureArchiveHorizon` | Same two-check rule as above. The daemon no longer mints a lock for a task whose capture generation is already gone, so a swept lock stays swept instead of being re-created at the next startup reconcile. |
 | In-memory barrier tracker | At most 64 unclaimed drain snapshots; connected waits scale with active calls, and disconnected waiters are evicted on the next tracker operation | Automatic and restart-local. |
 | In-memory parent guardrails | Terminal parents retire after their outstanding-child count reaches zero | Automatic; rebuilt from active durable rows. |
 

@@ -9,7 +9,7 @@ use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -59,6 +59,10 @@ pub enum ExecutorError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error(
+        "capture lock {path} was still held after {waited_ms}ms; refusing to block on it any longer"
+    )]
+    CaptureLockContended { path: PathBuf, waited_ms: u128 },
     #[error("cannot serialize unit exit record: {0}")]
     Json(#[from] serde_json::Error),
     #[error("cannot spawn {program}: {source}")]

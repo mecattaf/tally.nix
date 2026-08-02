@@ -1190,7 +1190,7 @@ fn public_evidence(evidence: Option<Value>, include_failure_stderr: bool) -> Opt
         fields.remove("stderr_truncated");
         if include_failure_stderr {
             if let Some(Value::String(stderr)) = stderr {
-                let (stderr, redacted, additionally_truncated) = redact_public_stderr(&stderr);
+                let (stderr, redactions, additionally_truncated) = redact_public_stderr(&stderr);
                 fields.insert("stderrTail".to_owned(), Value::String(stderr));
                 fields.insert(
                     "stderrTruncated".to_owned(),
@@ -1200,16 +1200,30 @@ fn public_evidence(evidence: Option<Value>, include_failure_stderr: bool) -> Opt
                     "stderrRedaction".to_owned(),
                     Value::String(PUBLIC_STDERR_REDACTION.to_owned()),
                 );
-                fields.insert("stderrRedacted".to_owned(), Value::Bool(redacted));
+                fields.insert("stderrRedacted".to_owned(), Value::Bool(redactions > 0));
+                // The boolean alone cannot distinguish one dropped token from
+                // forty dropped lines. Publish how many replacements the tail
+                // carries so a receipt states how much of it is missing.
+                fields.insert(
+                    "stderrRedactions".to_owned(),
+                    Value::Number((redactions as u64).into()),
+                );
             }
         }
         evidence
     })
 }
 
-fn redact_public_stderr(stderr: &str) -> (String, bool, bool) {
+/// Redact a stderr tail for publication.
+///
+/// Returns the redacted text, how many replacements were applied, and whether
+/// redaction itself pushed the tail over the publication bound. The count is
+/// over the whole redaction pass: a tail that is additionally truncated
+/// afterwards says so through `stderrTruncated`, so the two fields together
+/// still describe everything that was dropped.
+fn redact_public_stderr(stderr: &str) -> (String, usize, bool) {
     let mut output = String::with_capacity(stderr.len());
-    let mut redacted = false;
+    let mut redactions = 0_usize;
     let mut private_key_block = false;
     for line in stderr.split_inclusive('\n') {
         let lower = line.to_ascii_lowercase();
@@ -1222,11 +1236,11 @@ fn redact_public_stderr(stderr: &str) -> (String, bool, bool) {
             if line.ends_with('\n') {
                 output.push('\n');
             }
-            redacted = true;
+            redactions += 1;
         } else {
-            let (line, line_redacted) = redact_stderr_tokens(line);
+            let (line, line_redactions) = redact_stderr_tokens(line);
             output.push_str(&line);
-            redacted |= line_redacted;
+            redactions += line_redactions;
         }
         if lower.contains("-----end ") && lower.contains("private key-----") {
             private_key_block = false;
@@ -1237,7 +1251,7 @@ fn redact_public_stderr(stderr: &str) -> (String, bool, bool) {
         output.clear();
     }
     if output.len() <= crate::executor::CAPTURE_EXCERPT_MAX_BYTES {
-        return (output, redacted, false);
+        return (output, redactions, false);
     }
     let tail_limit =
         crate::executor::CAPTURE_EXCERPT_MAX_BYTES - PUBLIC_STDERR_TRUNCATION_MARKER.len();
@@ -1248,7 +1262,7 @@ fn redact_public_stderr(stderr: &str) -> (String, bool, bool) {
     let mut bounded = String::with_capacity(crate::executor::CAPTURE_EXCERPT_MAX_BYTES);
     bounded.push_str(PUBLIC_STDERR_TRUNCATION_MARKER);
     bounded.push_str(&output[start..]);
-    (bounded, redacted, true)
+    (bounded, redactions, true)
 }
 
 /// Markers that hide a whole line, but only where they stand in key position.
@@ -1315,21 +1329,21 @@ fn stderr_line_is_sensitive(lower: &str) -> bool {
     false
 }
 
-fn redact_stderr_tokens(line: &str) -> (String, bool) {
+fn redact_stderr_tokens(line: &str) -> (String, usize) {
     let mut output = String::with_capacity(line.len());
-    let mut redacted = false;
+    let mut redactions = 0_usize;
     for chunk in line.split_inclusive(char::is_whitespace) {
         let content_len = chunk.trim_end_matches(char::is_whitespace).len();
         let (content, spacing) = chunk.split_at(content_len);
         if stderr_token_is_sensitive(content) {
             output.push_str("[redacted-token]");
-            redacted = true;
+            redactions += 1;
         } else {
             output.push_str(content);
         }
         output.push_str(spacing);
     }
-    (output, redacted)
+    (output, redactions)
 }
 
 fn stderr_token_is_sensitive(token: &str) -> bool {
@@ -1574,10 +1588,12 @@ mod redaction_vector_tests {
                 .as_str()
                 .unwrap()
                 .replace("%LINE%", "[redacted sensitive stderr line]");
-            let (output, redacted, truncated) = redact_public_stderr(input);
+            let (output, redactions, truncated) = redact_public_stderr(input);
             assert_eq!(output, expected, "redacted text for {name}");
+            // The shared corpus stays a boolean contract: the Python side
+            // redacts machine steering, where the count has no reader.
             assert_eq!(
-                redacted,
+                redactions > 0,
                 case["redacted"].as_bool().unwrap(),
                 "flag for {name}"
             );

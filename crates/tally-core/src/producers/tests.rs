@@ -1227,7 +1227,37 @@ fn github_enforces_sources_trigger_actor_policy_and_completion_mutations() {
         .contains("ghp_012345678901234567890123456789012345"));
     assert_eq!(failure_evidence["stderrRedaction"], "conservative-v2");
     assert_eq!(failure_evidence["stderrRedacted"], true);
+    assert_eq!(failure_evidence["stderrRedactions"], 1);
     assert_eq!(failure_evidence["stderrTruncated"], false);
+
+    // Two secrets, one caught by the line rule and one by the token rule. The
+    // boolean cannot tell a receipt's reader those apart from a single hit; the
+    // count states how much of the tail is missing.
+    let mut two_secret_sink = RecordingMutation::default();
+    assert!(failure_engine
+        .complete_gh(
+            &origin,
+            Verdict::Failed,
+            Some(serde_json::json!({
+                "witnessSeq": 7,
+                "stderrTail": concat!(
+                    "actionable failure\n",
+                    "GITHUB_TOKEN=ghp_012345678901234567890123456789012345\n",
+                    "uploading with AKIAIOSFODNN7EXAMPLE now\n",
+                ),
+                "stderrTruncated": false,
+            })),
+            &mut two_secret_sink,
+        )
+        .unwrap());
+    let two_secret_evidence = two_secret_sink.comments[0].evidence.as_ref().unwrap();
+    assert_eq!(two_secret_evidence["stderrRedacted"], true);
+    assert_eq!(two_secret_evidence["stderrRedactions"], 2);
+    let two_secret_tail = two_secret_evidence["stderrTail"].as_str().unwrap();
+    assert!(two_secret_tail.contains("actionable failure"));
+    assert!(!two_secret_tail.contains("ghp_012345678901234567890123456789012345"));
+    assert!(!two_secret_tail.contains("AKIAIOSFODNN7EXAMPLE"));
+    assert!(two_secret_tail.contains("uploading with [redacted-token] now"));
 
     let mut comment_only_registry = registry.clone();
     let ProducerConfig::Gh(comment_only) = comment_only_registry.get_mut("github").unwrap() else {

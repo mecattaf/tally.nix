@@ -263,6 +263,33 @@ authorized.
 
 ### Changed
 
+- Capture locks moved out of the job-writable `unit-exit/` directory and the
+  daemon no longer blocks on one. New locks live at
+  `<stateDir>/capture-lock/<uuid>.capture.lock`, a sibling that no hardening
+  preset grants to a job — `strict` and `production` grant `unit-exit/` whole,
+  because the `ExecStopPost` recorder writes the exit record there, so any job
+  running as the daemon user could open and hold the lock the daemon waits on.
+  The wait is now a bounded try-lock: five seconds of backoff, then a clear
+  `capture lock … was still held` error instead of an indefinite `flock`. The
+  durable-wait RPC handlers additionally project a terminal witness after
+  releasing the daemon context write lock, on a blocking thread, so no capture
+  file work happens inline on the async runtime under that lock. Callers already
+  tolerate a failed excerpt materialization: a receipt loses its `stderrTail`
+  rather than the daemon losing the ability to answer. Locks left behind in
+  `unit-exit/` by an older daemon are never taken again and are drained by
+  `tally gc`, which now sweeps both locations.
+- `tally gc`'s capture-lock sweep actually drains now. The daemon used to create
+  the lock file *before* checking whether the capture generation still existed,
+  so the startup reconciler — which replays every failed witness in the ledger
+  at every start — re-minted one lock per historically failed task with a fresh
+  mtime, resetting the age the sweep measures. A deployment restarting more
+  often than `captureArchiveHorizon` therefore never collected a single lock.
+  The generation is now checked before the lock is taken as well as under it, so
+  a dead task mints nothing.
+- Failure receipts now carry `stderrRedactions` beside `stderrRedacted`, so a
+  reader can tell one dropped token from forty dropped lines. The boolean keeps
+  its meaning; the count is the number of replacements the redactor applied to
+  the tail. Redaction *matching* is unchanged.
 - `retention.horizon` now doubles as the retry window for brief-bearing jobs.
   This is not new behavior and not a regression, but it has never carried a
   release note: once a job's brief has expired out of `<dataDir>/briefs`, that
