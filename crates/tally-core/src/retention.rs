@@ -10,7 +10,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::brief::{self, BriefError};
-use crate::executor::CAPTURE_ARCHIVE_DIRECTORY;
+use crate::executor::{Uuid, CAPTURE_ARCHIVE_DIRECTORY, UNIT_EXIT_DIRECTORY};
 use crate::nix_store::GcRootBackend;
 use crate::producers::{pending_ingress_brief_paths, ProducerError, INGRESS_LOCK_FILE_NAME};
 use crate::taskdb::{read_acknowledged_events, TaskDbError};
@@ -18,6 +18,7 @@ use crate::witness::{is_nix_store_path, read_verified_records, WitnessError, Wit
 
 const ROOT_DIRECTORY_PREFIX: &str = "witness-";
 const EVENTS_DIRECTORY: &str = "events";
+const CAPTURE_LOCK_SUFFIX: &str = ".capture.lock";
 
 /// Ratified state-directory retention envelope.
 ///
@@ -144,12 +145,19 @@ pub struct GcReport {
     pub briefs_examined: usize,
     pub briefs_retained: usize,
     pub briefs_pruned: usize,
+    /// Files in the canonical store that carry a managed `<64hex>.json` name but
+    /// do not verify against it. They are skipped, never pruned, and counted
+    /// here so the condition is visible in every `tally gc` report.
+    pub briefs_unverified: usize,
     pub legacy_briefs_examined: usize,
     pub legacy_briefs_pruned: usize,
+    pub legacy_briefs_unverified: usize,
     pub state_dir_swept: bool,
     pub capture_archives_examined: usize,
     pub capture_archives_pruned: usize,
     pub capture_archive_directories_pruned: usize,
+    pub capture_locks_examined: usize,
+    pub capture_locks_pruned: usize,
     pub events_done_examined: usize,
     pub events_done_pruned: usize,
     pub events_rejected_examined: usize,
@@ -493,12 +501,16 @@ pub fn run_gc(
         briefs_examined: briefs.data_examined,
         briefs_retained: briefs.data_retained,
         briefs_pruned: briefs.data_pruned,
+        briefs_unverified: briefs.data_unverified,
         legacy_briefs_examined: briefs.legacy_examined,
         legacy_briefs_pruned: briefs.legacy_pruned,
+        legacy_briefs_unverified: briefs.legacy_unverified,
         state_dir_swept: state_dir.is_some(),
         capture_archives_examined: state.capture_archives_examined,
         capture_archives_pruned: state.capture_archives_pruned,
         capture_archive_directories_pruned: state.capture_archive_directories_pruned,
+        capture_locks_examined: state.capture_locks_examined,
+        capture_locks_pruned: state.capture_locks_pruned,
         events_done_examined: state.events_done_examined,
         events_done_pruned: state.events_done_pruned,
         events_rejected_examined: state.events_rejected_examined,
@@ -512,8 +524,10 @@ struct BriefSweep {
     data_examined: usize,
     data_retained: usize,
     data_pruned: usize,
+    data_unverified: usize,
     legacy_examined: usize,
     legacy_pruned: usize,
+    legacy_unverified: usize,
 }
 
 /// Marks briefs required by an unwitnessed attempt or a witness inside the
@@ -521,6 +535,18 @@ struct BriefSweep {
 /// state store is the legacy producer location shipped by #250; it receives an
 /// age floor as well as the same live-row floor so an upgrade can retire those
 /// duplicate and orphaned files safely.
+///
+/// A file whose bytes do not verify against the hash in its own name is
+/// **counted and skipped**, never pruned and never renamed. Two facts decide
+/// that: such a file is unaddressable — no live brief hash can resolve to it,
+/// so leaving it costs only its own bounded bytes — and it is the one case
+/// where the sweep cannot prove what it is looking at. Retention removes bytes
+/// it can prove are unreferenced; a file it cannot even parse is an operator's
+/// decision, not a timer's. Skipping also keeps a single damaged file from
+/// aborting `run_gc` before the state-directory and projection sweeps, which is
+/// what propagating the verification error used to do on every subsequent run.
+/// The counter rides in every `tally gc` report so the condition stays visible
+/// instead of being announced once and then forgotten.
 fn sweep_brief_stores(
     data_dir: &Path,
     state_dir: &Path,
@@ -575,7 +601,9 @@ fn sweep_brief_stores(
     }
 
     let mut sweep = BriefSweep::default();
-    for (hash, path, _) in managed_brief_files(data_dir)? {
+    let managed = managed_brief_files(data_dir)?;
+    sweep.data_unverified = managed.unverified;
+    for (hash, path, _) in managed.files {
         sweep.data_examined += 1;
         if retained.contains(&hash) {
             sweep.data_retained += 1;
@@ -587,7 +615,9 @@ fn sweep_brief_stores(
 
     if data_dir != state_dir {
         let legacy_cutoff = SystemTime::from(retained_cutoff);
-        for (hash, path, modified) in managed_brief_files(state_dir)? {
+        let legacy = managed_brief_files(state_dir)?;
+        sweep.legacy_unverified = legacy.unverified;
+        for (hash, path, modified) in legacy.files {
             sweep.legacy_examined += 1;
             if retained.contains(&hash)
                 || pending_paths.contains(&path)
@@ -602,17 +632,26 @@ fn sweep_brief_stores(
     Ok(sweep)
 }
 
-fn managed_brief_files(root: &Path) -> Result<Vec<(String, PathBuf, SystemTime)>, RetentionError> {
+#[derive(Debug, Default)]
+struct ManagedBriefs {
+    /// Files that verify against the hash in their own name, in name order.
+    files: Vec<(String, PathBuf, SystemTime)>,
+    /// Managed-looking files that failed `brief::read_verified`. See
+    /// [`sweep_brief_stores`] for why they are counted rather than removed.
+    unverified: usize,
+}
+
+fn managed_brief_files(root: &Path) -> Result<ManagedBriefs, RetentionError> {
     let directory = root.join(brief::BRIEF_DIRECTORY);
     if !directory.is_dir() {
-        return Ok(Vec::new());
+        return Ok(ManagedBriefs::default());
     }
     let mut entries = std::fs::read_dir(&directory)
         .map_err(|source| io_error(&directory, source))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|source| io_error(&directory, source))?;
     entries.sort_by_key(std::fs::DirEntry::file_name);
-    let mut managed = Vec::new();
+    let mut managed = ManagedBriefs::default();
     for entry in entries {
         let path = entry.path();
         let file_name = entry.file_name();
@@ -634,11 +673,14 @@ fn managed_brief_files(root: &Path) -> Result<Vec<(String, PathBuf, SystemTime)>
             continue;
         }
         let hash = format!("sha256:{digest}");
-        brief::read_verified(&path, &hash)?;
+        if brief::read_verified(&path, &hash).is_err() {
+            managed.unverified += 1;
+            continue;
+        }
         let modified = metadata
             .modified()
             .map_err(|source| io_error(&path, source))?;
-        managed.push((hash, path, modified));
+        managed.files.push((hash, path, modified));
     }
     Ok(managed)
 }
@@ -659,18 +701,26 @@ struct StateSweep {
     capture_archives_examined: usize,
     capture_archives_pruned: usize,
     capture_archive_directories_pruned: usize,
+    capture_locks_examined: usize,
+    capture_locks_pruned: usize,
     events_done_examined: usize,
     events_done_pruned: usize,
     events_rejected_examined: usize,
     events_rejected_pruned: usize,
 }
 
-/// Prunes the two unbounded on-disk sets under the daemon state directory.
+/// Prunes the unbounded on-disk sets under the daemon state directory.
 ///
 /// Runs inside `run_gc`, under the GC-roots lock it already holds, so there is
 /// no second sweep entry point and no second timer. The ingress directories are
 /// additionally guarded by the producer ingress lock, because the daemon renames
 /// consumed event files into `done`/`rejected` while holding it.
+///
+/// `unit-exit/` is swept for `<uuid>.capture.lock` files only. The exit records
+/// beside them are durable recovery input and keep their "no pruner, do not
+/// prune by age" envelope; the lock files are pure mutual-exclusion state that
+/// the failed-stderr reconciler re-mints for every historically failed task at
+/// every startup, so they accumulate one per dead task forever.
 fn sweep_state_directory(
     state_dir: &Path,
     policy: &StateRetentionPolicy,
@@ -681,6 +731,12 @@ fn sweep_state_directory(
     let archive_root = state_dir.join(CAPTURE_ARCHIVE_DIRECTORY);
     let capture_cutoff = mtime_cutoff(now, policy.capture_archive_max_age)?;
     prune_capture_archives(&archive_root, capture_cutoff, dry_run, &mut sweep)?;
+    prune_capture_locks(
+        &state_dir.join(UNIT_EXIT_DIRECTORY),
+        capture_cutoff,
+        dry_run,
+        &mut sweep,
+    )?;
 
     let events_dir = state_dir.join(EVENTS_DIRECTORY);
     if !events_dir.is_dir() {
@@ -777,6 +833,94 @@ fn prune_capture_archives(
                 if error.kind() == std::io::ErrorKind::NotFound
                     || error.raw_os_error() == Some(libc::ENOTEMPTY) => {}
             Err(source) => return Err(io_error(&unit_dir, source)),
+        }
+    }
+    Ok(())
+}
+
+/// Prunes dead `<uuid>.capture.lock` files from the daemon's `unit-exit/`
+/// directory under the capture-archive horizon.
+///
+/// Only the lock files are candidates. The exit records beside them are durable
+/// recovery input and keep their standing "do not prune by age" envelope; this
+/// pruner never opens, examines, or removes one.
+///
+/// Two independent checks gate every unlink, because neither is sufficient
+/// alone. `flock` does not touch mtime, and re-opening an existing lock file
+/// does not rewrite it either, so an old mtime proves only that nobody created
+/// the file recently — never that the lock is free. In the other direction,
+/// unlinking a lock somebody still holds is worse than leaking it: the next
+/// locker creates a fresh file at the same path, and the two of them then hold
+/// exclusive locks on different inodes and run concurrently. So a candidate
+/// must be both older than the cutoff *and* provably free right now, where
+/// "free" is proven by the non-blocking exclusive lock this sweep takes itself
+/// and holds across the unlink. A held lock is skipped whatever its mtime says.
+fn prune_capture_locks(
+    unit_exit_dir: &Path,
+    cutoff: SystemTime,
+    dry_run: bool,
+    sweep: &mut StateSweep,
+) -> Result<(), RetentionError> {
+    if !unit_exit_dir.is_dir() {
+        return Ok(());
+    }
+    let mut entries = std::fs::read_dir(unit_exit_dir)
+        .map_err(|source| io_error(unit_exit_dir, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| io_error(unit_exit_dir, source))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        // Exactly the executor's own naming: anything else in this directory,
+        // exit records included, is not this pruner's business.
+        let is_capture_lock = file_name
+            .to_str()
+            .and_then(|name| name.strip_suffix(CAPTURE_LOCK_SUFFIX))
+            .is_some_and(|stem| Uuid::parse_str(stem).is_ok());
+        if !is_capture_lock {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error(&path, source)),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        sweep.capture_locks_examined += 1;
+        let modified = metadata
+            .modified()
+            .map_err(|source| io_error(&path, source))?;
+        if modified >= cutoff {
+            continue;
+        }
+        let file = match OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error(&path, source)),
+        };
+        match FileExt::try_lock_exclusive(&file) {
+            Ok(()) => {}
+            // A live capture holds this lock. Its mtime says nothing about
+            // that; the contended lock says everything.
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
+            Err(source) => return Err(io_error(&path, source)),
+        }
+        sweep.capture_locks_pruned += 1;
+        if dry_run {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&path, source)),
         }
     }
     Ok(())
@@ -1332,6 +1476,164 @@ mod tests {
         assert!(legacy_live.exists());
         assert!(!legacy_expired.exists());
         assert!(legacy_fresh_orphan.exists());
+    }
+
+    #[test]
+    fn a_corrupt_brief_is_counted_and_skipped_without_aborting_the_rest_of_the_sweep() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
+        ledger_only_state(&data, now);
+
+        let live = brief::PreparedBrief::from_value(serde_json::json!({"kind": "live"})).unwrap();
+        let orphan =
+            brief::PreparedBrief::from_value(serde_json::json!({"kind": "orphan"})).unwrap();
+        for prepared in [&live, &orphan] {
+            brief::store(&data, prepared).unwrap();
+        }
+        let live_task = Uuid::new_v4();
+        write_enqueue_event_atomic(&state.join("events"), &brief_event(live_task, live.hash()))
+            .unwrap();
+
+        // A managed-looking name whose bytes do not hash to it. Before this
+        // sweep counted the condition, `read_verified` propagated out of
+        // `managed_brief_files` and killed `run_gc` before every later pruner,
+        // forever, because GC never removed the offending file either.
+        let corrupt = data
+            .join(brief::BRIEF_DIRECTORY)
+            .join(format!("{}.json", "d".repeat(64)));
+        fs::write(&corrupt, b"{\"kind\":\"not-what-my-name-says\"}").unwrap();
+
+        // Both state-directory sets have something to prune, so a completed
+        // sweep is provable rather than merely non-erroring.
+        let stale_archive = state
+            .join(CAPTURE_ARCHIVE_DIRECTORY)
+            .join("unit-a")
+            .join("attempt-0000000001-epoch-1.out");
+        write_aged(&stale_archive, chrono::TimeDelta::days(31), now);
+        let done_old = state.join("events/done/old.json");
+        write_aged(&done_old, chrono::TimeDelta::days(181), now);
+
+        let request = GcRequest {
+            data_dir: &data,
+            state_dir: Some(&state),
+            horizon_text: "30d",
+            state_retention: StateRetentionPolicy::default(),
+            now,
+            dry_run: false,
+            collect: false,
+        };
+        let first = run_gc(request.clone(), &FakeBackend::default()).unwrap();
+        assert_eq!(first.briefs_unverified, 1);
+        assert_eq!(first.briefs_examined, 2);
+        assert_eq!(first.briefs_retained, 1);
+        assert_eq!(first.briefs_pruned, 1);
+        assert!(brief::content_path(&data, live.hash()).unwrap().exists());
+        assert!(!brief::content_path(&data, orphan.hash()).unwrap().exists());
+        // Skipped, not deleted and not renamed: the sweep cannot parse it, so
+        // an operator decides its fate.
+        assert!(corrupt.exists());
+        // The pruners downstream of the brief sweep all ran.
+        assert!(first.state_dir_swept);
+        assert_eq!(first.capture_archives_examined, 1);
+        assert_eq!(first.capture_archives_pruned, 1);
+        assert_eq!(first.events_done_examined, 1);
+        assert_eq!(first.events_done_pruned, 1);
+        assert!(!stale_archive.exists());
+        assert!(!done_old.exists());
+
+        // The timer runs again tomorrow over the same unreadable file.
+        let second = run_gc(request, &FakeBackend::default()).unwrap();
+        assert_eq!(second.briefs_unverified, 1);
+        assert_eq!(second.briefs_examined, 1);
+        assert_eq!(second.briefs_pruned, 0);
+        assert!(corrupt.exists());
+    }
+
+    #[test]
+    fn capture_locks_expire_by_age_only_when_no_holder_has_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&data).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
+        ledger_only_state(&data, now);
+
+        let unit_exit = state.join(UNIT_EXIT_DIRECTORY);
+        let dead = Uuid::new_v4();
+        let held = Uuid::new_v4();
+        let young = Uuid::new_v4();
+        let dead_lock = unit_exit.join(format!("{dead}{CAPTURE_LOCK_SUFFIX}"));
+        let held_lock = unit_exit.join(format!("{held}{CAPTURE_LOCK_SUFFIX}"));
+        let young_lock = unit_exit.join(format!("{young}{CAPTURE_LOCK_SUFFIX}"));
+        write_aged(&dead_lock, chrono::TimeDelta::days(31), now);
+        // Older than the dead one and still live: mtime alone would condemn it.
+        write_aged(&held_lock, chrono::TimeDelta::days(40), now);
+        write_aged(&young_lock, chrono::TimeDelta::days(29), now);
+
+        // Exit records and capture generations are durable recovery input.
+        let exit_record = unit_exit.join(format!("{dead}.json"));
+        let generation = unit_exit.join(format!("{dead}.capture.json"));
+        let foreign = unit_exit.join(format!("not-a-uuid{CAPTURE_LOCK_SUFFIX}"));
+        for path in [&exit_record, &generation, &foreign] {
+            write_aged(path, chrono::TimeDelta::days(400), now);
+        }
+
+        let holder = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&held_lock)
+            .unwrap();
+        FileExt::lock_exclusive(&holder).unwrap();
+
+        let request = GcRequest {
+            data_dir: &data,
+            state_dir: Some(&state),
+            horizon_text: "30d",
+            state_retention: StateRetentionPolicy::default(),
+            now,
+            dry_run: true,
+            collect: false,
+        };
+        let dry = run_gc(request.clone(), &FakeBackend::default()).unwrap();
+        assert_eq!(dry.capture_locks_examined, 3);
+        assert_eq!(dry.capture_locks_pruned, 1);
+        assert!(dead_lock.exists());
+
+        let report = run_gc(
+            GcRequest {
+                dry_run: false,
+                ..request.clone()
+            },
+            &FakeBackend::default(),
+        )
+        .unwrap();
+        assert_eq!(report.capture_locks_examined, 3);
+        assert_eq!(report.capture_locks_pruned, 1);
+        assert!(!dead_lock.exists());
+        assert!(held_lock.exists());
+        assert!(young_lock.exists());
+        assert!(exit_record.exists());
+        assert!(generation.exists());
+        assert!(foreign.exists());
+
+        // Once the holder is gone the same file becomes collectable, which is
+        // the only reason the age floor is not the whole rule.
+        drop(holder);
+        let released = run_gc(
+            GcRequest {
+                dry_run: false,
+                ..request
+            },
+            &FakeBackend::default(),
+        )
+        .unwrap();
+        assert_eq!(released.capture_locks_pruned, 1);
+        assert!(!held_lock.exists());
+        assert!(young_lock.exists());
     }
 
     #[test]

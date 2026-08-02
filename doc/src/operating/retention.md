@@ -120,9 +120,19 @@ The GC command:
    one cannot be secured;
 6. removes expired brief bytes and an expired witness's root only when absent
    from the corresponding live set;
-7. prunes coordinator-side per-attempt capture archives and consumed/rejected
-   producer-event files according to their independent policies; and
+7. prunes coordinator-side per-attempt capture archives, dead
+   `unit-exit/<uuid>.capture.lock` files, and consumed/rejected producer-event
+   files according to their independent policies; and
 8. with `--collect`, runs `nix store gc`.
+
+A brief file whose bytes do not verify against the hash in its own name is
+counted as `briefsUnverified` (or `legacyBriefsUnverified`) and skipped. It is
+never pruned and never renamed: it is unaddressable, so it cannot satisfy any
+live brief hash, and it is the one case the sweep cannot parse well enough to
+act on. Removing it is an operator decision. A nonzero count is the signal —
+it is reported on every run, and it no longer aborts the sweep before the
+state-directory and projection pruners the way propagating the verification
+error did.
 
 The daemon separately checks `lifecycle.jsonl` at the storage poll cadence. Once it exceeds
 `lifecycleMaxBytes`, tally rewrites only the contiguous prefix older than `lifecycleHorizon` and
@@ -217,7 +227,7 @@ The current storage story is intentionally uneven:
 | Ordinary `artifact:<path>` files | Owned by the workload; no tally GC root | Apply a workload-specific policy only after accepting the reuse and audit consequences below. |
 | Producer events | Pending files are durable recovery inputs; consumed `events/done` defaults to 180 days, rejected files to 30 days/10,000 | Let `tally gc` prune only the managed done/rejected sets. |
 | Inert `taskdata/` and `taskdata.pre-rebuild-*` directories | Left in place by the TaskChampion delete; no pruner reads or writes them | Nothing depends on them. Delete them by hand to reclaim the space. |
-| Unit-exit state | Durable recovery input; no general pruner | Do not prune by age. |
+| Unit-exit state | Durable recovery input; no general pruner. One exception: `<uuid>.capture.lock` files expire under `captureArchiveHorizon` | Do not prune exit records or `<uuid>.capture.json` generations by age. `tally gc` removes only a `.capture.lock` that is both older than the horizon and unheld, proven by a non-blocking `flock` it takes before unlinking. |
 | In-memory barrier tracker | At most 64 unclaimed drain snapshots; connected waits scale with active calls, and disconnected waiters are evicted on the next tracker operation | Automatic and restart-local. |
 | In-memory parent guardrails | Terminal parents retire after their outstanding-child count reaches zero | Automatic; rebuilt from active durable rows. |
 

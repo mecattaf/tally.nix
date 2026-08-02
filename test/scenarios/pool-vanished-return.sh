@@ -195,6 +195,7 @@ lost="$($TALLY_BIN \
   --socket "$SCENARIO_SOCKET" \
   __producer-dispatch health \
   --state-dir "$root/state" \
+  --data-dir "$root/data" \
   --event '{"kind":"pool-reachability","reachable":false}')"
 jq -e '.transition == "lost"' <<<"$lost" >/dev/null \
   || scenario_fail "worker reboot did not produce a confirmed lost transition"
@@ -217,6 +218,7 @@ returned="$($TALLY_BIN \
   --socket "$SCENARIO_SOCKET" \
   __producer-dispatch health \
   --state-dir "$root/state" \
+  --data-dir "$root/data" \
   --event '{"kind":"pool-reachability","reachable":true}')"
 jq -e '.transition == "returned"' <<<"$returned" >/dev/null \
   || scenario_fail "worker return did not produce a confirmed returned transition"
