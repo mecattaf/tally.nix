@@ -329,7 +329,8 @@ fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Resul
             if no_enqueue {
                 serde_json::to_value(engine.preview_gh(&name, &intake, now)?)?
             } else {
-                let mut acknowledgements = GhCliAcknowledgementSink::default();
+                let mut acknowledgements =
+                    GhCliAcknowledgementSink::default().with_state_dir(&state_dir);
                 serde_json::to_value(engine.poll_gh_with_acknowledgements(
                     &name,
                     &intake,
@@ -397,7 +398,8 @@ fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Resul
             if dry_run {
                 serde_json::to_value(engine.preview_gh_observation(&name, &observation, now)?)?
             } else {
-                let mut acknowledgements = GhCliAcknowledgementSink::default();
+                let mut acknowledgements =
+                    GhCliAcknowledgementSink::default().with_state_dir(&state_dir);
                 serde_json::to_value(engine.admit_gh_observation(
                     &name,
                     &observation,
@@ -498,7 +500,8 @@ async fn run_producer_dispatch(
                 && trigger_value.is_none()
                 && context.is_none();
             if is_poll {
-                let mut acknowledgements = GhCliAcknowledgementSink::default();
+                let mut acknowledgements =
+                    GhCliAcknowledgementSink::default().with_state_dir(&state_dir);
                 serde_json::to_value(engine.poll_gh_with_acknowledgements(
                     &args.producer,
                     &GhCliIntake::default(),

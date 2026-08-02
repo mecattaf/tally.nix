@@ -157,12 +157,22 @@ pub trait GhMutationSink {
 pub(super) const GH_COMPLETION_STATE_GRAPHQL: &str = r#"query TallyCompletionState($itemId: ID!, $cursor: String) {
   node(id: $itemId) {
     __typename
-    ... on Issue { state comments(first: 100, after: $cursor) { nodes { body } pageInfo { hasNextPage endCursor } } }
-    ... on PullRequest { state comments(first: 100, after: $cursor) { nodes { body } pageInfo { hasNextPage endCursor } } }
+    ... on Issue { state comments(first: 100, after: $cursor) { nodes { id body } pageInfo { hasNextPage endCursor } } }
+    ... on PullRequest { state comments(first: 100, after: $cursor) { nodes { id body } pageInfo { hasNextPage endCursor } } }
+  }
+}"#;
+pub(super) const GH_ITEM_STATE_GRAPHQL: &str = r#"query TallyItemState($itemId: ID!) {
+  node(id: $itemId) {
+    __typename
+    ... on Issue { state }
+    ... on PullRequest { state }
   }
 }"#;
 pub(super) const GH_COMPLETION_COMMENT_GRAPHQL: &str = r#"mutation TallyCompletionComment($itemId: ID!, $body: String!) {
   addComment(input: {subjectId: $itemId, body: $body}) { commentEdge { node { id } } }
+}"#;
+pub(super) const GH_STICKY_COMMENT_GRAPHQL: &str = r#"mutation TallyStickyComment($commentId: ID!, $body: String!) {
+  updateIssueComment(input: {id: $commentId, body: $body}) { issueComment { id } }
 }"#;
 pub(super) const GH_COMPLETION_ISSUE_GRAPHQL: &str = r#"mutation TallyCompletionIssue($itemId: ID!) {
   closeIssue(input: {issueId: $itemId, stateReason: COMPLETED}) { issue { id state stateReason } }
@@ -175,9 +185,125 @@ pub(super) const GH_READER_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 pub(super) const MAX_GH_PROCESS_OUTPUT_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_GH_COMMENT_PAGES: usize = 100;
 
+/// One durable pointer from a logical tally comment to the GitHub node id of
+/// the comment that carries it. §9.1.3: receipts and evidence upsert, so the
+/// producer has to remember what it already created — across restarts, not in
+/// process memory — instead of re-deriving it from a thread scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub(super) struct GhStickyComment {
+    pub(super) schema_version: u32,
+    pub(super) kind: String,
+    pub(super) producer: String,
+    pub(super) item_id: String,
+    pub(super) logical_id: String,
+    pub(super) comment_id: String,
+}
+
+/// The identity of one logical comment: a trigger receipt or a completion
+/// publication on one item, owned by one producer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GhStickyKey {
+    kind: &'static str,
+    producer: String,
+    item_id: String,
+    logical_id: String,
+}
+
+impl GhStickyKey {
+    pub(super) fn receipt(producer: &str, item_id: &str, receipt_id: &str) -> Self {
+        Self {
+            kind: "receipt",
+            producer: producer.to_owned(),
+            item_id: item_id.to_owned(),
+            logical_id: receipt_id.to_owned(),
+        }
+    }
+
+    pub(super) fn completion(producer: &str, item_id: &str, completion_id: &str) -> Self {
+        Self {
+            kind: "completion",
+            producer: producer.to_owned(),
+            item_id: item_id.to_owned(),
+            logical_id: completion_id.to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct GhStickyCommentStore {
+    dir: PathBuf,
+}
+
+impl GhStickyCommentStore {
+    pub(super) fn new(state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: state_dir.into().join("producers/gh-comments"),
+        }
+    }
+
+    fn path(&self, key: &GhStickyKey) -> PathBuf {
+        self.dir.join(format!(
+            "{}.json",
+            stable_key(&[
+                "gh-sticky-comment",
+                key.kind,
+                &key.producer,
+                &key.item_id,
+                &key.logical_id,
+            ])
+        ))
+    }
+
+    /// The remembered node id, or `None` when there is nothing durable to edit.
+    /// An absent, unreadable, or mismatched record degrades to the marker-scan
+    /// recovery path instead of failing a post that can still be made safely.
+    fn lookup(&self, key: &GhStickyKey) -> Option<String> {
+        let path = self.path(key);
+        if !path_lexists(&path).ok()? {
+            return None;
+        }
+        let record: GhStickyComment =
+            serde_json::from_slice(&read_bounded_regular(&path, 64 * 1024).ok()?).ok()?;
+        (record.schema_version == 1
+            && record.kind == key.kind
+            && record.producer == key.producer
+            && record.item_id == key.item_id
+            && record.logical_id == key.logical_id
+            && !record.comment_id.is_empty())
+        .then_some(record.comment_id)
+    }
+
+    fn record(&self, key: &GhStickyKey, comment_id: &str) -> Result<(), String> {
+        write_json_atomic(
+            &self.path(key),
+            &GhStickyComment {
+                schema_version: 1,
+                kind: key.kind.to_owned(),
+                producer: key.producer.clone(),
+                item_id: key.item_id.clone(),
+                logical_id: key.logical_id.clone(),
+                comment_id: comment_id.to_owned(),
+            },
+        )
+        .map_err(|error| format!("cannot record the GitHub sticky comment id: {error}"))
+    }
+
+    fn forget(&self, key: &GhStickyKey) -> Result<(), String> {
+        let path = self.path(key);
+        match std::fs::remove_file(&path) {
+            Ok(()) => sync_directory(&self.dir)
+                .map_err(|error| format!("cannot forget the GitHub sticky comment id: {error}")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("cannot remove {}: {error}", path.display())),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct GhCliMutationSink {
     program: PathBuf,
+    sticky: Option<GhStickyCommentStore>,
 }
 
 #[derive(Debug, Clone)]
@@ -194,6 +320,7 @@ impl Default for GhCliMutationSink {
     fn default() -> Self {
         Self {
             program: PathBuf::from("gh"),
+            sticky: None,
         }
     }
 }
@@ -202,7 +329,17 @@ impl GhCliMutationSink {
     pub fn with_program(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            sticky: None,
         }
+    }
+
+    /// Bind the producer state directory that remembers sticky comment ids.
+    /// Without it every post degrades to the marker scan, which is correct but
+    /// costs one thread pagination per publication.
+    #[must_use]
+    pub fn with_state_dir(mut self, state_dir: impl Into<PathBuf>) -> Self {
+        self.sticky = Some(GhStickyCommentStore::new(state_dir));
+        self
     }
 }
 
@@ -218,6 +355,14 @@ impl GhCliAcknowledgementSink {
     pub fn with_program(program: impl Into<PathBuf>) -> Self {
         Self {
             mutation: GhCliMutationSink::with_program(program),
+        }
+    }
+
+    /// Bind the producer state directory that remembers sticky receipt ids.
+    #[must_use]
+    pub fn with_state_dir(self, state_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            mutation: self.mutation.with_state_dir(state_dir),
         }
     }
 }
@@ -1308,14 +1453,12 @@ impl GhMutationSink for GhCliMutationSink {
             || format!("{remote_marker}\n{encoded}"),
             |assisted_by| format!("{remote_marker}\n{encoded}\n\n{}", assisted_by.trailer()),
         );
-        let (kind, state, comment_exists) =
-            self.completion_state(&mutation.item_id, &remote_marker)?;
-        if !comment_exists {
-            self.graphql(serde_json::json!({
-                "query": GH_COMPLETION_COMMENT_GRAPHQL,
-                "variables": {"itemId": mutation.item_id, "body": body},
-            }))?;
-        }
+        let (kind, state) = self.upsert_sticky_comment(
+            &GhStickyKey::completion(&mutation.producer, &mutation.item_id, completion_id),
+            &mutation.item_id,
+            &remote_marker,
+            &body,
+        )?;
         if !matches!(state.as_str(), "OPEN" | "CLOSED" | "MERGED") {
             return Err(format!(
                 "GitHub {kind} {:?} has unsupported state {state:?}",
@@ -1338,7 +1481,8 @@ impl GhMutationSink for GhCliMutationSink {
             .ok_or_else(|| "concrete GitHub mutation requires a durable completionId".to_owned())?;
         let remote_key = stable_key(&["gh-remote-completion", completion_id]);
         let remote_marker = format!("<!-- tally-completion:{remote_key} -->");
-        let (kind, state, _) = self.completion_state(&mutation.item_id, &remote_marker)?;
+        let GhCommentScan { kind, state, .. } =
+            self.completion_state(&mutation.item_id, &remote_marker)?;
         if state == "OPEN" {
             let query = if kind == "Issue" {
                 GH_COMPLETION_ISSUE_GRAPHQL
@@ -1364,10 +1508,14 @@ impl GhAcknowledgementSink for GhCliAcknowledgementSink {
         &mut self,
         acknowledgement: &GhTriggerAcknowledgement,
     ) -> Result<(), String> {
-        let decision = match acknowledgement.decision {
-            GhDecisionStatus::Accepted => "accepted",
-            GhDecisionStatus::Filtered => "filtered",
-            GhDecisionStatus::Duplicate => "duplicate",
+        let (decision, summary) = match acknowledgement.decision {
+            GhDecisionStatus::Accepted => ("accepted", "Tally accepted this trigger."),
+            GhDecisionStatus::Filtered => ("filtered", "Tally filtered this trigger by policy."),
+            // Re-observing a trigger that is already in the ledger is
+            // producer-internal bookkeeping, and §3 keeps that off the forge.
+            // Publishing it meant every producer restart added one public
+            // "already recorded" comment per historical trigger (#245).
+            GhDecisionStatus::Duplicate => return Ok(()),
             _ => {
                 return Err(format!(
                     "refusing to acknowledge non-terminal trigger intake decision {:?}",
@@ -1375,16 +1523,12 @@ impl GhAcknowledgementSink for GhCliAcknowledgementSink {
                 ))
             }
         };
-        let marker = format!(
-            "<!-- tally-trigger:{}:{decision} -->",
-            acknowledgement.receipt_id
-        );
-        let summary = match acknowledgement.decision {
-            GhDecisionStatus::Accepted => "Tally accepted this trigger.",
-            GhDecisionStatus::Filtered => "Tally filtered this trigger by policy.",
-            GhDecisionStatus::Duplicate => "Tally already recorded this trigger.",
-            _ => unreachable!("decision was narrowed above"),
-        };
+        // The completion check matches the receipt id, not the decision that
+        // wrote the marker: a thread acknowledged before a restart carries
+        // whichever suffix its original decision produced, and legacy
+        // `:accepted` / `:filtered` markers must still count as acknowledged.
+        let marker_prefix = format!("<!-- tally-trigger:{}:", acknowledgement.receipt_id);
+        let marker = format!("{marker_prefix}{decision} -->");
         let mut body = format!("{marker}\n{summary}");
         if let Some(task_uuid) = &acknowledgement.task_uuid {
             body.push_str(&format!("\n\nTask: `{task_uuid}`"));
@@ -1392,15 +1536,16 @@ impl GhAcknowledgementSink for GhCliAcknowledgementSink {
         if let Some(pointer) = &acknowledgement.status_pointer {
             body.push_str(&format!("\nStatus: `{pointer}`"));
         }
-        let (_, state, exists) = self
-            .mutation
-            .completion_state(&acknowledgement.item_id, &marker)?;
-        if !exists {
-            self.mutation.graphql(serde_json::json!({
-                "query": GH_COMPLETION_COMMENT_GRAPHQL,
-                "variables": {"itemId": acknowledgement.item_id, "body": body},
-            }))?;
-        }
+        let (_, state) = self.mutation.upsert_sticky_comment(
+            &GhStickyKey::receipt(
+                &acknowledgement.producer,
+                &acknowledgement.item_id,
+                &acknowledgement.receipt_id,
+            ),
+            &acknowledgement.item_id,
+            &marker_prefix,
+            &body,
+        )?;
         if !matches!(state.as_str(), "OPEN" | "CLOSED" | "MERGED") {
             return Err(format!(
                 "GitHub item {:?} has unsupported state {state:?}",
@@ -1411,12 +1556,114 @@ impl GhAcknowledgementSink for GhCliAcknowledgementSink {
     }
 }
 
+/// Whether one tally marker is already on a thread, and the node id of the
+/// comment that carries it where GitHub returned one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum GhMarkerMatch {
+    Absent,
+    Present(Option<String>),
+}
+
+/// What one thread scan established: the item's identity plus whether the
+/// marker being published is already on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct GhCommentScan {
+    pub(super) kind: String,
+    pub(super) state: String,
+    pub(super) marker: GhMarkerMatch,
+}
+
+pub(super) fn created_comment_id(response: &Value) -> Option<String> {
+    response
+        .pointer("/data/addComment/commentEdge/node/id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 impl GhCliMutationSink {
+    /// Publish one sticky comment (§9.1.3): edit the comment this producer
+    /// already created for the logical id where it remembers one, otherwise
+    /// recover through the marker scan and create it at most once. Returns the
+    /// item's node kind and state. Steering, escalation, and the closing
+    /// summary deliberately do not come through here — they must stay fresh
+    /// comments so the operator is actually notified.
+    fn upsert_sticky_comment(
+        &self,
+        key: &GhStickyKey,
+        item_id: &str,
+        marker: &str,
+        body: &str,
+    ) -> Result<(String, String), String> {
+        if let Some(store) = &self.sticky {
+            if let Some(comment_id) = store.lookup(key) {
+                match self.graphql(serde_json::json!({
+                    "query": GH_STICKY_COMMENT_GRAPHQL,
+                    "variables": {"commentId": comment_id, "body": body},
+                })) {
+                    Ok(_) => return self.item_state(item_id),
+                    // The remembered comment is gone or no longer writable.
+                    // Forget it and recover through the marker scan; retrying
+                    // an edit that can never succeed would wedge the caller.
+                    Err(error) => store.forget(key).map_err(|forget| {
+                        format!(
+                            "cannot edit GitHub comment {comment_id:?} ({error}); \
+                             cannot forget it either: {forget}"
+                        )
+                    })?,
+                }
+            }
+        }
+        let scan = self.completion_state(item_id, marker)?;
+        let comment_id = match scan.marker {
+            GhMarkerMatch::Absent => created_comment_id(&self.graphql(serde_json::json!({
+                "query": GH_COMPLETION_COMMENT_GRAPHQL,
+                "variables": {"itemId": item_id, "body": body},
+            }))?),
+            // A comment posted before this producer stored ids, or before the
+            // state was lost. Adopt it so the next publication edits in place.
+            GhMarkerMatch::Present(comment_id) => comment_id,
+        };
+        if let (Some(store), Some(comment_id)) = (&self.sticky, comment_id) {
+            store.record(key, &comment_id)?;
+        }
+        Ok((scan.kind, scan.state))
+    }
+
+    /// The item's node kind and state alone. The sticky path knows which
+    /// comment to edit, so it must not pay for a full thread pagination.
+    fn item_state(&self, item_id: &str) -> Result<(String, String), String> {
+        let response = self.graphql(serde_json::json!({
+            "query": GH_ITEM_STATE_GRAPHQL,
+            "variables": {"itemId": item_id},
+        }))?;
+        let node = response
+            .pointer("/data/node")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                format!("GitHub item {item_id:?} did not resolve to an Issue or PullRequest")
+            })?;
+        let kind = node
+            .get("__typename")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "GitHub completion query omitted node __typename".to_owned())?;
+        if !matches!(kind, "Issue" | "PullRequest") {
+            return Err(format!(
+                "GitHub item {item_id:?} has unsupported node kind {kind:?}"
+            ));
+        }
+        let state = node
+            .get("state")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "GitHub completion query omitted node state".to_owned())?;
+        Ok((kind.to_owned(), state.to_owned()))
+    }
+
     fn completion_state(
         &self,
         item_id: &str,
         remote_marker: &str,
-    ) -> Result<(String, String, bool), String> {
+    ) -> Result<GhCommentScan, String> {
         let mut cursor = None::<String>;
         let mut identity = None::<(String, String)>;
         for _ in 0..MAX_GH_COMMENT_PAGES {
@@ -1454,20 +1701,31 @@ impl GhCliMutationSink {
             let comments = node
                 .get("comments")
                 .ok_or_else(|| "GitHub completion query omitted comments connection".to_owned())?;
-            if comments
-                .get("nodes")
-                .and_then(Value::as_array)
-                .is_some_and(|comments| {
-                    comments.iter().any(|comment| {
-                        comment
-                            .get("body")
-                            .and_then(Value::as_str)
-                            .is_some_and(|comment| comment.contains(remote_marker))
+            if let Some(existing) =
+                comments
+                    .get("nodes")
+                    .and_then(Value::as_array)
+                    .and_then(|comments| {
+                        comments.iter().find(|comment| {
+                            comment
+                                .get("body")
+                                .and_then(Value::as_str)
+                                .is_some_and(|body| body.contains(remote_marker))
+                        })
                     })
-                })
             {
                 let (kind, state) = identity.expect("identity was assigned above");
-                return Ok((kind, state, true));
+                return Ok(GhCommentScan {
+                    kind,
+                    state,
+                    marker: GhMarkerMatch::Present(
+                        existing
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .map(ToOwned::to_owned),
+                    ),
+                });
             }
             let page_info = comments
                 .get("pageInfo")
@@ -1479,7 +1737,11 @@ impl GhCliMutationSink {
                 .ok_or_else(|| "GitHub comments pageInfo omitted hasNextPage".to_owned())?
             {
                 let (kind, state) = identity.expect("identity was assigned above");
-                return Ok((kind, state, false));
+                return Ok(GhCommentScan {
+                    kind,
+                    state,
+                    marker: GhMarkerMatch::Absent,
+                });
             }
             cursor = Some(
                 page_info

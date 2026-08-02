@@ -65,8 +65,9 @@ impl DaemonHandler {
                     let warning_sequence = warning.warning_sequence;
                     let posted = tokio::task::spawn_blocking(move || {
                         let engine =
-                            ProducerEngine::new(&registry, events_dir, state_dir, data_dir);
-                        let mut sink = GhCliMutationSink::with_program(gh_program);
+                            ProducerEngine::new(&registry, events_dir, &state_dir, data_dir);
+                        let mut sink =
+                            GhCliMutationSink::with_program(gh_program).with_state_dir(&state_dir);
                         engine.post_storage_warning_once(&origin, &warning, &mut sink)
                     })
                     .await;
@@ -182,8 +183,9 @@ impl DaemonHandler {
                 let semantic_completion = result.completion.clone();
                 let verdict = result.verdict;
                 let completed = tokio::task::spawn_blocking(move || {
-                    let engine = ProducerEngine::new(&registry, events_dir, state_dir, data_dir);
-                    let mut sink = GhCliMutationSink::with_program(gh_program);
+                    let engine = ProducerEngine::new(&registry, events_dir, &state_dir, data_dir);
+                    let mut sink =
+                        GhCliMutationSink::with_program(gh_program).with_state_dir(&state_dir);
                     engine.complete_gh_once_with_completion(
                         &origin,
                         &completion_id,
