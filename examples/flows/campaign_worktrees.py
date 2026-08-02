@@ -23,7 +23,9 @@ Nothing here posts, publishes, or decides policy. Callers translate
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -31,6 +33,7 @@ from typing import Any
 # Identity fields are written as `tally.<key>`. Git folds a configuration key
 # to lower case, so the keys are lower case here too and round-trip byte for
 # byte.
+IDENTITY_SECTION = "tally"
 IDENTITY_PREFIX = "tally."
 IDENTITY_PATTERN = r"^tally\."
 IDENTITY_KEY = re.compile(r"^[a-z][a-z0-9]*$")
@@ -166,9 +169,61 @@ def read_identity(worktree: Path) -> dict[str, str]:
     return identity
 
 
+def worktree_config_path(worktree: Path) -> Path:
+    """The file `git config --worktree` writes for this linked worktree."""
+    git_dir = Path(_git(worktree, "rev-parse", "--absolute-git-dir").stdout.strip())
+    common_dir = Path(
+        _git(
+            worktree, "rev-parse", "--path-format=absolute", "--git-common-dir"
+        ).stdout.strip()
+    )
+    if git_dir.resolve() == common_dir.resolve():
+        # In the main worktree `git config --worktree` acts on the shared
+        # config, so writing `config.worktree` there would record identity in a
+        # file that means something different from what a read would return. No
+        # lane is ever the main worktree; refuse rather than diverge.
+        raise WorktreeError(
+            "worktree-invalid",
+            f"{worktree} is the main worktree and cannot carry lane identity",
+            {"worktreePath": str(worktree)},
+        )
+    return git_dir / "config.worktree"
+
+
 def write_identity(worktree: Path, identity: dict[str, str]) -> None:
-    for key, value in validate_identity(identity).items():
-        _git(worktree, "config", "--worktree", f"{IDENTITY_PREFIX}{key}", value)
+    """Record a lane's whole identity in one atomic act.
+
+    One `git config --worktree` call per field is one crash window per field,
+    and a lane that survives with some of its identity looks valid to every
+    later pass while being unable to answer for the fields it lost. The marker
+    file this replaced was written with a single `os.replace`; that property is
+    restored here without leaving git's own metadata: the replacement file is
+    built with `git config --file` -- so git does the escaping, and any foreign
+    per-worktree key already present survives -- and then renamed into place.
+    """
+    identity = validate_identity(identity)
+    path = worktree_config_path(worktree)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.unlink(missing_ok=True)
+        if path.exists():
+            shutil.copyfile(path, temporary)
+            _git(
+                worktree,
+                "config",
+                "--file",
+                str(temporary),
+                "--remove-section",
+                IDENTITY_SECTION,
+                check=False,
+            )
+        else:
+            temporary.touch(mode=0o644)
+        for key, value in identity.items():
+            _git(worktree, "config", "--file", str(temporary), f"{IDENTITY_PREFIX}{key}", value)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def registered(checkout: Path, worktree: Path) -> dict[str, str] | None:
@@ -230,18 +285,31 @@ def branch_exists(checkout: Path, branch: str) -> bool:
     )
 
 
-def resume(checkout: Path, worktree: Path, expected: dict[str, str]) -> dict[str, str] | None:
+def resume(
+    checkout: Path,
+    worktree: Path,
+    expected: dict[str, str],
+    *,
+    required: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
     """Adopt the lane already sitting at this path, or report there is none.
 
-    Returns the lane's full recorded identity when it is this caller's lane,
-    and `None` when the path is free. Anything else in the way is a conflict
-    rather than something to clobber: that refusal is the whole reason a lane
-    is safe to resume after its runner was killed.
+    Returns `None` when the path is free. Otherwise returns
 
-    A lane that git registered but that carries no identity yet -- the runner
-    died between `git worktree add` and the first `git config --worktree` -- is
-    healed rather than rejected. Its path and branch are derived from the same
-    identity the caller is asking for, so there is no other lane it could be.
+        {"identity": <recorded>, "complete": <bool>, "head": <resolved HEAD>}
+
+    Anything else in the way is a conflict rather than something to clobber:
+    that refusal is the whole reason a lane is safe to resume after its runner
+    was killed.
+
+    `complete` is false when the recorded identity is missing any key of
+    `expected` or `required` -- a lane an older tally created before identity
+    moved into git, or one whose runner died before the identity was written.
+    Such a lane is reported, never invented: writing back only the keys this
+    function happens to hold would make the lane look valid to every later pass
+    while leaving it permanently unable to answer for a field its caller
+    requires. The caller re-derives what it needs from the lane itself -- its
+    `head` is returned for exactly that -- and records a complete identity.
     """
     expected = validate_identity(expected)
     enable_worktree_config(checkout)
@@ -297,32 +365,55 @@ def resume(checkout: Path, worktree: Path, expected: dict[str, str]) -> dict[str
                     "actualBranch": actual,
                 },
             )
-    if any(recorded.get(key) != value for key, value in expected.items()):
-        write_identity(worktree, expected)
-        recorded = read_identity(worktree)
-    return recorded
+    missing = sorted((set(expected) | set(required)) - set(recorded))
+    return {
+        "identity": recorded,
+        "complete": not missing,
+        "missing": missing,
+        "head": _git(worktree, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip(),
+    }
+
+
+def add(checkout: Path, worktree: Path, branch: str, start_rev: str) -> str:
+    """Cut one lane and report the commit it actually ended up on.
+
+    An existing branch of the same name is adopted rather than refused: the
+    branch name is derived from the lane identity, so the only thing it can be
+    is this lane's own work outliving a removed worktree. That is also why the
+    resolved head is returned rather than assumed to be `start_rev` -- an
+    adopted branch sits wherever the killed runner left it, and every value
+    derived from the lane's position has to be derived from *that*.
+    """
+    check_branch_name(branch)
+    enable_worktree_config(checkout)
+    worktree.parent.mkdir(parents=True, exist_ok=True)
+    if branch_exists(checkout, branch):
+        _git(checkout, "worktree", "add", str(worktree), branch, code="worktree-create-failed")
+    else:
+        _git(
+            checkout,
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            str(worktree),
+            start_rev,
+            code="worktree-create-failed",
+        )
+    return _git(worktree, "rev-parse", "--verify", "HEAD^{commit}").stdout.strip()
 
 
 def create(
     checkout: Path, worktree: Path, branch: str, start_rev: str, identity: dict[str, str]
 ) -> dict[str, str]:
-    """Create one lane and record its identity in git's own worktree config.
+    """Cut one lane and record its identity, for a caller that derives nothing.
 
-    An existing branch of the same name is adopted rather than refused: the
-    branch name is derived from the lane identity, so the only thing it can be
-    is this lane's own work outliving a removed worktree.
+    A caller whose identity depends on where the lane actually landed calls
+    `add` and `write_identity` itself, so that the identity it commits is the
+    one the lane can answer for.
     """
     identity = validate_identity(identity)
-    check_branch_name(branch)
-    enable_worktree_config(checkout)
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    arguments = ["worktree", "add"]
-    if not branch_exists(checkout, branch):
-        arguments.extend(["-b", branch])
-        arguments.extend([str(worktree), start_rev])
-    else:
-        arguments.extend([str(worktree), branch])
-    _git(checkout, *arguments, code="worktree-create-failed")
+    add(checkout, worktree, branch, start_rev)
     write_identity(worktree, identity)
     return read_identity(worktree)
 

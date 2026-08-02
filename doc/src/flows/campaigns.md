@@ -259,13 +259,21 @@ and how many steered attempts they spent, tasks never attempted, every steering
 note and machinery fault, anomalies, and reconciler warnings. Every field is a
 projection of facts the pass already witnessed; the digest is not a state
 store. On completion the summary is the campaign's single
-`tally:campaign-complete:v1` comment, posted before the issue closes; at
-quiescence it is posted beside the escalation and reflects partial state.
-Neither is ever an upsert — a summary the operator is not notified about is not
-a summary — and both are idempotent: a repeated terminal pass finds its own
-marker and stays quiet. Both render inside nodes the campaign already had, so
-neither adds a flow node. On a local forge the summary is a durable blob at
-`refs/tally/spec-build/v1/<scope>/summary/<outcome>`. Operators can remove an open registration
+`tally:campaign-complete:v1` comment. A forge-native campaign posts it and then
+closes its task sub-issues and its master issue, so the digest is the last thing
+a reader of the closed issue sees. A file-worklist campaign posts the same
+comment and stops: its master issue is a projection whose lifecycle tally has
+never owned, so it stays open for whoever does. At quiescence the summary is
+published *before* the escalation, because the escalation is what every later
+pass reads back to decide the campaign has already stopped — publishing it
+second would mean one transient failure lost the digest for good, with no later
+pass willing to retry.
+
+Neither summary is ever an upsert — a summary the operator is not notified
+about is not a summary — and both are idempotent: a repeated terminal pass
+finds its own marker and stays quiet. Both render inside nodes the campaign
+already had, so neither adds a flow node. On a local forge the summary is a
+durable blob at `refs/tally/spec-build/v1/<scope>/summary/<outcome>`. Operators can remove an open registration
 without changing forge state with `tally campaign disarm ISSUE-URL`; registry
 read/modify/write operations are file-locked against timer and re-arm races.
 `tally campaign list` inspects registrations, while `tally campaign poll --once`
@@ -673,15 +681,34 @@ branch, and base revision under `tally.*` in that worktree's config; the
 enumeration a later pass reads is `git worktree list --porcelain` plus that
 config. `git worktree add` creates the record and `git worktree remove`
 destroys it, so the lane set and the lane identities cannot drift apart the way
-the pre-#312 JSON markers under `<workspaceRoot>/.state/` could. Resuming a
-lane means finding a recorded identity that matches; a lane whose branch
-outlived its worktree is re-adopted with its work, and a foreign identity at a
-lane path is a refusal, never a clobber. A directory git never registered — a
-runner killed inside `git worktree add` — is reclaimed by the sweep from the
-campaign's own derived lane layout. The run-scoped pass record under
-`.state/passes/` is not lane state and stays where it is. The same manager
-serves the agency-nightly driver, so both drivers promise one set of
-create/resume/validate semantics.
+the pre-#312 JSON markers under `<workspaceRoot>/.state/` could. The whole
+identity is written in one atomic act — a replacement `config.worktree` built
+with `git config --file` and renamed into place — because a lane that survives
+a kill holding half its identity looks valid to every later pass while being
+unable to answer for the half it lost. A lane that does turn up with an
+incomplete identity, which is what upgrading an estate across #312 over a live
+lane produces, is reported as incomplete and healed from the lane itself; it is
+never completed by inventing the missing fields.
+
+Resuming a lane means finding a recorded identity that matches; a lane whose
+branch outlived its worktree is re-adopted with its work, and a foreign
+identity at a lane path is a refusal, never a clobber. **A lane's prepared base
+is derived from the lane, not from the base branch's current tip**: it is where
+the lane's own head forks from base (`git merge-base`). On a fresh lane that is
+the base tip, or the merge base of an existing published head, exactly as
+before. On an adopted or healed lane it is an ancestor of the lane head by
+construction — which is what ownership, the diff fed to the diagnosing steward,
+and rebase all require of it. Recomputing it from a base branch that moved
+while the lane was gone would hand every one of them a base the lane's history
+does not descend from.
+
+A directory git never registered — a runner killed inside `git worktree add` —
+is reclaimed by the sweep from the campaign's own derived lane layout, and the
+same sweep reclaims any pre-#312 `.state/<runHash>/<taskId>.json` marker
+belonging to this campaign once the run it names is proved dead. The run-scoped
+pass record under `.state/passes/` is not lane state and stays where it is. The
+same manager serves the agency-nightly driver, so both drivers promise one set
+of create/resume/validate semantics.
 
 The reconcile node fetches the configured remote and reads the matching
 worklist blob from the exact remote base commit. Uncommitted files and the

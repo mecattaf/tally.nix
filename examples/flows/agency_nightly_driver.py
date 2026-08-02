@@ -257,6 +257,11 @@ def prepare_workspace(
     resumed = worktree_call(worktrees.resume, checkout, worktree, identity)
     if resumed is None:
         worktree_call(worktrees.create, checkout, worktree, branch, base_rev, identity)
+    elif not resumed["complete"]:
+        # A lane cut before this driver recorded identity in git. Nothing here
+        # is derived from the lane's position, so recording the identity it
+        # already answers for by path and branch completes it.
+        worktree_call(worktrees.write_identity, worktree, identity)
     return {
         "taskId": task_id,
         "branch": branch,
