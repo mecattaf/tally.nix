@@ -172,6 +172,18 @@ export const meta = {
             minItems: 1,
             items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
           },
+          // The adapter entry's environment, which is where a narrator's
+          // endpoint and credentials live. Reserved names are refused by the
+          // driver rather than silently overriding the publish node's own.
+          env: {
+            type: "object",
+            maxProperties: 64,
+            propertyNames: { pattern: "^[A-Za-z_][A-Za-z0-9_]*$" },
+            additionalProperties: { type: "string", maxLength: 4096 }
+          },
+          // The adapter's declared final-message capture, read back as the
+          // narration proposal. Absent means the shipped contract.
+          finalMessagePattern: { type: "string", minLength: 1, maxLength: 1024 },
           runtimeMaxSec: { type: ["integer", "null"], minimum: 1 }
         },
         additionalProperties: false

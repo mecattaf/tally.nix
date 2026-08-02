@@ -2549,6 +2549,25 @@ class NarrationValidatorTests(unittest.TestCase):
         self.assertEqual(narration["subject"], "feat(campaign): add the merge method option")
         self.assertEqual(narration["body"], "One conventional commit per task.")
 
+    def test_prose_that_only_looks_dangerous_is_still_accepted(self) -> None:
+        """The refusals are narrow on purpose.
+
+        A bare `#<n>` backlinks and notifies nobody, an address is not a
+        mention, and a subject may say what the change fixes as long as it does
+        not name an issue GitHub would then close.
+        """
+        for name, body in {
+            "bare-cross-reference": "Context: #42",
+            "address": "Reported by tally@example.invalid",
+            "prose-fix": "It fixes the drift the reconciler kept re-reading.",
+        }.items():
+            with self.subTest(name):
+                narration, reason = DRIVER.validated_narration(
+                    {"type": "feat", "scope": "api", "subject": "add the widget", "body": body}
+                )
+                self.assertIsNone(reason)
+                self.assertEqual(narration["body"], body)
+
     def test_a_scopeless_proposal_keeps_the_bare_type_prefix(self) -> None:
         narration, reason = DRIVER.validated_narration(
             {"type": "fix", "scope": None, "subject": "stop losing the receipt"}
@@ -2598,6 +2617,37 @@ class NarrationValidatorTests(unittest.TestCase):
                 },
                 "managed campaign marker",
             ),
+            # A pull-request body is executable on GitHub. The node appends its
+            # own `Closes #<sub-issue>`; a narrator that proposes one is
+            # proposing to close an issue the campaign never named.
+            "closing-keyword-in-body": (
+                {"type": "feat", "subject": "do a thing", "body": "Closes #1\nFixes #2"},
+                "GitHub closing keyword",
+            ),
+            "closing-keyword-in-subject": (
+                {"type": "fix", "subject": "fixes #12 at last"},
+                "GitHub closing keyword",
+            ),
+            "cross-repo-closing-keyword": (
+                {"type": "feat", "subject": "do a thing", "body": "resolved acme/spec#9"},
+                "GitHub closing keyword",
+            ),
+            "closing-keyword-by-url": (
+                {
+                    "type": "feat",
+                    "subject": "do a thing",
+                    "body": "Fixed https://github.com/acme/spec/issues/3",
+                },
+                "GitHub closing keyword",
+            ),
+            "mention": (
+                {"type": "feat", "subject": "do a thing", "body": "cc @torvalds"},
+                "@mention",
+            ),
+            "team-mention": (
+                {"type": "feat", "subject": "do a thing", "body": "ping @acme/security"},
+                "@mention",
+            ),
         }
         for name, (proposal, expected) in cases.items():
             with self.subTest(name):
@@ -2614,6 +2664,12 @@ class StewardNarrationTests(unittest.TestCase):
         path.write_text(f"#!{sys.executable}\n" + textwrap.dedent(body), encoding="utf-8")
         path.chmod(0o755)
         return [sys.executable, str(path)]
+
+    def role(self, argv: list[str], **overrides: object) -> dict[str, object]:
+        """Normalize the way the publish node does, not by hand."""
+        return DRIVER.steward_role(
+            {"adapter": "narrator", "argv": argv, "runtimeMaxSec": 30, **overrides}
+        )
 
     def test_no_steward_uses_the_brief_derived_template(self) -> None:
         narration, transcript = DRIVER.narrate(None, task("task-1"), {})
@@ -2646,7 +2702,7 @@ class StewardNarrationTests(unittest.TestCase):
                 """,
             )
             narration, transcript = DRIVER.narrate(
-                {"adapter": "narrator", "argv": argv, "runtimeMaxSec": 30},
+                self.role(argv),
                 task("task-1"),
                 {"schemaVersion": 1, "task": {"id": "task-1"}},
             )
@@ -2656,6 +2712,98 @@ class StewardNarrationTests(unittest.TestCase):
             self.assertEqual(
                 transcript, [{"attempt": 1, "status": "accepted", "reason": None}]
             )
+
+    def test_the_adapter_environment_reaches_the_narrator_and_the_brief_does_not(
+        self,
+    ) -> None:
+        """What makes "the adapter table decides endpoint and credentials" true.
+
+        The narrator also must not inherit TALLY_BRIEF: it is handed its request
+        on stdin, and the driver's own brief names the campaign checkout, the
+        agent argv, and the adapter table.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = self.shim(
+                root,
+                "narrate",
+                """
+                import json
+                import os
+                import sys
+
+                sys.stdin.read()
+                print("TALLY_FINAL_MESSAGE=" + json.dumps({
+                    "type": "feat",
+                    "subject": "reach " + os.environ["NARRATOR_ENDPOINT"],
+                    "body": "brief=" + os.environ.get("TALLY_BRIEF", "absent"),
+                }))
+                """,
+            )
+            with mock.patch.dict(
+                os.environ, {"TALLY_BRIEF": "/tmp/should-not-be-visible"}, clear=False
+            ):
+                narration, transcript = DRIVER.narrate(
+                    self.role(argv, env={"NARRATOR_ENDPOINT": "narrator.invalid"}),
+                    task("task-1"),
+                    {},
+                )
+            self.assertEqual(transcript[-1]["status"], "accepted")
+            self.assertEqual(narration["subject"], "feat: reach narrator.invalid")
+            self.assertEqual(narration["body"], "brief=absent")
+
+    def test_the_adapters_own_final_message_capture_is_what_is_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = self.shim(
+                root,
+                "narrate",
+                """
+                import json
+                import sys
+
+                sys.stdin.read()
+                print("TALLY_FINAL_MESSAGE=" + json.dumps({
+                    "type": "chore",
+                    "subject": "the shipped contract must not win here",
+                }))
+                print("narrator-result: " + json.dumps({
+                    "type": "feat",
+                    "subject": "read from the declared capture",
+                }))
+                """,
+            )
+            narration, transcript = DRIVER.narrate(
+                self.role(argv, finalMessagePattern="^narrator-result: (.*)$"),
+                task("task-1"),
+                {},
+            )
+            self.assertEqual(transcript[-1]["status"], "accepted")
+            self.assertEqual(narration["subject"], "feat: read from the declared capture")
+
+    def test_an_unusable_steward_binding_is_refused_rather_than_degraded(self) -> None:
+        cases = {
+            "reserved-env": ({"env": {"TALLY_BRIEF": "/tmp/x"}}, "reserved variable"),
+            "bad-env-name": ({"env": {"not a name": "x"}}, "environment identifiers"),
+            "bad-pattern": (
+                {"finalMessagePattern": "^unclosed(.*$"},
+                "not a valid regular expression",
+            ),
+            "no-capture-group": (
+                {"finalMessagePattern": "^narrator-result: .*$"},
+                "exactly one capture group",
+            ),
+            "two-capture-groups": (
+                {"finalMessagePattern": "^(a)(b)$"},
+                "exactly one capture group",
+            ),
+        }
+        for name, (override, expected) in cases.items():
+            with self.subTest(name):
+                with self.assertRaisesRegex(DRIVER.DriverError, expected):
+                    DRIVER.steward_role(
+                        {"adapter": "narrator", "argv": ["/bin/true"], **override}
+                    )
 
     def test_a_refused_proposal_is_re_requested_with_the_reason(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2682,7 +2830,7 @@ class StewardNarrationTests(unittest.TestCase):
                 """,
             )
             narration, transcript = DRIVER.narrate(
-                {"adapter": "narrator", "argv": argv, "runtimeMaxSec": 30},
+                self.role(argv),
                 task("task-1"),
                 {},
             )
@@ -2705,7 +2853,7 @@ class StewardNarrationTests(unittest.TestCase):
                 """,
             )
             narration, transcript = DRIVER.narrate(
-                {"adapter": "narrator", "argv": argv, "runtimeMaxSec": 30},
+                self.role(argv),
                 task("task-1"),
                 {},
             )
@@ -2738,7 +2886,7 @@ class StewardNarrationTests(unittest.TestCase):
                 """,
             )
             narration, transcript = DRIVER.narrate(
-                {"adapter": "narrator", "argv": argv, "runtimeMaxSec": 30},
+                self.role(argv),
                 task("task-1"),
                 {},
             )
@@ -2841,6 +2989,113 @@ class SquashMergeTests(unittest.TestCase):
                         "revision": revision,
                     }
                 ],
+            )
+
+    def test_a_lost_base_push_race_leaves_the_task_mergeable_on_the_next_pass(self) -> None:
+        """A receipt must never outrank the merge it only points at.
+
+        Git enforces fast-forward on every non-tag ref, the campaign's hidden
+        namespace included, and a retried squash always mints a different oid.
+        A receipt pushed without --force therefore refuses its own successor and
+        fails the node before the base push it needs to make progress, so one
+        lost race would wedge the task behind a ref nothing documents.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, remote = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            workspace_root.mkdir()
+            revision = "sha256:" + "a" * 64
+            branch = DRIVER.stable_publish_branch("fixture", "7", "task-1", revision)
+            head = self.publish_branch(checkout, branch)
+            config = DRIVER.repo_config(repository_config(checkout))
+            data = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "issue": issue(),
+                "workspaceRoot": str(workspace_root),
+                "task": {**task("task-1"), "revision": revision},
+            }
+            narration = DRIVER.template_narration(task("task-1"))
+            receipt = DRIVER.merge_receipt_ref("fixture", "7", "task-1", revision)
+
+            # A sibling lane wins the base push in the window between the two
+            # pushes. To the loser that is exactly a non-fast-forward refusal.
+            hook = remote / "hooks/pre-receive"
+            hook.parent.mkdir(parents=True, exist_ok=True)
+            hook.write_text(
+                "#!/bin/sh\nwhile read -r _ _ ref; do\n"
+                '  case "$ref" in refs/heads/*) echo "non-fast-forward" >&2; exit 1 ;; esac\n'
+                "done\nexit 0\n",
+                encoding="utf-8",
+            )
+            hook.chmod(0o755)
+            with self.assertRaises(DRIVER.DriverError):
+                DRIVER.merge_local(
+                    data,
+                    config,
+                    self.integration(checkout, branch, head),
+                    "squash",
+                    narration,
+                )
+            first_receipt = DRIVER.local_remote_refs(config, receipt).get(receipt)
+            self.assertIsNotNone(first_receipt)
+            # The receipt names a commit that never reached base, so it proves
+            # nothing and the task correctly still reads as unmerged.
+            self.assertEqual(
+                DRIVER.merged_local_tasks(
+                    "acme/spec",
+                    config,
+                    "fixture",
+                    "7",
+                    None,
+                    [{**task("task-1"), "revision": revision}],
+                ),
+                [],
+            )
+
+            # The winner's commit lands and the next pass rebases onto it, so
+            # the retry's squash necessarily has a different oid.
+            hook.unlink()
+            git(checkout, "switch", "--quiet", "main")
+            (checkout / "sibling.txt").write_text("sibling\n", encoding="utf-8")
+            git(checkout, "add", "sibling.txt")
+            git(checkout, "commit", "--quiet", "-m", "sibling: advance base")
+            git(checkout, "push", "--quiet", "origin", "HEAD:refs/heads/main")
+            git(checkout, "switch", "--quiet", "work")
+            git(checkout, "rebase", "--quiet", "origin/main")
+            rebased = git(checkout, "rev-parse", "HEAD")
+            git(checkout, "push", "--quiet", "--force", "origin", f"HEAD:refs/heads/{branch}")
+            git(checkout, "switch", "--quiet", "main")
+            git(checkout, "fetch", "--quiet", "--prune", "origin")
+
+            merge_commit = DRIVER.merge_local(
+                data,
+                config,
+                self.integration(checkout, branch, rebased),
+                "squash",
+                narration,
+            )
+
+            self.assertNotEqual(merge_commit, first_receipt)
+            self.assertEqual(
+                DRIVER.local_remote_refs(config, receipt).get(receipt), merge_commit
+            )
+            git(checkout, "fetch", "--quiet", "--prune", "origin")
+            self.assertEqual(git(checkout, "rev-parse", "origin/main"), merge_commit)
+            self.assertEqual(
+                [
+                    fact["mergeCommit"]
+                    for fact in DRIVER.merged_local_tasks(
+                        "acme/spec",
+                        config,
+                        "fixture",
+                        "7",
+                        None,
+                        [{**task("task-1"), "revision": revision}],
+                    )
+                ],
+                [merge_commit],
             )
 
     def test_local_merge_method_still_produces_a_merge_commit_and_no_receipt(self) -> None:

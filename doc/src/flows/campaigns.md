@@ -899,18 +899,45 @@ requires the commit it names to be an ancestor of the witnessed base.
 The message that squash commit carries comes from the steward. `steward` names
 an adapter in the open adapter map, bound as a catalog role; `stewardArgv` is
 appended to that adapter's own argv, and the result is the direct argv the
-publish node runs. The adapter entry — never the campaign option, and never the
-brief — decides model, endpoint, and credentials. The publish node writes a
-JSON narration request on the narrator's stdin and reads its proposal back from
-a `TALLY_FINAL_MESSAGE=` line, the same final-message contract the shipped
-`spec-build-driver` adapter scrapes. The proposal is text only: an object with
-`type`, `scope`, `subject`, and `body`.
+publish node runs. Three fields of that adapter entry reach the seam — `argv`,
+`env`, and `scrape.finalMessage` — and between them they decide which model
+answers, at which endpoint, with which credentials, and how its proposal is
+read. Swapping narrators is an adapter change; nothing about the model belongs
+in the campaign's own options.
+
+What the seam does **not** read is the adapter's per-job `launch` policies,
+`hardening` preset, and `extraWritablePaths`. The narrator is a direct-argv
+subprocess of the publish node, not a tally job — that is what keeps the seam
+free of flow nodes — so nothing applies them. A steward adapter that declares
+any of them is refused when the module is evaluated, rather than run without
+them: an estate that believes its narrator is sandboxed should not learn
+otherwise from a journal. For the same reason the narrator's environment is the
+publish node's, plus the adapter's `env`, minus `TALLY_BRIEF`: it is handed its
+request on stdin and has no business reading the driver's own brief.
+
+The publish node writes a JSON narration request on the narrator's stdin and
+reads its proposal back from the line matching the adapter's declared
+`scrape.finalMessage` regex, which defaults to the `TALLY_FINAL_MESSAGE=`
+contract the shipped `spec-build-driver` adapter scrapes. That regex must be a
+non-empty stdout `regex` capture with exactly one group, or the module refuses
+the binding. The proposal is text only: an object with `type`, `scope`,
+`subject`, and `body`.
 
 A deterministic, commitlint-shaped validator then decides whether that text is
 used. It requires a conventional type from a fixed set, an optional short
 lowercase scope, a `type(scope): subject` header of at most 72 characters with
 no trailing period and no leading capital, a body under 4000 characters wrapped
 at 100 columns, no control characters, and no managed campaign marker anywhere.
+
+It also refuses two things that are not style at all. A pull-request body is
+executable on GitHub: a closing keyword in a merged body — or in a commit
+message that lands on the default branch, which is exactly what the squash
+message does — closes the issue it names, and an `@mention` notifies a person
+or a whole team. The node appends its own `Closes #<sub-issue>` because that
+authority belongs to the node; a narrator proposing `Closes #310` is proposing
+to close the design issue that authored the campaign. Both are refused with a
+named reason. A bare `#<n>` cross-reference stays allowed: it backlinks and
+notifies nobody.
 A refused proposal is re-requested once with the refusal reason attached. A
 second refusal — or a narrator that exits nonzero, misses its deadline, or
 prints no final message — spends the slot, and publication falls back to the

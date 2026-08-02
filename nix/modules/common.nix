@@ -2136,8 +2136,18 @@ let
             conventional-commit message and pull-request prose, a deterministic
             validator accepts or refuses that text, and the node executes git.
             Null leaves the seam empty: publication text stays the
-            brief-derived template and no model is called. The adapter entry,
-            not this option, decides model, endpoint, and credentials.
+            brief-derived template and no model is called.
+
+            The adapter entry's argv, env, and scrape.finalMessage are what the
+            seam reads: which model answers, at which endpoint, with which
+            credentials, and how its proposal is captured are adapter changes,
+            not changes here and never values in this campaign's options. What
+            the seam does not read is the adapter's per-job launch policies,
+            hardening preset, and extraWritablePaths, because the narrator runs
+            as a direct-argv subprocess of the publish node rather than as a
+            tally job -- that is what keeps the seam free of flow nodes. An
+            adapter that declares any of those is refused here rather than
+            silently narrated without them.
           '';
         };
         stewardArgv = mkOption {
@@ -2147,10 +2157,11 @@ let
           description = ''
             Direct argv appended to the steward adapter's own argv for the
             narration call. The narration request arrives on stdin as JSON and
-            the proposal is read back from the adapter's final message, the
-            same `TALLY_FINAL_MESSAGE=` line the shipped spec-build-driver
-            adapter scrapes. Credentials belong in the adapter or its shim,
-            never here: this argv is rendered into the campaign brief.
+            the proposal is read back from the line matching the adapter's
+            declared scrape.finalMessage regex, defaulting to the same
+            `TALLY_FINAL_MESSAGE=` contract the shipped spec-build-driver
+            adapter scrapes. Credentials belong in the adapter's env, never
+            here: this argv is rendered verbatim into the campaign brief.
           '';
         };
         stewardRuntimeMaxSec = mkOption {
@@ -3241,6 +3252,29 @@ let
     // optionalAttrs (gate.kind == "forbidPaths") { inherit (gate) forbidPaths; }
   );
 
+  # The one final-message contract the campaign machinery reads: the shipped
+  # spec-build-driver adapter's capture, and the fallback a steward adapter that
+  # declares no capture of its own is narrated with.
+  defaultFinalMessagePattern = "^TALLY_FINAL_MESSAGE=(.*)$";
+
+  renderCampaignSteward =
+    cfg: campaign:
+    let
+      adapter = cfg.adapters.${campaign.steward} or { };
+      declared = (adapter.scrape or { }).finalMessage or null;
+    in
+    {
+      adapter = campaign.steward;
+      argv = (adapter.argv or [ ]) ++ campaign.stewardArgv;
+      # The adapter's env is what carries a narrator's endpoint and credentials.
+      # Dropping it was the difference between "the adapter table decides model,
+      # endpoint, and credentials" being true and being prose.
+      env = adapter.env or { };
+      finalMessagePattern =
+        if declared == null || declared.pattern == "" then defaultFinalMessagePattern else declared.pattern;
+      runtimeMaxSec = campaign.stewardRuntimeMaxSec;
+    };
+
   # Sweep, reconcile, one optional pass-level continuation, optional
   # pristine-base preflight prep/gates/cleanup, and one frontier's worst-case
   # implementation lanes: prep, agent, ownership check, initial gates,
@@ -3305,19 +3339,14 @@ let
       diagnosisSandboxPolicy = campaign.agentDiagnosisSandboxPolicy;
     };
     # The narrate slot rides the open adapter map: the campaign names a catalog
-    # role and the adapter entry supplies the argv that reaches the model, so
-    # swapping narrators is an adapter change and never a driver change. The
-    # publish node runs this argv directly, which is what keeps the seam free
-    # of flow nodes.
-    steward =
-      if campaign.steward == null then
-        null
-      else
-        {
-          adapter = campaign.steward;
-          argv = (cfg.adapters.${campaign.steward}.argv or [ ]) ++ campaign.stewardArgv;
-          runtimeMaxSec = campaign.stewardRuntimeMaxSec;
-        };
+    # role and the adapter entry supplies the argv and the environment that
+    # reach the model, so swapping narrators is an adapter change and never a
+    # driver change. The publish node runs this argv directly, which is what
+    # keeps the seam free of flow nodes -- and is also why the adapter's
+    # per-job launch policies, hardening, and writable paths cannot apply here.
+    # Declaring any of those on a steward adapter is refused rather than
+    # ignored; see the campaign assertions below.
+    steward = if campaign.steward == null then null else renderCampaignSteward cfg campaign;
     gates = renderCampaignGates campaign.gates;
   };
 
@@ -3468,7 +3497,7 @@ let
           scrape.finalMessage = {
             stream = "stdout";
             mode = "regex";
-            pattern = "^TALLY_FINAL_MESSAGE=(.*)$";
+            pattern = defaultFinalMessagePattern;
           };
         };
       };
@@ -3606,6 +3635,49 @@ let
             || (cfg.adapters.${campaign.steward}.argv or [ ]) != [ ]
             || campaign.stewardArgv != [ ];
           message = "tally campaign ${name} steward adapter ${toString campaign.steward} renders no narration argv; give the adapter an argv or set stewardArgv";
+        }
+        {
+          # The narrate slot runs a direct argv from inside the publish node,
+          # not a tally job, so nothing applies an adapter's per-job launch
+          # policies, hardening preset, or writable paths to it. An estate that
+          # declares them on a steward adapter has configured something that
+          # cannot take effect; saying so here is the difference between a
+          # loud refusal and a campaign that silently narrates from the
+          # template forever.
+          assertion =
+            !campaign.enable
+            || campaign.steward == null
+            || !(builtins.hasAttr campaign.steward cfg.adapters)
+            || (
+              let
+                adapter = cfg.adapters.${campaign.steward};
+              in
+              adapter.launch.model == null
+              && adapter.launch.effort == null
+              && adapter.launch.approvalPolicies == { }
+              && adapter.launch.sandboxPolicies == { }
+              && adapter.hardening == null
+              && adapter.extraWritablePaths == [ ]
+            );
+          message = "tally campaign ${name} steward adapter ${toString campaign.steward} declares launch policies, hardening, or extraWritablePaths, which the narration seam cannot apply to a direct argv; give the steward its own adapter entry";
+        }
+        {
+          # The narration proposal is read back from the adapter's declared
+          # final-message capture. A capture on the wrong stream or in a JSON
+          # mode is unreadable by the publish node, which would fall back to
+          # the template on every attempt and never say why.
+          assertion =
+            !campaign.enable
+            || campaign.steward == null
+            || !(builtins.hasAttr campaign.steward cfg.adapters)
+            || !(builtins.hasAttr "finalMessage" (cfg.adapters.${campaign.steward}.scrape or { }))
+            || (
+              let
+                capture = cfg.adapters.${campaign.steward}.scrape.finalMessage;
+              in
+              capture.stream == "stdout" && capture.mode == "regex" && capture.pattern != ""
+            );
+          message = "tally campaign ${name} steward adapter ${toString campaign.steward} must declare scrape.finalMessage as a non-empty stdout regex; the narration seam reads the proposal from that capture";
         }
         {
           assertion =

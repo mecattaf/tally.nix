@@ -70,7 +70,13 @@ MERGE_METHODS = frozenset({"merge", "squash"})
 # The narrate slot of §2's steward duty roster. The model proposes text; this
 # commitlint-shaped grammar is what decides whether the text is used, and the
 # node — never the model — runs git.
-NARRATION_CAPTURE = re.compile(r"^TALLY_FINAL_MESSAGE=(.*)$")
+DEFAULT_NARRATION_PATTERN = r"^TALLY_FINAL_MESSAGE=(.*)$"
+# Environment the publish node owns and a steward adapter may not redefine.
+# TALLY_BRIEF is stripped outright rather than overridden: the narrator is
+# handed its request on stdin and has no business reading the driver's own
+# brief, which names the campaign's checkout, agent argv, and adapter table.
+ENVIRONMENT_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+RESERVED_STEWARD_ENVIRONMENT = frozenset({"TALLY_BRIEF"})
 NARRATION_TYPES = frozenset(
     {
         "build",
@@ -98,6 +104,19 @@ NARRATION_DEFAULT_RUNTIME_MAX_SEC = 120
 # proposing to forge campaign state, so its proposal is refused outright — the
 # same line the worklist reader holds when a body repeats a managed marker.
 MANAGED_MARKER_PREFIX = "<!-- tally:"
+# A pull-request body is executable on GitHub: a closing keyword in a merged
+# body, or in a commit message that lands on the default branch, closes the
+# issue it names, and an @mention notifies a person or a whole team. The
+# narration is spliced into both surfaces, so a proposal carrying either is
+# proposing to mutate public forge state the campaign never named. The node
+# appends its own `Closes #<sub-issue>` at `github_pull_request`; that
+# authority belongs to the node, not to the model. A bare `#<n>` cross
+# reference stays allowed: it backlinks and notifies nobody.
+NARRATION_CLOSING_KEYWORD = re.compile(
+    r"(?i)\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\b\s*:?\s*"
+    r"(?:\#\d+|GH-\d+|[\w.-]+/[\w.-]+\#\d+|https?://\S+/(?:issues|pull)/\d+)"
+)
+NARRATION_MENTION = re.compile(r"(?<![0-9A-Za-z._-])@[0-9A-Za-z][0-9A-Za-z-]*")
 
 
 class DriverError(RuntimeError):
@@ -209,6 +228,7 @@ def run(
     check: bool = True,
     input_text: str | None = None,
     timeout: int | None = None,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -220,6 +240,7 @@ def run(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             timeout=timeout,
+            env=env,
         )
     except subprocess.TimeoutExpired:
         # A deadline is only ever set on an advisory subprocess whose caller
@@ -315,21 +336,50 @@ def merge_method(value: Any, context: str) -> str:
 def steward_role(value: Any, context: str = "campaign steward") -> dict[str, Any] | None:
     """The §2 steward bound as a catalog role, not as a script choice.
 
-    `adapter` names the entry in the estate's adapter table that decides model,
-    endpoint, and credentials; `argv` is the direct argv the publish node runs.
-    Null is the shipped state: no steward, template narration, no model call.
+    `adapter` names the entry in the estate's adapter table; that entry's argv
+    and env are what decide which model answers, at which endpoint, with which
+    credentials. `finalMessagePattern` is the adapter's own declared
+    final-message capture. Null is the shipped state: no steward, template
+    narration, no model call.
     """
     if value is None:
         return None
-    role = object_exact(value, {"adapter", "argv", "runtimeMaxSec"}, context)
+    role = object_exact(
+        value,
+        {"adapter", "argv", "env", "finalMessagePattern", "runtimeMaxSec"},
+        context,
+    )
     adapter = required_string(role.get("adapter"), f"{context}.adapter", 128)
     if not COMPONENT.fullmatch(adapter):
         fail(f"{context}.adapter is not a safe component")
     arguments = argv(role.get("argv"), f"{context}.argv")
+    environment = role.get("env", {})
+    if not isinstance(environment, dict):
+        fail(f"{context}.env must be an object")
+    for key, item in environment.items():
+        if not isinstance(key, str) or not ENVIRONMENT_NAME.fullmatch(key):
+            fail(f"{context}.env names must be environment identifiers")
+        if key in RESERVED_STEWARD_ENVIRONMENT:
+            fail(f"{context}.env must not set reserved variable {key}")
+        required_string(item, f"{context}.env.{key}", 4096)
+    pattern = role.get("finalMessagePattern", DEFAULT_NARRATION_PATTERN)
+    pattern = required_string(pattern, f"{context}.finalMessagePattern", 1024)
+    try:
+        compiled = re.compile(pattern)
+    except re.error as error:
+        fail(f"{context}.finalMessagePattern is not a valid regular expression: {error}")
+    if compiled.groups != 1:
+        fail(f"{context}.finalMessagePattern must declare exactly one capture group")
     runtime = role.get("runtimeMaxSec", NARRATION_DEFAULT_RUNTIME_MAX_SEC)
     if runtime is not None:
         runtime = positive_integer(runtime, f"{context}.runtimeMaxSec")
-    return {"adapter": adapter, "argv": arguments, "runtimeMaxSec": runtime}
+    return {
+        "adapter": adapter,
+        "argv": arguments,
+        "env": {key: str(item) for key, item in environment.items()},
+        "finalMessagePattern": pattern,
+        "runtimeMaxSec": runtime,
+    }
 
 
 def narration_record(value: Any, context: str) -> dict[str, Any]:
@@ -714,8 +764,13 @@ def validated_narration(value: Any) -> tuple[dict[str, str] | None, str | None]:
     for line in body.split("\n"):
         if len(line) > NARRATION_BODY_LINE_MAX:
             return None, f"body wraps past {NARRATION_BODY_LINE_MAX} columns"
-    if MANAGED_MARKER_PREFIX in header or MANAGED_MARKER_PREFIX in body:
-        return None, "proposal contains a managed campaign marker"
+    for text in (header, body):
+        if MANAGED_MARKER_PREFIX in text:
+            return None, "proposal contains a managed campaign marker"
+        if NARRATION_CLOSING_KEYWORD.search(text):
+            return None, "proposal contains a GitHub closing keyword"
+        if NARRATION_MENTION.search(text):
+            return None, "proposal contains an @mention"
     return {"subject": header, "body": body}, None
 
 
@@ -733,14 +788,29 @@ def narrate(
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     """§2's narrate slot: model proposes, validator enforces, node executes.
 
-    The steward is a plain direct argv — the estate's adapter table decides
-    which model answers and how it is reached — and its output is read the way
-    the built-in `spec-build-driver` adapter reads a final message. Two
-    validation failures spend the slot; the third message is the template, and
-    the campaign proceeds either way. The steward never runs git.
+    The steward is a plain direct argv — the estate's adapter table supplies
+    that argv and the environment it runs in, so which model answers and how it
+    is reached is an adapter change — and its output is read from the capture
+    that adapter declares, defaulting to the `spec-build-driver` adapter's own
+    final-message contract. Two validation failures spend the slot; the third
+    message is the template, and the campaign proceeds either way. The steward
+    never runs git.
+
+    The adapter's per-job launch policies, hardening preset, and writable paths
+    are deliberately not applied: this is a subprocess of the publish node, not
+    a tally job, which is what keeps the seam free of flow nodes. The module
+    refuses a steward adapter that declares any of them rather than letting the
+    estate believe they took effect.
     """
     if role is None:
         return template_narration(task), []
+    capture_pattern = re.compile(role["finalMessagePattern"])
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in RESERVED_STEWARD_ENVIRONMENT
+    }
+    environment.update(role["env"])
     transcript: list[dict[str, Any]] = []
 
     def reject(attempt: int, status: str, reason: str) -> None:
@@ -762,6 +832,7 @@ def narrate(
             check=False,
             input_text=json.dumps(payload, sort_keys=True, ensure_ascii=False),
             timeout=role["runtimeMaxSec"],
+            env=environment,
         )
         if invoked.returncode != 0:
             # The narrator's own stderr is deliberately not echoed: it can
@@ -771,11 +842,11 @@ def narrate(
             continue
         captured: str | None = None
         for line in invoked.stdout.splitlines():
-            matched = NARRATION_CAPTURE.match(line)
+            matched = capture_pattern.match(line)
             if matched:
                 captured = matched.group(1)
         if captured is None:
-            reject(attempt, "failed", "steward produced no TALLY_FINAL_MESSAGE line")
+            reject(attempt, "failed", "steward produced no final-message line")
             continue
         try:
             proposal = json.loads(captured)
@@ -5331,27 +5402,30 @@ def merge_local(
             )
         merge_commit = git(integration_checkout, "rev-parse", "HEAD").stdout.strip()
         if method == "squash":
-            # Published before the base advances: a receipt naming a commit
-            # that never reached base proves nothing, because the reader
-            # requires it to be an ancestor of the witnessed base anyway.
+            # Published before the base advances, and forced. A receipt naming
+            # a commit that never reached base proves nothing, because the
+            # reader requires it to be an ancestor of the witnessed base
+            # anyway, so the ref carries no authority that fast-forward
+            # protection would defend. It does need to be replaceable: if the
+            # base push below loses a race to a sibling lane, the next pass
+            # rebases and mints a squash with a different parent and a
+            # different oid, and a non-forced push of that oid is a
+            # non-fast-forward. Refusing it would fail the node before the base
+            # push it needs to make progress, wedging the task permanently
+            # behind a hidden ref no operator has been told about.
             receipt = merge_receipt_ref(
                 required_string(data.get("campaign"), "campaign"),
                 campaign_issue(data.get("issue"))["number"],
                 integration["taskId"],
                 task_revision(data["task"]),
             )
-            pushed = git(
+            git(
                 integration_checkout,
                 "push",
+                "--force",
                 "origin",
                 f"{merge_commit}:{receipt}",
-                check=False,
             )
-            if pushed.returncode != 0:
-                existing = local_remote_refs(config, receipt).get(receipt)
-                if existing != merge_commit:
-                    detail = pushed.stderr.strip() or pushed.stdout.strip() or "no output"
-                    fail(f"cannot publish squash merge receipt {receipt}: {detail}")
         git(
             integration_checkout,
             "push",
