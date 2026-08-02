@@ -156,6 +156,26 @@ export const meta = {
         },
         additionalProperties: false
       },
+      // How the merge node integrates a task. Absent means the campaign
+      // default, `squash`: the footprint a campaign should leave behind is one
+      // conventional commit per task, not a merge commit with a template message.
+      mergeMethod: { enum: ["merge", "squash"] },
+      // The steward bound as a catalog role. Null, or absent, is the
+      // shipped state: template narration and no model call at publication.
+      steward: {
+        type: ["object", "null"],
+        required: ["adapter", "argv"],
+        properties: {
+          adapter: { type: "string", minLength: 1, maxLength: 128 },
+          argv: {
+            type: "array",
+            minItems: 1,
+            items: { type: "string", minLength: 1, pattern: "^[^\\u0000-\\u001f\\u007f]+$" }
+          },
+          runtimeMaxSec: { type: ["integer", "null"], minimum: 1 }
+        },
+        additionalProperties: false
+      },
       agent: {
         type: "object",
         required: [
@@ -480,6 +500,7 @@ const effectiveConfigSchema = {
     "campaign",
     "repositoryConfig",
     "maxParallel",
+    "mergeMethod",
     "agent",
     "gates"
   ],
@@ -501,7 +522,9 @@ const effectiveConfigSchema = {
       additionalProperties: false
     },
     maxParallel: { type: "integer", minimum: 1, maximum: 128 },
+    mergeMethod: { enum: ["merge", "squash"] },
     agent: { type: "object" },
+    steward: { type: ["object", "null"] },
     gates: { type: "array", minItems: 1, maxItems: 16 }
   },
   additionalProperties: false
@@ -768,14 +791,55 @@ const checkpointCompletionSchema = {
   additionalProperties: false
 };
 
+// The validated publication text: what the pull request says and what the
+// squash commit will say. `source` records whether the steward authored it or
+// the deterministic template did.
+const narrationSchema = {
+  type: "object",
+  required: ["source", "subject", "body"],
+  properties: {
+    source: { enum: ["steward", "template"] },
+    subject: { type: "string", minLength: 1, maxLength: 200 },
+    body: { type: "string", maxLength: 4000 }
+  },
+  additionalProperties: false
+};
+
+// The validator transcript. Observability only: it is journaled with the
+// publish node's result and never reaches the forge.
+const narrationAttemptsSchema = {
+  type: "array",
+  maxItems: 2,
+  items: {
+    type: "object",
+    required: ["attempt", "status", "reason"],
+    properties: {
+      attempt: { type: "integer", minimum: 1, maximum: 2 },
+      status: { enum: ["accepted", "rejected", "failed"] },
+      reason: { type: ["string", "null"], maxLength: 200 }
+    },
+    additionalProperties: false
+  }
+};
+
 const publicationSchema = {
   type: "object",
-  required: ["taskId", "branch", "head", "pullRequest", "ownership"],
+  required: [
+    "taskId",
+    "branch",
+    "head",
+    "pullRequest",
+    "narration",
+    "narrationAttempts",
+    "ownership"
+  ],
   properties: {
     taskId: taskIdSchema,
     branch: { type: "string", minLength: 1 },
     head: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
     pullRequest: { type: "string", minLength: 1 },
+    narration: narrationSchema,
+    narrationAttempts: narrationAttemptsSchema,
     ownership: ownershipSchema
   },
   additionalProperties: false
@@ -789,6 +853,7 @@ const integrationSchema = {
     "branch",
     "head",
     "pullRequest",
+    "narration",
     "regate",
     "ownership"
   ],
@@ -798,6 +863,7 @@ const integrationSchema = {
     branch: { type: "string", minLength: 1 },
     head: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
     pullRequest: { type: "string", minLength: 1 },
+    narration: narrationSchema,
     regate: { type: "boolean" },
     ownership: ownershipSchema
   },
@@ -1304,7 +1370,9 @@ function sweepDeferral(sweepNode) {
         campaign: args.campaign,
         repositoryConfig: args.repositories[args.repository],
         maxParallel: args.maxParallel,
+        mergeMethod: args.mergeMethod || "squash",
         agent: diagnosisSandboxed(args.agent),
+        steward: args.steward || null,
         gates: args.gates
       };
   let sweepNode = null;
@@ -1702,6 +1770,7 @@ function sweepDeferral(sweepNode) {
         task,
         domainsRequired,
         gates: effective.gates,
+        steward: effective.steward || null,
         workspace: prepared.result,
         constraints: constraintResults
       },
@@ -1854,6 +1923,7 @@ function sweepDeferral(sweepNode) {
         workspaceRoot: args.workspaceRoot,
         task,
         domainsRequired,
+        mergeMethod: effective.mergeMethod,
         workspace: lane.prepared,
         integration: integration.result
       }),

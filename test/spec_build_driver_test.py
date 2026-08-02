@@ -191,7 +191,18 @@ class FakeGitHub:
                         return state.setdefault("issueComments", [])
                     return state.setdefault("threadComments", {}).setdefault(number, [])
 
-                if args[:2] == ["pr", "reopen"]:
+                if args[:2] == ["pr", "merge"]:
+                    # The real command both advances the base branch and flips
+                    # the pull request; onMerge stands in for the first half so
+                    # the driver's post-merge ancestry proof reads real git.
+                    import subprocess
+
+                    if state.get("onMerge"):
+                        subprocess.run(state["onMerge"], check=True)
+                    view = state.setdefault("prView", {})
+                    view["state"] = "MERGED"
+                    view["mergeCommit"] = {"oid": state.get("mergeCommitOid", "e" * 40)}
+                elif args[:2] == ["pr", "reopen"]:
                     url = args[2]
                     for candidate in state.get("pulls", []):
                         if candidate.get("url") == url:
@@ -1197,6 +1208,7 @@ class GitHubForgeTests(unittest.TestCase):
                     {"baseBranch": "main"},
                     checkout,
                     head,
+                    DRIVER.template_narration(data["task"]),
                 )
                 self.assertEqual(url, "https://github.com/acme/spec/pull/7")
                 self.assertEqual(github.state()["pulls"][0]["state"], "OPEN")
@@ -1988,12 +2000,26 @@ class NativeSubIssueTests(unittest.TestCase):
                 "head": head,
             }
             with FakeGitHub(root, state) as github:
-                DRIVER.merge_github(data, config, integration, {"subIssueWalk": True})
+                DRIVER.merge_github(
+                    data,
+                    config,
+                    integration,
+                    {"subIssueWalk": True},
+                    "merge",
+                    DRIVER.template_narration(data["task"]),
+                )
                 native = github.state()
                 self.assertEqual(native["comments"], [])
                 self.assertIn("- [ ] ", native["master"]["body"])
 
-                DRIVER.merge_github(data, config, integration, {"subIssueWalk": False})
+                DRIVER.merge_github(
+                    data,
+                    config,
+                    integration,
+                    {"subIssueWalk": False},
+                    "merge",
+                    DRIVER.template_narration(data["task"]),
+                )
                 degraded = github.state()
                 self.assertEqual(degraded["comments"], [])
                 self.assertIn(
@@ -2037,6 +2063,11 @@ class LaneLifecycleTests(unittest.TestCase):
                     "branch": stable_branch,
                     "head": published_head,
                     "pullRequest": "local://acme/spec/task-1",
+                    "narration": {
+                        "source": "template",
+                        "subject": "task-1: Task 1",
+                        "body": "",
+                    },
                     "ownership": {
                         "taskId": "task-1",
                         "domainsRequired": True,
@@ -2137,6 +2168,11 @@ class LaneLifecycleTests(unittest.TestCase):
                             "branch": stable_branch,
                             "head": published_head,
                             "pullRequest": "local://acme/spec/task-1",
+                            "narration": {
+                                "source": "template",
+                                "subject": "task-1: Task 1",
+                                "body": "",
+                            },
                             "ownership": {
                                 "taskId": "task-1",
                                 "domainsRequired": True,
@@ -2494,6 +2530,533 @@ class LaneLifecycleTests(unittest.TestCase):
                     check=False,
                 ).returncode,
                 0,
+            )
+
+
+class NarrationValidatorTests(unittest.TestCase):
+    """The narrate slot: model proposes, deterministic validator enforces."""
+
+    def test_a_conventional_proposal_is_composed_into_a_header(self) -> None:
+        narration, reason = DRIVER.validated_narration(
+            {
+                "type": "feat",
+                "scope": "campaign",
+                "subject": "add the merge method option",
+                "body": "One conventional commit per task.",
+            }
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(narration["subject"], "feat(campaign): add the merge method option")
+        self.assertEqual(narration["body"], "One conventional commit per task.")
+
+    def test_a_scopeless_proposal_keeps_the_bare_type_prefix(self) -> None:
+        narration, reason = DRIVER.validated_narration(
+            {"type": "fix", "scope": None, "subject": "stop losing the receipt"}
+        )
+        self.assertIsNone(reason)
+        self.assertEqual(narration["subject"], "fix: stop losing the receipt")
+        self.assertEqual(narration["body"], "")
+
+    def test_every_grammar_violation_is_refused_with_one_reason(self) -> None:
+        cases = {
+            "not-an-object": (["feat"], "not a JSON object"),
+            "unknown-field": (
+                {"type": "feat", "subject": "do a thing", "trailer": "Assisted-by: x"},
+                "unknown fields",
+            ),
+            "unknown-type": ({"type": "wip", "subject": "do a thing"}, "type must be one of"),
+            "bad-scope": (
+                {"type": "feat", "scope": "Campaign Core", "subject": "do a thing"},
+                "scope must be null",
+            ),
+            "empty-subject": ({"type": "feat", "subject": "   "}, "subject must be non-empty"),
+            "control-subject": (
+                {"type": "feat", "subject": "do a\tthing"},
+                "control characters",
+            ),
+            "trailing-period": (
+                {"type": "feat", "subject": "do a thing."},
+                "must not end with a period",
+            ),
+            "capitalized": (
+                {"type": "feat", "subject": "Do a thing"},
+                "must not start with a capital",
+            ),
+            "long-header": (
+                {"type": "feat", "subject": "x" * 80},
+                "over the 72 cap",
+            ),
+            "wide-body": (
+                {"type": "feat", "subject": "do a thing", "body": "y" * 120},
+                "wraps past 100 columns",
+            ),
+            "managed-marker": (
+                {
+                    "type": "feat",
+                    "subject": "do a thing",
+                    "body": "<!-- tally:spec-build:v1 campaign=fixture -->",
+                },
+                "managed campaign marker",
+            ),
+        }
+        for name, (proposal, expected) in cases.items():
+            with self.subTest(name):
+                narration, reason = DRIVER.validated_narration(proposal)
+                self.assertIsNone(narration)
+                self.assertIn(expected, reason)
+
+
+class StewardNarrationTests(unittest.TestCase):
+    """The steward runs as a plain argv and never reaches git."""
+
+    def shim(self, root: Path, name: str, body: str) -> list[str]:
+        path = root / name
+        path.write_text(f"#!{sys.executable}\n" + textwrap.dedent(body), encoding="utf-8")
+        path.chmod(0o755)
+        return [sys.executable, str(path)]
+
+    def test_no_steward_uses_the_brief_derived_template(self) -> None:
+        narration, transcript = DRIVER.narrate(None, task("task-1"), {})
+        self.assertEqual(transcript, [])
+        self.assertEqual(
+            narration,
+            {"source": "template", "subject": "task-1: Task task-1", "body": ""},
+        )
+
+    def test_an_accepted_proposal_is_read_from_the_final_message(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = self.shim(
+                root,
+                "narrate",
+                """
+                import json
+                import sys
+
+                request = json.loads(sys.stdin.read())
+                assert request["attempt"] == 1, request
+                assert request["task"]["id"] == "task-1", request
+                print("chatter the driver must ignore")
+                print("TALLY_FINAL_MESSAGE=" + json.dumps({
+                    "type": "feat",
+                    "scope": "fixture",
+                    "subject": "deliver the task",
+                    "body": "Body prose.",
+                }))
+                """,
+            )
+            narration, transcript = DRIVER.narrate(
+                {"adapter": "narrator", "argv": argv, "runtimeMaxSec": 30},
+                task("task-1"),
+                {"schemaVersion": 1, "task": {"id": "task-1"}},
+            )
+            self.assertEqual(narration["source"], "steward")
+            self.assertEqual(narration["subject"], "feat(fixture): deliver the task")
+            self.assertEqual(narration["body"], "Body prose.")
+            self.assertEqual(
+                transcript, [{"attempt": 1, "status": "accepted", "reason": None}]
+            )
+
+    def test_a_refused_proposal_is_re_requested_with_the_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = self.shim(
+                root,
+                "narrate",
+                """
+                import json
+                import sys
+
+                request = json.loads(sys.stdin.read())
+                if request["attempt"] == 1:
+                    print("TALLY_FINAL_MESSAGE=" + json.dumps({
+                        "type": "feat",
+                        "subject": "Deliver the task.",
+                    }))
+                else:
+                    assert "period" in request["previousRejection"], request
+                    print("TALLY_FINAL_MESSAGE=" + json.dumps({
+                        "type": "feat",
+                        "subject": "deliver the task",
+                    }))
+                """,
+            )
+            narration, transcript = DRIVER.narrate(
+                {"adapter": "narrator", "argv": argv, "runtimeMaxSec": 30},
+                task("task-1"),
+                {},
+            )
+            self.assertEqual(narration["source"], "steward")
+            self.assertEqual(narration["subject"], "feat: deliver the task")
+            self.assertEqual([entry["status"] for entry in transcript], ["rejected", "accepted"])
+
+    def test_two_failures_fall_back_to_the_template_and_hide_narrator_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = self.shim(
+                root,
+                "narrate",
+                """
+                import sys
+
+                sys.stdin.read()
+                print("token=super-secret endpoint=https://narrator.invalid", file=sys.stderr)
+                raise SystemExit(7)
+                """,
+            )
+            narration, transcript = DRIVER.narrate(
+                {"adapter": "narrator", "argv": argv, "runtimeMaxSec": 30},
+                task("task-1"),
+                {},
+            )
+            self.assertEqual(
+                narration,
+                {"source": "template", "subject": "task-1: Task task-1", "body": ""},
+            )
+            self.assertEqual(
+                transcript,
+                [
+                    {"attempt": 1, "status": "failed", "reason": "steward exited 7"},
+                    {"attempt": 2, "status": "failed", "reason": "steward exited 7"},
+                ],
+            )
+            for entry in transcript:
+                self.assertNotIn("secret", entry["reason"])
+                self.assertNotIn("narrator.invalid", entry["reason"])
+
+    def test_two_invalid_proposals_fall_back_to_the_template(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            argv = self.shim(
+                root,
+                "narrate",
+                """
+                import sys
+
+                sys.stdin.read()
+                print("TALLY_FINAL_MESSAGE=not json at all")
+                """,
+            )
+            narration, transcript = DRIVER.narrate(
+                {"adapter": "narrator", "argv": argv, "runtimeMaxSec": 30},
+                task("task-1"),
+                {},
+            )
+            self.assertEqual(narration["source"], "template")
+            self.assertEqual([entry["status"] for entry in transcript], ["rejected", "rejected"])
+
+
+class SquashMergeTests(unittest.TestCase):
+    """Squash integration, and the proofs that replace head ancestry."""
+
+    def integration(self, checkout: Path, branch: str, head: str) -> dict[str, object]:
+        return {
+            "taskId": "task-1",
+            "branch": branch,
+            "baseRev": git(checkout, "rev-parse", "origin/main"),
+            "head": head,
+            "pullRequest": f"local://acme/spec/{branch}",
+        }
+
+    def publish_branch(self, checkout: Path, branch: str) -> str:
+        git(checkout, "switch", "--quiet", "-c", "work", "origin/main")
+        (checkout / "delivered.txt").write_text("one\n", encoding="utf-8")
+        git(checkout, "add", "delivered.txt")
+        git(checkout, "commit", "--quiet", "-m", "wip: first")
+        (checkout / "delivered.txt").write_text("one\ntwo\n", encoding="utf-8")
+        git(checkout, "add", "delivered.txt")
+        git(checkout, "commit", "--quiet", "-m", "wip: second")
+        git(checkout, "push", "--quiet", "origin", f"HEAD:refs/heads/{branch}")
+        head = git(checkout, "rev-parse", "HEAD")
+        git(checkout, "switch", "--quiet", "main")
+        git(checkout, "fetch", "--quiet", "--prune", "origin")
+        return head
+
+    def test_local_squash_lands_one_commit_and_a_readable_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            workspace_root.mkdir()
+            revision = "sha256:" + "a" * 64
+            branch = DRIVER.stable_publish_branch("fixture", "7", "task-1", revision)
+            head = self.publish_branch(checkout, branch)
+            config = DRIVER.repo_config(repository_config(checkout))
+            data = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "issue": issue(),
+                "workspaceRoot": str(workspace_root),
+                "task": {**task("task-1"), "revision": revision},
+            }
+            narration = {
+                "source": "steward",
+                "subject": "feat(fixture): deliver the first task",
+                "body": "Steward-authored body.",
+            }
+            merge_commit = DRIVER.merge_local(
+                data,
+                config,
+                self.integration(checkout, branch, head),
+                "squash",
+                narration,
+            )
+            git(checkout, "fetch", "--quiet", "--prune", "origin")
+            base = git(checkout, "rev-parse", "origin/main")
+            self.assertEqual(base, merge_commit)
+            # One parent: a squash, not a merge commit.
+            self.assertEqual(len(git(checkout, "log", "-1", "--format=%P", base).split()), 1)
+            self.assertEqual(
+                git(checkout, "log", "-1", "--format=%B", base).strip(),
+                "feat(fixture): deliver the first task\n\nSteward-authored body.",
+            )
+            # The task head is deliberately not an ancestor of base: that is
+            # exactly why the pre-squash assertion had to be replaced.
+            self.assertNotEqual(
+                command(
+                    "git", "-C", str(checkout), "merge-base", "--is-ancestor", head, base,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            receipt = DRIVER.merge_receipt_ref("fixture", "7", "task-1", revision)
+            self.assertEqual(
+                DRIVER.local_remote_refs(config, receipt).get(receipt), merge_commit
+            )
+            facts = DRIVER.merged_local_tasks(
+                "acme/spec",
+                config,
+                "fixture",
+                "7",
+                None,
+                [{**task("task-1"), "revision": revision}],
+            )
+            self.assertEqual(
+                facts,
+                [
+                    {
+                        "taskId": "task-1",
+                        "pullRequest": f"local://acme/spec/{branch}",
+                        "mergeCommit": merge_commit,
+                        "revision": revision,
+                    }
+                ],
+            )
+
+    def test_local_merge_method_still_produces_a_merge_commit_and_no_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            workspace_root.mkdir()
+            branch = DRIVER.stable_publish_branch("fixture", "7", "task-1")
+            head = self.publish_branch(checkout, branch)
+            config = DRIVER.repo_config(repository_config(checkout))
+            data = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "issue": issue(),
+                "workspaceRoot": str(workspace_root),
+                "task": task("task-1"),
+            }
+            merge_commit = DRIVER.merge_local(
+                data,
+                config,
+                self.integration(checkout, branch, head),
+                "merge",
+                DRIVER.template_narration(task("task-1")),
+            )
+            git(checkout, "fetch", "--quiet", "--prune", "origin")
+            base = git(checkout, "rev-parse", "origin/main")
+            self.assertEqual(len(git(checkout, "log", "-1", "--format=%P", base).split()), 2)
+            self.assertEqual(
+                command(
+                    "git", "-C", str(checkout), "merge-base", "--is-ancestor", head, base,
+                    check=False,
+                ).returncode,
+                0,
+            )
+            self.assertEqual(
+                DRIVER.local_remote_refs(
+                    config, f"{DRIVER.local_state_prefix('fixture', '7')}/merge/*"
+                ),
+                {},
+            )
+            self.assertEqual(
+                [fact["mergeCommit"] for fact in DRIVER.merged_local_tasks(
+                    "acme/spec", config, "fixture", "7", None, [task("task-1")]
+                )],
+                [head],
+            )
+            self.assertNotEqual(merge_commit, head)
+
+    def github_state(
+        self, branch: str, head: str, merge_commit: str, on_merge: list[str]
+    ) -> dict[str, object]:
+        return {
+            "prView": {
+                "state": "OPEN",
+                "baseRefName": "main",
+                "headRefName": branch,
+                "headRefOid": head,
+            },
+            "mergeCommitOid": merge_commit,
+            "onMerge": on_merge,
+            "master": {
+                "body": (
+                    "<!-- tally:campaign-worklist:v1 -->\n"
+                    f"- [ ] {DRIVER.TASK_MARKER_PREFIX}task-1 -->\n"
+                    "<!-- tally:campaign-worklist:v1:end -->"
+                )
+            },
+            "comments": [],
+            "issueComments": [],
+            "calls": [],
+        }
+
+    def integration_commit(self, checkout: Path, branch: str, method: str) -> str:
+        """The commit the forge would mint, staged on a side branch."""
+        git(checkout, "switch", "--quiet", "-c", f"forge-{method}", "origin/main")
+        if method == "squash":
+            git(checkout, "merge", "--quiet", "--squash", f"origin/{branch}")
+            git(checkout, "commit", "--quiet", "-m", "feat(fixture): deliver the first task")
+        else:
+            git(checkout, "merge", "--quiet", "--no-ff", "--no-edit", f"origin/{branch}")
+        minted = git(checkout, "rev-parse", "HEAD")
+        git(checkout, "switch", "--quiet", "main")
+        return minted
+
+    def test_github_squash_passes_the_validated_message_and_proves_the_merge_commit(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, _ = initialize_repository(root, remote=True)
+            branch = DRIVER.stable_publish_branch("fixture", "7", "task-1")
+            head = self.publish_branch(checkout, branch)
+            squash = self.integration_commit(checkout, branch, "squash")
+            config = DRIVER.repo_config(repository_config(checkout, "github"))
+            data = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "issue": issue(),
+                "task": task("task-1"),
+                "workspace": {"publishBranch": branch},
+            }
+            integration = {
+                "taskId": "task-1",
+                "branch": branch,
+                "baseRev": git(checkout, "rev-parse", "origin/main"),
+                "head": head,
+                "pullRequest": "https://github.com/acme/spec/pull/1",
+            }
+            narration = {
+                "source": "steward",
+                "subject": "feat(fixture): deliver the first task",
+                "body": "Steward-authored body.",
+            }
+            state = self.github_state(
+                branch,
+                head,
+                squash,
+                ["git", "-C", str(checkout), "push", "--quiet", "origin",
+                 f"{squash}:refs/heads/main"],
+            )
+            with FakeGitHub(root, state) as github:
+                merged = DRIVER.merge_github(
+                    data, config, integration, {"subIssueWalk": True}, "squash", narration
+                )
+            self.assertEqual(merged, squash)
+            # The squash commit is on base and the task head is not: the
+            # pre-squash assertion would have failed this successful merge.
+            self.assertEqual(
+                command(
+                    "git", "-C", str(checkout), "merge-base", "--is-ancestor",
+                    squash, "origin/main", check=False,
+                ).returncode,
+                0,
+            )
+            self.assertNotEqual(
+                command(
+                    "git", "-C", str(checkout), "merge-base", "--is-ancestor",
+                    head, "origin/main", check=False,
+                ).returncode,
+                0,
+            )
+            merge_calls = [
+                call for call in github.state()["calls"] if call[:2] == ["pr", "merge"]
+            ]
+            self.assertEqual(len(merge_calls), 1)
+            self.assertIn("--squash", merge_calls[0])
+            self.assertNotIn("--merge", merge_calls[0])
+            self.assertEqual(
+                merge_calls[0][merge_calls[0].index("--subject") + 1],
+                "feat(fixture): deliver the first task",
+            )
+            self.assertEqual(
+                merge_calls[0][merge_calls[0].index("--body") + 1],
+                "Steward-authored body.",
+            )
+            self.assertEqual(
+                merge_calls[0][merge_calls[0].index("--match-head-commit") + 1], head
+            )
+
+    def test_github_merge_method_keeps_the_pre_squash_argv_and_assertion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            checkout, _ = initialize_repository(root, remote=True)
+            branch = DRIVER.stable_publish_branch("fixture", "7", "task-1")
+            head = self.publish_branch(checkout, branch)
+            minted = self.integration_commit(checkout, branch, "merge")
+            config = DRIVER.repo_config(repository_config(checkout, "github"))
+            data = {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "issue": issue(),
+                "task": task("task-1"),
+                "workspace": {"publishBranch": branch},
+            }
+            integration = {
+                "taskId": "task-1",
+                "branch": branch,
+                "baseRev": git(checkout, "rev-parse", "origin/main"),
+                "head": head,
+                "pullRequest": "https://github.com/acme/spec/pull/1",
+            }
+            state = self.github_state(
+                branch,
+                head,
+                minted,
+                ["git", "-C", str(checkout), "push", "--quiet", "origin",
+                 f"{minted}:refs/heads/main"],
+            )
+            with FakeGitHub(root, state) as github:
+                merged = DRIVER.merge_github(
+                    data,
+                    config,
+                    integration,
+                    {"subIssueWalk": True},
+                    "merge",
+                    DRIVER.template_narration(task("task-1")),
+                )
+            self.assertEqual(merged, minted)
+            merge_calls = [
+                call for call in github.state()["calls"] if call[:2] == ["pr", "merge"]
+            ]
+            self.assertEqual(
+                merge_calls,
+                [
+                    [
+                        "pr",
+                        "merge",
+                        "https://github.com/acme/spec/pull/1",
+                        "--repo",
+                        "acme/spec",
+                        "--merge",
+                        "--match-head-commit",
+                        head,
+                    ]
+                ],
             )
 
 

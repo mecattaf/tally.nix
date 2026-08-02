@@ -2749,6 +2749,34 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 json!(["task-1", "task-3"])
             );
             assert_eq!(second_value["merged"][0]["taskId"], "task-3");
+            // The campaign default is squash, so the base branch must carry a
+            // single-parent commit per merged task, not a merge commit. Every
+            // commit on main having at most one parent is the whole assertion:
+            // a `--no-ff` merge would show two.
+            fixture_git(&checkout, &["fetch", "--prune", "origin"]);
+            let parents = fixture_git(&checkout, &["log", "--format=%P", "origin/main"]);
+            assert!(
+                parents
+                    .lines()
+                    .all(|line| line.split_whitespace().count() <= 1),
+                "squash merges must leave no merge commit on base:\n{parents}"
+            );
+            // A squash leaves the task head unreachable from base, so the
+            // local read path proves merged-ness from this receipt instead.
+            let receipts = fixture_git(
+                &checkout,
+                &["ls-remote", "origin", "refs/tally/spec-build/v1/*/merge/*"],
+            );
+            assert!(
+                receipts.contains("/merge/task-3"),
+                "squash merge must publish a task-3 receipt ref:\n{receipts}"
+            );
+            // With no steward configured the narration is the brief-derived
+            // template, and it is what the squash commit says.
+            assert_eq!(
+                fixture_git(&checkout, &["log", "-1", "--format=%s", "origin/main"]),
+                "task-3: Create an independent fixture artifact"
+            );
             assert_eq!(second_value["failures"][0]["taskId"], "task-1");
             assert_eq!(second_value["failures"][0]["stage"], "ownership");
             assert_eq!(second_value["diagnoses"][0]["taskId"], "task-1");

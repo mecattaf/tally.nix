@@ -2103,11 +2103,65 @@ let
             conflict-disjoint siblings.
           '';
         };
+        mergeMethod = mkOption {
+          type = types.enum [
+            "merge"
+            "squash"
+          ];
+          default = "squash";
+          example = "merge";
+          description = ''
+            How the merge node integrates a completed task. The campaign
+            default is squash: the exposed surface a campaign should leave
+            behind is one conventional commit per task, authored at the publish
+            boundary, not a merge commit carrying a template message. Under
+            squash the merge node proves completion from the pull request's
+            merge commit rather than from the task head, which a squash never
+            makes an ancestor of the base branch.
+          '';
+        };
         agent = mkOption {
           type = types.str;
           default = "codex";
           example = "codex";
           description = "Configured adapter used by implementation and diagnosis nodes.";
+        };
+        steward = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "narrator";
+          description = ''
+            Configured adapter bound as this campaign's steward role. The
+            steward narrates at the publication boundary: it proposes the
+            conventional-commit message and pull-request prose, a deterministic
+            validator accepts or refuses that text, and the node executes git.
+            Null leaves the seam empty: publication text stays the
+            brief-derived template and no model is called. The adapter entry,
+            not this option, decides model, endpoint, and credentials.
+          '';
+        };
+        stewardArgv = mkOption {
+          type = types.listOf types.str;
+          default = [ ];
+          example = [ "--narrate" ];
+          description = ''
+            Direct argv appended to the steward adapter's own argv for the
+            narration call. The narration request arrives on stdin as JSON and
+            the proposal is read back from the adapter's final message, the
+            same `TALLY_FINAL_MESSAGE=` line the shipped spec-build-driver
+            adapter scrapes. Credentials belong in the adapter or its shim,
+            never here: this argv is rendered into the campaign brief.
+          '';
+        };
+        stewardRuntimeMaxSec = mkOption {
+          type = types.ints.positive;
+          default = 120;
+          example = 300;
+          description = ''
+            Deadline for one steward narration call. A narrator that does not
+            answer inside it counts as a failed attempt; two failures spend the
+            slot and publication falls back to the template.
+          '';
         };
         agentArgv = mkOption {
           type = types.listOf types.str;
@@ -2240,6 +2294,18 @@ let
         {
           assertion = config.agentArgv != [ ] && builtins.head config.agentArgv != "";
           message = "tally campaign ${name} agentArgv must start with a non-empty value";
+        }
+        {
+          assertion = config.steward == null || validComponent config.steward;
+          message = "tally campaign ${name} steward must be null or a safe adapter name";
+        }
+        {
+          assertion = config.steward != null || config.stewardArgv == [ ];
+          message = "tally campaign ${name} stewardArgv requires a steward adapter";
+        }
+        {
+          assertion = lib.all (item: item != "") config.stewardArgv;
+          message = "tally campaign ${name} stewardArgv must contain non-empty values";
         }
         {
           assertion = config.agentApprovalPolicy == null || config.agentApprovalPolicy != "";
@@ -3228,6 +3294,7 @@ let
     tally = lib.getExe cfg.package;
     driver = "${specBuildDriver}/bin/spec-build-driver";
     inherit (campaign) driverRuntimeMaxSec;
+    inherit (campaign) mergeMethod;
     agent = {
       adapter = campaign.agent;
       argv = campaign.agentArgv;
@@ -3237,6 +3304,20 @@ let
       sandboxPolicy = campaign.agentSandboxPolicy;
       diagnosisSandboxPolicy = campaign.agentDiagnosisSandboxPolicy;
     };
+    # The narrate slot rides the open adapter map: the campaign names a catalog
+    # role and the adapter entry supplies the argv that reaches the model, so
+    # swapping narrators is an adapter change and never a driver change. The
+    # publish node runs this argv directly, which is what keeps the seam free
+    # of flow nodes.
+    steward =
+      if campaign.steward == null then
+        null
+      else
+        {
+          adapter = campaign.steward;
+          argv = (cfg.adapters.${campaign.steward}.argv or [ ]) ++ campaign.stewardArgv;
+          runtimeMaxSec = campaign.stewardRuntimeMaxSec;
+        };
     gates = renderCampaignGates campaign.gates;
   };
 
@@ -3508,6 +3589,23 @@ let
         {
           assertion = !campaign.enable || builtins.hasAttr campaign.agent cfg.adapters;
           message = "tally campaign ${name} references unknown agent adapter ${campaign.agent}";
+        }
+        {
+          # The steward is a catalog role, so the catalog is what has to carry
+          # it. A name with no adapter entry would render an empty narration
+          # argv and silently degrade every publication to the template.
+          assertion =
+            !campaign.enable || campaign.steward == null || builtins.hasAttr campaign.steward cfg.adapters;
+          message = "tally campaign ${name} references unknown steward adapter ${toString campaign.steward}";
+        }
+        {
+          assertion =
+            !campaign.enable
+            || campaign.steward == null
+            || !(builtins.hasAttr campaign.steward cfg.adapters)
+            || (cfg.adapters.${campaign.steward}.argv or [ ]) != [ ]
+            || campaign.stewardArgv != [ ];
+          message = "tally campaign ${name} steward adapter ${toString campaign.steward} renders no narration argv; give the adapter an argv or set stewardArgv";
         }
         {
           assertion =

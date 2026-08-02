@@ -63,6 +63,41 @@ PUBLIC_REDACTIONS = frozenset({"conservative-v1", PUBLIC_REDACTION})
 PUBLIC_DIAGNOSIS_TRUNCATION = "\n[... diagnosis truncated after redaction ...]"
 LIVE_JOB_STATES = {"paused", "queued", "running"}
 PASS_RECORD_SCHEMA_VERSION = 2
+# How a campaign integrates a task. `squash` is the campaign default: §3's
+# target footprint is one conventional commit per task, and a merge commit
+# carrying a template message is not that.
+MERGE_METHODS = frozenset({"merge", "squash"})
+# The narrate slot of §2's steward duty roster. The model proposes text; this
+# commitlint-shaped grammar is what decides whether the text is used, and the
+# node — never the model — runs git.
+NARRATION_CAPTURE = re.compile(r"^TALLY_FINAL_MESSAGE=(.*)$")
+NARRATION_TYPES = frozenset(
+    {
+        "build",
+        "chore",
+        "ci",
+        "docs",
+        "feat",
+        "fix",
+        "perf",
+        "refactor",
+        "revert",
+        "style",
+        "test",
+    }
+)
+NARRATION_SCOPE = re.compile(r"^[a-z0-9][a-z0-9._/-]{0,31}$")
+NARRATION_HEADER_MAX = 72
+NARRATION_SUBJECT_MAX = 200
+NARRATION_BODY_MAX = 4_000
+NARRATION_BODY_LINE_MAX = 100
+NARRATION_REASON_MAX = 200
+NARRATION_ATTEMPTS = 2
+NARRATION_DEFAULT_RUNTIME_MAX_SEC = 120
+# Every managed campaign marker starts here. A narrator that proposes one is
+# proposing to forge campaign state, so its proposal is refused outright — the
+# same line the worklist reader holds when a body repeats a managed marker.
+MANAGED_MARKER_PREFIX = "<!-- tally:"
 
 
 class DriverError(RuntimeError):
@@ -173,6 +208,7 @@ def run(
     cwd: Path | None = None,
     check: bool = True,
     input_text: str | None = None,
+    timeout: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
     try:
         result = subprocess.run(
@@ -183,7 +219,13 @@ def run(
             input=input_text,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired:
+        # A deadline is only ever set on an advisory subprocess whose caller
+        # handles failure, so a timeout is reported as an exit status rather
+        # than as a driver fault.
+        result = subprocess.CompletedProcess(command, 124, "", "timed out")
     except OSError as error:
         fail(f"cannot execute {command[0]!r}: {error}")
     if check and result.returncode != 0:
@@ -253,6 +295,56 @@ def repo_config(value: Any) -> dict[str, Any]:
         "remote": remote,
         "forge": forge,
     }
+
+
+def merge_method(value: Any, context: str) -> str:
+    """How the merge node integrates a task, defaulting to the campaign default.
+
+    An absent value is `squash`, so a campaign brief minted before the option
+    existed integrates the way every campaign now does rather than silently
+    keeping the old merge-commit footprint.
+    """
+    if value is None:
+        return "squash"
+    method = required_string(value, context)
+    if method not in MERGE_METHODS:
+        fail(f"{context} must be merge or squash")
+    return method
+
+
+def steward_role(value: Any, context: str = "campaign steward") -> dict[str, Any] | None:
+    """The §2 steward bound as a catalog role, not as a script choice.
+
+    `adapter` names the entry in the estate's adapter table that decides model,
+    endpoint, and credentials; `argv` is the direct argv the publish node runs.
+    Null is the shipped state: no steward, template narration, no model call.
+    """
+    if value is None:
+        return None
+    role = object_exact(value, {"adapter", "argv", "runtimeMaxSec"}, context)
+    adapter = required_string(role.get("adapter"), f"{context}.adapter", 128)
+    if not COMPONENT.fullmatch(adapter):
+        fail(f"{context}.adapter is not a safe component")
+    arguments = argv(role.get("argv"), f"{context}.argv")
+    runtime = role.get("runtimeMaxSec", NARRATION_DEFAULT_RUNTIME_MAX_SEC)
+    if runtime is not None:
+        runtime = positive_integer(runtime, f"{context}.runtimeMaxSec")
+    return {"adapter": adapter, "argv": arguments, "runtimeMaxSec": runtime}
+
+
+def narration_record(value: Any, context: str) -> dict[str, Any]:
+    """A validated narration carried forward from the publish node."""
+    record = object_exact(value, {"source", "subject", "body"}, context)
+    source = required_string(record.get("source"), f"{context}.source")
+    if source not in {"steward", "template"}:
+        fail(f"{context}.source must be steward or template")
+    subject = required_string(record.get("subject"), f"{context}.subject", NARRATION_SUBJECT_MAX)
+    body = record.get("body", "")
+    if not isinstance(body, str) or len(body) > NARRATION_BODY_MAX:
+        fail(f"{context}.body must be a string of at most {NARRATION_BODY_MAX} characters")
+    if "\0" in body:
+        fail(f"{context}.body must not contain NUL bytes")
+    return {"source": source, "subject": subject, "body": body}
 
 
 def normalize_acceptance(value: Any, context: str) -> list[dict[str, Any]]:
@@ -576,6 +668,129 @@ def forge_agent(value: Any) -> dict[str, Any]:
     }
 
 
+def validated_narration(value: Any) -> tuple[dict[str, str] | None, str | None]:
+    """The commitlint-shaped grammar check on one steward proposal.
+
+    Deterministic and total: it returns either the composed conventional
+    message or exactly one reason the proposal was refused. Nothing here
+    consults a model, and no proposal reaches git without passing.
+    """
+    if not isinstance(value, dict):
+        return None, "proposal is not a JSON object"
+    unknown = sorted(set(value) - {"type", "scope", "subject", "body"})
+    if unknown:
+        return None, f"proposal has unknown fields: {', '.join(unknown)}"
+    kind = value.get("type")
+    if not isinstance(kind, str) or kind not in NARRATION_TYPES:
+        return None, "type must be one of " + ", ".join(sorted(NARRATION_TYPES))
+    scope = value.get("scope")
+    if scope is not None and (not isinstance(scope, str) or not NARRATION_SCOPE.fullmatch(scope)):
+        return None, "scope must be null or a short lowercase identifier"
+    subject = value.get("subject")
+    if not isinstance(subject, str) or not subject.strip():
+        return None, "subject must be non-empty text"
+    subject = subject.strip()
+    if any(ord(char) < 32 or ord(char) == 127 for char in subject):
+        return None, "subject contains control characters"
+    if subject.endswith("."):
+        return None, "subject must not end with a period"
+    if subject[:1].isupper():
+        return None, "subject must not start with a capital letter"
+    header = f"{kind}({scope}): {subject}" if scope else f"{kind}: {subject}"
+    if len(header) > NARRATION_HEADER_MAX:
+        return None, (
+            f"header is {len(header)} characters, over the {NARRATION_HEADER_MAX} cap"
+        )
+    body = value.get("body")
+    if body is None:
+        body = ""
+    if not isinstance(body, str):
+        return None, "body must be null or a string"
+    body = body.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if len(body) > NARRATION_BODY_MAX:
+        return None, f"body is over the {NARRATION_BODY_MAX} character cap"
+    if any(ord(char) < 32 and char != "\n" for char in body) or "\x7f" in body:
+        return None, "body contains control characters"
+    for line in body.split("\n"):
+        if len(line) > NARRATION_BODY_LINE_MAX:
+            return None, f"body wraps past {NARRATION_BODY_LINE_MAX} columns"
+    if MANAGED_MARKER_PREFIX in header or MANAGED_MARKER_PREFIX in body:
+        return None, "proposal contains a managed campaign marker"
+    return {"subject": header, "body": body}, None
+
+
+def template_narration(task: dict[str, Any]) -> dict[str, Any]:
+    """The brief-derived fallback: exactly the pre-steward publication text."""
+    return {
+        "source": "template",
+        "subject": f"{task['id']}: {task['title']}",
+        "body": "",
+    }
+
+
+def narrate(
+    role: dict[str, Any] | None, task: dict[str, Any], request: dict[str, Any]
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """§2's narrate slot: model proposes, validator enforces, node executes.
+
+    The steward is a plain direct argv — the estate's adapter table decides
+    which model answers and how it is reached — and its output is read the way
+    the built-in `spec-build-driver` adapter reads a final message. Two
+    validation failures spend the slot; the third message is the template, and
+    the campaign proceeds either way. The steward never runs git.
+    """
+    if role is None:
+        return template_narration(task), []
+    transcript: list[dict[str, Any]] = []
+
+    def reject(attempt: int, status: str, reason: str) -> None:
+        transcript.append(
+            {
+                "attempt": attempt,
+                "status": status,
+                "reason": reason[:NARRATION_REASON_MAX],
+            }
+        )
+
+    for attempt in range(1, NARRATION_ATTEMPTS + 1):
+        payload = dict(request)
+        payload["attempt"] = attempt
+        if transcript:
+            payload["previousRejection"] = transcript[-1]["reason"]
+        invoked = run(
+            role["argv"],
+            check=False,
+            input_text=json.dumps(payload, sort_keys=True, ensure_ascii=False),
+            timeout=role["runtimeMaxSec"],
+        )
+        if invoked.returncode != 0:
+            # The narrator's own stderr is deliberately not echoed: it can
+            # carry the estate's endpoint and credentials, and this transcript
+            # is quotable in a public failure receipt.
+            reject(attempt, "failed", f"steward exited {invoked.returncode}")
+            continue
+        captured: str | None = None
+        for line in invoked.stdout.splitlines():
+            matched = NARRATION_CAPTURE.match(line)
+            if matched:
+                captured = matched.group(1)
+        if captured is None:
+            reject(attempt, "failed", "steward produced no TALLY_FINAL_MESSAGE line")
+            continue
+        try:
+            proposal = json.loads(captured)
+        except json.JSONDecodeError:
+            reject(attempt, "rejected", "final message is not valid JSON")
+            continue
+        narration, reason = validated_narration(proposal)
+        if narration is None:
+            reject(attempt, "rejected", reason or "proposal is invalid")
+            continue
+        transcript.append({"attempt": attempt, "status": "accepted", "reason": None})
+        return {"source": "steward", **narration}, transcript
+    return template_narration(task), transcript
+
+
 def forge_gates(value: Any) -> list[dict[str, Any]]:
     if not isinstance(value, list) or not 1 <= len(value) <= 16:
         fail("campaign gates must contain 1..=16 entries")
@@ -647,7 +862,9 @@ def forge_manifest(
             "driverRuntimeMaxSec",
             "runtimeMaxSec",
             "pool",
+            "mergeMethod",
             "agent",
+            "steward",
             "gates",
             "tasks",
         },
@@ -679,7 +896,9 @@ def forge_manifest(
     pool = manifest.get("pool", "campaign")
     if not isinstance(pool, str) or not COMPONENT.fullmatch(pool):
         fail("campaign manifest.pool is not a safe component")
+    method = merge_method(manifest.get("mergeMethod"), "campaign manifest.mergeMethod")
     agent = forge_agent(manifest.get("agent"))
+    steward = steward_role(manifest.get("steward"), "campaign manifest.steward")
     gates = forge_gates(manifest.get("gates"))
     candidates = manifest.get("tasks")
     if not isinstance(candidates, list) or not 1 <= len(candidates) <= max_tasks:
@@ -754,7 +973,9 @@ def forge_manifest(
             "forge": repository_config["forge"],
         },
         "maxParallel": max_parallel,
+        "mergeMethod": method,
         "agent": agent,
+        "steward": steward,
         "gates": gates,
     }
     normalized_manifest = {
@@ -771,7 +992,9 @@ def forge_manifest(
         "driverRuntimeMaxSec": driver_runtime,
         "runtimeMaxSec": runtime,
         "pool": pool,
+        "mergeMethod": method,
         "agent": agent,
+        "steward": steward,
         "gates": gates,
         "tasks": references,
     }
@@ -1473,6 +1696,24 @@ def checkpoint_ref(
     return f"{local_state_prefix(campaign, issue_number)}/checkpoint/{identity}"
 
 
+def merge_receipt_ref(
+    campaign: str, issue_number: str, task_id: str, revision: str | None = None
+) -> str:
+    """Where a local-forge squash merge records the commit it produced.
+
+    A `--no-ff` merge proves itself: the published task head becomes an
+    ancestor of the base branch. A squash mints a new commit and leaves the
+    task head unreachable from base, so the local read path needs the same kind
+    of witnessed pointer the GitHub path gets for free from the pull request's
+    `mergeCommit` oid. The receipt lives in the campaign's existing hidden ref
+    namespace, is named by the same task identity as the publish branch, and
+    proves nothing on its own: the reader still requires the commit it names to
+    be an ancestor of the witnessed base.
+    """
+    suffix = "" if revision is None else "-" + revision.removeprefix("sha256:")[:16]
+    return f"{local_state_prefix(campaign, issue_number)}/merge/{task_id}{suffix}"
+
+
 def legacy_checkpoint_tag(
     campaign: str,
     issue_number: str,
@@ -1887,22 +2128,44 @@ def merged_local_tasks(
             f"{remote}/{config['baseBranch']}^{{commit}}",
         ).stdout.strip()
     facts: list[dict[str, str]] = []
-    for task in tasks:
-        if task["kind"] != "implementation":
-            continue
+    implementations = [task for task in tasks if task["kind"] == "implementation"]
+    # One listing serves every task. Squash receipts are the only merged-ness
+    # proof a squashed task leaves behind, and a campaign that switched
+    # mergeMethod between passes has tasks of both shapes at once, so both
+    # proofs are read on every pass rather than gated on the current setting.
+    receipts = (
+        local_remote_refs(config, f"{local_state_prefix(campaign, issue_number)}/merge/*")
+        if implementations
+        else {}
+    )
+    for task in implementations:
         revision = task_revision(task)
         branch = stable_publish_branch(campaign, issue_number, task["id"], revision)
-        remote_ref = f"refs/remotes/{remote}/{branch}"
-        if git(checkout, "show-ref", "--verify", "--quiet", remote_ref, check=False).returncode:
-            continue
-        head = git(checkout, "rev-parse", "--verify", f"{remote_ref}^{{commit}}").stdout.strip()
-        if git(checkout, "merge-base", "--is-ancestor", head, base_rev, check=False).returncode:
-            continue
+        merge_commit: str | None = None
+        receipt = receipts.get(merge_receipt_ref(campaign, issue_number, task["id"], revision))
+        if receipt is not None and not git(
+            checkout, "merge-base", "--is-ancestor", receipt, base_rev, check=False
+        ).returncode:
+            merge_commit = receipt
+        if merge_commit is None:
+            remote_ref = f"refs/remotes/{remote}/{branch}"
+            if git(
+                checkout, "show-ref", "--verify", "--quiet", remote_ref, check=False
+            ).returncode:
+                continue
+            head = git(
+                checkout, "rev-parse", "--verify", f"{remote_ref}^{{commit}}"
+            ).stdout.strip()
+            if git(
+                checkout, "merge-base", "--is-ancestor", head, base_rev, check=False
+            ).returncode:
+                continue
+            merge_commit = head
         facts.append(
             {
                 "taskId": task["id"],
                 "pullRequest": f"local://{repository}/{branch}",
-                "mergeCommit": head,
+                "mergeCommit": merge_commit,
                 **({"revision": revision} if revision is not None else {}),
             }
         )
@@ -4485,9 +4748,9 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
     if action == "rebase":
         allowed.update({"publication", "constraints", "domainsRequired"})
     if action == "publish":
-        allowed.update({"constraints", "domainsRequired", "gates"})
+        allowed.update({"constraints", "domainsRequired", "gates", "steward"})
     if action == "merge":
-        allowed.update({"integration", "domainsRequired"})
+        allowed.update({"integration", "domainsRequired", "mergeMethod"})
     data = object_exact(brief, allowed, f"{action} brief")
     config = repo_config(data.get("repositoryConfig"))
     workspace = object_exact(
@@ -4508,7 +4771,13 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
     return data, config, worktree
 
 
-def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: Path, head: str) -> str:
+def github_pull_request(
+    data: dict[str, Any],
+    config: dict[str, Any],
+    worktree: Path,
+    head: str,
+    narration: dict[str, Any],
+) -> str:
     repository = required_string(data.get("repository"), "repository")
     workspace = data["workspace"]
     branch = workspace["publishBranch"]
@@ -4550,8 +4819,14 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
     if isinstance(task.get("brief"), dict):
         task_issue = campaign_issue(task["brief"].get("issue"))
         closes = f"\n\nCloses #{task_issue['number']}"
+    # Steward prose leads; the managed marker and the campaign's own identity
+    # lines are appended by this node and are never model-authored. With no
+    # steward the narration is the template and this body is byte-identical to
+    # the pre-steward one.
+    prose = f"{narration['body']}\n\n" if narration["body"] else ""
     body = (
         f"{marker}\n"
+        f"{prose}"
         f"Spec-build campaign progress for {repository}#{issue['number']}.\n\n"
         f"Task `{task['id']}`: {task['title']}\n\n"
         f"Task ref: `{task_ref}`\n\n"
@@ -4571,7 +4846,7 @@ def github_pull_request(data: dict[str, Any], config: dict[str, Any], worktree: 
             "--head",
             branch,
             "--title",
-            f"{task['id']}: {task['title']}",
+            narration["subject"],
             "--body",
             body,
         ],
@@ -4623,8 +4898,48 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         constraints,
     )
     git(worktree, "push", config["remote"], f"HEAD:refs/heads/{publish_branch}")
+    # The publish node is the crossing point between the two surfaces (§3), so
+    # it is where the steward narrates. Everything it is given is already
+    # public or about to be: the task brief, the shape of the diff, and the
+    # campaign's own identifiers. The narration governs the pull request text
+    # here and the squash commit message at the merge node.
+    task = data["task"]
+    steward = steward_role(data.get("steward"))
+    request = (
+        {}
+        if steward is None
+        else {
+            "schemaVersion": 1,
+            "mission": (
+                "Propose the conventional-commit message and pull-request prose for one "
+                "completed campaign task. Reply with a single line of the form "
+                "TALLY_FINAL_MESSAGE=<json>, where <json> is an object with the keys "
+                "type, scope, subject, and body. Text only: you are not running git."
+            ),
+            "campaign": required_string(data.get("campaign"), "campaign"),
+            "task": {
+                "id": task["id"],
+                "title": task["title"],
+                "goal": task.get("goal"),
+                "brief": (task.get("brief") or {}).get("body")
+                if isinstance(task.get("brief"), dict)
+                else None,
+                "conflictDomains": task.get("conflictDomains", []),
+            },
+            "diffStat": git(
+                worktree, "diff", "--stat", f"{base_rev}..{head}"
+            ).stdout[:MAX_RETRY_CHARS],
+            "grammar": {
+                "types": sorted(NARRATION_TYPES),
+                "headerMaxChars": NARRATION_HEADER_MAX,
+                "bodyMaxChars": NARRATION_BODY_MAX,
+                "bodyMaxColumns": NARRATION_BODY_LINE_MAX,
+            },
+        }
+    )
+    narration, transcript = narrate(steward, task, request)
     if config["forge"] == "github":
-        pull_request = github_pull_request(data, config, worktree, head)
+        pull_request = github_pull_request(data, config, worktree, head, narration)
     else:
         pull_request = f"local://{data['repository']}/{publish_branch}"
     return {
@@ -4632,13 +4947,27 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         "branch": publish_branch,
         "head": head,
         "pullRequest": pull_request,
+        "narration": narration,
+        "narrationAttempts": transcript,
         "ownership": ownership,
     }
 
 
 def publication(value: Any, context: str = "publication") -> dict[str, Any]:
     item = object_exact(
-        value, {"taskId", "branch", "head", "pullRequest", "ownership"}, context
+        value,
+        {
+            "taskId",
+            "branch",
+            "head",
+            "pullRequest",
+            "narration",
+            # Observability only: the validator transcript is journaled with the
+            # publish node's result and is deliberately not carried onward.
+            "narrationAttempts",
+            "ownership",
+        },
+        context,
     )
     task_id = required_string(item.get("taskId"), f"{context}.taskId")
     if not TASK_ID.fullmatch(task_id):
@@ -4656,6 +4985,7 @@ def publication(value: Any, context: str = "publication") -> dict[str, Any]:
         "pullRequest": required_string(
             item.get("pullRequest"), f"{context}.pullRequest"
         ),
+        "narration": narration_record(item.get("narration"), f"{context}.narration"),
         "ownership": ownership,
     }
 
@@ -4733,6 +5063,7 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
             "branch": published["branch"],
             "head": local_head,
             "pullRequest": published["pullRequest"],
+            "narration": published["narration"],
             "regate": False,
             "ownership": ownership,
         }
@@ -4803,6 +5134,7 @@ def action_rebase(brief: dict[str, Any]) -> dict[str, Any]:
         "branch": published["branch"],
         "head": rebased_head,
         "pullRequest": published["pullRequest"],
+        "narration": published["narration"],
         "regate": True,
         "ownership": ownership,
     }
@@ -4929,7 +5261,20 @@ def action_cleanup(brief: dict[str, Any]) -> dict[str, Any]:
     return {"taskId": task_id, "cleaned": True}
 
 
-def merge_local(data: dict[str, Any], config: dict[str, Any], integration: dict[str, Any]) -> str:
+def merge_commit_message(narration: dict[str, Any]) -> str:
+    """The validated message the node writes. The model never runs git."""
+    if narration["body"]:
+        return f"{narration['subject']}\n\n{narration['body']}\n"
+    return f"{narration['subject']}\n"
+
+
+def merge_local(
+    data: dict[str, Any],
+    config: dict[str, Any],
+    integration: dict[str, Any],
+    method: str,
+    narration: dict[str, Any],
+) -> str:
     checkout: Path = config["checkout"]
     remote_url = git(checkout, "remote", "get-url", config["remote"]).stdout.strip()
     workspace_root = Path(data["workspaceRoot"])
@@ -4957,14 +5302,56 @@ def merge_local(data: dict[str, Any], config: dict[str, Any], integration: dict[
         if actual_head != integration["head"]:
             fail("published branch moved after the rebased head was gated")
         git(integration_checkout, "switch", "-C", config["baseBranch"], actual_base)
-        git(
-            integration_checkout,
-            "merge",
-            "--no-ff",
-            "--no-edit",
-            f"origin/{integration['branch']}",
-        )
+        if method == "squash":
+            git(
+                integration_checkout,
+                "merge",
+                "--squash",
+                f"origin/{integration['branch']}",
+            )
+            if not git(
+                integration_checkout, "diff", "--cached", "--quiet", check=False
+            ).returncode:
+                fail("squash merge staged no change against the witnessed base")
+            git(
+                integration_checkout,
+                "commit",
+                "--quiet",
+                "--file",
+                "-",
+                input_text=merge_commit_message(narration),
+            )
+        else:
+            git(
+                integration_checkout,
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                f"origin/{integration['branch']}",
+            )
         merge_commit = git(integration_checkout, "rev-parse", "HEAD").stdout.strip()
+        if method == "squash":
+            # Published before the base advances: a receipt naming a commit
+            # that never reached base proves nothing, because the reader
+            # requires it to be an ancestor of the witnessed base anyway.
+            receipt = merge_receipt_ref(
+                required_string(data.get("campaign"), "campaign"),
+                campaign_issue(data.get("issue"))["number"],
+                integration["taskId"],
+                task_revision(data["task"]),
+            )
+            pushed = git(
+                integration_checkout,
+                "push",
+                "origin",
+                f"{merge_commit}:{receipt}",
+                check=False,
+            )
+            if pushed.returncode != 0:
+                existing = local_remote_refs(config, receipt).get(receipt)
+                if existing != merge_commit:
+                    detail = pushed.stderr.strip() or pushed.stdout.strip() or "no output"
+                    fail(f"cannot publish squash merge receipt {receipt}: {detail}")
         git(
             integration_checkout,
             "push",
@@ -4979,6 +5366,8 @@ def merge_github(
     config: dict[str, Any],
     integration: dict[str, Any],
     capabilities: dict[str, bool],
+    method: str,
+    narration: dict[str, Any],
 ) -> str:
     repository = required_string(data.get("repository"), "repository")
     url = required_string(integration.get("pullRequest"), "integration.pullRequest")
@@ -5012,19 +5401,24 @@ def merge_github(
     if state.get("headRefOid") != integration["head"]:
         fail(f"pull request {url} changed head commit before merge")
     if state.get("state") != "MERGED":
-        run(
-            [
-                "gh",
-                "pr",
-                "merge",
-                url,
-                "--repo",
-                repository,
-                "--merge",
-                "--match-head-commit",
-                integration["head"],
-            ]
-        )
+        command = [
+            "gh",
+            "pr",
+            "merge",
+            url,
+            "--repo",
+            repository,
+            f"--{method}",
+            "--match-head-commit",
+            integration["head"],
+        ]
+        if method == "squash":
+            # The squash message is the validated narration, passed explicitly
+            # rather than left to whatever GitHub would assemble from the
+            # working commits. `--body` is sent even when empty so the default
+            # commit-list body is never substituted.
+            command += ["--subject", narration["subject"], "--body", narration["body"]]
+        run(command)
         viewed = run(
             ["gh", "pr", "view", url, "--repo", repository, "--json", "state,mergeCommit"]
         )
@@ -5033,18 +5427,30 @@ def merge_github(
         fail(f"pull request {url} did not reach MERGED")
     merge_commit = (state.get("mergeCommit") or {}).get("oid")
     merge_commit = required_string(merge_commit, "pull request merge commit")
+    if method == "squash":
+        full_git_oid(merge_commit, "pull request merge commit")
     git(checkout, "fetch", "--prune", config["remote"])
+    # A squash mints a commit whose parent is the base tip, so the task head it
+    # replaced is never an ancestor of the base and the pre-squash assertion
+    # would fail on every successful merge. The merge commit itself is the
+    # squash-compatible proof, and it is the same oid the read path already
+    # validates against the witnessed base.
+    contained = merge_commit if method == "squash" else integration["head"]
     if (
         git(
             checkout,
             "merge-base",
             "--is-ancestor",
-            integration["head"],
+            contained,
             f"{config['remote']}/{config['baseBranch']}",
             check=False,
         ).returncode
         != 0
     ):
+        if method == "squash":
+            fail(
+                f"current remote base does not contain squash merge commit {merge_commit}"
+            )
         fail("current remote base does not contain the merged task head")
     if not capabilities["subIssueWalk"]:
         github_merge_checkbox_repair(data)
@@ -5349,11 +5755,14 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
             "branch",
             "head",
             "pullRequest",
+            "narration",
             "regate",
             "ownership",
         },
         "integration",
     )
+    method = merge_method(data.get("mergeMethod"), "mergeMethod")
+    narration = narration_record(integration.get("narration"), "integration.narration")
     # The campaign's own parallelism decides whether domains are required. The
     # receipt carries an upstream copy of that bit, and merge is the last node
     # that can still refuse to act on it, so the two are compared here rather
@@ -5381,9 +5790,9 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
     if integration["branch"] != data["workspace"]["publishBranch"]:
         fail("integration.branch does not match workspace.publishBranch")
     if config["forge"] == "github":
-        merge_commit = merge_github(data, config, integration, capabilities)
+        merge_commit = merge_github(data, config, integration, capabilities, method, narration)
     else:
-        merge_commit = merge_local(data, config, integration)
+        merge_commit = merge_local(data, config, integration, method, narration)
     return {
         "taskId": task_id,
         "head": head,

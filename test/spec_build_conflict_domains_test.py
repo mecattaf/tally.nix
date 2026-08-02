@@ -95,7 +95,8 @@ class ConflictDomainSemanticsTests(unittest.TestCase):
         self.assertIn("two:\"changelog.md\" overlaps one:\"CHANGELOG.md\"", warnings[0])
 
 
-class PublicationConflictDomainTests(unittest.TestCase):
+class PublicationHarness(unittest.TestCase):
+    """One published lane on a local forge, shared by the publication suites."""
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
@@ -229,6 +230,9 @@ class PublicationConflictDomainTests(unittest.TestCase):
         )
         self.assertNotEqual(result.returncode, 0)
 
+
+
+class PublicationConflictDomainTests(PublicationHarness):
     def test_directory_and_exact_file_domains_admit_owned_changes(self) -> None:
         contact = self.checkout / "internal/contacts/model.go"
         contact.parent.mkdir(parents=True)
@@ -388,6 +392,11 @@ class PublicationConflictDomainTests(unittest.TestCase):
                     "branch": self.publish_branch,
                     "head": published_head,
                     "pullRequest": f"local://acme/spec/{self.publish_branch}",
+                    "narration": {
+                        "source": "template",
+                        "subject": "conflict-domain: Conflict domain",
+                        "body": "",
+                    },
                     "ownership": {
                         "taskId": "conflict-domain",
                         "domainsRequired": True,
@@ -765,6 +774,136 @@ class PublicationConflictDomainTests(unittest.TestCase):
         self.assertFalse(published["ownership"]["domainsRequired"])
         self.assertEqual(published["ownership"]["conflictDomains"], [])
         self.assertEqual(published["ownership"]["ownedPaths"], ["internal/cli/root.go"])
+
+
+class PublicationNarrationTests(PublicationHarness):
+    """The publish node is where the steward narrates, and where it cannot."""
+
+    def shim(self, name: str, body: str) -> list[str]:
+        import sys
+        import textwrap
+
+        path = self.root / name
+        path.write_text(f"#!{sys.executable}\n" + textwrap.dedent(body), encoding="utf-8")
+        path.chmod(0o755)
+        return [sys.executable, str(path)]
+
+    def deliver(self) -> str:
+        (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+        return self.commit("wip: whatever the coder called it")
+
+    def merge_squash(self, published: dict[str, Any], head: str) -> str:
+        config = driver.repo_config(self.brief()["repositoryConfig"])
+        return driver.merge_local(
+            {
+                "campaign": "fixture",
+                "repository": "acme/spec",
+                "issue": self.brief()["issue"],
+                "workspaceRoot": str(self.root / "workspaces"),
+                "task": task("conflict-domain", ["README.md"]),
+            },
+            config,
+            {
+                "taskId": "conflict-domain",
+                "branch": self.publish_branch,
+                "baseRev": self.base_rev,
+                "head": head,
+                "pullRequest": published["pullRequest"],
+            },
+            "squash",
+            published["narration"],
+        )
+
+    def test_a_witnessed_publish_carries_steward_text_into_the_squash_commit(self) -> None:
+        head = self.deliver()
+        brief = self.publish_brief(["README.md"])
+        brief["steward"] = {
+            "adapter": "narrator",
+            "argv": self.shim(
+                "narrate",
+                """
+                import json
+                import sys
+
+                request = json.loads(sys.stdin.read())
+                assert request["task"]["id"] == "conflict-domain", request
+                assert "README.md" in request["diffStat"], request
+                print("TALLY_FINAL_MESSAGE=" + json.dumps({
+                    "type": "feat",
+                    "scope": "readme",
+                    "subject": "record the delivered behavior",
+                    "body": "Narrated by the steward, executed by the node.",
+                }))
+                """,
+            ),
+            "runtimeMaxSec": 30,
+        }
+
+        published = driver.action_publish(brief)
+
+        self.assertEqual(published["narration"]["source"], "steward")
+        self.assertEqual(
+            published["narration"]["subject"], "feat(readme): record the delivered behavior"
+        )
+        # The validator transcript is observable in the node's own result.
+        self.assertEqual(
+            published["narrationAttempts"],
+            [{"attempt": 1, "status": "accepted", "reason": None}],
+        )
+
+        merge_commit = self.merge_squash(published, head)
+        self.assertEqual(
+            git("--git-dir", str(self.remote), "log", "-1", "--format=%B", merge_commit).strip(),
+            "feat(readme): record the delivered behavior\n\n"
+            "Narrated by the steward, executed by the node.",
+        )
+        self.assertEqual(
+            len(
+                git(
+                    "--git-dir", str(self.remote), "log", "-1", "--format=%P", merge_commit
+                ).split()
+            ),
+            1,
+        )
+
+    def test_a_dead_narrator_falls_back_to_the_template_and_the_lane_proceeds(self) -> None:
+        head = self.deliver()
+        brief = self.publish_brief(["README.md"])
+        brief["steward"] = {
+            "adapter": "narrator",
+            "argv": self.shim(
+                "narrate",
+                """
+                import sys
+
+                sys.stdin.read()
+                print("upstream refused the request", file=sys.stderr)
+                raise SystemExit(1)
+                """,
+            ),
+            "runtimeMaxSec": 30,
+        }
+
+        published = driver.action_publish(brief)
+
+        self.assertEqual(published["narration"]["source"], "template")
+        self.assertEqual(
+            published["narration"]["subject"], "conflict-domain: Implement conflict-domain"
+        )
+        self.assertEqual(
+            [entry["status"] for entry in published["narrationAttempts"]],
+            ["failed", "failed"],
+        )
+        # The lane proceeds: the branch is published and the squash still lands.
+        self.assertEqual(
+            git("--git-dir", str(self.remote), "rev-parse", f"refs/heads/{self.publish_branch}"),
+            head,
+        )
+        merge_commit = self.merge_squash(published, head)
+        self.assertEqual(
+            git("--git-dir", str(self.remote), "log", "-1", "--format=%s", merge_commit),
+            "conflict-domain: Implement conflict-domain",
+        )
 
 
 if __name__ == "__main__":

@@ -872,6 +872,63 @@ again. Thus concurrent implementation does not weaken “witnessed gates are the
 merge criterion." A dependent task cannot enter any frontier until its
 prerequisite PR is observed merged by a later pass.
 
+### Squash merges and the steward's narration
+
+`mergeMethod` decides how the merge node integrates a task, and the campaign
+default is `squash`. The footprint a campaign should leave on the forge is one
+conventional commit per task, not a merge commit carrying a template message.
+Under `merge` the driver runs `gh pr merge --merge --match-head-commit <head>`
+and proves completion by requiring the task head to be an ancestor of current
+base. A squash never makes the task head an ancestor of anything, so under
+`squash` the driver runs `gh pr merge --squash --match-head-commit <head>
+--subject <subject> --body <body>` and proves completion from the pull request
+instead: state `MERGED`, a full merge-commit object ID, and that merge commit
+contained in current remote base. That is the same oid the reconcile read path
+already validates against the witnessed base, so the read path needed no
+change.
+
+On a `forge = "local"` campaign the merge node runs `git merge --squash`
+followed by one commit on base carrying the validated message. A squash leaves
+no ancestry a later pass could read, so the node also publishes a receipt ref
+under the campaign's hidden state namespace naming the commit it produced.
+Reconciliation reads both proofs on every pass — branch-head ancestry and the
+receipt — so a campaign whose `mergeMethod` changed between passes still sees
+its earlier merges. A receipt proves nothing on its own: the reader still
+requires the commit it names to be an ancestor of the witnessed base.
+
+The message that squash commit carries comes from the steward. `steward` names
+an adapter in the open adapter map, bound as a catalog role; `stewardArgv` is
+appended to that adapter's own argv, and the result is the direct argv the
+publish node runs. The adapter entry — never the campaign option, and never the
+brief — decides model, endpoint, and credentials. The publish node writes a
+JSON narration request on the narrator's stdin and reads its proposal back from
+a `TALLY_FINAL_MESSAGE=` line, the same final-message contract the shipped
+`spec-build-driver` adapter scrapes. The proposal is text only: an object with
+`type`, `scope`, `subject`, and `body`.
+
+A deterministic, commitlint-shaped validator then decides whether that text is
+used. It requires a conventional type from a fixed set, an optional short
+lowercase scope, a `type(scope): subject` header of at most 72 characters with
+no trailing period and no leading capital, a body under 4000 characters wrapped
+at 100 columns, no control characters, and no managed campaign marker anywhere.
+A refused proposal is re-requested once with the refusal reason attached. A
+second refusal — or a narrator that exits nonzero, misses its deadline, or
+prints no final message — spends the slot, and publication falls back to the
+brief-derived template. The campaign proceeds either way; narration never
+blocks a merge. The model proposes, the validator enforces, and the node runs
+git. The narrator is never given git.
+
+The narration governs the pull-request title and the prose above the managed
+marker at publication, and the squash commit's subject and body at merge. A
+pass that reuses an already-open pull request leaves that pull request's text
+alone — it was authored by the pass that opened it and carries the campaign's
+identity marker — so on a re-published task the freshly narrated message
+reaches the squash commit and not the pull request. It
+adds no flow node: the publish node runs the narrator itself, so a campaign's
+node budget is the same with a steward as without one. With no steward
+configured the narration is the template, and the published text is byte for
+byte what it was before the seam existed.
+
 If the published head conflicts with current base, the driver aborts the rebase
 and deletes only that exact leased remote head. Pass-exit cleanup removes the
 failed lane. The next reconcile attempt therefore prepares the task from

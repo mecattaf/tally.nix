@@ -121,9 +121,27 @@ struct CampaignManifest {
     runtime_max_sec: Option<u64>,
     #[serde(default = "default_runner_pool")]
     pool: String,
+    /// How the merge node integrates a task. Squash is the campaign default:
+    /// the exposed footprint is one conventional commit per task, and a merge
+    /// commit carrying a template message is not that.
+    #[serde(default = "default_merge_method")]
+    merge_method: String,
     agent: CampaignAgent,
+    /// The steward bound as a catalog role. Absent leaves the narrate slot
+    /// empty: publication text stays the brief-derived template.
+    #[serde(default)]
+    steward: Option<CampaignSteward>,
     gates: Vec<CampaignGate>,
     tasks: Vec<CampaignTaskReference>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CampaignSteward {
+    adapter: String,
+    argv: Vec<String>,
+    #[serde(default)]
+    runtime_max_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +285,10 @@ const fn default_driver_runtime_max_sec() -> u64 {
 
 const fn default_campaign_runtime_max_sec() -> Option<u64> {
     Some(86_400)
+}
+
+fn default_merge_method() -> String {
+    "squash".to_owned()
 }
 
 fn default_runner_pool() -> String {
@@ -845,7 +867,23 @@ fn validate_manifest(manifest: &CampaignManifest) -> Result<()> {
     if !safe_component(&manifest.pool) {
         return Err(invalid("campaign pool is not a safe component"));
     }
+    if !matches!(manifest.merge_method.as_str(), "merge" | "squash") {
+        return Err(invalid("campaign mergeMethod must be merge or squash"));
+    }
     validate_agent(&manifest.agent)?;
+    if let Some(steward) = &manifest.steward {
+        if !safe_component(&steward.adapter) {
+            return Err(invalid("campaign steward adapter is not a safe component"));
+        }
+        if steward.argv.is_empty() || steward.argv.iter().any(|item| item.is_empty()) {
+            return Err(invalid(
+                "campaign steward argv must be non-empty and contain no empty values",
+            ));
+        }
+        if steward.runtime_max_sec == Some(0) {
+            return Err(invalid("campaign steward runtimeMaxSec must be positive"));
+        }
+    }
     validate_gates(&manifest.gates)?;
     if manifest.tasks.is_empty() || manifest.tasks.len() > manifest.max_tasks {
         return Err(invalid(format!(
@@ -1350,11 +1388,18 @@ fn validate_host(
             graph.manifest.pool
         )));
     }
-    for adapter in [
+    let mut required_adapters = vec![
         "shell",
         "spec-build-driver",
         graph.manifest.agent.adapter.as_str(),
-    ] {
+    ];
+    // The steward is bound as a catalog role, so arming refuses a campaign
+    // whose narrator names an adapter this host does not configure rather than
+    // degrading every publication to the template at run time.
+    if let Some(steward) = &graph.manifest.steward {
+        required_adapters.push(steward.adapter.as_str());
+    }
+    for adapter in required_adapters {
         if !config.adapters.contains_key(adapter) {
             return Err(invalid(format!(
                 "forge-native campaigns require configured adapter {adapter:?}"
@@ -3537,6 +3582,55 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn manifest_defaults_to_squash_with_no_steward_and_refuses_other_methods() {
+        // The campaign default is squash on both sides of the seam: the Nix
+        // module renders it into the brief and a forge-native manifest that
+        // names nothing gets the same integration.
+        let tasks = json!([{ "id": "task-1", "kind": "implementation", "issue": 8 }]);
+        let manifest: CampaignManifest =
+            serde_json::from_value(manifest_value_for_test(tasks.clone())).unwrap();
+        assert_eq!(manifest.merge_method, "squash");
+        assert!(manifest.steward.is_none());
+        validate_manifest(&manifest).unwrap();
+
+        let mut value = manifest_value_for_test(tasks.clone());
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("mergeMethod".into(), json!("rebase"));
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        let error = validate_manifest(&manifest).unwrap_err().to_string();
+        assert!(
+            error.contains("mergeMethod must be merge or squash"),
+            "{error}"
+        );
+
+        let mut value = manifest_value_for_test(tasks);
+        let object = value.as_object_mut().unwrap();
+        object.insert("mergeMethod".into(), json!("merge"));
+        object.insert(
+            "steward".into(),
+            json!({"adapter": "narrator", "argv": ["narrate", "--json"]}),
+        );
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        validate_manifest(&manifest).unwrap();
+        assert_eq!(manifest.merge_method, "merge");
+        assert_eq!(manifest.steward.as_ref().unwrap().adapter, "narrator");
+
+        // An empty narration argv would render a steward that cannot be run.
+        let mut value = manifest_value_for_test(json!([
+            { "id": "task-1", "kind": "implementation", "issue": 8 }
+        ]));
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("steward".into(), json!({"adapter": "narrator", "argv": []}));
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        let error = validate_manifest(&manifest).unwrap_err().to_string();
+        assert!(error.contains("steward argv must be non-empty"), "{error}");
     }
 
     #[test]
