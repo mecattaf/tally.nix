@@ -380,7 +380,22 @@ impl Executor {
                 lease_epoch: request.lease_epoch,
             });
         }
-        let paths = self.prepare_paths(&request.identity)?;
+        // `prepare_paths` takes the capture lock, and `execute_raw` runs under
+        // `spawn_local` on the daemon's single-threaded runtime. A contended
+        // lock sleeps for the whole deadline, which inline would park the one
+        // thread that answers RPCs and fires timers. The blocking pool is where
+        // every other capture-file wait in the daemon already lives.
+        let paths = {
+            let executor = self.clone();
+            let identity = request.identity.clone();
+            tokio::task::spawn_blocking(move || executor.prepare_paths(&identity))
+                .await
+                .map_err(|error| {
+                    ExecutorError::InvalidRequest(format!(
+                        "capture preparation worker failed: {error}"
+                    ))
+                })??
+        };
         write_capture_generation(
             &paths.capture_generation,
             CaptureGeneration {

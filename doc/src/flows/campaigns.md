@@ -375,8 +375,11 @@ once, without widening external campaign admission.
 accumulate several receipts. `postFailureStderr` requires it and adds only the
 bounded, conservatively redacted tail. The receipt states how much redaction
 removed: `stderrRedacted` says whether anything was dropped and
-`stderrRedactions` counts the replacements, so one dropped token reads
-differently from forty dropped lines. Redaction cannot recognize every
+`stderrRedactions` counts the replacements *in the published tail*, so one
+dropped token reads differently from forty dropped lines. When
+`stderrTruncated` is also true the head of the tail was dropped for length, and
+any redaction that fell in the dropped head is not counted — the number always
+describes the text in front of you. Redaction cannot recognize every
 application secret; leave both defaults off for a public repository unless the
 publication policy has been deliberately reviewed. Both the mention and
 pass-continuation producers inherit these settings.

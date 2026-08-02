@@ -324,6 +324,11 @@ impl Daemon {
                     )
                 }
             }
+            // A dispatch that never got the capture lock never ran the job, so
+            // there is no execution for a gate manifest to describe. Evaluating
+            // one would stamp a failed execution fact onto an attempt the agent
+            // never started.
+            (Some(_), Some(Err(error))) if undispatched_execution(error) => None,
             (Some(spec), Some(Err(error))) => {
                 let reason = match error {
                     ExecutorError::GitAiRequired(reason) => reason.clone(),
@@ -395,6 +400,22 @@ impl Daemon {
                     | ExecutorError::RemoteExecution { .. }
                     | ExecutorError::RemoteProtocol { .. }),
                 )) => return Err(error.into()),
+                // The capture lock was busy for the whole deadline, so the unit
+                // was never launched. Attributing that to the agent burns an
+                // attempt, writes a `Failed` witness, and — with
+                // `postFailureEvidence` on — posts a public failure receipt with
+                // no evidence in it, for a daemon-side file-locking condition.
+                // `Preempted` is the existing verdict for "the attempt did not
+                // get to run": it is excluded from canonical GPU seconds, emits
+                // a `Preempted` lifecycle event rather than a failure one, and
+                // carries a `ResourceReturn` retry trigger.
+                Some(Err(error @ ExecutorError::CaptureLockContended { .. })) => {
+                    eprintln!(
+                        "tally: capture lock for {} was contended, so the attempt never ran: {error}",
+                        job.stable_key()
+                    );
+                    (Verdict::Preempted, 1, None, None, Vec::new())
+                }
                 Some(Err(error)) => {
                     eprintln!("tally: executor failed for {}: {error}", job.stable_key());
                     (Verdict::Failed, 1, None, None, Vec::new())
@@ -936,4 +957,14 @@ fn recovery_action_task_uuid(action: &RecoveryAction) -> Option<Uuid> {
             ..
         } => None,
     }
+}
+
+/// Did the executor fail before the job could start?
+///
+/// A contended capture lock is the one executor error that means "the daemon
+/// could not prepare this dispatch", not "the work went wrong". It must not be
+/// attributed to the agent, and there is no execution for a gate manifest to
+/// describe.
+const fn undispatched_execution(error: &ExecutorError) -> bool {
+    matches!(error, ExecutorError::CaptureLockContended { .. })
 }
