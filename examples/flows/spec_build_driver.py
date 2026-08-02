@@ -3979,8 +3979,8 @@ def normalize_forbid_paths_gate(value: Any, context: str) -> dict[str, Any]:
     return {"kind": "forbidPaths", "id": gate_id, "forbidPaths": patterns}
 
 
-def reject_merge_commits(worktree: Path, base_rev: str, head: str) -> None:
-    """A merge commit in a task lane makes the whole mainline look authored.
+def reject_merge_commits(worktree: Path, union_base: str, head: str) -> None:
+    """A merge commit a lane authored makes the whole mainline look authored.
 
     The path union walks lane history with `git log -m`, which splits a merge
     and attributes both sides to the lane. A lane that merged the base branch
@@ -3990,13 +3990,21 @@ def reject_merge_commits(worktree: Path, base_rev: str, head: str) -> None:
     nobody in the task touched. `--first-parent` would hide the false positive
     and reopen the transient-path hole with it, so the lane is rejected by its
     real cause instead.
+
+    The range this reads is the union range, which starts at the base branch
+    commit the lane actually sits on. Every campaign merge is `--no-ff`, so a
+    base branch that has integrated anything is itself full of merge commits; a
+    lane that rebases onto it — the documented remediation — inherits them. A
+    range starting at the stale prepared base would contain those inherited
+    merges and reject the lane for doing exactly what the steering text tells
+    it to do.
     """
     listed = git(
         worktree,
         "rev-list",
         "--merges",
         "--end-of-options",
-        f"{base_rev}..{head}",
+        f"{union_base}..{head}",
         "--",
     ).stdout.split()
     if not listed:
@@ -4010,48 +4018,87 @@ def reject_merge_commits(worktree: Path, base_rev: str, head: str) -> None:
     )
 
 
-def resolved_union_base(
-    worktree: Path, base_rev: str, head: str, base_ref: str | None
+def current_base_revision(worktree: Path, config: dict[str, Any]) -> str:
+    """The base branch tip, taken from the forge rather than from a local ref.
+
+    A lane worktree is a linked worktree of the campaign checkout, so
+    `refs/remotes/<remote>/<baseBranch>` lives in the shared common Git
+    directory and anything running in the lane can write it — including the
+    agent whose ownership is about to be validated. Pointing it at the lane
+    head would collapse the union to nothing and make every declared domain
+    vacuously satisfied, which is the one thing the conflict-domain boundary
+    exists to prevent.
+
+    The fetch is therefore the read: `FETCH_HEAD` is per-worktree, this node is
+    the only thing running in the lane, and the value comes off the wire rather
+    than out of a ref an agent can reach. It also brings the objects needed to
+    reason about the base branch at all.
+    """
+    remote = config["remote"]
+    base_branch = config["baseBranch"]
+    fetched = git(
+        worktree,
+        "fetch",
+        "--no-tags",
+        "--end-of-options",
+        remote,
+        f"refs/heads/{base_branch}",
+        check=False,
+    )
+    if fetched.returncode != 0:
+        detail = fetched.stderr.strip() or fetched.stdout.strip() or "no output"
+        fail(f"cannot read base branch {base_branch!r} from {remote!r}: {detail}")
+    return full_git_oid(
+        git(worktree, "rev-parse", "--verify", "FETCH_HEAD^{commit}").stdout.strip(),
+        "fetched base branch revision",
+    )
+
+
+def lane_union_base(
+    worktree: Path, base_rev: str, head: str, current_base: str | None
 ) -> str:
     """The revision a lane's path union is resolved against.
 
     The prepared base goes stale the moment a sibling lane merges. A lane
     rebased onto the advanced base — the documented remediation for a red
     constraint — then carries every mainline commit between the two bases, and
-    a union taken from the prepared base claims their paths for the task. The
-    union is therefore resolved against the current base branch, but only where
-    the lane demonstrably already contains it: the current base must descend
-    from the prepared base and be an ancestor of the lane head. Every other
-    shape keeps the prepared base, so nothing this resolution does can widen
-    what a lane is allowed to touch.
+    a union taken from the prepared base claims their paths, and their merge
+    commits, for the task.
+
+    The right start is where this lane leaves the base branch, which is the
+    merge base of the lane head with the current base. It equals the prepared
+    base for a lane that never rebased, and the rebased-onto revision for one
+    that did, and — unlike the current tip — it does not move when the base
+    advances again afterwards, so a gate receipt and the publication that
+    re-checks it read the same range. The prepared base is kept whenever that
+    point cannot be established or would not contain it, so nothing here can
+    widen what a lane is allowed to touch.
     """
-    if base_ref is None:
+    if current_base is None or current_base == base_rev:
         return base_rev
     resolved = git(
-        worktree,
-        "rev-parse",
-        "--verify",
-        "--quiet",
-        "--end-of-options",
-        f"{base_ref}^{{commit}}",
-        check=False,
+        worktree, "merge-base", "--end-of-options", head, current_base, check=False
     )
-    current = resolved.stdout.strip()
-    if resolved.returncode != 0 or not GIT_OID.fullmatch(current) or current == base_rev:
+    fork = resolved.stdout.strip()
+    if resolved.returncode != 0 or not GIT_OID.fullmatch(fork) or fork == base_rev:
         return base_rev
-    if git(worktree, "merge-base", "--is-ancestor", base_rev, current, check=False).returncode:
+    if git(worktree, "merge-base", "--is-ancestor", base_rev, fork, check=False).returncode:
         return base_rev
-    if git(worktree, "merge-base", "--is-ancestor", current, head, check=False).returncode:
-        return base_rev
-    return current
+    return fork
 
 
 def changed_paths_in_history(
-    worktree: Path, base_rev: str, head: str, *, include_deletions: bool = False
+    worktree: Path, union_base: str, head: str, *, include_deletions: bool = False
 ) -> list[str]:
-    base_rev = full_git_oid(base_rev, "base revision")
+    """Every path the lane touched between the base it sits on and its head.
+
+    Callers resolve `union_base` with `lane_union_base` so that both this walk
+    and the merge-commit rejection read the lane's own history rather than the
+    mainline it may have rebased onto.
+    """
+    union_base = full_git_oid(union_base, "base revision")
     head = full_git_oid(head, "head revision")
-    reject_merge_commits(worktree, base_rev, head)
+    reject_merge_commits(worktree, union_base, head)
     diff_filter = "ACDMTUXB" if include_deletions else "ACMTUXB"
     changed = git(
         worktree,
@@ -4063,7 +4110,7 @@ def changed_paths_in_history(
         f"--diff-filter={diff_filter}",
         "-z",
         "--end-of-options",
-        f"{base_rev}..{head}",
+        f"{union_base}..{head}",
         "--",
     ).stdout
     return sorted({path for path in changed.split("\0") if path})
@@ -4113,7 +4160,7 @@ def enforce_conflict_domains(
     task: Any,
     expected_task_id: str,
     domains_required: bool,
-    base_ref: str | None = None,
+    current_base: str | None = None,
 ) -> dict[str, Any]:
     if not isinstance(task, dict):
         fail("task must be an object")
@@ -4131,11 +4178,11 @@ def enforce_conflict_domains(
     base_rev = full_git_oid(base_rev, "base revision")
     head = full_git_oid(head, "head revision")
     # The receipt keeps naming the base this lane was prepared and gated on;
-    # only the union narrows, and only onto a current base the lane already
-    # contains.
+    # only the union narrows, and only onto a base branch commit the lane
+    # already contains.
     changed_paths = changed_paths_in_history(
         worktree,
-        resolved_union_base(worktree, base_rev, head, base_ref),
+        lane_union_base(worktree, base_rev, head, current_base),
         head,
         include_deletions=True,
     )
@@ -4206,14 +4253,14 @@ def action_ownership(brief: dict[str, Any]) -> dict[str, Any]:
         data.get("task"),
         task_id,
         data.get("domainsRequired"),
-        f"{config['remote']}/{config['baseBranch']}",
+        current_base_revision(worktree, config),
     )
 
 
 def evaluate_forbid_paths(
-    worktree: Path, base_rev: str, head: str, gate_id: str, patterns: list[str]
+    worktree: Path, union_base: str, head: str, gate_id: str, patterns: list[str]
 ) -> int:
-    changed_paths = changed_paths_in_history(worktree, base_rev, head)
+    changed_paths = changed_paths_in_history(worktree, union_base, head)
     violations: list[tuple[str, list[str]]] = []
     for path in changed_paths:
         matched = [pattern for pattern in patterns if path_glob_matches(path, pattern)]
@@ -4233,10 +4280,13 @@ def evaluate_forbid_paths(
 
 
 def action_constraint(brief: dict[str, Any]) -> dict[str, Any]:
-    data = object_exact(brief, {"gate", "workspace"}, "constraint brief")
+    data = object_exact(
+        brief, {"gate", "repositoryConfig", "workspace"}, "constraint brief"
+    )
     gate = normalize_forbid_paths_gate(data.get("gate"), "constraint gate")
     gate_id = gate["id"]
     patterns = gate["forbidPaths"]
+    config = repo_config(data.get("repositoryConfig"))
 
     workspace = object_exact(
         data.get("workspace"), {"taskId", "baseRev", "branch", "worktreePath"}, "workspace"
@@ -4256,7 +4306,19 @@ def action_constraint(brief: dict[str, Any]) -> dict[str, Any]:
     if git(worktree, "merge-base", "--is-ancestor", base_rev, head, check=False).returncode != 0:
         fail("task head is not descended from its prepared base revision")
 
-    checked_paths = evaluate_forbid_paths(worktree, base_rev, head, gate_id, patterns)
+    # The receipt names the prepared base, which is what publication compares
+    # it against; the walk starts where the lane leaves the base branch, so a
+    # lane that rebased onto an advanced base is not gated on mainline paths it
+    # never touched.
+    checked_paths = evaluate_forbid_paths(
+        worktree,
+        lane_union_base(
+            worktree, base_rev, head, current_base_revision(worktree, config)
+        ),
+        head,
+        gate_id,
+        patterns,
+    )
     return {
         "gateId": gate_id,
         "kind": "forbidPaths",
@@ -4378,9 +4440,17 @@ def enforce_configured_gates(
 def enforce_constraint_results(
     worktree: Path,
     base_rev: str,
+    union_base: str,
     head: str,
     constraints: list[dict[str, Any]],
 ) -> None:
+    """Re-run each witnessed gate at publication.
+
+    The receipt is bound to the base the lane was prepared on, and the walk
+    runs over the same range the gate node used — where the lane leaves the
+    base branch — so the recounted path total is comparable with the one the
+    receipt carries even when the base advanced in between.
+    """
     for constraint in constraints:
         if constraint["baseRev"] != base_rev:
             fail(
@@ -4389,7 +4459,7 @@ def enforce_constraint_results(
             )
         checked_paths = evaluate_forbid_paths(
             worktree,
-            base_rev,
+            union_base,
             head,
             constraint["gateId"],
             constraint["patterns"],
@@ -4535,6 +4605,7 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         fail("agent produced no commit relative to the prepared base")
     if git(worktree, "merge-base", "--is-ancestor", base_rev, head, check=False).returncode != 0:
         fail("task head is not descended from its prepared base revision")
+    current_base = current_base_revision(worktree, config)
     ownership = enforce_conflict_domains(
         worktree,
         base_rev,
@@ -4542,9 +4613,15 @@ def action_publish(brief: dict[str, Any]) -> dict[str, Any]:
         data.get("task"),
         task_id,
         data.get("domainsRequired"),
-        f"{config['remote']}/{config['baseBranch']}",
+        current_base,
     )
-    enforce_constraint_results(worktree, base_rev, head, constraints)
+    enforce_constraint_results(
+        worktree,
+        base_rev,
+        lane_union_base(worktree, base_rev, head, current_base),
+        head,
+        constraints,
+    )
     git(worktree, "push", config["remote"], f"HEAD:refs/heads/{publish_branch}")
     if config["forge"] == "github":
         pull_request = github_pull_request(data, config, worktree, head)

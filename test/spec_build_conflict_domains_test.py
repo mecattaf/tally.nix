@@ -117,6 +117,7 @@ class PublicationConflictDomainTests(unittest.TestCase):
         self.base_rev = git("rev-parse", "HEAD", cwd=self.checkout)
         self.local_branch = "tally-work/fixture/conflict-domain"
         self.publish_branch = "tally/fixture-issue-7/conflict-domain"
+        self.advances = 0
         git("switch", "-c", self.local_branch, cwd=self.checkout)
 
     def tearDown(self) -> None:
@@ -182,19 +183,33 @@ class PublicationConflictDomainTests(unittest.TestCase):
         }
 
     def advance_base(self, path: str, content: str, message: str) -> str:
-        """Land a mainline commit the way a sibling lane's merge would."""
+        """Land a mainline commit exactly the way a campaign merge does.
+
+        `merge_local` integrates with `git merge --no-ff` and `merge_github`
+        asks the forge for a merge commit, so the tip of a base branch that has
+        integrated anything is a merge commit and every later lane inherits it
+        by rebasing. A fixture that advanced the base linearly would agree with
+        any claim about rebased lanes while production disagreed.
+        """
         advancer = self.root / "advancer"
         if not advancer.exists():
             git("clone", str(self.remote), str(advancer))
             git("config", "user.name", "Base Advance", cwd=advancer)
             git("config", "user.email", "base-advance@example.invalid", cwd=advancer)
         else:
-            git("pull", "--ff-only", cwd=advancer)
+            git("fetch", "origin", cwd=advancer)
+            git("switch", "main", cwd=advancer)
+            git("reset", "--hard", "origin/main", cwd=advancer)
+        self.advances += 1
+        sibling = f"sibling-{self.advances}"
+        git("switch", "-c", sibling, cwd=advancer)
         target = advancer / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         git("add", "--all", cwd=advancer)
         git("commit", "-m", message, cwd=advancer)
+        git("switch", "main", cwd=advancer)
+        git("merge", "--no-ff", "--no-edit", sibling, cwd=advancer)
         git("push", "origin", "main", cwd=advancer)
         git("fetch", "origin", cwd=self.checkout)
         return git("rev-parse", "HEAD", cwd=advancer)
@@ -491,6 +506,151 @@ class PublicationConflictDomainTests(unittest.TestCase):
         self.assertNotEqual(advanced, self.base_rev)
         published = driver.action_publish(self.publish_brief(["internal/contacts"]))
         self.assertEqual(published["ownership"], ownership)
+
+    def test_a_rebased_lane_survives_the_base_advancing_again_behind_it(self) -> None:
+        """The union starts where the lane leaves the base branch.
+
+        Resolving against the *current tip* only works until the tip moves
+        again: the lane then no longer contains it, the resolution falls back
+        to the stale prepared base, and the mainline merge commits the lane
+        inherited when it rebased make it look like the lane merged the base.
+        """
+        contact = self.checkout / "internal/contacts/model.go"
+        contact.parent.mkdir(parents=True)
+        contact.write_text("package contacts\n", encoding="utf-8")
+        self.commit("fixture: owned work")
+        self.advance_base(
+            "internal/cli/root.go",
+            "package cli\n// sibling one\n",
+            "fixture: sibling one",
+        )
+        git("rebase", "origin/main", cwd=self.checkout)
+        rebased_head = git("rev-parse", "HEAD", cwd=self.checkout)
+        # A second sibling lands while this lane is still being gated, so the
+        # lane no longer contains the base branch tip.
+        self.advance_base("docs/guide.md", "later\n", "fixture: sibling two")
+        self.assertNotEqual(
+            git("rev-parse", "origin/main", cwd=self.checkout), rebased_head
+        )
+        self.assertEqual(
+            len(
+                git(
+                    "rev-list",
+                    "--merges",
+                    f"{self.base_rev}..{rebased_head}",
+                    cwd=self.checkout,
+                ).split()
+            ),
+            1,
+            "the lane inherited a mainline merge commit by rebasing",
+        )
+
+        ownership = driver.action_ownership(self.ownership_brief(["internal/contacts"]))
+
+        self.assertEqual(ownership["ownedPaths"], ["internal/contacts/model.go"])
+        self.assertEqual(ownership["baseRev"], self.base_rev)
+
+    def test_the_forbid_paths_gate_resolves_against_the_same_base_as_ownership(
+        self,
+    ) -> None:
+        """#276 f2's second site: the gate node reads the lane's own history.
+
+        A lane that rebased onto the advanced base used to pass ownership and
+        then go red at the gate on a mainline path a sibling landed — the same
+        spurious red, one node later.
+        """
+        contact = self.checkout / "internal/contacts/model.go"
+        contact.parent.mkdir(parents=True)
+        contact.write_text("package contacts\n", encoding="utf-8")
+        self.commit("fixture: owned work")
+        self.advance_base("build/late.db", "sibling artifact\n", "fixture: sibling db")
+        git("rebase", "origin/main", cwd=self.checkout)
+        head = git("rev-parse", "HEAD", cwd=self.checkout)
+        gate = {
+            "kind": "forbidPaths",
+            "id": "no-db-artifacts",
+            "forbidPaths": ["*.db", "*.db-wal", "*.db-shm", "*.sqlite*"],
+            "runtimeMaxSec": 11,
+        }
+
+        receipt = driver.action_constraint(
+            {
+                "gate": gate,
+                "repositoryConfig": self.brief()["repositoryConfig"],
+                "workspace": {
+                    "taskId": "conflict-domain",
+                    "baseRev": self.base_rev,
+                    "branch": self.local_branch,
+                    "worktreePath": str(self.checkout),
+                },
+            }
+        )
+
+        self.assertEqual(receipt["gateId"], "no-db-artifacts")
+        self.assertEqual(receipt["checkedPaths"], 1)
+        self.assertEqual(receipt["baseRev"], self.base_rev)
+        self.assertEqual(receipt["head"], head)
+
+        published = driver.action_publish(
+            {
+                **self.publish_brief(["internal/contacts"], gates=[gate]),
+                "constraints": [receipt],
+            }
+        )
+
+        self.assertEqual(published["head"], head)
+        self.assertEqual(published["ownership"]["ownedPaths"], ["internal/contacts/model.go"])
+
+    def test_a_forged_remote_tracking_ref_cannot_empty_the_union(self) -> None:
+        """The lane's ref store is shared with the checkout and agent-writable.
+
+        `refs/remotes/<remote>/<base>` lives in the common Git directory, so a
+        lane can point it at its own head. If the union base came from that
+        ref, the union would collapse to nothing and every declared domain
+        would be vacuously satisfied — in the one check that exists because the
+        agent is not trusted to stay inside its lane.
+        """
+        worktree = self.root / "lanes/conflict-domain"
+        worktree.parent.mkdir(parents=True)
+        git(
+            "worktree",
+            "add",
+            "--detach",
+            str(worktree),
+            self.base_rev,
+            cwd=self.checkout,
+        )
+        git("switch", "-c", "tally-work/fixture/lane", cwd=worktree)
+        contact = worktree / "internal/contacts/model.go"
+        contact.parent.mkdir(parents=True)
+        contact.write_text("package contacts\n", encoding="utf-8")
+        (worktree / "internal/cli/root.go").write_text(
+            "package cli\n// unowned\n", encoding="utf-8"
+        )
+        git("add", "--all", cwd=worktree)
+        git("commit", "-m", "fixture: owned work and one unowned path", cwd=worktree)
+        head = git("rev-parse", "HEAD", cwd=worktree)
+        brief = self.ownership_brief(["internal/contacts"])
+        brief["workspace"].update(
+            {"branch": "tally-work/fixture/lane", "worktreePath": str(worktree)}
+        )
+        publish = self.publish_brief(["internal/contacts"])
+        publish["workspace"] = dict(brief["workspace"])
+        publish["workspace"]["publishBranch"] = self.publish_branch
+
+        with self.assertRaisesRegex(driver.DriverError, r'"internal/cli/root\.go"'):
+            driver.action_ownership(brief)
+
+        # The agent, from inside its own lane, points the shared
+        # remote-tracking ref at its head.
+        git("update-ref", "refs/remotes/origin/main", head, cwd=worktree)
+        self.assertEqual(git("rev-parse", "origin/main", cwd=self.checkout), head)
+
+        with self.assertRaisesRegex(driver.DriverError, r'"internal/cli/root\.go"'):
+            driver.action_ownership(brief)
+        with self.assertRaisesRegex(driver.DriverError, r'"internal/cli/root\.go"'):
+            driver.action_publish(publish)
+        self.assert_not_published()
 
     def test_publication_answers_to_configured_gates_not_to_the_receipt(self) -> None:
         """A receipt re-run against itself proves nothing about today's gate."""

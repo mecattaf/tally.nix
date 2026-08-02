@@ -3761,6 +3761,12 @@
                         forbidPaths: $patterns,
                         runtimeMaxSec: 11
                       },
+                      repositoryConfig: {
+                        checkout: $worktree,
+                        baseBranch: "main",
+                        remote: "origin",
+                        forge: "local"
+                      },
                       workspace: {
                         taskId: "task-1",
                         baseRev: $base,
