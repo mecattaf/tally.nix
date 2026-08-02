@@ -115,6 +115,48 @@ authorized.
   itself: a Boa-backed harness that evaluates the flow source exactly as the
   engine does and calls its pure helpers, replacing the ripgrep string matches
   that were all that guarded the per-task steering composition.
+- The fleet gate can no longer be widened by an ambient environment variable,
+  and the knob now covers the budgets that were actually tight (#325).
+  `test/fleet-gate.sh` runs `cargo test` directly on the host through `nix
+  develop`, which is not `--ignore-environment`, so a `TALLY_TEST_TIMEOUT_SCALE`
+  left over from reproducing #299 reached the ladder and made a run with 10x
+  wait budgets byte-indistinguishable from an honest one in the transcript that
+  is the merge evidence. The gate now scrubs that variable and honours
+  `TALLY_GATE_TIMEOUT_SCALE` instead, recording its value — or `1 (unscaled)` —
+  on a `timeout-scale:` line in the transcript header, so deliberately widening
+  a loaded host stays possible and self-describing. Separately, the knob reached
+  only the five `tokio::time::timeout` budgets in `flow_live.rs` and none of the
+  21 tighter 10-second polling deadlines, which were fixed iteration counts
+  (`for _ in 0..400 { …; sleep(25ms) }`) rather than budgets — they drifted with
+  RPC latency and gated the largest fan-outs. The three wait helpers and the two
+  inline loops now take a scaled wall-clock deadline and name the knob and its
+  value when one expires. Finally, `TALLY_TEST_TIMEOUT_SCALE` accepted values in
+  `(0, 1)`, which *narrowed* every budget it reached and produced reds that read
+  as product timeouts, and values large enough to overflow `Duration::mul_f64`
+  inside libcore where nothing named the variable; the accepted range is now
+  `[1, 1000]` and every rejection names the variable and its value.
+
+- A retained adapter-smoke commit probe is now bounded, named, and never seeded
+  for a failure that has nothing to do with the adapter (#328). `tally adapter
+  smoke --assert-commit` seeded its throwaway git repository *before* the
+  enqueue RPC, so an unreachable daemon left a full repository behind; the seed
+  now happens after the connection is open. Retaining the repository on an
+  adapter failure is still deliberate — a failed probe is the evidence — but
+  every failure past the seed now names the retained path, not just the
+  commit-assertion failure, and `tally gc` sweeps `adapter-smoke/probe-*` under
+  the state directory on the capture-archive horizon, reporting
+  `adapterProbesExamined`/`adapterProbesPruned`. Nothing had ever known that
+  prefix, so every retained repository was permanent.
+
+- `services.tally.producers.<name>.reviewers` no longer accepts a login the
+  daemon will refuse (routed from the #318 evaluation). The Nix assertion
+  enforced GitHub's login grammar with no length bound while
+  `producers/validate.rs` capped it at 39 characters, so a 40-character entry
+  deployed green through `nixos-rebuild` or Home Manager and then failed at
+  daemon config load — a green deploy with a dead daemon. The grammar now lives
+  in `nix/lib/gh-login.nix` with the bound included, and both sides run the
+  pinned corpus at `test/fixtures/gh-login/vectors.json`, so neither can drift
+  alone.
 
 - Repaired the two-repository campaign seam (#321): a split campaign could not
   pass a checkpoint, and every pull request it opened published a wrong
@@ -500,6 +542,22 @@ authorized.
 
 ### Changed
 
+- Cleared the residue the TaskChampion delete left behind (#326). `RELEASING.md`
+  told an operator upgrading a host to "preserve witness, taskdb, lease,
+  launch-marker, and worker state together" — but post-delete the only on-disk
+  artefact "taskdb" can name is `<dataDir>/taskdata/` and its
+  `taskdata.pre-rebuild-*` archives, which nothing reads, nothing sweeps, and
+  which still count against the data-store byte budget. On the #252 incident
+  host that sentence told the operator to preserve exactly the 270 GiB the
+  CHANGELOG told them to reclaim; it now names the durable state explicitly and
+  says outright that deleting `taskdata/` by hand is safe and is what returns
+  the space. The terminal-ack comment in `daemon/run.rs` no longer lists
+  "replica commit" as a post-ack step — that channel does not exist — and
+  `TaskRow`, `TaskStatus`, `impl From<&TaskRow> for RowFact`, and the
+  `TaskDbError::InvalidRow` variant are removed: nothing in the workspace
+  constructed any of them after the delete, and `pub` in a library crate meant
+  `dead_code` never said so.
+
 - **`--limit` on the default `tally query jobs` / `tally query log` now sizes a
   page, not the result set** (#316). Those commands walk the cursor to the end
   of the filtered window inside one invocation, so `--limit 10` returns the
@@ -665,8 +723,9 @@ authorized.
   figures, the per-store level derived from them, and `freeSpaceCheckedAt`
   whenever the snapshot's probe is newer than the walk's sample stamp; tree
   sizes, growth per completion, and `sampledAt` still come from the walk.
-  `freeSpaceCheckedAt` is now monotonic across interleaved probe and walk
-  applications. Admission math is unaffected either way — every admission
+  A tree walk can therefore no longer move `freeSpaceCheckedAt` backwards; the
+  guard constrains the walk writer only, and a probe still assigns the stamp
+  unconditionally from the wall clock. Admission math is unaffected either way — every admission
   re-probes before deciding — so this changes receipts, not who gets in.
 
 - A command whose reader hangs up now ends quietly instead of panicking.

@@ -160,10 +160,16 @@ because the point is a repository nothing else owns. The result is reported as
 
 A verified probe deletes its repository; any other status (`no-commit`,
 `dirty-worktree`, `unrelated-history`, or `not-checked` when the adapter itself
-failed) exits nonzero and retains the repository as the evidence. This is the
-one-command pre-flight for a policy pairing: an agent that writes its files
-correctly and cannot reach git metadata to commit them reports `no-commit` here
-in seconds instead of failing publication after a full campaign node.
+failed) exits nonzero and retains the repository as the evidence. Every failure
+after the repository exists names its path, including the ones that say nothing
+about the commit assertion, and the repository is seeded only once the daemon
+connection is open — a smoke that cannot reach the daemon at all leaves nothing
+behind. Retained repositories expire on the capture-archive horizon like any
+other retained evidence: `tally gc` sweeps `adapter-smoke/probe-*` under the
+state directory and reports `adapterProbesExamined`/`adapterProbesPruned`. This
+is the one-command pre-flight for a policy pairing: an agent that writes its
+files correctly and cannot reach git metadata to commit them reports `no-commit`
+here in seconds instead of failing publication after a full campaign node.
 
 `--probe-root PATH` names the directory the probe repository is created under.
 It defaults to `adapter-smoke/` below the state directory and is never the

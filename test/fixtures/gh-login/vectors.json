@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "note": "Shared GitHub-login grammar vector. nix/lib/gh-login.nix gates services.tally.producers.<name>.reviewers at module evaluation; crates/tally-core/src/producers/validate.rs gates the same list at daemon config load. Both sides run this corpus so an entry can never deploy green through nixos-rebuild or Home Manager and then fail the daemon it was deployed for.",
+  "maxLength": 39,
+  "cases": [
+    { "name": "ordinary login", "login": "octocat", "valid": true },
+    { "name": "single character", "login": "a", "valid": true },
+    { "name": "digits only", "login": "1234", "valid": true },
+    { "name": "interior hyphen", "login": "mona-lisa", "valid": true },
+    { "name": "several interior hyphens", "login": "a-b-c-d", "valid": true },
+    {
+      "name": "exactly the 39 character bound",
+      "login": "abcdefghijklmnopqrstuvwxyz0123456789abc",
+      "valid": true
+    },
+    {
+      "name": "39 characters ending in an alphanumeric after a hyphen",
+      "login": "a-cdefghijklmnopqrstuvwxyz0123456789abc",
+      "valid": true
+    },
+    {
+      "name": "one character past the bound",
+      "login": "abcdefghijklmnopqrstuvwxyz0123456789abcd",
+      "valid": false
+    },
+    {
+      "name": "far past the bound",
+      "login": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "valid": false
+    },
+    { "name": "empty", "login": "", "valid": false },
+    { "name": "leading hyphen", "login": "-octocat", "valid": false },
+    { "name": "trailing hyphen", "login": "octocat-", "valid": false },
+    { "name": "consecutive hyphens", "login": "octo--cat", "valid": false },
+    { "name": "underscore", "login": "octo_cat", "valid": false },
+    { "name": "dot", "login": "octo.cat", "valid": false },
+    { "name": "space", "login": "octo cat", "valid": false },
+    { "name": "leading at sign", "login": "@octocat", "valid": false },
+    { "name": "markdown bracket", "login": "octocat]", "valid": false },
+    { "name": "second mention", "login": "octocat @mona", "valid": false },
+    { "name": "query fragment", "login": "octocat?ref=1", "valid": false },
+    { "name": "newline", "login": "octocat\nmona", "valid": false },
+    { "name": "non ascii", "login": "octocät", "valid": false }
+  ]
+}

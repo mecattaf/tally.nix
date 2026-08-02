@@ -34,18 +34,28 @@ $ nix flake check -L
 ```
 
 The live flow suite waits on fixed wall-clock budgets sized for an idle machine. When reproducing a
-suspected timeout on a loaded host, set `TALLY_TEST_TIMEOUT_SCALE` to a positive multiplier to widen
-every one of those budgets without editing the tests:
+suspected timeout on a loaded host, set `TALLY_TEST_TIMEOUT_SCALE` to a multiplier to widen every one
+of those budgets — both the `tokio::time::timeout` budgets and the polling waits — without editing
+the tests:
 
 ```console
 $ TALLY_TEST_TIMEOUT_SCALE=3 cargo test -p tally --test flow_live
 ```
 
-Unset means `1` and is byte-identical to the unscaled budgets. A value that is not a positive finite
-number panics rather than silently running unscaled. The variable is read from the test process
-environment, so it reaches a direct `cargo test` run only; the tests run by `nix flake check` execute
-inside `buildRustPackage`'s pure sandbox and never see it. Diagnosing a red gate happens on the
-direct path anyway. The knob widens waits; it never changes what a test asserts.
+Unset means `1` and is byte-identical to the unscaled budgets. The accepted range is `[1, 1000]`: a
+value outside it — non-numeric, empty, zero, negative, infinite, below `1`, or large enough to
+overflow a `Duration` — panics naming the variable rather than silently running unscaled. Values
+below `1` are rejected because the knob only widens; a leftover `0.5` would tighten every budget and
+produce reds that read as product timeouts. The variable is read from the test process environment,
+so it reaches a direct `cargo test` run only; the tests run by `nix flake check` execute inside
+`buildRustPackage`'s pure sandbox and never see it. Diagnosing a red gate happens on the direct path
+anyway. The knob widens waits; it never changes what a test asserts.
+
+`test/fleet-gate.sh` **scrubs** `TALLY_TEST_TIMEOUT_SCALE` from its own `cargo test` stage, so an
+ambient value left over from a reproduce run cannot silently widen the gate. To widen a gate run on a
+genuinely loaded host, set `TALLY_GATE_TIMEOUT_SCALE` instead: the runner passes it through and
+records it on a `timeout-scale:` line in the transcript header, so a widened run is never
+byte-indistinguishable from an honest one. An unset knob records `timeout-scale: 1 (unscaled …)`.
 
 `test/cargo-deny.sh` checks advisories, licenses, sources, and duplicate versions with Cargo in
 offline and locked mode. The development shell supplies the RustSec database revision pinned by

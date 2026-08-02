@@ -30,6 +30,15 @@
         inherit self;
       };
       priorityRanks = import ./nix/lib/priority-ranks.nix;
+      ghLoginLibrary = import ./nix/lib/gh-login.nix;
+      # The corpus `crates/tally-core/src/producers/validate.rs` runs from the
+      # same path. Evaluating it here is what keeps the module assertion and the
+      # daemon's config-load check from drifting apart: a login one side accepts
+      # and the other rejects is a green deploy with a dead daemon.
+      ghLoginVectors = builtins.fromJSON (builtins.readFile ./test/fixtures/gh-login/vectors.json);
+      ghLoginVectorFailures = builtins.filter (
+        case: ghLoginLibrary.isValid case.login != case.valid
+      ) ghLoginVectors.cases;
     in
     {
       lib.adapters = adapterLibrary;
@@ -77,6 +86,7 @@
             ./examples/flows/spec-build.js
             ./examples/flows/spec_build_driver.py
             ./test/fixtures/flows
+            ./test/fixtures/gh-login
             ./test/fixtures/git-ai
             ./test/fixtures/ledger
             ./test/fixtures/redaction
@@ -1835,6 +1845,18 @@
                   kind = "gh";
                   requestReview = true;
                   reviewers = [ "not a login" ];
+                  enqueue = {
+                    argv = [ "gh-job" ];
+                    pool = "slot";
+                  };
+                };
+                # 40 characters: grammatical, one past GitHub's own bound. The
+                # module used to accept this and the daemon then refused to
+                # load the config it was deployed with.
+                bad-reviewer-length = {
+                  kind = "gh";
+                  requestReview = true;
+                  reviewers = [ "abcdefghijklmnopqrstuvwxyz0123456789abcd" ];
                   enqueue = {
                     argv = [ "gh-job" ];
                     pool = "slot";
@@ -4593,6 +4615,8 @@
               invalidProducerMessages;
             assert builtins.elem "gh producer bad-reviewer-login reviewers must be unique GitHub logins"
               invalidProducerMessages;
+            assert builtins.elem "gh producer bad-reviewer-length reviewers must be unique GitHub logins"
+              invalidProducerMessages;
             assert !invalidProducerAttempt.success;
             pkgs.runCommand "tally-producer-kind-required" { } ''
               touch "$out"
@@ -4636,6 +4660,17 @@
             pkgs.runCommand "tally-campaign-noncommitting-sandbox-rejected" { } ''
               touch "$out"
             '';
+          gh-login-grammar =
+            assert ghLoginVectors.maxLength == ghLoginLibrary.maxLength;
+            assert builtins.length ghLoginVectors.cases >= 20;
+            if ghLoginVectorFailures == [ ] then
+              pkgs.runCommand "tally-gh-login-grammar" { } ''
+                touch "$out"
+              ''
+            else
+              throw "nix/lib/gh-login.nix disagrees with test/fixtures/gh-login/vectors.json on: ${
+                nixpkgs.lib.concatMapStringsSep ", " (case: case.name) ghLoginVectorFailures
+              }";
           forbidden-options-absent =
             assert builtins.all (attempt: !attempt.success) forbiddenAttempts;
             pkgs.runCommand "tally-forbidden-options-absent" { } ''

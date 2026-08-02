@@ -22,6 +22,13 @@ use crate::witness::{is_nix_store_path, read_verified_records, WitnessError, Wit
 const ROOT_DIRECTORY_PREFIX: &str = "witness-";
 const EVENTS_DIRECTORY: &str = "events";
 
+/// The state-directory root under which `tally adapter smoke --assert-commit`
+/// seeds its throwaway git repositories, and the per-run directory prefix it
+/// mints inside it. Both are exported so the producer of those directories and
+/// the sweep that reaps them cannot name them differently.
+pub const ADAPTER_SMOKE_DIRECTORY: &str = "adapter-smoke";
+pub const ADAPTER_SMOKE_PROBE_PREFIX: &str = "probe-";
+
 /// Ratified state-directory retention envelope.
 ///
 /// `events/rejected` is the adversarially drivable set and carries both an age
@@ -187,6 +194,10 @@ pub struct GcReport {
     pub capture_archive_directories_pruned: usize,
     pub capture_locks_examined: usize,
     pub capture_locks_pruned: usize,
+    /// Retained `adapter smoke --assert-commit` probe repositories seen and
+    /// reaped under the capture-archive horizon.
+    pub adapter_probes_examined: usize,
+    pub adapter_probes_pruned: usize,
     pub events_done_examined: usize,
     pub events_done_pruned: usize,
     pub events_rejected_examined: usize,
@@ -542,6 +553,8 @@ pub fn run_gc(
         capture_archive_directories_pruned: state.capture_archive_directories_pruned,
         capture_locks_examined: state.capture_locks_examined,
         capture_locks_pruned: state.capture_locks_pruned,
+        adapter_probes_examined: state.adapter_probes_examined,
+        adapter_probes_pruned: state.adapter_probes_pruned,
         events_done_examined: state.events_done_examined,
         events_done_pruned: state.events_done_pruned,
         events_rejected_examined: state.events_rejected_examined,
@@ -736,6 +749,8 @@ struct StateSweep {
     capture_archive_directories_pruned: usize,
     capture_locks_examined: usize,
     capture_locks_pruned: usize,
+    adapter_probes_examined: usize,
+    adapter_probes_pruned: usize,
     events_done_examined: usize,
     events_done_pruned: usize,
     events_rejected_examined: usize,
@@ -770,6 +785,12 @@ fn sweep_state_directory(
     for locks in [CAPTURE_LOCK_DIRECTORY, LEGACY_CAPTURE_LOCK_DIRECTORY] {
         prune_capture_locks(&state_dir.join(locks), capture_cutoff, dry_run, &mut sweep)?;
     }
+    prune_adapter_smoke_probes(
+        &state_dir.join(ADAPTER_SMOKE_DIRECTORY),
+        capture_cutoff,
+        dry_run,
+        &mut sweep,
+    )?;
 
     let marker_cutoff = mtime_cutoff(now, policy.producer_marker_max_age)?;
     let markers_root = state_dir.join(PRODUCER_MARKER_DIRECTORY);
@@ -872,6 +893,73 @@ fn prune_capture_archives(
                 if error.kind() == std::io::ErrorKind::NotFound
                     || error.raw_os_error() == Some(libc::ENOTEMPTY) => {}
             Err(source) => return Err(io_error(&unit_dir, source)),
+        }
+    }
+    Ok(())
+}
+
+/// Prunes retained adapter-smoke commit probe repositories.
+///
+/// `tally adapter smoke --assert-commit` seeds a throwaway git repository under
+/// `<state_dir>/adapter-smoke/` and deliberately keeps it when the probe fails,
+/// because a failed probe *is* the evidence. Until this sweep existed nothing in
+/// the tree knew that prefix, so every retained repository was permanent and
+/// unbounded. Retained evidence gets a horizon here like every other retained
+/// artefact: the capture-archive horizon, which is the envelope the rest of the
+/// replay material already carries.
+///
+/// Only real directories named `probe-*` are candidates. Anything else under the
+/// root was not written by the probe and is left for an operator rather than
+/// deleted, the same rule [`prune_capture_archives`] applies. A probe repository
+/// is at most `SMOKE_RUNTIME_MAX_SEC` old while its run is still live, so any
+/// capture-archive horizon larger than a few minutes cannot reach one in flight.
+fn prune_adapter_smoke_probes(
+    probe_root: &Path,
+    cutoff: SystemTime,
+    dry_run: bool,
+    sweep: &mut StateSweep,
+) -> Result<(), RetentionError> {
+    if !probe_root.is_dir() {
+        return Ok(());
+    }
+    let mut entries = std::fs::read_dir(probe_root)
+        .map_err(|source| io_error(probe_root, source))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| io_error(probe_root, source))?;
+    entries.sort_by_key(std::fs::DirEntry::file_name);
+    for entry in entries {
+        let path = entry.path();
+        let is_probe = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(ADAPTER_SMOKE_PROBE_PREFIX));
+        if !is_probe {
+            continue;
+        }
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(source) => return Err(io_error(&path, source)),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            continue;
+        }
+        sweep.adapter_probes_examined += 1;
+        if !metadata
+            .modified()
+            .map(|modified| modified < cutoff)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        sweep.adapter_probes_pruned += 1;
+        if dry_run {
+            continue;
+        }
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => return Err(io_error(&path, source)),
         }
     }
     Ok(())
@@ -1550,6 +1638,16 @@ mod tests {
             .unwrap();
     }
 
+    fn set_dir_mtime(path: &Path, at: DateTime<Utc>) {
+        // A directory cannot be opened for writing, so the read handle carries
+        // the timestamps; the caller owns the tree, which is what `futimens`
+        // requires when explicit times are supplied.
+        let times = fs::FileTimes::new()
+            .set_accessed(SystemTime::from(at))
+            .set_modified(SystemTime::from(at));
+        fs::File::open(path).unwrap().set_times(times).unwrap();
+    }
+
     fn ledger_only_state(data: &Path, now: DateTime<Utc>) {
         let mut ledger = WitnessLedger::open(data.join("witness.jsonl")).unwrap();
         append(
@@ -1814,6 +1912,64 @@ mod tests {
         assert_eq!(released.capture_locks_pruned, 1);
         assert!(!held_lock.exists());
         assert!(young_lock.exists());
+    }
+
+    /// A retained commit probe is evidence, and evidence gets a horizon. Before
+    /// this sweep nothing in the tree knew the `adapter-smoke/probe-*` prefix,
+    /// so every failed `adapter smoke --assert-commit` leaked a whole git
+    /// repository permanently.
+    #[test]
+    fn retained_adapter_smoke_probes_expire_on_the_capture_archive_horizon() {
+        let temp = tempfile::tempdir().unwrap();
+        let data = temp.path().join("data");
+        let state = temp.path().join("state");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&state).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 26, 12, 0, 0).unwrap();
+        ledger_only_state(&data, now);
+
+        let probe_root = state.join(ADAPTER_SMOKE_DIRECTORY);
+        let seed = |name: &str, age: chrono::TimeDelta| {
+            let root = probe_root.join(name);
+            // A real tree, not an empty directory: the sweep has to remove the
+            // repository a failed probe left, not just its top-level inode.
+            fs::create_dir_all(root.join(".git/objects")).unwrap();
+            fs::write(root.join("tally-commit-probe.txt"), b"ok\n").unwrap();
+            set_dir_mtime(&root, now - age);
+            root
+        };
+        let expired = seed("probe-4242-1", chrono::TimeDelta::days(31));
+        let recent = seed("probe-4242-2", chrono::TimeDelta::days(1));
+        // Not written by the probe: left for an operator, never deleted.
+        let foreign = seed("operator-notes", chrono::TimeDelta::days(400));
+
+        let request = GcRequest {
+            data_dir: &data,
+            state_dir: Some(&state),
+            horizon_text: "30d",
+            state_retention: StateRetentionPolicy::default(),
+            now,
+            dry_run: true,
+            collect: false,
+        };
+        let dry = run_gc(request.clone(), &FakeBackend::default()).unwrap();
+        assert_eq!(dry.adapter_probes_examined, 2);
+        assert_eq!(dry.adapter_probes_pruned, 1);
+        assert!(expired.exists());
+
+        let report = run_gc(
+            GcRequest {
+                dry_run: false,
+                ..request
+            },
+            &FakeBackend::default(),
+        )
+        .unwrap();
+        assert_eq!(report.adapter_probes_examined, 2);
+        assert_eq!(report.adapter_probes_pruned, 1);
+        assert!(!expired.exists());
+        assert!(recent.join("tally-commit-probe.txt").exists());
+        assert!(foreign.exists());
     }
 
     #[test]

@@ -114,8 +114,14 @@ only a summary.
 ## Upgrade and rollback
 
 Before switching a host, quiesce new admission and take a recoverable backup of its configured
-`stateDir` and `dataDir`. Preserve witness, taskdb, lease, launch-marker, and worker state together;
-never delete durable state to force a deployment or rollback to start.
+`stateDir` and `dataDir`. Preserve the witness ledger, the durable enqueue events under
+`<stateDir>/events/`, the brief stores, lease, launch-marker, and worker state together; never delete
+durable state to force a deployment or rollback to start.
+
+`<dataDir>/taskdata/` and any `taskdata.pre-rebuild-*` archives are **not** durable state. The
+TaskChampion projection was deleted: nothing reads or writes those directories, no retention lane
+sweeps them, and they still count against the data-store byte budget. Deleting them by hand is what
+returns the space, and doing so is safe.
 
 For a NixOS deployment, select the previous system generation with:
 
