@@ -267,6 +267,7 @@ fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
                 sandbox: None,
                 approval_policy: None,
                 assert_commit: false,
+                state_dir: None,
                 probe_root: None,
             })
         }) if name == "codex"
@@ -296,6 +297,7 @@ fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
                 sandbox: None,
                 approval_policy: None,
                 assert_commit: false,
+                state_dir: None,
                 probe_root: None,
             })
         }) if name == "pi"
@@ -329,6 +331,7 @@ fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
                 sandbox: Some(sandbox),
                 approval_policy: Some(approval),
                 assert_commit: true,
+                state_dir: None,
                 probe_root: Some(probe_root),
             })
         }) if name == "codex"
@@ -358,6 +361,46 @@ fn adapter_smoke_cli_defaults_and_overrides_are_stable() {
         "--assert-commit",
         "--cwd",
         "worktree",
+    ])
+    .is_err());
+
+    // `--state-dir` names the directory the default probe root derives from,
+    // which is the same derivation `tally gc --state-dir` sweeps. Handing both
+    // commands one directory is the only way a retained probe is ever reaped.
+    let state_scoped = Opts::try_parse_from([
+        "tally",
+        "adapter",
+        "smoke",
+        "codex",
+        "--assert-commit",
+        "--state-dir",
+        "/var/lib/tally/state",
+    ])
+    .unwrap();
+    assert!(matches!(
+        state_scoped.command,
+        Some(Command::Adapter {
+            command: AdapterCommand::Smoke(AdapterSmokeArgs {
+                assert_commit: true,
+                state_dir: Some(state_dir),
+                probe_root: None,
+                ..
+            })
+        }) if state_dir == Path::new("/var/lib/tally/state")
+    ));
+
+    // Naming both a state directory to derive the root from and the root
+    // outright is a contradiction, not a precedence puzzle.
+    assert!(Opts::try_parse_from([
+        "tally",
+        "adapter",
+        "smoke",
+        "codex",
+        "--assert-commit",
+        "--state-dir",
+        "/var/lib/tally/state",
+        "--probe-root",
+        "/var/lib/tally/campaigns",
     ])
     .is_err());
 }

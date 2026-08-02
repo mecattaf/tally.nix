@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 use tally_core::adapters::{
@@ -597,6 +597,129 @@ async fn smoke_runs_real_jobs_parses_declared_captures_and_surfaces_pre_output_s
                     .unwrap()
                     .starts_with("adapter-smoke:"));
             }
+        })
+        .await;
+}
+
+/// The producer of the probe repositories and the sweep that reaps them must
+/// name one place. `--probe-root` names a directory directly; `--state-dir`
+/// names the directory the *default* probe root derives from, which is the same
+/// derivation `tally gc --state-dir` walks. Without it the CLI resolves the XDG
+/// state directory, which on a NixOS deployment is not the module's `stateDir`
+/// (`/var/lib/tally/state`) that the retention timer passes to `tally gc` — so
+/// every retained probe sat in a directory the sweep was never pointed at.
+#[tokio::test(flavor = "current_thread")]
+async fn the_smoke_probe_root_and_the_gc_sweep_root_agree_under_one_state_dir() {
+    LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = daemon_paths(temp.path());
+            let config = smoke_config(temp.path());
+            let config_path = temp.path().join("config.json");
+            std::fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+            let daemon = start_daemon(&paths, config).await;
+
+            // This adapter fails, so the probe repository is retained: exactly
+            // the population the sweep exists for.
+            let failed = run_tally(
+                &config_path,
+                &paths.socket,
+                &[
+                    "adapter",
+                    "smoke",
+                    "pre-output-failure",
+                    "--pool",
+                    "stock",
+                    "--assert-commit",
+                    "--state-dir",
+                    paths.state_dir.to_str().unwrap(),
+                ],
+            )
+            .await;
+            let stderr = String::from_utf8_lossy(&failed.stderr).into_owned();
+            assert_eq!(failed.status.code(), Some(1), "{stderr}");
+            let retained = PathBuf::from(
+                parse_stdout(&failed)["commitProbe"]["repository"]
+                    .as_str()
+                    .unwrap(),
+            );
+            assert!(
+                retained.starts_with(paths.state_dir.join("adapter-smoke")),
+                "{}",
+                retained.display()
+            );
+            // And explicitly *not* the XDG state directory the CLI resolves
+            // when it is not told which state directory to use.
+            assert!(
+                !retained.starts_with(temp.path().join("xdg-state")),
+                "{}",
+                retained.display()
+            );
+            daemon.stop().await;
+
+            // Age it past the horizon the shipped retention timer uses. A
+            // directory cannot be opened for writing, so the read handle
+            // carries the timestamps.
+            let aged = SystemTime::now() - Duration::from_secs(60 * 60 * 24 * 31);
+            std::fs::File::open(&retained)
+                .unwrap()
+                .set_times(
+                    std::fs::FileTimes::new()
+                        .set_accessed(aged)
+                        .set_modified(aged),
+                )
+                .unwrap();
+
+            let gc_argv = |dry: bool| {
+                let mut argv = vec![
+                    "gc".to_owned(),
+                    "--horizon".to_owned(),
+                    "30d".to_owned(),
+                    "--capture-archive-horizon".to_owned(),
+                    "30d".to_owned(),
+                    "--data-dir".to_owned(),
+                    paths.data_dir.display().to_string(),
+                    "--state-dir".to_owned(),
+                    paths.state_dir.display().to_string(),
+                ];
+                if dry {
+                    argv.push("--dry-run".to_owned());
+                }
+                argv
+            };
+            fn as_args(argv: &[String]) -> Vec<&str> {
+                argv.iter().map(String::as_str).collect()
+            }
+
+            let dry = gc_argv(true);
+            let dry = run_tally(&config_path, &paths.socket, &as_args(&dry)).await;
+            assert_eq!(
+                dry.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&dry.stderr)
+            );
+            let dry = parse_stdout(&dry);
+            assert_eq!(dry["adapterProbesExamined"], 1);
+            assert_eq!(dry["adapterProbesPruned"], 1);
+            assert!(retained.exists(), "a dry run must not remove anything");
+
+            let swept = gc_argv(false);
+            let swept = run_tally(&config_path, &paths.socket, &as_args(&swept)).await;
+            assert_eq!(
+                swept.status.code(),
+                Some(0),
+                "{}",
+                String::from_utf8_lossy(&swept.stderr)
+            );
+            let swept = parse_stdout(&swept);
+            assert_eq!(swept["adapterProbesExamined"], 1);
+            assert_eq!(swept["adapterProbesPruned"], 1);
+            assert!(
+                !retained.exists(),
+                "the gc sweep did not reach the probe root the smoke used: {}",
+                retained.display()
+            );
         })
         .await;
 }

@@ -78,11 +78,26 @@ fn parse_scale(raw: Option<&str>) -> f64 {
              or unset {TIMEOUT_SCALE_ENV} to use the unscaled budgets"
         )
     });
+    // One refusal per bound. A single message for both had to pick one
+    // explanation, and the one it picked was true only of the lower bound: a
+    // reader who typed `1e30` was told about values below 1 and never about the
+    // overflow that is the actual reason the upper bound exists.
     assert!(
-        (1.0..=MAX_TIMEOUT_SCALE).contains(&scale),
-        "{TIMEOUT_SCALE_ENV}={raw:?} must be a multiplier between 1 and \
-         {MAX_TIMEOUT_SCALE:.0}; the knob only widens budgets, so a value below 1 \
-         would tighten them and produce reds that read as product timeouts"
+        scale.is_finite(),
+        "{TIMEOUT_SCALE_ENV}={raw:?} must be a finite multiplier between 1 and \
+         {MAX_TIMEOUT_SCALE:.0}"
+    );
+    assert!(
+        scale >= 1.0,
+        "{TIMEOUT_SCALE_ENV}={raw:?} must be at least 1; the knob only widens \
+         budgets, so a value below 1 would tighten them and produce reds that read \
+         as product timeouts"
+    );
+    assert!(
+        scale <= MAX_TIMEOUT_SCALE,
+        "{TIMEOUT_SCALE_ENV}={raw:?} must be at most {MAX_TIMEOUT_SCALE:.0}; a \
+         larger multiplier overflows the scaled `Duration` and panics inside \
+         libcore, where nothing names this variable"
     );
     scale
 }
@@ -140,21 +155,27 @@ fn empty_scale_fails_loudly() {
 }
 
 #[test]
-#[should_panic(expected = "must be a multiplier between 1 and 1000")]
+#[should_panic(expected = "TALLY_TEST_TIMEOUT_SCALE=\"0\" must be at least 1")]
 fn zero_scale_fails_loudly() {
     scaled_with(Duration::from_secs(60), Some("0"));
 }
 
 #[test]
-#[should_panic(expected = "must be a multiplier between 1 and 1000")]
+#[should_panic(expected = "TALLY_TEST_TIMEOUT_SCALE=\"-2\" must be at least 1")]
 fn negative_scale_fails_loudly() {
     scaled_with(Duration::from_secs(60), Some("-2"));
 }
 
 #[test]
-#[should_panic(expected = "must be a multiplier between 1 and 1000")]
+#[should_panic(expected = "must be a finite multiplier between 1 and 1000")]
 fn infinite_scale_fails_loudly() {
     scaled_with(Duration::from_secs(60), Some("inf"));
+}
+
+#[test]
+#[should_panic(expected = "must be a finite multiplier between 1 and 1000")]
+fn not_a_number_scale_fails_loudly() {
+    scaled_with(Duration::from_secs(60), Some("NaN"));
 }
 
 /// The knob widens; it never narrows. A value left over from an experiment used
@@ -166,10 +187,21 @@ fn sub_unit_scale_is_rejected_rather_than_narrowing() {
     scaled_with(Duration::from_secs(60), Some("0.5"));
 }
 
-/// Without the upper bound this overflowed inside `core::time`, whose panic
-/// names neither the knob nor its value.
+/// Each bound explains itself. A single shared message had to pick one
+/// explanation and told an over-large value about the lower bound.
 #[test]
-#[should_panic(expected = "TALLY_TEST_TIMEOUT_SCALE=\"1e30\"")]
+#[should_panic(expected = "must be at most 1000")]
+fn just_past_the_upper_bound_is_rejected_and_says_why() {
+    scaled_with(Duration::from_secs(60), Some("1000.5"));
+}
+
+/// Without the upper bound this overflowed inside `core::time`, whose panic
+/// names neither the knob nor its value. The refusal names both, and explains
+/// the overflow rather than the lower bound.
+#[test]
+#[should_panic(
+    expected = "TALLY_TEST_TIMEOUT_SCALE=\"1e30\" must be at most 1000; a larger multiplier overflows"
+)]
 fn overflowing_scale_is_rejected_before_it_reaches_libcore() {
     scaled_with(Duration::from_secs(60), Some("1e30"));
 }

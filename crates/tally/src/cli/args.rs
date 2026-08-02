@@ -214,11 +214,21 @@ pub(super) struct AdapterSmokeArgs {
     /// commit descended from the seeded base and a clean worktree.
     #[arg(long)]
     pub(super) assert_commit: bool,
+    /// State directory the --assert-commit probe root derives from; defaults to
+    /// the XDG state directory. Point this at the daemon's configured stateDir
+    /// so that `tally gc --state-dir <same path>` reaps the probe repositories
+    /// a failed smoke retains. On a NixOS deployment the two are not the same
+    /// by default: the module's stateDir is /var/lib/tally/state while an
+    /// operator's shell resolves $XDG_STATE_HOME/tally.
+    #[arg(long, value_name = "PATH", conflicts_with = "probe_root")]
+    pub(super) state_dir: Option<PathBuf>,
     /// Directory the --assert-commit probe repository is created under; defaults
     /// to adapter-smoke/ below the state directory. Name the campaign's
-    /// workspace root to probe where implementation nodes actually run. Never
-    /// the system temporary directory: a hardened adapter's transient unit gets
-    /// a private /tmp, and an agent sandbox may treat it as writable by default.
+    /// workspace root to probe where implementation nodes actually run — but a
+    /// probe seeded outside <gc state dir>/adapter-smoke/ is not swept by
+    /// `tally gc` and must be removed by hand. Never the system temporary
+    /// directory: a hardened adapter's transient unit gets a private /tmp, and
+    /// an agent sandbox may treat it as writable by default.
     #[arg(long, value_name = "PATH", requires = "assert_commit")]
     pub(super) probe_root: Option<PathBuf>,
 }

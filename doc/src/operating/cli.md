@@ -165,21 +165,37 @@ after the repository exists names its path, including the ones that say nothing
 about the commit assertion, and the repository is seeded only once the daemon
 connection is open — a smoke that cannot reach the daemon at all leaves nothing
 behind. Retained repositories expire on the capture-archive horizon like any
-other retained evidence: `tally gc` sweeps `adapter-smoke/probe-*` under the
-state directory and reports `adapterProbesExamined`/`adapterProbesPruned`. This
-is the one-command pre-flight for a policy pairing: an agent that writes its
-files correctly and cannot reach git metadata to commit them reports `no-commit`
-here in seconds instead of failing publication after a full campaign node.
+other retained evidence: `tally gc --state-dir DIR` sweeps `probe-*` under
+`DIR/adapter-smoke/` and reports `adapterProbesExamined`/`adapterProbesPruned`.
+This is the one-command pre-flight for a policy pairing: an agent that writes
+its files correctly and cannot reach git metadata to commit them reports
+`no-commit` here in seconds instead of failing publication after a full campaign
+node.
 
-`--probe-root PATH` names the directory the probe repository is created under.
-It defaults to `adapter-smoke/` below the state directory and is never the
-system temporary directory, for two independent reasons. A
-[hardened](../configuration/hardening.md) adapter's transient unit runs with
-`PrivateTmp=yes`, so a `/tmp` working directory does not exist inside its
-namespace and systemd kills the unit before the adapter binary runs — a harness
-failure whose empty capture reads exactly like a policy failure. And an agent
-sandbox may treat `$TMPDIR` and `/tmp` as default writable roots, which would
-let a confining policy pass a probe it should fail. Name the campaign's
+**Point the probe at the state directory whose gc sweeps it.** `tally gc` reaps
+`probe-*` only under the `--state-dir` *it* is given, so the probe root and the
+gc root have to be the same place or nothing ever reaps a retained probe:
+
+- `--state-dir PATH` names the state directory the default probe root derives
+  from — the probe lands in `PATH/adapter-smoke/`. Without it the CLI resolves
+  `$XDG_STATE_HOME/tally` (or `$HOME/.local/state/tally`). On a Home Manager
+  deployment that already coincides with the module's `stateDir`. On a **NixOS**
+  deployment it does not: the module's `stateDir` is `/var/lib/tally/state` and
+  that is what the retention timer passes to `tally gc`, so pass
+  `--state-dir /var/lib/tally/state` (as the service user, which owns it) or
+  remove the retained repository by hand.
+- `--probe-root PATH` names the probe directory outright and is not derived from
+  any state directory. A probe seeded outside `<gc state dir>/adapter-smoke/` —
+  which includes every campaign workspace root — is **not** swept by `tally gc`
+  and must be removed by hand.
+
+`--probe-root` is never the system temporary directory, for two independent
+reasons. A [hardened](../configuration/hardening.md) adapter's transient unit
+runs with `PrivateTmp=yes`, so a `/tmp` working directory does not exist inside
+its namespace and systemd kills the unit before the adapter binary runs — a
+harness failure whose empty capture reads exactly like a policy failure. And an
+agent sandbox may treat `$TMPDIR` and `/tmp` as default writable roots, which
+would let a confining policy pass a probe it should fail. Name the campaign's
 workspace root to probe where implementation nodes actually run.
 
 The probe repository is submitted as the job's workspace, which is how a
