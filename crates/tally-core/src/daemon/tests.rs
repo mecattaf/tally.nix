@@ -9325,6 +9325,165 @@ mod tests {
             .await;
     }
 
+    /// #247, reproduced exactly as reported: **same items, `nextCursor: null`,
+    /// ground truth advancing** — no truncation involved.
+    ///
+    /// `--flow-run` membership is not a durable property of the run. It is
+    /// recomputed per call by scanning durable row details and witness records
+    /// for an orchestration capsule naming that `flowRunId`
+    /// (`query_v2::flow_run_tasks`), and a lifecycle event whose task is not in
+    /// that set is dropped outright (`lifecycle_matches`). An `attached`
+    /// admission writes no row (`enqueue::full_live_disposition` returns
+    /// before any `query_details.insert`), and the canonical payload hash
+    /// excludes the orchestration capsule (`wire::canonical_payload`), so a
+    /// second run submitting an identical node while the first is still in
+    /// flight is told `attached`, is handed the task UUID, and can never see
+    /// that task in its own window — not because the page was capped, but
+    /// because the node was never a member.
+    ///
+    /// This is the shape the crm report described and the one the stale-page-one
+    /// mechanism cannot produce: a null cursor means the page *is* the window.
+    #[tokio::test(flavor = "current_thread")]
+    async fn repro_247_an_attached_node_is_invisible_to_the_run_that_submitted_it() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let first_run = Uuid::new_v4().to_string();
+                let second_run = Uuid::new_v4().to_string();
+
+                // The first run admits the node: created, and visible to it.
+                let created = daemon
+                    .handler
+                    .enqueue_as_client(Some(monitor_node_payload(&first_run, 0)))
+                    .await
+                    .unwrap();
+                assert_eq!(created["disposition"], "created");
+                let shared_task = created["task_uuid"].as_str().unwrap().to_owned();
+
+                // A re-triggered run submits the identical node while the
+                // first one is still in flight. Only the capsule differs, and
+                // the capsule is not part of the payload hash.
+                let mut resubmitted = monitor_node_payload(&first_run, 0);
+                resubmitted["orchestration"]["flowRunId"] = json!(second_run);
+                let attached = daemon
+                    .handler
+                    .enqueue_as_client(Some(resubmitted))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    attached["disposition"], "attached",
+                    "the seam under test needs an attached admission: {attached}"
+                );
+                assert_eq!(
+                    attached["task_uuid"].as_str(),
+                    Some(shared_task.as_str()),
+                    "the second run was handed the very task it cannot see"
+                );
+
+                let poll = |flow_run: String| {
+                    let handler = &daemon.handler;
+                    async move {
+                        handler
+                            .query(
+                                "query.log",
+                                Some(json!({"flowRun": flow_run, "limit": 1000})),
+                            )
+                            .await
+                            .unwrap()
+                    }
+                };
+
+                // The reported symptom, asserted field by field.
+                let before = poll(second_run.clone()).await;
+                assert!(
+                    before["items"].as_array().unwrap().is_empty(),
+                    "expected the second run's window to be empty: {before}"
+                );
+                assert!(before["nextCursor"].is_null());
+                assert_eq!(before["truncated"], false);
+
+                // Ground truth advances: the shared task keeps emitting, and
+                // the first run's window grows to prove the events are real
+                // and durable rather than absent.
+                let first_before = poll(first_run.clone()).await["items"]
+                    .as_array()
+                    .unwrap()
+                    .len();
+                for event in [TallyEvent::Started, TallyEvent::Heartbeat] {
+                    let mut emit = crate::journal::EmitEvent::enqueued(
+                        shared_task.clone(),
+                        Priority::High,
+                        EnqueueSource::Orchestrator,
+                    );
+                    emit.event = event;
+                    emit.agent = Some("shell".to_owned());
+                    emit.attempt = Some(1);
+                    emit.lease_epoch = Some(1);
+                    emit.job_id = Some(shared_task.clone());
+                    emit.unit = Some(format!("tally-job-{shared_task}.service"));
+                    daemon
+                        .handler
+                        .history
+                        .borrow_mut()
+                        .append_now(emit.into_fields().unwrap())
+                        .unwrap();
+                }
+                let first_after = poll(first_run.clone()).await;
+                assert_eq!(
+                    first_after["items"].as_array().unwrap().len(),
+                    first_before + 2,
+                    "the events must be durable and visible to the run that owns the row"
+                );
+
+                // ...and the second run's window is byte-identical to before,
+                // still with a null cursor. Same items, no truncation signal,
+                // ground truth advancing: #247, with no page cap in sight.
+                let after = poll(second_run.clone()).await;
+                assert!(after["items"].as_array().unwrap().is_empty());
+                assert!(after["nextCursor"].is_null());
+                assert_eq!(after["truncated"], false);
+                assert_eq!(after["items"], before["items"]);
+
+                // The position still advances, because it is the head of the
+                // whole lifecycle stream rather than of this filter. That is
+                // also LOW-3 reproduced: the docs used to state the proof of
+                // quiet as "empty items AND the same position", a conjunction
+                // that cannot hold on any daemon with concurrent work.
+                assert_ne!(
+                    after["position"], before["position"],
+                    "the stream head must move even when the filtered window does not"
+                );
+
+                // What the repair gives a monitor: the run resolves to zero
+                // member tasks, so its empty window is legible as "this run
+                // has no members" rather than "this run is quiet". The run
+                // that owns the row still resolves to its one member.
+                assert_eq!(
+                    after["flowRunTasks"], 0,
+                    "an attached-only run must report that it resolved to nothing"
+                );
+                assert_eq!(poll(first_run).await["flowRunTasks"], 1);
+
+                // An unfiltered query has no membership to report, so the
+                // field is absent rather than a misleading zero.
+                let unfiltered = daemon
+                    .handler
+                    .query("query.log", Some(json!({"limit": 1000})))
+                    .await
+                    .unwrap();
+                assert!(unfiltered.get("flowRunTasks").is_none());
+            })
+            .await;
+    }
+
     /// `--after` is a durable stream coordinate, not a page cursor and not the
     /// `--since` time filter. Two successive polls over a quiet run must be
     /// byte-identical apart from the timestamp that dates the projection.

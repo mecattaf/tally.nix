@@ -369,6 +369,20 @@ pub struct CollectionEnvelope<T> {
     /// gone, and the response is therefore not a complete continuation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position_gap: Option<PositionGap>,
+    /// How many task UUIDs a `flowRun` filter resolved to, present only when
+    /// one was supplied.
+    ///
+    /// Run membership is not a durable property: it is recomputed per call by
+    /// scanning durable rows and witness records for an orchestration capsule
+    /// naming the run (`flow_run_tasks`). An admission that writes no row —
+    /// `attached`, and full-mode `reused` and `terminal` — leaves the run
+    /// holding a task UUID that resolves to no member here, so its events are
+    /// filtered out of the run's own window with no page cap in sight. That is
+    /// #247's `same items, nextCursor: null, ground truth advancing`. Reporting
+    /// the resolved count is what lets a monitor tell an empty window that
+    /// means "quiet" from one that means "this run resolved to nothing".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_run_tasks: Option<usize>,
     pub snapshot: QuerySnapshotMetadata,
 }
 
@@ -584,6 +598,7 @@ pub fn query_jobs(
         next_cursor: None,
         position: None,
         position_gap: None,
+        flow_run_tasks: None,
         snapshot: snapshot_metadata(history, witness),
     })
 }
@@ -811,6 +826,10 @@ pub fn query_lifecycle_log(
         next_cursor: None,
         position: None,
         position_gap: None,
+        // Reported whenever the caller scoped the query to a run, including
+        // when it resolved to nothing: a zero here is the difference between
+        // a quiet run and a run whose nodes are not members of it.
+        flow_run_tasks: flow_tasks.map(|tasks| tasks.len()),
         snapshot: snapshot_metadata(history, witness),
     })
 }
@@ -1692,6 +1711,7 @@ pub fn query_flow_proofs(
         next_cursor: None,
         position: None,
         position_gap: None,
+        flow_run_tasks: None,
         snapshot: snapshot_metadata(history, witness),
     })
 }

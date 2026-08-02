@@ -452,9 +452,12 @@ single-page semantics and marks the page with `truncated`, `nextCursor`, and `el
 `--after` takes a durable lifecycle-stream position, `log-v1:<lifecycle>:<witness>`, taken from
 the `position` field of a previous response. It is not `--since`, which remains a wall-clock time
 filter, and it is not `--cursor`, which is an ephemeral page offset; a page or watch cursor
-handed to `--after` is refused rather than misread. `--after` plus empty `items` and an unchanged
-`position` is a proof that the run is quiet. See [Poll a flow run
-correctly](observability.md#poll-a-flow-run-correctly) for the full monitoring contract.
+handed to `--after` is refused rather than misread. `--after` plus empty `items` means nothing after that
+position matched the filter; read `items` rather than `position`, which is the head of the whole
+lifecycle stream and advances whenever anything else on the daemon does. A run-scoped response
+also reports `flowRunTasks`, and `flowRunTasks: 0` means the window is not evidence about the run
+at all. See [Poll a flow run correctly](observability.md#poll-a-flow-run-correctly) for the full
+monitoring contract, including the membership seam behind #247.
 `query trace` also supports page cursors. Proof is not just a witness
 lookup: it reports whether a witness is expected, returns the canonical record when present,
 separates advisory attestations, and includes ledger verification state.

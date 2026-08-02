@@ -319,7 +319,8 @@ All query objects currently report `schemaVersion: 1` and `protocolVersion: 4`. 
 shapes are:
 
 - collection: `{schemaVersion, protocolVersion, items, nextCursor, truncated, elidedItems,
-  snapshot}`, plus `position` and optional `positionGap` on `query.log`;
+  snapshot}`, plus `position`, optional `positionGap`, and — when a `flowRun` filter was
+  supplied — `flowRunTasks` on `query.log`;
 - snapshot: `{createdAt, cursor, history, witnessHead:{seq,hash}}`;
 - job detail: `{schemaVersion, protocolVersion, job, attempts, snapshot}`;
 - run status: `{schemaVersion, protocolVersion, flowRunId, flowName?, campaign?, repository?,
@@ -358,7 +359,8 @@ receive current nodes and failures but have an empty task table; for those runs 
 `complete` when every admitted node holds a passing terminal verdict on its current attempt.
 
 `query.log` filters by `task`, `flowRun`, `attempt`, `session`, lifecycle `event`, `source`,
-`since`, and `until`, and accepts optional `provenance` and `after`. `after` is a durable
+`since`, and `until`, and accepts optional `provenance` and `after`. A `flowRun`-scoped response
+also reports `flowRunTasks`; see [Flow-run membership](#flow-run-membership). `after` is a durable
 lifecycle-stream position, described under [Lifecycle stream
 positions](#lifecycle-stream-positions) below; it is not `since`, which remains a wall-clock time
 filter, and it is not `cursor`, which is an ephemeral page offset. Lifecycle items expose `taskRef` when their durable row/witness did. A lifecycle event carries no orchestration capsule, so `flowRun` is resolved
@@ -421,6 +423,11 @@ Every page carries two completeness fields alongside `nextCursor`:
 | `truncated` | `true` exactly when this response is not the whole filtered window. A reader that checks nothing else still cannot mistake a capped page for a quiet run. |
 | `elidedItems` | How many items on this page were served with fields cut down to fit. |
 
+The CLI's default (non-`--json`) `query jobs` and `query log` print a *merged* envelope
+assembled by walking every page, in the same shape as a single page. On that output
+`elidedItems` is the sum across every page walked, so it can exceed the per-page maximum of
+one described below, and `truncated` is always `false` because the walk finished.
+
 An item that alone exceeds the 48 KiB cap is not an error and does not end the query. Its largest
 string fields are truncated — largest first, 256 bytes retained, the remainder replaced by
 `…<N bytes elided>` — and the item gains an `elided` object naming what was cut:
@@ -471,6 +478,31 @@ positionGap: {requested, earliestAvailable}
 
 and the window is a partial continuation: events between the retained floor and the request are
 gone.
+
+`position` is the head of the **whole** lifecycle stream, not of the caller's filter. A
+filtered poll therefore sees it advance whenever anything else on the daemon does; empty
+`items` is the signal that nothing matched after the held position, and `position` is what the
+caller carries forward.
+
+### Flow-run membership
+
+A `flowRun` filter on `query.log` is resolved per call: tally scans durable row details and
+witness records for an orchestration capsule naming that run and keeps only events whose task is
+in the resulting set. Membership is therefore **not** a durable property of the run. An admission
+that writes no row — `attached`, and full-mode `reused` and `terminal` — hands the caller a task
+UUID whose row, and whose membership, belongs to whichever run created it. Events for that task
+are filtered out of the submitting run's window entirely, with no page cap involved: same items,
+`nextCursor: null`, while the work runs.
+
+Every run-scoped `query.log` response reports the resolved membership so a caller can tell that
+case from a quiet run:
+
+```text
+flowRunTasks: <count of task UUIDs this flowRun resolved to>
+```
+
+The field is absent when no `flowRun` filter was supplied. `flowRunTasks: 0` means the response
+is not evidence about the run; the CLI says so on stderr.
 
 ### Watch cursors
 

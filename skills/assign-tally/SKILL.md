@@ -71,14 +71,29 @@ the reconciled task table, current-node elapsed/budget state, and failure
 pointers. For persistent monitoring, still corroborate ground truth: merged
 PRs, capture `.err` files, and runner-unit liveness.
 
-`tally query log --flow-run` is safe to poll: the human view walks the whole
-window rather than the first (permanently stale) page, and says on stderr when
-it cannot show all of it. For an unattended monitor, hold the `position` a
-response reports and poll with `--after <position>`; empty items plus an
-unchanged position is a proof that the run is quiet, not merely an absence of
-matches. The contract is in Operating → Observability, "Poll a flow run
-correctly". Silence is still not success: any watcher must fire on every
-terminal state, including "runner gone with work remaining."
+`tally query log --flow-run` no longer hides truncation: the human view walks
+the whole window rather than the first (permanently stale) page, and says on
+stderr when it cannot show all of it. For an unattended monitor, hold the
+`position` a response reports and poll with `--after <position>`; empty `items`
+means nothing after that position matched your filter. Read `items`, not
+`position` — the position is the head of the whole lifecycle stream, so it
+advances whenever anything else on the daemon does.
+
+**An empty `--flow-run` window is not automatically a fact about the run.**
+Membership is recomputed per call from durable rows and witness records, and an
+admission that wrote no row — `attached`, and full-mode `reused` and `terminal`
+— leaves the run holding a task UUID that is not one of its members. A
+re-triggered campaign attaching to nodes still in flight lands here, and the
+window then shows the same items forever with `nextCursor: null` while the work
+executes. That is the original #247 shape and it is **not fixed** — it is made
+legible: every run-scoped response reports `flowRunTasks`, and `flowRunTasks:
+0` means the window says nothing about the run. When the count is zero, or
+below the node count the runner reports, corroborate against `tally query run
+<id>`, runner-unit liveness, merged PRs, and capture `.err` files instead.
+
+The contract is in Operating → Observability, "Poll a flow run correctly".
+Silence is still not success: any watcher must fire on every terminal state,
+including "runner gone with work remaining."
 
 Known adapter noise such as "Reading additional input from stdin..." is retained
 in `.adapter.err`. The conventional `.err` path is an atomic, bounded
