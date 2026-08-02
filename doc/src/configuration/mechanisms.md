@@ -36,7 +36,7 @@ partial set.
 | [`predicate.windowed-consumption.windowSec`](core-options.md#servicestallypoolsnamepredicatewindowed-consumptionwindowsec) | Sets the rolling look-back interval for durable budget debits. |
 | [`predicate.windowed-consumption.consumptionCap`](core-options.md#servicestallypoolsnamepredicatewindowed-consumptionconsumptioncap) | Sets the spend ceiling in the pool's declared native unit. |
 | [`enforce`](core-options.md#servicestallypoolsnameenforce) | Selects the shipped enforcement implementation. Only cooperative enforcement exists; declaring a pool does not create a cgroup or patched-systemd boundary. |
-| [`hardPreempt`](core-options.md#servicestallypoolsnamehardpreempt) | Opts the pool into reclaiming a lower-priority holder that does not yield within the configured grace. |
+| [`hardPreempt`](core-options.md#servicestallypoolsnamehardpreempt) | Opts the pool into reclaiming a lower-priority holder that does not yield within the configured grace. A co-allocated victim is reclaimed only when every pool the same request asks it to yield in also opts in. |
 | [`autoResume`](core-options.md#servicestallypoolsnameautoresume) | Overrides resource-specific same-row recovery after a pool returns; leaving it unset uses tally's resource policy. |
 | [`priority`](core-options.md#servicestallypoolsnamepriority) | Orders pool consideration; lower ranks are considered first. It is separate from job priority. |
 | [`credentials`](core-options.md#servicestallypoolsnamecredentials) | Adds `LoadCredential` references to every job that leases this pool. Values are source paths, not secret contents. |

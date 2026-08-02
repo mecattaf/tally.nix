@@ -964,7 +964,13 @@ impl LeaseEngine {
                     .or_default()
                     .entry(pending.ticket_id.clone())
                     .and_modify(|intent| {
-                        intent.hard_reclaim |= hard_preempt;
+                        // Conjunctive, deliberately: a victim co-allocated on
+                        // several pools becomes hard-reclaim eligible only when
+                        // every pool this request asks it to yield in carries
+                        // `hardPreempt`. A pool's `false` is a promise to its
+                        // own workloads, and OR let a neighboring pool's opt-in
+                        // override it.
+                        intent.hard_reclaim &= hard_preempt;
                         intent.pools.insert(pool.clone());
                     })
                     .or_insert_with(|| YieldIntent {
@@ -2343,6 +2349,103 @@ mod tests {
             .unwrap()
             .preempted
             .is_empty());
+    }
+
+    /// Two capacity-1 pools, one victim holding both, one interrupt asking for
+    /// both. The pools disagree about `hardPreempt`, and the ruling on the
+    /// record is conjunctive: `beta`'s disabled flag is a promise to its own
+    /// workloads, so `alpha`'s opt-in must not reach across and kill a holder
+    /// of `beta`. The yield is still requested — cooperation is always asked
+    /// for — but the deadline passes without a reclaim and the interrupt stays
+    /// queued.
+    #[test]
+    fn a_co_allocated_victim_is_never_hard_reclaimed_when_one_pool_opts_out() {
+        let mut opted_in = pool(1);
+        opted_in.hard_preempt = true;
+        let opted_out = pool(1);
+        assert!(!opted_out.hard_preempt);
+        let mut engine = LeaseEngine::new(
+            9,
+            Duration::from_secs(20),
+            BTreeMap::from([
+                ("alpha".to_owned(), opted_in),
+                ("beta".to_owned(), opted_out),
+            ]),
+            None,
+        )
+        .unwrap();
+        let victim = grant(
+            engine
+                .admit_at(request("victim", &["alpha", "beta"], Priority::Low), now())
+                .unwrap(),
+        );
+        assert!(matches!(
+            engine
+                .admit_at(
+                    request("urgent", &["alpha", "beta"], Priority::Interrupt),
+                    now(),
+                )
+                .unwrap(),
+            AdmitOutcome::Queued { position: 1, .. }
+        ));
+        assert!(engine.status(&victim.lease_id, 9).unwrap().yield_requested);
+
+        let reclaim_at = now() + chrono::Duration::seconds(20);
+        assert!(engine.plan_tick(reclaim_at).unwrap().is_empty());
+        let outcome = engine.tick(reclaim_at).unwrap();
+        assert!(outcome.preempted.is_empty());
+        assert!(outcome.promoted.is_empty());
+        assert_eq!(engine.held_len(), 1);
+        assert_eq!(engine.queue_len(), 1);
+        assert!(matches!(
+            engine.commit_preemptions(std::slice::from_ref(&victim.lease_id), reclaim_at),
+            Err(LeaseError::InvalidRequest(_))
+        ));
+    }
+
+    /// The other half of the ruling: when every pool the request asks the
+    /// victim to yield in opts in, the grace deadline does reclaim it. The
+    /// reclaim is what the daemon turns into the canonical `preempted`
+    /// verdict; the lease layer's half of that is the committed preemption and
+    /// the promotion it unblocks.
+    #[test]
+    fn a_co_allocated_victim_is_hard_reclaimed_when_every_pool_opts_in() {
+        let mut alpha = pool(1);
+        alpha.hard_preempt = true;
+        let mut beta = pool(1);
+        beta.hard_preempt = true;
+        let mut engine = LeaseEngine::new(
+            9,
+            Duration::from_secs(20),
+            BTreeMap::from([("alpha".to_owned(), alpha), ("beta".to_owned(), beta)]),
+            None,
+        )
+        .unwrap();
+        let victim = grant(
+            engine
+                .admit_at(request("victim", &["alpha", "beta"], Priority::Low), now())
+                .unwrap(),
+        );
+        assert!(matches!(
+            engine
+                .admit_at(
+                    request("urgent", &["alpha", "beta"], Priority::Interrupt),
+                    now(),
+                )
+                .unwrap(),
+            AdmitOutcome::Queued { position: 1, .. }
+        ));
+
+        let reclaim_at = now() + chrono::Duration::seconds(20);
+        let planned = engine.plan_tick(reclaim_at).unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].lease_id, victim.lease_id);
+        let outcome = engine
+            .commit_preemptions(std::slice::from_ref(&victim.lease_id), reclaim_at)
+            .unwrap();
+        assert_eq!(outcome.preempted, [victim]);
+        assert_eq!(outcome.promoted[0].job_id, "urgent");
+        assert_eq!(engine.queue_len(), 0);
     }
 
     #[test]
