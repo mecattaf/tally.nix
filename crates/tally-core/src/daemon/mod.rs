@@ -393,6 +393,13 @@ impl JobResult {
         if let Some(task_ref) = &self.task_ref {
             value["taskRef"] = Value::String(task_ref.to_string());
         }
+        // The canonical model is already published to the gh producer's
+        // `Assisted-by:` trailer from the same job result. A flow that
+        // authors a commit message needs the same pointer, so the terminal
+        // fact carries it rather than making the script re-derive it.
+        if let Some(model) = &self.model {
+            value["model"] = Value::String(model.clone());
+        }
         if let Some(completion) = &self.completion {
             value["completion"] =
                 serde_json::to_value(completion).expect("semantic completion always serializes");

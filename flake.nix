@@ -1254,6 +1254,11 @@
                   agentRuntimeMaxSec = 120;
                   driverRuntimeMaxSec = 30;
                   mergeMethod = "merge";
+                  # Advisory is the only posture this wave arms: the merge node
+                  # records what the binding found and never fails on it. The
+                  # externally provisioned binary is absent from this fixture,
+                  # so what it records here is that fact.
+                  gitAiBinding = "advisory";
                   # The narrate seam is config-only: an adapter the estate adds
                   # to the open map, named as this campaign's catalog role. The
                   # rendered narration argv is the adapter's own argv with this
@@ -3618,6 +3623,7 @@
                   ($fixtureArgs.gates[1] | has("argv") | not) and
                   $fixtureArgs.gates[1].runtimeMaxSec == 11 and
                   $fixtureArgs.mergeMethod == "merge" and
+                  $fixtureArgs.gitAiBinding == "advisory" and
                   $fixtureArgs.steward.adapter == "narrator" and
                   $fixtureArgs.steward.argv == [
                     "/bin/sh", "/srv/campaign-fixtures/narrate", "--narrate"
@@ -3632,6 +3638,7 @@
                   .adapters["spec-build-driver"].scrape.finalMessage.pattern
                     == "^TALLY_FINAL_MESSAGE=(.*)$" and
                   $defaultedArgs.mergeMethod == "squash" and
+                  $defaultedArgs.gitAiBinding == "off" and
                   $defaultedArgs.steward == null and
                   $defaultedArgs.agent.adapter == "codex" and
                   $defaultedArgs.agent.approvalPolicy == "never" and

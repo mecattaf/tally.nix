@@ -111,6 +111,14 @@ distinguishes `match`, `revision-missing`, `missing-note`, `note-content-mismatc
 prints the note body. A later repository mutation can make this external check red while the
 historical witness chain remains independently green.
 
+The notes-ref target is checked by ancestry, not by equality. A notes ref is an ordinary commit
+history that grows whenever any commit in the repository is annotated — including a campaign merge
+node binding its squash commit — so equality would report a mismatch for every repository that
+stayed in use. The witnessed target must still be an ancestor of the observed one; a ref that was
+rewritten, rolled back, or rebuilt is not, and still reports `notes-ref-target-mismatch`. The proof
+is unchanged and remains exact: the note blob for the witnessed revision must hash to the witnessed
+digest.
+
 For attribution details, follow the witnessed revision into Git AI:
 
 ```console

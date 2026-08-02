@@ -8,6 +8,40 @@ authorized.
 
 ### Added
 
+- Added `services.tally.campaigns.<name>.gitAiBinding`, an enum of `off`
+  (default), `advisory`, and `required`, arming the fourth proof axis on the
+  commit a campaign integrates. A forge-side squash arrives with no authorship
+  note at all — `doc/src/flows/git-ai-squash-fidelity.md` measured that
+  attribution is re-minted at `git commit` time and only in the repository that
+  made the commit — so under `advisory` and `required` the merge node re-mints
+  the same integration in a detached worktree of the campaign checkout, proves
+  the merged commit's first parent is the gated base and its tree equals the
+  reconstruction's, copies the resulting note onto the integrated commit, and
+  pushes `refs/notes/ai` to the campaign remote. The push is fast-forward-only
+  and folds a diverged remote in with `cat_sort_uniq` rather than forcing.
+  Every outcome is journaled with the merge node as an `authorship` receipt
+  naming the posture, status, bound revision, notes-ref target, exact note
+  digest, whether it published, and a typed reason. `advisory` never fails a
+  node; `required` fails the merge on any status other than a published
+  `bound`. The binding is a step inside the existing merge action and adds no
+  flow node.
+- Added the `Assisted-by: <adapter>:<model> (tally:<taskUuid> witness:<seq>)`
+  trailer to campaign squash commit messages, byte-identical to the trailer the
+  gh producer publishes. Every component comes from the settled implementation
+  node — the campaign's agent adapter, the canonical model the daemon recorded,
+  and the task UUID and witness sequence of the attempt being merged. With no
+  canonical model recorded the node writes no trailer rather than a plausible
+  one, and the narration validator now refuses a proposal that carries an
+  `Assisted-by:` line: that authority belongs to the node.
+- Added `model` to the flow job spec and
+  `services.tally.campaigns.<name>.agentModel`. A flow's `job()` can now name
+  the model its node runs under, normalized into the same `adapterOptions`
+  kernel field catalog members already reach through their `launch` object, and
+  still refused outright by an adapter that authorizes no model override. The
+  flow node result carries the daemon's canonical model back to the script,
+  which is what makes the campaign's provenance trailer sourced from the
+  witnessed attempt rather than from the script's own input.
+
 - Added `services.tally.campaigns.<name>.mergeMethod`, an enum of `merge` and
   `squash` that defaults to `squash`. A squashed campaign leaves one commit per
   task on the base branch instead of a merge commit carrying a template
@@ -515,6 +549,16 @@ authorized.
   backlinks and notifies nobody.
 
 ### Changed
+
+- `tally witness verify-authorship` now compares the notes-ref target by
+  ancestry instead of by equality. A notes ref grows whenever any commit in the
+  repository is annotated — including a campaign merge node binding its squash
+  commit — so equality reported `notes-ref-target-mismatch` for every
+  repository that stayed in use after the binding. The witnessed target must
+  still be an ancestor of the observed one; a ref that was rewritten, rolled
+  back, or rebuilt still reports the typed mismatch. The proof is unchanged and
+  remains exact: the note blob for the witnessed revision must hash to the
+  witnessed digest.
 
 - GitHub receipt and evidence comments are now sticky. Tally stores the node id
   `addComment` returns under the producer state directory, keyed by receipt or

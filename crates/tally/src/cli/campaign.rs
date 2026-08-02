@@ -55,6 +55,11 @@ struct CampaignAgent {
     approval_policy: Option<String>,
     #[serde(default = "default_agent_sandbox_policy")]
     sandbox_policy: Option<String>,
+    /// The model this campaign dispatches its coder with. Absent leaves the
+    /// adapter's own resolution alone and leaves the merge node with no model
+    /// to name in an `Assisted-by:` trailer.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +131,11 @@ struct CampaignManifest {
     /// commit carrying a template message is not that.
     #[serde(default = "default_merge_method")]
     merge_method: String,
+    /// Whether the merge node binds Git AI authorship on the commit it just
+    /// integrated. `off` is the shipped state; `advisory` records the outcome
+    /// as a merge receipt and never fails the node; `required` fails it.
+    #[serde(default = "default_git_ai_binding")]
+    git_ai_binding: String,
     agent: CampaignAgent,
     /// The steward bound as a catalog role. Absent leaves the narrate slot
     /// empty: publication text stays the brief-derived template.
@@ -297,6 +307,10 @@ const fn default_campaign_runtime_max_sec() -> Option<u64> {
 
 fn default_merge_method() -> String {
     "squash".to_owned()
+}
+
+fn default_git_ai_binding() -> String {
+    "off".to_owned()
 }
 
 fn default_runner_pool() -> String {
@@ -878,6 +892,14 @@ fn validate_manifest(manifest: &CampaignManifest) -> Result<()> {
     if !matches!(manifest.merge_method.as_str(), "merge" | "squash") {
         return Err(invalid("campaign mergeMethod must be merge or squash"));
     }
+    if !matches!(
+        manifest.git_ai_binding.as_str(),
+        "off" | "advisory" | "required"
+    ) {
+        return Err(invalid(
+            "campaign gitAiBinding must be off, advisory, or required",
+        ));
+    }
     validate_agent(&manifest.agent)?;
     if let Some(steward) = &manifest.steward {
         if !safe_component(&steward.adapter) {
@@ -1010,6 +1032,7 @@ fn validate_agent(agent: &CampaignAgent) -> Result<()> {
     if agent.runtime_max_sec == Some(0)
         || agent.approval_policy.as_deref() == Some("")
         || agent.sandbox_policy.as_deref() == Some("")
+        || agent.model.as_deref() == Some("")
     {
         return Err(invalid(
             "campaign agent limits and policy names must be non-empty",
@@ -3711,6 +3734,55 @@ mod tests {
     }
 
     #[test]
+    fn manifest_git_ai_binding_is_off_by_default_and_refuses_unknown_postures() {
+        // The shipped state binds nothing. A forge-native manifest that names
+        // no posture gets the same integration it always had.
+        let tasks = json!([{ "id": "task-1", "kind": "implementation", "issue": 8 }]);
+        let manifest: CampaignManifest =
+            serde_json::from_value(manifest_value_for_test(tasks.clone())).unwrap();
+        assert_eq!(manifest.git_ai_binding, "off");
+        assert!(manifest.agent.model.is_none());
+        validate_manifest(&manifest).unwrap();
+
+        for posture in ["advisory", "required"] {
+            let mut value = manifest_value_for_test(tasks.clone());
+            value
+                .as_object_mut()
+                .unwrap()
+                .insert("gitAiBinding".into(), json!(posture));
+            let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+            validate_manifest(&manifest).unwrap();
+            assert_eq!(manifest.git_ai_binding, posture);
+        }
+
+        let mut value = manifest_value_for_test(tasks.clone());
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("gitAiBinding".into(), json!("on"));
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        let error = validate_manifest(&manifest).unwrap_err().to_string();
+        assert!(
+            error.contains("gitAiBinding must be off, advisory, or required"),
+            "{error}"
+        );
+
+        // An empty model would render a job asking the adapter for nothing at
+        // all, and a trailer naming nothing at all.
+        let mut value = manifest_value_for_test(tasks);
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("agent".into(), json!({"adapter": "codex", "model": ""}));
+        let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+        let error = validate_manifest(&manifest).unwrap_err().to_string();
+        assert!(
+            error.contains("agent limits and policy names must be non-empty"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn manifest_accepts_native_checkpoints_and_rejects_unknown_kinds() {
         let value = manifest_value_for_test(json!([
             {
@@ -3834,6 +3906,7 @@ mod tests {
             runtime_max_sec: default_agent_runtime_max_sec(),
             approval_policy: default_agent_approval_policy(),
             sandbox_policy: sandbox.map(str::to_owned),
+            model: None,
         }
     }
 

@@ -10,7 +10,8 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tally_client::RpcClient;
 use tally_core::adapters::{
-    AdapterConfig, AdapterLaunchConfig, ScrapeCapture, ScrapeMode, ScrapeStream,
+    AdapterConfig, AdapterLaunchConfig, AdapterValueOverride, ScrapeCapture, ScrapeMode,
+    ScrapeStream,
 };
 use tally_core::config::{
     CoResidencyPredicate, Config, JournaldConfig, PoolConfig, PoolPredicate, ResourceKind,
@@ -2356,6 +2357,14 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                         commit_capable_sandbox_policies: BTreeSet::from([
                             "danger-full-access".to_owned()
                         ]),
+                        // A model override the adapter authorizes. The
+                        // campaign dispatches with it, the daemon records it as
+                        // the job's canonical model, and the merge node names
+                        // that -- and only that -- in its trailer.
+                        model: Some(AdapterValueOverride {
+                            argv: vec!["--model".to_owned(), "%<value>%".to_owned()],
+                            allowed_values: vec!["fixture/policy-agent-1".to_owned()],
+                        }),
                         ..AdapterLaunchConfig::default()
                     },
                     ..AdapterConfig::default()
@@ -2442,6 +2451,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     "agent": {
                         "adapter": "codex",
                         "argv": [BRIEF_SENTINEL],
+                        "model": "fixture/policy-agent-1",
                         "priority": priority,
                         "runtimeMaxSec": 30,
                         "approvalPolicy": "never",
@@ -2777,6 +2787,26 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 fixture_git(&checkout, &["log", "-1", "--format=%s", "origin/main"]),
                 "task-3: Create an independent fixture artifact"
             );
+            // §7's provenance pointer is the node's own, assembled from the
+            // witnessed implementation attempt: the adapter, the canonical
+            // model the daemon recorded, the task UUID, and the witness
+            // sequence. It is byte-identical to what the gh producer
+            // publishes, and the narrator is refused if it proposes one.
+            let trailer = second_value["merged"][0]["trailer"].as_str().unwrap();
+            assert!(
+                trailer.starts_with("Assisted-by: codex:fixture/policy-agent-1 (tally:"),
+                "{trailer}"
+            );
+            assert!(trailer.ends_with(')'), "{trailer}");
+            assert!(trailer.contains(" witness:"), "{trailer}");
+            let message = fixture_git(&checkout, &["log", "-1", "--format=%B", "origin/main"]);
+            assert!(
+                message.contains(trailer),
+                "the squash message must carry the trailer:\n{message}"
+            );
+            // gitAiBinding defaults to off, so the merge node binds nothing
+            // and says so rather than leaving the reader to guess.
+            assert_eq!(second_value["merged"][0]["authorship"], Value::Null);
             assert_eq!(second_value["failures"][0]["taskId"], "task-1");
             assert_eq!(second_value["failures"][0]["stage"], "ownership");
             assert_eq!(second_value["diagnoses"][0]["taskId"], "task-1");

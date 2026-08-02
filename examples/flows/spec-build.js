@@ -160,6 +160,9 @@ export const meta = {
       // default, `squash`: the footprint a campaign should leave behind is one
       // conventional commit per task, not a merge commit with a template message.
       mergeMethod: { enum: ["merge", "squash"] },
+      // Whether the merge node binds Git AI authorship on the commit it
+      // integrated. Absent means `off`: the shipped state binds nothing.
+      gitAiBinding: { enum: ["off", "advisory", "required"] },
       // The steward bound as a catalog role. Null, or absent, is the
       // shipped state: template narration and no model call at publication.
       steward: {
@@ -209,7 +212,11 @@ export const meta = {
           runtimeMaxSec: { type: ["integer", "null"], minimum: 1 },
           approvalPolicy: { type: ["string", "null"], minLength: 1 },
           sandboxPolicy: { type: ["string", "null"], minLength: 1 },
-          diagnosisSandboxPolicy: { type: ["string", "null"], minLength: 1 }
+          diagnosisSandboxPolicy: { type: ["string", "null"], minLength: 1 },
+          // The model this campaign dispatches its coder with. Null leaves the
+          // adapter's own resolution alone -- and leaves the merge node with
+          // no model to name, so no `Assisted-by:` trailer is written.
+          model: { type: ["string", "null"], minLength: 1 }
         },
         additionalProperties: false
       },
@@ -513,6 +520,7 @@ const effectiveConfigSchema = {
     "repositoryConfig",
     "maxParallel",
     "mergeMethod",
+    "gitAiBinding",
     "agent",
     "gates"
   ],
@@ -535,6 +543,7 @@ const effectiveConfigSchema = {
     },
     maxParallel: { type: "integer", minimum: 1, maximum: 128 },
     mergeMethod: { enum: ["merge", "squash"] },
+    gitAiBinding: { enum: ["off", "advisory", "required"] },
     agent: { type: "object" },
     steward: { type: ["object", "null"] },
     gates: { type: "array", minItems: 1, maxItems: 16 }
@@ -882,16 +891,51 @@ const integrationSchema = {
   additionalProperties: false
 };
 
+// What the post-merge Git AI binding found, journaled with the merge node.
+// It is a receipt, never a gate: under `advisory` every status other than
+// `bound` is an observable warning and the campaign continues.
+const authorshipReceiptSchema = {
+  type: ["object", "null"],
+  required: ["binding", "status", "revision", "noteRef", "published", "reason"],
+  properties: {
+    binding: { enum: ["advisory", "required"] },
+    status: {
+      enum: ["bound", "unsupported", "unavailable", "missing-note", "mismatch", "error"]
+    },
+    revision: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
+    noteRef: { const: "refs/notes/ai" },
+    notesRefTarget: { type: ["string", "null"], pattern: "^[0-9a-f]{40,64}$" },
+    noteSha256: { type: ["string", "null"], pattern: "^sha256:[0-9a-f]{64}$" },
+    published: { type: "boolean" },
+    reason: { type: ["string", "null"], maxLength: 400 }
+  },
+  additionalProperties: false
+};
+
 const mergeSchema = {
   type: "object",
-  required: ["taskId", "head", "mergeCommit", "pullRequest", "regated", "ownership"],
+  required: [
+    "taskId",
+    "head",
+    "mergeCommit",
+    "pullRequest",
+    "regated",
+    "ownership",
+    "authorship",
+    "trailer"
+  ],
   properties: {
     taskId: taskIdSchema,
     head: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
     mergeCommit: { type: "string", pattern: "^[0-9a-f]{40,64}$" },
     pullRequest: { type: "string", minLength: 1 },
     regated: { type: "boolean" },
-    ownership: ownershipSchema
+    ownership: ownershipSchema,
+    authorship: authorshipReceiptSchema,
+    // The exact `Assisted-by:` line the node wrote into the squash message,
+    // or null when the campaign could not name the assisting session. The
+    // trailer is a pointer; the note is the proof.
+    trailer: { type: ["string", "null"], maxLength: 400 }
   },
   additionalProperties: false
 };
@@ -1187,6 +1231,9 @@ function applyAgentPolicies(spec, sandboxPolicy = effective.agent.sandboxPolicy)
   if (effective.agent.runtimeMaxSec !== null) {
     spec.runtimeMaxSec = effective.agent.runtimeMaxSec;
   }
+  if (effective.agent.model !== null && effective.agent.model !== undefined) {
+    spec.model = effective.agent.model;
+  }
   if (effective.agent.approvalPolicy !== null) {
     spec.approvalPolicy = effective.agent.approvalPolicy;
   }
@@ -1383,6 +1430,7 @@ function sweepDeferral(sweepNode) {
         repositoryConfig: args.repositories[args.repository],
         maxParallel: args.maxParallel,
         mergeMethod: args.mergeMethod || "squash",
+        gitAiBinding: args.gitAiBinding || "off",
         agent: diagnosisSandboxed(args.agent),
         steward: args.steward || null,
         gates: args.gates
@@ -1812,6 +1860,19 @@ function sweepDeferral(sweepNode) {
       task,
       prepared: prepared.result,
       publication: publication.result,
+      // Who assisted this task, straight off the settled implementation node.
+      // The model is the daemon's canonical one and is absent when the estate
+      // never named it; the merge node refuses to invent one, so an absent
+      // model means no trailer rather than a fabricated one.
+      assistedBy:
+        agent.model === undefined || agent.model === null
+          ? null
+          : {
+              adapter: effective.agent.adapter,
+              model: agent.model,
+              taskUuid: agent.taskUuid,
+              witnessSeq: agent.witnessSeq
+            },
       constraints: constraintResults,
       taskBrief,
       gateOutputs
@@ -1936,6 +1997,8 @@ function sweepDeferral(sweepNode) {
         task,
         domainsRequired,
         mergeMethod: effective.mergeMethod,
+        gitAiBinding: effective.gitAiBinding,
+        assistedBy: lane.assistedBy || null,
         workspace: lane.prepared,
         integration: integration.result
       }),

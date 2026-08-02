@@ -100,6 +100,26 @@ NARRATION_BODY_LINE_MAX = 100
 NARRATION_REASON_MAX = 200
 NARRATION_ATTEMPTS = 2
 NARRATION_DEFAULT_RUNTIME_MAX_SEC = 120
+# The fourth proof axis (AUGUST-01-DESIGN.md §7). `off` is the shipped state.
+GIT_AI_BINDINGS = frozenset({"off", "advisory", "required"})
+GIT_AI_PROGRAM = "git-ai"
+GIT_AI_NOTE_REF = "refs/notes/ai"
+# Where a fetched copy of the remote's notes ref lands while the local one is
+# folded into it. Never pushed, always deleted.
+GIT_AI_REMOTE_REF = "refs/notes/tally-spec-build-remote-ai"
+# The settlement barrier the binding waits on. git-ai mints a note from its
+# background service after `git commit` returns, so a read taken before the
+# service settles observes nothing and would report a false missing-note.
+GIT_AI_AWAIT_SEC = 60
+# `Assisted-by: <adapter>:<model> (tally:<taskUuid> witness:<seq>)`. The exact
+# formatting the gh producer already publishes; the trailer is a pointer into
+# the witness, never the proof (§7). Reject a narrator that proposes one: the
+# provenance line is the node's authority, not the model's.
+ASSISTED_BY_PREFIX = "Assisted-by:"
+ASSISTED_BY_MAX = 200
+UUID_TEXT = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 # Every managed campaign marker starts here. A narrator that proposes one is
 # proposing to forge campaign state, so its proposal is refused outright — the
 # same line the worklist reader holds when a body repeats a managed marker.
@@ -331,6 +351,62 @@ def merge_method(value: Any, context: str) -> str:
     if method not in MERGE_METHODS:
         fail(f"{context} must be merge or squash")
     return method
+
+
+def git_ai_binding(value: Any, context: str) -> str:
+    """Whether the merge node binds Git AI authorship on what it integrated.
+
+    An absent value is `off`, so a campaign brief minted before the option
+    existed integrates exactly the way it did before: no binding, no notes
+    pushed, no receipt.
+    """
+    if value is None:
+        return "off"
+    binding = required_string(value, context)
+    if binding not in GIT_AI_BINDINGS:
+        fail(f"{context} must be off, advisory, or required")
+    return binding
+
+
+def assisted_by_record(value: Any, context: str) -> dict[str, Any] | None:
+    """The assisting session the merge node may point at from the commit.
+
+    Null is ordinary: a checkpoint task has no agent, and an estate that never
+    named a model leaves one component of the trailer unknowable. The node
+    refuses to guess it -- an `Assisted-by:` line naming a model nobody
+    executed is a provenance claim, and a wrong one is worse than none.
+    """
+    if value is None:
+        return None
+    record = object_exact(value, {"adapter", "model", "taskUuid", "witnessSeq"}, context)
+    adapter = required_string(record.get("adapter"), f"{context}.adapter", 128)
+    model = required_string(record.get("model"), f"{context}.model", 128)
+    task_uuid = required_string(record.get("taskUuid"), f"{context}.taskUuid", 36)
+    if not UUID_TEXT.fullmatch(task_uuid):
+        fail(f"{context}.taskUuid must be a UUID")
+    witness_seq = positive_integer(record.get("witnessSeq"), f"{context}.witnessSeq")
+    for name, item in (("adapter", adapter), ("model", model)):
+        if "(" in item or ")" in item or "\n" in item:
+            fail(f"{context}.{name} must not contain trailer punctuation")
+    return {
+        "adapter": adapter,
+        "model": model,
+        "taskUuid": task_uuid,
+        "witnessSeq": witness_seq,
+    }
+
+
+def assisted_by_trailer(record: dict[str, Any] | None) -> str | None:
+    """The exact trailer `gh_intake` publishes, or nothing."""
+    if record is None:
+        return None
+    trailer = (
+        f"{ASSISTED_BY_PREFIX} {record['adapter']}:{record['model']} "
+        f"(tally:{record['taskUuid']} witness:{record['witnessSeq']})"
+    )
+    if len(trailer) > ASSISTED_BY_MAX:
+        fail("assistedBy renders a trailer over the published cap")
+    return trailer
 
 
 def steward_role(value: Any, context: str = "campaign steward") -> dict[str, Any] | None:
@@ -679,6 +755,7 @@ def forge_agent(value: Any) -> dict[str, Any]:
             "approvalPolicy",
             "sandboxPolicy",
             "diagnosisSandboxPolicy",
+            "model",
         },
         "campaign agent",
     )
@@ -707,6 +784,12 @@ def forge_agent(value: Any) -> dict[str, Any]:
         diagnosis_sandbox = required_string(
             diagnosis_sandbox, "campaign agent.diagnosisSandboxPolicy"
         )
+    # The model this campaign dispatches with. It is what the daemon records
+    # as the job's canonical model and therefore what the merge node may
+    # honestly name in an `Assisted-by:` trailer; null leaves both alone.
+    model = agent.get("model")
+    if model is not None:
+        model = required_string(model, "campaign agent.model", 128)
     return {
         "adapter": adapter,
         "argv": arguments,
@@ -715,6 +798,7 @@ def forge_agent(value: Any) -> dict[str, Any]:
         "approvalPolicy": approval,
         "sandboxPolicy": sandbox,
         "diagnosisSandboxPolicy": diagnosis_sandbox,
+        "model": model,
     }
 
 
@@ -767,6 +851,11 @@ def validated_narration(value: Any) -> tuple[dict[str, str] | None, str | None]:
     for text in (header, body):
         if MANAGED_MARKER_PREFIX in text:
             return None, "proposal contains a managed campaign marker"
+        if any(line.startswith(ASSISTED_BY_PREFIX) for line in text.split("\n")):
+            # The merge node appends the real trailer from the witnessed
+            # attempt. A model-authored one would be a provenance claim nothing
+            # verified, spliced into a commit that lands on the default branch.
+            return None, "proposal contains an Assisted-by trailer"
         if NARRATION_CLOSING_KEYWORD.search(text):
             return None, "proposal contains a GitHub closing keyword"
         if NARRATION_MENTION.search(text):
@@ -934,6 +1023,7 @@ def forge_manifest(
             "runtimeMaxSec",
             "pool",
             "mergeMethod",
+            "gitAiBinding",
             "agent",
             "steward",
             "gates",
@@ -968,6 +1058,7 @@ def forge_manifest(
     if not isinstance(pool, str) or not COMPONENT.fullmatch(pool):
         fail("campaign manifest.pool is not a safe component")
     method = merge_method(manifest.get("mergeMethod"), "campaign manifest.mergeMethod")
+    binding = git_ai_binding(manifest.get("gitAiBinding"), "campaign manifest.gitAiBinding")
     agent = forge_agent(manifest.get("agent"))
     steward = steward_role(manifest.get("steward"), "campaign manifest.steward")
     gates = forge_gates(manifest.get("gates"))
@@ -1045,6 +1136,7 @@ def forge_manifest(
         },
         "maxParallel": max_parallel,
         "mergeMethod": method,
+        "gitAiBinding": binding,
         "agent": agent,
         "steward": steward,
         "gates": gates,
@@ -1064,6 +1156,7 @@ def forge_manifest(
         "runtimeMaxSec": runtime,
         "pool": pool,
         "mergeMethod": method,
+        "gitAiBinding": binding,
         "agent": agent,
         "steward": steward,
         "gates": gates,
@@ -4821,7 +4914,15 @@ def publication_identity(brief: dict[str, Any], action: str) -> tuple[dict[str, 
     if action == "publish":
         allowed.update({"constraints", "domainsRequired", "gates", "steward"})
     if action == "merge":
-        allowed.update({"integration", "domainsRequired", "mergeMethod"})
+        allowed.update(
+            {
+                "integration",
+                "domainsRequired",
+                "mergeMethod",
+                "gitAiBinding",
+                "assistedBy",
+            }
+        )
     data = object_exact(brief, allowed, f"{action} brief")
     config = repo_config(data.get("repositoryConfig"))
     workspace = object_exact(
@@ -5332,11 +5433,278 @@ def action_cleanup(brief: dict[str, Any]) -> dict[str, Any]:
     return {"taskId": task_id, "cleaned": True}
 
 
-def merge_commit_message(narration: dict[str, Any]) -> str:
+def merge_commit_body(narration: dict[str, Any], trailer: str | None) -> str:
+    """Validated prose plus the node's own provenance pointer, in that order."""
+    parts = [part for part in (narration["body"], trailer) if part]
+    return "\n\n".join(parts)
+
+
+def merge_commit_message(narration: dict[str, Any], trailer: str | None = None) -> str:
     """The validated message the node writes. The model never runs git."""
-    if narration["body"]:
-        return f"{narration['subject']}\n\n{narration['body']}\n"
+    body = merge_commit_body(narration, trailer)
+    if body:
+        return f"{narration['subject']}\n\n{body}\n"
     return f"{narration['subject']}\n"
+
+
+def git_ai_available(checkout: Path) -> str | None:
+    """The externally provisioned binary's version, or None when unusable.
+
+    tally.nix does not package, vendor, or pin git-ai (doc/git-ai-authorship.md
+    states the deployment boundary); the estate installs it on every host where
+    a campaign may merge. Absence is an ordinary advisory outcome, not a fault.
+    """
+    if shutil.which(GIT_AI_PROGRAM) is None:
+        return None
+    probed = run([GIT_AI_PROGRAM, "--version"], cwd=checkout, check=False)
+    if probed.returncode != 0:
+        return None
+    return (probed.stdout.strip() or probed.stderr.strip() or "unknown")[:80]
+
+
+def reconstruct_squash(
+    config: dict[str, Any],
+    data: dict[str, Any],
+    base_rev: str,
+    head: str,
+    message: str,
+) -> tuple[str | None, str | None]:
+    """Mint the campaign's squash a second time, where the checkpoints live.
+
+    `test/git-ai-squash-fidelity.sh` measured what a squash carries
+    (doc/src/flows/git-ai-squash-fidelity.md): attribution is re-minted per
+    line, by git-ai's background service, at `git commit` time, and only in the
+    repository that made the commit. A forge-side squash is therefore
+    unbound -- `remote-squash` in that table is the decisive negative -- and
+    nothing is recoverable by fetching or reading it afterwards.
+
+    So the binding re-executes the same integration in a detached worktree of
+    the campaign checkout, which is the one place that still holds the task
+    branch's checkpoints and shares its refs/notes/ai. The result is a commit
+    with a different object ID and, by construction, the same parent and the
+    same tree as the one the forge minted; the caller proves both before
+    treating its note as the integrated commit's.
+    """
+    checkout: Path = config["checkout"]
+    workspace_root = Path(data["workspaceRoot"])
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="git-ai-bind-", dir=workspace_root) as temporary:
+        worktree = Path(temporary) / "squash"
+        added = git(
+            checkout, "worktree", "add", "--detach", "--quiet", str(worktree), base_rev,
+            check=False,
+        )
+        if added.returncode != 0:
+            detail = added.stderr.strip() or added.stdout.strip() or "no output"
+            return None, f"cannot reconstruct the squash: {detail}"
+        try:
+            merged = git(worktree, "merge", "--squash", head, check=False)
+            if merged.returncode != 0:
+                detail = merged.stderr.strip() or merged.stdout.strip() or "no output"
+                return None, f"reconstructed squash did not apply: {detail}"
+            if not git(worktree, "diff", "--cached", "--quiet", check=False).returncode:
+                return None, "reconstructed squash staged no change against the merged base"
+            committed = git(
+                worktree,
+                "-c",
+                "user.name=tally spec-build",
+                "-c",
+                "user.email=tally-spec-build@invalid",
+                "commit",
+                "--quiet",
+                "--file",
+                "-",
+                input_text=message,
+                check=False,
+            )
+            if committed.returncode != 0:
+                detail = committed.stderr.strip() or committed.stdout.strip() or "no output"
+                return None, f"reconstructed squash did not commit: {detail}"
+            local = git(worktree, "rev-parse", "HEAD").stdout.strip()
+            # The note is minted asynchronously by git-ai's background service,
+            # so a read taken before it settles sees nothing. The barrier is
+            # bounded and its failure is reported, never retried blindly.
+            settled = run(
+                [GIT_AI_PROGRAM, "await", "--timeout", str(GIT_AI_AWAIT_SEC)],
+                cwd=worktree,
+                check=False,
+                timeout=GIT_AI_AWAIT_SEC + 5,
+            )
+            if settled.returncode != 0:
+                detail = settled.stderr.strip() or settled.stdout.strip() or "no output"
+                return local, f"git-ai await exited {settled.returncode}: {detail[:200]}"
+            return local, None
+        finally:
+            git(checkout, "worktree", "remove", "--force", str(worktree), check=False)
+
+
+def publish_authorship_notes(checkout: Path, remote: str) -> tuple[bool, str | None]:
+    """Push refs/notes/ai to the campaign remote.
+
+    A notes ref is an ordinary ref, so the push is fast-forward-only and a
+    remote that carries notes this checkout has never seen refuses it. That is
+    folded in with git's own `cat_sort_uniq` strategy and retried once, rather
+    than forced: forcing would delete another lane's bindings to publish this
+    one.
+    """
+    pushed = git(
+        checkout, "push", remote, f"{GIT_AI_NOTE_REF}:{GIT_AI_NOTE_REF}", check=False
+    )
+    if pushed.returncode == 0:
+        return True, None
+    fetched = git(
+        checkout, "fetch", remote, f"+{GIT_AI_NOTE_REF}:{GIT_AI_REMOTE_REF}", check=False
+    )
+    if fetched.returncode == 0:
+        git(
+            checkout,
+            "notes",
+            "--ref",
+            GIT_AI_NOTE_REF,
+            "merge",
+            "-s",
+            "cat_sort_uniq",
+            GIT_AI_REMOTE_REF,
+            check=False,
+        )
+        git(checkout, "update-ref", "-d", GIT_AI_REMOTE_REF, check=False)
+        pushed = git(
+            checkout, "push", remote, f"{GIT_AI_NOTE_REF}:{GIT_AI_NOTE_REF}", check=False
+        )
+        if pushed.returncode == 0:
+            return True, None
+    detail = pushed.stderr.strip() or pushed.stdout.strip() or "no output"
+    return False, f"cannot publish {GIT_AI_NOTE_REF} to {remote}: {detail[:200]}"
+
+
+def bind_authorship(
+    data: dict[str, Any],
+    config: dict[str, Any],
+    integration: dict[str, Any],
+    method: str,
+    merge_commit: str,
+    binding: str,
+    message: str,
+) -> dict[str, Any] | None:
+    """Bind Git AI authorship on the commit this node just integrated.
+
+    §7 says the binding point "must move to the publish node". Taken
+    literally that is impossible: GitHub mints the squash at merge time, so at
+    publication the object being bound does not exist. This is that step, one
+    node later and inside the same merge action -- no new flow node, so the
+    51-node pin is untouched.
+
+    Under `advisory` every outcome other than a bound note is a receipt and the
+    campaign proceeds; §9.1.4 is explicit about why that has to come first, and
+    the spike doc records the reason it cannot be skipped: an unprovisioned
+    host and a squash that lost its attribution produce identical evidence.
+    """
+    if binding == "off":
+        return None
+    checkout: Path = config["checkout"]
+    remote = config["remote"]
+    # Under `merge` the working commits stay reachable from base carrying the
+    # notes git-ai already minted for them, so the bound revision is the task
+    # head. Under `squash` the forge minted a commit nothing has ever seen, and
+    # the bound revision is that commit.
+    bound_revision = merge_commit if method == "squash" else integration["head"]
+    receipt = {
+        "binding": binding,
+        "status": "error",
+        "revision": bound_revision,
+        "noteRef": GIT_AI_NOTE_REF,
+        "notesRefTarget": None,
+        "noteSha256": None,
+        "published": False,
+        "reason": None,
+    }
+
+    def settle(status: str, reason: str | None) -> dict[str, Any]:
+        receipt["status"] = status
+        receipt["reason"] = reason[:400] if reason else None
+        if binding == "required" and (status != "bound" or not receipt["published"]):
+            fail(
+                f"git-ai binding for {bound_revision} is {status} under required mode: "
+                f"{receipt['reason'] or 'no reason recorded'}"
+            )
+        return receipt
+
+    version = git_ai_available(checkout)
+    if version is None:
+        return settle(
+            "unavailable",
+            f"{GIT_AI_PROGRAM} is not usable on this host; the estate provisions it "
+            "and tally.nix does not ship it",
+        )
+    git(checkout, "fetch", "--prune", remote)
+    if git(checkout, "cat-file", "-e", f"{merge_commit}^{{commit}}", check=False).returncode:
+        return settle(
+            "error",
+            f"integrated commit {merge_commit} is absent from the campaign checkout "
+            f"{checkout}",
+        )
+    source = full_git_oid(integration["head"], "integration.head")
+    if method == "squash":
+        base_rev = full_git_oid(integration["baseRev"], "integration.baseRev")
+        parent = git(
+            checkout, "rev-parse", "--verify", f"{merge_commit}^1", check=False
+        ).stdout.strip()
+        if parent != base_rev:
+            return settle(
+                "mismatch",
+                f"squash commit {merge_commit} has parent {parent or 'none'}, not the "
+                f"gated base {base_rev}",
+            )
+        local, reason = reconstruct_squash(config, data, base_rev, source, message)
+        if local is None:
+            return settle("error", reason)
+        if reason is not None:
+            return settle("unavailable", reason)
+        local_tree = git(checkout, "rev-parse", f"{local}^{{tree}}").stdout.strip()
+        merged_tree = git(checkout, "rev-parse", f"{merge_commit}^{{tree}}").stdout.strip()
+        if local_tree != merged_tree:
+            return settle(
+                "mismatch",
+                f"reconstructed squash {local} carries tree {local_tree}, but the "
+                f"integrated commit carries {merged_tree}; nothing may be copied",
+            )
+        copied = git(
+            checkout,
+            "notes",
+            "--ref",
+            GIT_AI_NOTE_REF,
+            "copy",
+            "-f",
+            local,
+            merge_commit,
+            check=False,
+        )
+        if copied.returncode != 0:
+            detail = copied.stderr.strip() or copied.stdout.strip() or "no output"
+            return settle(
+                "missing-note",
+                f"git-ai {version} minted no note for the reconstructed squash {local}: "
+                f"{detail[:200]}",
+            )
+    note = git_bytes(
+        checkout, "notes", "--ref", GIT_AI_NOTE_REF, "show", bound_revision, check=False
+    )
+    if note.returncode != 0:
+        return settle(
+            "missing-note",
+            f"{GIT_AI_NOTE_REF} has no note for {bound_revision} in {checkout}",
+        )
+    receipt["noteSha256"] = "sha256:" + hashlib.sha256(note.stdout).hexdigest()
+    resolved = git(checkout, "rev-parse", "--verify", GIT_AI_NOTE_REF, check=False)
+    ref_target = resolved.stdout.strip() if resolved.returncode == 0 else ""
+    if not GIT_OID.fullmatch(ref_target):
+        return settle("error", f"{GIT_AI_NOTE_REF} does not resolve in {checkout}")
+    receipt["notesRefTarget"] = ref_target
+    published, reason = publish_authorship_notes(checkout, remote)
+    receipt["published"] = published
+    if not published:
+        return settle("error", reason)
+    return settle("bound", None)
 
 
 def merge_local(
@@ -5345,6 +5713,7 @@ def merge_local(
     integration: dict[str, Any],
     method: str,
     narration: dict[str, Any],
+    trailer: str | None = None,
 ) -> str:
     checkout: Path = config["checkout"]
     remote_url = git(checkout, "remote", "get-url", config["remote"]).stdout.strip()
@@ -5390,7 +5759,7 @@ def merge_local(
                 "--quiet",
                 "--file",
                 "-",
-                input_text=merge_commit_message(narration),
+                input_text=merge_commit_message(narration, trailer),
             )
         else:
             git(
@@ -5442,6 +5811,7 @@ def merge_github(
     capabilities: dict[str, bool],
     method: str,
     narration: dict[str, Any],
+    trailer: str | None = None,
 ) -> str:
     repository = required_string(data.get("repository"), "repository")
     url = required_string(integration.get("pullRequest"), "integration.pullRequest")
@@ -5491,7 +5861,12 @@ def merge_github(
             # rather than left to whatever GitHub would assemble from the
             # working commits. `--body` is sent even when empty so the default
             # commit-list body is never substituted.
-            command += ["--subject", narration["subject"], "--body", narration["body"]]
+            command += [
+                "--subject",
+                narration["subject"],
+                "--body",
+                merge_commit_body(narration, trailer),
+            ]
         run(command)
         viewed = run(
             ["gh", "pr", "view", url, "--repo", repository, "--json", "state,mergeCommit"]
@@ -5836,7 +6211,14 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
         "integration",
     )
     method = merge_method(data.get("mergeMethod"), "mergeMethod")
+    binding = git_ai_binding(data.get("gitAiBinding"), "gitAiBinding")
     narration = narration_record(integration.get("narration"), "integration.narration")
+    # The provenance pointer is the node's, from the witnessed attempt the
+    # reconciler already correlates. Only a squash gets one: a merge commit
+    # carries git's own template message and the working commits it collects
+    # keep their own notes.
+    assisted_by = assisted_by_record(data.get("assistedBy"), "assistedBy")
+    trailer = assisted_by_trailer(assisted_by) if method == "squash" else None
     # The campaign's own parallelism decides whether domains are required. The
     # receipt carries an upstream copy of that bit, and merge is the last node
     # that can still refuse to act on it, so the two are compared here rather
@@ -5864,9 +6246,22 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
     if integration["branch"] != data["workspace"]["publishBranch"]:
         fail("integration.branch does not match workspace.publishBranch")
     if config["forge"] == "github":
-        merge_commit = merge_github(data, config, integration, capabilities, method, narration)
+        merge_commit = merge_github(
+            data, config, integration, capabilities, method, narration, trailer
+        )
     else:
-        merge_commit = merge_local(data, config, integration, method, narration)
+        merge_commit = merge_local(
+            data, config, integration, method, narration, trailer
+        )
+    authorship = bind_authorship(
+        data,
+        config,
+        integration,
+        method,
+        merge_commit,
+        binding,
+        merge_commit_message(narration, trailer),
+    )
     return {
         "taskId": task_id,
         "head": head,
@@ -5874,6 +6269,8 @@ def action_merge(brief: dict[str, Any]) -> dict[str, Any]:
         "pullRequest": pull_request,
         "regated": integration["regate"],
         "ownership": ownership,
+        "authorship": authorship,
+        "trailer": trailer,
     }
 
 

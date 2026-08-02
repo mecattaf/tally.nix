@@ -146,6 +146,7 @@ impl FlowClient for MockClient {
             stderr_truncated: reply.stderr_truncated,
             witness_seq: reply.witness_seq,
             disposition: reply.disposition,
+            model: None,
             result: reply.result,
             gates: None,
             error: (!reply.verdict.is_pass()).then(|| NodeFailure {
@@ -252,6 +253,7 @@ impl BudgetContinuationClient {
             stderr_truncated: None,
             witness_seq: node.ordinal + 1,
             disposition,
+            model: None,
             result: Some(json!({"step": node.ordinal + 1})),
             gates: None,
             error: None,
@@ -870,7 +872,7 @@ fn local_unknown_options_use_the_shared_node_field_error_shape() {
         error.message,
         "unknown local() option \"resultShema\", expected one of argv, adapter, pools, executor, \
          priority, runtimeMaxSec, evidence, evidenceClass, manifestHash, workspace, brief, key, \
-         dedupKey, label, taskRef, env, approvalPolicy, sandboxPolicy, resultSchema, member"
+         dedupKey, label, taskRef, env, approvalPolicy, sandboxPolicy, model, resultSchema, member"
     );
     assert_eq!(error.details["field"], "resultShema");
 }
