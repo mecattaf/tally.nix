@@ -1656,7 +1656,12 @@ function sweepDeferral(sweepNode) {
       issue: args.issue,
       runId: args.runId,
       workspaceRoot: args.workspaceRoot,
-      task
+      task,
+      // The revision the reconciler witnessed the worklist at. Prep cuts the
+      // lane from whatever the remote base resolves to at its own later fetch;
+      // carrying the witnessed revision lets it refuse a base that does not
+      // descend from the history the worklist described.
+      sourceRevision: reconciliation.source.revision
     };
     const prepared = await driverNode(
       "prep",

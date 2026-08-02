@@ -120,6 +120,7 @@ def prep_brief(
     run_id: str,
     *,
     forge: str = "local",
+    source_revision: str | None = None,
 ) -> dict[str, object]:
     return {
         "campaign": "fixture",
@@ -129,6 +130,10 @@ def prep_brief(
         "runId": run_id,
         "workspaceRoot": str(workspace_root),
         "task": task("task-1"),
+        # The reconciler witnesses the worklist at the remote base head and
+        # carries that revision into the prep brief.
+        "sourceRevision": source_revision
+        or git(checkout, "rev-parse", "--verify", "origin/main^{commit}"),
     }
 
 
@@ -2243,6 +2248,85 @@ class NativeSubIssueTests(unittest.TestCase):
 
 
 class LaneLifecycleTests(unittest.TestCase):
+    def test_a_lane_base_that_left_the_witnessed_worklist_history_fails_closed(
+        self,
+    ) -> None:
+        """Worklist and worktrees must come from one history.
+
+        The reconciler witnesses the worklist at a revision; prep fetches later
+        and cuts the lane from whatever the remote base points at then. A
+        rewound or force-replaced remote silently produced lanes from a history
+        the witnessed worklist never described. Checkpoint lanes already
+        refused exactly this; implementation lanes now do too, and the ordinary
+        fast-forward case is unchanged.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            witnessed = git(checkout, "rev-parse", "HEAD")
+
+            # The ordinary case: base moved forward from the witnessed
+            # revision, so the lane descends from the worklist's history.
+            (checkout / "moved-on.txt").write_text("main moved\n", encoding="utf-8")
+            git(checkout, "add", "moved-on.txt")
+            git(checkout, "commit", "--quiet", "-m", "main: independent change")
+            git(checkout, "push", "--quiet", "origin", "main")
+            prepared = DRIVER.action_prep(
+                prep_brief(
+                    checkout,
+                    workspace_root,
+                    "coherent-pass",
+                    source_revision=witnessed,
+                )
+            )
+            self.assertTrue(Path(prepared["worktreePath"]).is_dir())
+
+            # The remote is force-replaced with an unrelated history. The
+            # witnessed revision is no longer an ancestor of the base, so no
+            # lane may be cut from it.
+            replacement = root / "replacement"
+            replacement.mkdir()
+            command("git", "init", "--quiet", "--initial-branch=main", str(replacement))
+            git(replacement, "config", "user.name", "Tally Test")
+            git(replacement, "config", "user.email", "tally-test@invalid")
+            (replacement / "other.go").write_text("other\n", encoding="utf-8")
+            git(replacement, "add", "other.go")
+            git(replacement, "commit", "--quiet", "-m", "unrelated root")
+            git(replacement, "remote", "add", "origin", git(checkout, "remote", "get-url", "origin"))
+            git(replacement, "push", "--quiet", "--force", "origin", "main")
+
+            with self.assertRaises(DRIVER.DriverError) as raised:
+                DRIVER.action_prep(
+                    prep_brief(
+                        checkout,
+                        workspace_root,
+                        "rewound-pass",
+                        source_revision=witnessed,
+                    )
+                )
+            self.assertIn(
+                "does not descend from the witnessed worklist revision",
+                str(raised.exception),
+            )
+
+    def test_a_prep_brief_without_a_source_revision_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            brief = prep_brief(checkout, root / "workspaces", "no-revision")
+            del brief["sourceRevision"]
+            with self.assertRaises(DRIVER.DriverError) as raised:
+                DRIVER.action_prep(brief)
+            self.assertIn("sourceRevision", str(raised.exception))
+
+            malformed = prep_brief(
+                checkout, root / "workspaces", "bad-revision", source_revision="main"
+            )
+            with self.assertRaises(DRIVER.DriverError) as raised:
+                DRIVER.action_prep(malformed)
+            self.assertIn("full Git object ID", str(raised.exception))
+
     def test_a_killed_lane_resumes_the_same_branch_and_worktree(self) -> None:
         """The resume invariant both managers promised, now proven once.
 
@@ -2501,7 +2585,9 @@ class LaneLifecycleTests(unittest.TestCase):
                 published_head,
             )
             rebase_brief = {
-                **old_brief,
+                # The rebase brief is built independently of the prep brief in
+                # the flow; it does not carry the prep-only sourceRevision.
+                **{key: value for key, value in old_brief.items() if key != "sourceRevision"},
                 "domainsRequired": True,
                 "workspace": prepared,
                 "publication": {
@@ -2606,7 +2692,11 @@ class LaneLifecycleTests(unittest.TestCase):
             with self.assertRaises(DRIVER.DriverError) as raised:
                 DRIVER.action_rebase(
                     {
-                        **old_brief,
+                        **{
+                            key: value
+                            for key, value in old_brief.items()
+                            if key != "sourceRevision"
+                        },
                         "domainsRequired": True,
                         "workspace": prepared,
                         "publication": {

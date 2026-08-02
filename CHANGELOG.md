@@ -381,6 +381,64 @@ authorized.
 
 ### Fixed
 
+- Landed the five defects the August 1 audit recorded (#318). Each is
+  independent; they share one entry because they shipped as one sweep.
+
+  1. **A flow `codex()` node no longer loses its `-C <worktree>` argv.** Flows
+     deliberately submit no raw `cwd` and carry structured workspace metadata
+     instead. #232 fixed the *process* working directory by deriving it from
+     `workspace.worktreePath`, but every adapter-argv render site still read the
+     raw row `cwd` — `None` for every flow node — so a lane executed in the
+     right directory with a witnessed argv that said nothing about it, and the
+     durable record, the resume render, and any executor that does not inherit
+     the request cwd all disagreed with reality. Admission, retry, recovery, and
+     the execution request now resolve one effective working directory
+     (`cwd`, else the workspace worktree), so the argv and the process cannot
+     diverge again. An explicit payload `cwd` still wins. The enqueue kernel is
+     untouched: the canonical payload hash still covers the submitted `cwd`
+     only, so dedup arithmetic is unchanged.
+
+  2. **`requestReview` requests a review instead of serializing a boolean.**
+     Its entire effect was encoding `"requestReview":true` inside the machine
+     completion comment; the producer's mutation vocabulary was comment /
+     closeIssue / closePullRequest, so no review was requested and no human was
+     notified. `gh` producers gain a `reviewers` list of GitHub logins, required
+     non-empty whenever `requestReview` is on (enforced in both Nix eval and
+     daemon validation). On fire, a pull request receives GitHub's own
+     `requestReviews` mutation — additive, so it never cancels a review a human
+     requested — and an issue, which has no review concept, receives one fresh
+     marker-idempotent comment mentioning the reviewers. Fresh rather than
+     upserted: anything that asks for a human has to actually notify one. The
+     encoded field stays in the completion record as provenance, now beside the
+     logins that were asked.
+
+  3. **An unset `closeOnPass` no longer inherits `postEvidence`.** The fallback
+     existed for configurations serialized before the field did, which is not a
+     supported input; its effect was that a producer could close issues purely
+     because evidence posting was on. Absent now means off. The
+     `closeOnPass = true` requires `postEvidence = true` guards are unchanged.
+
+  4. **`hardPreempt` on co-allocated pools is conjunctive, and the doc is
+     right.** The documentation promised that hard reclaim requires the opt-in
+     on every blocking pool; the code OR-ed the flag per victim lease, so a
+     holder co-allocated on a pool with `hardPreempt` and one without it was
+     killed even though the second pool's configuration promised its holders are
+     never killed. The conjunctive semantics are now pinned in code and tests:
+     a holder is hard-reclaim eligible only when every pool that same interrupt
+     request asks *it* to yield in opts in. A pool's `false` is a promise to its
+     own workloads.
+
+  5. **A campaign lane cannot be cut from a history the witnessed worklist never
+     described.** The reconciler witnesses the worklist at a revision; lane prep
+     fetches later and cuts from whatever `remote/baseBranch` resolves to then,
+     with nothing relating the two. Checkpoint lanes already asserted this
+     relationship; implementation lanes asserted nothing, so a rewound or
+     force-replaced remote silently produced lanes from an unrelated history.
+     The prep brief now carries the reconciliation's `source.revision`, and prep
+     fails closed after its fetch unless that revision is an ancestor of the
+     fetched base head, with the same legible error shape as the checkpoint
+     check.
+
 - A slow storage tree walk can no longer overwrite a fresher free-space probe
   (#317, closing #292). Two writers update the monitor's view of filesystem
   availability: the cheap per-intake/periodic probe, and the periodic tree walk,

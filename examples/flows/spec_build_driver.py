@@ -3791,6 +3791,7 @@ def prep_identity(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
             "runId",
             "workspaceRoot",
             "task",
+            "sourceRevision",
         },
         "prep brief",
     )
@@ -3811,6 +3812,9 @@ def prep_identity(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
     if not workspace_root.is_absolute():
         fail("workspaceRoot must be absolute")
     config = repo_config(data.get("repositoryConfig"))
+    source_revision = required_string(data.get("sourceRevision"), "sourceRevision")
+    if not re.fullmatch(r"[0-9a-f]{40,64}", source_revision):
+        fail("sourceRevision must be a full Git object ID")
     identity = {
         "campaign": campaign,
         "repository": repository,
@@ -3819,6 +3823,7 @@ def prep_identity(brief: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]
         "taskId": task_id,
         "taskKind": task_kind,
         "workspaceRoot": workspace_root,
+        "sourceRevision": source_revision,
     }
     return data, config, identity
 
@@ -4559,6 +4564,21 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     git(checkout, "fetch", "--prune", remote)
     base_ref = f"{remote}/{base_branch}"
     base_tip = git(checkout, "rev-parse", "--verify", f"{base_ref}^{{commit}}").stdout.strip()
+    # Worklist/worktree revision coherence. The reconciler read the worklist at
+    # one revision; this fetch happens later and resolves the base branch to
+    # whatever it points at now. A rewound or force-replaced remote would
+    # otherwise cut lanes from a history the witnessed worklist never
+    # described, silently. Checkpoint lanes already assert exactly this
+    # relationship, so implementation lanes fail closed the same way.
+    if git(
+        checkout,
+        "merge-base",
+        "--is-ancestor",
+        identity["sourceRevision"],
+        base_tip,
+        check=False,
+    ).returncode:
+        fail("prepared lane base does not descend from the witnessed worklist revision")
     if resumed is not None:
         # A lane git registered whose identity is short a field: a lane cut by
         # a tally from before identity moved into git, or a runner killed
