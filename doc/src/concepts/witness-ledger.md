@@ -59,9 +59,9 @@ explicitly `unauthenticated-by-construction`.
 Journal-backed query fields are projections, not the ledger. They are rebuilt
 on every daemon start from acknowledged durable events and the verified current
 witness chain; losing or changing them does not change canonical verdict
-history. The TaskChampion replica that used to be one of those projections was
-deleted outright — nothing read it, and its rewrite path was the #252 disk
-pathology.
+history. The third-party task-database replica that used to be one of those
+projections was deleted outright — nothing read it, and its rewrite path was
+the #252 disk pathology.
 
 The record builder, validator, append lock/fsync, clean-cut refusal, and all
 chain verification live in `crates/tally-core/src/witness.rs`. Query authority

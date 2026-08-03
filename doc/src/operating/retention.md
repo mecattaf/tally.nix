@@ -266,20 +266,20 @@ The current storage story is intentionally uneven:
 | Ordinary `artifact:<path>` files | Owned by the workload; no tally GC root | Apply a workload-specific policy only after accepting the reuse and audit consequences below. |
 | Producer events | Pending files are durable recovery inputs; consumed `events/done` defaults to 180 days, rejected files to 30 days/10,000 | Let `tally gc` prune only the managed done/rejected sets. |
 | Producer markers (`producers/gh-triggers`, `gh-completed`, `gh-comments`, `gh-storage-warnings`) | One `<key>.json` per dispatch making a forge mutation idempotent; expires under `producerMarkerHorizon` (180 days by default) | Automatic through `tally gc`. Collecting a marker costs at most a re-publication that the thread's own marker scan already collapses. A per-marker `<key>.lock` is collected only together with its marker and only when no writer holds it; the directory-wide `mutations.lock` is never collected. |
-| Inert `taskdata/` and `taskdata.pre-rebuild-*` directories | Left in place by the TaskChampion delete; no pruner reads or writes them | Nothing depends on them. Delete them by hand to reclaim the space. |
+| Inert `taskdata/` and `taskdata.pre-rebuild-*` directories | Left in place when the live task-database projection was deleted; no pruner reads or writes them | Nothing depends on them. Delete them by hand to reclaim the space. |
 | Unit-exit state | Durable recovery input; no general pruner. One exception: legacy `<uuid>.capture.lock` files expire under `captureArchiveHorizon` | Do not prune exit records or `<uuid>.capture.json` generations by age. `tally gc` removes only a `.capture.lock` that is both older than the horizon and unheld, proven by a non-blocking `flock` it takes before unlinking. Nothing creates a lock here any more, so this population only drains. |
 | Retained commit probes (`<gc --state-dir>/adapter-smoke/probe-*`) | One throwaway git repository per failed `tally adapter smoke --assert-commit`; expires under `captureArchiveHorizon` | A verified probe deletes itself; a failed one is the evidence and is kept. `tally gc` removes only `probe-*` directories older than the horizon, and only under the `--state-dir` it is given, so run the smoke with `--state-dir` naming the same directory. It reports `adapterProbesExamined`/`adapterProbesPruned`. Anything else under `adapter-smoke/`, and any probe seeded elsewhere via `--probe-root`, is left for an operator. |
 | Capture locks (`capture-lock/`) | One `<uuid>.capture.lock` per dispatched execution; expires under `captureArchiveHorizon` | Same two-check rule as above. The daemon no longer mints a lock for a task whose capture generation is already gone, so a swept lock stays swept instead of being re-created at the next startup reconcile. |
 | In-memory barrier tracker | At most 64 unclaimed drain snapshots; connected waits scale with active calls, and disconnected waiters are evicted on the next tracker operation | Automatic and restart-local. |
 | In-memory parent guardrails | Terminal parents retire after their outstanding-child count reaches zero | Automatic; rebuilt from active durable rows. |
 
-### Reclaim an inert TaskChampion projection
+### Reclaim an inert `taskdata/` projection
 
 Hard pressure never launches GC implicitly. Retention horizons are evidence policy, and the
 timer's `--collect` action is host-wide; a daemon must not silently shorten either policy merely
 to admit another job.
 
-Deleting the TaskChampion projection left any existing `<dataDir>/taskdata/` directory and its
+Deleting the live task-database projection left any existing `<dataDir>/taskdata/` directory and its
 `taskdata.pre-rebuild-*` archives on disk and inert. Nothing reads or writes them, no retention
 lane sweeps them, and they still count against the data-store allocated-byte budget — on the
 #252 incident host that inert tree is where the 270 GiB actually sits. Removing them is a manual

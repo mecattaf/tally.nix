@@ -23,8 +23,9 @@ The two store sizes use allocated filesystem blocks for budget decisions and als
 apparent bytes and file counts. Each store reports `filesystemAvailableBytes`,
 `warningFreeBytes`, and `minimumFreeBytes`; falling below the first emits an early warning and
 falling below the second is hard pressure even when the store's own allocated bytes are small.
-`schemaVersion` is 3: the former `taskchampion` section was removed with the TaskChampion
-projection and no placeholder replaces it.
+`schemaVersion` is 3: the section version 2 carried for the live task-database projection was
+removed with that projection and no placeholder replaces it. The CHANGELOG entry for the removal
+names the exact fields that disappeared.
 
 Directory measurement is an off-thread, cached sample. `sampledAt` is the tree-walk age
 boundary; `freeSpaceCheckedAt` is the latest cheap filesystem probe. `query storage` and

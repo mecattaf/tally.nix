@@ -477,7 +477,9 @@ services.tally = {
     };
 
     label = "spec-build";
-    mention = "@tally build";
+    # Substitute your own GitHub login. This token is posted as a real comment
+    # on a real issue, so it at-mentions whoever it names.
+    mention = "@<your-login> build";
     # The operator posts the mention using this same account's gh token.
     allowSelfTriggered = true;
     allowedActors = [ "mecattaf" ];
@@ -536,17 +538,42 @@ services.tally = {
 };
 ```
 
+### The mention token is a live GitHub mention
+
+`mention` is matched literally against the body of a comment, so tally treats it
+as an opaque token — but the comment it matches is a real comment on a real
+issue, and GitHub resolves every `@name` in it. **Name your own login and never
+a third party's.** A campaign that ships `@someone-else build` notifies that
+account on every trigger, forever, from a repository they have nothing to do
+with; the shipped `services.tally.campaigns.<name>.mention` default is exactly
+that shape and must be overridden. A token naming a login that does not exist
+notifies nobody, and a token with no `@` at all is a perfectly good trigger
+grammar — nothing about the mechanism requires the mention form.
+
+Naming your own login is also the coherent choice, because it composes with the
+two authorization switches directly below: the account you at-mention is
+normally the account posting the comment, which is either the authenticated
+`gh` identity (`allowSelfTriggered = true`, as in the block above) or a login in
+`allowedActors`. Under a bot identity, name the bot.
+
 `allowSelfTriggered` defaults to `false` on the operator-facing mention
 producer. Keep that loop-breaker when tally's authenticated GitHub identity is
 a bot. Set it to `true` only when the trusted person posting the campaign mention
 is also the account authenticated by `gh`, as in the single-account example
-above. `allowedActors` filters external actors on both producers;
+above. `allowedActors` filters external actors on this producer;
 `allowSelfTriggered` is the separate authorization for the authenticated `gh`
 identity and therefore does not require adding that identity to the external
-allowlist. The pass-continuation producer matches only the exact continuation
-command and always opts into authenticated self-triggering. A pass that merged
-work, passed a checkpoint, or published machine steering posts that command
-once, without widening external campaign admission.
+allowlist.
+
+Neither switch governs the machine's own next-pass nudge, and that is the
+point: a campaign no longer continues itself through this producer at all. A
+pass that merged work, passed a checkpoint, or published machine steering drops
+a JSON enqueue payload into the daemon's events directory, which the shipped
+drain admits — no comment is posted, no forge round trip is on the critical
+path, and nothing about external campaign admission is widened. The single
+`producers.campaign-continuation` events-dir entry described below is that
+mechanism; the mention producer these two switches configure remains the human,
+remote trigger surface.
 
 `postFailureEvidence` posts one comment for each failed attempt, so retries can
 accumulate several receipts. `postFailureStderr` requires it and adds only the
@@ -558,8 +585,9 @@ dropped token reads differently from forty dropped lines. When
 any redaction that fell in the dropped head is not counted — the number always
 describes the text in front of you. Redaction cannot recognize every
 application secret; leave both defaults off for a public repository unless the
-publication policy has been deliberately reviewed. Both the mention and
-pass-continuation producers inherit these settings.
+publication policy has been deliberately reviewed. These settings belong to the
+campaign's mention producer, which is now the only producer a campaign renders;
+the continuation carries no publication policy because it publishes nothing.
 
 Every gate sets an `id`, an explicit `kind`, and the fields for that kind:
 `kind = "command"` requires `preflightArgv` and `argv`, while `kind =
@@ -775,7 +803,7 @@ work on another. Three roles bind to entries of the campaign's own
 |---|---|
 | `codeRepository` | Lanes, publish branches, pull requests, merges, merge and checkpoint receipts, and the merged-pull-request scan. |
 | `specRepository` | The worklist artifact, read at the revision each pass pins. |
-| `issueRepository` | The campaign issue thread and every machine receipt: diagnoses, retries, escalation, the continuation receipt, and the closing summary. (Also task sub-issues, for the shape described under *staged, not yet reachable* below.) |
+| `issueRepository` | The campaign issue thread and every machine receipt: diagnoses, retries, escalation, and the closing summary. The next-pass continuation is not among them — it is a local events-directory drop and reaches no repository at all. (Also task sub-issues, for the shape described under *staged, not yet reachable* below.) |
 
 Each defaults inward: `issueRepository` falls back to `specRepository`, and
 both `specRepository` and `codeRepository` fall back to the repository the
@@ -1081,6 +1109,64 @@ authority—Git cannot prove that its holder ran the witnessed command. The
 direct-commit, exact-base, and dependency-ancestry checks reject malformed or
 inconsistent receipts; namespace protection keeps unrelated push identities
 from minting otherwise consistent ones.
+
+### What binds a forge-native checkpoint receipt
+
+Checkpoints are not a recurring-campaign feature. A forge-native campaign
+declares them the same way, as a `checkpoint` task reference in the master
+issue's manifest carrying `argv` and `runtimeMaxSec` with its brief in the
+sub-issue body, and the driver executes and records them through the same node.
+What differs is only where the two halves of the receipt identity come from,
+and that is worth being exact about, because a forge-native campaign
+re-resolves one of them on every single pass.
+
+A checkpoint receipt is named by `<task>-<source digest>/<base revision>`:
+
+- **The source digest is fixed by `arm`.** For a recurring campaign it is the
+  SHA-256 of the worklist blob read at the pinned revision. For a forge-native
+  campaign it is the admitted executable-graph digest recorded under
+  `$XDG_STATE_HOME/tally/campaigns/armed/`, and the reconcile node refuses to
+  run at all when the live issue graph no longer hashes to it. So this half
+  cannot drift underneath a pass: it changes only when an operator edits a
+  brief, gate, checkout, agent policy, or the DAG and explicitly re-arms — and
+  when it does, every checkpoint receipt for that campaign becomes unreadable
+  at once, exactly like every merged pull request's revision marker.
+- **The base revision is re-resolved every pass.** The forge-native worklist
+  node fetches the configured remote and resolves the base branch tip fresh, so
+  `source.revision` is a live witness of the code history rather than an
+  admitted, digest-covered value. A recurring campaign's `source.revision` is
+  the commit its worklist blob was read from and moves for the same reason.
+
+The consequence is one rule with two independent triggers. Reconciliation looks
+for a receipt under *this pass's* re-resolved base revision, and accepts it only
+when the ref points directly at that commit. A campaign whose base has advanced
+since the checkpoint last passed — because of an unrelated push, or a merge from
+another campaign — finds no receipt at the new revision and re-executes the
+checkpoint there. That is deliberate: a checkpoint asks a question about the
+accumulated repository state, so a green answer at an older commit is truthful
+history and not an answer about this one. Re-arming an unchanged graph does not
+have that effect, because the digest half is byte-identical and every existing
+receipt still resolves.
+
+Base movement *during* a checkpoint is the one case that fails rather than
+re-running. The record node publishes the receipt for the revision it actually
+tested — it is true, and nothing will ever re-test that commit — and then fails
+the lane, because that receipt names a revision the next reconciliation will not
+read. Reporting it as progress is what would let a base branch moving faster
+than the checkpoint runs keep a campaign "advanced" forever. The failure spends
+the checkpoint's ordinary steering budget and reaches escalation in a bounded
+number of passes. A campaign's own merges all land before its checkpoint lanes
+prepare, so only movement from outside the pass trips it.
+
+Two smaller consequences follow for a forge-native campaign specifically. The
+digest covers the normalized manifest together with every sub-issue's number,
+title, and body, so retitling a checkpoint's sub-issue is as much of an edit as
+changing its `argv`: the next pass refuses with "live issue executable graph
+does not match the armed digest", and once the operator has inspected it and
+re-armed, that checkpoint starts from no receipt. And under the native
+sub-issue projection a passed checkpoint writes no progress comment — the
+parent's own progress bar is the projection — while a degraded campaign posts
+one idempotently marked comment per passed checkpoint.
 
 Old refs are retained as historical audit receipts. Worklist edits and base
 movement make them unreachable from the active completion calculation rather
@@ -1483,7 +1569,8 @@ Only evidence that the task's work is wrong spends an attempt: a non-zero agent,
 a rejected ownership boundary, a red gate or re-gate, and a red checkpoint
 command. Campaign machinery — preparing a lane, an unexpected lane exception,
 rebasing, publishing, and merging — says nothing about the work, so a fault
-there posts a marked retry comment and the continuation instead. That retry
+there posts a marked retry comment instead, and the pass writes its
+continuation event so the retry is actually taken. That retry
 budget is bounded at two per task and is read back from the forge like every
 other campaign fact, so a permanently broken lane still spends its two steering
 attempts and reaches escalation rather than retrying forever.
