@@ -137,6 +137,21 @@ def prep_brief(
     }
 
 
+def preflight_brief(
+    checkout: Path,
+    workspace_root: Path,
+    run_id: str,
+) -> dict[str, object]:
+    return {
+        "campaign": "fixture",
+        "repository": "acme/spec",
+        "repositoryConfig": repository_config(checkout),
+        "issue": issue(),
+        "runId": run_id,
+        "workspaceRoot": str(workspace_root),
+    }
+
+
 def sweep_brief(
     checkout: Path,
     workspace_root: Path,
@@ -3152,6 +3167,97 @@ class LaneLifecycleTests(unittest.TestCase):
                 )
                 self.assertEqual(swept["liveRuns"], [])
                 self.assertFalse(worktree.exists())
+
+    def test_next_pass_sweeps_a_preflight_lane_left_by_a_killed_runner(self) -> None:
+        """The one preflight residue an operator can actually observe.
+
+        A pass cleans its own preflight lane unconditionally, red or green,
+        before it returns or throws. Only a runner killed while preflight is
+        still running leaves the `_campaign-preflight` worktree and its branch
+        behind. Nothing has to be removed by hand: the sweep recognises that
+        lane name, and once the dead pass is proven to have no live child it
+        reclaims both. Until then it defers rather than racing the job.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            workspace_root = root / "workspaces"
+            dead_flow = "00000000-0000-4000-8000-000000000921"
+            waiting_flow = "00000000-0000-4000-8000-000000000922"
+            live_flow = "00000000-0000-4000-8000-000000000923"
+            with FakeTally(root, dead_flow) as tally:
+                DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "killed-pass", tally.program)
+                )
+                prepared = DRIVER.action_preflight(
+                    preflight_brief(checkout, workspace_root, "killed-pass")
+                )
+                worktree = Path(prepared["worktreePath"])
+                branch = prepared["branch"]
+                self.assertEqual(prepared["taskId"], "campaign-preflight")
+                self.assertEqual(worktree.name, "_campaign-preflight")
+                self.assertTrue(worktree.is_dir())
+                self.assertTrue(str(branch).endswith("/_campaign-preflight"))
+                self.assertEqual(
+                    command(
+                        "git",
+                        "-C",
+                        str(checkout),
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        f"refs/heads/{branch}",
+                        check=False,
+                    ).returncode,
+                    0,
+                )
+
+                # The runner is killed here, so no preflight cleanup node ever
+                # runs. A still-live preflight job protects the whole namespace.
+                held_job = {
+                    "anchor": "00000000-0000-4000-8000-000000000924",
+                    "liveState": "running",
+                    "taskRef": "fixture/task-1",
+                    "orchestration": {"flowRunId": dead_flow},
+                }
+                tally.update(
+                    currentFlowRunId=waiting_flow,
+                    flows={dead_flow: [held_job]},
+                )
+                deferred = DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "waiting-pass", tally.program)
+                )
+                self.assertEqual(deferred["cleaned"], [])
+                self.assertTrue(worktree.is_dir())
+                self.assertEqual(
+                    [run["flowRunId"] for run in deferred["liveRuns"]],
+                    [dead_flow],
+                )
+
+                tally.update(
+                    currentFlowRunId=live_flow,
+                    flows={dead_flow: [], waiting_flow: []},
+                )
+                swept = DRIVER.action_sweep(
+                    sweep_brief(checkout, workspace_root, "recovery-pass", tally.program)
+                )
+            self.assertFalse(worktree.exists())
+            self.assertNotEqual(
+                command(
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    f"refs/heads/{branch}",
+                    check=False,
+                ).returncode,
+                0,
+            )
+            self.assertTrue(any(item.startswith("worktree:") for item in swept["cleaned"]))
+            self.assertEqual(swept["liveRuns"], [])
+            self.assertEqual(swept["warnings"], [])
 
     def test_sweep_liveness_survives_an_issue_campaign_rename(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

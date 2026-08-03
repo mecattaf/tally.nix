@@ -118,6 +118,37 @@ authorized.
 
 ### Added
 
+- **The real gate argv is witnessed at t=0, without gating (#320).** Since the
+  preflight/post-change split, a campaign's actual merge criterion — a command
+  gate's `argv` — first executed only after the first agent cycle. What ran at
+  t=0 was the `preflightArgv` proxy, declared base-safe and never validated to be
+  representative. The pristine-base preflight lane now runs each command gate's
+  real `argv` once, immediately after that gate's probe passes, as a non-gating
+  `preflight-witness-<id>` node: same worktree, same `CAMPAIGN_TASK_ID`, same
+  deadline, same `taskRef`, no `exit:0` evidence, verdict discarded. A run never
+  fails because of it, so a base that is legitimately red until an agent builds
+  something stays tolerated — but the exit code and stderr of the exact argv on
+  the exact host land in the witness record and the capture files before the
+  first agent cycle rather than after it. A gate whose own probe is red still
+  stops the pass there and is not witnessed.
+
+  The pass node budget grows accordingly: `campaignMaxNodes` and the CLI's
+  independent `max_flow_nodes` now reserve `2 + 2 × commandGateCount` preflight
+  nodes instead of `2 + commandGateCount`, moving the pinned budget for the
+  reference campaign shape from 51 to 52 at every assertion site. Existing
+  campaigns need no configuration change; `maxNodes` is computed.
+
+  Three probe-hygiene repairs ship with it. The copyable documentation examples
+  probed with `cargo --version` / `cargo fmt --version` — precisely what the
+  document's own warning calls insufficient — and now probe the compiler driver,
+  the offline workspace manifest, and rustfmt actually formatting something. The
+  shipped Nix fixtures no longer preflight with `/bin/true`, so a copied fixture
+  cannot propagate a no-op probe; a new evaluated check asserts both. And the
+  campaign documentation now records the one preflight residue an operator can
+  observe — a runner killed mid-preflight leaves its `_campaign-preflight`
+  worktree and branch — together with its recovery path, which is the next
+  pass's sweep and never a manual `git worktree remove`.
+
 - **Campaigns on the NixOS module, identity first (#303).** The system module
   deployed the daemon and asserted the campaign surface away, so a forge-native
   campaign armed against a host with no user session had no pools, no driver

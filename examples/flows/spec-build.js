@@ -307,8 +307,9 @@ export const meta = {
     additionalProperties: false
   },
   // One pass is bounded by maxParallel <= 128 and gates <= 16. Before the
-  // first merge, a separate pristine-base lane preflights every command gate
-  // before the dependency-ready implementation frontier is admitted.
+  // first merge, a separate pristine-base lane preflights every command gate --
+  // and witnesses each gate's real argv, non-gating, beside its probe -- before
+  // the dependency-ready implementation frontier is admitted.
   iterationCap: 4096,
   selectors: []
 };
@@ -1440,6 +1441,31 @@ async function runPreflightGate(task, gate, workspace) {
   });
 }
 
+// The gating probe above is only ever a proxy: `preflightArgv` is declared
+// base-safe, and nothing validates that it is representative of the argv that
+// actually decides a merge. So after a gate's proxy passes, run the real
+// merge-criterion `argv` once on the same pristine base, same workspace, same
+// CAMPAIGN_TASK_ID, same deadline -- and gate on nothing. No `exit:0` evidence
+// is declared, the verdict is discarded, and the pass continues whatever
+// happens; the value is the witness record and the capture files, which carry
+// the exact argv, exit code, and stderr from the exact host at t=0. An
+// estate-side toolchain defect that the proxy cannot see becomes visible before
+// the first agent cycle, while a base that is legitimately red until an agent
+// builds something stays tolerated.
+async function runPreflightWitness(task, gate, workspace) {
+  return sh(gate.argv, {
+    pools: ["campaign-control"],
+    priority: "low",
+    workspace,
+    env: { CAMPAIGN_TASK_ID: task.id },
+    runtimeMaxSec: gate.runtimeMaxSec,
+    key: `preflight-witness-${gate.id}`,
+    label: `preflight-witness-${gate.id}`,
+    settle: true,
+    taskRef: taskRefFor(task.id)
+  });
+}
+
 async function sweepCampaign(repositoryConfig) {
   // Producer admission holds the campaign's capacity-1 mutex only for the
   // runner process. The sweep registers this pass's run hash against its
@@ -1699,6 +1725,11 @@ function sweepDeferral(sweepNode) {
           failedGate = { gate, node: gated };
           break;
         }
+        // Non-gating: its verdict is never read, so a red real argv on the
+        // pristine base is recorded and the pass proceeds to agent dispatch.
+        // It runs only where the gating probe passed, because a gate whose own
+        // proxy is red has already stopped the pass.
+        await runPreflightWitness(preflightTask, gate, preflightWorkspace);
       }
       await driverNode(
         "cleanup",

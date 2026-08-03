@@ -5,6 +5,16 @@ control=$1
 gate=$2
 task=${CAMPAIGN_TASK_ID:?CAMPAIGN_TASK_ID is required}
 
+# The preflight witness runs this exact argv on the pristine campaign base,
+# before any agent has built anything. It is deliberately red there, and it
+# must say so by its own name rather than by a stray `cat` failure -- and it
+# must not consume the one-shot post-change failure below, which belongs to a
+# lane that has already run its agent.
+if [ ! -d build ]; then
+  printf '%s\n' 'fixture gate argv is red on the pristine campaign base' >&2
+  exit 3
+fi
+
 if [ "$task" = task-1 ] && [ "$gate" = first ] && [ ! -e "$control/post-change-failed-once" ]; then
   : >"$control/post-change-failed-once"
   printf '%s\n' 'fixture post-change gate fails once before publish' >&2

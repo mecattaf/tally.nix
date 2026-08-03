@@ -1890,10 +1890,14 @@ fn max_flow_nodes(manifest: &CampaignManifest) -> u32 {
         .iter()
         .filter(|gate| gate.is_command())
         .count();
+    // Two nodes per command gate: the gating base-safe probe and the
+    // non-gating witness that runs the gate's real merge-criterion argv on the
+    // same pristine base. The witness decides nothing, but it is admitted and
+    // therefore budgeted.
     let preflight = if command_gates == 0 {
         0
     } else {
-        command_gates + 2
+        2 * command_gates + 2
     };
     // Sweep, reconcile, one possible continuation, and each worst-case
     // implementation lane: prep, agent, ownership, gates, publish, rebase,
@@ -4119,8 +4123,9 @@ mod tests {
         let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
         // The Nix module computes this budget independently in
         // campaignMaxNodes. Its fixture campaign has this exact shape and is
-        // asserted to be 51 too; change one side and the other must follow.
-        assert_eq!(max_flow_nodes(&manifest), 51);
+        // asserted to be 52 too; change one side and the other must follow.
+        // 3 + (2 + 2*1) + 3*(11 + 2*2) = 52.
+        assert_eq!(max_flow_nodes(&manifest), 52);
     }
 
     #[test]
@@ -4129,41 +4134,63 @@ mod tests {
         // its machinery retry, diff, diagnosis, and steering on top. maxNodes
         // counts cumulative rows, so the budget must hold all of them at once:
         // a machinery fault past its retry budget records the retry receipt
-        // node and is steered in the same pass.
+        // node and is steered in the same pass. On top of that, a pass before
+        // the first merge also pays for the pristine-base preflight lane: its
+        // prep and cleanup, plus a gating probe and a non-gating real-argv
+        // witness for every command gate.
         const PASS_MAINTENANCE: usize = 3;
         const LANE_SUCCESS_PATH: usize = 7;
         const LANE_FAILURE_PATH: usize = 4;
+        const PREFLIGHT_LANE: usize = 2;
+        const PREFLIGHT_PER_COMMAND_GATE: usize = 2;
 
         for max_parallel in 1..=4 {
-            for gate_count in 0..=3 {
-                let mut value = manifest_value_for_test(json!([]));
-                let object = value.as_object_mut().unwrap();
-                object.insert("maxParallel".into(), json!(max_parallel));
-                object.insert(
-                    "gates".into(),
-                    Value::Array(
-                        (0..gate_count)
-                            .map(|index| {
-                                json!({
-                                    "kind": "forbidPaths",
-                                    "id": format!("no-databases-{index}"),
-                                    "forbidPaths": ["*.db"]
+            for command_gates in 0..=2 {
+                for constraint_gates in 0..=3 {
+                    let mut value = manifest_value_for_test(json!([]));
+                    let object = value.as_object_mut().unwrap();
+                    object.insert("maxParallel".into(), json!(max_parallel));
+                    object.insert(
+                        "gates".into(),
+                        Value::Array(
+                            (0..command_gates)
+                                .map(|index| {
+                                    json!({
+                                        "kind": "command",
+                                        "id": format!("tests-{index}"),
+                                        "preflightArgv": ["true"],
+                                        "argv": ["true"]
+                                    })
                                 })
-                            })
-                            .collect(),
-                    ),
-                );
-                let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
+                                .chain((0..constraint_gates).map(|index| {
+                                    json!({
+                                        "kind": "forbidPaths",
+                                        "id": format!("no-databases-{index}"),
+                                        "forbidPaths": ["*.db"]
+                                    })
+                                }))
+                                .collect(),
+                        ),
+                    );
+                    let manifest: CampaignManifest = serde_json::from_value(value).unwrap();
 
-                // No command gates here, so preflight costs nothing.
-                let worst_case = PASS_MAINTENANCE
-                    + max_parallel * (LANE_SUCCESS_PATH + LANE_FAILURE_PATH + 2 * gate_count);
-                assert!(
-                    max_flow_nodes(&manifest) as usize >= worst_case,
-                    "maxParallel {max_parallel} with {gate_count} gates budgets {} nodes \
-                     but a frontier failing at merge needs {worst_case}",
-                    max_flow_nodes(&manifest)
-                );
+                    let preflight = if command_gates == 0 {
+                        0
+                    } else {
+                        PREFLIGHT_LANE + PREFLIGHT_PER_COMMAND_GATE * command_gates
+                    };
+                    let gate_count = command_gates + constraint_gates;
+                    let worst_case = PASS_MAINTENANCE
+                        + preflight
+                        + max_parallel * (LANE_SUCCESS_PATH + LANE_FAILURE_PATH + 2 * gate_count);
+                    assert!(
+                        max_flow_nodes(&manifest) as usize >= worst_case,
+                        "maxParallel {max_parallel} with {command_gates} command and \
+                         {constraint_gates} constraint gates budgets {} nodes but a frontier \
+                         failing at merge after a full preflight needs {worst_case}",
+                        max_flow_nodes(&manifest)
+                    );
+                }
             }
         }
     }
