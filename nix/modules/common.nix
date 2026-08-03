@@ -1910,6 +1910,10 @@ let
             when kind = "forbidPaths". Declare the actual host and toolchain probe; do not
             make the post-change merge criterion pretend that unbuilt output
             exists.
+
+            Every command gate's probe runs before any gate's argv is witnessed
+            on that lane, so a probe may assume the pristine fetched base and may
+            assert that the output its own gate tests for is absent there.
           '';
         };
         argv = mkOption {
@@ -1924,6 +1928,19 @@ let
             Direct argv executed in each task worktree after the agent exits
             successfully. Required when kind = "command" and unavailable when
             kind = "forbidPaths".
+
+            It also runs once per pass on the isolated pristine preflight
+            worktree, before any agent is dispatched, as a non-gating
+            preflight-witness node: every command gate's base-safe preflightArgv
+            probe runs first, and if all pass, every gate's argv then runs there
+            in declaration order. Those runs decide nothing -- their verdicts are
+            discarded and a red one never stops a pass -- but they do execute, so
+            they are the reason the exact merge criterion is witnessed on the
+            real host at t=0 instead of one agent cycle later. Preflight stops
+            once the campaign's first pull request is merged. A merge criterion
+            that must never run against an unbuilt base -- one that deploys,
+            publishes, or mutates shared state rather than reading the tree --
+            belongs in a checkpoint node, not in a command gate.
           '';
         };
         forbidPaths = mkOption {
@@ -1948,6 +1965,7 @@ let
           example = 300;
           description = ''
             Gate deadline. Command gates share it between the base preflight
+            probe, the non-gating preflight witness of the same gate's argv,
             and each post-change invocation; constraint gates use it for the
             packaged driver invocation.
           '';
@@ -2164,7 +2182,8 @@ let
             Ordered command or built-in constraint gates run for every task.
             Command gates declare separate base-safe preflightArgv and
             post-change argv values with one deadline. Their preflights run on
-            an isolated pristine fetched base before the first frontier agent.
+            an isolated pristine fetched base before the first frontier agent,
+            followed there by a non-gating witness of each gate's own argv.
             forbidPaths constraints begin after the agent creates a committed
             diff. Every post-change gate runs again after a base-changing
             rebase; a failure blocks that task lane without starving successful
