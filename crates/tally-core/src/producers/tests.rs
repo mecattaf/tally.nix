@@ -3124,3 +3124,168 @@ fn ingress_claims_are_atomic_recoverable_and_nofollow() {
     }
     assert!(claim_ingress_files(&events).unwrap().is_empty());
 }
+
+/// Retiring a producer is a documented operation, so the projections admitted
+/// under it need a defined fate rather than a retry that can never win.
+#[test]
+fn a_removed_producer_makes_its_projection_terminal_and_restoring_it_clears_the_record() {
+    let temp = tempdir().unwrap();
+    let configured = registry(&temp.path().join("effects.jsonl"));
+    let ProducerConfig::Gh(github) = configured.get("github").unwrap() else {
+        unreachable!()
+    };
+    let origin = gh_origin(
+        "github",
+        github,
+        &gh_observation("PR_orphan", "author", "contributor"),
+    );
+    let state_dir = temp.path().join("state");
+    let events_dir = temp.path().join("events");
+    let task_uuid = Uuid::new_v4().to_string();
+    let completion_id = format!("{task_uuid}:1:9");
+    let projection = || GhCompletionProjection {
+        origin: &origin,
+        completion_id: &completion_id,
+        task_uuid: Some(&task_uuid),
+        verdict: Verdict::Pass,
+        evidence: Some(serde_json::json!({"taskUuid": task_uuid, "witnessSeq": 9})),
+        completion: None,
+    };
+
+    let retired = BTreeMap::new();
+    let engine = ProducerEngine::new(&retired, &events_dir, &state_dir, temp.path());
+    let mut sink = RecordingMutation::default();
+    let GhProjectionOutcome::Orphaned { record, first } = engine
+        .project_gh_completion(projection(), &mut sink)
+        .unwrap()
+    else {
+        panic!("a projection whose producer is gone is terminal, not retryable")
+    };
+    assert!(first);
+    assert_eq!(record.producer, "github");
+    assert_eq!(record.task_uuid.as_deref(), Some(task_uuid.as_str()));
+    assert_eq!(record.verdict, Some(Verdict::Pass));
+    assert_eq!(record.detail, "unknown producer \"github\"");
+    assert!(sink.comments.is_empty());
+
+    // Re-observing the same orphan records it once and announces it once.
+    let GhProjectionOutcome::Orphaned { first, .. } = engine
+        .project_gh_completion(projection(), &mut sink)
+        .unwrap()
+    else {
+        panic!("the second observation is still terminal")
+    };
+    assert!(!first);
+    let recorded = read_orphaned_projections(&state_dir).unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].observed_at, record.observed_at);
+    assert_eq!(recorded, engine.orphaned_projections().unwrap());
+
+    // Nothing consults the record to decide what to do, so restoring the
+    // producer block projects the completion after all — and the record stops
+    // claiming a loss that no longer holds.
+    let engine = ProducerEngine::new(&configured, &events_dir, &state_dir, temp.path());
+    assert_eq!(
+        engine
+            .project_gh_completion(projection(), &mut sink)
+            .unwrap(),
+        GhProjectionOutcome::Settled
+    );
+    assert_eq!(sink.comments.len(), 1);
+    assert!(read_orphaned_projections(&state_dir).unwrap().is_empty());
+}
+
+/// A storage-budget receipt is orphaned by exactly the same removal.
+#[test]
+fn a_removed_producer_makes_its_storage_warning_receipt_terminal() {
+    let temp = tempdir().unwrap();
+    let configured = registry(&temp.path().join("effects.jsonl"));
+    let ProducerConfig::Gh(github) = configured.get("github").unwrap() else {
+        unreachable!()
+    };
+    let origin = gh_origin(
+        "github",
+        github,
+        &gh_observation("PR_orphan_warning", "author", "contributor"),
+    );
+    let warning = crate::storage::ActiveStorageWarning {
+        warning_sequence: 3,
+        store: "dataDir".to_owned(),
+        level: crate::storage::BudgetLevel::Warning,
+        size_bytes: 200,
+        threshold_bytes: 100,
+        pressures: Vec::new(),
+        message: "warning budget crossed".to_owned(),
+    };
+    let state_dir = temp.path().join("state");
+    let retired = BTreeMap::new();
+    let engine = ProducerEngine::new(
+        &retired,
+        temp.path().join("events"),
+        &state_dir,
+        temp.path(),
+    );
+    let mut sink = RecordingMutation::default();
+    let GhProjectionOutcome::Orphaned { record, first } = engine
+        .project_storage_warning(&origin, &warning, &mut sink)
+        .unwrap()
+    else {
+        panic!("a storage-warning receipt whose producer is gone is terminal")
+    };
+    assert!(first);
+    assert_eq!(record.kind, OrphanedProjectionKind::StorageWarning);
+    assert_eq!(record.completion_id, "storage-warning:3");
+    assert_eq!(record.task_uuid, None);
+    assert!(sink.comments.is_empty());
+    assert_eq!(read_orphaned_projections(&state_dir).unwrap().len(), 1);
+}
+
+/// A forge outage is not a removed producer: it must keep retrying.
+#[test]
+fn a_failing_mutation_sink_is_still_a_retryable_error() {
+    struct RefusingSink;
+    impl GhMutationSink for RefusingSink {
+        fn post_evidence(&mut self, _: &GhCompletedMutation) -> Result<(), String> {
+            Err("gh: API rate limit exceeded".to_owned())
+        }
+        fn request_reviews(&mut self, _: &GhCompletedMutation) -> Result<(), String> {
+            Err("gh: API rate limit exceeded".to_owned())
+        }
+        fn close_item(&mut self, _: &GhCompletedMutation) -> Result<(), String> {
+            Err("gh: API rate limit exceeded".to_owned())
+        }
+    }
+
+    let temp = tempdir().unwrap();
+    let configured = registry(&temp.path().join("effects.jsonl"));
+    let ProducerConfig::Gh(github) = configured.get("github").unwrap() else {
+        unreachable!()
+    };
+    let origin = gh_origin(
+        "github",
+        github,
+        &gh_observation("PR_outage", "author", "contributor"),
+    );
+    let state_dir = temp.path().join("state");
+    let engine = ProducerEngine::new(
+        &configured,
+        temp.path().join("events"),
+        &state_dir,
+        temp.path(),
+    );
+    let error = engine
+        .project_gh_completion(
+            GhCompletionProjection {
+                origin: &origin,
+                completion_id: "outage:1:1",
+                task_uuid: None,
+                verdict: Verdict::Pass,
+                evidence: Some(serde_json::json!({"witnessSeq": 1})),
+                completion: None,
+            },
+            &mut RefusingSink,
+        )
+        .unwrap_err();
+    assert!(matches!(error, ProducerError::Mutation(_)), "{error}");
+    assert!(read_orphaned_projections(&state_dir).unwrap().is_empty());
+}

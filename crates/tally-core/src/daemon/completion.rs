@@ -53,6 +53,8 @@ impl DaemonHandler {
                         handler.execution_shutdown.clone(),
                     )
                 };
+                let attestations = Arc::clone(&handler.attestations);
+                let orphan_hint = orphan_listing_command(&state_dir);
                 let mut retry_delay = Duration::from_secs(1);
                 loop {
                     let registry = registry.clone();
@@ -63,16 +65,29 @@ impl DaemonHandler {
                     let origin = origin.clone();
                     let warning = warning.clone();
                     let warning_sequence = warning.warning_sequence;
+                    let attestations = Arc::clone(&attestations);
                     let posted = tokio::task::spawn_blocking(move || {
                         let engine =
                             ProducerEngine::new(&registry, events_dir, &state_dir, data_dir);
                         let mut sink =
                             GhCliMutationSink::with_program(gh_program).with_state_dir(&state_dir);
-                        engine.post_storage_warning_once(&origin, &warning, &mut sink)
+                        let outcome =
+                            engine.project_storage_warning(&origin, &warning, &mut sink)?;
+                        witness_new_orphan(&attestations, &outcome, None, None);
+                        Ok::<_, ProducerError>(outcome)
                     })
                     .await;
                     match posted {
-                        Ok(Ok(_)) => break,
+                        Ok(Ok(GhProjectionOutcome::Settled)) => break,
+                        Ok(Ok(GhProjectionOutcome::Orphaned { record, .. })) => {
+                            eprintln!(
+                                "tally: GitHub storage-warning receipt {warning_sequence} is \
+                                 orphaned and will not retry: {}. List every orphaned projection \
+                                 with: {orphan_hint}",
+                                record.detail
+                            );
+                            break;
+                        }
                         Ok(Err(error)) => eprintln!(
                             "tally: GitHub storage-warning receipt {} failed and will retry: {error}",
                             warning_sequence
@@ -149,7 +164,10 @@ impl DaemonHandler {
                     handler.execution_shutdown.clone(),
                 )
             };
-            let completion_id = format!("{}:{}:{}", row.uuid, result.attempt, result.witness_seq);
+            let attestations = Arc::clone(&handler.attestations);
+            let orphan_hint = orphan_listing_command(&state_dir);
+            let task_uuid = row.uuid.to_string();
+            let completion_id = gh_completion_id(row.uuid, result.attempt, result.witness_seq);
             let mut evidence = json!({
                 "taskUuid": row.uuid.to_string(),
                 "witnessSeq": result.witness_seq,
@@ -179,25 +197,46 @@ impl DaemonHandler {
                 let gh_program = gh_program.clone();
                 let origin = origin.clone();
                 let completion_id = completion_id.clone();
+                let task_uuid = task_uuid.clone();
                 let evidence = evidence.clone();
                 let semantic_completion = result.completion.clone();
                 let verdict = result.verdict;
+                let attempt = result.attempt;
+                let lease_epoch = result.lease_epoch;
+                let attestations = Arc::clone(&attestations);
                 let completed = tokio::task::spawn_blocking(move || {
                     let engine = ProducerEngine::new(&registry, events_dir, &state_dir, data_dir);
                     let mut sink =
                         GhCliMutationSink::with_program(gh_program).with_state_dir(&state_dir);
-                    engine.complete_gh_once_with_completion(
-                        &origin,
-                        &completion_id,
-                        verdict,
-                        Some(evidence),
-                        semantic_completion,
+                    let outcome = engine.project_gh_completion(
+                        GhCompletionProjection {
+                            origin: &origin,
+                            completion_id: &completion_id,
+                            task_uuid: Some(&task_uuid),
+                            verdict,
+                            evidence: Some(evidence),
+                            completion: semantic_completion,
+                        },
                         &mut sink,
-                    )
+                    )?;
+                    witness_new_orphan(&attestations, &outcome, Some(attempt), Some(lease_epoch));
+                    Ok::<_, ProducerError>(outcome)
                 })
                 .await;
                 match completed {
-                    Ok(Ok(_)) => break,
+                    Ok(Ok(GhProjectionOutcome::Settled)) => break,
+                    Ok(Ok(GhProjectionOutcome::Orphaned { record, .. })) => {
+                        // The completion is settled and witnessed; only the
+                        // forge-side projection is lost, and no retry can
+                        // change that while the producer is absent.
+                        eprintln!(
+                            "tally: post-ack GitHub COMPLETED mutation for {} is orphaned and \
+                             will not retry: {}. List every orphaned projection with: \
+                             {orphan_hint}",
+                            row.uuid, record.detail
+                        );
+                        break;
+                    }
                     Ok(Err(error)) => eprintln!(
                         "tally: post-ack GitHub COMPLETED mutation failed for {} and will retry: {error}",
                         row.uuid
@@ -628,6 +667,84 @@ impl DaemonHandler {
             }
         });
     }
+}
+
+/// The identity of one task generation's terminal forge projection.
+///
+/// Startup re-drive and the live post-ack worker must agree on this string, or
+/// the same projection would be recorded as two different orphans.
+pub(super) fn gh_completion_id(task_uuid: Uuid, attempt: u32, witness_seq: u64) -> String {
+    format!("{task_uuid}:{attempt}:{witness_seq}")
+}
+
+/// The command that lists every orphaned projection in one pass.
+pub(super) fn orphan_listing_command(state_dir: &Path) -> String {
+    format!(
+        "tally producer orphaned --state-dir {}",
+        state_dir.display()
+    )
+}
+
+/// Witness a newly recorded orphan on the advisory attestation chain.
+///
+/// Only the first observation appends: a restart re-derives the same terminal
+/// outcome and must not turn a one-line-per-minute log drip into a
+/// one-record-per-restart ledger drip.
+pub(super) fn witness_new_orphan(
+    attestations: &Arc<std::sync::Mutex<SharedAttestations>>,
+    outcome: &GhProjectionOutcome,
+    attempt: Option<u32>,
+    lease_epoch: Option<u64>,
+) {
+    let GhProjectionOutcome::Orphaned { record, first } = outcome else {
+        return;
+    };
+    if !*first {
+        return;
+    }
+    let mut attestations = attestations
+        .lock()
+        .expect("attestation ledger lock poisoned");
+    if let Err(error) = append_orphan_attestation(&mut attestations, record, attempt, lease_epoch) {
+        eprintln!("tally: orphaned-projection attestation failed: {error}");
+    }
+}
+
+pub(super) fn append_orphan_attestation(
+    attestations: &mut SharedAttestations,
+    record: &OrphanedProjection,
+    attempt: Option<u32>,
+    lease_epoch: Option<u64>,
+) -> Result<(), WitnessError> {
+    let mut payload = json!({
+        "kind": "projection-orphaned",
+        "schemaVersion": ORPHANED_PROJECTION_SCHEMA_VERSION,
+        "projection": record.kind.as_str(),
+        "producer": record.producer,
+        "source": record.source,
+        "itemId": record.item_id,
+        "completionId": record.completion_id,
+        "observedAt": record.observed_at,
+        "detail": record.detail,
+        "retryAuthority": "terminal-no-retry",
+    });
+    if let Some(task_uuid) = &record.task_uuid {
+        payload["taskUuid"] = Value::String(task_uuid.clone());
+    }
+    if let Some(verdict) = record.verdict {
+        payload["verdict"] =
+            serde_json::to_value(verdict).expect("verdict always serializes to a string");
+    }
+    if let Some(attempt) = attempt {
+        payload["attempt"] = Value::from(attempt);
+    }
+    if let Some(lease_epoch) = lease_epoch {
+        payload["leaseEpoch"] = Value::from(lease_epoch);
+    }
+    attestations
+        .ledger()
+        .and_then(|ledger| ledger.append(payload))
+        .map(|_| ())
 }
 
 async fn wait_for_cancellation(receiver: &mut broadcast::Receiver<Uuid>, job_id: Uuid) {

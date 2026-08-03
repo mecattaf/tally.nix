@@ -211,7 +211,12 @@ impl Daemon {
             Utc::now(),
         )?;
         reconcile_failure_stderr(&completed_witness, &executor)?;
-        let initial_gh_completions = recovery_gh_completions(&plan, &completed_witness, &executor)?;
+        let initial_gh_completions = sweep_orphaned_gh_completions(
+            recovery_gh_completions(&plan, &completed_witness, &executor)?,
+            &config,
+            &paths,
+            &mut attestations,
+        );
         let initial_lost_pools = ProducerEngine::new(
             &config.producers,
             paths.events_dir(),
@@ -471,6 +476,87 @@ pub(super) fn acquire_daemon_lock(state_dir: &Path) -> Result<File, DaemonError>
         }
     })?;
     Ok(file)
+}
+
+/// Give every terminal projection whose producer is gone a terminal outcome,
+/// before a single retry worker is spawned for it.
+///
+/// The population is decided from the effective configuration on every start,
+/// never from the records this writes. A producer block restored after a
+/// mistaken removal therefore projects its completions on the next start, and
+/// each stale record clears itself when its projection settles.
+///
+/// The whole set is reported in one pass. A projection that can never be
+/// applied is a permanent condition, and an operator deserves to read it as a
+/// list rather than discover it one log line per minute.
+pub(super) fn sweep_orphaned_gh_completions(
+    completions: Vec<GhTerminalWork>,
+    config: &Config,
+    paths: &DaemonPaths,
+    attestations: &mut SharedAttestations,
+) -> Vec<GhTerminalWork> {
+    let engine = ProducerEngine::new(
+        &config.producers,
+        paths.events_dir(),
+        &paths.state_dir,
+        &paths.data_dir,
+    );
+    let mut retained = Vec::with_capacity(completions.len());
+    for work in completions {
+        let Some(origin) = work.row.gh_origin.as_ref() else {
+            retained.push(work);
+            continue;
+        };
+        if config.producers.contains_key(&origin.producer) {
+            retained.push(work);
+            continue;
+        }
+        let record = OrphanedProjection {
+            schema_version: ORPHANED_PROJECTION_SCHEMA_VERSION,
+            kind: OrphanedProjectionKind::Completion,
+            producer: origin.producer.clone(),
+            source: origin.source.clone(),
+            item_id: origin.node_id.clone(),
+            completion_id: gh_completion_id(
+                work.row.uuid,
+                work.result.attempt,
+                work.result.witness_seq,
+            ),
+            task_uuid: Some(work.row.uuid.to_string()),
+            verdict: Some(work.result.verdict),
+            observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            detail: ProducerError::UnknownProducer(origin.producer.clone()).to_string(),
+        };
+        match engine.record_orphaned_projection(&record) {
+            Ok(true) => {
+                if let Err(error) = append_orphan_attestation(
+                    attestations,
+                    &record,
+                    Some(work.result.attempt),
+                    Some(work.result.lease_epoch),
+                ) {
+                    eprintln!("tally: orphaned-projection attestation failed: {error}");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => eprintln!(
+                "tally: recording the orphaned GitHub projection for {} failed: {error}",
+                work.row.uuid
+            ),
+        }
+    }
+    match read_orphaned_projections(&paths.state_dir) {
+        Ok(records) if !records.is_empty() => eprintln!(
+            "tally: {}",
+            OrphanedProjections {
+                records,
+                state_dir: paths.state_dir.clone(),
+            }
+        ),
+        Ok(_) => {}
+        Err(error) => eprintln!("tally: orphaned GitHub projection sweep failed: {error}"),
+    }
+    retained
 }
 
 pub(super) fn recovery_gh_completions(

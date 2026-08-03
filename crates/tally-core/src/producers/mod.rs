@@ -41,6 +41,7 @@ mod engine;
 mod gh_decision;
 mod gh_intake;
 mod ingress;
+mod orphan;
 mod validate;
 
 pub use config::*;
@@ -48,6 +49,7 @@ pub use engine::*;
 pub use gh_decision::*;
 pub use gh_intake::*;
 pub use ingress::*;
+pub use orphan::*;
 pub use validate::*;
 
 #[derive(Debug, Error)]

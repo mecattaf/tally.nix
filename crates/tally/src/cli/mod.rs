@@ -41,8 +41,8 @@ use tally_core::executor::{
     persist_exit_record_from_env, serve_remote_executor_stdio, ExecutionPaths, UnitLimits,
 };
 use tally_core::producers::{
-    record_producer_runtime, GhCliAcknowledgementSink, GhCliIntake, GhObservation, ProducerEngine,
-    ProducerObservation,
+    read_orphaned_projections, record_producer_runtime, GhCliAcknowledgementSink, GhCliIntake,
+    GhObservation, ProducerEngine, ProducerObservation,
 };
 use tally_core::provenance::Orchestration;
 use tally_core::recovery::RecoveryPolicy;
@@ -333,6 +333,22 @@ fn migration_executors(
 }
 
 fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Result<()> {
+    // An orphaned projection is exactly the case where the configuration no
+    // longer mentions the producer, so requiring a readable configuration to
+    // read the record would refuse the one question it answers.
+    if let ProducerCommand::Orphaned { state_dir } = command {
+        let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
+        let projections = read_orphaned_projections(&state_dir)?;
+        outln!(
+            "{}",
+            serde_json::to_string(&json!({
+                "stateDir": state_dir,
+                "count": projections.len(),
+                "projections": projections,
+            }))?
+        );
+        return Ok(());
+    }
     let config_path = config_path.map_or_else(default_config_path, Ok)?;
     let config = Config::from_path(&config_path)?;
     let intake = GhCliIntake::default();
@@ -453,6 +469,8 @@ fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Resul
                 )?)?
             }
         }
+        // Answered above, before the configuration is required.
+        ProducerCommand::Orphaned { .. } => unreachable!("orphaned listing returns early"),
     };
     outln!("{}", serde_json::to_string(&result)?);
     Ok(())

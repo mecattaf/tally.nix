@@ -528,6 +528,32 @@ Preserve the marker and captures, determine whether the external work could
 have run, and treat the job as an incident. Replaying argv automatically could
 duplicate side effects, which is why tally stops there.
 
+## Orphaned forge projection
+
+Retiring a producer means deleting its block from the configuration. Tasks it
+already admitted are already settled and witnessed, but their post-ack forge
+projection — the COMPLETED comment, the close, the storage-warning receipt —
+cannot be resolved without the producer that owns it. The daemon declares that
+projection terminal instead of retrying it:
+
+```text
+tally: post-ack GitHub COMPLETED mutation for <TASK-UUID> is orphaned and will not retry: unknown producer "<NAME>". List every orphaned projection with: tally producer orphaned --state-dir <STATE-DIR>
+```
+
+Each one is recorded under `<stateDir>/producers/gh-orphaned/`, witnessed once
+on the advisory attestation chain as `projection-orphaned`, and reported as a
+set on every daemon start rather than one line per projection per minute:
+
+```console
+$ tally producer orphaned --state-dir <STATE-DIR> | jq '.count, .projections[].taskUuid'
+```
+
+Nothing is owed. Only the forge-side projection was lost, which is the honest
+consequence of retiring the producer, and the task outcome itself is unchanged.
+If the removal was a mistake, restore the producer block and start the daemon
+again: the population is re-derived from the configuration on every start, so
+the projection is applied after all and its record clears itself.
+
 The strings above are anchored in
 [`daemon.rs`](https://github.com/mecattaf/tally.nix/blob/4c85563/crates/tally-core/src/daemon.rs),
 [`wire.rs`](https://github.com/mecattaf/tally.nix/blob/4c85563/crates/tally-core/src/wire.rs),

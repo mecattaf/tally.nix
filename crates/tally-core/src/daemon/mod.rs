@@ -31,6 +31,7 @@ use completion::{
     finalize_forced_locked, forced_witness, lock_gcroot_registration, release_child_charge,
     substituted_witness, GhTerminalWork, TerminalWork,
 };
+use completion::{append_orphan_attestation, gh_completion_id};
 pub(crate) use notify::watchdog_tick;
 use rpc::control::{find_job, lease_request, lease_wire, state_name};
 #[cfg(test)]
@@ -117,7 +118,9 @@ use crate::pagination::{PageCache, PaginationError};
 use crate::producer_query::query_producers;
 use crate::producers::{
     acknowledged_ingress_ids, archive_ingress_claim, claim_ingress_files, read_ingress_payload,
-    GhCliMutationSink, IngressOutcome, ProducerEngine, ReachabilityTransition,
+    read_orphaned_projections, GhCliMutationSink, GhCompletionProjection, GhProjectionOutcome,
+    IngressOutcome, OrphanedProjection, OrphanedProjectionKind, OrphanedProjections,
+    ProducerEngine, ProducerError, ReachabilityTransition, ORPHANED_PROJECTION_SCHEMA_VERSION,
 };
 use crate::provenance::{Orchestration, TaskRef, DEFAULT_FLOW_MAX_NODES};
 use crate::query::{

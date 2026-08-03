@@ -753,6 +753,124 @@ impl<'a> ProducerEngine<'a> {
         Ok(true)
     }
 
+    /// Project one terminal completion, giving a projection whose producer is
+    /// gone a terminal outcome instead of an error the caller must retry.
+    ///
+    /// Every other failure stays an error: a forge outage, a rate limit, and a
+    /// torn marker are all transient and the caller must keep trying. Only the
+    /// absence of the producer from the effective configuration is permanent,
+    /// because nothing about the projection can be resolved without it.
+    pub fn project_gh_completion(
+        &self,
+        projection: GhCompletionProjection<'_>,
+        sink: &mut dyn GhMutationSink,
+    ) -> Result<GhProjectionOutcome, ProducerError> {
+        let GhCompletionProjection {
+            origin,
+            completion_id,
+            task_uuid,
+            verdict,
+            evidence,
+            completion,
+        } = projection;
+        let settled = self.complete_gh_once_with_completion(
+            origin,
+            completion_id,
+            verdict,
+            evidence,
+            completion,
+            sink,
+        );
+        self.classify_projection(
+            settled,
+            OrphanedProjectionKind::Completion,
+            origin,
+            completion_id,
+            task_uuid.map(str::to_owned),
+            Some(verdict),
+        )
+    }
+
+    /// [`Self::project_gh_completion`] for a storage-budget warning receipt,
+    /// which is orphaned by exactly the same producer removal.
+    pub fn project_storage_warning(
+        &self,
+        origin: &GhOrigin,
+        warning: &crate::storage::ActiveStorageWarning,
+        sink: &mut dyn GhMutationSink,
+    ) -> Result<GhProjectionOutcome, ProducerError> {
+        let posted = self.post_storage_warning_once(origin, warning, sink);
+        let completion_id = format!("storage-warning:{}", warning.warning_sequence);
+        self.classify_projection(
+            posted,
+            OrphanedProjectionKind::StorageWarning,
+            origin,
+            &completion_id,
+            None,
+            None,
+        )
+    }
+
+    /// Record a projection already known to be orphaned, without attempting a
+    /// mutation whose outcome is not in doubt. Returns whether the record was
+    /// new. Startup uses this: the producer's absence is read from the
+    /// effective configuration, so nothing is learned by trying the sink.
+    pub fn record_orphaned_projection(
+        &self,
+        record: &OrphanedProjection,
+    ) -> Result<bool, ProducerError> {
+        write_orphaned_record(&self.state_dir, record)
+    }
+
+    /// Every orphaned projection recorded under this engine's state root.
+    pub fn orphaned_projections(&self) -> Result<Vec<OrphanedProjection>, ProducerError> {
+        read_orphaned_projections(&self.state_dir)
+    }
+
+    fn classify_projection(
+        &self,
+        outcome: Result<bool, ProducerError>,
+        kind: OrphanedProjectionKind,
+        origin: &GhOrigin,
+        completion_id: &str,
+        task_uuid: Option<String>,
+        verdict: Option<Verdict>,
+    ) -> Result<GhProjectionOutcome, ProducerError> {
+        let record = OrphanedProjection {
+            schema_version: ORPHANED_PROJECTION_SCHEMA_VERSION,
+            kind,
+            producer: origin.producer.clone(),
+            source: origin.source.clone(),
+            item_id: origin.node_id.clone(),
+            completion_id: completion_id.to_owned(),
+            task_uuid,
+            verdict,
+            observed_at: Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            detail: String::new(),
+        };
+        match outcome {
+            Ok(_) => {
+                // The projection settled, so any record of it being orphaned
+                // is now false. This is what makes restoring a removed
+                // producer sufficient on its own.
+                remove_orphaned_record(&self.state_dir, &record)?;
+                Ok(GhProjectionOutcome::Settled)
+            }
+            Err(error @ ProducerError::UnknownProducer(_)) => {
+                let record = OrphanedProjection {
+                    detail: error.to_string(),
+                    ..record
+                };
+                let first = write_orphaned_record(&self.state_dir, &record)?;
+                Ok(GhProjectionOutcome::Orphaned {
+                    record: Box::new(record),
+                    first,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     fn complete_gh_with_id(
         &self,
         origin: &GhOrigin,
