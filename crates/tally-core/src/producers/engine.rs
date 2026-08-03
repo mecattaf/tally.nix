@@ -49,6 +49,49 @@ impl Default for ReachabilityState {
     }
 }
 
+/// One class of per-dispatch idempotency marker: where it lives, the
+/// namespace its stable key is derived under, and how it is named in a
+/// refusal. The presence of a marker is the tree's durable proof that its
+/// forge mutation already happened.
+#[derive(Debug, Clone, Copy)]
+struct GhMarkerSet {
+    directory: &'static str,
+    key_namespace: &'static str,
+    label: &'static str,
+}
+
+impl GhMarkerSet {
+    fn directory_path(self) -> String {
+        format!("producers/{}", self.directory)
+    }
+}
+
+const GH_COMPLETED_MARKERS: GhMarkerSet = GhMarkerSet {
+    directory: "gh-completed",
+    key_namespace: "gh-completed",
+    label: "GitHub completion",
+};
+
+const GH_STORAGE_WARNING_MARKERS: GhMarkerSet = GhMarkerSet {
+    directory: "gh-storage-warnings",
+    key_namespace: "gh-storage-warning",
+    label: "GitHub storage-warning",
+};
+
+const fn marker_set_for(kind: OrphanedProjectionKind) -> GhMarkerSet {
+    match kind {
+        OrphanedProjectionKind::Completion => GH_COMPLETED_MARKERS,
+        OrphanedProjectionKind::StorageWarning => GH_STORAGE_WARNING_MARKERS,
+    }
+}
+
+/// The completion id one storage-budget warning receipt is published under.
+/// Derived in one place so the marker lookup and the orphan record cannot
+/// disagree about which receipt they are talking about.
+pub(super) fn storage_warning_completion_id(warning_sequence: u64) -> String {
+    format!("storage-warning:{warning_sequence}")
+}
+
 pub struct ProducerEngine<'a> {
     registry: &'a BTreeMap<String, ProducerConfig>,
     events_dir: PathBuf,
@@ -607,7 +650,7 @@ impl<'a> ProducerEngine<'a> {
                 ),
             ));
         }
-        let completed_dir = self.state_dir.join("producers/gh-completed");
+        let completed_dir = self.state_dir.join(GH_COMPLETED_MARKERS.directory_path());
         create_dir_durable(&completed_dir)?;
         let lock_path = completed_dir.join("mutations.lock");
         let lock = open_private_rw(&lock_path)?;
@@ -615,27 +658,11 @@ impl<'a> ProducerEngine<'a> {
             path: lock_path.clone(),
             source,
         })?;
-        let marker_key = stable_key(&[
-            "gh-completed",
-            &origin.producer,
-            &origin.source,
-            &origin.node_id,
-            completion_id,
-        ]);
-        let marker_path = completed_dir.join(format!("{marker_key}.json"));
-        if path_lexists(&marker_path)? {
-            let marker: GhCompletionMarker =
-                serde_json::from_slice(&read_bounded_regular(&marker_path, 64 * 1024)?)?;
-            if marker.completion_id != completion_id
-                || marker.producer != origin.producer
-                || marker.source != origin.source
-                || marker.item_id != origin.node_id
-            {
-                return Err(ProducerError::InvalidObservation(format!(
-                    "GitHub completion marker {} does not match its identity",
-                    marker_path.display()
-                )));
-            }
+        let marker_path = self.gh_marker_path(GH_COMPLETED_MARKERS, origin, completion_id);
+        // The marker is consulted before the producer is resolved, and that
+        // ordering is load-bearing: a projection already on the forge is
+        // settled whatever the configuration says about its producer now.
+        if self.gh_marker_settled(GH_COMPLETED_MARKERS, origin, completion_id)? {
             return Ok(false);
         }
         if !self.complete_gh_with_id(
@@ -674,15 +701,10 @@ impl<'a> ProducerEngine<'a> {
         warning: &crate::storage::ActiveStorageWarning,
         sink: &mut dyn GhMutationSink,
     ) -> Result<bool, ProducerError> {
-        let ProducerConfig::Gh(config) = self.get(&origin.producer)? else {
-            return Err(self.kind_mismatch(&origin.producer, "gh"));
-        };
-        if !config.enable || config.never_mutate || !config.post_evidence {
-            return Ok(false);
-        }
-        self.validate_gh_origin(origin)?;
-        let completion_id = format!("storage-warning:{}", warning.warning_sequence);
-        let completed_dir = self.state_dir.join("producers/gh-storage-warnings");
+        let completion_id = storage_warning_completion_id(warning.warning_sequence);
+        let completed_dir = self
+            .state_dir
+            .join(GH_STORAGE_WARNING_MARKERS.directory_path());
         create_dir_durable(&completed_dir)?;
         let lock_path = completed_dir.join("mutations.lock");
         let lock = open_private_rw(&lock_path)?;
@@ -690,29 +712,20 @@ impl<'a> ProducerEngine<'a> {
             path: lock_path.clone(),
             source,
         })?;
-        let marker_key = stable_key(&[
-            "gh-storage-warning",
-            &origin.producer,
-            &origin.source,
-            &origin.node_id,
-            &completion_id,
-        ]);
-        let marker_path = completed_dir.join(format!("{marker_key}.json"));
-        if path_lexists(&marker_path)? {
-            let marker: GhCompletionMarker =
-                serde_json::from_slice(&read_bounded_regular(&marker_path, 64 * 1024)?)?;
-            if marker.completion_id != completion_id
-                || marker.producer != origin.producer
-                || marker.source != origin.source
-                || marker.item_id != origin.node_id
-            {
-                return Err(ProducerError::InvalidObservation(format!(
-                    "GitHub storage-warning marker {} does not match its identity",
-                    marker_path.display()
-                )));
-            }
+        let marker_path = self.gh_marker_path(GH_STORAGE_WARNING_MARKERS, origin, &completion_id);
+        // As in `complete_gh_once_with_completion`, the marker is read before
+        // the producer is resolved. A receipt already on the forge is settled,
+        // and a producer retired afterwards cannot make it un-posted.
+        if self.gh_marker_settled(GH_STORAGE_WARNING_MARKERS, origin, &completion_id)? {
             return Ok(false);
         }
+        let ProducerConfig::Gh(config) = self.get(&origin.producer)? else {
+            return Err(self.kind_mismatch(&origin.producer, "gh"));
+        };
+        if !config.enable || config.never_mutate || !config.post_evidence {
+            return Ok(false);
+        }
+        self.validate_gh_origin(origin)?;
         sink.post_evidence(&GhCompletedMutation {
             producer: origin.producer.clone(),
             source: origin.source.clone(),
@@ -800,7 +813,7 @@ impl<'a> ProducerEngine<'a> {
         sink: &mut dyn GhMutationSink,
     ) -> Result<GhProjectionOutcome, ProducerError> {
         let posted = self.post_storage_warning_once(origin, warning, sink);
-        let completion_id = format!("storage-warning:{}", warning.warning_sequence);
+        let completion_id = storage_warning_completion_id(warning.warning_sequence);
         self.classify_projection(
             posted,
             OrphanedProjectionKind::StorageWarning,
@@ -811,10 +824,31 @@ impl<'a> ProducerEngine<'a> {
         )
     }
 
+    /// Whether this exact projection already reached the forge.
+    ///
+    /// The idempotency marker is the durable proof of delivery, and it is the
+    /// only thing that can answer the question after the producer that made
+    /// the mutation has been removed. A caller deciding whether a projection
+    /// is orphaned must ask this first, or it will call a delivered
+    /// projection lost.
+    ///
+    /// The read is deliberately lock-free. Markers are published by an atomic
+    /// rename, so a concurrent writer is either invisible here or complete,
+    /// and "not yet visible" is the same answer as "not settled" — which is
+    /// the conservative direction: it costs a retry, never a false claim.
+    pub fn gh_projection_settled(
+        &self,
+        kind: OrphanedProjectionKind,
+        origin: &GhOrigin,
+        completion_id: &str,
+    ) -> Result<bool, ProducerError> {
+        self.gh_marker_settled(marker_set_for(kind), origin, completion_id)
+    }
+
     /// Record a projection already known to be orphaned, without attempting a
     /// mutation whose outcome is not in doubt. Returns whether the record was
-    /// new. Startup uses this: the producer's absence is read from the
-    /// effective configuration, so nothing is learned by trying the sink.
+    /// new. Startup uses this once it has established, from the idempotency
+    /// marker, that the projection did not reach the forge.
     pub fn record_orphaned_projection(
         &self,
         record: &OrphanedProjection,
@@ -822,8 +856,17 @@ impl<'a> ProducerEngine<'a> {
         write_orphaned_record(&self.state_dir, record)
     }
 
+    /// Retract a record whose projection has been shown to be settled after
+    /// all, returning what it had claimed.
+    pub fn retract_orphaned_projection(
+        &self,
+        record: &OrphanedProjection,
+    ) -> Result<Option<OrphanedProjection>, ProducerError> {
+        remove_orphaned_record(&self.state_dir, record)
+    }
+
     /// Every orphaned projection recorded under this engine's state root.
-    pub fn orphaned_projections(&self) -> Result<Vec<OrphanedProjection>, ProducerError> {
+    pub fn orphaned_projections(&self) -> Result<OrphanedProjectionScan, ProducerError> {
         read_orphaned_projections(&self.state_dir)
     }
 
@@ -852,23 +895,76 @@ impl<'a> ProducerEngine<'a> {
             Ok(_) => {
                 // The projection settled, so any record of it being orphaned
                 // is now false. This is what makes restoring a removed
-                // producer sufficient on its own.
-                remove_orphaned_record(&self.state_dir, &record)?;
-                Ok(GhProjectionOutcome::Settled)
+                // producer sufficient on its own, and it is also how a record
+                // written for a projection that had in fact already been
+                // delivered retires itself.
+                let retracted = remove_orphaned_record(&self.state_dir, &record)?;
+                Ok(GhProjectionOutcome::Settled {
+                    retracted: retracted.map(Box::new),
+                })
             }
-            Err(error @ ProducerError::UnknownProducer(_)) => {
+            // Both of these say the same thing: this configuration cannot
+            // produce a GitHub projection for this origin, and no number of
+            // retries changes a configuration. An operator edit is what
+            // changes it, and that is exactly the restore path.
+            Err(
+                error @ (ProducerError::UnknownProducer(_) | ProducerError::KindMismatch { .. }),
+            ) => {
                 let record = OrphanedProjection {
                     detail: error.to_string(),
                     ..record
                 };
-                let first = write_orphaned_record(&self.state_dir, &record)?;
+                write_orphaned_record(&self.state_dir, &record)?;
                 Ok(GhProjectionOutcome::Orphaned {
                     record: Box::new(record),
-                    first,
                 })
             }
             Err(error) => Err(error),
         }
+    }
+
+    fn gh_marker_path(&self, set: GhMarkerSet, origin: &GhOrigin, completion_id: &str) -> PathBuf {
+        let marker_key = stable_key(&[
+            set.key_namespace,
+            &origin.producer,
+            &origin.source,
+            &origin.node_id,
+            completion_id,
+        ]);
+        self.state_dir
+            .join(set.directory_path())
+            .join(format!("{marker_key}.json"))
+    }
+
+    /// Whether the marker for this projection exists and names this identity.
+    ///
+    /// A marker naming something else is corruption, not delivery, and is
+    /// raised rather than answered either way: nothing may read a delivery out
+    /// of a file that does not describe this projection.
+    fn gh_marker_settled(
+        &self,
+        set: GhMarkerSet,
+        origin: &GhOrigin,
+        completion_id: &str,
+    ) -> Result<bool, ProducerError> {
+        let marker_path = self.gh_marker_path(set, origin, completion_id);
+        if !path_lexists(&marker_path)? {
+            return Ok(false);
+        }
+        let marker: GhCompletionMarker =
+            serde_json::from_slice(&read_bounded_regular(&marker_path, 64 * 1024)?)?;
+        if marker.completion_id != completion_id
+            || marker.producer != origin.producer
+            || marker.source != origin.source
+            || marker.item_id != origin.node_id
+        {
+            return Err(ProducerError::InvalidObservation(format!(
+                "{} marker {} does not match its identity",
+                set.label,
+                marker_path.display()
+            )));
+        }
+        Ok(true)
     }
 
     fn complete_gh_with_id(

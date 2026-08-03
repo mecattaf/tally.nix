@@ -8,6 +8,59 @@ authorized.
 
 ### Fixed
 
+- **The orphaned-projection sweep no longer declares a delivered projection
+  lost, and retracts the records that said so (#372 repair).** The startup
+  sweep decided orphan-ness from `config.producers` alone. It never consulted
+  the `producers/gh-completed/` idempotency marker — the durable proof that a
+  projection reached the forge — so on the first start after a producer was
+  retired it named *every* completed GitHub row of that producer still in the
+  recovery plan, back to the `events/done` horizon, as "the forge-side
+  projection is lost". The live storage-warning path had the same inversion:
+  `post_storage_warning_once` resolved the producer on its first line, above
+  its own marker check, so a receipt already on the forge was orphaned too.
+
+  This was wrong in the reassuring direction — the operator was told more was
+  lost than was lost — and it wrote the false claim to the strongest surface in
+  the tree, as a hash-chained `projection-orphaned` attestation carrying
+  `retryAuthority: "terminal-no-retry"`. The live completion path never had the
+  bug: `complete_gh_once_with_completion` reads the marker before it resolves
+  the producer. Both paths now take that ordering, through one shared marker
+  lookup. A record written under the old reading is withdrawn on the first
+  start after this change, and because an append-only chain cannot be edited,
+  the claim it stood on is answered with a `projection-orphan-retracted`
+  attestation naming the same identity rather than quietly dropped.
+
+  Three consequences of the same repair:
+
+  - Whether a claim has been witnessed is now decided by the attestation chain
+    rather than by the presence of the record file. That closes two states the
+    old flag could not reach: a record written by an observation that died
+    before it could append was never witnessed by any later one, and a record
+    collected by retention and re-derived on a later start would have been
+    witnessed twice.
+  - `producers/gh-orphaned/` joins `PRODUCER_MARKER_DIRECTORIES`, so `tally gc`
+    collects it at `retention.producerMarkerHorizon` like every other
+    per-dispatch `producers/` set. A record can only reach that age after the
+    acknowledged event it describes has left `events/done`, and a collected
+    record therefore does not come back. The Nix option documentation and the
+    retention table name the fifth directory.
+  - A producer *replaced* by one of another kind under the same name is
+    terminal too. `KindMismatch` says exactly what `UnknownProducer` says —
+    this configuration cannot produce a GitHub projection for this origin, and
+    only an operator edit changes a configuration — so it took the same
+    terminal outcome instead of the same forever-retry the issue was filed
+    about. `Mutation`, `Io`, and torn-marker failures remain retryable.
+
+- **`tally producer orphaned` and the startup report no longer go silent on one
+  unreadable record (#372 repair).** Both read the whole directory and stop at
+  the first file they cannot parse, discarding what they had already read, so a
+  single record from a newer schema — the realistic trigger is a package
+  rollback — hid every readable record and made the command the daemon's own
+  log line advertises exit 1. The pass now accumulates: unusable files are
+  reported by path and reason beside the usable ones, in the report and under
+  an `unreadable` key in the JSON, which is the discipline `UnitFactFailures`
+  already established for the recovery sweep.
+
 - **A post-ack forge projection whose producer has been removed is now terminal
   instead of retrying forever (#372).** Removing a producer block is documented
   operator work — the wave-3 close-out instructed exactly that for a retired

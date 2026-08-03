@@ -31,7 +31,7 @@ use completion::{
     finalize_forced_locked, forced_witness, lock_gcroot_registration, release_child_charge,
     substituted_witness, GhTerminalWork, TerminalWork,
 };
-use completion::{append_orphan_attestation, gh_completion_id};
+use completion::{append_orphan_attestation, append_orphan_retraction, gh_completion_id};
 pub(crate) use notify::watchdog_tick;
 use rpc::control::{find_job, lease_request, lease_wire, state_name};
 #[cfg(test)]

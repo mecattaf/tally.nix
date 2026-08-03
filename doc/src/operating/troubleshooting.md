@@ -530,29 +530,55 @@ duplicate side effects, which is why tally stops there.
 
 ## Orphaned forge projection
 
-Retiring a producer means deleting its block from the configuration. Tasks it
-already admitted are already settled and witnessed, but their post-ack forge
-projection — the COMPLETED comment, the close, the storage-warning receipt —
-cannot be resolved without the producer that owns it. The daemon declares that
-projection terminal instead of retrying it:
+Retiring a producer means deleting its block from the configuration, or
+repointing its name at a producer of another kind. Tasks it already admitted
+are already settled and witnessed, but a post-ack forge projection it still
+owes — the COMPLETED comment, the close, the storage-warning receipt — cannot
+be resolved without the producer. The daemon declares that projection terminal
+instead of retrying it:
 
 ```text
 tally: post-ack GitHub COMPLETED mutation for <TASK-UUID> is orphaned and will not retry: unknown producer "<NAME>". List every orphaned projection with: tally producer orphaned --state-dir <STATE-DIR>
 ```
 
-Each one is recorded under `<stateDir>/producers/gh-orphaned/`, witnessed once
-on the advisory attestation chain as `projection-orphaned`, and reported as a
-set on every daemon start rather than one line per projection per minute:
+A projection that already reached the forge is never in that set. Its
+`producers/gh-completed/` (or `producers/gh-storage-warnings/`) idempotency
+marker is the durable proof of delivery, and every path that can record an
+orphan reads that marker before it reads the configuration. Reporting a
+delivered projection as lost would be wrong in the reassuring direction, on the
+strongest claim surface in the tree.
+
+Each orphaned projection is recorded under `<stateDir>/producers/gh-orphaned/`,
+witnessed once on the advisory attestation chain as `projection-orphaned`, and
+reported as a set on every daemon start rather than one line per projection per
+minute:
 
 ```console
 $ tally producer orphaned --state-dir <STATE-DIR> | jq '.count, .projections[].taskUuid'
 ```
 
+The command reads the state directory alone — the configuration no longer names
+the producer — and one unreadable record file is listed under `unreadable`
+beside the readable ones rather than replacing the whole answer.
+
 Nothing is owed. Only the forge-side projection was lost, which is the honest
 consequence of retiring the producer, and the task outcome itself is unchanged.
-If the removal was a mistake, restore the producer block and start the daemon
-again: the population is re-derived from the configuration on every start, so
-the projection is applied after all and its record clears itself.
+There are two ways an entry leaves the report:
+
+- **Restore the producer.** If the removal or the kind change was a mistake,
+  put the block back and start the daemon again. The orphaned set is re-derived
+  from the effective configuration and the markers on every start, so the
+  projection is applied after all, its record clears itself, and its claim is
+  retracted on the attestation chain as `projection-orphan-retracted`.
+- **Let it retire.** `tally gc` collects the records at
+  `retention.producerMarkerHorizon`, the same envelope as the other
+  `producers/` marker sets. A record can only reach that age after the
+  acknowledged event it describes has aged out of `events/done`, and once that
+  event is gone no recovery plan re-derives the projection, so a collected
+  record does not come back. Removing the directory by hand is safe — nothing
+  reads it to decide behaviour — but a projection that is still orphaned is
+  recorded again on the next start, with a fresh first-seen date and no second
+  attestation.
 
 The strings above are anchored in
 [`daemon.rs`](https://github.com/mecattaf/tally.nix/blob/4c85563/crates/tally-core/src/daemon.rs),

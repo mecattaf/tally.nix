@@ -338,13 +338,24 @@ fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Resul
     // read the record would refuse the one question it answers.
     if let ProducerCommand::Orphaned { state_dir } = command {
         let state_dir = state_dir.map_or_else(default_state_dir, Ok)?;
-        let projections = read_orphaned_projections(&state_dir)?;
+        let scan = read_orphaned_projections(&state_dir)?;
+        // One unusable file must not hide the usable ones. It is named on
+        // stderr and counted in the envelope, and the listing an operator was
+        // told to run still answers.
+        for unreadable in &scan.unreadable {
+            errln!(
+                "tally: orphaned-projection record {} could not be read: {}",
+                unreadable.path.display(),
+                unreadable.detail
+            );
+        }
         outln!(
             "{}",
             serde_json::to_string(&json!({
                 "stateDir": state_dir,
-                "count": projections.len(),
-                "projections": projections,
+                "count": scan.records.len(),
+                "projections": scan.records,
+                "unreadable": scan.unreadable,
             }))?
         );
         return Ok(());

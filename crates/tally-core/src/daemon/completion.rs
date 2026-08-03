@@ -73,13 +73,13 @@ impl DaemonHandler {
                             GhCliMutationSink::with_program(gh_program).with_state_dir(&state_dir);
                         let outcome =
                             engine.project_storage_warning(&origin, &warning, &mut sink)?;
-                        witness_new_orphan(&attestations, &outcome, None, None);
+                        witness_projection_outcome(&attestations, &outcome, None, None);
                         Ok::<_, ProducerError>(outcome)
                     })
                     .await;
                     match posted {
-                        Ok(Ok(GhProjectionOutcome::Settled)) => break,
-                        Ok(Ok(GhProjectionOutcome::Orphaned { record, .. })) => {
+                        Ok(Ok(GhProjectionOutcome::Settled { .. })) => break,
+                        Ok(Ok(GhProjectionOutcome::Orphaned { record })) => {
                             eprintln!(
                                 "tally: GitHub storage-warning receipt {warning_sequence} is \
                                  orphaned and will not retry: {}. List every orphaned projection \
@@ -219,13 +219,18 @@ impl DaemonHandler {
                         },
                         &mut sink,
                     )?;
-                    witness_new_orphan(&attestations, &outcome, Some(attempt), Some(lease_epoch));
+                    witness_projection_outcome(
+                        &attestations,
+                        &outcome,
+                        Some(attempt),
+                        Some(lease_epoch),
+                    );
                     Ok::<_, ProducerError>(outcome)
                 })
                 .await;
                 match completed {
-                    Ok(Ok(GhProjectionOutcome::Settled)) => break,
-                    Ok(Ok(GhProjectionOutcome::Orphaned { record, .. })) => {
+                    Ok(Ok(GhProjectionOutcome::Settled { .. })) => break,
+                    Ok(Ok(GhProjectionOutcome::Orphaned { record })) => {
                         // The completion is settled and witnessed; only the
                         // forge-side projection is lost, and no retry can
                         // change that while the producer is absent.
@@ -685,39 +690,80 @@ pub(super) fn orphan_listing_command(state_dir: &Path) -> String {
     )
 }
 
-/// Witness a newly recorded orphan on the advisory attestation chain.
+pub(super) const ORPHANED_ATTESTATION_KIND: &str = "projection-orphaned";
+pub(super) const ORPHAN_RETRACTED_ATTESTATION_KIND: &str = "projection-orphan-retracted";
+
+/// Witness the terminal outcome of one projection on the advisory chain.
 ///
-/// Only the first observation appends: a restart re-derives the same terminal
-/// outcome and must not turn a one-line-per-minute log drip into a
-/// one-record-per-restart ledger drip.
-pub(super) fn witness_new_orphan(
+/// An orphan is witnessed once per identity and a retraction once per
+/// identity, and both are decided by asking the chain rather than by asking
+/// the record file. That is deliberate. Deriving "already witnessed" from the
+/// record file made two states unreachable: a record written by an observation
+/// that then died before appending could never be witnessed afterwards, and a
+/// record collected by retention and re-derived on a later start would be
+/// witnessed twice. The chain is the thing the claim lives on, so the chain is
+/// what is asked.
+pub(super) fn witness_projection_outcome(
     attestations: &Arc<std::sync::Mutex<SharedAttestations>>,
     outcome: &GhProjectionOutcome,
     attempt: Option<u32>,
     lease_epoch: Option<u64>,
 ) {
-    let GhProjectionOutcome::Orphaned { record, first } = outcome else {
-        return;
-    };
-    if !*first {
-        return;
-    }
     let mut attestations = attestations
         .lock()
         .expect("attestation ledger lock poisoned");
-    if let Err(error) = append_orphan_attestation(&mut attestations, record, attempt, lease_epoch) {
+    let appended = match outcome {
+        GhProjectionOutcome::Orphaned { record } => {
+            append_orphan_attestation(&mut attestations, record, attempt, lease_epoch)
+        }
+        GhProjectionOutcome::Settled {
+            retracted: Some(record),
+        } => append_orphan_retraction(&mut attestations, record, attempt, lease_epoch),
+        GhProjectionOutcome::Settled { retracted: None } => Ok(()),
+    };
+    if let Err(error) = appended {
+        // Not fatal, and not lost either: the next observation of the same
+        // projection asks the chain again and appends what is still missing.
         eprintln!("tally: orphaned-projection attestation failed: {error}");
     }
 }
 
+/// Append the terminal claim for one orphaned projection, unless the chain
+/// already carries it.
 pub(super) fn append_orphan_attestation(
     attestations: &mut SharedAttestations,
     record: &OrphanedProjection,
     attempt: Option<u32>,
     lease_epoch: Option<u64>,
 ) -> Result<(), WitnessError> {
-    let mut payload = json!({
-        "kind": "projection-orphaned",
+    let mut payload = orphan_attestation_payload(ORPHANED_ATTESTATION_KIND, record);
+    payload["retryAuthority"] = Value::from("terminal-no-retry");
+    append_orphan_payload(attestations, record, payload, attempt, lease_epoch)
+}
+
+/// Append the retraction of a claim this tree has been shown to have made
+/// wrongly.
+///
+/// The chain is append-only, so a false claim cannot be erased; the only
+/// honest correction is a later record naming the same identity. This fires
+/// when a projection that was recorded as orphaned turns out to have reached
+/// the forge after all — which is exactly what an estate carrying records
+/// written before the idempotency marker was consulted will find.
+pub(super) fn append_orphan_retraction(
+    attestations: &mut SharedAttestations,
+    record: &OrphanedProjection,
+    attempt: Option<u32>,
+    lease_epoch: Option<u64>,
+) -> Result<(), WitnessError> {
+    let mut payload = orphan_attestation_payload(ORPHAN_RETRACTED_ATTESTATION_KIND, record);
+    payload["retracts"] = Value::from(ORPHANED_ATTESTATION_KIND);
+    payload["reason"] = Value::from("projection-settled");
+    append_orphan_payload(attestations, record, payload, attempt, lease_epoch)
+}
+
+fn orphan_attestation_payload(kind: &str, record: &OrphanedProjection) -> Value {
+    json!({
+        "kind": kind,
         "schemaVersion": ORPHANED_PROJECTION_SCHEMA_VERSION,
         "projection": record.kind.as_str(),
         "producer": record.producer,
@@ -726,8 +772,16 @@ pub(super) fn append_orphan_attestation(
         "completionId": record.completion_id,
         "observedAt": record.observed_at,
         "detail": record.detail,
-        "retryAuthority": "terminal-no-retry",
-    });
+    })
+}
+
+fn append_orphan_payload(
+    attestations: &mut SharedAttestations,
+    record: &OrphanedProjection,
+    mut payload: Value,
+    attempt: Option<u32>,
+    lease_epoch: Option<u64>,
+) -> Result<(), WitnessError> {
     if let Some(task_uuid) = &record.task_uuid {
         payload["taskUuid"] = Value::String(task_uuid.clone());
     }
@@ -741,10 +795,34 @@ pub(super) fn append_orphan_attestation(
     if let Some(lease_epoch) = lease_epoch {
         payload["leaseEpoch"] = Value::from(lease_epoch);
     }
-    attestations
-        .ledger()
-        .and_then(|ledger| ledger.append(payload))
-        .map(|_| ())
+    let kind = payload["kind"]
+        .as_str()
+        .expect("payload kind is set by the caller")
+        .to_owned();
+    let ledger = attestations.ledger()?;
+    if chain_carries_projection_claim(ledger.records()?, &kind, record) {
+        return Ok(());
+    }
+    attestations.ledger()?.append(payload).map(|_| ())
+}
+
+/// Whether the chain already carries a claim of this kind for this exact
+/// projection identity.
+fn chain_carries_projection_claim(
+    records: &[crate::witness::AttestationRecord],
+    kind: &str,
+    record: &OrphanedProjection,
+) -> bool {
+    records.iter().any(|attested| {
+        let payload = &attested.payload;
+        payload.get("kind").and_then(Value::as_str) == Some(kind)
+            && payload.get("projection").and_then(Value::as_str) == Some(record.kind.as_str())
+            && payload.get("producer").and_then(Value::as_str) == Some(record.producer.as_str())
+            && payload.get("source").and_then(Value::as_str) == Some(record.source.as_str())
+            && payload.get("itemId").and_then(Value::as_str) == Some(record.item_id.as_str())
+            && payload.get("completionId").and_then(Value::as_str)
+                == Some(record.completion_id.as_str())
+    })
 }
 
 async fn wait_for_cancellation(receiver: &mut broadcast::Receiver<Uuid>, job_id: Uuid) {
