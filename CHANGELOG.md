@@ -8,6 +8,35 @@ authorized.
 
 ### Fixed
 
+- **A post-ack forge projection whose producer has been removed is now terminal
+  instead of retrying forever (#372).** Removing a producer block is documented
+  operator work — the wave-3 close-out instructed exactly that for a retired
+  campaign — but the projections admitted under it had no defined fate. Their
+  worker resolved the producer from the effective configuration, failed with
+  `unknown producer "<name>"`, and retried at a one-minute ceiling
+  indefinitely: five completed tasks on the coordinator estate produced 170 log
+  lines in 30 minutes and would have produced them until the daemon was
+  restarted, and then again after it.
+
+  Nothing was ever in doubt about those tasks. The completion is settled and
+  witnessed; only the forge-side projection is owed, and it can never be paid
+  while the producer is gone. That is now said once, in a defined state:
+  `unknown producer` yields a terminal `projection-orphaned` outcome, recorded
+  under `<stateDir>/producers/gh-orphaned/` and witnessed once on the advisory
+  attestation chain. Every other failure — a forge outage, a rate limit — is
+  unchanged and still retried. Storage-warning receipts, orphaned by the same
+  removal, take the same path.
+
+  The set is reported in one pass at daemon start rather than discovered one
+  line per projection per minute, and `tally producer orphaned --state-dir
+  <PATH>` lists it at any time. That command reads the state directory alone,
+  because the situation it describes is precisely one in which the
+  configuration no longer names the producer. Nothing consults the records to
+  decide what to do: the population is re-derived from the configuration on
+  every start, so restoring a mistakenly removed producer block projects the
+  completion after all and each stale record clears itself when its projection
+  settles.
+
 - **The unit-exit migration no longer advertises a repair it cannot perform, and
   no longer answers "clean" for a directory holding no durable rows
   (#371 repair).** Both defects had the same effect: an operator follows the

@@ -187,3 +187,96 @@ fn one_shot_test_is_read_only_and_reports_the_resolved_synthetic_trigger() {
     assert_eq!(std::fs::read_dir(&live_events).unwrap().count(), 1);
     assert!(!live_state.join("producers/gh-triggers").exists());
 }
+
+/// The orphaned-projection report names this command, so the command has to
+/// answer for real — including when the configuration no longer mentions the
+/// producer at all, which is the only situation in which it is ever run.
+#[test]
+fn orphaned_lists_every_recorded_projection_without_a_configuration() {
+    use std::collections::BTreeMap;
+
+    use tally_core::producers::{
+        OrphanedProjection, OrphanedProjectionKind, ProducerEngine,
+        ORPHANED_PROJECTION_SCHEMA_VERSION,
+    };
+    use tally_core::witness::Verdict;
+
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    // The registry is empty exactly as it is after a retired campaign's
+    // producer block is deleted.
+    let registry = BTreeMap::new();
+    let engine = ProducerEngine::new(
+        &registry,
+        state_dir.join("events"),
+        &state_dir,
+        temp.path().join("data"),
+    );
+    for (index, task) in [
+        "1514ece1-0000-4000-8000-000000000001",
+        "996a384d-0000-4000-8000-000000000002",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        assert!(engine
+            .record_orphaned_projection(&OrphanedProjection {
+                schema_version: ORPHANED_PROJECTION_SCHEMA_VERSION,
+                kind: OrphanedProjectionKind::Completion,
+                producer: "campaign-crm".to_owned(),
+                source: "notifications".to_owned(),
+                item_id: format!("I_retired_{index}"),
+                completion_id: format!("{task}:1:{index}"),
+                task_uuid: Some(task.to_owned()),
+                verdict: Some(Verdict::Pass),
+                observed_at: "2026-08-03T09:00:00.000Z".to_owned(),
+                detail: "unknown producer \"campaign-crm\"".to_owned(),
+            })
+            .unwrap());
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["producer", "orphaned", "--state-dir"])
+        .arg(&state_dir)
+        // No `--config`: the point of the command is that the configuration
+        // has stopped naming the producer.
+        .env("HOME", temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(listed["count"], 2);
+    assert_eq!(listed["stateDir"], state_dir.to_str().unwrap());
+    let projections = listed["projections"].as_array().unwrap();
+    assert_eq!(projections.len(), 2);
+    assert_eq!(projections[0]["producer"], "campaign-crm");
+    assert_eq!(projections[0]["kind"], "completion");
+    assert_eq!(projections[0]["itemId"], "I_retired_0");
+    assert_eq!(
+        projections[0]["taskUuid"],
+        "1514ece1-0000-4000-8000-000000000001"
+    );
+    assert_eq!(projections[0]["verdict"], "pass");
+    assert_eq!(projections[1]["itemId"], "I_retired_1");
+
+    // An untouched estate answers the same question with an empty set rather
+    // than an error about a missing directory.
+    let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["producer", "orphaned", "--state-dir"])
+        .arg(temp.path().join("never-used"))
+        .env("HOME", temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(listed["count"], 0);
+    assert_eq!(listed["projections"].as_array().unwrap().len(), 0);
+}

@@ -3809,6 +3809,230 @@ mod tests {
             .await;
     }
 
+    fn orphan_attestations(paths: &DaemonPaths) -> Vec<Value> {
+        let path = paths.attestations_path();
+        if !path.exists() {
+            return Vec::new();
+        }
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|record| record["payload"]["kind"] == "projection-orphaned")
+            .collect()
+    }
+
+    /// Removing a producer block is documented operator work, and the
+    /// projections admitted under it used to retry every 60 s forever because
+    /// resolution failed locally and nothing ever declared the attempt over.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_post_ack_projection_for_a_removed_producer_is_terminal_not_retried_forever() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                initialize_final_witness_state(&paths);
+                // The producer block that admitted this task is gone from the
+                // effective configuration, exactly as retiring a campaign
+                // leaves it.
+                let config = one_pool_config();
+                assert!(config.producers.is_empty());
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                // Resolution fails before any forge call, so a `gh` that would
+                // fail loudly if reached proves no API traffic is spent.
+                daemon.handler.gh_program = temp.path().join("absent-gh");
+
+                let mut row = durable_row(Uuid::new_v4(), "gh:retired:item-1", 1);
+                row.source = EnqueueSource::Gh;
+                row.adapter = "codex".to_owned();
+                row.gh_origin = Some(gh_test_origin("item-1", GhItemType::Issue));
+                let result = JobResult {
+                    task_uuid: Some(row.uuid.to_string()),
+                    task_ref: None,
+                    job_id: row.uuid.to_string(),
+                    verdict: Verdict::Pass,
+                    exit_code: 0,
+                    artifact_content_hash: Some("sha256:artifact".to_owned()),
+                    attempt: 1,
+                    lease_epoch: 1,
+                    witness_seq: 9,
+                    model: None,
+                    completion: None,
+                    stderr_excerpt: None,
+                };
+
+                daemon
+                    .handler
+                    .complete_gh_post_ack(row.clone(), result.clone());
+                // The bounded wait is the whole assertion: before the terminal
+                // outcome this worker never finished, so draining it hung.
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    daemon.handler.drain_post_ack_tasks(),
+                )
+                .await
+                .expect("a projection whose producer is gone must reach a terminal state");
+
+                let recorded = read_orphaned_projections(&paths.state_dir).unwrap();
+                assert_eq!(recorded.len(), 1);
+                assert_eq!(recorded[0].producer, "github");
+                assert_eq!(recorded[0].kind, OrphanedProjectionKind::Completion);
+                assert_eq!(recorded[0].task_uuid.as_deref(), Some(row.uuid.to_string()).as_deref());
+                assert_eq!(recorded[0].completion_id, format!("{}:1:9", row.uuid));
+                assert_eq!(recorded[0].verdict, Some(Verdict::Pass));
+                assert_eq!(recorded[0].detail, "unknown producer \"github\"");
+
+                let witnessed = orphan_attestations(&paths);
+                assert_eq!(witnessed.len(), 1);
+                assert_eq!(witnessed[0]["payload"]["taskUuid"], row.uuid.to_string());
+                assert_eq!(witnessed[0]["payload"]["producer"], "github");
+                assert_eq!(witnessed[0]["payload"]["verdict"], "pass");
+                assert_eq!(witnessed[0]["payload"]["attempt"], 1);
+                assert_eq!(witnessed[0]["payload"]["retryAuthority"], "terminal-no-retry");
+
+                // Re-driving the same projection re-derives the same terminal
+                // outcome without a second record or a second witness.
+                daemon.handler.complete_gh_post_ack(row, result);
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    daemon.handler.drain_post_ack_tasks(),
+                )
+                .await
+                .expect("the repeat observation is terminal too");
+                assert_eq!(read_orphaned_projections(&paths.state_dir).unwrap(), recorded);
+                assert_eq!(orphan_attestations(&paths).len(), 1);
+            })
+            .await;
+    }
+
+    /// The condition is permanent, so it is reported as a set at startup
+    /// rather than discovered one log line per projection per minute.
+    #[tokio::test(flavor = "current_thread")]
+    async fn startup_reports_every_orphaned_projection_at_once_and_drives_none() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                prepare_paths(&paths).unwrap();
+                let mut ledger = WitnessLedger::open(paths.witness_path()).unwrap();
+                let mut rows = Vec::new();
+                for index in 0..3_u32 {
+                    let mut row = durable_row(
+                        Uuid::new_v4(),
+                        &format!("gh:retired:item-{index}"),
+                        1,
+                    );
+                    let gh_origin = gh_test_origin(&format!("item-{index}"), GhItemType::Issue);
+                    row.source = EnqueueSource::Gh;
+                    row.origin = Some(AdmissionOrigin::github("github", gh_origin.clone()));
+                    row.gh_origin = Some(gh_origin);
+                    write_enqueue_event_atomic(
+                        &paths.events_dir(),
+                        &DurableEnqueueEvent::new(row.clone()).unwrap(),
+                    )
+                    .unwrap();
+                    ledger
+                        .append(WitnessBody {
+                            task_uuid: Some(row.uuid.to_string()),
+                            transition_timestamp: Utc::now()
+                                .to_rfc3339_opts(SecondsFormat::Millis, true),
+                            verdict: Verdict::Pass,
+                            exit_code: 0,
+                            artifact_content_hash: Some(format!("sha256:{:064x}", index)),
+                            store_paths: None,
+                            drv: None,
+                            gpu_seconds: None,
+                            wall_clock: 0.0,
+                            attempt: 1,
+                            lease_epoch: 1,
+                            dedup_key: row.dedup_key.clone(),
+                            payload_hash: row.payload_hash.clone(),
+                            brief_hash: row.brief_hash.clone(),
+                            origin: AdmissionOrigin::direct(EnqueueSource::Gh),
+                            orchestration: row.orchestration.clone(),
+                            labor_class: LaborClass::Fresh,
+                            trace_ref: None,
+                            pools: vec!["slot".to_owned()],
+                            executor: None,
+                            host_id: None,
+                            charge: None,
+                            model: None,
+                            evidence_class: None,
+                            manifest_hash: None,
+                            completion: None,
+                            result_revision: None,
+                            authorship: None,
+                            authorship_sessions: None,
+                        })
+                        .unwrap();
+                    rows.push(row);
+                }
+                drop(ledger);
+
+                let open = || {
+                    let executor = direct_executor(&paths.state_dir)
+                        .with_systemd_run(temp.path().join("absent-systemd-run"))
+                        .with_unit_probe(ExitFileProbe);
+                    Daemon::open_with_executor(
+                        one_pool_config(),
+                        paths.clone(),
+                        settings(),
+                        executor,
+                    )
+                };
+                let daemon = open().await.unwrap();
+                // Not one retry worker is spawned for a projection that can
+                // never be applied.
+                assert!(daemon.initial_gh_completions.is_empty());
+                drop(daemon);
+
+                let recorded = read_orphaned_projections(&paths.state_dir).unwrap();
+                assert_eq!(recorded.len(), 3);
+                let report = OrphanedProjections {
+                    records: recorded.clone(),
+                    state_dir: paths.state_dir.clone(),
+                }
+                .to_string();
+                for row in &rows {
+                    assert!(report.contains(&row.uuid.to_string()), "{report}");
+                }
+                assert!(report.contains("unknown producer \"github\""), "{report}");
+                assert!(
+                    report.contains(&format!(
+                        "tally producer orphaned --state-dir {}",
+                        paths.state_dir.display()
+                    )),
+                    "{report}"
+                );
+                assert_eq!(orphan_attestations(&paths).len(), 3);
+
+                // A restart re-derives the same set from the configuration and
+                // neither duplicates the records nor re-witnesses them.
+                let daemon = open().await.unwrap();
+                assert!(daemon.initial_gh_completions.is_empty());
+                drop(daemon);
+                assert_eq!(read_orphaned_projections(&paths.state_dir).unwrap(), recorded);
+                assert_eq!(orphan_attestations(&paths).len(), 3);
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn acceptance_24_7_producer_origin_survives_restart_and_joins_inventory() {
         let local = LocalSet::new();

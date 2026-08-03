@@ -796,6 +796,15 @@ pub(super) enum ProducerCommand {
         #[arg(long, value_name = "PATH")]
         data_dir: Option<PathBuf>,
     },
+    /// List every forge projection whose producer is no longer configured.
+    ///
+    /// These are terminal: the task completions are settled and witnessed, and
+    /// only the forge-side projection was lost. Reading them needs the state
+    /// directory alone — the configuration no longer names the producer.
+    Orphaned {
+        #[arg(long, value_name = "PATH")]
+        state_dir: Option<PathBuf>,
+    },
     Test {
         name: String,
         #[arg(long)]
