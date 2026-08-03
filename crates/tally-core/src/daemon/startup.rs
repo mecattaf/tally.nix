@@ -350,6 +350,7 @@ impl Daemon {
             git_ai: config.git_ai.clone(),
             exec_attestations: config.attestations.exec.enable,
             attestations: Arc::new(std::sync::Mutex::new(attestations)),
+            flow_lineage_cache: Rc::new(RefCell::new(None)),
         };
         Ok(Self {
             _state_lock: state_lock,

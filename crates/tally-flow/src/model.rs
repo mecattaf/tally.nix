@@ -941,7 +941,9 @@ impl ClientError {
             | "catalog-history-conflict"
             | "script-changed-mid-run"
             | "args-changed-mid-run"
-            | "catalog-changed-mid-run" => "FlowReplayError",
+            | "catalog-changed-mid-run"
+            | "flow-run-superseded" => "FlowReplayError",
+            "flow-lineage-unusable" | "flow-lineage-conflict" => "FlowLineageError",
             _ => "FlowClientError",
         };
         let mut error = FlowError::new(name, self.code, self.message)
@@ -954,6 +956,8 @@ impl ClientError {
                     | "script-changed-mid-run"
                     | "args-changed-mid-run"
                     | "catalog-changed-mid-run"
+                    | "flow-run-superseded"
+                    | "flow-lineage-unusable"
             ) {
                 if let Value::Object(details) = details {
                     error.details.extend(details);
@@ -964,6 +968,10 @@ impl ClientError {
                 error = error.detail("client", details);
             }
         }
-        error
+        // The same wire code must carry the same recovery facts whether it was
+        // raised by the runner's own startup scan or handed back by the daemon
+        // mid-run. Stamping here covers every code that reaches a script
+        // through the client boundary.
+        crate::error::with_recovery_facts(error)
     }
 }

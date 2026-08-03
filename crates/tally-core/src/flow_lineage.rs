@@ -18,7 +18,8 @@
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use chrono::{SecondsFormat, Utc};
@@ -29,6 +30,38 @@ use uuid::Uuid;
 
 pub const FLOW_LINEAGE_SCHEMA_VERSION: u32 = 1;
 pub const FLOW_LINEAGE_FILE: &str = "flow-lineage.jsonl";
+
+/// Newest records kept when the ledger is compacted on append.
+///
+/// The bound exists because a declarative estate retires one run per work item
+/// per activation: a 3,000-item worklist on a daily cadence writes ~1.1 M
+/// records a year, and the file is read whole. Compaction is safe here for the
+/// reason stated at the top of this module — this is an index, not a proof
+/// chain — and it drops the *oldest* generations, whose runs are long past any
+/// possibility of replay. Shaped after `changes.jsonl`'s count bound rather
+/// than inventing a new retention mechanism.
+pub const FLOW_LINEAGE_MAX_RECORDS: usize = 100_000;
+
+/// One canonical rendering for a run ID: hyphenated, lowercase.
+///
+/// `Uuid::parse_str` also accepts upper case, the unhyphenated simple form, and
+/// the braced form. Each of those is a *different* `String` key, so storing the
+/// caller's raw spelling would let a rollover be recorded against a run nobody
+/// ever replays — the exact silent-no-op this whole mechanism exists to
+/// eliminate. Every write and every lookup goes through here.
+pub fn canonical_flow_run_id(value: &str) -> Result<String, FlowLineageError> {
+    Uuid::parse_str(value)
+        .map(|uuid| uuid.hyphenated().to_string())
+        .map_err(|_| FlowLineageError::Invalid(format!("{value:?} is not a UUID")))
+}
+
+/// The lookup key for a possibly non-canonical run ID.
+///
+/// A value that is not a UUID cannot name a flow run at all, so it keys to
+/// itself and simply matches nothing.
+fn lookup_key(value: &str) -> String {
+    canonical_flow_run_id(value).unwrap_or_else(|_| value.to_owned())
+}
 
 /// Why a run was abandoned in favour of a successor.
 ///
@@ -197,6 +230,48 @@ fn durable_parent(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
+/// Decode every complete record in the ledger, ignoring a torn final line.
+///
+/// Returns the `(line number, record)` pairs and whether a torn tail was seen,
+/// so the write path can physically truncate what the read path merely skips.
+fn read_records(
+    path: &Path,
+) -> Result<(Vec<(usize, FlowSupersedeRecord)>, bool), FlowLineageError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), false))
+        }
+        Err(error) => return Err(io_error(path, error)),
+    };
+    let torn = !bytes.is_empty() && bytes.last() != Some(&b'\n');
+    let complete = if torn {
+        bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1)
+    } else {
+        bytes.len()
+    };
+    let mut records = Vec::new();
+    for (index, line) in BufReader::new(&bytes[..complete]).lines().enumerate() {
+        let line = line.map_err(|source| io_error(path, source))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let malformed = |reason: String| FlowLineageError::Malformed {
+            path: path.to_owned(),
+            line: index + 1,
+            reason,
+        };
+        let record: FlowSupersedeRecord =
+            serde_json::from_str(&line).map_err(|error| malformed(error.to_string()))?;
+        record.validate().map_err(malformed)?;
+        records.push((index + 1, record));
+    }
+    Ok((records, torn))
+}
+
 /// An in-memory index over the append-only ledger.
 #[derive(Debug, Clone, Default)]
 pub struct FlowLineage {
@@ -206,45 +281,36 @@ pub struct FlowLineage {
 
 impl FlowLineage {
     /// Read the ledger. A ledger that does not exist yet is an empty lineage.
+    ///
+    /// An unterminated final line is an interrupted append — a crash, a power
+    /// loss, or a short write under ENOSPC — and is ignored, as the attestation
+    /// chain already does with its own torn tail. A *complete* record that is
+    /// unusable is still a hard failure: skipping it could resurrect a run an
+    /// operator durably retired, which is the one outcome this store exists to
+    /// prevent. Repair is one line out of a plain JSONL index, documented in
+    /// the troubleshooting chapter.
     pub fn read(path: &Path) -> Result<Self, FlowLineageError> {
-        let file = match File::open(path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(Self::default())
-            }
-            Err(error) => return Err(io_error(path, error)),
-        };
+        let (records, _) = read_records(path)?;
         let mut lineage = Self::default();
-        for (index, line) in BufReader::new(file).lines().enumerate() {
-            let line = line.map_err(|source| io_error(path, source))?;
-            if line.trim().is_empty() {
-                continue;
-            }
-            let record: FlowSupersedeRecord =
-                serde_json::from_str(&line).map_err(|error| FlowLineageError::Malformed {
-                    path: path.to_owned(),
-                    line: index + 1,
-                    reason: error.to_string(),
-                })?;
-            record
-                .validate()
-                .map_err(|reason| FlowLineageError::Malformed {
-                    path: path.to_owned(),
-                    line: index + 1,
-                    reason,
-                })?;
+        for (line, record) in records {
             lineage
                 .insert(record)
                 .map_err(|reason| FlowLineageError::Malformed {
                     path: path.to_owned(),
-                    line: index + 1,
+                    line,
                     reason,
                 })?;
         }
         Ok(lineage)
     }
 
-    fn insert(&mut self, record: FlowSupersedeRecord) -> Result<(), String> {
+    fn insert(&mut self, mut record: FlowSupersedeRecord) -> Result<(), String> {
+        // Read-side canonicalization absorbs a record written before run IDs
+        // were canonicalized on the way in, so a pre-repair ledger entry in an
+        // upper-case or unhyphenated rendering still answers the lookup the
+        // runner actually makes.
+        record.flow_run_id = lookup_key(&record.flow_run_id);
+        record.successor_flow_run_id = lookup_key(&record.successor_flow_run_id);
         if let Some(existing) = self.by_predecessor.get(&record.flow_run_id) {
             return Err(format!(
                 "flow run {} is already superseded by {}",
@@ -272,19 +338,19 @@ impl FlowLineage {
     /// The record that made `flow_run_id` terminal, if any.
     #[must_use]
     pub fn superseded_by(&self, flow_run_id: &str) -> Option<&FlowSupersedeRecord> {
-        self.by_predecessor.get(flow_run_id)
+        self.by_predecessor.get(&lookup_key(flow_run_id))
     }
 
     /// The record naming `flow_run_id` as a successor, if any.
     #[must_use]
     pub fn supersedes(&self, flow_run_id: &str) -> Option<&FlowSupersedeRecord> {
-        self.by_successor.get(flow_run_id)
+        self.by_successor.get(&lookup_key(flow_run_id))
     }
 
     /// The whole generation chain, oldest first. Always contains `flow_run_id`.
     #[must_use]
     pub fn chain(&self, flow_run_id: &str) -> Vec<String> {
-        let mut root = flow_run_id.to_owned();
+        let mut root = lookup_key(flow_run_id);
         let mut guard = 0_usize;
         while let Some(record) = self.by_successor.get(&root) {
             root = record.flow_run_id.clone();
@@ -307,17 +373,17 @@ impl FlowLineage {
 
     #[must_use]
     pub fn view(&self, flow_run_id: &str) -> FlowLineageView {
-        let chain = self.chain(flow_run_id);
-        let current = chain
-            .last()
-            .cloned()
-            .unwrap_or_else(|| flow_run_id.to_owned());
+        let key = lookup_key(flow_run_id);
+        let chain = self.chain(&key);
+        let current = chain.last().cloned().unwrap_or_else(|| key.clone());
         FlowLineageView {
             schema_version: FLOW_LINEAGE_SCHEMA_VERSION,
-            flow_run_id: flow_run_id.to_owned(),
-            superseded: self.by_predecessor.contains_key(flow_run_id),
-            superseded_by: self.by_predecessor.get(flow_run_id).cloned(),
-            supersedes: self.by_successor.get(flow_run_id).cloned(),
+            // The view echoes the canonical rendering, never the caller's, so
+            // two spellings of one run cannot read as two runs.
+            flow_run_id: key.clone(),
+            superseded: self.by_predecessor.contains_key(&key),
+            superseded_by: self.by_predecessor.get(&key).cloned(),
+            supersedes: self.by_successor.get(&key).cloned(),
             chain,
             current_flow_run_id: current,
         }
@@ -325,7 +391,7 @@ impl FlowLineage {
 
     /// True when superseding `predecessor` with `successor` would close a cycle.
     fn would_cycle(&self, predecessor: &str, successor: &str) -> bool {
-        let mut cursor = successor.to_owned();
+        let mut cursor = lookup_key(successor);
         let mut guard = 0_usize;
         while let Some(record) = self.by_predecessor.get(&cursor) {
             if record.successor_flow_run_id == predecessor {
@@ -351,6 +417,8 @@ impl FlowLineage {
         successor: &str,
         reason: SupersedeReason,
     ) -> Result<Option<&FlowSupersedeRecord>, FlowLineageError> {
+        let predecessor = &canonical_flow_run_id(predecessor)?;
+        let successor = &canonical_flow_run_id(successor)?;
         if predecessor == successor {
             return Err(FlowLineageError::Invalid(
                 "successorFlowRunId must differ from flowRunId".to_owned(),
@@ -402,27 +470,57 @@ pub fn record_supersede(
     reason: SupersedeReason,
     pins: &PredecessorPins,
 ) -> Result<SupersedeOutcome, FlowLineageError> {
-    for (name, value) in [
-        ("flowRunId", predecessor),
-        ("successorFlowRunId", successor),
-    ] {
-        Uuid::parse_str(value)
-            .map_err(|_| FlowLineageError::Invalid(format!("{name} is not a UUID")))?;
-    }
+    record_supersede_bounded(
+        path,
+        predecessor,
+        successor,
+        reason,
+        pins,
+        FLOW_LINEAGE_MAX_RECORDS,
+    )
+}
+
+fn record_supersede_bounded(
+    path: &Path,
+    predecessor: &str,
+    successor: &str,
+    reason: SupersedeReason,
+    pins: &PredecessorPins,
+    max_records: usize,
+) -> Result<SupersedeOutcome, FlowLineageError> {
+    let predecessor = canonical_flow_run_id(predecessor)?;
+    let successor = canonical_flow_run_id(successor)?;
     let parent = durable_parent(path);
     std::fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    let created = !path.exists();
+    // 0600 like `lifecycle.jsonl` and `changes.jsonl`; the contents are not
+    // sensitive, but a data-dir store should not be the one that is world
+    // readable by accident.
     let mut file = OpenOptions::new()
         .create(true)
         .read(true)
         .append(true)
+        .mode(0o600)
         .open(path)
         .map_err(|source| io_error(path, source))?;
     file.lock_exclusive()
         .map_err(|source| io_error(path, source))?;
     // Re-read under the lock: another connection may have recorded the same
-    // rollover between this caller's read and its write.
-    let lineage = FlowLineage::read(path)?;
-    if let Some(existing) = lineage.classify(predecessor, successor, reason)? {
+    // rollover between this caller's read and its write. This also decides the
+    // torn tail — the read path skips an interrupted append, and here, holding
+    // the write lock, it is truncated for good.
+    let (existing_records, torn) = read_records(path)?;
+    let mut lineage = FlowLineage::default();
+    for (line, record) in &existing_records {
+        lineage
+            .insert(record.clone())
+            .map_err(|reason| FlowLineageError::Malformed {
+                path: path.to_owned(),
+                line: *line,
+                reason,
+            })?;
+    }
+    if let Some(existing) = lineage.classify(&predecessor, &successor, reason)? {
         return Ok(SupersedeOutcome {
             ok: true,
             disposition: SupersedeDisposition::Reused,
@@ -431,8 +529,8 @@ pub fn record_supersede(
     }
     let record = FlowSupersedeRecord {
         schema_version: FLOW_LINEAGE_SCHEMA_VERSION,
-        flow_run_id: predecessor.to_owned(),
-        successor_flow_run_id: successor.to_owned(),
+        flow_run_id: predecessor,
+        successor_flow_run_id: successor,
         reason,
         recorded_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
         predecessor_script_hash: pins.script_hash.clone(),
@@ -440,20 +538,94 @@ pub fn record_supersede(
         predecessor_catalog_hash: pins.catalog_hash.clone(),
     };
     record.validate().map_err(FlowLineageError::Invalid)?;
-    let mut line = serde_json::to_vec(&record)
-        .map_err(|error| FlowLineageError::Invalid(error.to_string()))?;
-    line.push(b'\n');
-    file.write_all(&line)
-        .map_err(|source| io_error(path, source))?;
-    file.sync_all().map_err(|source| io_error(path, source))?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| io_error(parent, source))?;
+    if existing_records.len() >= max_records {
+        // Keep the newest `max_records - 1` and let the new record complete the bound.
+        let dropped = existing_records.len() + 1 - max_records;
+        let kept = existing_records
+            .into_iter()
+            .skip(dropped)
+            .map(|(_, record)| record)
+            .chain(std::iter::once(record.clone()))
+            .collect::<Vec<_>>();
+        rewrite_compacted(path, parent, &kept)?;
+    } else {
+        if torn {
+            truncate_torn_tail(&mut file, path)?;
+        }
+        let mut line = serde_json::to_vec(&record)
+            .map_err(|error| FlowLineageError::Invalid(error.to_string()))?;
+        line.push(b'\n');
+        file.write_all(&line)
+            .map_err(|source| io_error(path, source))?;
+        file.sync_all().map_err(|source| io_error(path, source))?;
+    }
+    if created {
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|source| io_error(parent, source))?;
+    }
     Ok(SupersedeOutcome {
         ok: true,
         disposition: SupersedeDisposition::Recorded,
         record,
     })
+}
+
+/// Drop an interrupted final append, keeping every complete record.
+fn truncate_torn_tail(file: &mut File, path: &Path) -> Result<(), FlowLineageError> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|source| io_error(path, source))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|source| io_error(path, source))?;
+    if bytes.is_empty() || bytes.last() == Some(&b'\n') {
+        return Ok(());
+    }
+    let complete = bytes
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |position| position + 1);
+    file.set_len(complete as u64)
+        .map_err(|source| io_error(path, source))?;
+    file.sync_all().map_err(|source| io_error(path, source))
+}
+
+/// Replace the ledger with `kept`, oldest first, through a temporary file.
+///
+/// A concurrent reader without the write lock observes either the whole old
+/// file or the whole new one, never a half-written ledger. Writers are
+/// serialized above this by the daemon: one daemon owns a data directory
+/// (`daemon.lock`) and its RPC loop is single-threaded, so the `flock` this
+/// runs under is defence in depth rather than the mechanism that makes the
+/// rename safe.
+fn rewrite_compacted(
+    path: &Path,
+    parent: &Path,
+    kept: &[FlowSupersedeRecord],
+) -> Result<(), FlowLineageError> {
+    let temporary = path.with_extension("jsonl.compact");
+    let mut bytes = Vec::new();
+    for record in kept {
+        serde_json::to_writer(&mut bytes, record)
+            .map_err(|error| FlowLineageError::Invalid(error.to_string()))?;
+        bytes.push(b'\n');
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|source| io_error(&temporary, source))?;
+    file.write_all(&bytes)
+        .map_err(|source| io_error(&temporary, source))?;
+    file.sync_all()
+        .map_err(|source| io_error(&temporary, source))?;
+    drop(file);
+    std::fs::rename(&temporary, path).map_err(|source| io_error(path, source))?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| io_error(parent, source))
 }
 
 #[cfg(test)]
@@ -612,6 +784,171 @@ mod tests {
             matches!(error, FlowLineageError::Malformed { .. }),
             "{error}"
         );
+    }
+
+    #[test]
+    fn every_valid_uuid_rendering_names_one_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(FLOW_LINEAGE_FILE);
+        // The braced, upper-case rendering on the way in.
+        let recorded = record_supersede(
+            &path,
+            "{00000000-0000-4000-8000-0000000000A1}",
+            "00000000000040008000000000000B2A".to_owned().as_str(),
+            SupersedeReason::GenerationChange,
+            &pins(),
+        )
+        .unwrap();
+        assert_eq!(recorded.disposition, SupersedeDisposition::Recorded);
+        assert_eq!(recorded.record.flow_run_id, A);
+        assert_eq!(
+            recorded.record.successor_flow_run_id,
+            "00000000-0000-4000-8000-000000000b2a"
+        );
+
+        // The hyphenated lower-case rendering the runner actually presents
+        // finds it, and so does the upper-case one an operator might paste.
+        let lineage = FlowLineage::read(&path).unwrap();
+        for rendering in [
+            A,
+            "00000000-0000-4000-8000-0000000000A1",
+            "{00000000-0000-4000-8000-0000000000a1}",
+            "000000000000400080000000000000a1",
+        ] {
+            let view = lineage.view(rendering);
+            assert!(view.superseded, "rendering {rendering} lost its rollover");
+            assert_eq!(view.flow_run_id, A, "rendering {rendering}");
+            assert_eq!(
+                view.current_flow_run_id,
+                "00000000-0000-4000-8000-000000000b2a"
+            );
+        }
+
+        // And the retry in yet another rendering is still the same rollover,
+        // not a second one against a burned successor.
+        let repeated = record_supersede(
+            &path,
+            "00000000-0000-4000-8000-0000000000A1",
+            "00000000-0000-4000-8000-000000000B2A",
+            SupersedeReason::GenerationChange,
+            &PredecessorPins::default(),
+        )
+        .unwrap();
+        assert_eq!(repeated.disposition, SupersedeDisposition::Reused);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().lines().count(),
+            1,
+            "a differently rendered retry must not append a second record"
+        );
+    }
+
+    #[test]
+    fn a_pre_repair_ledger_entry_is_absorbed_on_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(FLOW_LINEAGE_FILE);
+        // Exactly what the merged-but-unrepaired build could write: the
+        // caller's own upper-case spelling stored verbatim.
+        let legacy = FlowSupersedeRecord {
+            schema_version: FLOW_LINEAGE_SCHEMA_VERSION,
+            flow_run_id: "00000000-0000-4000-8000-0000000000A1".to_owned(),
+            successor_flow_run_id: "00000000-0000-4000-8000-0000000000B2".to_owned(),
+            reason: SupersedeReason::GenerationChange,
+            recorded_at: "2026-08-02T00:00:00.000Z".to_owned(),
+            predecessor_script_hash: None,
+            predecessor_args_hash: None,
+            predecessor_catalog_hash: None,
+        };
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string(&legacy).unwrap()),
+        )
+        .unwrap();
+
+        let lineage = FlowLineage::read(&path).unwrap();
+        let view = lineage.view(A);
+        assert!(view.superseded, "the runner's rendering must still match");
+        assert_eq!(view.superseded_by.unwrap().successor_flow_run_id, B);
+        assert_eq!(view.chain, vec![A.to_owned(), B.to_owned()]);
+        // It is one rollover, so re-recording it is a reuse rather than a
+        // conflict against a successor that looks unclaimed.
+        assert_eq!(
+            record_supersede(&path, A, B, SupersedeReason::GenerationChange, &pins())
+                .unwrap()
+                .disposition,
+            SupersedeDisposition::Reused
+        );
+    }
+
+    #[test]
+    fn an_interrupted_append_never_blocks_an_unrelated_run() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(FLOW_LINEAGE_FILE);
+        record_supersede(&path, A, B, SupersedeReason::GenerationChange, &pins()).unwrap();
+        // A crash, a power loss, or a short write under ENOSPC between
+        // `write_all` and `sync_all`.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(br#"{"schemaVersion":1,"flowRunId":"00000000-0000-4000-8"#)
+            .unwrap();
+        drop(file);
+
+        let lineage = FlowLineage::read(&path).expect("a torn tail must not fail the read");
+        assert!(lineage.view(A).superseded);
+        assert!(!lineage.view(C).superseded);
+
+        // The next write cleans it up rather than appending after the debris.
+        record_supersede(&path, B, C, SupersedeReason::ScriptChanged, &pins()).unwrap();
+        let repaired = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(repaired.lines().count(), 2);
+        assert!(repaired.ends_with('\n'));
+        assert_eq!(
+            FlowLineage::read(&path).unwrap().chain(A),
+            vec![A.to_owned(), B.to_owned(), C.to_owned()]
+        );
+    }
+
+    #[test]
+    fn the_ledger_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(FLOW_LINEAGE_FILE);
+        record_supersede(&path, A, B, SupersedeReason::GenerationChange, &pins()).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn the_ledger_compacts_to_its_record_bound() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(FLOW_LINEAGE_FILE);
+        let run = |index: u32| format!("00000000-0000-4000-8000-{index:012}");
+        // A chain long enough to cross a small bound twice over.
+        for index in 0..8_u32 {
+            record_supersede_bounded(
+                &path,
+                &run(index),
+                &run(index + 1),
+                SupersedeReason::GenerationChange,
+                &pins(),
+                5,
+            )
+            .unwrap();
+        }
+        let lines = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(lines.lines().count(), 5, "the bound holds");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "compaction keeps the ledger owner-only"
+        );
+        let lineage = FlowLineage::read(&path).unwrap();
+        // The newest generations survive; the oldest are the ones dropped.
+        assert!(lineage.view(&run(7)).superseded);
+        assert!(!lineage.view(&run(0)).superseded);
+        assert_eq!(lineage.view(&run(7)).current_flow_run_id, run(8));
+        assert_eq!(lineage.chain(&run(8)).len(), 6);
     }
 
     #[test]

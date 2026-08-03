@@ -10311,4 +10311,165 @@ mod tests {
             })
             .await;
     }
+
+    /// The repair's two halves at the daemon boundary: a rollover must name a
+    /// run that exists, and one run must have exactly one key however its ID is
+    /// spelled.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_supersede_refuses_an_unknown_predecessor_and_keys_every_rendering_alike() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let old_run = "00000000-0000-4000-8000-000000000271";
+                let new_run = "00000000-0000-4000-8000-000000000272";
+                let unknown = "00000000-0000-4000-8000-000000000273";
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
+                let supersede = |predecessor: &str, successor: &str| {
+                    client.call(
+                        "flow.supersede",
+                        Some(json!({
+                            "flowRunId": predecessor,
+                            "successorFlowRunId": successor,
+                            "reason": "generation-change"
+                        })),
+                    )
+                };
+
+                // A run that never existed cannot have tripped an identity pin,
+                // so it can never need retiring. It used to answer ok:true.
+                let invented = supersede(unknown, new_run).await.unwrap_err();
+                assert!(
+                    matches!(invented, WireIoError::Rpc(WireErrorCode::NotFound, _, _)),
+                    "{invented:?}"
+                );
+                assert!(
+                    !paths.flow_lineage_path().exists(),
+                    "a refused rollover writes nothing"
+                );
+
+                let mut payload =
+                    fs1_full_payload("flow:rendering:0", &["true"], ["exit:0".to_owned()]);
+                payload["source"] = json!("orchestrator");
+                payload["orchestration"] = json!({
+                    "flowName": "generation-a",
+                    "flowRunId": old_run,
+                    "scriptHash": "sha256:generation-a-script",
+                    "argsHash": "sha256:generation-a-args",
+                    "nodeOrdinal": 0,
+                    "maxNodes": 2
+                });
+                let created = client.call("queue.enqueue", Some(payload)).await.unwrap();
+                assert_eq!(fs1_wait(&client, &created).await["verdict"], "pass");
+
+                // Recorded through an upper-case rendering; stored canonically.
+                let recorded = supersede(&old_run.to_uppercase(), &new_run.to_uppercase())
+                    .await
+                    .unwrap();
+                assert_eq!(recorded["disposition"], "recorded");
+                assert_eq!(recorded["record"]["flowRunId"], old_run);
+                assert_eq!(recorded["record"]["successorFlowRunId"], new_run);
+                // The promised pins are present, not silently omitted.
+                assert_eq!(
+                    recorded["record"]["predecessorScriptHash"],
+                    "sha256:generation-a-script"
+                );
+
+                // The rendering the runner actually presents sees the rollover.
+                for rendering in [old_run.to_owned(), old_run.to_uppercase()] {
+                    let view = client
+                        .call("query.lineage", Some(json!({"flowRun": rendering})))
+                        .await
+                        .unwrap();
+                    assert_eq!(view["superseded"], true, "rendering {rendering}");
+                    assert_eq!(view["flowRunId"], old_run);
+                    assert_eq!(view["currentFlowRunId"], new_run);
+                }
+                let run_view = client
+                    .call("query.run", Some(json!({"id": old_run.to_uppercase()})))
+                    .await
+                    .unwrap();
+                assert_eq!(run_view["supersededBy"]["successorFlowRunId"], new_run);
+
+                // The honest retry in the canonical rendering is a reuse, not a
+                // conflict against a successor its own typo already burned.
+                assert_eq!(
+                    supersede(old_run, new_run).await.unwrap()["disposition"],
+                    "reused"
+                );
+
+                // A run ID that is not a UUID is an error, not a well-formed
+                // "not superseded" answer that hides a mis-rendered lookup.
+                let bogus = client
+                    .call("query.lineage", Some(json!({"flowRun": "not-a-uuid"})))
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(bogus, WireIoError::Rpc(WireErrorCode::InvalidParams, _, _)),
+                    "{bogus:?}"
+                );
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    /// An unreadable lineage ledger stops flow starts, so it must never look
+    /// like an anonymous internal fault to the supervisor reading the contract
+    /// in `errors.md`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_unusable_lineage_ledger_reports_typed_recovery_facts() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let run = "00000000-0000-4000-8000-000000000281";
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                // A complete but unusable record — a hand edit, not a torn
+                // append. Skipping it could resurrect a retired run, so it fails
+                // closed; the facts say the failure is permanent and bounded.
+                fs::write(
+                    paths.flow_lineage_path(),
+                    "{\"schemaVersion\":1,\"flowRunId\":\"nope\",\"successorFlowRunId\":\"nope2\",\
+                      \"reason\":\"operator\",\"recordedAt\":\"2026-08-02T00:00:00.000Z\"}\n",
+                )
+                .unwrap();
+                let error = client
+                    .call("query.lineage", Some(json!({"flowRun": run})))
+                    .await
+                    .unwrap_err();
+                let WireIoError::Rpc(code, message, data) = error else {
+                    panic!("expected a typed RPC error");
+                };
+                assert_eq!(code, WireErrorCode::FlowLineageUnusable);
+                assert!(message.contains("line 1"), "{message}");
+                let data = data.expect("an unusable ledger carries recovery facts");
+                assert_eq!(data["transient"], false);
+                assert_eq!(data["resolution"], "repair-lineage-ledger");
+
+                // Repairing the file by hand is enough; the cache revalidates
+                // against the bytes rather than pinning the failure until the
+                // daemon restarts.
+                fs::remove_file(paths.flow_lineage_path()).unwrap();
+                let view = client
+                    .call("query.lineage", Some(json!({"flowRun": run})))
+                    .await
+                    .unwrap();
+                assert_eq!(view["superseded"], false);
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
 }

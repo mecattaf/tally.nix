@@ -435,46 +435,41 @@ impl DaemonHandler {
             reason: SupersedeReason,
         }
         let params: Params = decode_params(params)?;
-        for (name, value) in [
-            ("flowRunId", &params.flow_run_id),
-            ("successorFlowRunId", &params.successor_flow_run_id),
-        ] {
-            Uuid::parse_str(value)
-                .map_err(|_| WireError::invalid(format!("{name} must be a UUID")))?;
-        }
+        // Canonicalize before anything else. A run ID may be presented upper
+        // case, unhyphenated, or braced and still parse; storing the caller's
+        // spelling would key the rollover to a run nobody ever replays, and
+        // answer `ok: true` while recovering nothing.
+        let predecessor = canonical_flow_run_id(&params.flow_run_id)
+            .map_err(|_| WireError::invalid("flowRunId must be a UUID"))?;
+        let successor = canonical_flow_run_id(&params.successor_flow_run_id)
+            .map_err(|_| WireError::invalid("successorFlowRunId must be a UUID"))?;
         let path = self.context.read().await.paths.flow_lineage_path();
-        let already_recorded = FlowLineage::read(&path)
-            .map_err(lineage_wire)?
-            .classify(
-                &params.flow_run_id,
-                &params.successor_flow_run_id,
-                params.reason,
-            )
+        let already_recorded = self
+            .flow_lineage()
+            .await?
+            .classify(&predecessor, &successor, params.reason)
             .map_err(lineage_wire)?
             .is_some();
         // The idempotent retry answers from the durable record before any
         // liveness question, so a supervisor that crashed between recording the
         // rollover and running the successor can always call again.
-        if !already_recorded {
-            self.assert_supersedable(&params.flow_run_id, &params.successor_flow_run_id)
-                .await?;
-        }
-        let pins = self.predecessor_pins(&params.flow_run_id).await;
-        let outcome = record_supersede(
-            &path,
-            &params.flow_run_id,
-            &params.successor_flow_run_id,
-            params.reason,
-            &pins,
-        )
-        .map_err(lineage_wire)?;
+        let pins = if already_recorded {
+            PredecessorPins::default()
+        } else {
+            let pins = self.assert_supersedable(&predecessor, &successor).await?;
+            pins
+        };
+        let outcome = record_supersede(&path, &predecessor, &successor, params.reason, &pins)
+            .map_err(lineage_wire)?;
+        self.invalidate_flow_lineage().await;
         serde_json::to_value(outcome).map_err(internal_wire)
     }
 
-    /// Refuse a rollover that would strand live work or continue an already
-    /// started successor.
+    /// Refuse a rollover that names no real run, would strand live work, or
+    /// would continue an already started successor; return the predecessor's
+    /// own pinned hashes on success.
     ///
-    /// The successor's freshness is asked of the durable row projection rather
+    /// Existence and freshness are asked of the durable row projection rather
     /// than of live jobs: a run started under an earlier daemon epoch is still a
     /// started run, and the same projection is what the runner's own identity
     /// scan reads.
@@ -482,7 +477,7 @@ impl DaemonHandler {
         &self,
         predecessor: &str,
         successor: &str,
-    ) -> Result<(), WireError> {
+    ) -> Result<PredecessorPins, WireError> {
         let (unfinished, details) = {
             let mut context = self.context.write().await;
             let unfinished = context
@@ -512,40 +507,41 @@ impl DaemonHandler {
                 ),
             ));
         }
-        Ok(())
+        // A run with no durable node never recorded a script hash, so it can
+        // never trip a startup identity pin and never needs superseding. Every
+        // other run-keyed verb answers not-found for it; this one used to
+        // answer `ok: true`, which is the silent no-op #251 is about.
+        predecessor_pins(&details, predecessor)
     }
 
-    /// The abandoned generation's own pinned hashes, read from its durable rows.
+    /// The parsed lineage ledger, re-read only when its bytes changed.
     ///
-    /// Never taken from the caller: this is the frozen fingerprint of what was
-    /// abandoned, and it is what makes the boundary auditable later. A run whose
-    /// rows disagree records no pin rather than an arbitrary one.
-    async fn predecessor_pins(&self, predecessor: &str) -> PredecessorPins {
-        let details = self.context.write().await.query_details.snapshot();
-        let mut script = BTreeSet::new();
-        let mut args = BTreeSet::new();
-        let mut catalog = BTreeSet::new();
-        for orchestration in flow_run_details(&details, predecessor)
-            .filter_map(|detail| detail.orchestration.as_ref())
-        {
-            for (field, sink) in [
-                ("scriptHash", &mut script),
-                ("argsHash", &mut args),
-                ("catalogHash", &mut catalog),
-            ] {
-                if let Some(hash) = orchestration.as_value().get(field).and_then(Value::as_str) {
-                    sink.insert(hash.to_owned());
-                }
+    /// Every flow start asks `query.lineage`, so an uncached read would parse
+    /// the whole ledger once per run — linear in a store that grows by one
+    /// record per retired generation. The daemon caches the parsed index and
+    /// revalidates it against the file's length and modification time, so an
+    /// external edit is still picked up.
+    pub(crate) async fn flow_lineage(&self) -> Result<Rc<FlowLineage>, WireError> {
+        let path = self.context.read().await.paths.flow_lineage_path();
+        let stamp = std::fs::metadata(&path)
+            .ok()
+            .map(|metadata| (metadata.len(), metadata.modified().ok()));
+        if let Some(cached) = self.flow_lineage_cache.borrow().as_ref() {
+            if cached.stamp == stamp {
+                return Ok(cached.lineage.clone());
             }
         }
-        let single = |values: BTreeSet<String>| {
-            (values.len() == 1).then(|| values.into_iter().next().expect("one element"))
-        };
-        PredecessorPins {
-            script_hash: single(script),
-            args_hash: single(args),
-            catalog_hash: single(catalog),
-        }
+        let lineage = Rc::new(FlowLineage::read(&path).map_err(lineage_wire)?);
+        *self.flow_lineage_cache.borrow_mut() = Some(CachedFlowLineage {
+            stamp,
+            lineage: lineage.clone(),
+        });
+        Ok(lineage)
+    }
+
+    /// Drop the cached lineage after this daemon wrote the ledger itself.
+    pub(crate) async fn invalidate_flow_lineage(&self) {
+        self.flow_lineage_cache.borrow_mut().take();
     }
 
     pub(crate) async fn cancel_one(
@@ -757,13 +753,90 @@ pub(crate) fn job_is_in_flow_run(job: &Job, flow_run_id: &str) -> bool {
         .is_some_and(|orchestration| orchestration.flow_run_id() == flow_run_id)
 }
 
+/// The abandoned generation's own pinned hashes, read from its durable rows.
+///
+/// Never taken from the caller: this is the frozen fingerprint of what was
+/// abandoned, and it is what makes the boundary auditable later.
+///
+/// A predecessor with no durable node, or with no recorded `scriptHash`, is not
+/// a flow run this operation can retire — it can never trip a startup identity
+/// pin, so it can never need retiring — and is refused as not found rather than
+/// recorded with the hashes silently omitted. Rows that disagree about a pin are
+/// the `*-history-conflict` pathology and are refused too: recording an
+/// arbitrary one of two hashes would put a lie in the audit record.
+fn predecessor_pins(
+    details: &[RowDetailFact],
+    predecessor: &str,
+) -> Result<PredecessorPins, WireError> {
+    let mut script = BTreeSet::new();
+    let mut args = BTreeSet::new();
+    let mut catalog = BTreeSet::new();
+    let mut rows = 0_usize;
+    for orchestration in
+        flow_run_details(details, predecessor).filter_map(|detail| detail.orchestration.as_ref())
+    {
+        rows += 1;
+        for (field, sink) in [
+            ("scriptHash", &mut script),
+            ("argsHash", &mut args),
+            ("catalogHash", &mut catalog),
+        ] {
+            if let Some(hash) = orchestration.as_value().get(field).and_then(Value::as_str) {
+                sink.insert(hash.to_owned());
+            }
+        }
+    }
+    if rows == 0 {
+        return Err(WireError::not_found(format!(
+            "flow run {predecessor} has no durable node; there is no generation to supersede"
+        )));
+    }
+    for (name, values) in [
+        ("scriptHash", &script),
+        ("argsHash", &args),
+        ("catalogHash", &catalog),
+    ] {
+        if values.len() > 1 {
+            return Err(WireError::new(
+                WireErrorCode::FlowLineageConflict,
+                format!(
+                    "flow run {predecessor} recorded {} different {name} values; \
+                     resolve that history conflict before superseding it",
+                    values.len()
+                ),
+            ));
+        }
+    }
+    if script.is_empty() {
+        return Err(WireError::not_found(format!(
+            "flow run {predecessor} recorded no orchestration scriptHash; it is not a flow run"
+        )));
+    }
+    let single = |values: BTreeSet<String>| values.into_iter().next();
+    Ok(PredecessorPins {
+        script_hash: single(script),
+        args_hash: single(args),
+        catalog_hash: single(catalog),
+    })
+}
+
 pub(crate) fn lineage_wire(error: FlowLineageError) -> WireError {
     match error {
         FlowLineageError::Invalid(message) => WireError::invalid(message),
         FlowLineageError::Conflict(message) => {
             WireError::new(WireErrorCode::FlowLineageConflict, message)
         }
-        other => internal_wire(other),
+        // A ledger that cannot be read stops every flow start in the estate, so
+        // it must never look like an anonymous internal fault to a supervisor:
+        // it is permanent, and the operator action is bounded and named.
+        other => WireError {
+            code: WireErrorCode::FlowLineageUnusable,
+            message: other.to_string(),
+            data: Some(json!({
+                "transient": false,
+                "resolution": "repair-lineage-ledger",
+            })),
+        },
     }
 }
 

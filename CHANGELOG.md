@@ -6,6 +6,83 @@ authorized.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Repaired the seven post-merge findings on the flow-lineage successor path
+  (#251 repair).** The mechanism shipped correct for the states its tests
+  constructed; the defects were in the states they did not — a predecessor that
+  does not exist, a run ID written in a different but still valid UUID
+  rendering, and a ledger whose last line is torn.
+
+  **A rollover must name a real run, in one canonical rendering.**
+  `flow.supersede` validated only that both IDs *parsed* as UUIDs and then
+  stored the caller's raw spelling as the ledger key, so an invented or
+  mis-rendered predecessor answered `ok: true, disposition: "recorded"` and
+  recovered nothing for the run actually being replayed — the silent no-op the
+  whole feature exists to eliminate, and irreversible because the successor UUID
+  was then durably burned. Both IDs are now canonicalized to hyphenated
+  lowercase on every write *and* every lookup, including `query.lineage`,
+  `query.run`, and the runner's own startup scan, so the upper-case,
+  unhyphenated, and braced renderings all name one run; records written by the
+  previous build in another rendering are absorbed by the same canonicalization
+  on read, so nothing needs migrating. A predecessor with no durable node, or
+  with no recorded `orchestration.scriptHash`, is refused as `not_found` — such
+  a run can never trip an identity pin, so it can never need retiring — and a
+  predecessor whose rows disagree about a pinned hash is refused as
+  `flow-lineage-conflict` rather than recorded with an arbitrary one. The
+  documented predecessor hashes are therefore never silently omitted.
+
+  **One torn line no longer stops every flow run in the estate.** Every flow
+  start reads the lineage index, and `FlowLineage::read` failed the whole read
+  on the first unusable line, so an interrupted append — a crash, a power loss,
+  or a short write under ENOSPC, which the #251 incident's own low-disk
+  condition makes concrete — blocked runs that had no rollover at all, and
+  bricked the recovery operation itself. An unterminated final record is now
+  skipped on read and truncated by the next write, following
+  `truncate_incomplete_attestation_tail`. A *complete* record that cannot be
+  decoded still fails closed, deliberately: skipping it could resurrect a run an
+  operator durably retired. That failure now carries the new
+  `flow-lineage-unusable` wire code with `transient: false` and
+  `resolution: "repair-lineage-ledger"`, and the troubleshooting chapter
+  documents the one-line repair, so it can never strand a supervisor as an
+  anonymous internal fault.
+
+  **The lineage store is bounded, cached, and inventoried.**
+  `<dataDir>/flow-lineage.jsonl` was unbounded, absent from the retention
+  inventory, and re-parsed in full on every flow start — measured at ~1.1 s per
+  start against a 160,000-record file, on the machine whose ten-minute
+  supervisor cadence is the point of the issue. The daemon now caches the parsed
+  index and revalidates it against the file's length and mtime, so a hand repair
+  is still picked up without a restart, and the ledger keeps its newest 100,000
+  records, compacting through an atomic rewrite on the append that would cross
+  the bound — the `changes.jsonl` count-bound shape, safe here because this
+  store is an index and not a proof chain. It now appears in
+  `retention.md`'s "What still grows" table, and is created `0600` like its
+  sibling ledgers instead of world-readable.
+
+  **The `transient`/`resolution` contract covers every classified code, on both
+  paths.** It previously reached three of the four fatal replay codes and only
+  when raised at startup, so `replay-divergence` and every mid-run identity
+  refusal handed back by the daemon carried no facts at all, and a supervisor
+  written to the documented recipe would retry them forever. One table now
+  stamps the pair wherever a classified error is constructed — startup pins,
+  mid-run daemon refusals, and the client's own translations — so one wire code
+  never has two `details` contracts. `replay-divergence` and the three
+  `*-history-conflict` codes resolve to `investigate` (a rollover does not clear
+  them); the transient daemon codes carry `transient: true, resolution: "retry"`.
+  `errors.md` states that absence of the pair means unclassified, not transient.
+
+  **Documentation matches the behaviour.** `errors.md`'s automation recipe is
+  now the one that works: persist the successor UUID before calling (a fresh
+  UUID per attempt is a conflict, not a retry), read `query.lineage` and adopt
+  `supersededBy` on `flow-lineage-conflict`, and cancel a live predecessor
+  first. `submission-and-replay.md` states the scope of the replay refusal that
+  the merged pull request promised and did not include: it is runner-side and
+  startup-only, is not an admission-time prohibition, and does not stop a
+  runner already in flight. `query.lineage` validates its run ID like
+  `flow.supersede` does instead of answering any string with a well-formed
+  "not superseded" view.
+
 ### Added
 
 - **A witnessed successor path for fatal replay divergence (#251).** Replay

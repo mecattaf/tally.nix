@@ -32,7 +32,7 @@ use completion::{
     substituted_witness, GhTerminalWork, TerminalWork,
 };
 pub(crate) use notify::watchdog_tick;
-use rpc::control::{find_job, lease_request, lease_wire, lineage_wire, state_name};
+use rpc::control::{find_job, lease_request, lease_wire, state_name};
 #[cfg(test)]
 use rpc::producer::{pool_loss_intent_directory, read_pool_loss_intent, write_pool_loss_intent};
 use rpc::producer::{reconcile_pool_loss_intents, PoolTransitionTask};
@@ -102,7 +102,8 @@ use crate::executor::{
     ExecutorError, UnitLimits, Uuid,
 };
 use crate::flow_lineage::{
-    record_supersede, FlowLineage, FlowLineageError, PredecessorPins, SupersedeReason,
+    canonical_flow_run_id, record_supersede, FlowLineage, FlowLineageError, PredecessorPins,
+    SupersedeReason,
 };
 use crate::git_ai::GitAiExecution;
 use crate::history::{HistoryError, LifecycleStore};
@@ -578,6 +579,17 @@ struct DaemonHandler {
     git_ai: GitAiConfig,
     exec_attestations: bool,
     attestations: Arc<std::sync::Mutex<SharedAttestations>>,
+    flow_lineage_cache: Rc<RefCell<Option<CachedFlowLineage>>>,
+}
+
+/// The parsed lineage index plus the file stamp it was parsed from.
+///
+/// Every flow start reads this store, so it is cached rather than re-parsed per
+/// run. The stamp is revalidated on each read, so an operator repairing the
+/// ledger by hand does not have to restart the daemon.
+pub(crate) struct CachedFlowLineage {
+    stamp: Option<(u64, Option<std::time::SystemTime>)>,
+    lineage: Rc<FlowLineage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

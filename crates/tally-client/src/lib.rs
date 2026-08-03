@@ -135,6 +135,8 @@ pub enum WireErrorCode {
     FlowNodeCap,
     #[serde(rename = "flow-lineage-conflict")]
     FlowLineageConflict,
+    #[serde(rename = "flow-lineage-unusable")]
+    FlowLineageUnusable,
     #[serde(rename = "storage-budget-exceeded")]
     StorageBudgetExceeded,
     #[serde(rename = "storage-monitor-unavailable")]

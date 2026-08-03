@@ -572,9 +572,16 @@ fn payload_divergence_stops_admission_at_the_mismatched_ordinal() {
             "expectedHash",
             "recordedHash",
             "expectedLabel",
-            "recordedLabel"
+            "recordedLabel",
+            "transient",
+            "resolution",
         ]
     );
+    // A rollover does not clear a payload divergence, so the resolution differs
+    // from the identity pins' — but it is still permanent, and says so.
+    assert_eq!(error.details["transient"], false);
+    assert_eq!(error.details["resolution"], "investigate");
+    assert!(!error.details.contains_key("divergentInput"));
     assert_eq!(client.submissions.borrow().len(), 2);
 }
 
@@ -729,8 +736,33 @@ fn a_concurrent_identity_change_stops_the_admission_frontier() {
         let error = run(&source, client.clone()).unwrap_err();
         assert_eq!(error.name, "FlowReplayError");
         assert_eq!(error.code, code);
+        // The same wire code carries the same contract whether the runner
+        // raised it at startup or the daemon handed it back mid-run.
+        assert_eq!(error.details["transient"], false, "{code}");
+        assert_eq!(error.details["resolution"], "supersede", "{code}");
+        assert_eq!(
+            error.details["divergentInput"],
+            code.trim_end_matches("-changed-mid-run"),
+            "{code}"
+        );
         assert_eq!(client.submissions.borrow().len(), 1);
     }
+}
+
+#[test]
+fn a_transient_daemon_failure_says_so_where_a_permanent_one_does_not() {
+    let source = format!(
+        "{}
+(async () => sh(['one'], {{pools: ['cpu']}}))()",
+        meta(&["cpu"], &[])
+    );
+    let client = MockClient::new(vec![Reply::client_error("daemon-unreachable")]);
+    let error = run(&source, client).unwrap_err();
+    assert_eq!(error.code, "daemon-unreachable");
+    // The other half of the contract: a supervisor that sees `true` here may
+    // retry, and only a code carrying neither value is unclassified.
+    assert_eq!(error.details["transient"], true);
+    assert_eq!(error.details["resolution"], "retry");
 }
 
 #[test]

@@ -299,9 +299,11 @@ What it does, and equally what it does not:
   is a statement about the run, not an edit of it.
 - The predecessor/successor relationship and the reason become durable in
   `<dataDir>/flow-lineage.jsonl`, together with the abandoned generation's own recorded script,
-  argument, and catalog hashes.
-- Repeating the identical call is safe. It answers `disposition: "reused"` and writes nothing, so
-  a supervisor may call it again after its own restart.
+  argument, and catalog hashes, read from its rows rather than from the caller.
+- Repeating the **identical** call is safe. It answers `disposition: "reused"` and writes nothing,
+  so a supervisor may call it again after its own restart. Idempotency is keyed on the whole
+  `(flowRunId, successorFlowRunId, reason)` triple, so mint the successor UUID once and persist it
+  *before* calling; a fresh UUID per attempt is a `flow-lineage-conflict`, not a retry.
 - Replaying the superseded ID is refused with `flow-run-superseded`, which names the successor.
 - The successor is **not** created and inherits nothing. It starts as a fresh run, which is why a
   run that already has nodes is refused as a successor. Reusing application-level artifacts or
@@ -323,9 +325,58 @@ reports `state: superseded` for a retired run whatever its own node verdicts say
 successor above the task board.
 
 A contradiction is refused rather than rewritten: a second different successor, a successor that
-already succeeds another run, or a rollover that would close a cycle all fail with
-`flow-lineage-conflict`. A predecessor with unfinished nodes is refused too — cancel the run
-first, so that a rollover can never strand live work.
+already succeeds another run, a rollover that would close a cycle, or a predecessor whose own rows
+disagree about a pinned hash all fail with `flow-lineage-conflict`. A predecessor with unfinished
+nodes is refused too — cancel the run first, so that a rollover can never strand live work.
+
+**A rollover must name a run that exists.** A predecessor with no durable node, or with no
+recorded `orchestration.scriptHash`, is refused as `not_found`. Such a run can never trip a
+startup identity pin, so it can never need retiring, and refusing it is what catches a typo'd or
+mis-pasted run ID — the alternative is a rollover that reports success while recovering nothing
+for the run the supervisor is actually replaying. It also means the recorded predecessor hashes
+are never silently omitted.
+
+**Every valid rendering of a run ID names one run.** A UUID may be written hyphenated, bare,
+braced, upper case, or lower case. All of those are canonicalized to hyphenated lowercase on the
+way into the ledger and on every lookup, so a rollover recorded from one spelling is found by the
+runner presenting another. Records written by an earlier tally in a different rendering are
+absorbed by the same canonicalization when the ledger is read; nothing needs migrating.
+
+### The scope of the refusal
+
+This prevention is deliberately narrow, and building automation on it means knowing where it
+stops:
+
+- It lives in the **flow runner's startup**, in the same `inspect_run` scan as the three identity
+  pins. It is evaluated once, before the script is evaluated.
+- It is therefore **not** an admission-time check. A rollover recorded while a run is already in
+  flight does not stop that runner from admitting its remaining nodes under the retired ID; the
+  refusal applies to the *next* start. Cancel the run first if you need it stopped now — which is
+  also what `flow.supersede` requires of a predecessor with unfinished nodes.
+- Any client that is not this runner — a direct `queue.enqueue`, an older binary — can still
+  enqueue work carrying a retired `flowRunId`. `tally flow run` is the only thing that mints
+  flow-run-scoped nodes in practice, which is why the runner-side check is sufficient in the
+  shape the incident actually takes, but it is not a kernel-level prohibition and is not
+  described as one.
+
+### When the lineage index itself is damaged
+
+Every flow start reads `<dataDir>/flow-lineage.jsonl`, so its integrity matters beyond the runs
+it names. Two failure modes, treated differently on purpose:
+
+- **An interrupted append** — a crash, a power loss, or a short write under ENOSPC — leaves an
+  unterminated final line. That is ignored on read and truncated by the next write, exactly as the
+  attestation chain repairs its own torn tail. No run is blocked.
+- **A complete record that cannot be decoded or validated** — a hand edit, or bit rot — fails
+  closed with `flow-lineage-unusable`, and that blocks every flow start until it is repaired. The
+  alternative, skipping the bad line, could resurrect a run an operator durably retired, which is
+  the one outcome this store exists to prevent. The failure carries `transient: false` and
+  `resolution: "repair-lineage-ledger"` so a supervisor escalates instead of retrying it all
+  night. Repair is removing one line from a plain JSONL file with the daemon stopped; it is an
+  index, not a hash chain, so nothing downstream needs re-verifying.
+
+The ledger keeps its newest 100,000 records; see the
+[retention inventory](../operating/retention.md#what-still-grows).
 
 ### `replay-divergence` — exit 20
 

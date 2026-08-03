@@ -18,6 +18,7 @@ use serde_json::{json, Map, Value};
 
 use crate::catalog::sha256;
 use crate::dialect::validate_instance;
+use crate::error::with_recovery_facts;
 use crate::executor::FlowJobExecutor;
 use crate::model::{
     flow_canonical_payload_fields, is_nix_store_path, node_spec_fields, sugar_reserved_fields,
@@ -110,7 +111,6 @@ pub fn run_script(
     if let Some(recorded_hash) = inspection.script_hash.as_deref() {
         validate_startup_hash(
             "script-changed-mid-run",
-            "script",
             &options.flow_run_id,
             recorded_hash,
             &script_hash,
@@ -119,7 +119,6 @@ pub fn run_script(
     if let Some(recorded_hash) = inspection.args_hash.as_deref() {
         validate_startup_hash(
             "args-changed-mid-run",
-            "args",
             &options.flow_run_id,
             recorded_hash,
             &args_hash,
@@ -298,17 +297,12 @@ pub fn run_script(
 /// only one of them can ever be resolved by retrying. These fields say which is
 /// which, and what the machine-actionable next step is, so an unattended queue
 /// does not spend a night re-observing a permanent answer.
-fn replay_facts(error: FlowError, flow_run_id: &str, divergent_input: &str) -> FlowError {
-    error
-        .detail("flowRunId", flow_run_id)
-        .detail("divergentInput", divergent_input)
-        .detail("transient", false)
-        .detail("resolution", "supersede")
+fn replay_facts(error: FlowError, flow_run_id: &str) -> FlowError {
+    with_recovery_facts(error.detail("flowRunId", flow_run_id))
 }
 
 fn validate_startup_hash(
     code: &str,
-    divergent_input: &str,
     flow_run_id: &str,
     recorded_hash: &str,
     current_hash: &str,
@@ -326,7 +320,6 @@ fn validate_startup_hash(
         .detail("recordedHash", recorded_hash)
         .detail("currentHash", current_hash),
         flow_run_id,
-        divergent_input,
     ))
 }
 
@@ -349,7 +342,6 @@ fn changed_catalog_error(
         .detail("recordedHash", recorded_hash)
         .detail("currentHash", current_hash),
         flow_run_id,
-        "catalog",
     )
 }
 
@@ -358,7 +350,7 @@ fn changed_catalog_error(
 /// This is the one replay refusal that carries its own remedy: the successor is
 /// named, so a supervisor switches to it instead of escalating to a human.
 fn superseded_error(flow_run_id: &str, supersede: &RunSupersede) -> FlowError {
-    FlowError::new(
+    let error = FlowError::new(
         "FlowReplayError",
         "flow-run-superseded",
         format!(
@@ -373,9 +365,8 @@ fn superseded_error(flow_run_id: &str, supersede: &RunSupersede) -> FlowError {
         supersede.successor_flow_run_id.as_str(),
     )
     .detail("reason", supersede.reason.as_str())
-    .detail("recordedAt", supersede.recorded_at.as_str())
-    .detail("transient", false)
-    .detail("resolution", "run-successor")
+    .detail("recordedAt", supersede.recorded_at.as_str());
+    with_recovery_facts(error)
 }
 
 fn evaluate_script(source: &str, path: Option<&Path>, context: &mut Context) -> JsResult<JsValue> {

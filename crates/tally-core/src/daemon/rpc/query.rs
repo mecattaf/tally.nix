@@ -63,16 +63,17 @@ impl DaemonHandler {
                 flow_run: String,
             }
             let params: Params = decode_params(params)?;
-            if params.flow_run.trim().is_empty() {
-                return Err(WireError::invalid("query lineage run ID must not be empty"));
-            }
-            // A run with no recorded rollover is a valid, empty answer rather
-            // than a not-found: a supervisor asks this question about every run
-            // it is about to replay, including the very first one.
-            let path = self.context.read().await.paths.flow_lineage_path();
-            let view = FlowLineage::read(&path)
-                .map_err(lineage_wire)?
-                .view(&params.flow_run);
+            // A non-UUID cannot name a flow run, and answering it with a
+            // well-formed "not superseded" view is how a mis-rendered ID looks
+            // like a normal answer instead of an error. Validate it the way
+            // `flow.supersede` does, and canonicalize so that two spellings of
+            // one run cannot read as two runs.
+            let flow_run = canonical_flow_run_id(&params.flow_run)
+                .map_err(|_| WireError::invalid("query lineage run ID must be a UUID"))?;
+            // A run with no recorded rollover is still a valid, empty answer
+            // rather than a not-found: a supervisor asks this question about
+            // every run it is about to replay, including the very first one.
+            let view = self.flow_lineage().await?.view(&flow_run);
             return serde_json::to_value(view).map_err(internal_wire);
         }
         if method == "query.storage" {
@@ -162,11 +163,8 @@ impl DaemonHandler {
                 let mut result =
                     query_run(&params.id, &details, &live, &history, &witness, Utc::now())
                         .map_err(observability_wire)?;
-                let lineage_path = self.context.read().await.paths.flow_lineage_path();
-                apply_run_lineage(
-                    &mut result,
-                    &FlowLineage::read(&lineage_path).map_err(lineage_wire)?,
-                );
+                let lineage = self.flow_lineage().await?;
+                apply_run_lineage(&mut result, &lineage);
                 for failure in &mut result.failures {
                     let (Some(attempt), Some(lease_epoch), Ok(uuid)) = (
                         failure.attempt,

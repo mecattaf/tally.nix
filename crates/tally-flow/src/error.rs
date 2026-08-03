@@ -119,6 +119,72 @@ impl FlowError {
     }
 }
 
+/// What a supervisor should do about one error code, without reading prose.
+///
+/// `transient` says whether repeating the identical command can ever produce a
+/// different answer; `resolution` names the bounded operation that clears it.
+/// The pair exists because an unattended queue that cannot tell a permanent
+/// identity refusal from a lost socket spends the night re-observing the
+/// permanent one — the failure #251 is about.
+const RECOVERY_FACTS: &[(&str, bool, &str)] = &[
+    // Permanent: the run's recorded identity and the current inputs disagree.
+    // Only an explicit generation rollover clears these.
+    ("script-changed-mid-run", false, "supersede"),
+    ("args-changed-mid-run", false, "supersede"),
+    ("catalog-changed-mid-run", false, "supersede"),
+    // Permanent, and the successor is already named in the same error.
+    ("flow-run-superseded", false, "run-successor"),
+    // Permanent, but a rollover does not clear it: the same ordinal re-derived
+    // different work, which is a question about the script or configuration.
+    ("replay-divergence", false, "investigate"),
+    ("script-history-conflict", false, "investigate"),
+    ("args-history-conflict", false, "investigate"),
+    ("catalog-history-conflict", false, "investigate"),
+    // Permanent until the operator repairs the durable lineage index.
+    ("flow-lineage-unusable", false, "repair-lineage-ledger"),
+    ("flow-lineage-conflict", false, "investigate"),
+    // Transient: exactly the codes the flow client's own re-arm classification
+    // already retries.
+    ("daemon-unreachable", true, "retry"),
+    ("daemon-timeout", true, "retry"),
+    ("daemon-epoch-changed", true, "retry"),
+];
+
+/// Which identity-bearing input diverged, for the codes where that is fixed.
+fn divergent_input(code: &str) -> Option<&'static str> {
+    match code {
+        "script-changed-mid-run" => Some("script"),
+        "args-changed-mid-run" => Some("args"),
+        "catalog-changed-mid-run" => Some("catalog"),
+        _ => None,
+    }
+}
+
+/// Attach the `transient` / `resolution` (and, where fixed, `divergentInput`)
+/// facts for this error's code.
+///
+/// Applied wherever a classified error is constructed — the startup identity
+/// pins, the mid-run daemon refusals, and the client's own translations — so one
+/// wire code never has two different `details` contracts depending on where it
+/// was raised. A code with no entry is left unstamped, and `errors.md` says that
+/// absence means unclassified rather than transient.
+#[must_use]
+pub fn with_recovery_facts(error: FlowError) -> FlowError {
+    let Some((_, transient, resolution)) = RECOVERY_FACTS
+        .iter()
+        .find(|(code, _, _)| *code == error.code)
+    else {
+        return error;
+    };
+    let error = error
+        .detail("transient", *transient)
+        .detail("resolution", *resolution);
+    match divergent_input(&error.code) {
+        Some(input) => error.detail("divergentInput", input),
+        None => error,
+    }
+}
+
 fn banned_global_remedy(global: &str) -> &'static str {
     match global {
         "Date" => "witness a clock reading in a node instead",
