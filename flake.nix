@@ -3418,6 +3418,8 @@
         campaignHomeServices = campaignHome.config.systemd.user.services;
         campaignHomeTimers = campaignHome.config.systemd.user.timers;
         campaignPollScript = campaignHomeServices.tally-campaign-poll.Service.ExecStart;
+        campaignSystemPollScript =
+          campaignNixos.config.systemd.services.tally-campaign-poll.serviceConfig.ExecStart;
         checkedHomeConfig = stockHome.config.xdg.configFile."tally/config.json".source;
         checkedCampaignConfig = campaignHome.config.xdg.configFile."tally/config.json".source;
         systemServices = stockNixos.config.systemd.services;
@@ -3621,6 +3623,21 @@
           assert campaignSystemTimers.tally-campaign-poll.timerConfig.Unit == "tally-campaign-poll.service";
           assert !(campaignPollDisabledNixos.config.systemd.services ? tally-campaign-poll);
           assert !(campaignPollDisabledNixos.config.systemd.timers ? tally-campaign-poll);
+          # An `After=` on a target nothing pulls in orders against nothing, and
+          # the scan's first act is an authenticated forge read 15s after boot.
+          assert
+            campaignSystemServices.tally-campaign-poll.after == [
+              "network-online.target"
+              "tally-daemon.service"
+            ];
+          assert campaignSystemServices.tally-campaign-poll.wants == [ "network-online.target" ];
+          # A host whose secret is not provisioned yet skips the scan instead of
+          # failing a unit every tick.
+          assert
+            campaignSystemServices.tally-campaign-poll.unitConfig.ConditionPathExists == [
+              "/etc/tally/config.json"
+              "/var/lib/tally/forge/.config/gh/hosts.yml"
+            ];
           # The identity. The account gets a real home because campaign jobs are
           # transient units in its own user manager and read gh and git
           # configuration from HOME; the token is piped in from its declared
@@ -3632,6 +3649,25 @@
           assert pkgs.lib.hasInfix "--git-email tally-fixture@users.noreply.github.com"
             campaignSystemActivation;
           assert pkgs.lib.hasInfix "< /run/secrets/tally-campaign-forge-token" campaignSystemActivation;
+          # A missing secret is named by the option it comes from, rather than
+          # arriving as a bare shell redirection error.
+          assert pkgs.lib.hasInfix "if [ ! -r /run/secrets/tally-campaign-forge-token ]"
+            campaignSystemActivation;
+          assert pkgs.lib.hasInfix "services.tally.campaignForge.tokenFile is unreadable"
+            campaignSystemActivation;
+          # No estate here runs sops-nix or agenix, so the ordering list is the
+          # account record alone; naming a snippet that does not exist is an
+          # evaluation error, which is why the dependency is conditional.
+          assert
+            campaignNixos.config.system.activationScripts.tallyCampaignForgeIdentity.deps == [
+              "users"
+            ];
+          # Turning the surface off removes the token this writer left behind,
+          # and a host that never enabled it still runs the same no-op snippet.
+          assert !(campaignNixos.config.system.activationScripts ? tallyCampaignForgeTeardown);
+          assert !(stockNixos.config.system.activationScripts ? tallyCampaignForgeIdentity);
+          assert pkgs.lib.hasInfix "--remove --home /var/lib/tally/forge"
+            stockNixos.config.system.activationScripts.tallyCampaignForgeTeardown.text;
           assert builtins.elem
             "services.tally.campaignForge.login must name the GitHub account the tally system service acts as; unlike the Home Manager module there is no ambient operator identity to inherit"
             anonymousCampaignMessages;
@@ -3911,6 +3947,7 @@
                 checkedConfig = checkedCampaignConfig;
                 stockConfig = checkedHomeConfig;
                 pollScript = campaignPollScript;
+                systemPollScript = campaignSystemPollScript;
                 nativeBuildInputs = [
                   pkgs.git
                   pkgs.jq
@@ -3924,12 +3961,22 @@
                 # run, so the timer must scan once and return rather than wait
                 # out a campaign pass under the lock; --wait would block
                 # interactive arm, disarm, and list for the pass duration.
-                test -x "$pollScript"
-                grep -Fq -- "campaign poll --once" "$pollScript"
-                if grep -Fq -- "--wait" "$pollScript"; then
-                  echo "campaign-render: poll timer must not pass --wait" >&2
-                  exit 1
-                fi
+                # Both modules render their own poll program, so both are held
+                # to this; the system one is also held to the state directory
+                # the module deploys, because an interactive arm and this timer
+                # disagreeing about the registry root is a campaign that
+                # registers and then never polls.
+                for script in "$pollScript" "$systemPollScript"; do
+                  test -x "$script"
+                  grep -Fq -- "campaign poll --once" "$script"
+                  if grep -Fq -- "--wait" "$script"; then
+                    echo "campaign-render: poll timer must not pass --wait: $script" >&2
+                    exit 1
+                  fi
+                done
+                grep -Fq -- "--config /etc/tally/config.json" "$systemPollScript"
+                grep -Fq -- "--socket /run/tally/tally.sock" "$systemPollScript"
+                grep -Fq -- "--state-dir /var/lib/tally/state" "$systemPollScript"
                 jq -e '
                   .producers["campaign-fixture"].enqueue.brief as $fixtureArgs |
                   .producers["campaign-defaulted"].enqueue.brief as $defaultedArgs |
