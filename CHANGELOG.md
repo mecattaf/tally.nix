@@ -8,6 +8,29 @@ authorized.
 
 ### Fixed
 
+- **The systemd watchdog keepalive no longer shares the dispatch loop, so a
+  busy daemon is no longer killed for being busy (#370).** `WATCHDOG=1` was
+  emitted from a `tokio::select!` arm in the daemon's dispatch loop. A
+  `select!` arm is only polled when the loop comes back around to poll it, and
+  it does not come back around while another arm's *body* is awaiting — a
+  terminal transaction, a lifecycle compaction, a witness fsync under an
+  estate-sized context. One slow body therefore held the keepalive for as long
+  as it ran, and at thirty seconds systemd sent `SIGABRT`. That is the
+  2026-07-30 00:01–00:03 sequence in the coordinator journal: four
+  `Watchdog timeout (limit 30s)!` kills in three minutes, of a daemon that was
+  working.
+
+  The keepalive now runs on a dedicated OS thread (`tally-watchdog`) that holds
+  no daemon state and takes no daemon lock, so nothing the daemon does can
+  delay the datagram. It is not thereby licensed to lie: the thread never
+  speaks for itself, and sends a ping only while two witnesses stamped by the
+  daemon are fresh — one stamped by a task on the daemon's runtime, which goes
+  stale when the runtime thread is blocked or deadlocked, and one stamped at
+  the top of the dispatch loop, which goes stale when an arm body stops
+  returning. When either goes stale the keepalive falls silent, says on stderr
+  which witness went stale and for how long, and systemd's own timer runs to
+  completion. A wedged daemon is still killed loudly; a slow one is not.
+
 - **The orphaned-projection sweep no longer declares a delivered projection
   lost, and retracts the records that said so (#372 repair).** The startup
   sweep decided orphan-ness from `config.producers` alone. It never consulted

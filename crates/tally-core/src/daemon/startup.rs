@@ -373,6 +373,8 @@ impl Daemon {
             lease_tick_hook: None,
             #[cfg(test)]
             connection_count_hook: None,
+            #[cfg(test)]
+            dispatch_stall_hook: None,
         })
     }
 }

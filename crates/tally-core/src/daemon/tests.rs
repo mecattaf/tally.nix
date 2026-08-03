@@ -8328,6 +8328,244 @@ mod tests {
         }
     }
 
+    /// Read every datagram already queued on `socket`, with the instant each
+    /// one was observed. The socket must carry a short read timeout.
+    fn drain_notifications(socket: &UnixDatagram) -> Vec<(String, Instant)> {
+        let mut seen = Vec::new();
+        loop {
+            let mut buffer = [0_u8; 256];
+            match socket.recv(&mut buffer) {
+                Ok(read) => seen.push((
+                    String::from_utf8_lossy(&buffer[..read]).into_owned(),
+                    Instant::now(),
+                )),
+                Err(_) => return seen,
+            }
+        }
+    }
+
+    /// The defect in #370: the keepalive used to be a `select!` arm, so it was
+    /// only polled when the dispatch loop came back around to poll it. One slow
+    /// arm body — a terminal transaction, a lifecycle compaction — held the ping
+    /// past `WatchdogSec` and systemd killed a daemon that was working fine.
+    ///
+    /// The stall here is five watchdog periods long, which is what the
+    /// coordinator's 30 s service would have needed 150 s of stalled arm to
+    /// reproduce. The keepalive must ping right through it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn watchdog_keepalive_pings_while_a_dispatch_arm_holds_the_loop() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let notify_path = temp.path().join("notify.sock");
+                let notify_socket = UnixDatagram::bind(&notify_path).unwrap();
+                notify_socket
+                    .set_read_timeout(Some(Duration::from_millis(100)))
+                    .unwrap();
+                let watchdog = Duration::from_millis(400);
+                daemon.notifier = SystemdNotifier::with_socket(notify_path, Some(watchdog));
+                let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+                let (release_tx, release_rx) = watch::channel(false);
+                daemon.dispatch_stall_hook = Some(DispatchStallHook {
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+
+                // The notify socket is read on an OS thread of its own. A
+                // blocking read on the runtime thread would stop the daemon's
+                // scheduler witness and the keepalive would — correctly —
+                // refuse to ping, which is a different property than the one
+                // under test.
+                let stall = watchdog * 5;
+                let collector = std::thread::spawn(move || {
+                    let deadline = Instant::now() + stall + watchdog * 6;
+                    let mut seen = Vec::new();
+                    while Instant::now() < deadline {
+                        seen.extend(drain_notifications(&notify_socket));
+                        if seen.iter().any(|(payload, _)| payload == "STOPPING=1") {
+                            break;
+                        }
+                    }
+                    seen
+                });
+
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                tokio::time::timeout(Duration::from_secs(5), entered_rx.recv())
+                    .await
+                    .expect("a dispatch arm must take the stall hook")
+                    .expect("the stall hook must remain open");
+                let stall_started = Instant::now();
+                tokio::time::sleep(stall).await;
+                let stall_ended = Instant::now();
+                release_tx.send(true).unwrap();
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+                let observed = collector.join().unwrap();
+
+                let payloads = observed
+                    .iter()
+                    .map(|(payload, _)| payload.as_str())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    payloads.first().copied(),
+                    Some("READY=1\nSTATUS=tally daemon ready"),
+                    "{payloads:?}"
+                );
+                assert_eq!(
+                    payloads.last().copied(),
+                    Some("STOPPING=1"),
+                    "no keepalive may follow the daemon's own STOPPING: {payloads:?}"
+                );
+                let pings = observed
+                    .iter()
+                    .filter(|(payload, at)| {
+                        payload == "WATCHDOG=1" && *at >= stall_started && *at <= stall_ended
+                    })
+                    .map(|(_, at)| *at)
+                    .collect::<Vec<_>>();
+                assert!(
+                    pings.len() >= 8,
+                    "the keepalive stopped while a dispatch arm held the loop: {} pings in {:?}, all payloads {payloads:?}",
+                    pings.len(),
+                    stall_ended - stall_started
+                );
+                let mut previous = stall_started;
+                for ping in &pings {
+                    let gap = *ping - previous;
+                    assert!(
+                        gap < watchdog,
+                        "a {gap:?} gap would have missed a {watchdog:?} service watchdog"
+                    );
+                    previous = *ping;
+                }
+                assert!(
+                    stall_ended - previous < watchdog,
+                    "the last ping was {:?} before the stall ended",
+                    stall_ended - previous
+                );
+            })
+            .await;
+    }
+
+    /// The keepalive must never be worth more than the evidence behind it. A
+    /// runtime that has stopped scheduling is a daemon that is wedged, and a
+    /// keepalive that kept pinging for it would convert a loud restart into a
+    /// silent hang.
+    #[test]
+    fn watchdog_keepalive_falls_silent_when_the_runtime_stops_scheduling() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("notify.sock");
+        let socket = UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        // Scheduler horizon 200 ms, keepalive cadence 100 ms.
+        let watchdog = Duration::from_millis(400);
+        let notifier = SystemdNotifier::with_socket(path, Some(watchdog));
+        let (fatal_tx, _fatal_rx) = mpsc::unbounded_channel();
+        let keepalive = notifier
+            .keepalive(fatal_tx)
+            .expect("a watched service starts a keepalive");
+        let liveness = keepalive.liveness();
+
+        let deadline = Instant::now() + watchdog * 2;
+        while Instant::now() < deadline {
+            liveness.stamp_scheduler();
+            liveness.stamp_dispatch();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            drain_notifications(&socket)
+                .iter()
+                .filter(|(payload, _)| payload == "WATCHDOG=1")
+                .count()
+                >= 3,
+            "an observed daemon must be pinged for"
+        );
+
+        // Stop witnessing. Any ping still in flight stood on evidence no older
+        // than the horizon; after that the keepalive owes systemd silence.
+        std::thread::sleep(watchdog);
+        let _ = drain_notifications(&socket);
+        std::thread::sleep(watchdog * 3);
+        assert_eq!(
+            drain_notifications(&socket),
+            Vec::new(),
+            "a keepalive must not speak for a daemon it cannot observe"
+        );
+    }
+
+    /// The same rule for the other witness: a `select!` arm body that never
+    /// returns is a wedged dispatch loop even though the runtime is still
+    /// scheduling other tasks. It gets bounded headroom, not immunity.
+    #[test]
+    fn watchdog_keepalive_falls_silent_when_a_dispatch_arm_never_returns() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("notify.sock");
+        let socket = UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        // Dispatch horizon 2 s, scheduler horizon 100 ms, cadence 50 ms.
+        let watchdog = Duration::from_millis(200);
+        let notifier = SystemdNotifier::with_socket(path, Some(watchdog));
+        let (fatal_tx, _fatal_rx) = mpsc::unbounded_channel();
+        let keepalive = notifier
+            .keepalive(fatal_tx)
+            .expect("a watched service starts a keepalive");
+        let liveness = keepalive.liveness();
+
+        // The runtime keeps scheduling for the whole test; only the dispatch
+        // loop is stuck.
+        let scheduler = Arc::clone(&liveness);
+        let stop = Arc::new(AtomicBool::new(false));
+        let scheduler_stop = Arc::clone(&stop);
+        let stamper = std::thread::spawn(move || {
+            while !scheduler_stop.load(Ordering::Acquire) {
+                scheduler.stamp_scheduler();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        std::thread::sleep(watchdog * 5);
+        assert!(
+            drain_notifications(&socket)
+                .iter()
+                .filter(|(payload, _)| payload == "WATCHDOG=1")
+                .count()
+                >= 3,
+            "a slow dispatch arm gets headroom, not a dead service"
+        );
+        std::thread::sleep(watchdog * 8);
+        let _ = drain_notifications(&socket);
+        std::thread::sleep(watchdog * 4);
+        assert_eq!(
+            drain_notifications(&socket),
+            Vec::new(),
+            "a dispatch loop that never comes back must still reach the service watchdog"
+        );
+        stop.store(true, Ordering::Release);
+        stamper.join().unwrap();
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn acceptance_24_1_restart_reconstructs_lineage_two_attempts_log_and_proof() {
         let local = LocalSet::new();
