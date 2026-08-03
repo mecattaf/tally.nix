@@ -39,13 +39,13 @@ when a corpus is frozen.
 
 ## Arm an ad-hoc issue campaign
 
-Campaigns are a Home Manager feature on both deployment paths. The Home Manager
-module installs the generic campaign pools, packaged flow and driver, and
-`tally-campaign-poll.timer` once. The NixOS module deploys only the daemon and
-asserts that `services.tally.campaigns` is empty, so it renders no campaign
-pools, no spec-build flow, no driver adapter, and no poll timer; a campaign
-armed against a NixOS-only host would have nothing to dispatch into. Run
-campaigns from the Home Manager module.
+The Home Manager module installs the generic campaign pools, packaged flow and
+driver, and `tally-campaign-poll.timer` once, unconditionally. The NixOS module
+deploys the daemon only until
+[`services.tally.campaignForge.enable`](../configuration/nixos-options.md#servicestallycampaignforgeenable)
+is set; see [Campaigns on a NixOS host](#campaigns-on-a-nixos-host) for what
+that switch renders and for the forge identity it requires. Declared
+`services.tally.campaigns` remain Home Manager only on both paths.
 
 The timer only scans locally armed
 issue locators; an empty registry performs no work. A pass that advanced admits
@@ -317,12 +317,118 @@ to retain it for inspection. Set `TALLY_CAMPAIGN_E2E_DAEMON_MODE=host` to
 exercise an already deployed daemon whose protocol generation matches the
 package.
 
+## Campaigns on a NixOS host
+
+The single-operator deployment is Home Manager, and nothing below changes that.
+A host with no user session — a builder, a server, a machine nobody logs into —
+runs the system daemon instead, and that daemon can execute forge-native
+campaigns once two things are true: the campaign surface is rendered, and the
+service account has a forge identity.
+
+```nix
+services.tally = {
+  enable = true;
+
+  campaignForge = {
+    enable = true;
+    login = "tally-bot";
+    # A path, never a secret. Activation reads the file; the module never does,
+    # and nothing about the token enters the Nix store.
+    tokenFile = "/run/secrets/tally-campaign-forge-token";
+  };
+};
+```
+
+`campaignForge.enable` is the whole execution surface in one switch. It renders
+the generic campaign pools (`campaign`, `campaign-agent`, `campaign-control`,
+and `flow`), the packaged spec-build driver adapter, the fanout floor, and the
+`campaign-continuation` events-directory registry entry — exactly the surface
+`tally campaign arm` validates a host against before it spends agent time — and
+then installs `tally-campaign-poll.service` and its timer as system units owned
+by the service account. With the switch off, the module renders none of it, as
+before: a poll timer without pools, driver adapter, or identity would fire on
+schedule and fail every tick, which is worse than absent because it looks like a
+broken campaign rather than an unsupported one.
+
+Declared `services.tally.campaigns` stay Home Manager only, and the NixOS
+assertion still refuses them. A declared campaign is driven by a managed GitHub
+mention producer, and this module renders no producer units at all. The one
+registry entry it does carry, `campaign-continuation`, renders no unit anywhere:
+`tally-drain.timer` already drains that directory at the same cadence.
+
+### The identity
+
+This is the substantive difference between the two modules. A Home Manager
+campaign runs as the operator and inherits the operator's own authenticated
+`gh` and `git`. The system service account has neither, and every campaign job
+runs as that account: the driver opens and merges pull requests, the agent
+writes commits, the poll scan reads the issue graph. Campaign jobs are transient
+units in the account's own user manager, so a unit environment on the poll
+service would not reach them, and the shipped driver reads no `LoadCredential`.
+The account's home is therefore the identity, and activation materialises it:
+
+- The account's home moves from `/var/empty` to
+  `services.tally.campaignForge.homeDir` (`/var/lib/tally/forge` by default),
+  which is also where the campaign CLI's own XDG fallbacks resolve.
+- `~/.config/gh/hosts.yml`, mode `0600`, holds the declared login and the token
+  read from `tokenFile`. The token is piped to the identity writer on standard
+  input, so it is never a program argument and never a store path; the file it
+  comes from is read by root, so it needs no particular ownership.
+- `~/.gitconfig`, mode `0600`, binds the commit identity
+  (`campaignForge.gitUserName` and `gitUserEmail`, defaulting to the login and
+  its GitHub no-reply address) and a `gh auth git-credential` helper, so https
+  pushes authenticate with that same one copy of the token.
+
+Rotating the token is an ordinary activation: replace the file's contents and
+rebuild. The home stays writable for the driver adapter and the poll service
+because `gh` rewrites its own configuration file the first time it runs against
+a directory it did not write, and fails the call when it cannot.
+
+One first-deployment caveat: campaign jobs inherit `HOME` from the service
+account's user manager, and that manager reads the account record when it
+starts. On a host where the manager is already running — anything but a fresh
+boot — restart it once after the first activation that sets this option, so jobs
+see the new home rather than `/var/empty`:
+
+```console
+# systemctl restart user@"$(id -u tally)".service
+```
+
+The token needs the scopes a campaign actually uses: read the issue graph, push
+branches, open pull requests, and merge them. The campaign's checkout must be
+writable by the service account and must have an https `github.com` remote.
+
+An agent adapter hardened to `strict` or `production` needs the same home in its
+`extraWritablePaths`; the shipped driver adapter already declares it on this
+module.
+
+### Arming from the system host
+
+The registry lives under the system state directory, which is mode `0700` and
+owned by the service account, so `arm`, `disarm`, and `list` run as that
+account and must name the same state directory the poll unit scans. Passing a
+different one — or omitting `--state-dir`, which resolves through `HOME` — files
+a registration no timer will ever read.
+
+```console
+# runuser -u tally -- tally \
+    --config /etc/tally/config.json --socket /run/tally/tally.sock \
+    campaign arm --state-dir /var/lib/tally/state ISSUE-URL
+# runuser -u tally -- tally \
+    --config /etc/tally/config.json --socket /run/tally/tally.sock \
+    campaign list --state-dir /var/lib/tally/state
+```
+
+`services.tally.campaignPoll.interval` and `.timeout` mean what they mean on
+Home Manager; on this module they take effect only while `campaignForge.enable`
+is set.
+
 ## Configure a recurring campaign
 
-Campaigns are a Home Manager surface because their GitHub producer is a managed
-user service. The configured checkout must be writable by that user, have the
-named remote, and already have Git and `gh` authentication suitable for pushing,
-opening pull requests, and merging them.
+Declared campaigns are a Home Manager surface because their GitHub producer is a
+managed user service. The configured checkout must be writable by that user,
+have the named remote, and already have Git and `gh` authentication suitable for
+pushing, opening pull requests, and merging them.
 
 ```nix
 services.tally = {

@@ -546,14 +546,29 @@
             cmp core-option-keys.json home-option-keys.json
             jq -S '
               keys - [
+                "services.tally.campaignForge",
+                "services.tally.campaignForge.enable",
+                "services.tally.campaignForge.gitUserEmail",
+                "services.tally.campaignForge.gitUserName",
+                "services.tally.campaignForge.homeDir",
+                "services.tally.campaignForge.login",
+                "services.tally.campaignForge.tokenFile",
                 "services.tally.group",
                 "services.tally.user"
               ]
             ' "$nixos_json" > nixos-common-option-keys.json
             cmp core-option-keys.json nixos-common-option-keys.json
+            # The three options the NixOS module owns alone: the account the
+            # system service runs as, and the forge identity it acts as when it
+            # executes campaigns. Home Manager needs neither -- it runs as the
+            # operator and inherits the operator's own gh and git identity.
             jq -e '
               has("services.tally.group")
               and has("services.tally.user")
+              and has("services.tally.campaignForge.enable")
+              and has("services.tally.campaignForge.login")
+              and has("services.tally.campaignForge.tokenFile")
+              and has("services.tally.campaignForge.homeDir")
             ' "$nixos_json" >/dev/null
             jq -e '
               all(to_entries[];
@@ -1986,6 +2001,80 @@
             }
           ];
         };
+        # A NixOS host that executes forge-native campaigns. The token path is a
+        # path, never a secret: activation reads it, the module never does.
+        campaignNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            {
+              services.tally = {
+                enable = true;
+                campaignForge = {
+                  enable = true;
+                  login = "tally-fixture";
+                  tokenFile = "/run/secrets/tally-campaign-forge-token";
+                };
+                campaignPoll.interval = "4min";
+                campaignPoll.timeout = "2min";
+              };
+            }
+          ];
+        };
+        campaignPollDisabledNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            {
+              services.tally = {
+                enable = true;
+                campaignForge = {
+                  enable = true;
+                  login = "tally-fixture";
+                  tokenFile = "/run/secrets/tally-campaign-forge-token";
+                };
+                campaignPoll.enable = false;
+              };
+            }
+          ];
+        };
+        # The identity is not optional on this module, so an operator who turns
+        # the surface on without declaring one is refused at evaluation rather
+        # than by a timer that fails every tick.
+        anonymousCampaignNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            { services.tally.campaignForge.enable = true; }
+          ];
+        };
+        badLoginCampaignNixos = nixpkgs.lib.nixosSystem {
+          inherit system;
+          modules = [
+            self.nixosModules.tally
+            nixosBase
+            {
+              services.tally = {
+                enable = true;
+                campaignForge = {
+                  enable = true;
+                  login = "not a login";
+                  tokenFile = "/run/secrets/tally-campaign-forge-token";
+                };
+              };
+            }
+          ];
+        };
+        failedAssertionMessages =
+          evaluated:
+          builtins.map (entry: entry.message) (
+            builtins.filter (entry: !entry.assertion) evaluated.config.assertions
+          );
+        anonymousCampaignMessages = failedAssertionMessages anonymousCampaignNixos;
+        badLoginCampaignMessages = failedAssertionMessages badLoginCampaignNixos;
         unsupportedSystemNixos = nixpkgs.lib.nixosSystem {
           inherit system;
           modules = [
@@ -3333,6 +3422,11 @@
         checkedCampaignConfig = campaignHome.config.xdg.configFile."tally/config.json".source;
         systemServices = stockNixos.config.systemd.services;
         systemTimers = stockNixos.config.systemd.timers;
+        campaignSystemConfig = campaignNixos.config.services.tally;
+        campaignSystemServices = campaignNixos.config.systemd.services;
+        campaignSystemTimers = campaignNixos.config.systemd.timers;
+        campaignSystemActivation =
+          campaignNixos.config.system.activationScripts.tallyCampaignForgeIdentity.text;
         systemServiceExec = name: systemServices.${name}.serviceConfig.ExecStart;
         systemDaemon = systemServices.tally-daemon;
         systemWitnessEmitter = systemServices."tally-witness-emit@";
@@ -3462,8 +3556,93 @@
             "services.tally.flows must be empty in the NixOS module; configure flows with the Home Manager module (tally.homeManagerModules.tally)"
             unsupportedSystemMessages;
           assert builtins.elem
-            "services.tally.campaigns must be empty in the NixOS module; configure campaigns with the Home Manager module (tally.homeManagerModules.tally)"
+            "services.tally.campaigns must be empty in the NixOS module: a declared campaign is driven by a managed GitHub producer unit and only the Home Manager module renders producer units. Set services.tally.campaignForge.enable = true and arm forge-native campaigns with `tally campaign arm`, or configure declared campaigns with the Home Manager module (tally.homeManagerModules.tally)"
             unsupportedSystemMessages;
+          # The campaign execution surface on NixOS. A stock host renders none
+          # of it: the switch is off, so the module deploys the daemon exactly
+          # as it did before the option existed.
+          assert stockNixos.config.services.tally.campaignForge.enable == false;
+          assert stockNixos.config.services.tally.producers == { };
+          assert !(stockNixos.config.services.tally.pools ? campaign);
+          assert !(stockNixos.config.services.tally.pools ? campaign-agent);
+          assert !(stockNixos.config.services.tally.pools ? campaign-control);
+          assert !(stockNixos.config.services.tally.pools ? flow);
+          assert !(stockNixos.config.services.tally.adapters ? spec-build-driver);
+          assert !(systemServices ? tally-campaign-poll);
+          assert !(systemTimers ? tally-campaign-poll);
+          assert stockNixos.config.users.users.tally.home == "/var/empty";
+          # With the switch on, the host renders exactly what `tally campaign
+          # arm` validates a host against: the four pools, the driver adapter,
+          # and a fanout cap that admits a worst-case pass.
+          assert campaignSystemConfig.pools.campaign.resource == "mutex";
+          assert campaignSystemConfig.pools.campaign.capacity == 1;
+          assert campaignSystemConfig.pools.campaign-agent.resource == "slot";
+          assert campaignSystemConfig.pools.campaign-control.resource == "cpu-slot";
+          assert campaignSystemConfig.pools.flow.resource == "cpu-slot";
+          assert campaignSystemConfig.enqueue.fanoutCap == 64;
+          # The events directory the continuation payload is written into, plus
+          # the home the driver's own forge identity lives in: a hardened
+          # driver adapter has to keep both writable on a system host, because
+          # `gh` rewrites its own configuration file on first use.
+          assert
+            campaignSystemConfig.adapters.spec-build-driver.extraWritablePaths == [
+              "/var/lib/tally/forge"
+              "/var/lib/tally/state/events"
+            ];
+          assert
+            campaignSystemConfig.adapters.spec-build-driver.scrape.finalMessage.pattern
+            == "^TALLY_FINAL_MESSAGE=(.*)$";
+          # One registry entry, no producer unit: this module renders no
+          # producer units at all, and tally-drain.timer already drains that
+          # directory at the same cadence the entry declares.
+          assert campaignSystemConfig.producers.campaign-continuation.kind == "events-dir";
+          assert campaignSystemConfig.producers.campaign-continuation.selfDrain == false;
+          assert !(campaignSystemServices ? tally-producer-campaign-continuation);
+          assert !(campaignSystemTimers ? tally-producer-campaign-continuation);
+          assert campaignSystemTimers.tally-drain.timerConfig.OnUnitActiveSec == "5s";
+          # The continuation payload's directory exists before the first job
+          # that names it starts, on this module too.
+          assert pkgs.lib.hasInfix "/var/lib/tally/state/events" systemDaemon.serviceConfig.ExecStartPre;
+          assert pkgs.lib.hasInfix "/var/lib/tally/state/events"
+            stockNixos.config.system.activationScripts.tallyRuntimeDirectories.text;
+          # The poll units, with system-service paths.
+          assert campaignSystemServices.tally-campaign-poll.serviceConfig.User == "tally";
+          assert campaignSystemServices.tally-campaign-poll.serviceConfig.TimeoutStartSec == "2min";
+          assert
+            campaignSystemServices.tally-campaign-poll.serviceConfig.ReadWritePaths == [
+              "/var/lib/tally/state"
+              "/var/lib/tally/forge"
+            ];
+          assert
+            campaignSystemServices.tally-campaign-poll.serviceConfig.Environment == [
+              "HOME=/var/lib/tally/forge"
+            ];
+          assert campaignSystemTimers.tally-campaign-poll.timerConfig.OnUnitActiveSec == "4min";
+          assert campaignSystemTimers.tally-campaign-poll.timerConfig.Unit == "tally-campaign-poll.service";
+          assert !(campaignPollDisabledNixos.config.systemd.services ? tally-campaign-poll);
+          assert !(campaignPollDisabledNixos.config.systemd.timers ? tally-campaign-poll);
+          # The identity. The account gets a real home because campaign jobs are
+          # transient units in its own user manager and read gh and git
+          # configuration from HOME; the token is piped in from its declared
+          # path and appears nowhere in the store.
+          assert campaignNixos.config.users.users.tally.home == "/var/lib/tally/forge";
+          assert campaignNixos.config.users.users.tally.createHome;
+          assert pkgs.lib.hasInfix "--login tally-fixture" campaignSystemActivation;
+          assert pkgs.lib.hasInfix "--git-name tally-fixture" campaignSystemActivation;
+          assert pkgs.lib.hasInfix "--git-email tally-fixture@users.noreply.github.com"
+            campaignSystemActivation;
+          assert pkgs.lib.hasInfix "< /run/secrets/tally-campaign-forge-token" campaignSystemActivation;
+          assert builtins.elem
+            "services.tally.campaignForge.login must name the GitHub account the tally system service acts as; unlike the Home Manager module there is no ambient operator identity to inherit"
+            anonymousCampaignMessages;
+          assert builtins.elem
+            "services.tally.campaignForge.tokenFile must be the absolute path of a file holding that account's GitHub token; it is read at activation and never enters the Nix store"
+            anonymousCampaignMessages;
+          assert builtins.elem "services.tally.campaignForge.enable requires services.tally.enable"
+            anonymousCampaignMessages;
+          assert builtins.elem
+            "services.tally.campaignForge.login must be a GitHub login: alphanumerics and interior hyphens, at most 39 characters"
+            badLoginCampaignMessages;
           assert builtins.elem
             "services.tally.pools.<name>.usageMeter must be null in the NixOS module; configure usage meters with the Home Manager module (tally.homeManagerModules.tally)"
             unsupportedSystemMessages;
@@ -4853,6 +5032,10 @@
         }
         // pkgs.lib.optionalAttrs isLinux {
           stock-nixos-activation = stockNixos.config.system.build.toplevel;
+          # The campaign surface on a system host has to survive the same
+          # config check the daemon runs at load: campaign pools and the driver
+          # adapter are rendered here without a single declared flow.
+          campaign-nixos-activation = campaignNixos.config.system.build.toplevel;
           stock-host-activation = stockHostTest;
           system-socket-execution = systemSocketExecutionTest;
           retention-liveness-floor = retentionTest;

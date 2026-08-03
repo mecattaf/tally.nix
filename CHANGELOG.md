@@ -85,6 +85,39 @@ authorized.
 
 ### Added
 
+- **Campaigns on the NixOS module, identity first (#303).** The system module
+  deployed the daemon and asserted the campaign surface away, so a forge-native
+  campaign armed against a host with no user session had no pools, no driver
+  adapter, and nothing to dispatch into. `services.tally.campaignForge.enable`
+  now renders that whole execution surface in one switch — the `campaign`,
+  `campaign-agent`, `campaign-control`, and `flow` pools, the packaged
+  spec-build driver adapter, the fanout floor, the `campaign-continuation`
+  registry entry, and `tally-campaign-poll.service` with its timer as system
+  units. Off by default: a poll timer without the surface beneath it would fire
+  on schedule and fail every tick, which is worse than absent.
+
+  The identity is the substance. Home Manager campaigns inherit the operator's
+  own authenticated `gh` and `git`; a system service account has neither, and
+  every campaign job — the driver's pull requests and merges, the agent's
+  commits, the poll scan — runs as that account in its own user manager, where
+  a unit environment does not reach and the shipped driver reads no
+  `LoadCredential`. So the account gets a real home
+  (`campaignForge.homeDir`, `/var/lib/tally/forge` by default) and activation
+  materialises exactly two `0600` files in it: a `gh` hosts file holding the
+  declared `login` and the token read from `campaignForge.tokenFile`, and a
+  `.gitconfig` binding the commit identity and a `gh auth git-credential`
+  helper. The token is piped to the identity writer on standard input, so it is
+  never a program argument and never enters the Nix store, and the file it is
+  read from needs no particular ownership. Enabling the surface without a login
+  or a token file is refused at evaluation.
+
+  Declared `services.tally.campaigns` stay Home Manager only and the assertion
+  still refuses them, now saying why: they are driven by a managed GitHub
+  producer unit, and this module renders no producer units. The one entry it
+  does carry, `campaign-continuation`, renders no unit anywhere — `tally-drain`
+  already drains that directory — and the daemon now creates
+  `<stateDir>/events` on both modules alike.
+
 - **A witnessed successor path for fatal replay divergence (#251).** Replay
   identity refusals are correct, but a refusal alone was not a recovery: a
   supervised runner that persists one `flowRunId` per work item and retries it
