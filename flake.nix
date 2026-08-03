@@ -1497,9 +1497,13 @@
         # the exact failure an out-of-repo configuration written before gate
         # kinds became mandatory hits on its next deploy, and it is the
         # migration the CHANGELOG names, so the fixture set has to contain it.
-        # It is kept out of the list above because forcing it throws rather
-        # than yielding an assertion message, which would take the readable
-        # messages with it.
+        # It is kept out of the list above, and out of `invalidCampaignHome`,
+        # because forcing it throws rather than yielding an assertion message:
+        # a fixture carrying it fails at the option system before Home
+        # Manager's assertion machinery runs, so it would take every readable
+        # campaign-gate message down with it and leave
+        # `!invalidCampaignAttempt.success` green even if the campaign-gate
+        # assertions were unwired from the module entirely.
         missingKindCampaignGate = {
           id = "no-kind";
           # no-op-probe-allowed: this gate exists to be refused for the one
@@ -1514,7 +1518,6 @@
         suppliedKindCampaignGate = missingKindCampaignGate // {
           kind = "command";
         };
-        invalidCampaignGates = invalidCampaignGateFields ++ [ missingKindCampaignGate ];
         invalidCampaignHome = home-manager.lib.homeManagerConfiguration {
           inherit pkgs;
           modules = [
@@ -1530,7 +1533,10 @@
                 campaigns.invalid = {
                   enable = true;
                   repositories."acme/spec".checkout = "/tmp/spec";
-                  gates = invalidCampaignGates;
+                  # Only the field fixtures. This activation is what proves the
+                  # campaign-gate assertions are wired into Home Manager at all,
+                  # and it can only prove that by failing *as an assertion*.
+                  gates = invalidCampaignGateFields;
                 };
               };
             }
@@ -4554,6 +4560,32 @@
                 default_mention="$(jq -r \
                   '.producers["campaign-defaulted"].triggers.mentions[0]' \
                   "$checkedConfig")"
+                # And the default itself is pinned, because #319 made it a
+                # back-compat contract: it is deliberately left naming a real,
+                # unrelated GitHub account so that campaigns relying on it do
+                # not silently lose their trigger grammar, and a promise nothing
+                # checks is not a promise. Retiring it is a release-boundary
+                # decision, and this pin is what makes that decision explicit
+                # rather than a diff nobody noticed.
+                #
+                # The pin is the digest and not the literal on purpose. #319's
+                # first acceptance criterion is that grepping this file and
+                # doc/ for the account that default names returns nothing, and
+                # a pin that spelled it would fail that criterion in the act of
+                # protecting it. The digest moves if and only if the default
+                # does; the CHANGELOG carries the literal, which is outside
+                # that grep's scope and is where a migrating operator looks.
+                default_mention_sha256="$(printf '%s' "$default_mention" \
+                  | sha256sum | cut -d' ' -f1)"
+                if [ "$default_mention_sha256" != \
+                  "bd13b18429fdb18e7b981e1a552dd2c97d375fc33557e59855616d4e6b956d2d" ]; then
+                  echo "the shipped campaigns.<name>.mention default changed" >&2
+                  echo "  rendered digest: $default_mention_sha256" >&2
+                  echo "  if that change is intended, update this pin and give" >&2
+                  echo "  the CHANGELOG the migration note the old default is" >&2
+                  echo "  owed; if it is not, the module default regressed" >&2
+                  exit 1
+                fi
                 default_event="$(printf '%s' \
                   '{"kind":"gh","source":"search","repo":"acme/spec","number":6,"htmlUrl":"https://github.com/acme/spec/issues/6","itemType":"issue","nodeId":"I-campaign-6","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-6","commentId":"comment-6","triggerTimestamp":"2026-07-31T08:59:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["campaign"],"assignees":[],"triggeringComment":{"id":"comment-6","author":"operator","body":"PLACEHOLDER"}}}' \
                   | jq -c --arg mention "$default_mention" \

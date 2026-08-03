@@ -8,6 +8,36 @@ authorized.
 
 ### Fixed
 
+- **Three post-merge repairs on the campaigns docs batch (#319 repair).** The
+  kind-less gate fixture #319 added was also concatenated into the Home Manager
+  fixture whose whole job is to fail *as an assertion*. Because `kind` is an
+  enum with no default, forcing that gate throws at the option system before
+  Home Manager's assertion machinery runs, so `invalidCampaignHome` started
+  failing for the missing field instead of for the two gate assertions the check
+  is named after — leaving `assert !invalidCampaignAttempt.success` green even
+  if the campaign-gate assertions were unwired from the module entirely. That
+  fixture is back on the field-fixture list alone; `missingKindCampaignAttempt`
+  and its `kind = "command"` control keep the kind-less coverage, and the Home
+  Manager activation once again fails with `tally campaign gate … fields must
+  agree with kind` and the `'**'`-component message.
+
+  The continuation passages named three of the five conditions that write a
+  continuation event. The flow writes one when a task merged, a checkpoint
+  passed, machine steering was published, **a machinery retry was posted, or a
+  checkpoint deferred** — and the last two are exactly the passes that produced
+  no completion, so a reader could conclude that a lane which only faulted stops
+  the campaign, the opposite of the behaviour. All four prose sites now match
+  the flow's own `advanced` predicate and the file's pseudocode.
+
+  `services.tally.campaigns.<name>.mention` is a back-compat contract this
+  changelog declared load-bearing and nothing checked. `checks.campaign-render`
+  now pins it, so a silent change to the shipped default is caught and retiring
+  it stays a deliberate release-boundary decision. The pin is the digest of the
+  rendered default rather than the literal, because `grep -rn "@tally" doc/
+  flake.nix` returning nothing is an acceptance criterion of #319 and that file
+  is in its scope; the digest moves if and only if the default does, and the
+  failure message says what to do either way.
+
 - **The campaign mention example no longer at-mentions a real, unrelated GitHub
   account (#246).** `mention = "@tally build"` was the copyable literal in
   `doc/src/flows/campaigns.md` and in the shipped flake fixtures. tally matches
