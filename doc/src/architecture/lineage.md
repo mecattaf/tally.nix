@@ -129,8 +129,8 @@ rulings implemented only the parts that fit the single-operator system:
 That narrower shipped ruling is recorded in the
 [plain-schema witness chapter](https://github.com/mecattaf/tally.nix/blob/4c85563a3899369f1aa4905f44e9806e424593f1/doc/witness.md): one in-place
 `witness.jsonl` and predecessor archives inert. That chapter also recorded a
-rebuildable TaskChampion view; the view has since been deleted outright, and the
-durable store it projected is unchanged.
+rebuildable third-party task-database view; the view has since been deleted
+outright, and the durable store it projected is unchanged.
 It supersedes the briefs' “later witness version” speculation; the source notes are
 preserved because they explain the questions, not because their deferred designs
 remain promised.

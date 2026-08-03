@@ -1108,8 +1108,12 @@ let
         mentions = mkOption {
           type = types.listOf types.str;
           default = [ ];
-          example = [ "@tally run" ];
-          description = "Exact explicit mention-command grammar.";
+          example = [ "@your-login run" ];
+          description = ''
+            Exact explicit mention-command grammar. Matched literally, but the
+            comment that carries it at-mentions whoever it names on GitHub, so
+            name an account that belongs to this deployment.
+          '';
         };
         assignments = mkOption {
           type = types.listOf types.str;
@@ -2099,8 +2103,18 @@ let
         mention = mkOption {
           type = types.str;
           default = "@tally build";
-          example = "@tally build";
-          description = "Exact mention comment that starts one bounded campaign reconcile pass.";
+          example = "@your-login build";
+          description = ''
+            Exact mention comment that starts one bounded campaign reconcile
+            pass. tally matches this string literally, but the comment carrying
+            it is a real comment on a real issue, so GitHub resolves every
+            `@name` in it. Name your own login — or the bot's, under a bot
+            identity — and never a third party's. **Override the default**: it
+            names an unrelated real GitHub account, which every trigger on a
+            campaign that keeps it notifies. Nothing about the mechanism
+            requires the mention form; a token with no `@` is a perfectly good
+            trigger grammar.
+          '';
         };
         allowSelfTriggered = mkOption {
           type = types.bool;
@@ -2108,9 +2122,10 @@ let
           example = true;
           description = ''
             Explicitly allow the operator-facing campaign mention when its
-            actor is the authenticated GitHub identity. The exact
-            merge-continuation command uses a separate producer that always
-            permits authenticated self-triggering.
+            actor is the authenticated GitHub identity. This governs the human
+            trigger surface only: a campaign's own next-pass continuation is a
+            local events-directory drop admitted by the shipped drain, not a
+            comment this or any other gh producer polls back.
           '';
         };
         allowedActors = mkOption {
@@ -2416,9 +2431,11 @@ let
           example = 82800;
           description = ''
             Optional deadline for one bounded reconcile-pass runner. Null
-            leaves the fixed 24-hour evaluator budget as its safety boundary;
-            campaign continuation lives in marked pull requests and issue
-            comments, not this run.
+            leaves the fixed 24-hour evaluator budget as its safety boundary.
+            The deadline bounds one pass, not the campaign: durable completion
+            lives in marked pull requests and checkpoint refs, steering in
+            marked issue comments, and the next pass is admitted from a
+            continuation event this run writes before it exits.
           '';
         };
         pool.name = mkOption {
@@ -3008,9 +3025,12 @@ let
               default = true;
               description = ''
                 Install the timer that reconciles locally armed forge-native
-                campaigns. This timer is the continuation mechanism for
-                forge-native campaigns: they post no continuation comment, so
-                disabling it makes every pass after the first one manual.
+                campaigns. A pass that advanced admits its own successor
+                through the events directory, so this timer is the recovery
+                path for a lost continuation event and the way an outside
+                change to the issue graph is noticed — not the ordinary way a
+                campaign reaches its next pass. Disabling it leaves a campaign
+                that dropped its continuation with no automatic way back.
               '';
             };
             interval = mkOption {

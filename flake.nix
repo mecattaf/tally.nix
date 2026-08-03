@@ -1244,7 +1244,10 @@
                   enable = true;
                   repositories."acme/spec".checkout = toString ./test/fixtures/spec-build/repo;
                   label = "spec-campaign";
-                  mention = "@tally build";
+                  # A mention token is posted as a real comment and at-mentions
+                  # whoever it names, so the fixture names the campaign's own
+                  # trusted actor rather than an unrelated real account.
+                  mention = "@operator build";
                   allowSelfTriggered = true;
                   allowedActors = [ "operator" ];
                   pollIntervalSec = 17;
@@ -1468,7 +1471,9 @@
             }
           ];
         };
-        invalidCampaignGates = [
+        # Gate fixtures that evaluate cleanly and are then rejected by a named
+        # assertion, so `mkAssertions` can be read for the message.
+        invalidCampaignGateFields = [
           {
             kind = "command";
             id = "mixed";
@@ -1486,6 +1491,30 @@
             forbidPaths = [ "src/**.db" ];
           }
         ];
+        # `kind` is an enum with no default, so a gate that omits it is refused
+        # one layer earlier than an assertion: the option system itself throws
+        # "The option `...kind' was accessed but has no value defined." That is
+        # the exact failure an out-of-repo configuration written before gate
+        # kinds became mandatory hits on its next deploy, and it is the
+        # migration the CHANGELOG names, so the fixture set has to contain it.
+        # It is kept out of the list above because forcing it throws rather
+        # than yielding an assertion message, which would take the readable
+        # messages with it.
+        missingKindCampaignGate = {
+          id = "no-kind";
+          # no-op-probe-allowed: this gate exists to be refused for the one
+          # field it omits, so nothing here ever runs and a representative
+          # probe would only obscure what the fixture tests.
+          preflightArgv = [ "true" ];
+          argv = [ "true" ];
+        };
+        # The same gate with the one missing field supplied. It is the control:
+        # without it, the refusal below would be evidence only that *something*
+        # about the fixture is wrong.
+        suppliedKindCampaignGate = missingKindCampaignGate // {
+          kind = "command";
+        };
+        invalidCampaignGates = invalidCampaignGateFields ++ [ missingKindCampaignGate ];
         invalidCampaignHome = home-manager.lib.homeManagerConfiguration {
           inherit pkgs;
           modules = [
@@ -1934,11 +1963,35 @@
               };
               config.services.tally.campaigns.invalid = {
                 repositories."acme/spec".checkout = "/tmp/spec";
-                gates = invalidCampaignGates;
+                gates = invalidCampaignGateFields;
               };
             }
           ];
         };
+        mkCampaignGateSchema =
+          gates:
+          pkgs.lib.evalModules {
+            modules = [
+              {
+                options.services.tally = moduleCommon.mkOptions {
+                  defaultPackage = tally;
+                  defaultDataDir = "/tmp/tally-data";
+                  defaultStateDir = "/tmp/tally-state";
+                };
+                config.services.tally.campaigns.invalid = {
+                  repositories."acme/spec".checkout = "/tmp/spec";
+                  inherit gates;
+                };
+              }
+            ];
+          };
+        forceCampaignGates =
+          schema:
+          builtins.tryEval (builtins.deepSeq schema.config.services.tally.campaigns.invalid.gates true);
+        missingKindCampaignAttempt = forceCampaignGates (mkCampaignGateSchema [ missingKindCampaignGate ]);
+        suppliedKindCampaignAttempt = forceCampaignGates (mkCampaignGateSchema [
+          suppliedKindCampaignGate
+        ]);
         nonCommittingCampaignSchema = pkgs.lib.evalModules {
           modules = [
             {
@@ -4117,7 +4170,7 @@
                   .producers["campaign-fixture"].sources[0].search.labels == ["spec-campaign"] and
                   .producers["campaign-fixture"].sources[0].search.state == "open" and
                   .producers["campaign-fixture"].sources[0].search.kinds == ["issue"] and
-                  .producers["campaign-fixture"].triggers.mentions == ["@tally build"] and
+                  .producers["campaign-fixture"].triggers.mentions == ["@operator build"] and
                   .producers["campaign-fixture"].allowSelfTriggered == true and
                   .producers["campaign-fixture"].allowedActors == ["operator"] and
                   .producers["campaign-fixture"].pollIntervalSec == 17 and
@@ -4492,7 +4545,19 @@
                   refs/heads/tally/fixture-issue-7/task-1 | cut -f1)" = \
                   "$witnessed_head"
 
-                default_event='{"kind":"gh","source":"search","repo":"acme/spec","number":6,"htmlUrl":"https://github.com/acme/spec/issues/6","itemType":"issue","nodeId":"I-campaign-6","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-6","commentId":"comment-6","triggerTimestamp":"2026-07-31T08:59:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["campaign"],"assignees":[],"triggeringComment":{"id":"comment-6","author":"operator","body":"@tally build"}}}'
+                # `campaigns.defaulted` declares no mention, so its trigger
+                # grammar is whatever the module ships. Reading that grammar
+                # back out of the rendered config keeps the event honest under a
+                # future default change and keeps this file from repeating a
+                # mention literal, which is a live GitHub at-mention wherever it
+                # is copied from.
+                default_mention="$(jq -r \
+                  '.producers["campaign-defaulted"].triggers.mentions[0]' \
+                  "$checkedConfig")"
+                default_event="$(printf '%s' \
+                  '{"kind":"gh","source":"search","repo":"acme/spec","number":6,"htmlUrl":"https://github.com/acme/spec/issues/6","itemType":"issue","nodeId":"I-campaign-6","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-6","commentId":"comment-6","triggerTimestamp":"2026-07-31T08:59:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["campaign"],"assignees":[],"triggeringComment":{"id":"comment-6","author":"operator","body":"PLACEHOLDER"}}}' \
+                  | jq -c --arg mention "$default_mention" \
+                    '.context.triggeringComment.body = $mention')"
                 mkdir -p "$TMPDIR/data"
                 default_dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
                   __producer-dispatch campaign-defaulted --state-dir "$TMPDIR/state" \
@@ -4501,7 +4566,7 @@
                 test "$(printf '%s' "$default_dispatch" | jq -r '.filtered.reason')" = \
                   self-trigger-disabled
 
-                event='{"kind":"gh","source":"search","repo":"acme/spec","number":7,"htmlUrl":"https://github.com/acme/spec/issues/7","itemType":"issue","nodeId":"I-campaign-7","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-7","commentId":"comment-7","triggerTimestamp":"2026-07-31T09:00:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["spec-campaign"],"assignees":[],"triggeringComment":{"id":"comment-7","author":"operator","body":"@tally build"}}}'
+                event='{"kind":"gh","source":"search","repo":"acme/spec","number":7,"htmlUrl":"https://github.com/acme/spec/issues/7","itemType":"issue","nodeId":"I-campaign-7","itemAuthor":"operator","triggerActor":"operator","selfActor":"operator","triggerKind":"mention","eventId":"comment-7","commentId":"comment-7","triggerTimestamp":"2026-07-31T09:00:00Z","context":{"schemaVersion":2,"title":"Build the frozen spec","body":"The work lives in the spec repository.","state":"open","labels":["spec-campaign"],"assignees":[],"triggeringComment":{"id":"comment-7","author":"operator","body":"@operator build"}}}'
                 dispatch="$(${tally}/bin/tally --config "$checkedConfig" \
                   __producer-dispatch campaign-fixture --state-dir "$TMPDIR/state" \
                   --data-dir "$TMPDIR/data" \
@@ -4690,9 +4755,13 @@
               ''
                 # tally-campaign-poll.timer ships, so the campaign docs must
                 # not carry the unscoped claim that no periodic campaign timer
-                # exists. Module-declared campaigns continue via their own
-                # /tally reconcile comment and forge-native ones via the timer;
-                # a blanket denial is true of neither path.
+                # exists. Since #306 both campaign classes continue themselves
+                # through a JSON drop in the shipped events directory, and this
+                # timer is the recovery path for a lost continuation event plus
+                # the way an outside edit to an armed issue graph is noticed. A
+                # blanket denial is false of that arrangement too, and a drift
+                # check whose own rationale describes a deleted mechanism is
+                # exactly what the next reader trusts.
                 if rg -n 'there is no periodic campaign timer' \
                   ${./doc/src/flows/campaigns.md}; then
                   echo "campaigns.md contradicts the shipped tally-campaign-poll.timer" >&2
@@ -4964,6 +5033,13 @@
             assert builtins.any (
               message: nixpkgs.lib.hasInfix "use '**' only as a complete path component" message
             ) invalidCampaignMessages;
+            # A gate that omits `kind` is refused by the option system rather
+            # than by an assertion, so it is proved by evaluation failure and
+            # not by a message. The control below is what makes that failure
+            # mean "the missing kind" and not "something about this fixture":
+            # the same gate with `kind = "command"` supplied evaluates.
+            assert !missingKindCampaignAttempt.success;
+            assert suppliedKindCampaignAttempt.success;
             assert !invalidCampaignAttempt.success;
             pkgs.runCommand "tally-campaign-gates-rejected" { } ''
               touch "$out"

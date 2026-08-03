@@ -8,6 +8,81 @@ authorized.
 
 ### Fixed
 
+- **The campaign mention example no longer at-mentions a real, unrelated GitHub
+  account (#246).** `mention = "@tally build"` was the copyable literal in
+  `doc/src/flows/campaigns.md` and in the shipped flake fixtures. tally matches
+  that token literally, but the comment carrying it is a real comment on a real
+  issue, so GitHub resolved `@tally` — an account with nothing to do with this
+  project — and notified it on every trigger of every campaign that copied the
+  block. The documented example is now `@<your-login> build` with an explicit
+  warning that the token is a live GitHub mention, that it must never name a
+  third party, and that naming your own login is what composes with
+  `allowSelfTriggered` and `allowedActors`. The flake's campaign fixture and
+  its intake event fixtures move in lockstep to `@operator build`, matching the
+  `operator` trigger actor those events already declare, and the fixture that
+  exercises the shipped defaults now reads its trigger grammar back out of the
+  rendered config instead of repeating a mention literal.
+
+  **Migration:** `services.tally.campaigns.<name>.mention` still *defaults* to
+  `@tally build`, because changing it would silently retire the trigger grammar
+  of every deployed campaign that relies on the default. Set it explicitly to
+  your own login — or to a token with no `@` at all, which is an equally valid
+  trigger grammar — on every campaign. The option's own description now says
+  so, and the same warning was added to the generic
+  `producers.<name>.triggers.mentions` example.
+
+- **The campaign gate `kind` migration is named, and an omitted `kind` is now a
+  fixture (#276 finding 3).** The entry recording that gate kinds "are now
+  explicit" never said that `kind` is a *required* field on every entry of
+  `services.tally.campaigns.<name>.gates`, with no default, so an out-of-repo
+  configuration written before the change fails evaluation with `The option
+  '…gates."[definition 1-entry 1]".kind' was accessed but has no value defined`
+  and nothing pointed at the cause.
+
+  **Migration:** add `kind = "command"` to every gate that declares
+  `preflightArgv`/`argv` and `kind = "forbidPaths"` to every gate that declares
+  `forbidPaths`; the two field sets may not be mixed. The refusal is now
+  proved rather than asserted in prose: `checks.campaign-gates-rejected` carries
+  a gate that omits `kind`, requires its evaluation to fail, and requires the
+  byte-identical gate with `kind = "command"` supplied to evaluate — so the
+  failure means the missing field and not some other defect of the fixture.
+  Eval-only; no flow node, and `campaignMaxNodes`/`max_flow_nodes` is untouched
+  at 51.
+
+- **Campaign docs no longer describe the machine self-continuation as a GitHub
+  comment (#306 follow-up).** A campaign's next-pass nudge became a JSON drop in
+  the shipped events directory, but `campaigns.md` still documented a
+  "pass-continuation producer" that "matches only the exact continuation
+  command", listed the continuation among the receipts a split campaign's
+  `issueRepository` carries, and said the projection switches were inherited by
+  a second producer that no longer exists. Three option descriptions carried the
+  same stale mechanism — `allowSelfTriggered` pointed at the deleted producer,
+  `campaigns.<name>.runtimeMaxSec` said continuation "lives in marked pull
+  requests and issue comments", and `campaignPoll.enable` called the timer the
+  continuation mechanism rather than the recovery path for a lost event. The
+  `campaign-timer-doc-drift` check's own rationale explained itself in terms of
+  the deleted `/tally reconcile` comment, which is exactly the kind of thing the
+  next reader trusts.
+
+- **`campaigns.md` now states how a forge-native checkpoint receipt binds
+  (#297 finding 5).** That finding recorded checkpoints as silently unavailable
+  to forge-native campaigns; #295 typed them end to end instead, so what was
+  missing was the receipt contract. A new section states that the receipt
+  identity is `<task>-<source digest>/<base revision>`, that the digest half is
+  the admitted executable-graph digest a forge-native pass refuses to run
+  without, that the revision half is re-resolved from the freshly fetched base
+  on every pass, and what each half moving does: a moved base re-executes the
+  checkpoint at the new revision, a re-armed graph edit invalidates every
+  receipt at once, and base movement *during* a checkpoint publishes the
+  truthful receipt and then fails the lane.
+
+- **The TaskChampion projection is out of the book.** The removal and its
+  migration note stay in this file, which is where a reader migrating a
+  version-2 `query.storage` consumer should look; the mentions that survived
+  across `doc/src/` are now written in terms of what remains — the inert
+  `taskdata/` directories an operator may reclaim, and the section
+  `schemaVersion` 3 no longer carries.
+
 - **The preflight witness no longer mutates the base a later gate's probe is
   judged against (#320 repair).** #320 ran each command gate's non-gating
   real-`argv` witness immediately after that gate's own probe, so for two or more
