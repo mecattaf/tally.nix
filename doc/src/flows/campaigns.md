@@ -567,10 +567,14 @@ allowlist.
 
 Neither switch governs the machine's own next-pass nudge, and that is the
 point: a campaign no longer continues itself through this producer at all. A
-pass that merged work, passed a checkpoint, or published machine steering drops
-a JSON enqueue payload into the daemon's events directory, which the shipped
-drain admits — no comment is posted, no forge round trip is on the critical
-path, and nothing about external campaign admission is widened. The single
+pass that advanced drops a JSON enqueue payload into the daemon's events
+directory, which the shipped drain admits — no comment is posted, no forge round
+trip is on the critical path, and nothing about external campaign admission is
+widened. Advancing means any of five things: a task merged, a checkpoint passed,
+machine steering was published, a machinery retry was posted, or a checkpoint
+deferred. The last two matter most, because they are the passes that produced no
+completion at all: a lane that only faulted, or a checkpoint that only deferred,
+still has to reach its next attempt. The single
 `producers.campaign-continuation` events-dir entry described below is that
 mechanism; the mention producer these two switches configure remains the human,
 remote trigger surface.
@@ -679,9 +683,8 @@ One enabled attrset expands to all of the following:
 One further mechanism is installed once for the whole host rather than per
 campaign: `producers.campaign-continuation`, an `events-dir` registry entry
 declaring the contract that the machine self-continuation every campaign class
-writes — after a pass merges work, passes a checkpoint, or publishes machine
-steering — is an events-directory enqueue payload. It is not per-campaign
-state, so arming still requires no Nix change.
+writes — after any pass that advanced — is an events-directory enqueue payload.
+It is not per-campaign state, so arming still requires no Nix change.
 
 That entry renders no unit of its own: it carries `selfDrain = false`, and the
 shipped `tally-drain.timer` is the single drainer. Every tally home already ran
@@ -705,8 +708,9 @@ The producer posts its receipt and witnessed evidence. Under the degraded
 projection, each merge and passed checkpoint repairs its own worklist checkbox
 and a passed checkpoint posts an idempotently marked progress comment; under
 the native sub-issue projection neither is written. Once task execution,
-integration, and diagnosis settle, a pass that merged work, passed a checkpoint,
-or published machine steering writes its continuation payload from one separate
+integration, and diagnosis settle, a pass that merged a task, passed a
+checkpoint, published machine steering, posted a machinery retry, or deferred a
+checkpoint writes its continuation payload from one separate
 node. That node writes no comment: the file lands in the events directory under
 a name and `dedupKey` derived from this pass's identity, and the drain admits a
 fresh pass behind the campaign mutex. Neither the producer nor the drain closes
@@ -1649,8 +1653,9 @@ the same forge facts before dispatch.
 
 Each pass contains at most one bounded frontier, so the fixed 24-hour evaluator
 budget no longer measures the whole campaign. Both campaign classes continue the
-same way and neither posts a public self-nudge: a pass that merges, checkpoints,
-or diagnoses a failure writes one bounded JSON enqueue payload into the daemon's
+same way and neither posts a public self-nudge: a pass that merges a task,
+passes a checkpoint, diagnoses a failure, posts a machinery retry, or defers a
+checkpoint writes one bounded JSON enqueue payload into the daemon's
 events directory, and the 5s drain admits the next pass. A module-declared pass
 writes its own flow-run argv under a derived run identity; a forge-native pass
 writes the same registry scan the timer runs, so the next pass inherits the
