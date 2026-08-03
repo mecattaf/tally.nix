@@ -1257,7 +1257,19 @@
                     {
                       kind = "command";
                       id = "content";
-                      preflightArgv = [ "/bin/true" ];
+                      # A fixture is copied, so it must not model a no-op probe.
+                      # This one exercises what the gate below actually needs --
+                      # the interpreter the gate argv names -- and asserts that
+                      # the subject the gate tests for is genuinely absent on
+                      # the pristine base, so a green post-change gate is proof
+                      # the agent built it rather than proof it was always
+                      # there.
+                      preflightArgv = [
+                        "/bin/sh"
+                        "-eu"
+                        "-c"
+                        "test -x /bin/sh; test ! -d build"
+                      ];
                       argv = [
                         "/bin/sh"
                         "-eu"
@@ -1330,7 +1342,12 @@
                     {
                       kind = "command";
                       id = "content";
-                      preflightArgv = [ "/bin/true" ];
+                      preflightArgv = [
+                        "/bin/sh"
+                        "-eu"
+                        "-c"
+                        "test -x /bin/true"
+                      ];
                       argv = [ "/bin/true" ];
                     }
                   ];
@@ -1345,7 +1362,12 @@
                     {
                       kind = "command";
                       id = "content";
-                      preflightArgv = [ "/bin/true" ];
+                      preflightArgv = [
+                        "/bin/sh"
+                        "-eu"
+                        "-c"
+                        "test -x /bin/true"
+                      ];
                       argv = [ "/bin/true" ];
                     }
                   ];
@@ -1923,7 +1945,12 @@
                     {
                       kind = "command";
                       id = "content";
-                      preflightArgv = [ "/bin/true" ];
+                      preflightArgv = [
+                        "/bin/sh"
+                        "-eu"
+                        "-c"
+                        "test -x /bin/true"
+                      ];
                       argv = [ "/bin/true" ];
                     }
                   ];
@@ -1952,7 +1979,12 @@
                   {
                     kind = "command";
                     id = "content";
-                    preflightArgv = [ "/bin/true" ];
+                    preflightArgv = [
+                      "/bin/sh"
+                      "-eu"
+                      "-c"
+                      "test -x /bin/true"
+                    ];
                     argv = [ "/bin/true" ];
                   }
                 ];
@@ -3492,9 +3524,10 @@
           # implementations of one budget, and nothing else makes them agree.
           # The fixture campaign has the shape the CLI unit test uses --
           # maxParallel 3, two gates, one of them a command gate -- so both
-          # sides must land on 51. Drift on either side breaks a test rather
-          # than silently capping a run below its own worst case.
-          assert campaignHome.config.services.tally.flows.fixture.maxNodes == 51;
+          # sides must land on 3 + (2 + 2*1) + 3*(11 + 2*2) = 52. Drift on
+          # either side breaks a test rather than silently capping a run below
+          # its own worst case.
+          assert campaignHome.config.services.tally.flows.fixture.maxNodes == 52;
           # The generated producer's projection literals are mkDefault: an
           # ordinary estate override wins without mkForce, and every campaign
           # that states no opinion keeps the shipped defaults bit for bit.
@@ -4001,7 +4034,8 @@
                   $fixtureArgs.agent.sandboxPolicy == null and
                   $fixtureArgs.agent.diagnosisSandboxPolicy == null and
                   $fixtureArgs.gates[0].kind == "command" and
-                  $fixtureArgs.gates[0].preflightArgv == ["/bin/true"] and
+                  $fixtureArgs.gates[0].preflightArgv ==
+                    ["/bin/sh", "-eu", "-c", "test -x /bin/sh; test ! -d build"] and
                   $fixtureArgs.gates[0].runtimeMaxSec == 900 and
                   ($fixtureArgs.gates[0] | has("forbidPaths") | not) and
                   $fixtureArgs.gates[1].kind == "forbidPaths" and
@@ -4073,7 +4107,7 @@
                   .producers["campaign-fixture"].enqueue.argv[0:3] == [
                     "${tally}/bin/tally", "flow", "run"
                   ] and
-                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "51"] and
+                  .producers["campaign-fixture"].enqueue.argv[4:7] == ["--args-from-brief", "--max-nodes", "52"] and
                   ([.producers | keys[] | select(test("reconcile"))] == []) and
                   ([.producers | keys[] | select(startswith("campaign-"))]
                     == [
@@ -4461,7 +4495,7 @@
                   .maxTasks == 7 and
                   .maxParallel == 3 and
                   (.continuation.argv | index("--args-from-brief")) == 4 and
-                  .continuation.argv[6] == "51" and
+                  .continuation.argv[6] == "52" and
                   .continuation.pool == ["flow", "fixture-campaign"] and
                   .continuation.priority == "low" and
                   (.continuation.eventsDir | endswith("/events")) and
@@ -4476,7 +4510,8 @@
                   .agent.diagnosisSandboxPolicy == null and
                   [.gates[].id] == ["content", "no-db-artifacts"] and
                   .gates[0].kind == "command" and
-                  .gates[0].preflightArgv == ["/bin/true"] and
+                  .gates[0].preflightArgv ==
+                    ["/bin/sh", "-eu", "-c", "test -x /bin/sh; test ! -d build"] and
                   .gates[0].argv == ["/bin/sh", "-eu", "-c", "test -d build"] and
                   .gates[0].runtimeMaxSec == 900 and
                   (.gates[0] | has("forbidPaths") | not) and
@@ -4633,6 +4668,49 @@
                 if rg -n 'there is no periodic campaign timer' \
                   ${./doc/src/flows/campaigns.md}; then
                   echo "campaigns.md contradicts the shipped tally-campaign-poll.timer" >&2
+                  exit 1
+                fi
+                touch "$out"
+              '';
+          campaign-preflight-probe-drift =
+            pkgs.runCommand "tally-campaign-preflight-probe-drift" { nativeBuildInputs = [ pkgs.ripgrep ]; }
+              ''
+                # The copyable blocks are what an operator pastes, and a probe
+                # that only asks a tool for its version is exactly what this
+                # document's own warning calls insufficient. A `/bin/true`
+                # fixture probe teaches the same no-op by example.
+                if rg -n 'cargo --version|cargo fmt --version' \
+                  ${./doc/src/flows/campaigns.md}; then
+                  echo "campaigns.md still ships a version-only preflight probe" >&2
+                  exit 1
+                fi
+                # The needle is assembled here rather than written out, so
+                # this guard cannot satisfy itself by matching its own source.
+                noop="/bin/""true"
+                if rg -nF "preflightArgv = [ \"$noop\" ]" ${./flake.nix}; then
+                  echo "flake.nix still ships a no-op preflight probe" >&2
+                  exit 1
+                fi
+                # The replacements have to be present, not merely the absence
+                # of the bad ones: a probe that reaches the compiler driver and
+                # resolves the workspace offline, and one that makes rustfmt
+                # format something. The shipped Nix fixture's own replacement is
+                # asserted against the rendered campaign args in
+                # checks.campaign-render, which is stronger than a grep.
+                if ! rg -qF \
+                  'command -v cargo >/dev/null; command -v cc >/dev/null; cargo metadata --offline --format-version 1 >/dev/null' \
+                  ${./doc/src/flows/campaigns.md}; then
+                  echo "campaigns.md lost its representative test-gate preflight probe" >&2
+                  exit 1
+                fi
+                if ! rg -qF 'rustfmt --emit stdout >/dev/null' ${./doc/src/flows/campaigns.md}; then
+                  echo "campaigns.md lost its representative format-gate preflight probe" >&2
+                  exit 1
+                fi
+                # The non-gating witness is the whole point of #320: the real
+                # merge-criterion argv has to run at t=0 beside the proxy.
+                if ! rg -qF 'preflight-witness-' ${./examples/flows/spec-build.js}; then
+                  echo "spec-build.js dropped the non-gating preflight witness node" >&2
                   exit 1
                 fi
                 touch "$out"

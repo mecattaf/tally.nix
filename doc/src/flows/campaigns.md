@@ -99,7 +99,7 @@ that hand-maintained copy. Start from one JSON worklist:
       {
         "kind": "command",
         "id": "tests",
-        "preflightArgv": ["nix", "develop", "--command", "cargo", "--version"],
+        "preflightArgv": ["nix", "develop", "--command", "sh", "-euc", "command -v cargo >/dev/null; command -v cc >/dev/null; cargo metadata --offline --format-version 1 >/dev/null"],
         "argv": ["nix", "develop", "--command", "cargo", "test", "--workspace"],
         "runtimeMaxSec": 900
       }
@@ -502,17 +502,28 @@ services.tally = {
         id = "no-db-artifacts";
         forbidPaths = [ "*.db" "*.db-wal" "*.db-shm" "*.sqlite*" ];
       }
+      # Each probe exercises the estate dependency its own gate would die on:
+      # the development shell activating, the compiler driver the linker step
+      # needs, and the workspace manifest resolving offline. A bare
+      # `--version` call proves none of that and is the probe the pristine-base
+      # preflight exists to replace.
       {
         kind = "command";
         id = "tests";
-        preflightArgv = [ "nix" "develop" "--command" "cargo" "--version" ];
+        preflightArgv = [
+          "nix" "develop" "--command" "sh" "-euc"
+          "command -v cargo >/dev/null; command -v cc >/dev/null; cargo metadata --offline --format-version 1 >/dev/null"
+        ];
         argv = [ "nix" "develop" "--command" "cargo" "test" "--workspace" ];
         runtimeMaxSec = 900;
       }
       {
         kind = "command";
         id = "format";
-        preflightArgv = [ "nix" "develop" "--command" "cargo" "fmt" "--version" ];
+        preflightArgv = [
+          "nix" "develop" "--command" "sh" "-euc"
+          "command -v rustfmt >/dev/null; printf '' | rustfmt --emit stdout >/dev/null"
+        ];
         argv = [ "nix" "develop" "--command" "cargo" "fmt" "--all" "--check" ];
         runtimeMaxSec = 900;
       }
@@ -719,6 +730,25 @@ and witnessed node are the failure receipt rather than an agent cycle spent
 discovering the same broken host. Gate IDs must be unique; declarative Nix
 configuration rejects duplicates, and direct `tally flow run` arguments are
 validated before the worklist node is admitted.
+
+Immediately after a gate's probe passes, the same lane also runs that gate's
+real `argv` once as `preflight-witness-<id>`. That node is **not** a gate. It
+declares no `exit:0` evidence, its verdict is discarded, and the pass proceeds
+to agent dispatch whatever it returns; a base that is legitimately red until an
+agent has built something stays tolerated exactly as before. Its whole purpose
+is evidence: the exact merge-criterion argv, its exit code, and its stderr, on
+the exact host, at t=0. `preflightArgv` is only ever a declared-base-safe proxy
+for that argv, and nothing validates that the proxy is representative — so an
+estate-side toolchain defect that the proxy cannot see is visible in the witness
+record and the capture file before the first agent cycle instead of after it.
+The witness runs on the same pristine worktree, with the same
+`CAMPAIGN_TASK_ID`, the same `runtimeMaxSec`, and the same `taskRef` as the
+probe beside it. A gate whose own probe is red stops the pass there and is not
+witnessed, because its proxy has already reported the failure.
+
+A campaign's pass node budget therefore reserves two nodes per command gate for
+the preflight lane, plus its prep and cleanup. `services.tally.flows.<name>.maxNodes`
+is computed from the campaign definition, so no operator action is required.
 
 `forbidPaths` gates are not preflighted because the unmodified base has no task
 history to constrain. They begin in their declared position in the post-agent
@@ -1073,7 +1103,9 @@ if remaining is nonempty and frontier is empty:
   -> post the one marked escalation with accumulated diagnoses -> exit
 if implemented is empty, an implementation is in the frontier, and command gates exist:
   prepare an isolated worktree at current remote main
-  -> run each command gate.preflightArgv -> clean up the preflight lane
+  -> for each command gate: run gate.preflightArgv (gating), then
+       run gate.argv once as a non-gating witness
+  -> clean up the preflight lane
 parallel(implementation frontier):
   prepare isolated worktree -> agent -> witness ownership
     -> each configured gate -> recheck ownership -> push stable task branch
@@ -1104,7 +1136,8 @@ later passes do not repeat preflight. A checkpoint-only frontier does not
 dispatch an implementation agent and therefore does not consume this
 implementation admission probe. Because it validates the first frontier
 implementation's prepared environment, each preflight node carries that task's
-`taskRef`.
+`taskRef` — including the non-gating `preflight-witness-<id>` node that runs the
+gate's real `argv` beside its probe.
 
 A checkpoint lane is prepared after this pass's merges, not beside them. A
 checkpoint reads the accumulated tree and its receipt is bound to the exact
@@ -1480,6 +1513,22 @@ An operator can then repair and merge a marked task PR or otherwise resolve the
 forge state before posting a fresh mention. Preflight remains outside this
 task-attempt protocol because it proves campaign admission before any task agent
 runs; repair its host or base defect and re-enter with the configured mention.
+
+A pass that reaches its own preflight verdict — green or red — always cleans the
+preflight lane before it returns or throws, so an ordinary red preflight leaves
+no residue. The one case that does is a runner killed while preflight is still
+running: the `_campaign-preflight` worktree under
+`<workspaceRoot>/<repository>/<runHash>/` and its
+`tally-work/<campaign>-<runHash>/_campaign-preflight` branch outlive the process
+that made them. Nothing needs to be removed by hand. The next pass's sweep node
+claims the same namespace: it recognises `_campaign-preflight` as a campaign
+lane name, proves through the daemon that the dead pass has no live child, and
+then removes both the worktree and the branch, reporting each as a `cleaned`
+entry. If a preflight job from the killed pass is still running, the sweep
+refuses to touch anything and returns `deferred-live-jobs` instead of racing it;
+post the mention again once it settles. The recovery path is therefore the same
+one every other campaign failure has — post the configured mention — and never a
+manual `git worktree remove`.
 
 ```console
 $ gh issue comment ISSUE --repo OWNER/REPO --body '<configured mention>'

@@ -3475,11 +3475,16 @@ let
   # needs only sweep, reconcile, and escalation. This is a pass bound, not the
   # complete worklist size. max_flow_nodes in crates/tally/src/cli/campaign.rs
   # computes the same bound independently and is pinned against this one.
+  #
+  # The preflight lane costs two nodes per command gate, not one: the gating
+  # base-safe probe, plus the non-gating witness that runs the gate's real
+  # merge-criterion argv on the same pristine base. The witness never changes a
+  # verdict, but it is an admitted node and must be budgeted like one.
   campaignMaxNodes =
     campaign:
     let
       commandGateCount = builtins.length (builtins.filter (gate: gate.kind == "command") campaign.gates);
-      preflightNodes = if commandGateCount == 0 then 0 else 2 + commandGateCount;
+      preflightNodes = if commandGateCount == 0 then 0 else 2 + 2 * commandGateCount;
     in
     3 + preflightNodes + campaign.maxParallel * (11 + 2 * builtins.length campaign.gates);
 

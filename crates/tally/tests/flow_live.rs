@@ -104,6 +104,7 @@ const SPEC_BUILD_RUN_RECOVERED: &str = "00000000-0000-4000-8000-000000000533";
 const SPEC_BUILD_RUN_HALTED: &str = "00000000-0000-4000-8000-000000000534";
 const SPEC_BUILD_RUN_LAST_TASK: &str = "00000000-0000-4000-8000-000000000535";
 const SPEC_BUILD_RUN_COMPLETE: &str = "00000000-0000-4000-8000-000000000536";
+const SPEC_BUILD_RED_PREFLIGHT_RUN: &str = "00000000-0000-4000-8000-000000000537";
 const DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-flow-fixture.drv";
 const DRV_OUTPUT: &str = "/nix/store/11111111111111111111111111111111-flow-fixture";
 static ENVIRONMENT_LOCK: Mutex<()> = Mutex::const_new(());
@@ -948,6 +949,16 @@ async fn await_items(client: &RpcClient, items: &[Value]) {
         .await
         .expect("node wait timed out")
         .unwrap();
+        // The pristine-base preflight witness runs a gate's real
+        // merge-criterion argv before any agent has built anything, so it is
+        // red by construction and decides nothing. That it settled is the
+        // whole assertion; its verdict is deliberately not a pass.
+        if item["orchestration"]["nodeLabel"]
+            .as_str()
+            .is_some_and(|label| label.starts_with("preflight-witness-"))
+        {
+            continue;
+        }
         assert_eq!(terminal["verdict"], "pass", "{terminal}");
     }
 }
@@ -2616,7 +2627,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                             script,
                             "--args-from-brief",
                             "--max-nodes",
-                            "51"
+                            "52"
                         ],
                         "pool": ["flow", "fixture-campaign"],
                         "priority": "low",
@@ -2699,6 +2710,81 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .await
                     .is_empty(),
                 "duplicate gate ids must be rejected before reconciliation is admitted"
+            );
+
+            // The ordinary red preflight: a plain non-zero exit inside the
+            // deadline -- the "this host has no toolchain" shape. It must reach
+            // the same `preflight-failed` refusal as the timeout below, admit
+            // no agent, and leave no lane behind. A gate whose own base-safe
+            // probe is red is never witnessed, so the pass stops at five nodes.
+            let red_preflight = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                SPEC_BUILD_RED_PREFLIGHT_RUN,
+                &arguments("red-preflight-comment", "low"),
+                20,
+            )
+            .spawn()
+            .unwrap();
+            let red_preflight = runner_output(red_preflight).await;
+            assert_eq!(
+                red_preflight.status.code(),
+                Some(1),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&red_preflight.stdout),
+                String::from_utf8_lossy(&red_preflight.stderr)
+            );
+            let red_failure = flow_failure(&red_preflight);
+            assert_eq!(red_failure["error"]["name"], "SpecBuildPreflightError");
+            assert_eq!(red_failure["error"]["code"], "preflight-failed");
+            assert_eq!(red_failure["error"]["details"]["gateId"], "fixture-first");
+            assert_eq!(
+                red_failure["error"]["details"]["node"]["verdict"],
+                "failed",
+                "a plain non-zero preflight exit is not a runtime-exceeded verdict"
+            );
+            assert_eq!(
+                red_failure["error"]["details"]["node"]["stderrExcerpt"],
+                "fixture preflight cannot find the toolchain on this host\n"
+            );
+            let red_terminal = runner_events(&red_preflight, "node-terminal")
+                .into_iter()
+                .find(|event| event["verdict"] == "failed")
+                .expect("runner omitted the failed node-terminal event");
+            assert_eq!(
+                red_terminal["stderrExcerpt"],
+                "fixture preflight cannot find the toolchain on this host\n"
+            );
+            let red_items =
+                wait_for_flow_items(&client, SPEC_BUILD_RED_PREFLIGHT_RUN, 5).await;
+            assert_eq!(
+                red_items.len(),
+                5,
+                "a red gating preflight must admit only sweep, reconcile, prep, gate, \
+                 and cleanup: {:?}",
+                red_items
+                    .iter()
+                    .map(|item| item["orchestration"]["nodeLabel"]
+                        .as_str()
+                        .unwrap_or("<missing>"))
+                    .collect::<Vec<_>>()
+            );
+            for item in &red_items {
+                client
+                    .call(
+                        "queue.await_job",
+                        Some(json!({"task_uuid": item["anchor"]})),
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(!control.join("agent-order.log").exists());
+            assert!(!control.join("gate-order.log").exists());
+            assert!(!control.join("preflight-order.log").exists());
+            assert!(
+                !fixture_git(&checkout, &["worktree", "list", "--porcelain"])
+                    .contains("_campaign-preflight")
             );
 
             let first = runner(
@@ -3035,17 +3121,17 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
 
             assert_eq!(
                 second_submitted.len(),
-                24,
+                26,
                 "unexpected second-pass nodes: {:?}",
                 second_submitted
                     .iter()
                     .map(|event| event["label"].as_str().unwrap_or("<missing>"))
                     .collect::<Vec<_>>()
             );
-            let second_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_2, 24).await;
+            let second_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_2, 26).await;
             assert_eq!(
                 second_items.len(),
-                24,
+                26,
                 "unexpected durable second-pass nodes: {:?}",
                 json!({
                     "durable": second_items
@@ -3060,12 +3146,17 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     "report": second_value,
                 })
             );
+            // Four preflight nodes became six: prep, cleanup, and now a
+            // gating probe plus a non-gating real-argv witness for each of the
+            // two command gates -- all carrying the first frontier
+            // implementation's taskRef, on top of task-1's own seven lane
+            // nodes.
             assert_eq!(
                 second_submitted
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-1")
                     .count(),
-                11
+                13
             );
             assert_eq!(
                 second_submitted
@@ -3087,7 +3178,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .iter()
                     .filter(|item| item["taskRef"] == "fixture/task-1")
                     .count(),
-                11
+                13
             );
             assert_eq!(
                 second_items
@@ -3128,6 +3219,53 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 fs::read_to_string(control.join("preflight-order.log")).unwrap(),
                 "preflight:task-1:first\npreflight:task-1:second\n"
             );
+
+            // #320: beside each green base-safe probe the pass also ran that
+            // gate's real merge-criterion argv once, on the same pristine base,
+            // as a non-gating witness. Both are red there -- the fixture gate
+            // needs a `build` directory no agent has created yet -- and the
+            // pass still dispatched both frontier agents and merged task-3
+            // above. The exit code and stderr are the evidence #264's split
+            // left unavailable at t=0.
+            let second_terminals = runner_events(&second, "node-terminal");
+            for (label, argv) in [
+                ("preflight-witness-fixture-first", &first_gate_argv),
+                ("preflight-witness-fixture-second", &second_gate_argv),
+            ] {
+                let submitted = second_submitted
+                    .iter()
+                    .find(|event| event["label"] == label)
+                    .unwrap_or_else(|| panic!("the pass never submitted {label}"));
+                assert_eq!(submitted["taskRef"], "fixture/task-1", "{label}");
+                let uuid = submitted["taskUuid"].as_str().unwrap();
+                let terminal = second_terminals
+                    .iter()
+                    .find(|event| event["taskUuid"] == uuid)
+                    .unwrap_or_else(|| panic!("{label} never reached a terminal verdict"));
+                assert_eq!(terminal["verdict"], "failed", "{label}");
+                assert_eq!(terminal["exitCode"], 3, "{label}");
+                assert_eq!(
+                    terminal["stderrExcerpt"],
+                    "fixture gate argv is red on the pristine campaign base\n",
+                    "{label}"
+                );
+                let projected = client
+                    .call("query.job", Some(json!({"id": uuid})))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    projected["job"]["argv"],
+                    json!(argv),
+                    "{label} must execute the gate's real argv without rewriting it"
+                );
+                assert_eq!(projected["job"]["taskRef"], "fixture/task-1", "{label}");
+                assert_eq!(projected["job"]["runtimeMaxSec"], 1, "{label}");
+                assert!(
+                    task_capture(&daemon_paths, uuid, "task-1")
+                        .contains("fixture gate argv is red on the pristine campaign base"),
+                    "{label} did not retain its capture"
+                );
+            }
 
             fixture_git(&checkout, &["fetch", "origin"]);
             assert_eq!(
