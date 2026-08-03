@@ -319,6 +319,12 @@ successor. A supervisor can act on this without reading prose —
 `resolution: "supersede"` and `transient: false` are unchanged, and `remedy` is
 the new string field carrying the command.
 
+A run with unfinished nodes cannot be superseded: the call is refused with
+`flow-lineage-conflict` and `flow run <OLD> still has N unfinished node(s);
+cancel the run before superseding it`. An in-flight run — which is exactly the
+population an upgrade strands — therefore needs `tally flow cancel <OLD>` first.
+The remedy the error prints is the second of the two steps, not the only one.
+
 ## `flow-run-superseded`
 
 The run ID was durably retired by `tally flow supersede`. The runner reports

@@ -133,13 +133,51 @@ Running it again is a no-op (`alreadyLabeled`). Only records whose recorded name
 is exactly the pre-label name for their own row are touched; anything else is
 listed under `skipped` with the reason, and stays for a human.
 
+Copy `<STATE_DIR>` from the refusal, which prints the daemon's own absolute
+path. Without `--state-dir` the CLI resolves `$XDG_STATE_HOME/tally`, which is
+**not** the NixOS module's `/var/lib/tally/state`. Run the command as the user
+that owns that directory — under the shipped systemd units that is the service
+user, not root. Exit records are written mode 0600 and nothing repairs
+ownership afterwards, so a record rewritten under `sudo` is one the daemon can
+no longer read: you would trade a name mismatch for a permission failure. A
+directory that is not a coordinator's state tree is refused rather than reported
+clean, so a mistyped path cannot masquerade as "nothing to migrate".
+
 The pre-label name is a pure function of the record's file name
 (`unit-exit/<uuid>.json` → `tally-job-<uuid>.service`), so no backup copy is
 written: it would carry nothing the surviving file does not.
 
-Rows dispatched to a remote executor keep their records in that worker's own
-state directory. They appear under `skipped` naming the executor; run the same
-command against that host.
+### Rows dispatched to a remote executor
+
+**The migration cannot repair these, on either host.** The labeled name is
+derived from the durable rows, and those exist only on the coordinator: a worker
+runs no tally daemon and has no `events/`, so the same command run there reads
+zero rows and rewrites nothing. Running it on a worker and reading its clean
+report as success is the one wrong turn to avoid here.
+
+What the coordinator can do is tell you exactly what to write. Each such row
+appears under `skipped` with the facts the hand repair needs:
+
+```console
+$ tally migrate unit-exit-labels --state-dir <STATE_DIR> \
+    | jq '.skipped[] | select(.executor) | {executor, recordPath, preLabelUnit, expectedUnit}'
+{
+  "executor": "worker",
+  "recordPath": "/var/lib/tally-worker/state/unit-exit/<uuid>.json",
+  "preLabelUnit": "tally-job-<uuid>.service",
+  "expectedUnit": "tally-job-<campaign>-<task>-<uuid>.service"
+}
+```
+
+`recordPath` is resolved from the coordinator's `executors.<name>.stateDir`; if
+no configuration is in scope it is omitted and the `reason` says which key to
+read it from. On the owning host, as the account that owns that `stateDir`,
+rewrite the `unit` field of each named record and change nothing else:
+
+```console
+$ jq --arg unit "$EXPECTED" '.unit = $unit' <RECORD> > <RECORD>.new \
+    && mv <RECORD>.new <RECORD>
+```
 
 Then restart the daemon as above.
 

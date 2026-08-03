@@ -8,6 +8,50 @@ authorized.
 
 ### Fixed
 
+- **The unit-exit migration no longer advertises a repair it cannot perform, and
+  no longer answers "clean" for a directory holding no durable rows
+  (#371 repair).** Both defects had the same effect: an operator follows the
+  documented command, is told everything is fine, restarts, and crash-loops
+  again with no signal.
+
+  The refusal, the migration's own skip reason, `operating/recovery.md`,
+  `operating/cli.md`, and the upgrade note above all said that a record owned by
+  a remote executor should be migrated by running the same command against that
+  worker's state directory. That command is a guaranteed no-op there. The
+  labeled name is derived from the durable rows, and those exist only on the
+  coordinator — a worker runs no tally daemon and has no `events/` — so the
+  invocation reads zero rows, rewrites nothing, and exits 0 with an empty
+  report. For remote-owned rows that was worse than saying nothing: it retired
+  the by-hand repair with a command that reports success. Every one of those
+  five claims is retracted. The migration now states plainly that it repairs
+  coordinator records only, and each remote-owned row is reported with the facts
+  the hand repair needs — `executor`, `recordPath` (resolved from the
+  coordinator's `executors.<name>.stateDir`), `preLabelUnit`, and
+  `expectedUnit` — so nothing has to be rediscovered from the source. The
+  startup refusal carries the same caveat and counts the affected rows.
+
+  A `--state-dir` naming a directory that is not a coordinator's state tree —
+  a typo, or a worker's — read as zero acknowledged rows and reported clean.
+  Both that directory and its `events/` must now exist, or the command fails
+  before doing anything. `--config` is now read for the `executors` map that
+  names remote records; it does not and cannot select a state directory,
+  because tally's configuration has no such key, and `cli.md` said otherwise.
+  That documentation now matches what `tally gc` three sections earlier already
+  said: without `--state-dir` the CLI resolves `$XDG_STATE_HOME/tally`, which is
+  not the NixOS module's `/var/lib/tally/state`.
+
+  The refusal, `cli.md`, `recovery.md`, and the upgrade note now also say which
+  user to run as. Exit records are written mode 0600 and nothing repairs
+  ownership afterwards, so a record rewritten under `sudo` on a NixOS
+  deployment is one the service user can no longer read — trading a name
+  mismatch for a permission failure.
+
+  `troubleshooting.md` now records that `tally flow supersede` is refused with
+  `flow-lineage-conflict` while the run still has unfinished nodes, so an
+  in-flight run — the population an upgrade actually strands — needs
+  `tally flow cancel` first. The remedy the error prints is the second of two
+  steps, not the only one.
+
 - **A pin advance no longer crash-loops the daemon on pre-label unit-exit
   records, and recovery no longer hides the population behind one restart per
   record (#371).** Campaign task labels entered the execution unit name, so a
@@ -45,11 +89,14 @@ authorized.
   `executor fact collection failed: N acknowledged row(s) have unusable local
   execution facts` and `[pre-label unit-exit record]`, run
   `tally migrate unit-exit-labels --state-dir <STATE_DIR>` to review the plan,
-  then the same command with `--apply`, then start the daemon. Rows dispatched
-  to a remote executor keep their records on that worker; they are listed under
-  `skipped` naming the executor, and the same command must be run against that
-  host's state directory. Deleting the records instead removes the evidence
-  recovery uses to decide whether replay is safe.
+  then the same command with `--apply`, then start the daemon. Copy
+  `<STATE_DIR>` from the refusal, and run the command as the user that owns that
+  directory — under the shipped systemd units that is the service user, not
+  root. Rows dispatched to a remote executor cannot be repaired by this command
+  on either host; they are listed under `skipped` with the record's path on the
+  owning worker and the exact name to write, and must be rewritten there by
+  hand. Deleting the records instead removes the evidence recovery uses to
+  decide whether replay is safe.
 
 - **A flow run recorded by an older binary is no longer refused with nothing but
   two hashes (#371).** `argsHash` pins the bytes the runner serialized, not a

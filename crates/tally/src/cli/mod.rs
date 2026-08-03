@@ -30,7 +30,7 @@ use tally_client::{
 };
 use tally_core::authorship::{verify_authorship, verify_revision_authorship};
 use tally_core::completion::{AcceptancePolicy, GateManifestSpec};
-use tally_core::config::Priority;
+use tally_core::config::{ExecutionTargetConfig, Priority};
 use tally_core::daemon::{Daemon, DaemonPaths, DaemonSettings, DEFAULT_MAX_CONNECTIONS};
 use tally_core::evidence::RetryPolicy;
 use tally_core::exec_attestation::{
@@ -285,7 +285,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             )
             .await
         }
-        Some(Command::Migrate { command }) => run_migrate(command),
+        Some(Command::Migrate { command }) => run_migrate(opts.config.as_deref(), command),
         None => {
             Opts::command().print_help().map_err(out::map_write_error)?;
             outln!();
@@ -294,19 +294,42 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
     }
 }
 
-fn run_migrate(command: MigrateCommand) -> Result<()> {
+fn run_migrate(config_path: Option<&Path>, command: MigrateCommand) -> Result<()> {
     match command {
         MigrateCommand::UnitExitLabels(args) => {
             let state_dir = args.state_dir.map_or_else(default_state_dir, Ok)?;
             if !state_dir.is_absolute() {
                 return Err(invalid("--state-dir must be absolute"));
             }
-            let report =
-                tally_core::unit_exit_migration::migrate_unit_exit_labels(&state_dir, args.apply)?;
+            let report = tally_core::unit_exit_migration::migrate_unit_exit_labels(
+                &state_dir,
+                &migration_executors(config_path)?,
+                args.apply,
+            )?;
             outln!("{}", serde_json::to_string(&report)?);
             Ok(())
         }
     }
+}
+
+/// The configured execution targets, used only to name a worker's own
+/// `stateDir` for records this command cannot repair.
+///
+/// An explicitly selected configuration must exist and parse, matching the
+/// global contract. Without one, an absent default file is not an error: the
+/// migration still runs and the affected rows are reported with the executor
+/// named and the path left null.
+fn migration_executors(
+    config_path: Option<&Path>,
+) -> Result<BTreeMap<String, ExecutionTargetConfig>> {
+    if let Some(path) = config_path {
+        return Ok(Config::from_path(path)?.executors);
+    }
+    let path = default_config_path()?;
+    if path.exists() {
+        return Ok(Config::from_path(&path)?.executors);
+    }
+    Ok(BTreeMap::new())
 }
 
 fn run_producer(config_path: Option<PathBuf>, command: ProducerCommand) -> Result<()> {
