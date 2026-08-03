@@ -3220,13 +3220,39 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 "preflight:task-1:first\npreflight:task-1:second\n"
             );
 
-            // #320: beside each green base-safe probe the pass also ran that
-            // gate's real merge-criterion argv once, on the same pristine base,
-            // as a non-gating witness. Both are red there -- the fixture gate
-            // needs a `build` directory no agent has created yet -- and the
-            // pass still dispatched both frontier agents and merged task-3
-            // above. The exit code and stderr are the evidence #264's split
-            // left unavailable at t=0.
+            // #320: once every base-safe probe was green the pass also ran each
+            // gate's real merge-criterion argv once, on the same lane, as a
+            // non-gating witness. Both are red there -- the fixture gate needs a
+            // `build` directory no agent has created yet -- and the pass still
+            // dispatched both frontier agents and merged task-3 above. The exit
+            // code and stderr are the evidence #264's split left unavailable at
+            // t=0.
+            //
+            // The two phases must not interleave. A probe is declared base-safe
+            // and this fixture's probe asserts the pristine premise
+            // (`test ! -e preflight-witness-ran`, preflight.sh); the witness
+            // writes that marker, because a gate's real argv is the merge
+            // criterion and is expected to build and write. So a witness running
+            // between two probes turns the second gate's probe red and refuses
+            // admission naming the innocent gate. Asserting the submission order
+            // states the invariant directly; the fixture pair is the tripwire
+            // that fires if it is ever broken.
+            let preflight_labels = second_submitted
+                .iter()
+                .filter_map(|event| event["label"].as_str())
+                .filter(|label| label.starts_with("preflight-gate-")
+                    || label.starts_with("preflight-witness-"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                preflight_labels,
+                vec![
+                    "preflight-gate-fixture-first",
+                    "preflight-gate-fixture-second",
+                    "preflight-witness-fixture-first",
+                    "preflight-witness-fixture-second",
+                ],
+                "every gating probe must run on the pristine base before any witness mutates it"
+            );
             let second_terminals = runner_events(&second, "node-terminal");
             for (label, argv) in [
                 ("preflight-witness-fixture-first", &first_gate_argv),

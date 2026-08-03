@@ -8,6 +8,39 @@ authorized.
 
 ### Fixed
 
+- **The preflight witness no longer mutates the base a later gate's probe is
+  judged against (#320 repair).** #320 ran each command gate's non-gating
+  real-`argv` witness immediately after that gate's own probe, so for two or more
+  command gates the order was `probe(g1) → argv(g1) → probe(g2)` on one shared
+  worktree. A gate's `argv` is the merge criterion — the one command the design
+  expects to build and write — so gate 2's base-safe probe was judged against a
+  base gate 1 had already changed. A probe that asserts its own gate's output is
+  absent on the base, which is the shape this repository's own examples teach,
+  then went red because of an unrelated gate and the campaign refused admission
+  naming the innocent gate, on every pass, forever: no agent is ever dispatched,
+  so the first merge that would end preflight can never happen.
+
+  Every probe now runs first, on the genuinely pristine base; the witnesses
+  follow only if all of them passed, in declaration order. The live fixture is
+  armed rather than incidentally green: the witness branch of the fixture gate
+  writes a marker into the lane and the fixture's probe asserts that marker is
+  absent, so the interleaved ordering turns the second gate's probe red. The
+  submission order is asserted directly as well.
+
+  Three integrity repairs ride along. `checks.campaign-preflight-probe-drift`
+  grepped one exact spelling and was therefore green while the file it guards
+  shipped two no-op probes it could not see; it now reads every `preflightArgv`
+  declaration on the Nix surface and refuses both the cannot-fail family (`true`,
+  `/bin/true`, `/usr/bin/true`, `:`, and the `sh -c` forms) and probes that are a
+  single bare existence test, with an explicit `no-op-probe-allowed:` opt-out for
+  fixtures that exist to be rejected. The `argv`, `preflightArgv`, `runtimeMaxSec`
+  and `gates` option descriptions now state that a command gate's `argv` also
+  executes once on the preflight lane before any agent — the declarative
+  operator's contract said post-agent only — and point a criterion that must
+  never see an unbuilt base at a checkpoint node instead. The four campaign
+  fixtures that #320 left probing for the existence of `/bin/true` now carry the
+  same representative probe-and-gate pair as the reference fixture.
+
 - **Six post-merge repairs on the NixOS campaign surface (#303 repair).** The
   poll service ordered itself after `network-online.target` without wanting it,
   which orders against nothing: nixpkgs warned on every evaluation of such a
@@ -122,15 +155,15 @@ authorized.
   preflight/post-change split, a campaign's actual merge criterion — a command
   gate's `argv` — first executed only after the first agent cycle. What ran at
   t=0 was the `preflightArgv` proxy, declared base-safe and never validated to be
-  representative. The pristine-base preflight lane now runs each command gate's
-  real `argv` once, immediately after that gate's probe passes, as a non-gating
-  `preflight-witness-<id>` node: same worktree, same `CAMPAIGN_TASK_ID`, same
-  deadline, same `taskRef`, no `exit:0` evidence, verdict discarded. A run never
-  fails because of it, so a base that is legitimately red until an agent builds
-  something stays tolerated — but the exit code and stderr of the exact argv on
-  the exact host land in the witness record and the capture files before the
-  first agent cycle rather than after it. A gate whose own probe is red still
-  stops the pass there and is not witnessed.
+  representative. The pristine-base preflight lane now runs every command gate's
+  base-safe probe first and then, only if all of them passed, each gate's real
+  `argv` once as a non-gating `preflight-witness-<id>` node: same lane, same
+  `CAMPAIGN_TASK_ID`, same deadline, same `taskRef`, no `exit:0` evidence,
+  verdict discarded. A run never fails because of it, so a base that is
+  legitimately red until an agent builds something stays tolerated — but the exit
+  code and stderr of the exact argv on the exact host land in the witness record
+  and the capture files before the first agent cycle rather than after it. A red
+  probe stops the pass and nothing is witnessed.
 
   The pass node budget grows accordingly: `campaignMaxNodes` and the CLI's
   independent `max_flow_nodes` now reserve `2 + 2 × commandGateCount` preflight
@@ -142,8 +175,9 @@ authorized.
   probed with `cargo --version` / `cargo fmt --version` — precisely what the
   document's own warning calls insufficient — and now probe the compiler driver,
   the offline workspace manifest, and rustfmt actually formatting something. The
-  shipped Nix fixtures no longer preflight with `/bin/true`, so a copied fixture
-  cannot propagate a no-op probe; a new evaluated check asserts both. And the
+  shipped Nix fixtures no longer preflight with a command that cannot fail, and a
+  new evaluated check reads every probe on that surface and refuses the ones that
+  prove nothing. And the
   campaign documentation now records the one preflight residue an operator can
   observe — a runner killed mid-preflight leaves its `_campaign-preflight`
   worktree and branch — together with its recovery path, which is the next

@@ -6,11 +6,22 @@ gate=$2
 task=${CAMPAIGN_TASK_ID:?CAMPAIGN_TASK_ID is required}
 
 # The preflight witness runs this exact argv on the pristine campaign base,
-# before any agent has built anything. It is deliberately red there, and it
-# must say so by its own name rather than by a stray `cat` failure -- and it
-# must not consume the one-shot post-change failure below, which belongs to a
-# lane that has already run its agent.
+# before any agent has built anything. `build` is created by the agent and by
+# nothing else, so its absence is what identifies this invocation. The witness
+# is deliberately red here, and it must say so by its own name rather than by a
+# stray `cat` failure -- and it must not consume the one-shot post-change
+# failure below, which belongs to a lane that has already run its agent.
+#
+# It also writes. That is the tripwire, and it is load-bearing: a gate's real
+# argv is the merge criterion, which is exactly the command that is allowed to
+# build and mutate, so a fixture whose witness were a pure no-op could not
+# detect a witness running between two gating probes. preflight.sh asserts this
+# marker is absent, so the interleaved ordering turns the second gate's
+# base-safe probe red while the correct ordering -- every probe, then every
+# witness -- stays green. The marker is untracked and the lane is reclaimed with
+# `git worktree remove --force`, so it cannot outlive the preflight lane.
 if [ ! -d build ]; then
+  printf 'witness ran here\n' >preflight-witness-ran
   printf '%s\n' 'fixture gate argv is red on the pristine campaign base' >&2
   exit 3
 fi

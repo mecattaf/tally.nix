@@ -1719,17 +1719,32 @@ function sweepDeferral(sweepNode) {
       );
       const preflightWorkspace = workspaceFor(preflight.result);
       let failedGate = null;
+      // Every gating probe first, then every witness. The two loops share one
+      // worktree and must not be interleaved: a probe is declared base-safe, a
+      // gate's real `argv` is the merge criterion and is expected to build and
+      // write. Running a witness between two probes hands the second probe a
+      // base the first gate's argv has already mutated, so a probe that asserts
+      // its own subject is absent on the base -- the shape this repository's own
+      // fixtures and examples teach -- goes red because of an unrelated gate,
+      // and the pass refuses admission naming the innocent gate. Probes see the
+      // pristine base; witnesses see the base plus whatever earlier witnesses
+      // did, which is the same order the post-change gate sequence has always
+      // run in.
       for (const gate of commandGates) {
         const gated = await runPreflightGate(preflightTask, gate, preflightWorkspace);
         if (gated.verdict !== "pass") {
           failedGate = { gate, node: gated };
           break;
         }
-        // Non-gating: its verdict is never read, so a red real argv on the
-        // pristine base is recorded and the pass proceeds to agent dispatch.
-        // It runs only where the gating probe passed, because a gate whose own
-        // proxy is red has already stopped the pass.
-        await runPreflightWitness(preflightTask, gate, preflightWorkspace);
+      }
+      if (failedGate === null) {
+        for (const gate of commandGates) {
+          // Non-gating: its verdict is never read, so a red real argv on the
+          // pristine base is recorded and the pass proceeds to agent dispatch.
+          // Witnesses run only where every probe passed, because a red proxy has
+          // already stopped the pass.
+          await runPreflightWitness(preflightTask, gate, preflightWorkspace);
+        }
       }
       await driverNode(
         "cleanup",

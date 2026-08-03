@@ -1346,9 +1346,14 @@
                         "/bin/sh"
                         "-eu"
                         "-c"
-                        "test -x /bin/true"
+                        "test -x /bin/sh; test ! -d build"
                       ];
-                      argv = [ "/bin/true" ];
+                      argv = [
+                        "/bin/sh"
+                        "-eu"
+                        "-c"
+                        "test -d build"
+                      ];
                     }
                   ];
                   agentArgv = [ "/bin/true" ];
@@ -1366,9 +1371,14 @@
                         "/bin/sh"
                         "-eu"
                         "-c"
-                        "test -x /bin/true"
+                        "test -x /bin/sh; test ! -d build"
                       ];
-                      argv = [ "/bin/true" ];
+                      argv = [
+                        "/bin/sh"
+                        "-eu"
+                        "-c"
+                        "test -d build"
+                      ];
                     }
                   ];
                   agentArgv = [ "/bin/true" ];
@@ -1462,6 +1472,10 @@
           {
             kind = "command";
             id = "mixed";
+            # no-op-probe-allowed: this gate exists to be rejected. It declares
+            # forbidPaths beside a command kind, so the module refuses the
+            # campaign before any probe could run; a representative probe here
+            # would only obscure what the fixture is testing.
             preflightArgv = [ "true" ];
             argv = [ "true" ];
             forbidPaths = [ "*.db" ];
@@ -1949,9 +1963,14 @@
                         "/bin/sh"
                         "-eu"
                         "-c"
-                        "test -x /bin/true"
+                        "test -x /bin/sh; test ! -d build"
                       ];
-                      argv = [ "/bin/true" ];
+                      argv = [
+                        "/bin/sh"
+                        "-eu"
+                        "-c"
+                        "test -d build"
+                      ];
                     }
                   ];
                   agentSandboxPolicy = "workspace-write";
@@ -1983,9 +2002,14 @@
                       "/bin/sh"
                       "-eu"
                       "-c"
-                      "test -x /bin/true"
+                      "test -x /bin/sh; test ! -d build"
                     ];
-                    argv = [ "/bin/true" ];
+                    argv = [
+                      "/bin/sh"
+                      "-eu"
+                      "-c"
+                      "test -d build"
+                    ];
                   }
                 ];
               };
@@ -2130,6 +2154,10 @@
                     {
                       kind = "command";
                       id = "tests";
+                      # no-op-probe-allowed: this host is evaluated only to
+                      # prove the unsupported-system assertion fires. The
+                      # campaign never renders a flow, so the gate's content is
+                      # irrelevant to what the fixture asserts.
                       preflightArgv = [ "true" ];
                       argv = [ "true" ];
                     }
@@ -4673,24 +4701,28 @@
                 touch "$out"
               '';
           campaign-preflight-probe-drift =
-            pkgs.runCommand "tally-campaign-preflight-probe-drift" { nativeBuildInputs = [ pkgs.ripgrep ]; }
+            pkgs.runCommand "tally-campaign-preflight-probe-drift"
+              {
+                nativeBuildInputs = [
+                  pkgs.ripgrep
+                  pkgs.python3
+                ];
+              }
               ''
                 # The copyable blocks are what an operator pastes, and a probe
                 # that only asks a tool for its version is exactly what this
-                # document's own warning calls insufficient. A `/bin/true`
-                # fixture probe teaches the same no-op by example.
+                # document's own warning calls insufficient.
                 if rg -n 'cargo --version|cargo fmt --version' \
                   ${./doc/src/flows/campaigns.md}; then
                   echo "campaigns.md still ships a version-only preflight probe" >&2
                   exit 1
                 fi
-                # The needle is assembled here rather than written out, so
-                # this guard cannot satisfy itself by matching its own source.
-                noop="/bin/""true"
-                if rg -nF "preflightArgv = [ \"$noop\" ]" ${./flake.nix}; then
-                  echo "flake.nix still ships a no-op preflight probe" >&2
-                  exit 1
-                fi
+                # Every command gate's probe on the shipped Nix surface is read
+                # and judged, rather than one exact spelling being grepped for.
+                # The first version of this guard matched only `[ "/bin/true" ]`
+                # and was green while this very file shipped `[ "true" ]` twice.
+                ${pkgs.python3}/bin/python3 ${./test/preflight_probe_drift.py} \
+                  ${./flake.nix} ${./nix/modules/common.nix}
                 # The replacements have to be present, not merely the absence
                 # of the bad ones: a probe that reaches the compiler driver and
                 # resolves the workspace offline, and one that makes rustfmt

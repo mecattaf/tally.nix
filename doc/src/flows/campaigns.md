@@ -731,20 +731,31 @@ discovering the same broken host. Gate IDs must be unique; declarative Nix
 configuration rejects duplicates, and direct `tally flow run` arguments are
 validated before the worklist node is admitted.
 
-Immediately after a gate's probe passes, the same lane also runs that gate's
-real `argv` once as `preflight-witness-<id>`. That node is **not** a gate. It
-declares no `exit:0` evidence, its verdict is discarded, and the pass proceeds
-to agent dispatch whatever it returns; a base that is legitimately red until an
-agent has built something stays tolerated exactly as before. Its whole purpose
-is evidence: the exact merge-criterion argv, its exit code, and its stderr, on
-the exact host, at t=0. `preflightArgv` is only ever a declared-base-safe proxy
-for that argv, and nothing validates that the proxy is representative — so an
-estate-side toolchain defect that the proxy cannot see is visible in the witness
-record and the capture file before the first agent cycle instead of after it.
-The witness runs on the same pristine worktree, with the same
-`CAMPAIGN_TASK_ID`, the same `runtimeMaxSec`, and the same `taskRef` as the
-probe beside it. A gate whose own probe is red stops the pass there and is not
-witnessed, because its proxy has already reported the failure.
+Once **every** command gate's probe has passed, the same lane then runs each
+gate's real `argv` once, in declaration order, as `preflight-witness-<id>`. Those
+nodes are **not** gates. They declare no `exit:0` evidence, their verdicts are
+discarded, and the pass proceeds to agent dispatch whatever they return; a base
+that is legitimately red until an agent has built something stays tolerated
+exactly as before. Their whole purpose is evidence: the exact merge-criterion
+argv, its exit code, and its stderr, on the exact host, at t=0. `preflightArgv`
+is only ever a declared-base-safe proxy for that argv, and nothing validates that
+the proxy is representative — so an estate-side toolchain defect that the proxy
+cannot see is visible in the witness record and the capture file before the first
+agent cycle instead of after it. Each witness uses the same worktree, the same
+`CAMPAIGN_TASK_ID`, the same `runtimeMaxSec`, and the same `taskRef` as its own
+probe. If any probe is red the pass stops there and nothing is witnessed, because
+the proxy has already reported the failure.
+
+The two phases are ordered, not interleaved, and the reason is the whole point of
+the split. A probe is declared base-safe; a gate's real `argv` is the merge
+criterion and is expected to build, write, and mutate. Running one gate's witness
+between two probes would hand the second probe a base an unrelated gate had
+already changed — so a probe that asserts its own subject is absent on the base,
+which is the shape the examples above teach, would go red and the pass would
+refuse admission naming the innocent gate. Every probe therefore sees the
+pristine base. The witnesses that follow see the base plus whatever earlier
+witnesses did to it, which is exactly the order the post-change gate sequence has
+always run in.
 
 A campaign's pass node budget therefore reserves two nodes per command gate for
 the preflight lane, plus its prep and cleanup. `services.tally.flows.<name>.maxNodes`
@@ -1103,8 +1114,9 @@ if remaining is nonempty and frontier is empty:
   -> post the one marked escalation with accumulated diagnoses -> exit
 if implemented is empty, an implementation is in the frontier, and command gates exist:
   prepare an isolated worktree at current remote main
-  -> for each command gate: run gate.preflightArgv (gating), then
-       run gate.argv once as a non-gating witness
+  -> run every command gate.preflightArgv (gating) on the pristine base
+  -> then, only if all passed, run every command gate.argv once as a
+       non-gating witness
   -> clean up the preflight lane
 parallel(implementation frontier):
   prepare isolated worktree -> agent -> witness ownership
