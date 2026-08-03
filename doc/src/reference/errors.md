@@ -165,6 +165,7 @@ fields for exactly that:
 |---|---|
 | `transient` | `true` when repeating the identical command can produce a different answer; `false` when it cannot. |
 | `resolution` | The bounded operation that clears it: `retry`, `supersede`, `run-successor`, `investigate`, or `repair-lineage-ledger`. |
+| `remedy` | Present on the three `*-changed-mid-run` codes: the `tally flow supersede` invocation that clears this run, with the successor UUID left as a placeholder because it must be persisted before the call. |
 
 The classification is fixed per code and is the same wherever the error was raised — the
 runner's own startup scan, a daemon refusal handed back mid-run, or the client's translation of
@@ -172,9 +173,9 @@ an RPC code. One wire code never has two `details` contracts.
 
 | Code | `transient` | `resolution` | Also carries |
 |---|---|---|---|
-| `script-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "script"`, `recordedHash`, `currentHash` |
-| `args-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "args"`, `recordedHash`, `currentHash` |
-| `catalog-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "catalog"`, `recordedHash`, `currentHash` |
+| `script-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "script"`, `recordedHash`, `currentHash`, `remedy` |
+| `args-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "args"`, `recordedHash`, `currentHash`, `remedy` |
+| `catalog-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "catalog"`, `recordedHash`, `currentHash`, `remedy` |
 | `flow-run-superseded` | `false` | `run-successor` | `flowRunId`, `successorFlowRunId`, `reason`, `recordedAt` |
 | `replay-divergence` | `false` | `investigate` | `expectedHash`, `recordedHash`, labels. A rollover does **not** clear it: the same ordinal re-derived different work, which is a question about the script or the configuration. |
 | `script-history-conflict`, `args-history-conflict`, `catalog-history-conflict` | `false` | `investigate` | The run's own history already holds more than one hash. |

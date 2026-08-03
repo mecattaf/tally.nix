@@ -751,12 +751,16 @@ fn changed_hash_error(
 ) -> ClientError {
     ClientError::new(
         code,
-        format!("flow run {flow_run_id} is pinned to {recorded_hash}, not {current_hash}"),
+        format!(
+            "flow run {flow_run_id} is pinned to {recorded_hash}, not {current_hash}{}",
+            tally_flow::identity_refusal_remedy_sentence(code, flow_run_id)
+        ),
     )
     .with_details(json!({
         "flowRunId": flow_run_id,
         "recordedHash": recorded_hash,
         "currentHash": current_hash,
+        "remedy": tally_flow::supersede_remedy(code, flow_run_id),
     }))
 }
 
@@ -769,12 +773,16 @@ fn changed_catalog_identity_error(
     let rendered_current = current_hash.unwrap_or("<none>");
     ClientError::new(
         "catalog-changed-mid-run",
-        format!("flow run {flow_run_id} is pinned to {rendered_recorded}, not {rendered_current}"),
+        format!(
+            "flow run {flow_run_id} is pinned to {rendered_recorded}, not {rendered_current}{}",
+            tally_flow::identity_refusal_remedy_sentence("catalog-changed-mid-run", flow_run_id)
+        ),
     )
     .with_details(json!({
         "flowRunId": flow_run_id,
         "recordedHash": recorded_hash,
         "currentHash": current_hash,
+        "remedy": tally_flow::supersede_remedy("catalog-changed-mid-run", flow_run_id),
     }))
 }
 

@@ -8,6 +8,82 @@ authorized.
 
 ### Fixed
 
+- **A pin advance no longer crash-loops the daemon on pre-label unit-exit
+  records, and recovery no longer hides the population behind one restart per
+  record (#371).** Campaign task labels entered the execution unit name, so a
+  row whose orchestration carries a `taskRef` now owns
+  `tally-job-<campaign>-<task>-<uuid>.service` where it previously owned
+  `tally-job-<uuid>.service`. `UnitExitRecord::validate` compares that name byte
+  for byte, so every `unit-exit/<uuid>.json` written by an earlier binary for a
+  campaign task refused startup — and because collection died on the *first*
+  invalid record, an operator discovered the next one only by paying another
+  ~25 s restart. On the host that hit this, 23 of 6,985 acknowledged events
+  carried a `taskRef` and each one wedged startup in sequence.
+
+  Collection now probes every acknowledged row before raising anything and
+  reports all unusable records in one pass, each naming its row, its executor,
+  the unit that was expected, and the record's own name. Records that are
+  exactly the pre-label rename are marked as such and the refusal names the
+  one-shot forward migration that clears them; a mismatch of any other shape is
+  reported without being advertised as migratable, because guessing at a name
+  is how a migration renames a record into something recovery still refuses.
+
+  Strict validation is unchanged and no shim accepts the old name. The new
+  `tally migrate unit-exit-labels --state-dir PATH [--apply]` rewrites the
+  `unit` field of pre-label records to the name the current derivation
+  produces, deriving both halves of the rename from the same
+  `row_execution_identity` recovery derives its expectation from. Without
+  `--apply` it prints the plan as JSON and writes nothing. It is idempotent,
+  touches only records whose recorded name is exactly the pre-label name for
+  their own row, lists everything else under `skipped` with a reason, and leaves
+  `invocationId`, `attempt`, `leaseEpoch`, `serviceResult`, and the exit
+  metadata untouched. The witness ledger is neither read nor written. No backup
+  copy is kept, because the pre-label name is a pure function of the record's
+  own file name and a copy would carry nothing the surviving file does not.
+
+  **Upgrade note:** if the daemon refuses to start after an upgrade with
+  `executor fact collection failed: N acknowledged row(s) have unusable local
+  execution facts` and `[pre-label unit-exit record]`, run
+  `tally migrate unit-exit-labels --state-dir <STATE_DIR>` to review the plan,
+  then the same command with `--apply`, then start the daemon. Rows dispatched
+  to a remote executor keep their records on that worker; they are listed under
+  `skipped` naming the executor, and the same command must be run against that
+  host's state directory. Deleting the records instead removes the evidence
+  recovery uses to decide whether replay is safe.
+
+- **A flow run recorded by an older binary is no longer refused with nothing but
+  two hashes (#371).** `argsHash` pins the bytes the runner serialized, not a
+  canonical form of the logical value, so moving the runner's arguments off argv
+  and into the brief file changed the hash for arguments nobody edited: four
+  in-flight runs on one estate failed `args-changed-mid-run` where `jq -c` of
+  the unchanged arguments file reproduced the *current* hash exactly, and the
+  24/7 drain sat behind its consecutive-failure fuse until the pinned run ids
+  were rotated by hand. `resolution: "supersede"` told a supervisor the class of
+  operation; it never told a person which command to type.
+
+  All three `*-changed-mid-run` refusals — at startup and mid-run alike — now
+  say that the pin covers the exact serialized bytes and that a run recorded by
+  an earlier tally can therefore be refused for an input it never changed, and
+  end with the `tally flow supersede` invocation that retires the run, with the
+  matching `--reason`. The same string is available to machines as a new
+  `remedy` detail. `transient`, `resolution`, and `divergentInput` are
+  unchanged, so nothing branching on the existing contract moves.
+
+  There is deliberately no migration on this side and there cannot be one:
+  re-deriving the recorded hash from the current arguments is the same operation
+  as dropping the pin, and the pin exists because only the operator can attest
+  the arguments are unchanged. Both halves of this fix therefore ship the same
+  policy — strict validation stays, and the refusal names one documented
+  command.
+
+  **Upgrade note:** every operator with a long-running flow hits this on the
+  next advance that moves how arguments are serialized. An in-flight run started
+  before the upgrade must be retired and restarted as a successor:
+  `tally flow supersede --flow-run-id <OLD> --new-flow-run-id <FRESH-UUID>
+  --reason args-changed`. Persist the successor UUID before calling —
+  idempotency is keyed on the whole triple, so minting a fresh UUID per attempt
+  records a different rollover.
+
 - **Three post-merge repairs on the campaigns docs batch (#319 repair).** The
   kind-less gate fixture #319 added was also concatenated into the Home Manager
   fixture whose whole job is to fail *as an assertion*. Because `kind` is an

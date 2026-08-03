@@ -314,11 +314,15 @@ fn validate_startup_hash(
         FlowError::new(
             "FlowReplayError",
             code,
-            format!("flow run {flow_run_id} is pinned to {recorded_hash}, not {current_hash}"),
+            format!(
+                "flow run {flow_run_id} is pinned to {recorded_hash}, not {current_hash}{}",
+                crate::error::identity_refusal_remedy_sentence(code, flow_run_id)
+            ),
         )
         .at(RUNTIME_ERROR_LOCATION)
         .detail("recordedHash", recorded_hash)
-        .detail("currentHash", current_hash),
+        .detail("currentHash", current_hash)
+        .detail("remedy", crate::error::supersede_remedy(code, flow_run_id)),
         flow_run_id,
     ))
 }
@@ -335,12 +339,20 @@ fn changed_catalog_error(
             "FlowReplayError",
             "catalog-changed-mid-run",
             format!(
-                "flow run {flow_run_id} is pinned to {rendered_recorded}, not {rendered_current}"
+                "flow run {flow_run_id} is pinned to {rendered_recorded}, not {rendered_current}{}",
+                crate::error::identity_refusal_remedy_sentence(
+                    "catalog-changed-mid-run",
+                    flow_run_id
+                )
             ),
         )
         .at(RUNTIME_ERROR_LOCATION)
         .detail("recordedHash", recorded_hash)
-        .detail("currentHash", current_hash),
+        .detail("currentHash", current_hash)
+        .detail(
+            "remedy",
+            crate::error::supersede_remedy("catalog-changed-mid-run", flow_run_id),
+        ),
         flow_run_id,
     )
 }

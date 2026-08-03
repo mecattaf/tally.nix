@@ -671,6 +671,52 @@ fn identity_divergence_carries_machine_readable_recovery_facts() {
     assert_eq!(error.details["resolution"], "supersede");
 }
 
+/// The second half of the wave-3 pin advance: four in-flight runs recorded by
+/// the old binary were refused on the new one for arguments the operator never
+/// touched, and the error said only which two hashes disagreed. It now names
+/// why a byte-identical input can still be refused and the exact command that
+/// retires the run.
+#[test]
+fn an_identity_refusal_names_the_command_that_clears_it() {
+    let source = format!("{}\n42;", meta(&["cpu"], &[]));
+    let script_hash = sha256(source.as_bytes());
+    let client = MockClient::with_inspection(RunInspection {
+        script_hash: Some(script_hash),
+        args_hash: Some("sha256:recorded-by-the-previous-binary".to_owned()),
+        catalog_hash: None,
+        supersede: None,
+    });
+    let error = run_script(
+        &source,
+        Some(Path::new("test-flow.js")),
+        client,
+        Rc::new(VecLifecycleSink::default()),
+        RunOptions::new("run-1", json!({"subject": "unchanged"})),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.code, "args-changed-mid-run");
+    let remedy = "tally flow supersede --flow-run-id run-1 --new-flow-run-id <FRESH-UUID> \
+                  --reason args-changed";
+    assert_eq!(error.details["remedy"], remedy);
+    assert!(
+        error.message.contains(remedy),
+        "the message must carry the remedy for a human reading a log: {}",
+        error.message
+    );
+    assert!(
+        error
+            .message
+            .contains("recorded by an earlier tally can be refused for args it never changed"),
+        "the message must explain that the pin covers serialized bytes: {}",
+        error.message
+    );
+    // The machine-readable contract is unchanged.
+    assert_eq!(error.details["transient"], false);
+    assert_eq!(error.details["resolution"], "supersede");
+    assert_eq!(error.details["divergentInput"], "args");
+}
+
 #[test]
 fn a_flow_run_pins_args_then_catalog_before_submission() {
     let source = format!("{}\n42;", meta(&["cpu"], &[]));

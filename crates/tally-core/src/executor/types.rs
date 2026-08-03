@@ -97,6 +97,18 @@ impl ExecutionIdentity {
         format!("{}.service", self.unit_stem())
     }
 
+    /// The unit name this identity would have carried before campaign task
+    /// labels entered `unit_stem`.
+    ///
+    /// Nothing mints this name any more. It exists so a reader of a durable
+    /// record written by an older binary can recognize the one historical
+    /// naming scheme by construction instead of by pattern-matching a string,
+    /// and so the migration that rewrites those records derives both halves of
+    /// the rename from the same identity recovery derives its expectation from.
+    pub fn pre_label_unit_name(&self) -> String {
+        format!("tally-job-{}.service", self.unit_uuid())
+    }
+
     pub fn capture_stem(&self) -> String {
         self.task_ref.as_ref().map_or_else(
             || self.unit_uuid().to_string(),
@@ -268,10 +280,10 @@ impl UnitExitRecord {
             )));
         }
         if self.unit != expected_unit {
-            return Err(ExecutorError::InvalidExitRecord(format!(
-                "record unit {:?} does not match expected unit {expected_unit:?}",
-                self.unit
-            )));
+            return Err(ExecutorError::ExitRecordUnitMismatch {
+                recorded: self.unit.clone(),
+                expected: expected_unit.to_owned(),
+            });
         }
         if self.attempt == 0 {
             return Err(ExecutorError::InvalidExitRecord(

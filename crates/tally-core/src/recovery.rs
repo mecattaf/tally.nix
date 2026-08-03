@@ -13,7 +13,14 @@ use crate::executor::{
 use crate::taskdb::{read_acknowledged_events, DurableEnqueueEvent, RowSeed, TaskDbError};
 use crate::witness::{read_verified_records, LaborClass, Verdict, WitnessError, WitnessRecord};
 
-fn row_execution_identity(row: &RowSeed) -> ExecutionIdentity {
+/// The execution identity a durable row is expected to own.
+///
+/// Public because the unit-exit label migration must derive the same two names
+/// recovery derives — the one it expects and the pre-label one it may find —
+/// from this single function. A migration with its own copy of the naming
+/// scheme is a migration that can rename records into a name recovery still
+/// refuses.
+pub fn row_execution_identity(row: &RowSeed) -> ExecutionIdentity {
     ExecutionIdentity {
         job_id: row.uuid,
         task_uuid: Some(row.uuid),
@@ -21,6 +28,91 @@ fn row_execution_identity(row: &RowSeed) -> ExecutionIdentity {
             .orchestration
             .as_ref()
             .and_then(crate::provenance::Orchestration::task_ref),
+    }
+}
+
+/// One acknowledged row whose local execution facts could not be collected.
+///
+/// Collection reports every one of these together, so an operator sees the
+/// whole population in a single startup instead of one record per restart.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitFactFailure {
+    pub uuid: Uuid,
+    pub expected_unit: String,
+    /// The remote execution target that owns this row's state, when the record
+    /// does not live in the coordinator's own state directory.
+    pub executor: Option<String>,
+    /// Set when the durable record carries the pre-label unit name, which is
+    /// the one historical naming scheme a forward migration can repair.
+    pub pre_label_record: bool,
+    pub detail: String,
+}
+
+impl UnitFactFailure {
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "row {} ", self.uuid)?;
+        match self.executor.as_deref() {
+            Some(executor) => write!(formatter, "on executor {executor:?} ")?,
+            None => write!(formatter, "on this host ")?,
+        }
+        write!(
+            formatter,
+            "(expected unit {:?}): {}",
+            self.expected_unit, self.detail
+        )?;
+        if self.pre_label_record {
+            formatter.write_str(" [pre-label unit-exit record]")?;
+        }
+        Ok(())
+    }
+}
+
+/// Every failure collection found, plus the one command that clears the
+/// migratable subset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnitFactFailures {
+    pub failures: Vec<UnitFactFailure>,
+    /// The local state root whose `unit-exit/` directory holds the records.
+    pub state_dir: std::path::PathBuf,
+}
+
+impl UnitFactFailures {
+    #[must_use]
+    pub fn pre_label_count(&self) -> usize {
+        self.failures
+            .iter()
+            .filter(|failure| failure.pre_label_record)
+            .count()
+    }
+}
+
+impl std::fmt::Display for UnitFactFailures {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} acknowledged row(s) have unusable local execution facts:",
+            self.failures.len()
+        )?;
+        for failure in &self.failures {
+            formatter.write_str("\n  ")?;
+            failure.render(formatter)?;
+        }
+        let pre_label = self.pre_label_count();
+        if pre_label > 0 {
+            let state_dir = self.state_dir.display();
+            write!(
+                formatter,
+                "\n{pre_label} of these are unit-exit records written before campaign task labels \
+                 entered the execution unit name. This binary does not accept the old name and no \
+                 shim makes it valid; run the one-shot forward migration instead:\n  tally \
+                 migrate unit-exit-labels --state-dir {state_dir}\n  tally migrate \
+                 unit-exit-labels --state-dir {state_dir} --apply\nThe first prints the plan and \
+                 changes nothing; the second rewrites the records and is a no-op afterwards. \
+                 Records owned by a remote executor must be migrated against that worker's own \
+                 state directory. Then start the daemon again."
+            )?;
+        }
+        Ok(())
     }
 }
 
@@ -32,6 +124,8 @@ pub enum RecoveryError {
     Witness(#[from] WitnessError),
     #[error("executor fact collection failed: {0}")]
     Executor(#[from] ExecutorError),
+    #[error("executor fact collection failed: {0}")]
+    UnitFacts(UnitFactFailures),
     #[error("witness chain is not verified: {0}")]
     InvalidWitness(String),
     #[error("invalid recovery facts: {0}")]
@@ -145,6 +239,11 @@ pub async fn collect_local_unit_facts(
     }
 
     let mut facts = BTreeMap::new();
+    // Every row is probed before the first failure is raised. Dying on the
+    // first bad record makes an operator discover the population one ~25 s
+    // restart at a time, which is how 23 pre-label records on one host became
+    // 23 crash-loops instead of one migration.
+    let mut failures = Vec::new();
     for event in &durable.events {
         let uuid = event.row.uuid;
         let identity = row_execution_identity(&event.row);
@@ -166,13 +265,62 @@ pub async fn collect_local_unit_facts(
         let fact = if remote_is_canonically_terminal {
             LocalUnitFact::absent(executor.unit_name(&identity))
         } else {
-            executor
+            match executor
                 .inspect_identity_on(event.row.executor.as_deref(), &identity)
-                .await?
+                .await
+            {
+                Ok(fact) => fact,
+                Err(error) => {
+                    failures.push(UnitFactFailure {
+                        uuid,
+                        expected_unit: identity.unit_name(),
+                        executor: event.row.executor.clone(),
+                        pre_label_record: is_pre_label_record_refusal(&identity, &error),
+                        detail: error.to_string(),
+                    });
+                    continue;
+                }
+            }
         };
         facts.insert(uuid, fact);
     }
+    if !failures.is_empty() {
+        return Err(RecoveryError::UnitFacts(UnitFactFailures {
+            failures,
+            state_dir: executor.state_dir().to_path_buf(),
+        }));
+    }
     Ok(facts)
+}
+
+/// Whether this refusal is exactly the pre-label unit-exit record the forward
+/// migration repairs, rather than an unrelated corrupt or contradictory record.
+///
+/// The test is constructive: the identity is asked for both names, and only a
+/// record naming the pre-label one where the labeled one is expected qualifies.
+/// An identity with no `taskRef` derives the same name twice and never matches,
+/// so a genuinely mismatched record is never advertised as migratable.
+fn is_pre_label_record_refusal(identity: &ExecutionIdentity, error: &ExecutorError) -> bool {
+    let expected = identity.unit_name();
+    let pre_label = identity.pre_label_unit_name();
+    if pre_label == expected {
+        return false;
+    }
+    match error {
+        ExecutorError::ExitRecordUnitMismatch { recorded, expected } => {
+            recorded == &pre_label && expected == &identity.unit_name()
+        }
+        // A refusal raised on a remote worker crosses the transport as prose,
+        // so the same classification is read back out of the rendered text the
+        // typed variant produces. The needle is the whole rendered clause, not
+        // a loose fragment.
+        ExecutorError::RemoteExecution { .. } | ExecutorError::RemoteProtocol { .. } => {
+            error.to_string().contains(&format!(
+                "record unit {pre_label:?} does not match expected unit {expected:?}"
+            ))
+        }
+        _ => false,
+    }
 }
 
 pub fn collect_rowless_unit_fact(
@@ -1220,6 +1368,202 @@ mod tests {
                 })
             })
         }
+    }
+
+    /// The exact half of `interpret_systemd_unit_show` that reads a durable
+    /// record for a unit systemd no longer knows about.
+    ///
+    /// Every historical row on a restarted host takes this branch: the
+    /// transient unit is long gone (`LoadState=not-found`) and the only
+    /// surviving fact is `unit-exit/<uuid>.json`. Reproducing that branch is
+    /// what makes the pre-label refusal observable without systemd.
+    struct DurableRecordProbe;
+
+    impl crate::executor::LocalUnitProbe for DurableRecordProbe {
+        fn inspect(
+            &self,
+            unit: &str,
+            paths: &crate::executor::ExecutionPaths,
+        ) -> Result<LocalUnitFact, ExecutorError> {
+            match crate::executor::read_exit_record(&paths.exit_record, unit) {
+                Ok(record) => Ok(LocalUnitFact {
+                    unit: unit.to_owned(),
+                    loaded: false,
+                    state: LocalUnitState::Exited,
+                    invocation_id: Some(record.invocation_id.clone()),
+                    attempt: Some(record.attempt),
+                    lease_epoch: Some(record.lease_epoch),
+                    exit_record: Some(record),
+                }),
+                Err(ExecutorError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Ok(LocalUnitFact::absent(unit))
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+
+    /// The live wave-3 failure, as a test: three campaign-task rows whose
+    /// `unit-exit` records were written by a binary from before task labels
+    /// entered the unit name (#265).
+    ///
+    /// Before the fix this refused startup one record at a time, so an operator
+    /// paid one ~25 s restart per record to discover the next one. The assertion
+    /// is that a single pass names all three, says they are migratable, and
+    /// prints the command that clears them — and that after running exactly that
+    /// migration, collection succeeds.
+    #[tokio::test]
+    async fn pre_label_unit_exit_records_are_all_reported_in_one_pass_and_clear_after_migration() {
+        use crate::unit_exit_migration::fixtures::{row as fixture_row, seed};
+        use crate::unit_exit_migration::migrate_unit_exit_labels;
+
+        let temp = tempfile::tempdir().unwrap();
+        let executor = Executor::new(temp.path(), "/bin/tally").with_unit_probe(DurableRecordProbe);
+
+        let rows: Vec<_> = (1..=3)
+            .map(|index| fixture_row(Uuid::new_v4(), Some(&format!("issue253-live/task-{index}"))))
+            .collect();
+        // One ordinary row with no taskRef: its name did not move, so it must
+        // stay collectable throughout and never appear in the migration.
+        let plain = fixture_row(Uuid::new_v4(), None);
+
+        for row in &rows {
+            seed(
+                temp.path(),
+                row,
+                &row_execution_identity(row).pre_label_unit_name(),
+            );
+        }
+        seed(
+            temp.path(),
+            &plain,
+            &row_execution_identity(&plain).unit_name(),
+        );
+
+        let durable = DurableRecoveryFacts::from_verified(
+            rows.iter()
+                .chain(std::iter::once(&plain))
+                .map(|row| event(row.clone()))
+                .collect(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        let error = collect_local_unit_facts(&executor, &durable)
+            .await
+            .expect_err("pre-label records must still be refused");
+        let RecoveryError::UnitFacts(failures) = error else {
+            panic!("expected an aggregated unit-fact failure, got {error}");
+        };
+        assert_eq!(
+            failures.failures.len(),
+            3,
+            "every invalid record is reported in one pass, not one per restart"
+        );
+        assert_eq!(failures.pre_label_count(), 3);
+        for row in &rows {
+            assert!(
+                failures
+                    .failures
+                    .iter()
+                    .any(|failure| failure.uuid == row.uuid),
+                "row {} is missing from the aggregate",
+                row.uuid
+            );
+        }
+        let rendered = failures.to_string();
+        assert!(
+            rendered.contains("tally migrate unit-exit-labels"),
+            "the refusal must name the migration: {rendered}"
+        );
+        assert!(rendered.contains(temp.path().to_str().unwrap()));
+
+        let report = migrate_unit_exit_labels(temp.path(), true).unwrap();
+        assert_eq!(report.rewritten.len(), 3);
+        assert_eq!(
+            report.labeled_rows, 3,
+            "the taskRef-less row is out of scope"
+        );
+        assert!(report.skipped.is_empty());
+
+        let facts = collect_local_unit_facts(&executor, &durable)
+            .await
+            .expect("startup is clean once the migration has run");
+        assert_eq!(facts.len(), 4);
+        for row in &rows {
+            let fact = &facts[&row.uuid];
+            assert_eq!(fact.unit, row_execution_identity(row).unit_name());
+            assert_eq!(fact.state, LocalUnitState::Exited);
+        }
+    }
+
+    /// A worker raises the refusal on its own side, so it reaches the
+    /// coordinator as prose inside a transport error. The classification has to
+    /// survive that crossing, or every remote campaign row is refused with no
+    /// hint at all.
+    #[test]
+    fn a_refusal_relayed_from_a_worker_is_still_classified() {
+        let uuid = Uuid::new_v4();
+        let identity = row_execution_identity(&crate::unit_exit_migration::fixtures::row(
+            uuid,
+            Some("issue253-live/task-1"),
+        ));
+        let relayed = ExecutorError::RemoteExecution {
+            executor: "worker".to_owned(),
+            detail: ExecutorError::ExitRecordUnitMismatch {
+                recorded: identity.pre_label_unit_name(),
+                expected: identity.unit_name(),
+            }
+            .to_string(),
+        };
+        assert!(is_pre_label_record_refusal(&identity, &relayed));
+
+        let unrelated = ExecutorError::RemoteExecution {
+            executor: "worker".to_owned(),
+            detail: "ssh: connect to host worker port 22: Connection refused".to_owned(),
+        };
+        assert!(!is_pre_label_record_refusal(&identity, &unrelated));
+
+        // A row with no taskRef derives one name, so nothing about it is ever
+        // the pre-label rename.
+        let plain = row_execution_identity(&crate::unit_exit_migration::fixtures::row(uuid, None));
+        assert!(!is_pre_label_record_refusal(
+            &plain,
+            &ExecutorError::ExitRecordUnitMismatch {
+                recorded: plain.pre_label_unit_name(),
+                expected: plain.unit_name(),
+            }
+        ));
+    }
+
+    /// A mismatch that is not the pre-label rename is still reported, but is
+    /// never advertised as something the migration will fix.
+    #[tokio::test]
+    async fn an_unrelated_record_mismatch_is_not_advertised_as_migratable() {
+        use crate::unit_exit_migration::fixtures::{row as fixture_row, seed};
+
+        let temp = tempfile::tempdir().unwrap();
+        let executor = Executor::new(temp.path(), "/bin/tally").with_unit_probe(DurableRecordProbe);
+        let row = fixture_row(Uuid::new_v4(), Some("issue253-live/task-9"));
+        seed(temp.path(), &row, "tally-job-someone-elses.service");
+
+        let durable =
+            DurableRecoveryFacts::from_verified(vec![event(row.clone())], Vec::new()).unwrap();
+        let error = collect_local_unit_facts(&executor, &durable)
+            .await
+            .expect_err("a foreign unit name is still refused");
+        let RecoveryError::UnitFacts(failures) = error else {
+            panic!("expected an aggregated unit-fact failure, got {error}");
+        };
+        assert_eq!(failures.failures.len(), 1);
+        assert_eq!(failures.pre_label_count(), 0);
+        let rendered = failures.to_string();
+        assert!(
+            !rendered.contains("tally migrate unit-exit-labels"),
+            "an unrelated mismatch must not be sold as migratable: {rendered}"
+        );
     }
 
     fn executor_with_probe_transport(state_dir: &Path, calls: Arc<AtomicUsize>) -> Executor {

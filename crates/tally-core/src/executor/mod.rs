@@ -82,6 +82,12 @@ pub enum ExecutorError {
     CredentialedFallback,
     #[error("unit exit record is invalid: {0}")]
     InvalidExitRecord(String),
+    /// The one invalid-record shape a forward migration can repair, typed apart
+    /// from the rest so a caller classifies it without parsing prose.
+    #[error(
+        "unit exit record is invalid: record unit {recorded:?} does not match expected unit {expected:?}"
+    )]
+    ExitRecordUnitMismatch { recorded: String, expected: String },
     #[error("execution unit {0} is already reserved by another executor")]
     AlreadyRunning(String),
     #[error("cannot inspect local execution unit {unit}: {detail}")]
@@ -219,6 +225,14 @@ impl Executor {
 
     pub fn recorder_program(&self) -> &Path {
         &self.recorder_program
+    }
+
+    /// The local state root this executor reads durable execution facts from.
+    ///
+    /// Diagnostics name it so an operator repairing state does not have to
+    /// rediscover which directory a message is about.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir
     }
 
     /// Opt into the compatibility direct-process backend when `systemd-run`
