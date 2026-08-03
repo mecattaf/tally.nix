@@ -345,9 +345,13 @@ and scheduled flow runners. Use the generated
 [Home Manager options](home-manager-options.md#servicestallyenable) when
 building that topology.
 
-The NixOS wrapper currently renders the system daemon and witness emitter only.
-It can type-check producer, meter, and flow declarations without deploying the
-units that drive them. Use the generated
+The NixOS wrapper renders the system daemon and witness emitter, plus — when
+[`campaignForge.enable`](nixos-options.md#servicestallycampaignforgeenable) is
+set — the campaign execution surface and its poll units for forge-native
+campaigns, described in
+[Campaigns on a NixOS host](../flows/campaigns.md#campaigns-on-a-nixos-host).
+It renders no producer, meter, or flow units at all, and can type-check those
+declarations without deploying anything that drives them. Use the generated
 [NixOS options](nixos-options.md#servicestallyenable) for that narrower system
 surface, and do not infer a producer service merely because its option
 evaluated successfully.
