@@ -154,3 +154,132 @@ fn the_named_migration_plans_then_relabels_and_is_a_no_op_afterwards() {
     assert_eq!(again["alreadyLabeled"], json!(1));
     assert_eq!(again["skipped"].as_array().unwrap().len(), 0);
 }
+
+/// The evaluator's Finding 2, as a regression: a state directory that does not
+/// exist used to report `labeledRows: 0` and exit 0, which is the failure where
+/// an operator runs the documented command, sees a clean report, restarts, and
+/// crash-loops again with no signal that they pointed at the wrong tree.
+#[test]
+fn a_state_directory_that_holds_no_durable_rows_is_refused_rather_than_reported_clean() {
+    let temp = tempfile::tempdir().unwrap();
+
+    for (label, dir) in [
+        ("typo", temp.path().join("stat")),
+        // A worker's layout: an exit record, and no durable rows anywhere.
+        ("worker", temp.path().join("worker")),
+    ] {
+        if label == "worker" {
+            std::fs::create_dir_all(dir.join(UNIT_EXIT_DIRECTORY)).unwrap();
+        }
+        let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+            .arg("migrate")
+            .arg("unit-exit-labels")
+            .arg("--state-dir")
+            .arg(&dir)
+            .arg("--apply")
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{label}: a directory with no durable rows must not report clean; stdout was {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.stdout.is_empty(), "{label}: no report is emitted");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("is not a directory; nothing here can be migrated"),
+            "{label}: {stderr}"
+        );
+    }
+}
+
+/// A remote-owned row reaches the operator through the real binary carrying the
+/// path on the worker and both names — the facts the hand repair needs, since
+/// no invocation of this command can perform it.
+#[test]
+fn a_remote_owned_row_reports_the_hand_repair_and_never_claims_to_have_made_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+
+    let uuid = Uuid::new_v4();
+    let row: RowSeed = serde_json::from_value(json!({
+        "uuid": uuid,
+        "description": "campaign task dispatched to a worker",
+        "priority": "high",
+        "source": "events-dir",
+        "adapter": "shell",
+        "pool": ["worker"],
+        "executor": "worker",
+        "leaseEpoch": 3,
+        "argv": ["worker", "leaf"],
+        "cwd": "/work",
+        "orchestration": {
+            "flowRunId": "018f5f8e-7b2a-7cc1-8c3a-2dd44ad1f321",
+            "taskRef": "issue253-live/task-1",
+        },
+    }))
+    .unwrap();
+    let events_dir = state_dir.join("events");
+    std::fs::create_dir_all(&events_dir).unwrap();
+    write_enqueue_event_atomic(&events_dir, &DurableEnqueueEvent::new(row).unwrap()).unwrap();
+
+    let config = temp.path().join("config.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&json!({
+            "executors": {
+                "worker": {
+                    "kind": "ssh",
+                    "host": "worker.invalid",
+                    "user": "tally-worker",
+                    "sshProgram": "/bin/ssh",
+                    "identityFile": "/key",
+                    "knownHostsFile": "/known-hosts",
+                    "program": "/bin/tally",
+                    "stateDir": "/var/lib/tally-worker/state",
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .arg("--config")
+        .arg(&config)
+        .arg("migrate")
+        .arg("unit-exit-labels")
+        .arg("--state-dir")
+        .arg(&state_dir)
+        .arg("--apply")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "migrate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["rewritten"].as_array().unwrap().len(), 0);
+    let skipped = &report["skipped"][0];
+    assert_eq!(skipped["executor"], json!("worker"));
+    assert_eq!(
+        skipped["recordPath"],
+        json!(format!("/var/lib/tally-worker/state/unit-exit/{uuid}.json"))
+    );
+    assert_eq!(
+        skipped["preLabelUnit"],
+        json!(format!("tally-job-{uuid}.service"))
+    );
+    assert_eq!(
+        skipped["expectedUnit"],
+        json!(format!("tally-job-issue253-live-task-1-{uuid}.service"))
+    );
+    let reason = skipped["reason"].as_str().unwrap();
+    assert!(
+        !reason.contains("run this migration against"),
+        "the retracted claim must be gone: {reason}"
+    );
+    assert!(reason.contains("cannot reach or repair"), "{reason}");
+}

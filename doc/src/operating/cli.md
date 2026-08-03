@@ -792,8 +792,22 @@ $ tally migrate unit-exit-labels --state-dir /var/lib/tally/state --apply
 
 Rewrites `unit-exit/<uuid>.json` records that name `tally-job-<uuid>.service` for a row whose
 orchestration carries a `taskRef`, which now owns `tally-job-<campaign>-<task>-<uuid>.service`.
-Without `--apply` the plan is printed and nothing is written; read `rewritten` first. `--state-dir`
-must be absolute and defaults to the same state directory the daemon uses.
+Without `--apply` the plan is printed and nothing is written; read `rewritten` first.
+
+`--state-dir PATH` must be absolute. Without it the CLI resolves `$XDG_STATE_HOME/tally` (or
+`$HOME/.local/state/tally`), exactly as [`tally gc`](#retention-derived-view-and-execution-wrapper)
+does. On a Home Manager deployment that already coincides with the module's `stateDir`. On a
+**NixOS** deployment it does not: the module's `stateDir` is `/var/lib/tally/state`, so pass it
+explicitly — and run the command **as the service user, which owns that directory**. Exit
+records are written mode 0600 with no ownership repair, so a record rewritten under `sudo` is one
+the daemon can no longer read. The startup refusal prints the correct absolute path; copying it
+from there is the safe route.
+
+A state directory that is not a coordinator's — a typo, or a worker's — is refused rather than
+reported clean: both the directory and its `events/` must exist. There is no configuration key
+for the state directory, so `--config` does not select one; it is read only for the
+`executors.<name>.stateDir` values used to name remote records (below), and an absent default
+config file is not an error.
 
 The report is JSON:
 
@@ -802,9 +816,13 @@ schemaVersion, applied, stateDir, labeledRows, rewritten[], alreadyLabeled, skip
 ```
 
 `rewritten[]` carries `uuid`, `path`, `recordedUnit`, and `expectedUnit`. `skipped[]` carries
-`uuid`, `expectedUnit`, and a `reason` — a row owned by a remote executor (migrate it against
-that worker's state directory) or a record whose name is neither the pre-label nor the expected
-one, which this migration will not guess at. Re-running is a no-op: already-labeled records are
-counted, not rewritten. Only the `unit` field changes; every other field round-trips untouched
-and the witness ledger is not read or written. See
-[recovery](recovery.md#startup-refuses-pre-label-unit-exit-records).
+`uuid`, `expectedUnit`, a `reason`, and — for a remote-owned row — `executor`, `recordPath`, and
+`preLabelUnit`. Re-running is a no-op: already-labeled records are counted, not rewritten. Only
+the `unit` field changes; every other field round-trips untouched and the witness ledger is not
+read or written.
+
+**This command repairs records on the coordinator only.** The labeled name is derived from the
+durable rows, which exist only here — a worker runs no tally daemon and has no `events/` — so
+running it on a worker reads nothing and rewrites nothing. Remote-owned rows are therefore
+reported, never repaired, and `skipped[]` carries everything the hand repair on that host needs.
+See [recovery](recovery.md#startup-refuses-pre-label-unit-exit-records) for the procedure.

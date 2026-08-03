@@ -84,6 +84,16 @@ impl UnitFactFailures {
             .filter(|failure| failure.pre_label_record)
             .count()
     }
+
+    /// The pre-label subset whose records live on a worker, which the migration
+    /// can describe but not repair.
+    #[must_use]
+    pub fn remote_pre_label_count(&self) -> usize {
+        self.failures
+            .iter()
+            .filter(|failure| failure.pre_label_record && failure.executor.is_some())
+            .count()
+    }
 }
 
 impl std::fmt::Display for UnitFactFailures {
@@ -107,10 +117,26 @@ impl std::fmt::Display for UnitFactFailures {
                  shim makes it valid; run the one-shot forward migration instead:\n  tally \
                  migrate unit-exit-labels --state-dir {state_dir}\n  tally migrate \
                  unit-exit-labels --state-dir {state_dir} --apply\nThe first prints the plan and \
-                 changes nothing; the second rewrites the records and is a no-op afterwards. \
-                 Records owned by a remote executor must be migrated against that worker's own \
-                 state directory. Then start the daemon again."
+                 changes nothing; the second rewrites the records and is a no-op afterwards. Run \
+                 it as the user that owns that directory — under the shipped systemd units that \
+                 is the service user, not root."
             )?;
+            // Naming a command that cannot repair these would be worse than
+            // naming none: the worker holds no durable rows, so the same
+            // command run there reads nothing and answers clean.
+            let remote = self.remote_pre_label_count();
+            if remote > 0 {
+                write!(
+                    formatter,
+                    "\n{remote} of them belong to a remote executor and cannot be repaired by \
+                     this command, here or on the worker: the labeled name is derived from \
+                     durable rows, which exist only on this coordinator. The plan above lists \
+                     each of those under \"skipped\" with the record's path on the owning host \
+                     and the exact name to write; rewrite the \"unit\" field of each by hand, \
+                     changing nothing else."
+                )?;
+            }
+            formatter.write_str("\nThen start the daemon again.")?;
         }
         Ok(())
     }
@@ -1479,8 +1505,13 @@ mod tests {
             "the refusal must name the migration: {rendered}"
         );
         assert!(rendered.contains(temp.path().to_str().unwrap()));
+        assert_eq!(failures.remote_pre_label_count(), 0);
+        assert!(
+            !rendered.contains("belong to a remote executor"),
+            "no row here is remote-owned, so the caveat must stay quiet: {rendered}"
+        );
 
-        let report = migrate_unit_exit_labels(temp.path(), true).unwrap();
+        let report = migrate_unit_exit_labels(temp.path(), &BTreeMap::new(), true).unwrap();
         assert_eq!(report.rewritten.len(), 3);
         assert_eq!(
             report.labeled_rows, 3,
@@ -1497,6 +1528,58 @@ mod tests {
             assert_eq!(fact.unit, row_execution_identity(row).unit_name());
             assert_eq!(fact.state, LocalUnitState::Exited);
         }
+    }
+
+    /// The refusal used to end by telling the operator to run the migration
+    /// "against that worker's own state directory". That command is a
+    /// guaranteed no-op there — a worker holds no durable rows — so for those
+    /// rows the advice was worse than none: it retired the hand repair the
+    /// estate had actually been doing and replaced it with a command that
+    /// answers clean. The remedy the refusal names must stay true to what the
+    /// command can do.
+    #[test]
+    fn a_remote_owned_pre_label_record_is_never_promised_a_repair_this_command_cannot_make() {
+        let uuid = Uuid::new_v4();
+        let identity = row_execution_identity(&crate::unit_exit_migration::fixtures::row(
+            uuid,
+            Some("issue253-live/task-1"),
+        ));
+        let failures = UnitFactFailures {
+            state_dir: PathBuf::from("/var/lib/tally/state"),
+            failures: vec![UnitFactFailure {
+                uuid,
+                expected_unit: identity.unit_name(),
+                executor: Some("worker".to_owned()),
+                pre_label_record: true,
+                detail: ExecutorError::ExitRecordUnitMismatch {
+                    recorded: identity.pre_label_unit_name(),
+                    expected: identity.unit_name(),
+                }
+                .to_string(),
+            }],
+        };
+
+        assert_eq!(failures.remote_pre_label_count(), 1);
+        let rendered = failures.to_string();
+        assert!(
+            !rendered.contains("must be migrated against that worker's own state directory"),
+            "the retracted claim must be gone: {rendered}"
+        );
+        assert!(
+            rendered.contains("cannot be repaired by this command, here or on the worker"),
+            "the refusal must say plainly that the command cannot reach it: {rendered}"
+        );
+        assert!(
+            rendered.contains("rewrite the \"unit\" field of each by hand"),
+            "the refusal must name what the operator does instead: {rendered}"
+        );
+        // Finding 3: the natural reflex on a crash-looping system service is
+        // sudo, and a root-written 0600 record is one the service user cannot
+        // read back.
+        assert!(
+            rendered.contains("as the user that owns that directory"),
+            "the refusal must say which user to run as: {rendered}"
+        );
     }
 
     /// A worker raises the refusal on its own side, so it reaches the
