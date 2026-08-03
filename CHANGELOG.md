@@ -47,7 +47,7 @@ authorized.
   byte-identical gate with `kind = "command"` supplied to evaluate — so the
   failure means the missing field and not some other defect of the fixture.
   Eval-only; no flow node, and `campaignMaxNodes`/`max_flow_nodes` is untouched
-  at 51.
+  at 52.
 
 - **Campaign docs no longer describe the machine self-continuation as a GitHub
   comment (#306 follow-up).** A campaign's next-pass nudge became a JSON drop in
