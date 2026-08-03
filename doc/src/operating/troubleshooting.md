@@ -18,12 +18,13 @@ the shipped implementation; placeholders vary with the job.
 | A key names different work | `dedup-key-conflict for key "KEY"` | The same full-mode key was presented with a different payload, or legacy history contains multiple live owners. |
 | Flow history no longer matches | code `replay-divergence`; `ordinal N re-derived payload NEW but the ledger recorded OLD` | Replay derived different work at an existing ordinal. |
 | Flow script changes during one run | code `script-changed-mid-run`; `flow run ID is pinned to RECORDED, not CURRENT` | One flow run observed two script hashes. |
-| Flow arguments change during one run | code `args-changed-mid-run`; `flow run ID is pinned to RECORDED, not CURRENT` | One flow run observed two serialized argument hashes. |
+| Flow arguments change during one run | code `args-changed-mid-run`; `flow run ID is pinned to RECORDED, not CURRENT; ... Retire the run and start a successor: tally flow supersede ...` | One flow run observed two serialized argument hashes — including when only the binary moved. |
 | Flow catalog changes during one run | code `catalog-changed-mid-run`; `flow run ID is pinned to RECORDED, not CURRENT` | One flow run observed different exact catalog bytes, or changed between a catalog and none. |
 | A retired run ID is replayed | code `flow-run-superseded`; `flow run OLD was superseded by NEW ...` | `tally flow supersede` durably retired that run; start the successor. |
 | CLI loses the socket on a large request or response | `wire frame exceeds N bytes` or `daemon closed the socket before replying` | One side exceeded its configured frame bound. |
 | Declared culmination is absent | `cannot read gate manifest PATH: ...` in `completion.gates.manifestError` | The job did not write the declared file on its execution host. |
 | Remote work appears hung | `tally: remote executor "NAME" transport is unavailable; retaining leases and retrying: ...` | SSH or the fixed worker helper is unavailable after dispatch. |
+| The daemon crash-loops at startup after an upgrade | `recovery error: executor fact collection failed: N acknowledged row(s) have unusable local execution facts` with `[pre-label unit-exit record]` | `unit-exit/` records written before campaign task labels entered the unit name. Run the named migration. |
 
 ## A job failed
 
@@ -288,6 +289,35 @@ values with the same serialized identity. For a catalog, use the exact original
 bytes, including insignificant-looking whitespace; adding or removing the
 catalog is also an identity change. Use a new flow run ID when either change is
 intentional.
+
+### After a tally upgrade, byte-identical arguments can still be refused
+
+The pin is over the bytes the runner serialized, not over a canonical form of
+the logical value, so an in-flight run recorded by an older tally can be refused
+for arguments nobody edited. Moving the runner's arguments off argv and into the
+brief file did exactly this: the same logical arguments reach the hash through a
+different serialization, so the recorded hash and the current hash disagree even
+though `jq -c` of the unchanged arguments file reproduces the *current* hash
+exactly.
+
+There is no migration for this and there deliberately is not one. Recomputing
+the recorded hash from the current arguments is the same operation as dropping
+the pin, and the pin exists precisely because only the operator can attest that
+the arguments are unchanged. The refusal therefore names the remedy, and the
+`remedy` detail carries the command verbatim:
+
+```console
+$ tally flow supersede \
+    --flow-run-id <OLD> \
+    --new-flow-run-id <FRESH-UUID> \
+    --reason args-changed
+```
+
+Persist the successor UUID before calling: idempotency is keyed on the whole
+triple, so a fresh UUID per attempt records a different rollover. Then start the
+successor. A supervisor can act on this without reading prose —
+`resolution: "supersede"` and `transient: false` are unchanged, and `remedy` is
+the new string field carrying the command.
 
 ## `flow-run-superseded`
 

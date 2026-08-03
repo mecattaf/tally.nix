@@ -59,6 +59,7 @@ assertions.
 | `daemon` | Run the daemon or drain event ingress. | Long-running process or drain JSON. |
 | `query` | Jobs, run status, lifecycle, proof, traces, producers, watch, status, and pool headroom. | JSON, JSONL, or compact text. |
 | `flow` | Check or execute a deterministic JavaScript flow. | Meta JSON or lifecycle JSONL. |
+| `migrate` | Run a one-shot forward migration of durable state written by an older binary. | Migration report JSON. |
 
 The installed `tallyd` symlink with no arguments is equivalent to `tally daemon run`.
 `tally --mode daemon` with no subcommand is another compatibility spelling.
@@ -777,3 +778,33 @@ $ tally attest exec \
 `--brief-hash`, `--executor`, and repeatable `--evidence` are optional. The wrapper inherits
 stdio, environment, and cwd, appends one advisory execution observation when it can, and
 propagates the child's status.
+
+## One-shot forward migrations
+
+`tally migrate` holds the migrations that repair durable state written by an older tally. These
+are not compatibility shims: the read paths stay strict, and each verb exists so the error that
+refuses old state can name one documented command.
+
+```console
+$ tally migrate unit-exit-labels --state-dir /var/lib/tally/state
+$ tally migrate unit-exit-labels --state-dir /var/lib/tally/state --apply
+```
+
+Rewrites `unit-exit/<uuid>.json` records that name `tally-job-<uuid>.service` for a row whose
+orchestration carries a `taskRef`, which now owns `tally-job-<campaign>-<task>-<uuid>.service`.
+Without `--apply` the plan is printed and nothing is written; read `rewritten` first. `--state-dir`
+must be absolute and defaults to the same state directory the daemon uses.
+
+The report is JSON:
+
+```text
+schemaVersion, applied, stateDir, labeledRows, rewritten[], alreadyLabeled, skipped[]
+```
+
+`rewritten[]` carries `uuid`, `path`, `recordedUnit`, and `expectedUnit`. `skipped[]` carries
+`uuid`, `expectedUnit`, and a `reason` — a row owned by a remote executor (migrate it against
+that worker's state directory) or a record whose name is neither the pre-label nor the expected
+one, which this migration will not guess at. Re-running is a no-op: already-labeled records are
+counted, not rewritten. Only the `unit` field changes; every other field round-trips untouched
+and the witness ledger is not read or written. See
+[recovery](recovery.md#startup-refuses-pre-label-unit-exit-records).

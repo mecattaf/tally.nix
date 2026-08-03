@@ -160,6 +160,42 @@ fn divergent_input(code: &str) -> Option<&'static str> {
     }
 }
 
+/// The `tally flow supersede` invocation that clears one identity refusal.
+///
+/// `resolution: "supersede"` already told an unattended *supervisor* which
+/// class of operation clears the code. It never told a *person* which command
+/// to type, and after a binary advance the refusal does not explain itself: the
+/// pin covers the bytes the runner serialized, so a run recorded by an earlier
+/// tally is refused for an input the operator never touched. Naming the exact
+/// command is what turns that into one documented step instead of a source
+/// reading. The successor UUID is left as a placeholder deliberately — it must
+/// be persisted before the call, because idempotency is keyed on the whole
+/// triple.
+#[must_use]
+pub fn supersede_remedy(code: &str, flow_run_id: &str) -> String {
+    let reason = match divergent_input(code) {
+        Some(input) => format!("{input}-changed"),
+        None => "operator".to_owned(),
+    };
+    format!(
+        "tally flow supersede --flow-run-id {flow_run_id} --new-flow-run-id <FRESH-UUID> \
+         --reason {reason}"
+    )
+}
+
+/// The sentence appended to a mid-run identity refusal, naming both why a
+/// byte-identical input can still be refused and the command that clears it.
+#[must_use]
+pub fn identity_refusal_remedy_sentence(code: &str, flow_run_id: &str) -> String {
+    let input = divergent_input(code).unwrap_or("input");
+    format!(
+        "; the pin covers the exact bytes this runner hashed, so a run recorded by an earlier \
+         tally can be refused for {input} it never changed. Retire the run and start a \
+         successor: {}",
+        supersede_remedy(code, flow_run_id)
+    )
+}
+
 /// Attach the `transient` / `resolution` (and, where fixed, `divergentInput`)
 /// facts for this error's code.
 ///

@@ -285,9 +285,25 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             )
             .await
         }
+        Some(Command::Migrate { command }) => run_migrate(command),
         None => {
             Opts::command().print_help().map_err(out::map_write_error)?;
             outln!();
+            Ok(())
+        }
+    }
+}
+
+fn run_migrate(command: MigrateCommand) -> Result<()> {
+    match command {
+        MigrateCommand::UnitExitLabels(args) => {
+            let state_dir = args.state_dir.map_or_else(default_state_dir, Ok)?;
+            if !state_dir.is_absolute() {
+                return Err(invalid("--state-dir must be absolute"));
+            }
+            let report =
+                tally_core::unit_exit_migration::migrate_unit_exit_labels(&state_dir, args.apply)?;
+            outln!("{}", serde_json::to_string(&report)?);
             Ok(())
         }
     }

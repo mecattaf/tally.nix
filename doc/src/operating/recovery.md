@@ -97,6 +97,52 @@ decide whether replay is safe. An old-format events directory produces an
 explicit archive-aside error; archive the named directory exactly as the error
 instructs, rather than converting or deleting it.
 
+## Startup refuses pre-label unit-exit records
+
+Campaign task labels entered the execution unit name, so a row whose
+orchestration carries a `taskRef` now owns
+`tally-job-<campaign>-<task>-<uuid>.service` where it previously owned
+`tally-job-<uuid>.service`. Records written before that change name a unit this
+binary never derives, and recovery refuses them:
+
+```text
+tally: recovery error: executor fact collection failed: 23 acknowledged row(s)
+have unusable local execution facts:
+  row <uuid> on this host (expected unit "tally-job-<campaign>-<task>-<uuid>.service"):
+  unit exit record is invalid: record unit "tally-job-<uuid>.service" does not
+  match expected unit "tally-job-<campaign>-<task>-<uuid>.service"
+  [pre-label unit-exit record]
+```
+
+Every unusable record is listed in one pass, so the population is known before
+the first repair rather than discovered one restart at a time. Validation stays
+strict: nothing accepts the old name. Run the one-shot forward migration the
+error names, which reads the same durable rows recovery reads and derives the
+new name from the same function:
+
+```console
+$ tally migrate unit-exit-labels --state-dir <STATE_DIR>
+$ tally migrate unit-exit-labels --state-dir <STATE_DIR> --apply
+```
+
+The first form prints the plan as JSON and writes nothing; run it first and read
+`rewritten`. The second rewrites the `unit` field and nothing else — the
+`invocationId`, `attempt`, `leaseEpoch`, `serviceResult`, and exit metadata
+round-trip untouched, and the witness ledger is neither read nor written.
+Running it again is a no-op (`alreadyLabeled`). Only records whose recorded name
+is exactly the pre-label name for their own row are touched; anything else is
+listed under `skipped` with the reason, and stays for a human.
+
+The pre-label name is a pure function of the record's file name
+(`unit-exit/<uuid>.json` → `tally-job-<uuid>.service`), so no backup copy is
+written: it would carry nothing the surviving file does not.
+
+Rows dispatched to a remote executor keep their records in that worker's own
+state directory. They appear under `skipped` naming the executor; run the same
+command against that host.
+
+Then restart the daemon as above.
+
 ## Recover a killed flow runner
 
 Use the original flow-run ID and the same script generation:
