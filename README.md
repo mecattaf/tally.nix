@@ -60,6 +60,27 @@ recovery, evidence evaluation, and the canonical verdict. The NixOS module
 uses `/run/tally/tally.sock`; the Home Manager CLI discovers its user socket
 by default.
 
+## Campaigns, optionally across two repositories
+
+A campaign turns one labeled GitHub issue into a reconciled batch of agent
+lanes: the forge keeps intake and steering, the work graph is witnessed from a
+pinned worklist, and every lane's merge criterion is a witnessed command gate —
+never a model's opinion.
+
+The repository roles can be split (#321). A campaign may read its worklist from
+a **spec repository** at a pinned revision, cut lanes and publish branches on a
+**code repository**, and keep the campaign issue thread and every machine
+receipt on an **issue repository**. A single-repository campaign is the same
+mechanism with all three roles on one coordinate; configurations that do not
+split render byte-identically to the pre-seam shape.
+
+One honest boundary: a split campaign currently runs the checkbox projection.
+Native per-task sub-issue threads exist only on the forge-native
+single-repository path, so "split" and "sub-issues" cannot yet be combined —
+the cross-repository closing grammar for that shape is staged, not reachable.
+Details and the worked example live in
+[the campaigns chapter](https://mecattaf.github.io/tally.nix/flows/campaigns.html).
+
 ## Read next
 
 - [Install tally](https://mecattaf.github.io/tally.nix/getting-started/install.html)
