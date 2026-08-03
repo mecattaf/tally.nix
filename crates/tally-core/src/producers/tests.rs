@@ -3155,41 +3155,46 @@ fn a_removed_producer_makes_its_projection_terminal_and_restoring_it_clears_the_
     let retired = BTreeMap::new();
     let engine = ProducerEngine::new(&retired, &events_dir, &state_dir, temp.path());
     let mut sink = RecordingMutation::default();
-    let GhProjectionOutcome::Orphaned { record, first } = engine
+    let GhProjectionOutcome::Orphaned { record } = engine
         .project_gh_completion(projection(), &mut sink)
         .unwrap()
     else {
         panic!("a projection whose producer is gone is terminal, not retryable")
     };
-    assert!(first);
     assert_eq!(record.producer, "github");
     assert_eq!(record.task_uuid.as_deref(), Some(task_uuid.as_str()));
     assert_eq!(record.verdict, Some(Verdict::Pass));
     assert_eq!(record.detail, "unknown producer \"github\"");
     assert!(sink.comments.is_empty());
 
-    // Re-observing the same orphan records it once and announces it once.
-    let GhProjectionOutcome::Orphaned { first, .. } = engine
+    // Re-observing the same orphan keeps one record with its first timestamp.
+    let GhProjectionOutcome::Orphaned { .. } = engine
         .project_gh_completion(projection(), &mut sink)
         .unwrap()
     else {
         panic!("the second observation is still terminal")
     };
-    assert!(!first);
     let recorded = read_orphaned_projections(&state_dir).unwrap();
-    assert_eq!(recorded.len(), 1);
-    assert_eq!(recorded[0].observed_at, record.observed_at);
+    assert_eq!(recorded.records.len(), 1);
+    assert!(recorded.unreadable.is_empty());
+    assert_eq!(recorded.records[0].observed_at, record.observed_at);
     assert_eq!(recorded, engine.orphaned_projections().unwrap());
 
     // Nothing consults the record to decide what to do, so restoring the
     // producer block projects the completion after all — and the record stops
     // claiming a loss that no longer holds.
     let engine = ProducerEngine::new(&configured, &events_dir, &state_dir, temp.path());
+    let GhProjectionOutcome::Settled { retracted } = engine
+        .project_gh_completion(projection(), &mut sink)
+        .unwrap()
+    else {
+        panic!("a configured producer projects the completion")
+    };
+    // The record that claimed a loss is handed back so its caller can retract
+    // the claim on the append-only chain rather than quietly drop it.
     assert_eq!(
-        engine
-            .project_gh_completion(projection(), &mut sink)
-            .unwrap(),
-        GhProjectionOutcome::Settled
+        retracted.map(|record| record.detail),
+        Some("unknown producer \"github\"".to_owned())
     );
     assert_eq!(sink.comments.len(), 1);
     assert!(read_orphaned_projections(&state_dir).unwrap().is_empty());
@@ -3226,18 +3231,20 @@ fn a_removed_producer_makes_its_storage_warning_receipt_terminal() {
         temp.path(),
     );
     let mut sink = RecordingMutation::default();
-    let GhProjectionOutcome::Orphaned { record, first } = engine
+    let GhProjectionOutcome::Orphaned { record } = engine
         .project_storage_warning(&origin, &warning, &mut sink)
         .unwrap()
     else {
         panic!("a storage-warning receipt whose producer is gone is terminal")
     };
-    assert!(first);
     assert_eq!(record.kind, OrphanedProjectionKind::StorageWarning);
     assert_eq!(record.completion_id, "storage-warning:3");
     assert_eq!(record.task_uuid, None);
     assert!(sink.comments.is_empty());
-    assert_eq!(read_orphaned_projections(&state_dir).unwrap().len(), 1);
+    assert_eq!(
+        read_orphaned_projections(&state_dir).unwrap().records.len(),
+        1
+    );
 }
 
 /// A forge outage is not a removed producer: it must keep retrying.
@@ -3288,4 +3295,233 @@ fn a_failing_mutation_sink_is_still_a_retryable_error() {
         .unwrap_err();
     assert!(matches!(error, ProducerError::Mutation(_)), "{error}");
     assert!(read_orphaned_projections(&state_dir).unwrap().is_empty());
+}
+
+/// A projection that already reached the forge is settled, and retiring the
+/// producer afterwards cannot make it un-posted.
+///
+/// This is the invariant #375 broke on the startup path and on the live
+/// storage-warning path: both asked the configuration before they asked the
+/// idempotency marker, and so reported a delivery as a loss.
+#[test]
+fn a_delivered_projection_is_settled_even_after_its_producer_is_retired() {
+    let temp = tempdir().unwrap();
+    let configured = registry(&temp.path().join("effects.jsonl"));
+    let ProducerConfig::Gh(github) = configured.get("github").unwrap() else {
+        unreachable!()
+    };
+    let origin = gh_origin(
+        "github",
+        github,
+        &gh_observation("PR_delivered", "author", "contributor"),
+    );
+    let state_dir = temp.path().join("state");
+    let events_dir = temp.path().join("events");
+    let task_uuid = Uuid::new_v4().to_string();
+    let completion_id = format!("{task_uuid}:1:9");
+    let projection = || GhCompletionProjection {
+        origin: &origin,
+        completion_id: &completion_id,
+        task_uuid: Some(&task_uuid),
+        verdict: Verdict::Pass,
+        evidence: Some(serde_json::json!({"taskUuid": task_uuid, "witnessSeq": 9})),
+        completion: None,
+    };
+    let mut sink = RecordingMutation::default();
+
+    // The comment goes out and the marker lands.
+    let configured_engine = ProducerEngine::new(&configured, &events_dir, &state_dir, temp.path());
+    assert_eq!(
+        configured_engine
+            .project_gh_completion(projection(), &mut sink)
+            .unwrap(),
+        GhProjectionOutcome::Settled { retracted: None }
+    );
+    assert_eq!(sink.comments.len(), 1);
+    assert!(configured_engine
+        .gh_projection_settled(OrphanedProjectionKind::Completion, &origin, &completion_id)
+        .unwrap());
+
+    // The producer is retired. The marker still proves the delivery, and the
+    // engine reports it as settled without a record and without a second
+    // mutation.
+    let retired = BTreeMap::new();
+    let retired_engine = ProducerEngine::new(&retired, &events_dir, &state_dir, temp.path());
+    assert!(retired_engine
+        .gh_projection_settled(OrphanedProjectionKind::Completion, &origin, &completion_id)
+        .unwrap());
+    assert_eq!(
+        retired_engine
+            .project_gh_completion(projection(), &mut sink)
+            .unwrap(),
+        GhProjectionOutcome::Settled { retracted: None }
+    );
+    assert_eq!(sink.comments.len(), 1);
+    assert!(read_orphaned_projections(&state_dir).unwrap().is_empty());
+}
+
+/// The same, for the storage-warning receipt: its producer resolution used to
+/// run above its marker check, so a receipt already on the forge was declared
+/// orphaned the moment the producer went away.
+#[test]
+fn a_delivered_storage_warning_receipt_is_settled_after_its_producer_is_retired() {
+    let temp = tempdir().unwrap();
+    let configured = registry(&temp.path().join("effects.jsonl"));
+    let ProducerConfig::Gh(github) = configured.get("github").unwrap() else {
+        unreachable!()
+    };
+    let origin = gh_origin(
+        "github",
+        github,
+        &gh_observation("PR_delivered_warning", "author", "contributor"),
+    );
+    let warning = crate::storage::ActiveStorageWarning {
+        warning_sequence: 3,
+        store: "dataDir".to_owned(),
+        level: crate::storage::BudgetLevel::Hard,
+        size_bytes: 200,
+        threshold_bytes: 100,
+        pressures: Vec::new(),
+        message: "hard budget crossed".to_owned(),
+    };
+    let state_dir = temp.path().join("state");
+    let events_dir = temp.path().join("events");
+    let mut sink = RecordingMutation::default();
+
+    let configured_engine = ProducerEngine::new(&configured, &events_dir, &state_dir, temp.path());
+    assert_eq!(
+        configured_engine
+            .project_storage_warning(&origin, &warning, &mut sink)
+            .unwrap(),
+        GhProjectionOutcome::Settled { retracted: None }
+    );
+    assert_eq!(sink.comments.len(), 1);
+
+    let retired = BTreeMap::new();
+    let retired_engine = ProducerEngine::new(&retired, &events_dir, &state_dir, temp.path());
+    assert_eq!(
+        retired_engine
+            .project_storage_warning(&origin, &warning, &mut sink)
+            .unwrap(),
+        GhProjectionOutcome::Settled { retracted: None }
+    );
+    assert_eq!(sink.comments.len(), 1);
+    assert!(read_orphaned_projections(&state_dir).unwrap().is_empty());
+}
+
+/// A producer name repointed at another kind is exactly as permanent as one
+/// deleted outright: no retry changes a configuration, and only an operator
+/// edit does — which is the same restore path either way.
+#[test]
+fn a_producer_replaced_by_another_kind_is_terminal_too() {
+    let temp = tempdir().unwrap();
+    let configured = registry(&temp.path().join("effects.jsonl"));
+    let ProducerConfig::Gh(github) = configured.get("github").unwrap() else {
+        unreachable!()
+    };
+    let origin = gh_origin(
+        "github",
+        github,
+        &gh_observation("PR_repointed", "author", "contributor"),
+    );
+    let state_dir = temp.path().join("state");
+    let repointed = BTreeMap::from([(
+        "github".to_owned(),
+        ProducerConfig::EventsDir(EventsDirProducer {
+            credentials: BTreeMap::new(),
+            poll_interval_sec: 60,
+        }),
+    )]);
+    let engine = ProducerEngine::new(
+        &repointed,
+        temp.path().join("events"),
+        &state_dir,
+        temp.path(),
+    );
+    let mut sink = RecordingMutation::default();
+    let GhProjectionOutcome::Orphaned { record } = engine
+        .project_gh_completion(
+            GhCompletionProjection {
+                origin: &origin,
+                completion_id: "repointed:1:1",
+                task_uuid: None,
+                verdict: Verdict::Pass,
+                evidence: Some(serde_json::json!({"witnessSeq": 1})),
+                completion: None,
+            },
+            &mut sink,
+        )
+        .unwrap()
+    else {
+        panic!("a name that can never resolve to a gh producer is terminal")
+    };
+    assert_eq!(
+        record.detail,
+        "producer \"github\" has kind \"events-dir\", expected \"gh\""
+    );
+    assert!(sink.comments.is_empty());
+    assert_eq!(
+        read_orphaned_projections(&state_dir).unwrap().records.len(),
+        1
+    );
+}
+
+/// One unusable record must not hide the usable ones. This is the discipline
+/// `UnitFactFailures` established: a per-item failure is reported beside the
+/// rest of the pass, never instead of it.
+#[test]
+fn an_unreadable_orphan_record_is_reported_beside_the_readable_ones() {
+    let temp = tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let registry = BTreeMap::new();
+    let engine = ProducerEngine::new(
+        &registry,
+        temp.path().join("events"),
+        &state_dir,
+        temp.path(),
+    );
+    let readable = OrphanedProjection {
+        schema_version: ORPHANED_PROJECTION_SCHEMA_VERSION,
+        kind: OrphanedProjectionKind::Completion,
+        producer: "campaign-crm".to_owned(),
+        source: "notifications".to_owned(),
+        item_id: "I_kept".to_owned(),
+        completion_id: "kept:1:1".to_owned(),
+        task_uuid: None,
+        verdict: Some(Verdict::Pass),
+        observed_at: "2026-08-03T09:00:00.000Z".to_owned(),
+        detail: "unknown producer \"campaign-crm\"".to_owned(),
+    };
+    assert!(engine.record_orphaned_projection(&readable).unwrap());
+
+    let directory = state_dir.join("producers/gh-orphaned");
+    // A record from a schema this binary does not accept — the realistic
+    // trigger is a package rollback past a schema bump.
+    std::fs::write(
+        directory.join("newer.json"),
+        br#"{"schemaVersion":2,"kind":"completion","producer":"crm-build","source":"notifications","itemId":"I_new","completionId":"new:1:1","observedAt":"2026-08-03T09:00:00.000Z","detail":"x"}"#,
+    )
+    .unwrap();
+    // And a stray entry that is not a regular file at all.
+    std::fs::create_dir(directory.join("stray.json")).unwrap();
+
+    let scan = read_orphaned_projections(&state_dir).unwrap();
+    assert_eq!(scan.records, vec![readable]);
+    assert_eq!(scan.unreadable.len(), 2);
+    assert_eq!(scan.unreadable[0].path, directory.join("newer.json"));
+    assert!(
+        scan.unreadable[0].detail.contains("schema version 2"),
+        "{}",
+        scan.unreadable[0].detail
+    );
+    assert_eq!(scan.unreadable[1].path, directory.join("stray.json"));
+
+    let report = OrphanedProjections {
+        scan,
+        state_dir: state_dir.clone(),
+    }
+    .to_string();
+    assert!(report.contains("I_kept"), "{report}");
+    assert!(report.contains("newer.json"), "{report}");
+    assert!(report.contains("stray.json"), "{report}");
 }

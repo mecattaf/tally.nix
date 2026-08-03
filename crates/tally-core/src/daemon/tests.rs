@@ -3809,7 +3809,7 @@ mod tests {
             .await;
     }
 
-    fn orphan_attestations(paths: &DaemonPaths) -> Vec<Value> {
+    fn attestations_of_kind(paths: &DaemonPaths, kind: &str) -> Vec<Value> {
         let path = paths.attestations_path();
         if !path.exists() {
             return Vec::new();
@@ -3818,8 +3818,16 @@ mod tests {
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .filter(|record| record["payload"]["kind"] == "projection-orphaned")
+            .filter(|record| record["payload"]["kind"] == kind)
             .collect()
+    }
+
+    fn orphan_attestations(paths: &DaemonPaths) -> Vec<Value> {
+        attestations_of_kind(paths, "projection-orphaned")
+    }
+
+    fn orphan_retractions(paths: &DaemonPaths) -> Vec<Value> {
+        attestations_of_kind(paths, "projection-orphan-retracted")
     }
 
     /// Removing a producer block is documented operator work, and the
@@ -3885,13 +3893,17 @@ mod tests {
                 .expect("a projection whose producer is gone must reach a terminal state");
 
                 let recorded = read_orphaned_projections(&paths.state_dir).unwrap();
-                assert_eq!(recorded.len(), 1);
-                assert_eq!(recorded[0].producer, "github");
-                assert_eq!(recorded[0].kind, OrphanedProjectionKind::Completion);
-                assert_eq!(recorded[0].task_uuid.as_deref(), Some(row.uuid.to_string()).as_deref());
-                assert_eq!(recorded[0].completion_id, format!("{}:1:9", row.uuid));
-                assert_eq!(recorded[0].verdict, Some(Verdict::Pass));
-                assert_eq!(recorded[0].detail, "unknown producer \"github\"");
+                assert_eq!(recorded.records.len(), 1);
+                assert!(recorded.unreadable.is_empty());
+                assert_eq!(recorded.records[0].producer, "github");
+                assert_eq!(recorded.records[0].kind, OrphanedProjectionKind::Completion);
+                assert_eq!(
+                    recorded.records[0].task_uuid.as_deref(),
+                    Some(row.uuid.to_string()).as_deref()
+                );
+                assert_eq!(recorded.records[0].completion_id, format!("{}:1:9", row.uuid));
+                assert_eq!(recorded.records[0].verdict, Some(Verdict::Pass));
+                assert_eq!(recorded.records[0].detail, "unknown producer \"github\"");
 
                 let witnessed = orphan_attestations(&paths);
                 assert_eq!(witnessed.len(), 1);
@@ -3912,6 +3924,341 @@ mod tests {
                 .expect("the repeat observation is terminal too");
                 assert_eq!(read_orphaned_projections(&paths.state_dir).unwrap(), recorded);
                 assert_eq!(orphan_attestations(&paths).len(), 1);
+            })
+            .await;
+    }
+
+    /// Write the durable row, the acknowledged event, and the terminal witness
+    /// one GitHub completion needs to reach the startup re-drive set.
+    fn durable_gh_completion(
+        paths: &DaemonPaths,
+        ledger: &mut WitnessLedger,
+        item: &str,
+        seq: u64,
+    ) -> RowSeed {
+        let mut row = durable_row(Uuid::new_v4(), &format!("gh:retired:{item}"), 1);
+        let gh_origin = gh_test_origin(item, GhItemType::Issue);
+        row.source = EnqueueSource::Gh;
+        row.adapter = "codex".to_owned();
+        row.origin = Some(AdmissionOrigin::github("github", gh_origin.clone()));
+        row.gh_origin = Some(gh_origin);
+        write_enqueue_event_atomic(
+            &paths.events_dir(),
+            &DurableEnqueueEvent::new(row.clone()).unwrap(),
+        )
+        .unwrap();
+        ledger
+            .append(WitnessBody {
+                task_uuid: Some(row.uuid.to_string()),
+                transition_timestamp: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+                verdict: Verdict::Pass,
+                exit_code: 0,
+                artifact_content_hash: Some(format!("sha256:{seq:064x}")),
+                store_paths: None,
+                drv: None,
+                gpu_seconds: None,
+                wall_clock: 0.0,
+                attempt: 1,
+                lease_epoch: 1,
+                dedup_key: row.dedup_key.clone(),
+                payload_hash: row.payload_hash.clone(),
+                brief_hash: row.brief_hash.clone(),
+                origin: AdmissionOrigin::direct(EnqueueSource::Gh),
+                orchestration: row.orchestration.clone(),
+                labor_class: LaborClass::Fresh,
+                trace_ref: None,
+                pools: vec!["slot".to_owned()],
+                executor: None,
+                host_id: None,
+                charge: None,
+                model: None,
+                evidence_class: None,
+                manifest_hash: None,
+                completion: None,
+                result_revision: None,
+                authorship: None,
+                authorship_sessions: None,
+            })
+            .unwrap();
+        row
+    }
+
+    fn gh_producer_config() -> Config {
+        let mut config = one_pool_config();
+        config.producers = serde_json::from_value(json!({
+            "github": {
+                "kind": "gh",
+                "enable": true,
+                "sources": [{"notifications": {"repo": "acme/widgets"}}],
+                "triggers": {"assignments": ["tally-bot"]},
+                "postEvidence": true,
+                "enqueue": {"argv": ["true"], "pool": "slot"}
+            }
+        }))
+        .unwrap();
+        config
+    }
+
+    fn orphan_record_for(row: &RowSeed, witness_seq: u64) -> OrphanedProjection {
+        let origin = row.gh_origin.as_ref().unwrap();
+        OrphanedProjection {
+            schema_version: ORPHANED_PROJECTION_SCHEMA_VERSION,
+            kind: OrphanedProjectionKind::Completion,
+            producer: origin.producer.clone(),
+            source: origin.source.clone(),
+            item_id: origin.node_id.clone(),
+            completion_id: gh_completion_id(row.uuid, 1, witness_seq),
+            task_uuid: Some(row.uuid.to_string()),
+            verdict: Some(Verdict::Pass),
+            observed_at: "2026-08-03T09:00:00.000Z".to_owned(),
+            detail: "unknown producer \"github\"".to_owned(),
+        }
+    }
+
+    /// A projection that actually reached the forge is not orphaned, whatever
+    /// the configuration says about its producer afterwards.
+    ///
+    /// The sweep used to decide from `config.producers` alone and never
+    /// consulted the completion marker, so every delivered projection of a
+    /// retired producer was declared lost — wrong in the reassuring direction,
+    /// and committed to the attestation chain. A record written under that
+    /// reading is withdrawn on the first start after the repair, and the claim
+    /// it stood on is retracted rather than silently dropped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_delivered_projection_is_not_swept_as_orphaned_and_a_false_record_is_retracted() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                prepare_paths(&paths).unwrap();
+                let mut ledger = WitnessLedger::open(paths.witness_path()).unwrap();
+                let delivered = durable_gh_completion(&paths, &mut ledger, "item-delivered", 1);
+                let undelivered = durable_gh_completion(&paths, &mut ledger, "item-stuck", 2);
+                drop(ledger);
+
+                // Phase 1: the producer is configured and the COMPLETED
+                // comment for `delivered` actually goes out.
+                let gh = temp.path().join("fake-gh");
+                crate::test_support::install_shell_program(
+                    &gh,
+                    concat!(
+                        "#!/bin/sh\n",
+                        "[ \"$1 $2 $3 $4\" = 'api graphql --input -' ] || exit 91\n",
+                        "request=$(cat)\n",
+                        "case \"$request\" in\n",
+                        "  *TallyCompletionState*) printf '{\"data\":{\"node\":{\"__typename\":\"Issue\",\"state\":\"OPEN\",\"comments\":{\"nodes\":[],\"pageInfo\":{\"hasNextPage\":false,\"endCursor\":null}}}}}' ;;\n",
+                        "  *TallyCompletionComment*) printf '{\"data\":{\"addComment\":{}}}' ;;\n",
+                        "  *) exit 92 ;;\n",
+                        "esac\n",
+                    ),
+                );
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    gh_producer_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                daemon.handler.gh_program = gh;
+                let result = JobResult {
+                    task_uuid: Some(delivered.uuid.to_string()),
+                    task_ref: None,
+                    job_id: delivered.uuid.to_string(),
+                    verdict: Verdict::Pass,
+                    exit_code: 0,
+                    artifact_content_hash: Some(format!("sha256:{:064x}", 1)),
+                    attempt: 1,
+                    lease_epoch: 1,
+                    witness_seq: 1,
+                    model: None,
+                    completion: None,
+                    stderr_excerpt: None,
+                };
+                daemon.handler.complete_gh_post_ack(delivered.clone(), result);
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    daemon.handler.drain_post_ack_tasks(),
+                )
+                .await
+                .expect("the configured projection settles");
+                drop(daemon);
+                let markers = fs::read_dir(paths.state_dir.join("producers/gh-completed"))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "json"))
+                    .count();
+                assert_eq!(markers, 1, "the delivery must leave its idempotency marker");
+                assert!(read_orphaned_projections(&paths.state_dir)
+                    .unwrap()
+                    .is_empty());
+
+                // A record written by a reading that never consulted the
+                // marker, exactly as the merged version of #375 wrote them.
+                let false_record = orphan_record_for(&delivered, 1);
+                let registry = BTreeMap::new();
+                ProducerEngine::new(
+                    &registry,
+                    paths.events_dir(),
+                    &paths.state_dir,
+                    &paths.data_dir,
+                )
+                .record_orphaned_projection(&false_record)
+                .unwrap();
+                {
+                    let mut attestations = SharedAttestations::new(paths.attestations_path());
+                    append_orphan_attestation(&mut attestations, &false_record, Some(1), Some(1))
+                        .unwrap();
+                }
+                assert_eq!(orphan_attestations(&paths).len(), 1);
+
+                // Phase 2: the producer block is retired.
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let redriven = daemon
+                    .initial_gh_completions
+                    .iter()
+                    .map(|work| work.row.uuid)
+                    .collect::<Vec<_>>();
+                drop(daemon);
+                // The delivered projection is handed back to the ordinary
+                // post-ack worker, which takes the marker's no-op path; the
+                // stuck one is not driven at all.
+                assert_eq!(redriven, vec![delivered.uuid]);
+
+                let scan = read_orphaned_projections(&paths.state_dir).unwrap();
+                assert_eq!(scan.records.len(), 1);
+                assert_eq!(
+                    scan.records[0].task_uuid.as_deref(),
+                    Some(undelivered.uuid.to_string()).as_deref()
+                );
+
+                // The false claim is withdrawn from disk and retracted on the
+                // append-only chain, naming the same identity.
+                let retractions = orphan_retractions(&paths);
+                assert_eq!(retractions.len(), 1);
+                assert_eq!(
+                    retractions[0]["payload"]["taskUuid"],
+                    delivered.uuid.to_string()
+                );
+                assert_eq!(retractions[0]["payload"]["retracts"], "projection-orphaned");
+                assert_eq!(retractions[0]["payload"]["reason"], "projection-settled");
+                // The only remaining orphan claim is the true one.
+                let orphaned = orphan_attestations(&paths);
+                assert_eq!(orphaned.len(), 2);
+                assert_eq!(
+                    orphaned[1]["payload"]["taskUuid"],
+                    undelivered.uuid.to_string()
+                );
+            })
+            .await;
+    }
+
+    /// The chain, not the record file, decides whether a claim has been
+    /// witnessed.
+    ///
+    /// Two states depend on that. A record written by an observation that died
+    /// before it could witness must still be witnessed by a later one — the
+    /// record file said "not first" forever, so nothing ever did. And a record
+    /// collected by retention and re-derived on a later start must not append
+    /// a second identical claim.
+    #[tokio::test(flavor = "current_thread")]
+    async fn witnessing_an_orphan_is_decided_by_the_chain_not_by_the_record_file() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                prepare_paths(&paths).unwrap();
+                let mut ledger = WitnessLedger::open(paths.witness_path()).unwrap();
+                let collected = durable_gh_completion(&paths, &mut ledger, "item-collected", 1);
+                let unwitnessed = durable_gh_completion(&paths, &mut ledger, "item-unwitnessed", 2);
+                drop(ledger);
+
+                // A record on disk whose claim never reached the chain: the
+                // shape a crash, or a failed ledger append, leaves behind.
+                let unwitnessed_record = orphan_record_for(&unwitnessed, 2);
+                let registry = BTreeMap::new();
+                ProducerEngine::new(
+                    &registry,
+                    paths.events_dir(),
+                    &paths.state_dir,
+                    &paths.data_dir,
+                )
+                .record_orphaned_projection(&unwitnessed_record)
+                .unwrap();
+                assert!(orphan_attestations(&paths).is_empty());
+
+                let open = || {
+                    let executor = direct_executor(&paths.state_dir)
+                        .with_systemd_run(temp.path().join("absent-systemd-run"))
+                        .with_unit_probe(ExitFileProbe);
+                    Daemon::open_with_executor(
+                        one_pool_config(),
+                        paths.clone(),
+                        settings(),
+                        executor,
+                    )
+                };
+                drop(open().await.unwrap());
+                // Both are witnessed, including the one whose record was
+                // already there when this start began.
+                let claimed = |paths: &DaemonPaths| {
+                    orphan_attestations(paths)
+                        .iter()
+                        .map(|record| {
+                            record["payload"]["completionId"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned()
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let collected_record = orphan_record_for(&collected, 1);
+                let mut expected = vec![
+                    collected_record.completion_id.clone(),
+                    unwitnessed_record.completion_id.clone(),
+                ];
+                expected.sort();
+                let mut witnessed = claimed(&paths);
+                witnessed.sort();
+                assert_eq!(witnessed, expected);
+
+                // Retention collects one record at the marker horizon. The
+                // next start re-derives it, because the condition still holds,
+                // and appends nothing: the chain already carries that claim.
+                let directory = paths.state_dir.join("producers/gh-orphaned");
+                let collected_path =
+                    directory.join(format!("{}.json", collected_record.marker_key()));
+                assert!(collected_path.exists());
+                fs::remove_file(&collected_path).unwrap();
+
+                drop(open().await.unwrap());
+                assert!(collected_path.exists());
+                let mut witnessed = claimed(&paths);
+                witnessed.sort();
+                assert_eq!(witnessed, expected);
             })
             .await;
     }
@@ -4003,9 +4350,9 @@ mod tests {
                 drop(daemon);
 
                 let recorded = read_orphaned_projections(&paths.state_dir).unwrap();
-                assert_eq!(recorded.len(), 3);
+                assert_eq!(recorded.records.len(), 3);
                 let report = OrphanedProjections {
-                    records: recorded.clone(),
+                    scan: recorded.clone(),
                     state_dir: paths.state_dir.clone(),
                 }
                 .to_string();

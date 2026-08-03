@@ -54,11 +54,25 @@ pub const DEFAULT_PRODUCER_MARKER_MAX_AGE: &str = "180d";
 /// retention entry, or a tmpfiles rule. They are collected as one class rather
 /// than one at a time, because "anything written per dispatch with no GC" is
 /// the growth surface this tree keeps reproducing.
-const PRODUCER_MARKER_DIRECTORIES: [&str; 4] = [
+///
+/// `gh-orphaned` is written per dispatch too, though it guards nothing: it is
+/// the durable statement that one projection can never be applied, and its
+/// only readers are the startup report and `tally producer orphaned`. It joins
+/// the class anyway, because the growth argument does not care what a file is
+/// for. Collecting one is safe precisely because nothing reads it to decide
+/// behaviour, and it does not resurrect: a record can only outlive this
+/// horizon if the acknowledged event it describes outlived it first, and once
+/// that event is collected at the `events/done` horizon no recovery plan
+/// re-derives the projection. Should one be re-derived anyway — an operator
+/// running a shorter marker horizon than event horizon — the attestation
+/// chain, not the record file, decides whether it has already been witnessed,
+/// so a collected record cannot produce a duplicate claim.
+const PRODUCER_MARKER_DIRECTORIES: [&str; 5] = [
     "gh-triggers",
     "gh-completed",
     "gh-comments",
     "gh-storage-warnings",
+    "gh-orphaned",
 ];
 const PRODUCER_MARKER_DIRECTORY: &str = "producers";
 /// The mutual-exclusion file a marker directory keeps for its own writers. It
@@ -2181,10 +2195,10 @@ mod tests {
 
     /// Every `producers/*` marker directory was written once per dispatch and
     /// collected by nothing: no sweeper, no retention entry, no tmpfiles rule.
-    /// One sweep covers all four, keeps the directory-wide mutation lock, and
+    /// One sweep covers all five, keeps the directory-wide mutation lock, and
     /// takes a per-marker lock away only together with the marker it guards.
     #[test]
-    fn expired_producer_markers_are_collected_across_all_four_directories() {
+    fn expired_producer_markers_are_collected_across_every_marker_directory() {
         let temp = tempfile::tempdir().unwrap();
         let data = temp.path().join("data");
         let state = temp.path().join("state");
@@ -2193,12 +2207,7 @@ mod tests {
         ledger_only_state(&data, now);
 
         let markers = state.join("producers");
-        for set in [
-            "gh-triggers",
-            "gh-completed",
-            "gh-comments",
-            "gh-storage-warnings",
-        ] {
+        for set in PRODUCER_MARKER_DIRECTORIES {
             write_aged(
                 &markers.join(set).join("expired.json"),
                 chrono::TimeDelta::days(200),
@@ -2247,19 +2256,14 @@ mod tests {
         };
 
         let dry = run_gc(request(true), &FakeBackend::default()).unwrap();
-        assert_eq!(dry.producer_markers_examined, 8);
-        assert_eq!(dry.producer_markers_pruned, 4);
+        assert_eq!(dry.producer_markers_examined, 10);
+        assert_eq!(dry.producer_markers_pruned, 5);
         assert!(triggers.join("expired.json").exists());
 
         let report = run_gc(request(false), &FakeBackend::default()).unwrap();
-        assert_eq!(report.producer_markers_examined, 8);
-        assert_eq!(report.producer_markers_pruned, 4);
-        for set in [
-            "gh-triggers",
-            "gh-completed",
-            "gh-comments",
-            "gh-storage-warnings",
-        ] {
+        assert_eq!(report.producer_markers_examined, 10);
+        assert_eq!(report.producer_markers_pruned, 5);
+        for set in PRODUCER_MARKER_DIRECTORIES {
             assert!(!markers.join(set).join("expired.json").exists());
             assert!(markers.join(set).join("fresh.json").exists());
             assert!(markers.join(set).join(PRODUCER_MUTATION_LOCK).exists());

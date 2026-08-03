@@ -478,13 +478,27 @@ pub(super) fn acquire_daemon_lock(state_dir: &Path) -> Result<File, DaemonError>
     Ok(file)
 }
 
-/// Give every terminal projection whose producer is gone a terminal outcome,
-/// before a single retry worker is spawned for it.
+/// Give every terminal projection that can no longer be applied a terminal
+/// outcome, before a single retry worker is spawned for it.
 ///
-/// The population is decided from the effective configuration on every start,
-/// never from the records this writes. A producer block restored after a
-/// mistaken removal therefore projects its completions on the next start, and
-/// each stale record clears itself when its projection settles.
+/// Two questions decide each projection, in this order:
+///
+/// 1. Did it already reach the forge? The `producers/gh-completed/` marker is
+///    the durable proof, and it is asked first for the same reason
+///    `complete_gh_once_with_completion` asks it first: a delivered projection
+///    is settled whatever the configuration says about its producer now.
+///    Saying otherwise would report a loss that did not happen — wrong in the
+///    reassuring direction, on the strongest claim surface in the tree.
+/// 2. Does its producer still resolve? Only if the answer to (1) is no does
+///    the absence of the producer make the projection terminal.
+///
+/// The population is decided from the effective configuration and the markers
+/// on every start, never from the records this writes. A producer block
+/// restored after a mistaken removal therefore projects its completions on the
+/// next start, and each stale record clears itself when its projection
+/// settles — including a record written before this ordering was in place,
+/// which retires on the first start after the upgrade and is retracted on the
+/// attestation chain by the worker that settles it.
 ///
 /// The whole set is reported in one pass. A projection that can never be
 /// applied is a permanent condition, and an operator deserves to read it as a
@@ -507,10 +521,6 @@ pub(super) fn sweep_orphaned_gh_completions(
             retained.push(work);
             continue;
         };
-        if config.producers.contains_key(&origin.producer) {
-            retained.push(work);
-            continue;
-        }
         let record = OrphanedProjection {
             schema_version: ORPHANED_PROJECTION_SCHEMA_VERSION,
             kind: OrphanedProjectionKind::Completion,
@@ -527,29 +537,60 @@ pub(super) fn sweep_orphaned_gh_completions(
             observed_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
             detail: ProducerError::UnknownProducer(origin.producer.clone()).to_string(),
         };
-        match engine.record_orphaned_projection(&record) {
+        match engine.gh_projection_settled(
+            OrphanedProjectionKind::Completion,
+            origin,
+            &record.completion_id,
+        ) {
             Ok(true) => {
-                if let Err(error) = append_orphan_attestation(
-                    attestations,
-                    &record,
-                    Some(work.result.attempt),
-                    Some(work.result.lease_epoch),
-                ) {
-                    eprintln!("tally: orphaned-projection attestation failed: {error}");
-                }
+                // Delivered. Retain it so the ordinary post-ack worker takes
+                // the no-op path it has always taken, and retract any record
+                // that claimed otherwise.
+                retract_settled_projection(&engine, attestations, &record, &work);
+                retained.push(work);
+                continue;
             }
             Ok(false) => {}
-            Err(error) => eprintln!(
+            Err(error) => {
+                // A marker that does not describe this projection is a
+                // corruption, and corruption is not evidence of loss. Hand it
+                // to the ordinary worker, which refuses it loudly and by name,
+                // rather than inventing a terminal claim from an unreadable
+                // file.
+                eprintln!(
+                    "tally: cannot tell whether the GitHub projection for {} was delivered; \
+                     leaving it to the post-ack worker: {error}",
+                    work.row.uuid
+                );
+                retained.push(work);
+                continue;
+            }
+        }
+        if config.producers.contains_key(&origin.producer) {
+            retained.push(work);
+            continue;
+        }
+        if let Err(error) = engine.record_orphaned_projection(&record) {
+            eprintln!(
                 "tally: recording the orphaned GitHub projection for {} failed: {error}",
                 work.row.uuid
-            ),
+            );
+            continue;
+        }
+        if let Err(error) = append_orphan_attestation(
+            attestations,
+            &record,
+            Some(work.result.attempt),
+            Some(work.result.lease_epoch),
+        ) {
+            eprintln!("tally: orphaned-projection attestation failed: {error}");
         }
     }
     match read_orphaned_projections(&paths.state_dir) {
-        Ok(records) if !records.is_empty() => eprintln!(
+        Ok(scan) if !scan.is_empty() => eprintln!(
             "tally: {}",
             OrphanedProjections {
-                records,
+                scan,
                 state_dir: paths.state_dir.clone(),
             }
         ),
@@ -557,6 +598,40 @@ pub(super) fn sweep_orphaned_gh_completions(
         Err(error) => eprintln!("tally: orphaned GitHub projection sweep failed: {error}"),
     }
     retained
+}
+
+/// Withdraw a record, and the claim it stood on, for a projection the marker
+/// proves was delivered.
+fn retract_settled_projection(
+    engine: &ProducerEngine<'_>,
+    attestations: &mut SharedAttestations,
+    record: &OrphanedProjection,
+    work: &GhTerminalWork,
+) {
+    let retracted = match engine.retract_orphaned_projection(record) {
+        Ok(Some(retracted)) => retracted,
+        Ok(None) => return,
+        Err(error) => {
+            eprintln!(
+                "tally: retracting the orphaned-projection record for {} failed: {error}",
+                work.row.uuid
+            );
+            return;
+        }
+    };
+    eprintln!(
+        "tally: the GitHub projection for {} was recorded as orphaned but its completion marker \
+         proves it reached the forge; the record is withdrawn and the claim retracted",
+        work.row.uuid
+    );
+    if let Err(error) = append_orphan_retraction(
+        attestations,
+        &retracted,
+        Some(work.result.attempt),
+        Some(work.result.lease_epoch),
+    ) {
+        eprintln!("tally: orphaned-projection retraction failed: {error}");
+    }
 }
 
 pub(super) fn recovery_gh_completions(

@@ -2769,11 +2769,18 @@ let
               description = ''
                 Systemd timespan after which the per-dispatch marker files under
                 producers/gh-triggers, producers/gh-completed,
-                producers/gh-comments, and producers/gh-storage-warnings expire.
-                Each marker makes one forge mutation idempotent; collecting one
-                costs at most a re-publication that the marker scan on the
-                thread already collapses, so the envelope matches the ingress
-                audit trail rather than the shorter archive one.
+                producers/gh-comments, producers/gh-storage-warnings, and
+                producers/gh-orphaned expire. Each of the first four makes one
+                forge mutation idempotent; collecting one costs at most a
+                re-publication that the marker scan on the thread already
+                collapses, so the envelope matches the ingress audit trail
+                rather than the shorter archive one. A gh-orphaned record
+                guards nothing — it is the durable statement that one
+                projection can never be applied, read only by the startup
+                report and by "tally producer orphaned" — and it retires with
+                the acknowledged event it describes, so keep this at or above
+                eventsDoneHorizon unless a shorter report is worth losing the
+                first-seen date.
               '';
             };
             lifecycleHorizon = mkOption {

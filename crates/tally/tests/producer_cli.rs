@@ -279,4 +279,41 @@ fn orphaned_lists_every_recorded_projection_without_a_configuration() {
     let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(listed["count"], 0);
     assert_eq!(listed["projections"].as_array().unwrap().len(), 0);
+    assert_eq!(listed["unreadable"].as_array().unwrap().len(), 0);
+
+    // One file this binary cannot read must not hide the ones it can. The
+    // daemon's own log line tells the operator to run this command, so it
+    // answers, names the unusable file on stderr, and still exits 0.
+    std::fs::write(
+        state_dir
+            .join("producers/gh-orphaned")
+            .join("from-a-newer-schema.json"),
+        br#"{"schemaVersion":2,"kind":"completion","producer":"campaign-crm","source":"notifications","itemId":"I_new","completionId":"new:1:1","observedAt":"2026-08-03T09:00:00.000Z","detail":"x"}"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_tally"))
+        .args(["producer", "orphaned", "--state-dir"])
+        .arg(&state_dir)
+        .env("HOME", temp.path())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let listed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(listed["count"], 2);
+    let unreadable = listed["unreadable"].as_array().unwrap();
+    assert_eq!(unreadable.len(), 1);
+    assert!(unreadable[0]["path"]
+        .as_str()
+        .unwrap()
+        .ends_with("from-a-newer-schema.json"));
+    assert!(unreadable[0]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("schema version 2"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("from-a-newer-schema.json"), "{stderr}");
 }
