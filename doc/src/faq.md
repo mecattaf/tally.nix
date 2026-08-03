@@ -156,6 +156,15 @@ witness emitter, drain timer, and retention timer, but rejects producer,
 usage-meter, and flow declarations. Use Home Manager—standalone or integrated
 into NixOS—for those workload-scheduling surfaces.
 
+Forge-native campaigns are the one exception, and they are not a producer:
+`services.tally.campaignForge.enable` renders the campaign pools, the driver
+adapter, one events-directory registry entry that carries no unit, and the
+`tally-campaign-poll` service and timer, so a host with no user session can
+execute campaigns armed with `tally campaign arm`. Declared
+`services.tally.campaigns` are still rejected there, because those are driven by
+a managed GitHub producer unit. See
+[Campaigns on a NixOS host](flows/campaigns.md#campaigns-on-a-nixos-host).
+
 ## Is a passing witness a permanent artifact archive?
 
 No. It proves the canonical record and the evidence observed at transition

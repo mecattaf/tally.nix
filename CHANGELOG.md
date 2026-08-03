@@ -8,6 +8,39 @@ authorized.
 
 ### Fixed
 
+- **Six post-merge repairs on the NixOS campaign surface (#303 repair).** The
+  poll service ordered itself after `network-online.target` without wanting it,
+  which orders against nothing: nixpkgs warned on every evaluation of such a
+  host, and the timer's first tick 15 s into a boot could run its authenticated
+  forge read before the network was up and leave a failed unit behind. It now
+  `wants` that target — and refuses to start at all until the forge identity
+  exists, so a host whose secret is not provisioned yet skips the scan instead
+  of failing a unit every tick.
+
+  The identity writer now also emits `~/.config/gh/config.yml` (`version: "1"`,
+  mode `0600`). That is the file `gh` writes for itself on first use, failing
+  the whole call when it cannot, and writing it at activation makes the home
+  read-only-safe for every consumer — including the `shell` adapter that runs a
+  campaign's own self-continuation, which never had the home in its writable
+  paths. The existing writable-home allowances stay for self-healing; nothing
+  requires them after a successful activation.
+
+  Teardown, ordering, and diagnosis: turning `campaignForge.enable` off now
+  removes the identity files it wrote, keyed on a marker so a `homeDir` pointed
+  at a pre-existing home keeps its own `.gitconfig`; the activation snippet is
+  ordered after `setupSecrets`/`agenixInstall` when the estate runs sops-nix or
+  agenix, rather than relying on names sorting favourably; and a missing or
+  unreadable `tokenFile` now fails with a message naming the option instead of a
+  bare shell redirection error.
+
+  Guard and doc gaps: `checks.campaign-render` now holds the NixOS poll program
+  to the same `--once`/no-`--wait` contract as the Home Manager one and pins its
+  `--config`, `--socket`, and `--state-dir`, so the registry the timer scans
+  cannot silently drift from the one an interactive `arm` writes. The worked
+  `campaign arm` example gains `--allow-actor`, which the bot identity makes
+  mandatory rather than optional, and `faq.md` and `fleet-deployment.md` no
+  longer state that the NixOS module renders no campaign units.
+
 - **Repaired the seven post-merge findings on the flow-lineage successor path
   (#251 repair).** The mechanism shipped correct for the states its tests
   constructed; the defects were in the states they did not — a predecessor that

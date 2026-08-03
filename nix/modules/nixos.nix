@@ -62,20 +62,30 @@ let
   # not a LoadCredential the shipped driver never reads -- is the only place an
   # identity reaches the driver, the agent's commits, and the poll scan alike.
   # Hence: the service account gets a real home, and activation materialises
-  # exactly two files in it.
+  # the identity in it.
   #
   # The token arrives on stdin, so it is never a program argument, never in the
   # Nix store, and the file it comes from need only be readable by root.
+  #
+  # `--remove` is the teardown half: turning the surface off reverts the account
+  # record to `/var/empty`, which would otherwise leave a live token at rest in
+  # a directory nothing looks at again. It removes only files this writer left,
+  # which is what the marker is for -- an operator who pointed `homeDir` at a
+  # pre-existing home keeps their own `.gitconfig`.
+  forgeIdentityMarker = ".tally-campaign-forge-identity";
   forgeIdentityProgram = pkgs.writeShellApplication {
     name = "tally-campaign-forge-identity";
     runtimeInputs = [ pkgs.coreutils ];
     text = ''
+      marker=${lib.escapeShellArg forgeIdentityMarker}
+      mode="write"
       home=""
       login=""
       git_name=""
       git_email=""
       while [ "$#" -gt 0 ]; do
         case "$1" in
+          --remove) mode="remove"; shift ;;
           --home) home="$2"; shift 2 ;;
           --login) login="$2"; shift 2 ;;
           --git-name) git_name="$2"; shift 2 ;;
@@ -83,9 +93,26 @@ let
           *) echo "tally-campaign-forge-identity: unknown argument $1" >&2; exit 2 ;;
         esac
       done
-      for required in "$home" "$login" "$git_name" "$git_email"; do
+      if [ -z "$home" ]; then
+        echo "tally-campaign-forge-identity: --home is required" >&2
+        exit 2
+      fi
+
+      if [ "$mode" = "remove" ]; then
+        # A no-op unless this writer owns the directory's contents.
+        if [ -e "$home/$marker" ]; then
+          rm -f -- \
+            "$home/.config/gh/hosts.yml" \
+            "$home/.config/gh/config.yml" \
+            "$home/.gitconfig" \
+            "$home/$marker"
+        fi
+        exit 0
+      fi
+
+      for required in "$login" "$git_name" "$git_email"; do
         if [ -z "$required" ]; then
-          echo "tally-campaign-forge-identity: --home, --login, --git-name, and --git-email are required" >&2
+          echo "tally-campaign-forge-identity: --login, --git-name, and --git-email are required" >&2
           exit 2
         fi
       done
@@ -107,6 +134,15 @@ let
       chmod 0600 -- "$home/.config/gh/hosts.yml.new"
       mv -f -- "$home/.config/gh/hosts.yml.new" "$home/.config/gh/hosts.yml"
 
+      # The file `gh` would otherwise write itself on first use -- and it fails
+      # the whole call when it cannot ("failed to write config after
+      # migration"). Writing it here is what makes this home read-only-safe for
+      # every consumer: the driver adapter, the `shell` adapter that runs the
+      # campaign's own self-continuation, and the agent adapters alike.
+      printf 'version: "1"\n' >"$home/.config/gh/config.yml.new"
+      chmod 0600 -- "$home/.config/gh/config.yml.new"
+      mv -f -- "$home/.config/gh/config.yml.new" "$home/.config/gh/config.yml"
+
       # git pushes over https with the same token, through gh's own credential
       # helper, so the token stays in exactly one file. The helper path is
       # absolute because git runs it without this program's PATH.
@@ -114,6 +150,10 @@ let
         "$git_name" "$git_email" ${lib.escapeShellArg "${pkgs.gh}/bin/gh"} >"$home/.gitconfig.new"
       chmod 0600 -- "$home/.gitconfig.new"
       mv -f -- "$home/.gitconfig.new" "$home/.gitconfig"
+
+      printf 'tally-campaign-forge-identity\n' >"$home/$marker.new"
+      chmod 0600 -- "$home/$marker.new"
+      mv -f -- "$home/$marker.new" "$home/$marker"
     '';
   };
 
@@ -218,9 +258,12 @@ in
           authentication; the system service account has none, and every
           campaign job — the driver's pull requests and merges, the agent's
           commits — runs as that account. Activation therefore gives the
-          account a real home and writes exactly two files into it: a `gh` hosts
-          file holding the declared token, and a `.gitconfig` binding the commit
-          identity and a `gh auth git-credential` helper for https pushes.
+          account a real home and writes the identity into it: a `gh` hosts file
+          holding the declared token, a `.gitconfig` binding the commit identity
+          and a `gh auth git-credential` helper for https pushes, and the `gh`
+          config file that `gh` would otherwise insist on writing itself, which
+          is what leaves the home read-only-safe for every consumer afterwards.
+          Turning this back off removes those files again.
         '';
         type = lib.types.submodule {
           options = {
@@ -518,7 +561,18 @@ in
       };
 
       system.activationScripts.tallyCampaignForgeIdentity = {
-        deps = [ "users" ];
+        # `users` for the account record. The secret provisioners are named only
+        # when the estate actually runs one, because an activation dependency on
+        # a snippet that does not exist is an evaluation error -- and relying on
+        # `setupSecrets` and `agenixInstall` sorting before `tally…` is
+        # alphabetical luck, not an ordering.
+        deps = [
+          "users"
+        ]
+        ++ lib.filter (script: config.system.activationScripts ? ${script}) [
+          "agenixInstall"
+          "setupSecrets"
+        ];
         text = ''
           ${lib.escapeShellArgs [
             "${pkgs.coreutils}/bin/install"
@@ -531,23 +585,33 @@ in
             cfg.group
             (toString forge.homeDir)
           ]}
-          ${
-            lib.escapeShellArgs [
-              "${pkgs.util-linux}/bin/runuser"
-              "-u"
-              cfg.user
-              "--"
-              "${forgeIdentityProgram}/bin/tally-campaign-forge-identity"
-              "--home"
-              (toString forge.homeDir)
-              "--login"
-              forgeLogin
-              "--git-name"
-              forgeGitUserName
-              "--git-email"
-              forgeGitUserEmail
-            ]
-          } < ${lib.escapeShellArg (toString forge.tokenFile)}
+          # A missing secret is named, not left to a bare redirection error.
+          # The surface is already rendered by this point -- activation cannot
+          # unbuild units -- so the poll service additionally refuses to run
+          # without the identity file this writes, which keeps an unprovisioned
+          # host quiet instead of failing a unit every tick.
+          if [ ! -r ${lib.escapeShellArg (toString forge.tokenFile)} ]; then
+            echo ${lib.escapeShellArg "tally: services.tally.campaignForge.tokenFile is unreadable (${toString forge.tokenFile}); the campaign surface is enabled but the ${cfg.user} account has no forge identity. Provision that file (sops-nix and agenix both run before this snippet) and activate again."} >&2
+            false
+          else
+            ${
+              lib.escapeShellArgs [
+                "${pkgs.util-linux}/bin/runuser"
+                "-u"
+                cfg.user
+                "--"
+                "${forgeIdentityProgram}/bin/tally-campaign-forge-identity"
+                "--home"
+                (toString forge.homeDir)
+                "--login"
+                forgeLogin
+                "--git-name"
+                forgeGitUserName
+                "--git-email"
+                forgeGitUserEmail
+              ]
+            } < ${lib.escapeShellArg (toString forge.tokenFile)}
+          fi
         '';
       };
 
@@ -557,8 +621,20 @@ in
           "network-online.target"
           "tally-daemon.service"
         ];
+        # An `After=` on a target nothing pulls into the transaction orders
+        # against nothing: the timer arms 15s after boot and the scan's first
+        # act is an authenticated forge read, so without this the first poll of
+        # every boot could fail before the network was up.
+        wants = [ "network-online.target" ];
         requires = [ "tally-daemon.service" ];
-        unitConfig.ConditionPathExists = configPath;
+        # A scan with no forge identity fails on its first API call, every tick.
+        # Conditioning on the identity file makes an unprovisioned host skip the
+        # unit -- systemd records a skipped start, not a failed one -- and start
+        # polling by itself once activation has written it.
+        unitConfig.ConditionPathExists = [
+          configPath
+          "${toString forge.homeDir}/.config/gh/hosts.yml"
+        ];
         serviceConfig = {
           Type = "oneshot";
           User = cfg.user;
@@ -597,6 +673,24 @@ in
           Persistent = true;
           Unit = "tally-campaign-poll.service";
         };
+      };
+    })
+    # Turning the surface off reverts the account record to `/var/empty`, which
+    # on its own would leave a live GitHub token at rest in a directory nothing
+    # looks at again. The writer's `--remove` mode deletes exactly the files it
+    # wrote, keyed on its own marker, so a host that never enabled the surface
+    # and a `homeDir` pointed at somebody's real home are both untouched.
+    # Removing the tally module altogether still leaves the directory: there is
+    # no activation left to run. The docs say so.
+    (lib.mkIf (cfg.enable && !campaignSurface) {
+      system.activationScripts.tallyCampaignForgeTeardown = {
+        deps = [ "users" ];
+        text = lib.escapeShellArgs [
+          "${forgeIdentityProgram}/bin/tally-campaign-forge-identity"
+          "--remove"
+          "--home"
+          (toString forge.homeDir)
+        ];
       };
     })
   ];

@@ -8,9 +8,12 @@ captures.
 
 The shipped multi-host check uses a Home Manager coordinator embedded in a
 NixOS host. That distinction matters: the NixOS module renders the system
-daemon, witness emitter, drain timer, and retention timer. It rejects producers,
-meters, and flow calendar declarations; those workload-scheduling units exist
-only in the Home Manager module.
+daemon, witness emitter, drain timer, and retention timer — plus, when
+[`services.tally.campaignForge.enable`](../configuration/nixos-options.md#servicestallycampaignforgeenable)
+is set, the campaign execution surface and its `tally-campaign-poll` units for
+forge-native campaigns. It rejects producers, meters, and flow calendar
+declarations; those workload-scheduling units exist only in the Home Manager
+module.
 
 ## Choose the coordinator shape
 

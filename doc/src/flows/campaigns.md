@@ -378,11 +378,36 @@ The account's home is therefore the identity, and activation materialises it:
   (`campaignForge.gitUserName` and `gitUserEmail`, defaulting to the login and
   its GitHub no-reply address) and a `gh auth git-credential` helper, so https
   pushes authenticate with that same one copy of the token.
+- `~/.config/gh/config.yml`, mode `0600`, holding nothing but `version: "1"`.
+  This is the file `gh` writes for itself on first use, and it fails the whole
+  call when it cannot (`failed to write config after migration`). Writing it at
+  activation is what makes the home **read-only-safe afterwards**: every
+  consumer — the driver adapter, the `shell` adapter that runs a campaign's own
+  self-continuation, the agent adapters — can read this identity without needing
+  write access to it.
+
+Activation writes a fourth file, `~/.tally-campaign-forge-identity`, which marks
+the directory as this module's to manage.
 
 Rotating the token is an ordinary activation: replace the file's contents and
-rebuild. The home stays writable for the driver adapter and the poll service
-because `gh` rewrites its own configuration file the first time it runs against
-a directory it did not write, and fails the call when it cannot.
+rebuild. Turning `campaignForge.enable` back off is a teardown: the same
+activation snippet removes the identity files it wrote — but only in a home
+carrying that marker, so a `homeDir` pointed at a pre-existing home keeps its
+own `.gitconfig`. Removing the tally module altogether leaves the directory
+behind, because there is no activation left to run; delete `homeDir` by hand and
+revoke the token when a host is retired.
+
+The poll service and the driver adapter still declare the home writable, which
+costs nothing and keeps a hand-edited or half-provisioned home self-healing.
+After a successful activation nothing requires it.
+
+If the token is provisioned by sops-nix or agenix, this snippet is ordered after
+`setupSecrets` and `agenixInstall` when the estate runs one — as a declared
+dependency, not by luck of the name. A token file that is missing or unreadable
+at activation fails that snippet with a message naming
+`services.tally.campaignForge.tokenFile`, and the poll service refuses to start
+until the identity exists, so an unprovisioned host stays quiet rather than
+failing a unit on every tick.
 
 One first-deployment caveat: campaign jobs inherit `HOME` from the service
 account's user manager, and that manager reads the account record when it
@@ -398,10 +423,6 @@ The token needs the scopes a campaign actually uses: read the issue graph, push
 branches, open pull requests, and merge them. The campaign's checkout must be
 writable by the service account and must have an https `github.com` remote.
 
-An agent adapter hardened to `strict` or `production` needs the same home in its
-`extraWritablePaths`; the shipped driver adapter already declares it on this
-module.
-
 ### Arming from the system host
 
 The registry lives under the system state directory, which is mode `0700` and
@@ -410,14 +431,26 @@ account and must name the same state directory the poll unit scans. Passing a
 different one — or omitting `--state-dir`, which resolves through `HOME` — files
 a registration no timer will ever read.
 
+`--allow-actor` is effectively mandatory here, and this is the one command that
+differs materially from the Home Manager path. `arm` defaults the allowlist to
+the account it authenticates as and then refuses a master or task issue authored
+by anyone outside it. On Home Manager that account is the operator, who also
+wrote the issues; here it is the bot, so the human who filed them has to be named
+— once, at arm time, which is the review boundary the flag exists for.
+
 ```console
 # runuser -u tally -- tally \
     --config /etc/tally/config.json --socket /run/tally/tally.sock \
-    campaign arm --state-dir /var/lib/tally/state ISSUE-URL
+    campaign arm --state-dir /var/lib/tally/state \
+    --allow-actor OPERATOR-LOGIN ISSUE-URL
 # runuser -u tally -- tally \
     --config /etc/tally/config.json --socket /run/tally/tally.sock \
     campaign list --state-dir /var/lib/tally/state
 ```
+
+The alternative is to have the bot author the issue graph in the first place, by
+running `campaign project` under the same `runuser`; then the default allowlist
+already matches and no flag is needed.
 
 `services.tally.campaignPoll.interval` and `.timeout` mean what they mean on
 Home Manager; on this module they take effect only while `campaignForge.enable`
