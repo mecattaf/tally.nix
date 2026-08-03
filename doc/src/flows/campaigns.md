@@ -384,6 +384,16 @@ rebuild. The home stays writable for the driver adapter and the poll service
 because `gh` rewrites its own configuration file the first time it runs against
 a directory it did not write, and fails the call when it cannot.
 
+One first-deployment caveat: campaign jobs inherit `HOME` from the service
+account's user manager, and that manager reads the account record when it
+starts. On a host where the manager is already running — anything but a fresh
+boot — restart it once after the first activation that sets this option, so jobs
+see the new home rather than `/var/empty`:
+
+```console
+# systemctl restart user@"$(id -u tally)".service
+```
+
 The token needs the scopes a campaign actually uses: read the issue graph, push
 branches, open pull requests, and merge them. The campaign's checkout must be
 writable by the service account and must have an https `github.com` remote.
