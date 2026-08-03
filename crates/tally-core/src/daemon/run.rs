@@ -3,6 +3,9 @@ use super::*;
 use tokio::task::JoinSet;
 
 #[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
 #[derive(Clone)]
 pub(super) struct LeaseTickHook {
     pub(super) started: mpsc::UnboundedSender<()>,
@@ -11,13 +14,20 @@ pub(super) struct LeaseTickHook {
 
 /// Hold one `select!` arm's body open, the way a slow terminal transaction or a
 /// lifecycle compaction holds it open on the estate. Nothing else in the loop
-/// runs while a body is awaiting, which is exactly the condition the watchdog
+/// runs while a body is held, which is exactly the condition the watchdog
 /// keepalive must survive.
+///
+/// `blocking` reproduces the shape that matters most: `WitnessLedger::append`
+/// and `LifecycleLog::compact_if_over_limit` spend their time in `flock`,
+/// `write_all` and `sync_all`, so they hold the single runtime thread rather
+/// than parking on an `await`. A hook that only awaits cannot reach that class.
 #[cfg(test)]
 #[derive(Clone)]
 pub(super) struct DispatchStallHook {
     pub(super) entered: mpsc::UnboundedSender<()>,
     pub(super) release: watch::Receiver<bool>,
+    pub(super) blocking: Option<Duration>,
+    pub(super) blocked: Rc<Cell<bool>>,
 }
 
 #[cfg(test)]
@@ -25,6 +35,13 @@ impl DispatchStallHook {
     async fn stall(&self) {
         let mut release = self.release.clone();
         if *release.borrow() {
+            return;
+        }
+        if let Some(blocking) = self.blocking {
+            if !self.blocked.replace(true) {
+                let _ = self.entered.send(());
+                std::thread::sleep(blocking);
+            }
             return;
         }
         let _ = self.entered.send(());
@@ -108,7 +125,6 @@ impl Daemon {
         #[cfg(test)]
         let dispatch_stall_hook = self.dispatch_stall_hook.clone();
         let mut keepalive = None;
-        let mut scheduler_witness: Option<JoinHandle<()>> = None;
         let mut result = if let Some(error) = startup_error {
             Err(error)
         } else {
@@ -126,24 +142,13 @@ impl Daemon {
                     // deliberately not a `select!` arm any more: an arm is only
                     // polled when the loop comes back around to poll it, so any
                     // one slow arm body used to hold the ping until systemd gave
-                    // up. What the loop still owes is evidence, stamped below.
+                    // up. What the loop still owes is proof that it came back
+                    // around, stamped below.
                     keepalive = self.notifier.keepalive(self.handler.fatal.clone());
-                    if let Some(keepalive) = &keepalive {
-                        let liveness = keepalive.liveness();
-                        let cadence = keepalive.scheduler_cadence();
-                        scheduler_witness = Some(tokio::spawn(async move {
-                            let mut tick = tokio::time::interval(cadence);
-                            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            loop {
-                                tick.tick().await;
-                                liveness.stamp_scheduler();
-                            }
-                        }));
-                    }
-                    let dispatch_witness = keepalive.as_ref().map(WatchdogKeepalive::liveness);
+                    let progress = keepalive.as_ref().map(WatchdogKeepalive::progress);
                     loop {
-                        if let Some(liveness) = &dispatch_witness {
-                            liveness.stamp_dispatch();
+                        if let Some(progress) = &progress {
+                            progress.stamp();
                         }
                         tokio::select! {
                             accepted = self.listener.accept(), if connections.len() < max_connections => {
@@ -257,12 +262,7 @@ impl Daemon {
             }
         };
         // The keepalive stops before the daemon announces STOPPING=1, so no
-        // WATCHDOG=1 can follow that announcement, and the scheduler witness
-        // stops with it: nothing keeps stamping liveness for a daemon that has
-        // left its dispatch loop.
-        if let Some(witness) = scheduler_witness.take() {
-            witness.abort();
-        }
+        // WATCHDOG=1 can follow that announcement.
         if let Some(mut keepalive) = keepalive.take() {
             keepalive.shutdown();
         }

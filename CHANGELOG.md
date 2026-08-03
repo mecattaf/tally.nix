@@ -23,13 +23,29 @@ authorized.
   The keepalive now runs on a dedicated OS thread (`tally-watchdog`) that holds
   no daemon state and takes no daemon lock, so nothing the daemon does can
   delay the datagram. It is not thereby licensed to lie: the thread never
-  speaks for itself, and sends a ping only while two witnesses stamped by the
-  daemon are fresh — one stamped by a task on the daemon's runtime, which goes
-  stale when the runtime thread is blocked or deadlocked, and one stamped at
-  the top of the dispatch loop, which goes stale when an arm body stops
-  returning. When either goes stale the keepalive falls silent, says on stderr
-  which witness went stale and for how long, and systemd's own timer runs to
-  completion. A wedged daemon is still killed loudly; a slow one is not.
+  speaks for itself, and pings only while the dispatch loop has come back
+  around within its headroom, which the loop stamps before every `select!`. The
+  100 ms lease tick is what makes that meaningful — a healthy loop stamps at
+  10 Hz even with nothing to do, so staleness means *stuck*, not *idle*.
+
+  The headroom is `10 × WatchdogSec`, and it is the same number whether the arm
+  body is parked on an `await` or blocked in a syscall. That matters more than
+  it sounds: the runtime is single-threaded, and the expensive part of a
+  terminal witness append or a lifecycle compaction is `flock` / `write_all` /
+  `sync_all`, not an `await`. A liveness witness stamped by a runtime task
+  would stop for exactly those calls, so it would have been the tighter bound
+  in precisely the case that needs the looser one — the daemon would have got
+  roughly one service period of headroom for its slowest synchronous work while
+  being documented as having ten. One witness, stamped by the loop, avoids
+  that.
+
+  Past the headroom the keepalive falls silent, says so on stderr, and
+  systemd's own timer runs to completion, so a wedged daemon is still killed —
+  at `11 × WatchdogSec` rather than `1 ×`. That window is not silent: an
+  overdue loop is reported from `2 × WatchdogSec` onward, every two periods,
+  while the keepalive is still standing for it. Both nix modules now carry the
+  derivation next to `WatchdogSec = "30s"`, and a test pins what those divisors
+  come to at that value.
 
 - **The orphaned-projection sweep no longer declares a delivered projection
   lost, and retracts the records that said so (#372 repair).** The startup

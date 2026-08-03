@@ -3881,6 +3881,10 @@
           assert systemWitnessEmitter.serviceConfig.NoNewPrivileges;
           assert systemWitnessEmitter.serviceConfig.ProtectSystem == "strict";
           assert systemWitnessEmitter.serviceConfig.ReadWritePaths == [ "/var/lib/tally/data" ];
+          # The daemon's watchdog keepalive derives every liveness budget from
+          # this period, and pins those derivations at 30s in daemon::notify.
+          assert systemDaemon.serviceConfig.WatchdogSec == "30s";
+          assert homeServices.tally-daemon.Service.WatchdogSec == "30s";
           assert systemDaemon.serviceConfig.StateDirectory == "tally";
           assert systemDaemon.serviceConfig.LogsDirectory == "tally";
           assert systemDaemon.serviceConfig.RestrictAddressFamilies == [ "AF_UNIX" ];

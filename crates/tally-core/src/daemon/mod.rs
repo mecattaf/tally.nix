@@ -33,6 +33,11 @@ use completion::{
 };
 use completion::{append_orphan_attestation, append_orphan_retraction, gh_completion_id};
 pub(crate) use notify::WatchdogKeepalive;
+#[cfg(test)]
+use notify::{
+    dispatch_stall_horizon, dispatch_stall_notice, keepalive_cadence, keepalive_verdict,
+    KeepaliveVerdict,
+};
 use rpc::control::{find_job, lease_request, lease_wire, state_name};
 #[cfg(test)]
 use rpc::producer::{pool_loss_intent_directory, read_pool_loss_intent, write_pool_loss_intent};

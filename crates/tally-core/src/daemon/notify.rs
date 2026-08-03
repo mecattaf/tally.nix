@@ -8,59 +8,47 @@ use std::sync::{Condvar, PoisonError};
 /// The keepalive runs on its own OS thread precisely so that a busy daemon
 /// cannot delay the datagram — but that also means the thread has no first-hand
 /// knowledge of whether the daemon is still working. It therefore never speaks
-/// for itself: it forwards a ping only while both witnesses below are fresh.
-/// When either goes stale the keepalive falls silent and systemd's own timer
-/// runs to completion, so a wedged daemon is still killed loudly rather than
-/// held alive by a keepalive that has stopped meaning anything.
+/// for itself: it forwards a ping only while this witness is fresh.
+///
+/// The witness is stamped at the top of the dispatch loop, before every
+/// `select!`, and it is the *only* thing the keepalive consults. That is
+/// deliberate. A witness stamped by a task on the runtime would be the tighter
+/// of the two and would silently govern every case: the runtime is
+/// single-threaded, so a blocking `sync_all` or `flock` — which is what the
+/// expensive part of a terminal witness append or a lifecycle compaction
+/// actually is — stops such a task exactly as it stops the loop, and the
+/// daemon would get the tight bound precisely where it needs the loose one. One
+/// witness means a stall costs the same whether the thread is parked on an
+/// `await` or blocked in a syscall.
+///
+/// The 100 ms lease tick is what makes the witness meaningful: a healthy loop
+/// re-enters at least at 10 Hz even with nothing else to do, so staleness means
+/// one arm's body has stopped returning rather than that the daemon is idle.
 #[derive(Debug)]
-pub(crate) struct DaemonLiveness {
+pub(crate) struct DispatchProgress {
     origin: Instant,
-    /// Stamped by a task on the daemon's runtime. Proves the executor is still
-    /// scheduling work — it goes stale when the runtime thread is blocked in
-    /// synchronous code or deadlocked.
-    scheduler_millis: AtomicU64,
-    /// Stamped at the top of the dispatch loop, before every `select!`. Proves
-    /// the loop still comes back around. The 100 ms lease tick is what makes
-    /// this witness meaningful: a healthy loop re-enters at least at 10 Hz even
-    /// with nothing else to do, so staleness here means one arm's body has
-    /// stopped returning rather than that the daemon happens to be idle.
-    dispatch_millis: AtomicU64,
+    stamped_millis: AtomicU64,
 }
 
-impl DaemonLiveness {
+impl DispatchProgress {
     fn new() -> Self {
-        let liveness = Self {
+        let progress = Self {
             origin: Instant::now(),
-            scheduler_millis: AtomicU64::new(0),
-            dispatch_millis: AtomicU64::new(0),
+            stamped_millis: AtomicU64::new(0),
         };
-        liveness.stamp_scheduler();
-        liveness.stamp_dispatch();
-        liveness
+        progress.stamp();
+        progress
     }
 
-    pub(crate) fn stamp_scheduler(&self) {
-        self.scheduler_millis
+    pub(crate) fn stamp(&self) {
+        self.stamped_millis
             .store(self.elapsed_millis(), Ordering::Relaxed);
     }
 
-    pub(crate) fn stamp_dispatch(&self) {
-        self.dispatch_millis
-            .store(self.elapsed_millis(), Ordering::Relaxed);
-    }
-
-    fn scheduler_age(&self) -> Duration {
-        self.age(&self.scheduler_millis)
-    }
-
-    fn dispatch_age(&self) -> Duration {
-        self.age(&self.dispatch_millis)
-    }
-
-    fn age(&self, stamp: &AtomicU64) -> Duration {
+    fn age(&self) -> Duration {
         Duration::from_millis(
             self.elapsed_millis()
-                .saturating_sub(stamp.load(Ordering::Relaxed)),
+                .saturating_sub(self.stamped_millis.load(Ordering::Relaxed)),
         )
     }
 
@@ -70,37 +58,49 @@ impl DaemonLiveness {
 }
 
 /// How often the keepalive thread wakes to consider sending a ping.
-fn keepalive_cadence(watchdog: Duration) -> Duration {
-    fraction(watchdog, 4)
+pub(crate) fn keepalive_cadence(watchdog: Duration) -> Duration {
+    watchdog
+        .checked_div(4)
+        .unwrap_or(Duration::from_micros(1))
+        .max(Duration::from_micros(1))
 }
 
-/// How often the daemon's runtime stamps the scheduler witness.
-fn scheduler_cadence(watchdog: Duration) -> Duration {
-    fraction(watchdog, 8)
+/// When an overdue dispatch loop stops being silent. A loop that has not come
+/// back around for two service periods is already abnormal, and the operator
+/// must not have to wait for [`dispatch_stall_horizon`] to hear about it.
+pub(crate) fn dispatch_stall_notice(watchdog: Duration) -> Duration {
+    watchdog.saturating_mul(2)
 }
 
-/// The oldest scheduler evidence a ping may stand on. Half the service period
-/// keeps the claim conservative: systemd never learns of a liveness observation
-/// more than half a watchdog period after it was made.
-fn scheduler_horizon(watchdog: Duration) -> Duration {
-    fraction(watchdog, 2)
-}
-
-/// The headroom the dispatch loop gets. A `select!` arm whose body is merely
-/// slow — a witness fsync, a lifecycle compaction, a terminal transaction under
-/// an estate-sized context — must not cost the daemon its life, which is the
-/// whole defect being repaired. A body that never returns still must, so the
-/// budget is finite: ten service periods, after which the keepalive stops and
-/// systemd restarts the daemon exactly as it does today.
-fn dispatch_horizon(watchdog: Duration) -> Duration {
+/// The headroom the dispatch loop gets before the keepalive stops standing for
+/// it. A `select!` arm body that is merely slow must not cost the daemon its
+/// life; one that never returns still must, so the budget is finite.
+pub(crate) fn dispatch_stall_horizon(watchdog: Duration) -> Duration {
     watchdog.saturating_mul(10)
 }
 
-fn fraction(watchdog: Duration, divisor: u32) -> Duration {
-    watchdog
-        .checked_div(divisor)
-        .unwrap_or(Duration::from_micros(1))
-        .max(Duration::from_micros(1))
+/// What the keepalive thread owes systemd for a dispatch loop of a given age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeepaliveVerdict {
+    Ping,
+    /// Overdue, but still inside the headroom: ping, and say so.
+    PingOverdue,
+    /// Past the headroom: the service watchdog must be allowed to act.
+    Withhold,
+}
+
+pub(crate) fn keepalive_verdict(
+    age: Duration,
+    notice: Duration,
+    horizon: Duration,
+) -> KeepaliveVerdict {
+    if age > horizon {
+        KeepaliveVerdict::Withhold
+    } else if age > notice {
+        KeepaliveVerdict::PingOverdue
+    } else {
+        KeepaliveVerdict::Ping
+    }
 }
 
 /// The systemd watchdog keepalive, running on a thread of its own.
@@ -108,19 +108,14 @@ fn fraction(watchdog: Duration, divisor: u32) -> Duration {
 /// It owns no daemon state and takes no daemon locks, so nothing the daemon
 /// does can delay the datagram. What it can do is decline to send one.
 pub(crate) struct WatchdogKeepalive {
-    liveness: Arc<DaemonLiveness>,
-    scheduler_cadence: Duration,
+    progress: Arc<DispatchProgress>,
     stop: Arc<(std::sync::Mutex<bool>, Condvar)>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl WatchdogKeepalive {
-    pub(crate) fn liveness(&self) -> Arc<DaemonLiveness> {
-        Arc::clone(&self.liveness)
-    }
-
-    pub(crate) const fn scheduler_cadence(&self) -> Duration {
-        self.scheduler_cadence
+    pub(crate) fn progress(&self) -> Arc<DispatchProgress> {
+        Arc::clone(&self.progress)
     }
 
     /// Stop pinging and join the thread. Called before `STOPPING=1` so that no
@@ -218,17 +213,19 @@ impl SystemdNotifier {
         fatal: mpsc::UnboundedSender<DaemonError>,
     ) -> Option<WatchdogKeepalive> {
         let watchdog = self.watchdog?;
-        let liveness = Arc::new(DaemonLiveness::new());
+        let progress = Arc::new(DispatchProgress::new());
         let stop = Arc::new((std::sync::Mutex::new(false), Condvar::new()));
         let cadence = keepalive_cadence(watchdog);
-        let scheduler_horizon = scheduler_horizon(watchdog);
-        let dispatch_horizon = dispatch_horizon(watchdog);
+        let notice = dispatch_stall_notice(watchdog);
+        let horizon = dispatch_stall_horizon(watchdog);
         let notifier = self.clone();
-        let thread_liveness = Arc::clone(&liveness);
+        let thread_progress = Arc::clone(&progress);
         let thread_stop = Arc::clone(&stop);
         let thread = std::thread::Builder::new()
             .name("tally-watchdog".to_owned())
             .spawn(move || {
+                let notice_millis = notice.as_millis().max(1);
+                let mut announced = 0;
                 let mut withheld = false;
                 loop {
                     {
@@ -244,37 +241,47 @@ impl SystemdNotifier {
                             break;
                         }
                     }
-                    let scheduler_age = thread_liveness.scheduler_age();
-                    let dispatch_age = thread_liveness.dispatch_age();
-                    let stale = if scheduler_age > scheduler_horizon {
-                        Some(format!(
-                            "the daemon runtime has not run a task for {} ms",
-                            scheduler_age.as_millis()
-                        ))
-                    } else if dispatch_age > dispatch_horizon {
-                        Some(format!(
-                            "the daemon dispatch loop has not re-entered its select for {} ms",
-                            dispatch_age.as_millis()
-                        ))
-                    } else {
-                        None
-                    };
-                    if let Some(reason) = stale {
-                        if !withheld {
-                            withheld = true;
-                            eprintln!(
-                                "tally: {reason}; withholding the systemd watchdog keepalive so \
-                                 the service watchdog can act"
-                            );
+                    let age = thread_progress.age();
+                    match keepalive_verdict(age, notice, horizon) {
+                        KeepaliveVerdict::Withhold => {
+                            if !withheld {
+                                withheld = true;
+                                eprintln!(
+                                    "tally: the daemon dispatch loop has not re-entered its \
+                                     select for {} ms, which is past its {} ms headroom; \
+                                     withholding the systemd watchdog keepalive so the service \
+                                     watchdog can act",
+                                    age.as_millis(),
+                                    horizon.as_millis()
+                                );
+                            }
+                            continue;
                         }
-                        continue;
-                    }
-                    if withheld {
-                        withheld = false;
-                        eprintln!(
-                            "tally: the daemon is making progress again; the systemd watchdog \
-                             keepalive has resumed"
-                        );
+                        // Still pinging, but an overdue loop is reported while
+                        // it is overdue rather than only once it is fatal.
+                        KeepaliveVerdict::PingOverdue => {
+                            let elapsed_notices = age.as_millis() / notice_millis;
+                            if elapsed_notices > announced {
+                                announced = elapsed_notices;
+                                eprintln!(
+                                    "tally: the daemon dispatch loop has not re-entered its \
+                                     select for {} ms; still keeping the service watchdog alive \
+                                     for up to {} ms",
+                                    age.as_millis(),
+                                    horizon.as_millis()
+                                );
+                            }
+                        }
+                        KeepaliveVerdict::Ping => {
+                            if withheld || announced > 0 {
+                                eprintln!(
+                                    "tally: the daemon dispatch loop is running again after {} ms",
+                                    age.as_millis()
+                                );
+                            }
+                            withheld = false;
+                            announced = 0;
+                        }
                     }
                     if let Err(error) = notifier.watchdog() {
                         let _ = fatal.send(error);
@@ -285,8 +292,8 @@ impl SystemdNotifier {
         let thread = match thread {
             Ok(thread) => thread,
             Err(error) => {
-                // A daemon that cannot start its keepalive would be killed by
-                // the service watchdog within one period. Say why now, on the
+                // A daemon that cannot start its keepalive is killed by the
+                // service watchdog within one period. Say why now, on the
                 // surface an operator reads, rather than leaving the restart
                 // unexplained.
                 eprintln!(
@@ -296,8 +303,7 @@ impl SystemdNotifier {
             }
         };
         Some(WatchdogKeepalive {
-            liveness,
-            scheduler_cadence: scheduler_cadence(watchdog),
+            progress,
             stop,
             thread: Some(thread),
         })
