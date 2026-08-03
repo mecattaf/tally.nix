@@ -1,10 +1,141 @@
 use super::*;
 
-pub(crate) async fn watchdog_tick(interval: &mut Option<tokio::time::Interval>) {
-    if let Some(interval) = interval {
-        interval.tick().await;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Condvar, PoisonError};
+
+/// What the daemon must prove before a `WATCHDOG=1` may be sent on its behalf.
+///
+/// The keepalive runs on its own OS thread precisely so that a busy daemon
+/// cannot delay the datagram — but that also means the thread has no first-hand
+/// knowledge of whether the daemon is still working. It therefore never speaks
+/// for itself: it forwards a ping only while this witness is fresh.
+///
+/// The witness is stamped at the top of the dispatch loop, before every
+/// `select!`, and it is the *only* thing the keepalive consults. That is
+/// deliberate. A witness stamped by a task on the runtime would be the tighter
+/// of the two and would silently govern every case: the runtime is
+/// single-threaded, so a blocking `sync_all` or `flock` — which is what the
+/// expensive part of a terminal witness append or a lifecycle compaction
+/// actually is — stops such a task exactly as it stops the loop, and the
+/// daemon would get the tight bound precisely where it needs the loose one. One
+/// witness means a stall costs the same whether the thread is parked on an
+/// `await` or blocked in a syscall.
+///
+/// The 100 ms lease tick is what makes the witness meaningful: a healthy loop
+/// re-enters at least at 10 Hz even with nothing else to do, so staleness means
+/// one arm's body has stopped returning rather than that the daemon is idle.
+#[derive(Debug)]
+pub(crate) struct DispatchProgress {
+    origin: Instant,
+    stamped_millis: AtomicU64,
+}
+
+impl DispatchProgress {
+    fn new() -> Self {
+        let progress = Self {
+            origin: Instant::now(),
+            stamped_millis: AtomicU64::new(0),
+        };
+        progress.stamp();
+        progress
+    }
+
+    pub(crate) fn stamp(&self) {
+        self.stamped_millis
+            .store(self.elapsed_millis(), Ordering::Relaxed);
+    }
+
+    fn age(&self) -> Duration {
+        Duration::from_millis(
+            self.elapsed_millis()
+                .saturating_sub(self.stamped_millis.load(Ordering::Relaxed)),
+        )
+    }
+
+    fn elapsed_millis(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+/// How often the keepalive thread wakes to consider sending a ping.
+pub(crate) fn keepalive_cadence(watchdog: Duration) -> Duration {
+    watchdog
+        .checked_div(4)
+        .unwrap_or(Duration::from_micros(1))
+        .max(Duration::from_micros(1))
+}
+
+/// When an overdue dispatch loop stops being silent. A loop that has not come
+/// back around for two service periods is already abnormal, and the operator
+/// must not have to wait for [`dispatch_stall_horizon`] to hear about it.
+pub(crate) fn dispatch_stall_notice(watchdog: Duration) -> Duration {
+    watchdog.saturating_mul(2)
+}
+
+/// The headroom the dispatch loop gets before the keepalive stops standing for
+/// it. A `select!` arm body that is merely slow must not cost the daemon its
+/// life; one that never returns still must, so the budget is finite.
+pub(crate) fn dispatch_stall_horizon(watchdog: Duration) -> Duration {
+    watchdog.saturating_mul(10)
+}
+
+/// What the keepalive thread owes systemd for a dispatch loop of a given age.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum KeepaliveVerdict {
+    Ping,
+    /// Overdue, but still inside the headroom: ping, and say so.
+    PingOverdue,
+    /// Past the headroom: the service watchdog must be allowed to act.
+    Withhold,
+}
+
+pub(crate) fn keepalive_verdict(
+    age: Duration,
+    notice: Duration,
+    horizon: Duration,
+) -> KeepaliveVerdict {
+    if age > horizon {
+        KeepaliveVerdict::Withhold
+    } else if age > notice {
+        KeepaliveVerdict::PingOverdue
     } else {
-        std::future::pending::<()>().await;
+        KeepaliveVerdict::Ping
+    }
+}
+
+/// The systemd watchdog keepalive, running on a thread of its own.
+///
+/// It owns no daemon state and takes no daemon locks, so nothing the daemon
+/// does can delay the datagram. What it can do is decline to send one.
+pub(crate) struct WatchdogKeepalive {
+    progress: Arc<DispatchProgress>,
+    stop: Arc<(std::sync::Mutex<bool>, Condvar)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl WatchdogKeepalive {
+    pub(crate) fn progress(&self) -> Arc<DispatchProgress> {
+        Arc::clone(&self.progress)
+    }
+
+    /// Stop pinging and join the thread. Called before `STOPPING=1` so that no
+    /// keepalive can follow the daemon's own announcement that it is going away.
+    pub(crate) fn shutdown(&mut self) {
+        {
+            let (lock, condvar) = &*self.stop;
+            let mut stopped = lock.lock().unwrap_or_else(PoisonError::into_inner);
+            *stopped = true;
+            condvar.notify_all();
+        }
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for WatchdogKeepalive {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -72,12 +203,109 @@ impl SystemdNotifier {
         self.send("STOPPING=1")
     }
 
-    pub(crate) fn watchdog_interval(&self) -> Option<tokio::time::Interval> {
-        self.watchdog.map(|duration| {
-            let cadence = duration.checked_div(2).unwrap_or(Duration::from_micros(1));
-            let mut interval = tokio::time::interval(cadence.max(Duration::from_micros(1)));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval
+    /// Start the keepalive thread, if this service is watched at all.
+    ///
+    /// `fatal` carries a send failure back into the daemon's own fatal channel:
+    /// the previous in-loop keepalive ended the run loop when the notify socket
+    /// refused a datagram, and that is still the outcome.
+    pub(crate) fn keepalive(
+        &self,
+        fatal: mpsc::UnboundedSender<DaemonError>,
+    ) -> Option<WatchdogKeepalive> {
+        let watchdog = self.watchdog?;
+        let progress = Arc::new(DispatchProgress::new());
+        let stop = Arc::new((std::sync::Mutex::new(false), Condvar::new()));
+        let cadence = keepalive_cadence(watchdog);
+        let notice = dispatch_stall_notice(watchdog);
+        let horizon = dispatch_stall_horizon(watchdog);
+        let notifier = self.clone();
+        let thread_progress = Arc::clone(&progress);
+        let thread_stop = Arc::clone(&stop);
+        let thread = std::thread::Builder::new()
+            .name("tally-watchdog".to_owned())
+            .spawn(move || {
+                let notice_millis = notice.as_millis().max(1);
+                let mut announced = 0;
+                let mut withheld = false;
+                loop {
+                    {
+                        let (lock, condvar) = &*thread_stop;
+                        let stopped = lock.lock().unwrap_or_else(PoisonError::into_inner);
+                        if *stopped {
+                            break;
+                        }
+                        let (stopped, _) = condvar
+                            .wait_timeout(stopped, cadence)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        if *stopped {
+                            break;
+                        }
+                    }
+                    let age = thread_progress.age();
+                    match keepalive_verdict(age, notice, horizon) {
+                        KeepaliveVerdict::Withhold => {
+                            if !withheld {
+                                withheld = true;
+                                eprintln!(
+                                    "tally: the daemon dispatch loop has not re-entered its \
+                                     select for {} ms, which is past its {} ms headroom; \
+                                     withholding the systemd watchdog keepalive so the service \
+                                     watchdog can act",
+                                    age.as_millis(),
+                                    horizon.as_millis()
+                                );
+                            }
+                            continue;
+                        }
+                        // Still pinging, but an overdue loop is reported while
+                        // it is overdue rather than only once it is fatal.
+                        KeepaliveVerdict::PingOverdue => {
+                            let elapsed_notices = age.as_millis() / notice_millis;
+                            if elapsed_notices > announced {
+                                announced = elapsed_notices;
+                                eprintln!(
+                                    "tally: the daemon dispatch loop has not re-entered its \
+                                     select for {} ms; still keeping the service watchdog alive \
+                                     for up to {} ms",
+                                    age.as_millis(),
+                                    horizon.as_millis()
+                                );
+                            }
+                        }
+                        KeepaliveVerdict::Ping => {
+                            if withheld || announced > 0 {
+                                eprintln!(
+                                    "tally: the daemon dispatch loop is running again after {} ms",
+                                    age.as_millis()
+                                );
+                            }
+                            withheld = false;
+                            announced = 0;
+                        }
+                    }
+                    if let Err(error) = notifier.watchdog() {
+                        let _ = fatal.send(error);
+                        break;
+                    }
+                }
+            });
+        let thread = match thread {
+            Ok(thread) => thread,
+            Err(error) => {
+                // A daemon that cannot start its keepalive is killed by the
+                // service watchdog within one period. Say why now, on the
+                // surface an operator reads, rather than leaving the restart
+                // unexplained.
+                eprintln!(
+                    "tally: the systemd watchdog keepalive thread could not be started: {error}"
+                );
+                return None;
+            }
+        };
+        Some(WatchdogKeepalive {
+            progress,
+            stop,
+            thread: Some(thread),
         })
     }
 }

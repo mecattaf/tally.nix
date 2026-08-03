@@ -409,6 +409,11 @@ in
           User = cfg.user;
           Group = cfg.group;
           NotifyAccess = "main";
+          # The daemon derives its liveness budgets from this period: it pings
+          # every WatchdogSec/4, reports a dispatch loop that has not come back
+          # around for 2x WatchdogSec, and stops pinging at 10x, after which
+          # systemd takes one more period to restart. Moving this number moves
+          # all four; daemon::notify pins them at 30s.
           WatchdogSec = "30s";
           Restart = "always";
           RestartSec = "2s";

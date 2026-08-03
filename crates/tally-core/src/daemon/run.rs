@@ -3,10 +3,54 @@ use super::*;
 use tokio::task::JoinSet;
 
 #[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
 #[derive(Clone)]
 pub(super) struct LeaseTickHook {
     pub(super) started: mpsc::UnboundedSender<()>,
     pub(super) release: watch::Receiver<bool>,
+}
+
+/// Hold one `select!` arm's body open, the way a slow terminal transaction or a
+/// lifecycle compaction holds it open on the estate. Nothing else in the loop
+/// runs while a body is held, which is exactly the condition the watchdog
+/// keepalive must survive.
+///
+/// `blocking` reproduces the shape that matters most: `WitnessLedger::append`
+/// and `LifecycleLog::compact_if_over_limit` spend their time in `flock`,
+/// `write_all` and `sync_all`, so they hold the single runtime thread rather
+/// than parking on an `await`. A hook that only awaits cannot reach that class.
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct DispatchStallHook {
+    pub(super) entered: mpsc::UnboundedSender<()>,
+    pub(super) release: watch::Receiver<bool>,
+    pub(super) blocking: Option<Duration>,
+    pub(super) blocked: Rc<Cell<bool>>,
+}
+
+#[cfg(test)]
+impl DispatchStallHook {
+    async fn stall(&self) {
+        let mut release = self.release.clone();
+        if *release.borrow() {
+            return;
+        }
+        if let Some(blocking) = self.blocking {
+            if !self.blocked.replace(true) {
+                let _ = self.entered.send(());
+                std::thread::sleep(blocking);
+            }
+            return;
+        }
+        let _ = self.entered.send(());
+        while !*release.borrow() {
+            if release.changed().await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 impl Daemon {
@@ -72,130 +116,156 @@ impl Daemon {
             storage_poll_interval,
         );
         storage_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut watchdog = self.notifier.watchdog_interval();
         let mut lease_ticks = JoinSet::new();
         let mut storage_samples = JoinSet::new();
         let mut connections = JoinSet::new();
         let max_connections = self.handler.settings.max_connections;
         #[cfg(test)]
         let connection_count_hook = self.connection_count_hook.clone();
+        #[cfg(test)]
+        let dispatch_stall_hook = self.dispatch_stall_hook.clone();
+        let mut keepalive = None;
         let mut result = if let Some(error) = startup_error {
             Err(error)
         } else {
             match self.notifier.ready() {
                 Err(error) => Err(error),
-                Ok(()) => loop {
-                    tokio::select! {
-                        accepted = self.listener.accept(), if connections.len() < max_connections => {
-                            match accepted {
-                                Ok((stream, _)) => {
-                                    let handler = self.handler.clone();
-                                    let max_frame_bytes = self.max_frame_bytes;
-                                    connections.spawn_local(async move {
-                                        if let Err(error) = serve_connection_with_limits(
-                                            stream,
-                                            handler,
-                                            max_frame_bytes,
-                                            Some(RPC_IDLE_TIMEOUT),
-                                        )
-                                        .await
-                                        {
-                                            eprintln!("tally: RPC connection failed: {error}");
+                Ok(()) => {
+                    // READY=1 is what arms the service watchdog, so this is the
+                    // first instant a keepalive is owed and the last instant it
+                    // can be started from. Everything before it — the whole of
+                    // `Daemon::open`, including unit-fact collection and the
+                    // startup projection sweep — is covered by TimeoutStartSec
+                    // instead, and cannot miss a watchdog deadline.
+                    //
+                    // The keepalive lives on its own OS thread from here. It is
+                    // deliberately not a `select!` arm any more: an arm is only
+                    // polled when the loop comes back around to poll it, so any
+                    // one slow arm body used to hold the ping until systemd gave
+                    // up. What the loop still owes is proof that it came back
+                    // around, stamped below.
+                    keepalive = self.notifier.keepalive(self.handler.fatal.clone());
+                    let progress = keepalive.as_ref().map(WatchdogKeepalive::progress);
+                    loop {
+                        if let Some(progress) = &progress {
+                            progress.stamp();
+                        }
+                        tokio::select! {
+                            accepted = self.listener.accept(), if connections.len() < max_connections => {
+                                match accepted {
+                                    Ok((stream, _)) => {
+                                        let handler = self.handler.clone();
+                                        let max_frame_bytes = self.max_frame_bytes;
+                                        connections.spawn_local(async move {
+                                            if let Err(error) = serve_connection_with_limits(
+                                                stream,
+                                                handler,
+                                                max_frame_bytes,
+                                                Some(RPC_IDLE_TIMEOUT),
+                                            )
+                                            .await
+                                            {
+                                                eprintln!("tally: RPC connection failed: {error}");
+                                            }
+                                        });
+                                        #[cfg(test)]
+                                        if let Some(hook) = &connection_count_hook {
+                                            let _ = hook.send(connections.len());
                                         }
-                                    });
-                                    #[cfg(test)]
-                                    if let Some(hook) = &connection_count_hook {
-                                        let _ = hook.send(connections.len());
                                     }
+                                    Err(source) if retryable_accept_error(&source) => {
+                                        eprintln!(
+                                            "tally: RPC accept failed, retrying after {} ms: {source}",
+                                            ACCEPT_ERROR_BACKOFF.as_millis()
+                                        );
+                                        tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                                    }
+                                    Err(source) => break Err(io_error(&socket_path, source)),
                                 }
-                                Err(source) if retryable_accept_error(&source) => {
-                                    eprintln!(
-                                        "tally: RPC accept failed, retrying after {} ms: {source}",
-                                        ACCEPT_ERROR_BACKOFF.as_millis()
-                                    );
-                                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                            }
+                            Some(joined) = connections.join_next(), if !connections.is_empty() => {
+                                if let Err(error) = joined {
+                                    eprintln!("tally: RPC connection task failed: {error}");
                                 }
-                                Err(source) => break Err(io_error(&socket_path, source)),
-                            }
-                        }
-                        Some(joined) = connections.join_next(), if !connections.is_empty() => {
-                            if let Err(error) = joined {
-                                eprintln!("tally: RPC connection task failed: {error}");
-                            }
-                            #[cfg(test)]
-                            if let Some(hook) = &connection_count_hook {
-                                let _ = hook.send(connections.len());
-                            }
-                        }
-                        Some(finished) = self.completion_rx.recv() => {
-                            if let Err(error) = self.finish_job(finished).await {
-                                break Err(error);
-                            }
-                        }
-                        Some(error) = self.fatal_rx.recv() => break Err(error),
-                        _ = lease_tick.tick() => {
-                            if lease_ticks.is_empty() {
-                                let handler = self.handler.clone();
                                 #[cfg(test)]
-                                let hook = self.lease_tick_hook.clone();
-                                lease_ticks.spawn_local(async move {
+                                if let Some(hook) = &connection_count_hook {
+                                    let _ = hook.send(connections.len());
+                                }
+                            }
+                            Some(finished) = self.completion_rx.recv() => {
+                                if let Err(error) = self.finish_job(finished).await {
+                                    break Err(error);
+                                }
+                            }
+                            Some(error) = self.fatal_rx.recv() => break Err(error),
+                            _ = lease_tick.tick() => {
+                                #[cfg(test)]
+                                if let Some(hook) = &dispatch_stall_hook {
+                                    hook.stall().await;
+                                }
+                                if lease_ticks.is_empty() {
+                                    let handler = self.handler.clone();
                                     #[cfg(test)]
-                                    if let Some(mut hook) = hook {
-                                        let _ = hook.started.send(());
-                                        while !*hook.release.borrow() {
-                                            if hook.release.changed().await.is_err() {
-                                                break;
+                                    let hook = self.lease_tick_hook.clone();
+                                    lease_ticks.spawn_local(async move {
+                                        #[cfg(test)]
+                                        if let Some(mut hook) = hook {
+                                            let _ = hook.started.send(());
+                                            while !*hook.release.borrow() {
+                                                if hook.release.changed().await.is_err() {
+                                                    break;
+                                                }
                                             }
                                         }
-                                    }
-                                    Self::tick_leases(handler).await
-                                });
+                                        Self::tick_leases(handler).await
+                                    });
+                                }
                             }
-                        }
-                        _ = storage_tick.tick() => {
-                            self.handler.compact_lifecycle_if_needed().await;
-                            if storage_samples.is_empty() {
-                                let handler = self.handler.clone();
-                                storage_samples.spawn_local(async move {
-                                    handler.refresh_storage_now().await
-                                });
+                            _ = storage_tick.tick() => {
+                                self.handler.compact_lifecycle_if_needed().await;
+                                if storage_samples.is_empty() {
+                                    let handler = self.handler.clone();
+                                    storage_samples.spawn_local(async move {
+                                        handler.refresh_storage_now().await
+                                    });
+                                }
                             }
-                        }
-                        Some(sampled) = storage_samples.join_next(), if !storage_samples.is_empty() => {
-                            if let Err(error) = sampled {
-                                eprintln!("tally: storage sampling task failed: {error}");
+                            Some(sampled) = storage_samples.join_next(), if !storage_samples.is_empty() => {
+                                if let Err(error) = sampled {
+                                    eprintln!("tally: storage sampling task failed: {error}");
+                                }
                             }
-                        }
-                        Some(tick_result) = lease_ticks.join_next(), if !lease_ticks.is_empty() => {
-                            match tick_result {
-                                Ok(Ok(())) => {}
-                                Ok(Err(error)) => break Err(error),
-                                Err(error) => break Err(DaemonError::Invalid(format!(
-                                    "lease tick task failed: {error}"
-                                ))),
+                            Some(tick_result) = lease_ticks.join_next(), if !lease_ticks.is_empty() => {
+                                match tick_result {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(error)) => break Err(error),
+                                    Err(error) => break Err(DaemonError::Invalid(format!(
+                                        "lease tick task failed: {error}"
+                                    ))),
+                                }
                             }
-                        }
-                        _ = watchdog_tick(&mut watchdog), if watchdog.is_some() => {
-                            if let Err(error) = self.notifier.watchdog() {
-                                break Err(error);
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    break Ok(());
+                                }
                             }
-                        }
-                        changed = shutdown.changed() => {
-                            if changed.is_err() || *shutdown.borrow() {
-                                break Ok(());
+                            signal = tokio::signal::ctrl_c() => {
+                                match signal {
+                                    Ok(()) => break Ok(()),
+                                    Err(error) => break Err(DaemonError::Notify(error.to_string())),
+                                }
                             }
+                            _ = terminate.recv() => break Ok(()),
                         }
-                        signal = tokio::signal::ctrl_c() => {
-                            match signal {
-                                Ok(()) => break Ok(()),
-                                Err(error) => break Err(DaemonError::Notify(error.to_string())),
-                            }
-                        }
-                        _ = terminate.recv() => break Ok(()),
                     }
-                },
+                }
             }
         };
+        // The keepalive stops before the daemon announces STOPPING=1, so no
+        // WATCHDOG=1 can follow that announcement.
+        if let Some(mut keepalive) = keepalive.take() {
+            keepalive.shutdown();
+        }
         if let Err(error) = self.notifier.stopping() {
             if result.is_ok() {
                 result = Err(error);

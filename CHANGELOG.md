@@ -8,6 +8,45 @@ authorized.
 
 ### Fixed
 
+- **The systemd watchdog keepalive no longer shares the dispatch loop, so a
+  busy daemon is no longer killed for being busy (#370).** `WATCHDOG=1` was
+  emitted from a `tokio::select!` arm in the daemon's dispatch loop. A
+  `select!` arm is only polled when the loop comes back around to poll it, and
+  it does not come back around while another arm's *body* is awaiting — a
+  terminal transaction, a lifecycle compaction, a witness fsync under an
+  estate-sized context. One slow body therefore held the keepalive for as long
+  as it ran, and at thirty seconds systemd sent `SIGABRT`. That is the
+  2026-07-30 00:01–00:03 sequence in the coordinator journal: four
+  `Watchdog timeout (limit 30s)!` kills in three minutes, of a daemon that was
+  working.
+
+  The keepalive now runs on a dedicated OS thread (`tally-watchdog`) that holds
+  no daemon state and takes no daemon lock, so nothing the daemon does can
+  delay the datagram. It is not thereby licensed to lie: the thread never
+  speaks for itself, and pings only while the dispatch loop has come back
+  around within its headroom, which the loop stamps before every `select!`. The
+  100 ms lease tick is what makes that meaningful — a healthy loop stamps at
+  10 Hz even with nothing to do, so staleness means *stuck*, not *idle*.
+
+  The headroom is `10 × WatchdogSec`, and it is the same number whether the arm
+  body is parked on an `await` or blocked in a syscall. That matters more than
+  it sounds: the runtime is single-threaded, and the expensive part of a
+  terminal witness append or a lifecycle compaction is `flock` / `write_all` /
+  `sync_all`, not an `await`. A liveness witness stamped by a runtime task
+  would stop for exactly those calls, so it would have been the tighter bound
+  in precisely the case that needs the looser one — the daemon would have got
+  roughly one service period of headroom for its slowest synchronous work while
+  being documented as having ten. One witness, stamped by the loop, avoids
+  that.
+
+  Past the headroom the keepalive falls silent, says so on stderr, and
+  systemd's own timer runs to completion, so a wedged daemon is still killed —
+  at `11 × WatchdogSec` rather than `1 ×`. That window is not silent: an
+  overdue loop is reported from `2 × WatchdogSec` onward, every two periods,
+  while the keepalive is still standing for it. Both nix modules now carry the
+  derivation next to `WatchdogSec = "30s"`, and a test pins what those divisors
+  come to at that value.
+
 - **The orphaned-projection sweep no longer declares a delivered projection
   lost, and retracts the records that said so (#372 repair).** The startup
   sweep decided orphan-ness from `config.producers` alone. It never consulted

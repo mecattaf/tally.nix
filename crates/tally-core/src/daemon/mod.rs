@@ -32,7 +32,12 @@ use completion::{
     substituted_witness, GhTerminalWork, TerminalWork,
 };
 use completion::{append_orphan_attestation, append_orphan_retraction, gh_completion_id};
-pub(crate) use notify::watchdog_tick;
+pub(crate) use notify::WatchdogKeepalive;
+#[cfg(test)]
+use notify::{
+    dispatch_stall_horizon, dispatch_stall_notice, keepalive_cadence, keepalive_verdict,
+    KeepaliveVerdict,
+};
 use rpc::control::{find_job, lease_request, lease_wire, state_name};
 #[cfg(test)]
 use rpc::producer::{pool_loss_intent_directory, read_pool_loss_intent, write_pool_loss_intent};
@@ -43,12 +48,12 @@ use rpc::query::{
     overlay_live_states, read_usage_meter, usage_meter_event_path, write_usage_meter,
     UsageMeterObservation,
 };
-#[cfg(test)]
-use run::LeaseTickHook;
 use run::{
     merge_selected_pool_returns, pool_representations, promoted_jobs, renderable_pool_return_rows,
     resume_paused_jobs_locked,
 };
+#[cfg(test)]
+use run::{DispatchStallHook, LeaseTickHook};
 #[cfg(test)]
 use startup::{
     acquire_daemon_lock, hydrate_adopted_adapter_metadata, hydrate_completed_adapter_metadata,
@@ -963,6 +968,8 @@ pub struct Daemon {
     lease_tick_hook: Option<LeaseTickHook>,
     #[cfg(test)]
     connection_count_hook: Option<mpsc::UnboundedSender<usize>>,
+    #[cfg(test)]
+    dispatch_stall_hook: Option<DispatchStallHook>,
 }
 
 #[cfg(test)]
