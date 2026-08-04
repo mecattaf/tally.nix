@@ -674,8 +674,8 @@
         # `config::tests::pool_config_reads_the_nix_rendered_declared_vs_undeclared_fixture_correctly`.
         # Nix's rendering and Rust's reading of it cannot drift apart
         # silently without both pins failing.
-        poolResourceDeclarationFixture = (
-          moduleCommon.mkRuntimeConfig
+        poolResourceDeclarationFixture =
+          (moduleCommon.mkRuntimeConfig
             (pkgs.lib.evalModules {
               modules = [
                 {
@@ -696,7 +696,7 @@
                 }
               ];
             }).config.services.tally
-        ).pools;
+          ).pools;
         # Representative arguments for the checked-in examples, so the flake
         # exercises each argsSchema instead of only its meta block. The agency
         # wave is the exception: it ships its own documented argument file,

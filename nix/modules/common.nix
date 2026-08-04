@@ -1726,15 +1726,12 @@ let
           assertion =
             config.budgetGb == null
             || (
-              effectivePoolResource config == "vram"
-              && config.capacity > 1
-              && config.predicate ? co-residency
+              effectivePoolResource config == "vram" && config.capacity > 1 && config.predicate ? co-residency
             );
           message = "pool ${name} budgetGb is valid only for a co-resident vram pool with capacity > 1";
         }
         {
-          assertion =
-            !(config.predicate ? windowed-consumption) || effectivePoolResource config == "budget";
+          assertion = !(config.predicate ? windowed-consumption) || effectivePoolResource config == "budget";
           message = "pool ${name} windowed-consumption predicate requires resource = budget";
         }
         {
