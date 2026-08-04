@@ -110,6 +110,7 @@ impl DaemonHandler {
             live,
             report,
             witness,
+            membership,
         } = self.query_projection().await?;
 
         match method {
@@ -160,9 +161,16 @@ impl DaemonHandler {
                 if params.id.trim().is_empty() {
                     return Err(WireError::invalid("query run ID must not be empty"));
                 }
-                let mut result =
-                    query_run(&params.id, &details, &live, &history, &witness, Utc::now())
-                        .map_err(observability_wire)?;
+                let mut result = query_run(
+                    &params.id,
+                    &details,
+                    &live,
+                    &history,
+                    &witness,
+                    Utc::now(),
+                    &membership,
+                )
+                .map_err(observability_wire)?;
                 let lineage = self.flow_lineage().await?;
                 apply_run_lineage(&mut result, &lineage);
                 for failure in &mut result.failures {
@@ -297,6 +305,7 @@ impl DaemonHandler {
                             &report,
                             &witness,
                             &attestations,
+                            &membership,
                         )
                         .map_err(observability_wire)?,
                     )
@@ -411,10 +420,14 @@ struct QueryProjection {
     live: Vec<LiveJobFact>,
     report: crate::witness::VerifyReport,
     witness: std::sync::Arc<Vec<WitnessRecord>>,
+    /// Durable run membership, so that a `flowRun`-scoped projection resolves
+    /// the nodes a run was handed and not only the ones whose row it owns.
+    membership: Rc<FlowMembership>,
 }
 
 impl DaemonHandler {
     async fn query_projection(&self) -> Result<QueryProjection, WireError> {
+        let membership = self.flow_membership().await?;
         let history = self.history.borrow().snapshot();
         let journal = history
             .records
@@ -468,6 +481,7 @@ impl DaemonHandler {
             live,
             report,
             witness,
+            membership,
         })
     }
 
@@ -532,6 +546,7 @@ impl DaemonHandler {
             details,
             live,
             witness,
+            membership,
             ..
         } = self.query_projection().await?;
         let pool_signals = {
@@ -568,6 +583,7 @@ impl DaemonHandler {
                 since: params.since,
                 until: params.until,
             },
+            &membership,
         )
         .map_err(observability_wire)?;
         for item in &mut result.items {
@@ -637,6 +653,7 @@ impl DaemonHandler {
             details,
             history,
             witness,
+            membership,
             ..
         } = self.query_projection().await?;
         let explicit_event = params.event.is_some();
@@ -654,6 +671,7 @@ impl DaemonHandler {
                 since: params.since,
                 until: params.until,
             },
+            &membership,
         )
         .map_err(observability_wire)?;
         if params.provenance == Some(false) {

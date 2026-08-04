@@ -489,18 +489,21 @@ fn report_page_completeness(envelope: &Value) -> Result<()> {
     report_empty_flow_run(envelope)
 }
 
-/// A `--flow-run` window that resolved to no member tasks is not evidence
-/// about the run. Run membership is recomputed per call from durable rows and
-/// witness records, and an admission that wrote no row — `attached`, and
-/// full-mode `reused` and `terminal` — leaves the run holding a task UUID that
-/// is not a member of it. Reading that empty window as "quiet" is #247.
+/// A `--flow-run` window that resolved to no member tasks says the run admitted
+/// nothing under that ID. Since #380 every admission under a `flowRunId` writes
+/// durable membership before it is acknowledged — including the row-less
+/// dispositions `attached`, and full-mode `reused` and `terminal`, which used
+/// to hand a run a task UUID that never joined it — so zero here is a fact
+/// about the run rather than the W-316 blind spot it used to be. It is still
+/// worth saying out loud, because the commonest cause is a mistyped or stale
+/// run ID.
 fn report_empty_flow_run(envelope: &Value) -> Result<()> {
     if envelope["flowRunTasks"].as_u64() == Some(0) {
         errln!(
-            "notice: this flow run resolves to NO member tasks, so an empty window here says \
-             nothing about whether it is running; a node admitted as attached/reused/terminal \
-             writes no row and never joins the run that submitted it. Corroborate with \
-             `tally query run <id>`, the runner unit, or the node's own task UUID."
+            "notice: this flow run resolves to NO member tasks: nothing has been admitted \
+             under this run ID. Check the ID itself first — an empty window here is a fact \
+             about the run, not a blind spot. `tally query run <id>` and the runner unit are \
+             the corroborating views."
         );
     }
     Ok(())

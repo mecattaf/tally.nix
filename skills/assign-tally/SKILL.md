@@ -80,16 +80,18 @@ means nothing after that position matched your filter. Read `items`, not
 advances whenever anything else on the daemon does.
 
 **An empty `--flow-run` window is not automatically a fact about the run.**
-Membership is recomputed per call from durable rows and witness records, and an
-admission that wrote no row — `attached`, and full-mode `reused` and `terminal`
-— leaves the run holding a task UUID that is not one of its members. A
-re-triggered campaign attaching to nodes still in flight lands here, and the
-window then shows the same items forever with `nextCursor: null` while the work
-executes. That is the original #247 shape and it is **not fixed** — it is made
-legible: every run-scoped response reports `flowRunTasks`, and `flowRunTasks:
-0` means the window says nothing about the run. When the count is zero, or
-below the node count the runner reports, corroborate against `tally query run
-<id>`, runner-unit liveness, merged PRs, and capture `.err` files instead.
+Membership is a durable admission fact: every admission under a `flowRunId`
+records `(run, task)` before it is acknowledged, for all five dispositions,
+including the row-less ones — `attached`, and full-mode `reused` and `terminal`
+— that used to leave a run holding a task UUID that was not one of its members.
+A re-triggered campaign attaching to nodes still in flight used to get a window
+showing the same items forever with `nextCursor: null` while the work executed;
+that is the original #247 shape and it is **fixed**. Every run-scoped response
+still reports `flowRunTasks`, and `flowRunTasks: 0` now means nothing was
+admitted under that run ID — suspect the ID before you suspect the daemon. A
+count below the node count the runner reports is a real discrepancy: corroborate
+against `tally query run <id>`, runner-unit liveness, merged PRs, and capture
+`.err` files.
 
 The contract is in Operating → Observability, "Poll a flow run correctly".
 Silence is still not success: any watcher must fire on every terminal state,

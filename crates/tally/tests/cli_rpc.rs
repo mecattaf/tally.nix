@@ -1948,9 +1948,12 @@ async fn query_jobs_names_the_item_it_cannot_render_and_exits_nonzero() {
 }
 
 /// #247 repair, at the surface an operator actually reads: a `--flow-run`
-/// window that resolved to no member tasks must say so. Without the notice the
-/// output is indistinguishable from a quiet run, which is precisely the
-/// ambiguity #316 exists to remove.
+/// window that resolved to no member tasks must say so. Since #380 made
+/// membership a durable admission fact, a zero here means the run admitted
+/// nothing under that ID -- most often a mistyped or stale run ID -- rather
+/// than the old blind spot where a row-less admission left a live node out of
+/// its own run. The notice still has to fire: an empty window and a zero
+/// membership are different claims, and the operator reads only one of them.
 #[tokio::test(flavor = "current_thread")]
 async fn an_empty_flow_run_window_says_the_run_resolved_to_no_members() {
     let temp = tempfile::tempdir().unwrap();
@@ -1999,8 +2002,8 @@ async fn an_empty_flow_run_window_says_the_run_resolved_to_no_members() {
                     "{args:?} presented an empty window as authoritative:\n{stderr}"
                 );
                 assert!(
-                    stderr.contains("attached/reused/terminal"),
-                    "{args:?} did not name the seam:\n{stderr}"
+                    stderr.contains("Check the ID itself first"),
+                    "{args:?} did not name the first thing to check:\n{stderr}"
                 );
             }
             server.await.unwrap();

@@ -124,6 +124,12 @@ a correct replay looks like from here. Those answers appear in the runner's own
 lifecycle stream instead; see [Follow a flow run's
 nodes](#follow-a-flow-runs-nodes) below.
 
+Not writing a row no longer means not joining the run: all five dispositions
+record durable run membership at admission, so `query jobs --flow-run` and
+`query log --flow-run` show a node the run attached to or reused even though
+its row belongs to another run. See [Run membership is a durable admission
+fact](#run-membership-is-a-durable-admission-fact).
+
 To verify that a re-run replayed rather than re-executed: the node count and the
 `dedupKey` set must be unchanged, and every `disposition` must still read
 `created` from the first run.
@@ -282,11 +288,11 @@ Four facts drive the contract:
   poller cannot hold one between polls.
 - `--since` is a wall-clock **time filter**. It is not a stream position and
   never was.
-- **Run membership is recomputed per call, and not every node a run submitted
-  is a member of it.** See [When a run's window is not evidence about the
-  run](#when-a-runs-window-is-not-evidence-about-the-run) below. This is the
-  one failure mode where an empty window is not a fact about the run, and it
-  is the mechanism behind the original #247 report.
+- **Run membership is durable, written at admission.** See [Run membership is a
+  durable admission fact](#run-membership-is-a-durable-admission-fact) below.
+  It used to be recomputed per call, which is the mechanism behind the original
+  #247 report; a run-scoped window is now evidence about the run, and
+  `flowRunTasks` says how many nodes it resolved to.
 
 ### For a human at a terminal
 
@@ -361,42 +367,53 @@ Rules for the loop:
 `--after` unchanged. Use `--since` to bound a window in time; use `--after` to
 resume a stream.
 
-### When a run's window is not evidence about the run
+### Run membership is a durable admission fact
 
-A `--flow-run` filter does not select on a durable property of the run. Tally
-recomputes membership on every call by scanning durable rows and witness
-records for an orchestration capsule naming that run ID, and an event whose
-task is not in the resulting set is dropped outright.
+A `--flow-run` filter selects on run membership, and membership is written down
+at admission time. Every admission carrying an orchestration capsule records
+`(flowRunId, taskUuid)` in a durable ledger — `<data-dir>/flow-membership.jsonl`
+— before the admission is acknowledged, for **all five dispositions**:
+`created`, `attached`, `reused`, `terminal`, and `conflict` (which admits
+nothing, and therefore joins the run to nothing).
 
-Three admissions write no durable row: `attached`, and full-mode `reused` and
-`terminal`. Each hands the caller a task UUID for work that is real and
-running, while the row — and therefore the membership — stays with whichever
-run first created it. A re-triggered campaign that attaches to nodes still in
-flight from its previous run is the ordinary way to land here.
+This closed a real hole, and the shape of the hole is worth knowing because it
+still describes what older data looks like. Three admissions write no durable
+row of their own: `attached`, and full-mode `reused` and `terminal`. Each hands
+the caller a task UUID for work that is real and running, while the row stays
+with whichever run first created it. Membership used to be *recomputed* per
+call by scanning rows and witness records for a capsule naming the run, so a
+re-triggered campaign that attached to nodes still in flight from its previous
+run got a window that showed the same items forever, with `nextCursor: null`
+and nothing elided, while the run executed. No page cap was involved, so none
+of the truncation machinery above fired. That is the shape the #247 report
+described, and it is fixed.
 
-The result is a window that shows the same items forever, with `nextCursor:
-null` and nothing elided, while the run executes. No page cap is involved, so
-none of the truncation machinery above fires. This is the shape the #247
-report described.
+A run resolves to the union of the ledger and the old scan, so nothing
+regresses across an upgrade: a run whose rows were written before the ledger
+existed still resolves exactly as it did, from its rows.
 
-Every `query log` response scoped to a run therefore reports how many tasks
-that run resolved to:
+Every `query log` and `query jobs` response scoped to a run reports how many
+tasks that run resolved to:
 
 ```console
 $ tally query log --flow-run <id> --json | jq .flowRunTasks
 0
 ```
 
-**`flowRunTasks: 0` means the window is not evidence about the run.** The
-human path says so on stderr rather than making you look. A non-zero count
-below the number of nodes the runner reports submitting means the difference
-was admitted without a row and is invisible here.
+**`flowRunTasks: 0` now means the run admitted nothing under that ID.** Check
+the run ID itself first — a mistyped or stale ID is the ordinary cause. The
+human path says so on stderr rather than making you look.
 
-When the count does not match what you expect, corroborate against ground
-truth rather than trusting the window: `tally query run <id>` for the
-reconciled task table, the runner unit's own liveness, or `tally query log
---task <uuid>` for a specific node, which does not go through run membership
-at all.
+A count *below* the number of nodes the runner reports submitting is a real
+discrepancy to chase, not an expected artefact: corroborate with `tally query
+run <id>` for the reconciled task table, the runner unit's own liveness, or
+`tally query log --task <uuid>` for a specific node, which does not go through
+run membership at all.
+
+If the ledger itself is damaged, run-scoped queries fail loudly with
+`repair-flow-membership-ledger` rather than quietly answering with a smaller
+run. It is plain JSONL: delete the offending line, or delete the file, in which
+case membership falls back to the row scan.
 
 ## Resume a watch
 

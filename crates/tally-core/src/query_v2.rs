@@ -6,6 +6,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::flow_lineage::{FlowLineage, FlowSupersedeRecord};
+use crate::flow_membership::FlowMembership;
 use crate::history::{LifecycleRecord, LifecycleSnapshot, RetentionMetadata};
 use crate::journal::TallyEvent;
 use crate::provenance::{Orchestration, TaskRef};
@@ -373,15 +374,20 @@ pub struct CollectionEnvelope<T> {
     /// How many task UUIDs a `flowRun` filter resolved to, present only when
     /// one was supplied.
     ///
-    /// Run membership is not a durable property: it is recomputed per call by
-    /// scanning durable rows and witness records for an orchestration capsule
-    /// naming the run (`flow_run_tasks`). An admission that writes no row —
-    /// `attached`, and full-mode `reused` and `terminal` — leaves the run
-    /// holding a task UUID that resolves to no member here, so its events are
-    /// filtered out of the run's own window with no page cap in sight. That is
-    /// #247's `same items, nextCursor: null, ground truth advancing`. Reporting
-    /// the resolved count is what lets a monitor tell an empty window that
-    /// means "quiet" from one that means "this run resolved to nothing".
+    /// Membership is a durable admission fact as of #380: every admission under
+    /// a `flowRunId` records `(run, task)` in the membership ledger before it is
+    /// acknowledged, including the row-less dispositions — `attached`, and
+    /// full-mode `reused` and `terminal` — that used to hand a run a task UUID
+    /// it could never see in its own window. `flow_run_tasks` resolves that
+    /// ledger unioned with the rows and witnesses carrying the run's capsule,
+    /// so a run submitted before that ledger existed still resolves exactly as
+    /// it did.
+    ///
+    /// The count remains reported for a different reason than it was
+    /// introduced: it is still the difference between a window that is empty
+    /// because the run is quiet and one that is empty because the run has no
+    /// members at all — which now means the run really admitted nothing, rather
+    /// than that its nodes went missing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_run_tasks: Option<usize>,
     pub snapshot: QuerySnapshotMetadata,
@@ -530,6 +536,7 @@ pub enum ObservabilityError {
     InvalidPosition(String),
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn query_jobs(
     details: &[RowDetailFact],
     live: &[LiveJobFact],
@@ -537,9 +544,16 @@ pub fn query_jobs(
     witness: &[WitnessRecord],
     pool_signals: &BTreeMap<String, HeadroomSignal>,
     filter: &JobsFilter,
+    membership: &FlowMembership,
 ) -> Result<CollectionEnvelope<JobSummary>, ObservabilityError> {
     let since = filter.since.as_deref().map(parse_timestamp).transpose()?;
     let until = filter.until.as_deref().map(parse_timestamp).transpose()?;
+    // A `flowRun` filter selects on run membership, which a row-less admission
+    // does not put on the row: resolve it once, the same way `query.log` does.
+    let flow_tasks = filter
+        .flow_run
+        .as_deref()
+        .map(|flow_run| flow_run_tasks(flow_run, details, witness, membership));
     let children = child_index(details);
     let mut anchors = BTreeSet::new();
     anchors.extend(details.iter().map(|detail| detail.task_uuid.clone()));
@@ -588,7 +602,7 @@ pub fn query_jobs(
             children.get(&anchor).cloned().unwrap_or_default(),
             pool_signals,
         );
-        if matches_jobs_filter(&summary, filter, since, until) {
+        if matches_jobs_filter(&summary, filter, flow_tasks.as_ref(), since, until) {
             items.push(summary);
         }
     }
@@ -599,7 +613,7 @@ pub fn query_jobs(
         next_cursor: None,
         position: None,
         position_gap: None,
-        flow_run_tasks: None,
+        flow_run_tasks: flow_tasks.map(|tasks| tasks.len()),
         snapshot: snapshot_metadata(history, witness),
     })
 }
@@ -680,6 +694,7 @@ pub fn query_job(
         witness,
         pool_signals,
         &JobsFilter::default(),
+        &FlowMembership::default(),
     )?;
     let job = collection
         .items
@@ -769,13 +784,14 @@ pub fn query_lifecycle_log(
     history: &LifecycleSnapshot,
     witness: &[WitnessRecord],
     filter: &LifecycleLogFilter,
+    membership: &FlowMembership,
 ) -> Result<CollectionEnvelope<LifecycleEventProjection>, ObservabilityError> {
     let since = filter.since.as_deref().map(parse_timestamp).transpose()?;
     let until = filter.until.as_deref().map(parse_timestamp).transpose()?;
     let flow_tasks = filter
         .flow_run
         .as_deref()
-        .map(|flow_run| flow_run_tasks(flow_run, details, witness));
+        .map(|flow_run| flow_run_tasks(flow_run, details, witness, membership));
     let mut ordered = Vec::<(DateTime<Utc>, u8, u64, LifecycleEventProjection)>::new();
     for record in &history.records {
         let projection = lifecycle_projection(record);
@@ -826,10 +842,16 @@ pub fn query_lifecycle_log(
             .collect(),
         next_cursor: None,
         position: None,
+        // Membership never touches this. `positionGap` is decided in the RPC
+        // layer by comparing the caller's `after` against the retained floor of
+        // durable history, not against the filtered window, so a run whose
+        // membership just became complete still reports the same gap it
+        // reported before. "No gap detected" keeps meaning history is intact,
+        // not that the window happens to be reachable.
         position_gap: None,
         // Reported whenever the caller scoped the query to a run, including
         // when it resolved to nothing: a zero here is the difference between
-        // a quiet run and a run whose nodes are not members of it.
+        // a quiet run and a run that admitted nothing at all.
         flow_run_tasks: flow_tasks.map(|tasks| tasks.len()),
         snapshot: snapshot_metadata(history, witness),
     })
@@ -1109,8 +1131,9 @@ pub fn query_run(
     history: &LifecycleSnapshot,
     witness: &[WitnessRecord],
     now: DateTime<Utc>,
+    membership: &FlowMembership,
 ) -> Result<RunView, ObservabilityError> {
-    let flow_tasks = flow_run_tasks(flow_run, details, witness);
+    let flow_tasks = flow_run_tasks(flow_run, details, witness, membership);
     let parent_detail = details.iter().find(|detail| detail.task_uuid == flow_run);
     let parent_live = live.iter().find(|fact| fact.anchor == flow_run);
     let parent_events = history
@@ -1702,13 +1725,42 @@ pub fn query_flow_proofs(
     witness_report: &VerifyReport,
     witness: &[WitnessRecord],
     attestations: &[AttestationRecord],
+    membership: &FlowMembership,
 ) -> Result<CollectionEnvelope<ProofView>, ObservabilityError> {
-    let mut nodes = details
+    let detail_ordinals = details
         .iter()
         .filter_map(|detail| {
             let orchestration = detail.orchestration.as_ref()?;
             (orchestration.flow_run_id() == flow_run)
-                .then(|| (orchestration.node_ordinal(), detail.task_uuid.clone()))
+                .then(|| (detail.task_uuid.as_str(), orchestration.node_ordinal()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    // The ordinal to sort a node by is the one *this* run admitted it under.
+    // For a node the run attached to, the durable row carries the creating
+    // run's ordinal instead, so the membership record is the only place the
+    // submitting run's own position is written down.
+    let mut nodes = flow_run_tasks(flow_run, details, witness, membership)
+        .into_iter()
+        // A member whose row, events, and witnesses have all aged out of
+        // retention has no proof to render, and asking for one would fail the
+        // whole run's proof set rather than the one node. This is exactly the
+        // existence test `query_proof` applies, so nothing provable is dropped.
+        .filter(|task_uuid| {
+            detail_ordinals.contains_key(task_uuid.as_str())
+                || details.iter().any(|detail| detail.task_uuid == *task_uuid)
+                || history
+                    .records
+                    .iter()
+                    .any(|record| record.fields.task_uuid == *task_uuid)
+                || witness
+                    .iter()
+                    .any(|record| record.task_uuid.as_deref() == Some(task_uuid.as_str()))
+        })
+        .map(|task_uuid| {
+            let ordinal = membership
+                .node_ordinal(flow_run, &task_uuid)
+                .or_else(|| detail_ordinals.get(task_uuid.as_str()).copied().flatten());
+            (ordinal, task_uuid)
         })
         .collect::<Vec<_>>();
     nodes.sort();
@@ -2085,9 +2137,13 @@ fn child_index(details: &[RowDetailFact]) -> BTreeMap<String, Vec<String>> {
 fn matches_jobs_filter(
     job: &JobSummary,
     filter: &JobsFilter,
+    flow_tasks: Option<&BTreeSet<String>>,
     since: Option<DateTime<Utc>>,
     until: Option<DateTime<Utc>>,
 ) -> bool {
+    if flow_tasks.is_some_and(|tasks| !tasks.contains(&job.anchor)) {
+        return false;
+    }
     if filter
         .live_state
         .as_deref()
@@ -2126,11 +2182,6 @@ fn matches_jobs_filter(
             .parent
             .as_deref()
             .is_some_and(|value| job.parent_task_uuid.as_deref() != Some(value))
-        || filter.flow_run.as_deref().is_some_and(|value| {
-            job.orchestration
-                .as_ref()
-                .is_none_or(|orchestration| orchestration.flow_run_id() != value)
-        })
         || filter.session.as_deref().is_some_and(|value| {
             job.session_ref
                 .as_ref()
@@ -2366,14 +2417,25 @@ const fn passing_verdict(verdict: Verdict) -> bool {
     )
 }
 
-/// Every task UUID a flow run admitted, from durable rows and the witness chain.
+/// Every task UUID a flow run holds: the durable membership ledger, unioned
+/// with the rows and witnesses that carry the run's orchestration capsule.
 ///
 /// A lifecycle event carries no orchestration capsule, so a `--flow-run` filter
-/// has to resolve the run's nodes from the two records that do carry one.
+/// has to resolve the run's nodes from records that do.
+///
+/// The union is not belt-and-braces, it is the compatibility story. Membership
+/// became a durable admission fact in #380; every row written before that, and
+/// every row recovered from a durable enqueue event, carries its capsule and
+/// nothing else. Resolving membership from the ledger alone would empty every
+/// pre-existing run's window the moment a host advanced its pin. Resolving it
+/// from the scan alone is W-316: a row-less admission (`attached`, and
+/// full-mode `reused` and `terminal`) hands a run a task UUID whose row belongs
+/// to a different run, and the submitting run never sees its own node.
 fn flow_run_tasks(
     flow_run: &str,
     details: &[RowDetailFact],
     witness: &[WitnessRecord],
+    membership: &FlowMembership,
 ) -> BTreeSet<String> {
     let mut tasks = BTreeSet::new();
     for detail in details {
@@ -2394,6 +2456,7 @@ fn flow_run_tasks(
             }
         }
     }
+    tasks.extend(membership.tasks(flow_run).map(ToOwned::to_owned));
     tasks
 }
 
@@ -2977,6 +3040,7 @@ mod tests {
                 task: Some("00000000-0000-4000-8000-000000000024".to_owned()),
                 ..LifecycleLogFilter::default()
             },
+            &FlowMembership::default(),
         )
         .unwrap();
         assert_eq!(log.items.len(), 1);
@@ -3012,6 +3076,7 @@ mod tests {
             &history,
             &[witness],
             &LifecycleLogFilter::default(),
+            &FlowMembership::default(),
         )
         .unwrap();
         assert_eq!(raw.items.len(), 3);
@@ -3072,6 +3137,7 @@ mod tests {
             &history,
             &[first.clone(), second.clone()],
             &LifecycleLogFilter::default(),
+            &FlowMembership::default(),
         )
         .unwrap();
         assert_eq!(raw.items.len(), 3);
@@ -3120,6 +3186,7 @@ mod tests {
             &history,
             std::slice::from_ref(&witness),
             &LifecycleLogFilter::default(),
+            &FlowMembership::default(),
         )
         .unwrap();
         assert_eq!(raw.items.len(), 3);
@@ -3169,6 +3236,7 @@ mod tests {
             &history,
             &[],
             parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
 
@@ -3232,6 +3300,7 @@ mod tests {
             &[],
             // 460 s elapsed against a 60 s budget.
             parse_timestamp("2026-08-01T10:07:40.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
 
@@ -3256,6 +3325,7 @@ mod tests {
             &history(),
             &[],
             parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
         assert!(pending.tasks.is_empty());
@@ -3268,6 +3338,7 @@ mod tests {
             &history(),
             &[witness],
             parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
         assert!(finished.tasks.is_empty());
@@ -3293,6 +3364,7 @@ mod tests {
                 &history(),
                 std::slice::from_ref(&witness),
                 now,
+                &FlowMembership::default(),
             )
             .unwrap()
         };
@@ -3372,6 +3444,7 @@ mod tests {
                 task: Some(labelled.task_uuid.clone()),
                 ..LifecycleLogFilter::default()
             },
+            &FlowMembership::default(),
         )
         .unwrap();
         assert_eq!(filtered.items.len(), 1);
@@ -3391,6 +3464,7 @@ mod tests {
                 task: Some(labelled.task_uuid.clone()),
                 ..LifecycleLogFilter::default()
             },
+            &FlowMembership::default(),
         )
         .unwrap();
         assert!(promoted
@@ -3421,6 +3495,7 @@ mod tests {
             &history(),
             &[],
             parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
 
@@ -3468,6 +3543,7 @@ mod tests {
             &history,
             &[witness],
             parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
 
@@ -3525,6 +3601,7 @@ mod tests {
             &history(),
             &[],
             parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
 
@@ -3576,6 +3653,7 @@ mod tests {
             &history(),
             &[],
             parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
 
@@ -3640,6 +3718,7 @@ mod tests {
             &history(),
             &[witness],
             parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
 
@@ -3702,6 +3781,7 @@ mod tests {
             &history(),
             &[],
             parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
         assert_eq!(active.counts.done, 1);
@@ -3725,6 +3805,7 @@ mod tests {
             &terminal_history,
             &[witness],
             parse_timestamp("2026-08-01T10:00:14.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
         assert_eq!(failed.counts.done, 1);
@@ -3754,6 +3835,7 @@ mod tests {
             &history,
             &[witness],
             parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
+            &FlowMembership::default(),
         )
         .unwrap();
 
@@ -3782,6 +3864,7 @@ mod tests {
             &[],
             &BTreeMap::new(),
             &JobsFilter::default(),
+            &FlowMembership::default(),
         )
         .unwrap();
         let job = &jobs.items[0];
@@ -3811,6 +3894,7 @@ mod tests {
             std::slice::from_ref(&witness),
             &BTreeMap::new(),
             &JobsFilter::default(),
+            &FlowMembership::default(),
         )
         .unwrap();
         let projected = jobs.items[0].authorship.as_ref().unwrap();
@@ -3889,6 +3973,7 @@ mod tests {
             &[],
             &BTreeMap::new(),
             &JobsFilter::default(),
+            &FlowMembership::default(),
         )
         .unwrap();
         let job = &jobs.items[0];
@@ -3914,5 +3999,88 @@ mod tests {
             Some(EvidenceResult::Fail)
         );
         assert!(detail.attempts[1].timestamps.terminal_at.is_some());
+    }
+
+    /// #380: the durable ledger and the original scan agree wherever both can
+    /// see, and the ledger is exactly the difference where the scan is blind.
+    ///
+    /// The truth of this corpus is fixed by construction rather than derived
+    /// from either mechanism: run A created two nodes and owns both rows; run B
+    /// created nothing and was handed one of A's task UUIDs by a row-less
+    /// admission. The assertions name those UUIDs.
+    #[test]
+    fn acceptance_380_membership_agrees_with_the_scan_and_supplies_only_what_it_cannot_see() {
+        let run_a = "00000000-0000-4000-8000-0000000003a0";
+        let run_b = "00000000-0000-4000-8000-0000000003b0";
+        let owned = "00000000-0000-4000-8000-000000000251";
+        let shared = "00000000-0000-4000-8000-000000000250";
+
+        let details = vec![
+            flow_node_detail(run_a, RowStatus::Pending),
+            reconciliation_detail(run_a),
+        ];
+        assert_eq!(details[0].task_uuid, owned);
+        assert_eq!(details[1].task_uuid, shared);
+        let witness = vec![terminal_witness(
+            shared,
+            Verdict::Pass,
+            flow_orchestration(run_a, 0, "spec-build-reconcile", None),
+        )];
+
+        // Run A owns both rows, so the scan alone already knows its whole
+        // membership -- and the ledger, which also records A's created
+        // admissions, must not change that number by so much as one.
+        let mut ledger = FlowMembership::default();
+        for task in [owned, shared] {
+            ledger.insert(crate::flow_membership::FlowMembershipRecord::new(
+                run_a.to_owned(),
+                task.to_owned(),
+                crate::flow_membership::MembershipDisposition::Created,
+                Some(0),
+                None,
+            ));
+        }
+        let scan_only = flow_run_tasks(run_a, &details, &witness, &FlowMembership::default());
+        let derived = flow_run_tasks(run_a, &details, &witness, &ledger);
+        assert_eq!(
+            scan_only,
+            BTreeSet::from([owned.to_owned(), shared.to_owned()]),
+            "the scan half must be untouched"
+        );
+        assert_eq!(
+            derived, scan_only,
+            "a run that owns its rows resolves identically with and without the ledger"
+        );
+
+        // Run B owns no row at all. The scan is blind to it; the ledger is the
+        // whole of what it can see, and it is exactly the one task B was handed.
+        ledger.insert(crate::flow_membership::FlowMembershipRecord::new(
+            run_b.to_owned(),
+            shared.to_owned(),
+            crate::flow_membership::MembershipDisposition::Attached,
+            Some(7),
+            Some("b-node-7".to_owned()),
+        ));
+        assert!(flow_run_tasks(run_b, &details, &witness, &FlowMembership::default()).is_empty());
+        assert_eq!(
+            flow_run_tasks(run_b, &details, &witness, &ledger),
+            BTreeSet::from([shared.to_owned()])
+        );
+
+        // A's answer is still A's answer: the ledger gaining a record for B
+        // cannot move A's membership.
+        assert_eq!(
+            flow_run_tasks(run_a, &details, &witness, &ledger),
+            scan_only
+        );
+
+        // And the node ordinal B submitted under is B's, not the ordinal on the
+        // row, which belongs to A.
+        assert_eq!(ledger.node_ordinal(run_b, shared), Some(7));
+        assert_eq!(
+            node_ordinal(details[1].orchestration.as_ref()),
+            Some(0),
+            "the row still carries the creating run's ordinal, unchanged"
+        );
     }
 }

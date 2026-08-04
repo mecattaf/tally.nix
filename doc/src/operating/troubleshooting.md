@@ -410,6 +410,47 @@ refused on replay, and its successor is no longer reachable through
 `tally query lineage`. Re-record it with `tally flow supersede` if it still
 applies.
 
+## `repair-flow-membership-ledger`
+
+Every admission under a `flowRunId` records `(run, task)` in
+`<dataDir>/flow-membership.jsonl`, and every run-scoped query reads it, so a
+damaged record there stops both:
+
+```text
+flow membership ledger <PATH> line <N> is unusable: <reason>
+```
+
+The error carries `transient: false` with
+`resolution: "repair-flow-membership-ledger"` so automation escalates instead of
+retrying it every pass. The same resolution appears when the ledger cannot be
+*written* — a full or read-only data directory — in which case the admission is
+refused rather than acknowledged. That refusal is the point: an `attached`
+admission whose membership was not recorded would hand a run a task UUID it
+could never see in its own window, which is the W-316 failure the ledger exists
+to close.
+
+As with the lineage ledger, an *interrupted* append never causes this: an
+unterminated final line is skipped on read and truncated by the next write. This
+message means a **complete** record cannot be decoded or validated. Failing
+closed is deliberate: skipping the line would answer a membership question with
+a number smaller than the truth.
+
+Repair it with the daemon stopped. The file is a plain JSONL index:
+
+```console
+$ systemctl --user stop tally
+$ sed -n '<N>p' ~/.local/share/tally/flow-membership.jsonl   # inspect it first
+$ sed -i '<N>d' ~/.local/share/tally/flow-membership.jsonl
+$ systemctl --user start tally
+```
+
+Removing a line forgets that one run held that one task. If the task's durable
+row carries that run's capsule the scan still finds it and nothing changes; if
+it does not — the row-less `attached`/`reused`/`terminal` case — that node
+disappears from the run's window again, exactly as it did before #380. Deleting
+the whole file is also safe in the same sense: membership falls back everywhere
+to the durable-row scan.
+
 ## Oversized wire frame
 
 Requests and responses are newline-framed JSON. Both directions default to

@@ -375,7 +375,7 @@ shapes are:
 
 - collection: `{schemaVersion, protocolVersion, items, nextCursor, truncated, elidedItems,
   snapshot}`, plus `position`, optional `positionGap`, and — when a `flowRun` filter was
-  supplied — `flowRunTasks` on `query.log`;
+  supplied — `flowRunTasks` on `query.log` and `query.jobs`;
 - snapshot: `{createdAt, cursor, history, witnessHead:{seq,hash}}`;
 - job detail: `{schemaVersion, protocolVersion, job, attempts, snapshot}`;
 - run status: `{schemaVersion, protocolVersion, flowRunId, flowName?, campaign?, repository?,
@@ -419,7 +419,8 @@ also reports `flowRunTasks`; see [Flow-run membership](#flow-run-membership). `a
 lifecycle-stream position, described under [Lifecycle stream
 positions](#lifecycle-stream-positions) below; it is not `since`, which remains a wall-clock time
 filter, and it is not `cursor`, which is an ephemeral page offset. Lifecycle items expose `taskRef` when their durable row/witness did. A lifecycle event carries no orchestration capsule, so `flowRun` is resolved
-to the run's task UUIDs through the durable rows and the witness chain. A `failed` lifecycle item
+to the run's task UUIDs through the durable membership ledger, the durable rows, and the witness
+chain. A `failed` lifecycle item
 includes `stderrTail` and `stderrTruncated`, bounded as described for terminal waits above.
 Omitting `provenance` preserves the original RPC behavior and returns the source provenance
 stream. The CLI sends `provenance:false` for its default human renderer and `--json`; the daemon
@@ -542,23 +543,39 @@ caller carries forward.
 
 ### Flow-run membership
 
-A `flowRun` filter on `query.log` is resolved per call: tally scans durable row details and
-witness records for an orchestration capsule naming that run and keeps only events whose task is
-in the resulting set. Membership is therefore **not** a durable property of the run. An admission
-that writes no row — `attached`, and full-mode `reused` and `terminal` — hands the caller a task
-UUID whose row, and whose membership, belongs to whichever run created it. Events for that task
-are filtered out of the submitting run's window entirely, with no page cap involved: same items,
-`nextCursor: null`, while the work runs.
+Run membership is a durable admission fact. Every admission carrying an orchestration capsule
+appends `{schemaVersion, flowRunId, taskUuid, disposition, nodeOrdinal?, nodeLabel?, recordedAt}`
+to `<data-dir>/flow-membership.jsonl` and fsyncs it **before the admission is acknowledged**, for
+all five dispositions: `created`, `attached`, `reused`, `terminal`, and `conflict` — a conflict
+admits nothing and therefore records nothing. `nodeOrdinal`/`nodeLabel` are the submitting run's,
+which for a row-less admission is the only place they are written down at all. An admission
+carrying no capsule writes nothing and does not create the file.
 
-Every run-scoped `query.log` response reports the resolved membership so a caller can tell that
-case from a quiet run:
+A `flowRun` filter resolves to the **union** of that ledger and the original scan of durable row
+details and witness records for a capsule naming the run. The union is what keeps an upgrade
+safe: a row written before the ledger existed still resolves from its capsule exactly as it did.
+
+This replaces the pre-#380 behaviour, in which membership was recomputed per call from the scan
+alone. An admission that writes no row — `attached`, and full-mode `reused` and `terminal` —
+handed the caller a task UUID whose row, and whose membership, belonged to whichever run created
+it, and events for that task were filtered out of the submitting run's window entirely, with no
+page cap involved: same items, `nextCursor: null`, while the work ran.
+
+Every run-scoped `query.log` and `query.jobs` response reports the resolved membership:
 
 ```text
 flowRunTasks: <count of task UUIDs this flowRun resolved to>
 ```
 
-The field is absent when no `flowRun` filter was supplied. `flowRunTasks: 0` means the response
-is not evidence about the run; the CLI says so on stderr.
+The field is absent when no `flowRun` filter was supplied. `flowRunTasks: 0` means nothing was
+admitted under that run ID; the CLI says so on stderr.
+
+An unterminated final line in the ledger is an interrupted append and is skipped on read and
+truncated on the next append. A *complete* record that cannot be decoded fails the query with
+`resolution: repair-flow-membership-ledger` rather than silently answering with a smaller run.
+The ledger is compacted at 100,000 records by dropping whole runs, oldest first — never part of a
+run, because a partially-present run would report a membership count lower than the truth. A run
+dropped by compaction falls back to the row scan.
 
 ### Watch cursors
 

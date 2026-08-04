@@ -544,6 +544,58 @@ impl DaemonHandler {
         self.flow_lineage_cache.borrow_mut().take();
     }
 
+    /// The parsed run-membership ledger, re-read only when its bytes changed.
+    pub(crate) async fn flow_membership(&self) -> Result<Rc<FlowMembership>, WireError> {
+        let path = self.context.read().await.paths.flow_membership_path();
+        let stamp = membership_stamp(&path);
+        if let Some(cached) = self.flow_membership_cache.borrow().as_ref() {
+            if cached.stamp == stamp {
+                return Ok(cached.membership.clone());
+            }
+        }
+        let membership = Rc::new(FlowMembership::read(&path).map_err(membership_wire)?);
+        *self.flow_membership_cache.borrow_mut() = Some(CachedFlowMembership {
+            stamp,
+            membership: membership.clone(),
+        });
+        Ok(membership)
+    }
+
+    /// Make `flow_run_id` durably hold `task_uuid`, before this admission is
+    /// acknowledged to its caller.
+    ///
+    /// The whole point of the record is that it is written for the dispositions
+    /// that write no row of their own, so a failure here cannot be swallowed:
+    /// an `attached` caller that is handed a task UUID it will never be able to
+    /// see in its own window is W-316 all over again, and the response would
+    /// say `ok` while lying. The error surfaces instead.
+    pub(crate) async fn record_flow_membership(
+        &self,
+        record: FlowMembershipRecord,
+    ) -> Result<(), WireError> {
+        let path = self.context.read().await.paths.flow_membership_path();
+        let held = self.flow_membership().await?;
+        if held.contains(&record.flow_run_id, &record.task_uuid) {
+            return Ok(());
+        }
+        record_membership(&path, &record, &held).map_err(membership_wire)?;
+        // Refresh in place rather than dropping: the next reader is very often
+        // the very next admission, and re-parsing per admission is what the
+        // cache exists to avoid. Taking the cache first usually leaves this the
+        // only strong reference, so the update is in-place too.
+        let mut updated = self
+            .flow_membership_cache
+            .borrow_mut()
+            .take()
+            .map_or_else(|| (*held).clone(), |cached| (*cached.membership).clone());
+        updated.insert(record);
+        *self.flow_membership_cache.borrow_mut() = Some(CachedFlowMembership {
+            stamp: membership_stamp(&path),
+            membership: Rc::new(updated),
+        });
+        Ok(())
+    }
+
     pub(crate) async fn cancel_one(
         &self,
         task_uuid: &str,
@@ -835,6 +887,30 @@ pub(crate) fn lineage_wire(error: FlowLineageError) -> WireError {
             data: Some(json!({
                 "transient": false,
                 "resolution": "repair-lineage-ledger",
+            })),
+        },
+    }
+}
+
+fn membership_stamp(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.len(), metadata.modified().ok()))
+}
+
+/// A membership ledger that cannot be read or written is not an anonymous
+/// internal fault: it makes every run-scoped window under-report, which is the
+/// one direction an observability surface must never fail in. Name it, and name
+/// the bounded repair.
+pub(crate) fn membership_wire(error: FlowMembershipError) -> WireError {
+    match error {
+        FlowMembershipError::Invalid(message) => WireError::invalid(message),
+        other => WireError {
+            code: WireErrorCode::Internal,
+            message: other.to_string(),
+            data: Some(json!({
+                "transient": false,
+                "resolution": "repair-flow-membership-ledger",
             })),
         },
     }

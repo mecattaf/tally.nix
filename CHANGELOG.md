@@ -8,6 +8,54 @@ authorized.
 
 ### Fixed
 
+- **Flow-run membership is now a durable admission fact, so a node a run
+  attached to or reused is visible in that run's own window (#380, W-316).**
+  Membership used to be recomputed on every query by scanning durable rows and
+  witness records for an orchestration capsule naming the run. Three admissions
+  write no row of their own — `attached`, and full-mode `reused` and `terminal`
+  — and each hands the caller a task UUID for work that is real and running
+  while the row, and therefore the scanned membership, stays with whichever run
+  created it. A re-triggered campaign that attached to nodes still in flight
+  from its previous run got a `query log --flow-run` window that showed the same
+  items forever, with `nextCursor: null` and nothing elided, while the work ran.
+  No page cap was involved, so none of the truncation machinery fired. That is
+  the #247 report, made legible by #316/#354 and now repaired at the root.
+
+  Every admission carrying an orchestration capsule appends
+  `{schemaVersion, flowRunId, taskUuid, disposition, nodeOrdinal?, nodeLabel?,
+  recordedAt}` to a new durable ledger, `<data-dir>/flow-membership.jsonl`, and
+  fsyncs it **before the admission is acknowledged** — for all five
+  dispositions. A `conflict` admits nothing and therefore records nothing, which
+  is asserted rather than assumed. `nodeOrdinal` and `nodeLabel` are the
+  *submitting* run's, which for a row-less admission is the only place they are
+  written down at all.
+
+  `query log --flow-run`, `query jobs --flow-run`, `query run`, and
+  `query proof --flow-run` resolve a run to the **union** of that ledger and the
+  original scan, so nothing regresses across an upgrade: a run whose rows were
+  written before the ledger existed still resolves exactly as it did, from its
+  rows. Removing the ledger restores the pre-#380 answer node for node.
+
+  The enqueue kernel is unchanged. The two-part key (`dedupKey` identity ×
+  `payloadHash` work-equality) resolves to the same five dispositions with the
+  same evidence-probed reuse; membership is recorded by a wrapper that never
+  inspects the key and cannot return a different disposition than the kernel
+  decided. An admission carrying no capsule takes none of this path and does not
+  create the file. The flow-node cap still counts durable rows, so attaching to
+  another run's node does not consume a node of the run that attached.
+
+  `query jobs` now also reports `flowRunTasks` when a `flowRun` filter was
+  supplied, matching `query log`.
+
+  Operator-visible consequences: `flowRunTasks: 0` now means *nothing was
+  admitted under that run ID* — suspect the ID before the daemon — and the CLI's
+  stderr notice says so. A membership ledger that cannot be read or written
+  fails the call with `resolution: repair-flow-membership-ledger` rather than
+  quietly answering with a smaller run; an interrupted append (torn final line)
+  is skipped on read and truncated on the next append. The ledger is compacted
+  at 100,000 records by dropping whole runs, oldest first, never part of a run.
+  No row field changed, so no row migration is required.
+
 - **The systemd watchdog keepalive no longer shares the dispatch loop, so a
   busy daemon is no longer killed for being busy (#370).** `WATCHDOG=1` was
   emitted from a `tokio::select!` arm in the daemon's dispatch loop. A
