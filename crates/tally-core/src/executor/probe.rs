@@ -365,8 +365,12 @@ pub(super) fn split_systemd_words(input: &str) -> Result<Vec<String>, String> {
 
 /// The properties the exit recorder's one accounting `systemctl show` reads.
 /// `CPUUsageNSec` is the generic per-job charge; the two monotonic
-/// timestamps give a GPU-pool job's wall-clock occupancy, measured by
-/// systemd's own clock rather than the daemon's dispatch-side `Instant`.
+/// timestamps give a GPU-pool job's main-process wall-clock runtime,
+/// measured by systemd's own clock rather than the daemon's dispatch-side
+/// `Instant`. That is a lower bound on how long the job actually held its
+/// pool lease, not the lease span itself — the lease is held from admission
+/// through completion handling, which strictly contains `ExecMain`'s
+/// lifetime.
 const ACCOUNTING_PROPERTIES: [&str; 3] = [
     "CPUUsageNSec",
     "ExecMainStartTimestampMonotonic",

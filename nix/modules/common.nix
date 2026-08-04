@@ -1547,25 +1547,47 @@ let
     }
   );
 
+  # `null` is "the operator declared nothing", distinct from `"vram"` declared
+  # explicitly. Every admission-relevant reading in this module — the shape
+  # assertions below, and every other option that predates #382 — must keep
+  # resolving an undeclared pool to `"vram"` exactly as it always has; this is
+  # the Nix-side mirror of `PoolConfig::resource()` on the Rust side. Only the
+  # rendered runtime config (`renderPool`) is allowed to see the raw `null`,
+  # because that is the one place the distinction is meant to survive: the
+  # daemon's own `gpuSeconds` gate reads "was `vram` declared", not "what does
+  # this pool behave like".
+  effectivePoolResource = pool: if pool.resource == null then "vram" else pool.resource;
+
   mkPoolType = types.submodule (
     { config, name, ... }: {
       options = {
         resource = mkOption {
-          type = types.enum [
-            "vram"
-            "build-slot"
-            "cpu-slot"
-            "slot"
-            "budget"
-            "mutex"
-          ];
-          default = "vram";
+          type = types.nullOr (
+            types.enum [
+              "vram"
+              "build-slot"
+              "cpu-slot"
+              "slot"
+              "budget"
+              "mutex"
+            ]
+          );
+          default = null;
           example = "build-slot";
           description = ''
             Resource accounted by this pool: memory co-residency ("vram"),
             counted build or CPU slots, a neutral counted concurrency lane
             for external or metered capacity ("slot"), rolling spend
             ("budget"), or a capacity-one exclusion lock ("mutex").
+
+            Defaults to unset (`null`), meaning undeclared: every admission
+            decision this module or the daemon makes still treats an
+            undeclared pool as "vram", exactly as before this option gained a
+            null state. The one exception is the daemon's witnessed
+            `gpuSeconds` figure — that field is filled only for a pool that
+            declares `resource = "vram"` explicitly, never for one that says
+            nothing, so an operator who never intends a GPU pool never sees
+            fabricated-looking GPU-seconds on a host with no GPU.
           '';
         };
         capacity = mkOption {
@@ -1695,23 +1717,30 @@ let
 
       config._tallyAssertions = flatten [
         {
-          assertion = config.resource != "mutex" || (config.capacity == 1 && config.predicate ? co-residency);
+          assertion =
+            effectivePoolResource config != "mutex"
+            || (config.capacity == 1 && config.predicate ? co-residency);
           message = "mutex pool ${name} must use co-residency with capacity 1";
         }
         {
           assertion =
             config.budgetGb == null
-            || (config.resource == "vram" && config.capacity > 1 && config.predicate ? co-residency);
+            || (
+              effectivePoolResource config == "vram"
+              && config.capacity > 1
+              && config.predicate ? co-residency
+            );
           message = "pool ${name} budgetGb is valid only for a co-resident vram pool with capacity > 1";
         }
         {
-          assertion = !(config.predicate ? windowed-consumption) || config.resource == "budget";
+          assertion =
+            !(config.predicate ? windowed-consumption) || effectivePoolResource config == "budget";
           message = "pool ${name} windowed-consumption predicate requires resource = budget";
         }
         {
           assertion =
             config.usageMeter == null
-            || (config.resource == "budget" && config.predicate ? windowed-consumption);
+            || (effectivePoolResource config == "budget" && config.predicate ? windowed-consumption);
           message = "pool ${name} usageMeter requires a windowed-consumption budget pool";
         }
         (if config.usageMeter == null then [ ] else config.usageMeter._tallyAssertions)
@@ -3351,26 +3380,34 @@ let
       inherit (adapter) skillRevision;
     };
 
-  renderPool = _: pool: {
-    inherit (pool)
-      resource
-      capacity
-      budgetGb
-      predicate
-      enforce
-      hardPreempt
-      autoResume
-      priority
-      ;
-    credentials = mapAttrs (_: toString) pool.credentials;
-    usageMeter =
-      if pool.usageMeter == null then
-        null
-      else
-        {
-          inherit (pool.usageMeter) argv pollIntervalSec budgetClass;
-        };
-  };
+  renderPool =
+    _: pool:
+    {
+      inherit (pool)
+        capacity
+        budgetGb
+        predicate
+        enforce
+        hardPreempt
+        autoResume
+        priority
+        ;
+      credentials = mapAttrs (_: toString) pool.credentials;
+      usageMeter =
+        if pool.usageMeter == null then
+          null
+        else
+          {
+            inherit (pool.usageMeter) argv pollIntervalSec budgetClass;
+          };
+    }
+    # `resource` is rendered only when the operator declared it. This is the
+    # one place `null` must survive unresolved to `"vram"`: the daemon's own
+    # `PoolConfig.resource: Option<ResourceKind>` (#382) reads an absent key
+    # as "undeclared" and an emitted `"vram"` as "declared", and every other
+    # admission decision on both sides of the wire keeps defaulting an
+    # undeclared pool to `vram` regardless.
+    // optionalAttrs (pool.resource != null) { inherit (pool) resource; };
 
   renderFlow = _: flow: {
     script = storePathWithContext flow.script;
@@ -4076,7 +4113,7 @@ let
             !campaign.enable
             || (
               builtins.hasAttr "campaign-agent" cfg.pools
-              && cfg.pools."campaign-agent".resource == "slot"
+              && effectivePoolResource cfg.pools."campaign-agent" == "slot"
               && cfg.pools."campaign-agent".capacity >= campaign.maxParallel
             );
           message = "tally campaign ${name} requires campaign-agent slot capacity >= maxParallel ${toString campaign.maxParallel}";
@@ -4086,7 +4123,7 @@ let
             !campaign.enable
             || (
               builtins.hasAttr "campaign-control" cfg.pools
-              && cfg.pools."campaign-control".resource == "cpu-slot"
+              && effectivePoolResource cfg.pools."campaign-control" == "cpu-slot"
               && cfg.pools."campaign-control".capacity >= campaign.maxParallel
             );
           message = "tally campaign ${name} requires campaign-control cpu-slot capacity >= maxParallel ${toString campaign.maxParallel}";
@@ -4096,7 +4133,7 @@ let
             !campaign.enable
             || (
               builtins.hasAttr campaign.pool.name cfg.pools
-              && cfg.pools.${campaign.pool.name}.resource == "mutex"
+              && effectivePoolResource cfg.pools.${campaign.pool.name} == "mutex"
               && cfg.pools.${campaign.pool.name}.capacity == 1
             );
           message = "tally campaign ${name} pool ${campaign.pool.name} must remain a capacity-1 mutex";
@@ -4164,7 +4201,7 @@ let
             message = "tally flow ${name} workloadMutex must not be flow or build";
           }
           {
-            assertion = mutexPool == null || mutexPool.resource == "mutex";
+            assertion = mutexPool == null || effectivePoolResource mutexPool == "mutex";
             message = "tally flow ${name} workloadMutex must reference a resource = mutex pool";
           }
           {

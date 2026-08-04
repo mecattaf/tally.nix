@@ -1480,7 +1480,11 @@ mod tests {
         };
         let (charge, gpu_seconds) = accounting_witness_fields(Some(accounting), true);
         assert_eq!(charge.map(|charge| charge.amount), Some(2.5));
-        assert_eq!(gpu_seconds, Some(3.5), "wall-clock occupancy, not CPU time");
+        assert_eq!(
+            gpu_seconds,
+            Some(3.5),
+            "main-process wall-clock runtime, not CPU time"
+        );
     }
 
     #[test]
@@ -5819,8 +5823,8 @@ mod tests {
                 // The direct-fallback backend never probes systemd, so this
                 // stands in for what a real `ExecStopPost` accounting probe
                 // would have embedded in the exit record: 2.5 measured
-                // CPU-seconds, and a 3.5-second measured wall-clock GPU-pool
-                // occupancy.
+                // CPU-seconds, and 3.5 seconds of measured main-process
+                // wall-clock runtime for the GPU-pool job.
                 if let Some(Ok(outcome)) = finished.outcome.as_mut() {
                     outcome.record.accounting = Some(UnitAccounting {
                         cpu_usage_nsec: Some(2_500_000_000),

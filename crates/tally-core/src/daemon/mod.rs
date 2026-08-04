@@ -414,9 +414,9 @@ pub struct JobResult {
     pub completion: Option<SemanticCompletion>,
     pub stderr_excerpt: Option<crate::executor::CaptureExcerpt>,
     /// The same value just appended to the witness record: `None` unless
-    /// this attempt actually measured GPU-pool occupancy. Carried here so
-    /// the completion lifecycle event can report it truthfully instead of
-    /// inventing a zero.
+    /// this attempt actually measured a declared GPU pool's main-process
+    /// runtime. Carried here so the completion lifecycle event can report it
+    /// truthfully instead of inventing a zero.
     pub gpu_seconds: Option<f64>,
 }
 

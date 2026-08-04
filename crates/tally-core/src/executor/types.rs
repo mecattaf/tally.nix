@@ -294,12 +294,17 @@ impl UnitAccounting {
             .map(|nsec| nsec as f64 / 1_000_000_000.0)
     }
 
-    /// Wall-clock seconds the unit's main process actually ran, measured by
-    /// systemd's own monotonic clock rather than the daemon's dispatch-side
-    /// `Instant`. This is what "GPU-seconds" means for a job that held a
-    /// `vram`-resource pool: seconds the slot was occupied, not CPU-cgroup
-    /// time (which would systematically understate a GPU job that is mostly
-    /// waiting on the device).
+    /// Wall-clock seconds the unit's main process actually ran
+    /// (`ExecMainExitTimestampMonotonic − ExecMainStartTimestampMonotonic`),
+    /// measured by systemd's own monotonic clock rather than the daemon's
+    /// dispatch-side `Instant`. For a job that held a `vram`-resource pool
+    /// this is "GPU-seconds" — but it is the main process's runtime, a
+    /// **lower bound** on how long the job actually held the pool lease, not
+    /// the lease span itself: the lease is held from admission through
+    /// completion handling, which strictly contains this window. It is still
+    /// the right quantity to prefer over CPU-cgroup time (which would
+    /// understate a GPU job that is mostly waiting on the device by a much
+    /// larger, unbounded margin), just not an exact occupancy figure.
     #[must_use]
     pub fn wall_seconds(self) -> Option<f64> {
         let start = self.exec_main_start_monotonic_usec?;

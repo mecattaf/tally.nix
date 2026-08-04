@@ -1,0 +1,29 @@
+{
+  "declared": {
+    "autoResume": null,
+    "budgetGb": null,
+    "capacity": 2,
+    "credentials": {},
+    "enforce": "cooperative",
+    "hardPreempt": false,
+    "predicate": {
+      "co-residency": {}
+    },
+    "priority": 0,
+    "resource": "vram",
+    "usageMeter": null
+  },
+  "undeclared": {
+    "autoResume": null,
+    "budgetGb": null,
+    "capacity": 2,
+    "credentials": {},
+    "enforce": "cooperative",
+    "hardPreempt": false,
+    "predicate": {
+      "co-residency": {}
+    },
+    "priority": 0,
+    "usageMeter": null
+  }
+}

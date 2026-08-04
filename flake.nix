@@ -89,6 +89,7 @@
             ./test/fixtures/gh-login
             ./test/fixtures/git-ai
             ./test/fixtures/ledger
+            ./test/fixtures/pools
             ./test/fixtures/redaction
             ./test/fixtures/shell-command-provider
             ./test/fixtures/spec-build
@@ -661,6 +662,41 @@
             package = tally;
           }
         );
+        # #382 HIGH-1's pinned cross-language vector: a pool that declares no
+        # `resource` and one that declares `resource = "vram"` explicitly,
+        # rendered through the exact `mkRuntimeConfig`/`renderPool` path the
+        # daemon's config comes from — not the raw NixOS option, so a
+        # regression in `renderPool`'s `optionalAttrs` guard is caught here,
+        # not just in the option type. Compared against
+        # `test/fixtures/pools/resource-declaration.golden.json` by the
+        # `pool-resource-declaration` check below; `PoolConfig`'s Rust
+        # `Deserialize` is pinned against the same checked-in file by
+        # `config::tests::pool_config_reads_the_nix_rendered_declared_vs_undeclared_fixture_correctly`.
+        # Nix's rendering and Rust's reading of it cannot drift apart
+        # silently without both pins failing.
+        poolResourceDeclarationFixture = (
+          moduleCommon.mkRuntimeConfig
+            (pkgs.lib.evalModules {
+              modules = [
+                {
+                  options.services.tally = moduleCommon.mkOptions {
+                    defaultPackage = null;
+                    defaultDataDir = "/var/lib/tally/data";
+                    defaultStateDir = "/var/lib/tally/state";
+                  };
+                }
+                {
+                  services.tally.pools.undeclared = {
+                    capacity = 2;
+                  };
+                  services.tally.pools.declared = {
+                    resource = "vram";
+                    capacity = 2;
+                  };
+                }
+              ];
+            }).config.services.tally
+        ).pools;
         # Representative arguments for the checked-in examples, so the flake
         # exercises each argsSchema instead of only its meta block. The agency
         # wave is the exception: it ships its own documented argument file,
@@ -4958,6 +4994,22 @@
                 ' ${catalogFixture} >/dev/null
                 ${tally}/bin/tally flow check ${./examples/flows/pooled-review.js} \
                   --catalog ${catalogFixture} >/dev/null
+                touch "$out"
+              '';
+          pool-resource-declaration =
+            pkgs.runCommand "tally-pool-resource-declaration"
+              {
+                nativeBuildInputs = [ pkgs.jq ];
+                rendered = pkgs.writeText "pool-resource-declaration-rendered.json" (
+                  builtins.toJSON poolResourceDeclarationFixture
+                );
+              }
+              ''
+                jq -S . "$rendered" > rendered.json
+                jq -S . ${./test/fixtures/pools/resource-declaration.golden.json} > golden.json
+                cmp rendered.json golden.json
+                jq -e '(.undeclared | has("resource")) | not' rendered.json >/dev/null
+                jq -e '.declared.resource == "vram"' rendered.json >/dev/null
                 touch "$out"
               '';
           flow-catalog-reject-unknown-class = mkCatalogRejectionCheck {

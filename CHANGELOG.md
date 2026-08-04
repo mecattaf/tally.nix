@@ -22,9 +22,14 @@ authorized.
   generic per-job `Charge{unit: "cpu-second", amount, class: "measured"}`; the
   two monotonic timestamps become `gpuSeconds` for a job whose pool
   **explicitly** declares `resource = "vram"`, measured as systemd's own
-  wall-clock occupancy rather than CPU-cgroup time, which would understate a
-  job that mostly waits on the device. `witness::canonical_gpu_seconds`
-  (unchanged) now sums a real, non-fabricated figure.
+  main-process wall-clock runtime rather than CPU-cgroup time, which would
+  understate a job that mostly waits on the device. That runtime is a lower
+  bound on how long the job actually held the pool's lease, not the lease
+  span itself — the lease is held from admission through completion
+  handling, which strictly contains it, so `gpuSeconds` understates true
+  occupancy by a small, fixed per-job overhead.
+  `witness::canonical_gpu_seconds` (unchanged) now sums a real,
+  non-fabricated figure.
 
   `resource` is `PoolConfig`'s one field where "declared" and "effective"
   must be told apart: `ResourceKind::Vram` is `resource`'s own default, so a
@@ -36,6 +41,21 @@ authorized.
   `gpuSeconds` is gated on the new `LeaseEngine::declared_resource_kind`,
   which answers only the narrower question and returns `None` for a pool
   that declared nothing.
+
+  The NixOS/Home Manager `resource` pool option carries the same
+  distinction: it is now `nullOr (enum [...])` with `default = null`
+  (previously a required-shaped enum defaulting to the string `"vram"`), and
+  the rendered runtime config only emits a `resource` key when the operator
+  set one. Every one of the module's own admission-relevant assertions
+  (mutex shape, budget-gb, windowed-consumption, usage-meter, and the three
+  campaign-pool checks) reads the same defaulted-to-`vram` value they always
+  did, through a new `effectivePoolResource` helper — the Nix-side mirror of
+  `PoolConfig::resource()`. Only `gpuSeconds` sees the narrower, undefaulted
+  reading. A checked-in fixture
+  (`test/fixtures/pools/resource-declaration.golden.json`), re-rendered and
+  diffed on every `nix flake check` (`checks.pool-resource-declaration`) and
+  read back by a Rust test, pins that Nix's rendering and Rust's parsing of
+  it cannot drift apart silently.
 
   A failed probe — a missing `systemctl`, a nonzero exit, a malformed
   property — is a typed absence (`accounting: None`) logged to the job's
@@ -50,11 +70,13 @@ authorized.
   and a fixture pinned to that exact pre-#382 shape proves it.
 
   `doc/src/reference/witness-format.md` documents both fields' exact
-  semantics: `gpuSeconds` is declared-pool wall-clock occupancy, not GPU
-  compute time; `charge` is whole-cgroup CPU-seconds, including the exit
-  recorder's own overhead (single-digit milliseconds, dominant on very short
-  jobs, proportionally negligible on longer ones) — a known floor left for
-  the eventual billing-aggregation lane to decide whether to subtract.
+  semantics: `gpuSeconds` is the declared-pool unit's main-process wall-clock
+  runtime — a lower bound on lease occupancy, not GPU compute time and not
+  an exact occupancy figure; `charge` is whole-cgroup CPU-seconds, including
+  the exit recorder's own overhead (single-digit milliseconds, dominant on
+  very short jobs, proportionally negligible on longer ones) — a known floor
+  left for the eventual billing-aggregation lane to decide whether to
+  subtract.
 
   Two now-stale sentences in the #381 usage-breakdown documentation
   (`crates/tally-core/src/usage.rs`, `doc/src/concepts/adapters.md`) said

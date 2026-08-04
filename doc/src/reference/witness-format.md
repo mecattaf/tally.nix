@@ -43,7 +43,7 @@ The known top-level fields have this order and shape:
 | `artifactContentHash` | no | Lowercase `sha256:` plus 64 hexadecimal digits. |
 | `storePaths` | no | Non-empty byte-ascending, unique array of valid Nix store paths. |
 | `drv` | no | `{drvPath, outputs:[{name,path}, ...]}`; output names are sorted and unique. |
-| `gpuSeconds` | no | Finite, non-negative seconds the unit occupied a **declared** `vram`-resource pool (see below); not GPU compute time. |
+| `gpuSeconds` | no | Finite, non-negative seconds the unit's main process ran, for a **declared** `vram`-resource pool (see below); a lower bound on lease occupancy, not GPU compute time. |
 | `wallClock` | yes | Finite, non-negative seconds. |
 | `attempt` | yes | Positive integer. |
 | `leaseEpoch` | yes | Positive integer. |
@@ -99,10 +99,15 @@ properties, issued while the transient unit is still queryable
 (`ExecStopPost`, before `--collect` can garbage-collect it). Neither field observes a GPU;
 there is no vendor-neutral GPU accounting in systemd to read.
 
-`gpuSeconds` is the unit's **wall-clock occupancy** of a pool the operator explicitly
-configured `resource = "vram"` — a job holding that pool while idle bills the same as one
-saturating the device. It is deliberately not CPU-cgroup time, which would understate a
-GPU-bound job that spends most of its wall clock waiting on the device. It is gated on the
+`gpuSeconds` is the unit's **main-process wall-clock runtime**
+(`ExecMainExitTimestampMonotonic − ExecMainStartTimestampMonotonic`), for a pool the operator
+explicitly configured `resource = "vram"` — a job holding that pool while idle bills the same
+as one saturating the device. It is deliberately not CPU-cgroup time, which would understate a
+GPU-bound job that spends most of its wall clock waiting on the device. It is a **lower bound**
+on how long the job actually held the pool's lease, not the lease span itself: the lease is
+held from admission through completion handling, which strictly contains the main process's
+lifetime, so `gpuSeconds` understates true occupancy by a fixed per-job overhead — in the
+same reassuring-shortfall direction as `charge`'s recorder floor below. It is gated on the
 pool's *declared* resource, not the default: a pool whose config omits `resource` entirely
 never carries `gpuSeconds`, even though `vram` is `resource`'s default value for every other
 admission decision. Saying nothing about a pool's resource is not the same fact as declaring

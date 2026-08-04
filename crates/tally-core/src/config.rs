@@ -1401,4 +1401,36 @@ mod tests {
             .to_string()
             .contains("unknown executor"));
     }
+
+    /// The pinned cross-language vector for #382's HIGH-1 repair.
+    ///
+    /// `test/fixtures/pools/resource-declaration.golden.json` is rendered by
+    /// `nix/modules/common.nix`'s `mkRuntimeConfig`/`renderPool` from a
+    /// pool that declares no `resource` and one that declares `"vram"`
+    /// explicitly (`.#checks.<system>.pool-resource-declaration` re-renders
+    /// it live and `cmp`s against this exact file, so Nix's rendering and
+    /// this fixture cannot drift apart silently). This test pins the other
+    /// half of the contract: that `PoolConfig`'s `Deserialize` reads that
+    /// exact rendered shape the way #382 requires — an absent `resource`
+    /// key as `None` (undeclared), never as `Some(Vram)` by way of
+    /// defaulting, and a present `"vram"` key as `Some(Vram)` (declared).
+    #[test]
+    fn pool_config_reads_the_nix_rendered_declared_vs_undeclared_fixture_correctly() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/pools/resource-declaration.golden.json");
+        let rendered: BTreeMap<String, PoolConfig> =
+            serde_json::from_str(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+
+        let undeclared = &rendered["undeclared"];
+        assert_eq!(undeclared.resource, None);
+        assert_eq!(
+            undeclared.resource(),
+            ResourceKind::Vram,
+            "the effective admission reading stays vram, unchanged by #382"
+        );
+
+        let declared = &rendered["declared"];
+        assert_eq!(declared.resource, Some(ResourceKind::Vram));
+        assert_eq!(declared.resource(), ResourceKind::Vram);
+    }
 }
