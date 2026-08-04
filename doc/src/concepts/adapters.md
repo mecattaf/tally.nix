@@ -77,8 +77,10 @@ derived from the components and labelled as derived.
 
 `inputTokens` alone is not the cross-harness "fresh input" figure. claude-code's
 cache-write tokens are fresh, uncached prompt tokens its `input_tokens`
-excludes; codex has no cache-write category at all. A consumer comparing
-harnesses adds `inputTokens + cacheWriteTokens`.
+excludes; codex declares its own cache-write category
+(`cache_write_input_tokens`), observed at 0 on every real capture so far but
+not structurally absent. A consumer comparing harnesses adds
+`inputTokens + cacheWriteTokens` for both.
 
 Three states are kept apart, and none of them is a zero:
 

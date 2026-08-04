@@ -1245,6 +1245,7 @@ impl DaemonHandler {
                         model: record.model.clone(),
                         completion: None,
                         stderr_excerpt: None,
+                        gpu_seconds: None,
                     };
                     context.barriers.complete_job(&stable_key, result.value());
                     rollback_child_charge(&mut context, caller_job_id.as_deref(), child_charged)?;

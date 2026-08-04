@@ -363,6 +363,15 @@ impl Daemon {
             Some(Ok(outcome)) => outcome.host_id.clone(),
             _ => None,
         };
+        // `finished.outcome` is matched by value below (its `record.termination`
+        // and `record.evidence_gate` fields are partially moved out), so the
+        // accounting sample the exit recorder measured has to be copied out
+        // here while a shared reference is still enough. `UnitAccounting` is
+        // `Copy` for exactly this: cheap to lift out before the move.
+        let accounting = match &finished.outcome {
+            Some(Ok(outcome)) => outcome.record.accounting,
+            _ => None,
+        };
         let semantic_completion = match (&effective_gate_manifest, &finished.outcome) {
             (None, Some(Ok(outcome))) if outcome.semantic_completion.is_some() => {
                 return Err(DaemonError::Invalid(format!(
@@ -543,6 +552,11 @@ impl Daemon {
             } else {
                 execution_host_id.clone()
             };
+            let gpu_pool_job =
+                job.row.pools.iter().any(|pool| {
+                    context.lease.engine().resource_kind(pool) == Some(ResourceKind::Vram)
+                });
+            let (charge, gpu_seconds) = accounting_witness_fields(accounting, gpu_pool_job);
             let record = append_context_witness(
                 &mut context,
                 WitnessBody {
@@ -553,7 +567,7 @@ impl Daemon {
                     artifact_content_hash: artifact_hash.clone(),
                     store_paths: store_paths.clone(),
                     drv: job.row.drv.clone(),
-                    gpu_seconds: None,
+                    gpu_seconds,
                     wall_clock: finished.elapsed.as_secs_f64(),
                     attempt: job.row.attempt,
                     lease_epoch: job.row.lease_epoch,
@@ -571,7 +585,7 @@ impl Daemon {
                     pools: job.row.pools.clone(),
                     executor: job.row.executor.clone(),
                     host_id,
-                    charge: None,
+                    charge,
                     model: model.clone(),
                     evidence_class: job.row.evidence_class.clone(),
                     manifest_hash: job.row.manifest_hash.clone(),
@@ -582,6 +596,7 @@ impl Daemon {
                 },
             )?;
             let result = JobResult {
+                gpu_seconds: record.gpu_seconds,
                 task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
                 task_ref: job.task_ref(),
                 job_id: job.job_id.to_string(),

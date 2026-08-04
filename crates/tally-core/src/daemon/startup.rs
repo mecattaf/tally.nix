@@ -690,6 +690,7 @@ pub(super) fn recovery_gh_completions(
         .map(|(task_uuid, record)| GhTerminalWork {
             row: rows[&task_uuid].clone(),
             result: JobResult {
+                gpu_seconds: None,
                 task_uuid: Some(task_uuid.to_string()),
                 task_ref: record
                     .orchestration

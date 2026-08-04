@@ -362,3 +362,99 @@ pub(super) fn split_systemd_words(input: &str) -> Result<Vec<String>, String> {
     }
     Ok(words)
 }
+
+/// The properties the exit recorder's one accounting `systemctl show` reads.
+/// `CPUUsageNSec` is the generic per-job charge; the two monotonic
+/// timestamps give a GPU-pool job's wall-clock occupancy, measured by
+/// systemd's own clock rather than the daemon's dispatch-side `Instant`.
+const ACCOUNTING_PROPERTIES: [&str; 3] = [
+    "CPUUsageNSec",
+    "ExecMainStartTimestampMonotonic",
+    "ExecMainExitTimestampMonotonic",
+];
+
+/// Issues the exit recorder's one accounting probe. Called from
+/// `ExecStopPost`, while the transient unit is still `deactivating` /
+/// `stop-post` and therefore still queryable — after the unit is collected
+/// (which can happen within seconds) every property below reads back empty.
+///
+/// A spawn failure, non-zero exit, or malformed line fails the whole probe;
+/// the caller logs and stores a typed absence rather than treating any of
+/// this as fatal to the exit record itself. Accounting is advisory.
+pub(super) fn probe_unit_accounting(
+    systemctl: &Path,
+    unit: &str,
+) -> Result<UnitAccounting, ExecutorError> {
+    let mut command = std::process::Command::new(systemctl);
+    command.arg("--user").arg("show");
+    for property in ACCOUNTING_PROPERTIES {
+        command.arg(format!("--property={property}"));
+    }
+    command.arg("--").arg(unit);
+    let output = command
+        .output()
+        .map_err(|source| ExecutorError::UnitProbe {
+            unit: unit.to_owned(),
+            detail: source.to_string(),
+        })?;
+    if !output.status.success() {
+        return Err(ExecutorError::UnitProbe {
+            unit: unit.to_owned(),
+            detail: format!(
+                "systemctl --user show (accounting) failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        });
+    }
+    parse_unit_accounting(unit, &output.stdout)
+}
+
+pub(super) fn parse_unit_accounting(
+    unit: &str,
+    stdout: &[u8],
+) -> Result<UnitAccounting, ExecutorError> {
+    let text = std::str::from_utf8(stdout).map_err(|error| ExecutorError::UnitProbe {
+        unit: unit.to_owned(),
+        detail: format!("systemctl show (accounting) output is not UTF-8: {error}"),
+    })?;
+    let mut properties = HashMap::new();
+    for line in text.lines() {
+        let (name, value) = line
+            .split_once('=')
+            .ok_or_else(|| ExecutorError::UnitProbe {
+                unit: unit.to_owned(),
+                detail: format!("malformed systemctl show (accounting) line {line:?}"),
+            })?;
+        if !ACCOUNTING_PROPERTIES.contains(&name) {
+            return Err(ExecutorError::UnitProbe {
+                unit: unit.to_owned(),
+                detail: format!("unexpected systemctl show (accounting) property {name:?}"),
+            });
+        }
+        if properties.insert(name, value).is_some() {
+            return Err(ExecutorError::UnitProbe {
+                unit: unit.to_owned(),
+                detail: format!("duplicate systemctl show (accounting) property {name:?}"),
+            });
+        }
+    }
+    let parse_property = |name: &'static str| -> Result<Option<u64>, ExecutorError> {
+        match properties.get(name).copied() {
+            None | Some("[not set]") | Some("") => Ok(None),
+            Some(value) => value
+                .parse::<u64>()
+                .map(Some)
+                .map_err(|_| ExecutorError::UnitProbe {
+                    unit: unit.to_owned(),
+                    detail: format!(
+                        "systemctl show (accounting) property {name} is not a u64: {value:?}"
+                    ),
+                }),
+        }
+    };
+    Ok(UnitAccounting {
+        cpu_usage_nsec: parse_property("CPUUsageNSec")?,
+        exec_main_start_monotonic_usec: parse_property("ExecMainStartTimestampMonotonic")?,
+        exec_main_exit_monotonic_usec: parse_property("ExecMainExitTimestampMonotonic")?,
+    })
+}

@@ -647,9 +647,17 @@ pub fn read_exit_record(path: &Path, expected_unit: &str) -> Result<UnitExitReco
     Ok(record)
 }
 
+/// The exit recorder's entry point, run as `ExecStopPost`. Beyond the
+/// environment-derived fields `persist_exit_record` has always written, this
+/// issues the one accounting `systemctl show` while the unit is still
+/// queryable and embeds the result. A failed probe never fails the exit
+/// record: accounting is advisory to the verdict, so the failure is logged to
+/// the job's captured stderr (the executor module's diagnostics convention,
+/// #315) and the record is written with a typed absence instead.
 pub fn persist_exit_record_from_env(
     path: &Path,
     expected_unit: &str,
+    systemctl: &Path,
 ) -> Result<UnitExitRecord, ExecutorError> {
     let mut values = HashMap::new();
     for name in [
@@ -672,13 +680,37 @@ pub fn persist_exit_record_from_env(
             }
         }
     }
-    persist_exit_record(path, expected_unit, &values)
+    let accounting = match probe_unit_accounting(systemctl, expected_unit) {
+        Ok(sample) => Some(sample),
+        Err(error) => {
+            eprintln!("tally: unit accounting probe failed for {expected_unit}: {error}");
+            None
+        }
+    };
+    let record = build_exit_record(expected_unit, &values, accounting)?;
+    write_exit_record(path, &record)?;
+    Ok(record)
 }
 
+/// The environment-only builder, kept for the test suite that exercises
+/// `EXIT_CODE`/`EXIT_STATUS` shapes without a `systemctl` binary in play.
+/// Production has one entry point, `persist_exit_record_from_env`, which
+/// always attempts the accounting probe too.
+#[cfg(test)]
 pub(super) fn persist_exit_record(
     path: &Path,
     expected_unit: &str,
     environment: &HashMap<&str, String>,
+) -> Result<UnitExitRecord, ExecutorError> {
+    let record = build_exit_record(expected_unit, environment, None)?;
+    write_exit_record(path, &record)?;
+    Ok(record)
+}
+
+fn build_exit_record(
+    expected_unit: &str,
+    environment: &HashMap<&str, String>,
+    accounting: Option<UnitAccounting>,
 ) -> Result<UnitExitRecord, ExecutorError> {
     let required = |name: &'static str| {
         environment
@@ -707,9 +739,9 @@ pub(super) fn persist_exit_record(
         service_result: required("SERVICE_RESULT")?,
         exit_code: optional("EXIT_CODE")?,
         exit_status: optional("EXIT_STATUS")?,
+        accounting,
     };
     record.validate(expected_unit)?;
-    write_exit_record(path, &record)?;
     Ok(record)
 }
 
@@ -761,6 +793,7 @@ pub(super) fn direct_completion(
     if let Some(code) = status.code() {
         return (
             UnitExitRecord {
+                accounting: None,
                 schema_version: UNIT_EXIT_SCHEMA_VERSION,
                 unit: String::new(),
                 invocation_id,
@@ -782,6 +815,7 @@ pub(super) fn direct_completion(
     let signal = 0;
     (
         UnitExitRecord {
+            accounting: None,
             schema_version: UNIT_EXIT_SCHEMA_VERSION,
             unit: String::new(),
             invocation_id,

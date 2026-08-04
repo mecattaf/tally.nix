@@ -59,6 +59,7 @@ fn seed(
             .join(UNIT_EXIT_DIRECTORY)
             .join(format!("{uuid}.json")),
         &UnitExitRecord {
+            accounting: None,
             schema_version: UNIT_EXIT_SCHEMA_VERSION,
             unit: unit_of(&identity),
             invocation_id: "5f3b1a2c4d6e7f8a".to_owned(),

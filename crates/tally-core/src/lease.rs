@@ -497,6 +497,15 @@ impl LeaseEngine {
         self.held.len()
     }
 
+    /// The configured resource kind for a pool, or `None` when the name
+    /// names no pool. `vram` is the codebase's one definition of "GPU pool"
+    /// (see `doc/src/configuration/mechanisms.md`); nothing in the runtime
+    /// pool state carries a separate GPU flag, so this is the single place a
+    /// caller determines GPU-pool membership from.
+    pub fn resource_kind(&self, pool: &str) -> Option<ResourceKind> {
+        self.pools.get(pool).map(|state| state.config.resource)
+    }
+
     pub fn held_in_pool(&self, pool: &str) -> Result<usize, LeaseError> {
         self.pools
             .get(pool)
@@ -1912,6 +1921,25 @@ mod tests {
         ));
         assert_eq!(engine.held_in_pool("api").unwrap(), 0);
         assert_eq!(engine.budget_used_at("api", now()).unwrap(), 0);
+    }
+
+    #[test]
+    fn resource_kind_reports_a_configured_pools_resource_and_none_for_an_unknown_name() {
+        let gpu = PoolConfig {
+            resource: ResourceKind::Vram,
+            capacity: 1,
+            ..PoolConfig::default()
+        };
+        let engine = LeaseEngine::new(
+            1,
+            Duration::from_secs(20),
+            BTreeMap::from([("gpu".to_owned(), gpu), ("cpu".to_owned(), pool(1))]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(engine.resource_kind("gpu"), Some(ResourceKind::Vram));
+        assert_eq!(engine.resource_kind("cpu"), Some(ResourceKind::BuildSlot));
+        assert_eq!(engine.resource_kind("unknown"), None);
     }
 
     #[test]

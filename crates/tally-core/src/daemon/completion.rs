@@ -1058,6 +1058,35 @@ pub(super) fn canonical_job_model(job: &Job) -> Option<String> {
     })
 }
 
+/// The witness's resource facts for one completion, from whatever the exit
+/// recorder's accounting probe measured.
+///
+/// `charge` is the generic per-job cost — CPU-seconds, whenever a probe
+/// succeeded, regardless of which pool the job ran in. `gpu_seconds` is
+/// narrower: it is set only for a job that held a `vram`-resource pool, and
+/// it is the unit's wall-clock occupancy (`UnitAccounting::wall_seconds`),
+/// not CPU-cgroup time — a GPU-bound job that mostly waits on the device
+/// would otherwise be charged far fewer GPU-seconds than it actually held
+/// the pool for, wrong in exactly the reassuring direction. Neither field is
+/// ever a fabricated value: an unmeasured or non-GPU-pool input yields
+/// `None`, never `Some(0.0)`.
+pub(super) fn accounting_witness_fields(
+    accounting: Option<UnitAccounting>,
+    gpu_pool_job: bool,
+) -> (Option<Charge>, Option<f64>) {
+    let charge = accounting
+        .and_then(UnitAccounting::cpu_seconds)
+        .map(|amount| Charge {
+            unit: "cpu-second".to_owned(),
+            amount,
+            class_name: "measured".to_owned(),
+        });
+    let gpu_seconds = gpu_pool_job
+        .then(|| accounting.and_then(UnitAccounting::wall_seconds))
+        .flatten();
+    (charge, gpu_seconds)
+}
+
 fn log_gcroot_registration_failures(record: &WitnessRecord, paths: &DaemonPaths) {
     let report = register_record_roots(&paths.gcroots_dir(), record, &NixStore::default());
     for failure in report.failures {
@@ -1209,6 +1238,7 @@ pub(super) fn finalize_forced_locked(
         .then(|| context.host_id.clone());
     let record = append_context_witness(context, forced_witness(&job, verdict, host_id))?;
     let result = JobResult {
+        gpu_seconds: None,
         task_uuid: job.task_uuid.map(|uuid| uuid.to_string()),
         task_ref: job.task_ref(),
         job_id: job.job_id.to_string(),
@@ -1329,7 +1359,7 @@ pub(super) fn completed_event(job: &Job, result: &JobResult, evidence: String) -
             .stderr_excerpt
             .as_ref()
             .map(|excerpt| excerpt.truncated),
-        gpu_seconds: Some(0.0),
+        gpu_seconds: result.gpu_seconds,
         artifact_hash: result.artifact_content_hash.clone(),
         evidence: Some(evidence),
         attempt: Some(result.attempt),

@@ -388,6 +388,7 @@ pub(crate) mod fixtures {
 
     pub(crate) fn exit_record(unit: &str) -> UnitExitRecord {
         UnitExitRecord {
+            accounting: None,
             schema_version: crate::executor::UNIT_EXIT_SCHEMA_VERSION,
             unit: unit.to_owned(),
             invocation_id: "5f3b1a2c4d6e7f8a".to_owned(),

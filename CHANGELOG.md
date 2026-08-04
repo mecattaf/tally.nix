@@ -8,6 +8,45 @@ authorized.
 
 ### Added
 
+- **The exit recorder fills `charge` and, for GPU-pool jobs, `gpuSeconds` from
+  real systemd cgroup accounting (#382).** These witness fields have existed
+  since the schema was designed but no write path ever set them: `charge` was
+  always `None`, and the daemon's own completion lifecycle event fabricated
+  `gpuSeconds: Some(0.0)` on every job regardless of whether anything was
+  measured. `__record-unit-exit`, run as `ExecStopPost` while the transient
+  unit is still queryable (before `--collect` can garbage-collect it), now
+  issues one `systemctl --user show --property=CPUUsageNSec
+  --property=ExecMainStartTimestampMonotonic
+  --property=ExecMainExitTimestampMonotonic` and embeds the result as a new
+  optional `accounting` field on `UnitExitRecord`. `CPUUsageNSec` becomes the
+  generic per-job `Charge{unit: "cpu-second", amount, class: "measured"}`; the
+  two monotonic timestamps become `gpuSeconds` for a job that held a
+  `vram`-resource pool, measured as systemd's own wall-clock occupancy rather
+  than CPU-cgroup time, which would understate a job that mostly waits on the
+  device. `witness::canonical_gpu_seconds` (unchanged) now sums a real,
+  non-fabricated figure.
+
+  A failed probe — a missing `systemctl`, a nonzero exit, a malformed
+  property — is a typed absence (`accounting: None`) logged to the job's
+  captured stderr, never a fabricated zero and never a reason to fail the
+  exit record itself: accounting is advisory to the verdict. `[not set]`
+  (accounting disabled for a specific property) reads the same way. The new
+  field is additive and optional with no schema-version bump: a record an
+  older binary wrote round-trips unchanged, and a fixture pinned to that exact
+  pre-#382 shape proves it.
+
+  `LeaseEngine::resource_kind` is the one new accessor this needed — GPU-pool
+  membership was previously only visible to the lease engine's own admission
+  logic, and "GPU pool" has always meant a pool configured with `resource =
+  "vram"` (`doc/src/configuration/mechanisms.md`), not a name convention.
+
+  Two now-stale sentences in the #381 usage-breakdown documentation
+  (`crates/tally-core/src/usage.rs`, `doc/src/concepts/adapters.md`) said
+  "codex has no cache-write category at all"; #381 itself had already
+  falsified that by declaring codex's `cache_write_input_tokens` key. Both are
+  corrected: codex does declare a cache-write category, observed at 0 on
+  every real capture so far.
+
 - **Per-attempt harness usage is normalized at the adapter boundary and
   persisted (#381).** Raw provider usage objects already landed in the advisory
   attestation ledger, but nothing reconciled them across harness shapes, no
