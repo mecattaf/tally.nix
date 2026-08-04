@@ -28,7 +28,7 @@
 //! or empty degrades exactly to the pre-#380 behaviour rather than to an empty
 //! run.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use chrono::{SecondsFormat, Utc};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use thiserror::Error;
 
 pub const FLOW_MEMBERSHIP_SCHEMA_VERSION: u32 = 1;
@@ -51,11 +52,21 @@ pub const FLOW_MEMBERSHIP_FILE: &str = "flow-membership.jsonl";
 /// store with a rare-event bound is a named recurring class here.
 ///
 /// What the bound is *not* sized by, any more, is the admission path. Appending
-/// is now one set lookup, one write, and one fsync, so per-admission cost is
-/// flat in the ledger's size — measured at 0.81–0.90 ms per admission across
-/// ledgers of 0, 5,000, 20,000, and 25,000 records (debug profile, ext4, via
-/// `membership_admission_cost_sweep`). What the bound *is* sized by is the cost
-/// that stayed linear:
+/// is one set lookup, one write, and one fsync, so per-admission cost is **flat
+/// in the ledger's size**: 2.13 / 1.91 / 2.16 / 2.02 ms across ledgers of 0,
+/// 5,000, 20,000, and 25,000 records (debug profile, ext4, via
+/// `membership_admission_cost_sweep`).
+///
+/// The flatness is the claim, not the constant. Absolute numbers move with host
+/// load — an independent measurement of the same code on the same host under
+/// different load read 3.27 / 3.33 / 2.89 / 3.39 ms — and at an empty ledger the
+/// figure is indistinguishable from the pre-#380 admission path, because at zero
+/// records there was never anything to improve. What the repair removed is the
+/// *growth*: the same sweep against the first draft read 2.8 ms empty, 17.4 ms
+/// at 10,000, 77.5 ms at 50,000, and 977 ms past the bound, where every
+/// admission rewrote the whole ledger.
+///
+/// What the bound *is* sized by is the cost that stayed linear:
 ///
 /// - **The one-time parse**, paid at daemon open and again whenever the ledger
 ///   changes underneath the cache: ~10 µs/record, so ~200 ms at 20,000 records
@@ -70,12 +81,16 @@ pub const FLOW_MEMBERSHIP_FILE: &str = "flow-membership.jsonl";
 /// run is old enough that its own rows and witnesses are the thing an operator
 /// reads anyway.
 ///
-/// Compaction drops **whole runs**, oldest first, never individual records.
-/// A run that is half-present would report a membership count lower than the
-/// truth — a number that is wrong in the reassuring direction, which is the one
-/// outcome this whole store exists to remove. A run that is wholly absent falls
-/// back to the row scan, which is exactly what an operator got before this
-/// ledger existed and is what the observability chapter already documents.
+/// Compaction drops **whole runs** — never part of one, because a half-present
+/// run reports a membership count lower than the truth, which is the
+/// reassuring-direction lie this store exists to remove. It drops
+/// least-recently-touched first and never touches a run that is still holding
+/// executing work; see [`FlowMembership::eviction_plan`]. A run that is wholly
+/// evicted falls back to the row scan, which is what an operator got before this
+/// ledger existed and is what the observability chapter documents — with the
+/// limit that a row-less admission has nothing to fall back to, which is why
+/// eviction has to keep away from live runs rather than merely be tidy about
+/// whole ones.
 pub const FLOW_MEMBERSHIP_MAX_RECORDS: usize = 20_000;
 
 /// What a compaction compacts *down to*, as a fraction of the bound.
@@ -101,12 +116,16 @@ pub const fn flow_membership_compact_to(max_records: usize) -> usize {
 /// does.
 const TAIL_SCAN_BYTES: u64 = 64 * 1024;
 
-/// Which admission handed the run this task.
+/// Which admission handed the run this task: the parsed view of
+/// [`FlowMembershipRecord::disposition`], which is stored as the raw wire string.
 ///
 /// Open on the read side on purpose. A closed vocabulary that hard-fails on an
 /// unknown string would mean a ledger written by a newer daemon crashes an
 /// older one's queries on a pin rollback — the #371 failure, imported into a
-/// store whose whole job is to keep a window honest.
+/// store whose whole job is to keep a window honest. `Unknown` is this binary
+/// saying it does not recognise the value, never a replacement for it: the
+/// record keeps what was written, so a compaction rewrite cannot flatten a newer
+/// daemon's disposition into the literal `"unknown"`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MembershipDisposition {
@@ -165,32 +184,51 @@ impl std::fmt::Display for MembershipDisposition {
 ///
 /// **Deliberately not `deny_unknown_fields`, and deliberately diverging from
 /// [`crate::flow_lineage`] here.** This store's stated purpose is surviving a
-/// pin move in *both* directions, and the module already goes out of its way to
-/// defend that for the disposition string. Rejecting an unknown field would
-/// reintroduce the same #371 failure one level down, and worse: `read` fails the
-/// whole ledger, so one field written by a newer daemon would take out every
+/// pin move in *both* directions. Rejecting an unknown field would reintroduce
+/// the same #371 failure one level down, and worse: `read` fails the whole
+/// ledger, so one field written by a newer daemon would take out every
 /// run-scoped query and every flow admission on an older one, not one record.
 ///
-/// Ignoring the field instead is not silent record-dropping — nothing is
-/// skipped, and every field this binary understands is honoured. The residual
-/// risk is a future field that *narrows* membership (a retraction, say), which
-/// an older daemon would not apply and would therefore over-report. That is the
-/// tolerable direction: an operator sees a node that is no longer a member,
-/// which is visible and investigable, rather than a daemon-wide outage. A
-/// future version that needs the older daemon to refuse instead has the
-/// `schemaVersion` bump to say so with.
+/// **Reading is not enough: the record must survive being written back.**
+/// Compaction re-serializes every record it retains, so an older daemon that
+/// merely *ignored* a newer daemon's fields would permanently strip them the
+/// first time it compacted — while leaving the higher `schemaVersion` label in
+/// place, so rolling the pin forward again could not even detect the loss. The
+/// residual would not be "an older daemon over-reports a member a newer one
+/// retracted", which is visible and investigable; it would be "the retraction is
+/// gone". So unknown fields are *captured* in [`Self::extra`] and re-emitted
+/// verbatim, and `disposition` is stored as the raw wire string rather than as
+/// the parsed enum, whose `Unknown` variant would otherwise write back the
+/// literal `"unknown"` and destroy the original value.
+///
+/// What this daemon cannot do is *honour* a field it does not understand. A
+/// future field that narrows membership is preserved through a rollback but not
+/// applied during one, so an older daemon over-reports until the pin moves
+/// forward again — the tolerable direction, and now genuinely recoverable. A
+/// future version that needs the older daemon to refuse outright has to say so
+/// in a way this reader already enforces: `validate` accepts a `schemaVersion`
+/// at or above its own and refuses one below, so the mechanism is "the older
+/// daemon's own floor", not a bump. Bumping alone does not make an old reader
+/// refuse, by design — that is what keeps a rollback survivable.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlowMembershipRecord {
     pub schema_version: u32,
     pub flow_run_id: String,
     pub task_uuid: String,
-    pub disposition: MembershipDisposition,
+    /// The disposition exactly as written. Parsed through
+    /// [`Self::disposition`]; kept raw so a value this binary does not know
+    /// survives a compaction rewrite unchanged.
+    pub disposition: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_ordinal: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_label: Option<String>,
     pub recorded_at: String,
+    /// Every field a newer daemon wrote that this one does not know, captured so
+    /// a rewrite re-emits it rather than deleting it.
+    #[serde(flatten, default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub extra: BTreeMap<String, Value>,
 }
 
 impl FlowMembershipRecord {
@@ -206,11 +244,20 @@ impl FlowMembershipRecord {
             schema_version: FLOW_MEMBERSHIP_SCHEMA_VERSION,
             flow_run_id,
             task_uuid,
-            disposition,
+            disposition: disposition.as_str().to_owned(),
             node_ordinal,
             node_label,
             recorded_at: Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true),
+            extra: BTreeMap::new(),
         }
+    }
+
+    /// The disposition this binary understands, or
+    /// [`MembershipDisposition::Unknown`] for one written by a newer daemon.
+    /// The wire value stays in [`Self::disposition`] either way.
+    #[must_use]
+    pub fn disposition(&self) -> MembershipDisposition {
+        MembershipDisposition::from_response(&self.disposition)
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -383,38 +430,88 @@ impl FlowMembership {
         membership
     }
 
-    /// Drop whole runs, oldest first, until the index fits `target`.
+    /// Which whole runs to evict to bring the index down to `target`.
     ///
-    /// Consumes the index: the caller replaces it with one built from the
-    /// returned records, which is what keeps the daemon's cache and the file on
-    /// disk from diverging. Returning a borrowed view instead is what let the
-    /// first draft rebuild its cache from the *pre*-compaction index, so the
-    /// cache never shrank and every later append re-compacted forever.
-    fn compact_to(self, target: usize) -> Vec<FlowMembershipRecord> {
-        let mut runs = self.by_run.into_values().collect::<Vec<_>>();
-        runs.sort_by(|left, right| run_age(left).cmp(&run_age(right)));
+    /// **Least-recently-*touched* first, never least-recently-born.** Ordering
+    /// by a run's earliest record — which is what the first repair did — makes
+    /// the eviction key anti-correlated with liveness: the longer a campaign
+    /// runs, the older its first record and the sooner it is evicted, so the
+    /// policy preferentially deletes the membership of exactly the runs an
+    /// operator is still watching. Keying on the run's *latest* record means a
+    /// run that is still admitting nodes keeps moving to the back of the queue.
+    ///
+    /// `protected` is never evicted whatever its age. It carries two things the
+    /// timestamps cannot: the run being written right now (a compaction that
+    /// evicts its own caller's run would report a durable membership that is not
+    /// there), and runs holding a task that is still executing. The second is
+    /// what covers a run that admitted everything early and has been quietly
+    /// running ever since, which LRU alone would eventually evict.
+    ///
+    /// Returns the run IDs to drop, cheaply and without cloning any record, so
+    /// the caller can skip the expensive rewrite when nothing is evictable.
+    fn eviction_plan(&self, target: usize, protected: &BTreeSet<String>) -> Vec<String> {
+        if self.records <= target {
+            return Vec::new();
+        }
+        let mut candidates = self
+            .by_run
+            .iter()
+            .filter(|(run, _)| !protected.contains(*run))
+            .map(|(run, tasks)| (run_last_touched(tasks), run.as_str(), tasks.len()))
+            .collect::<Vec<_>>();
+        candidates.sort();
         let mut total = self.records;
-        let mut dropped = 0_usize;
-        for tasks in &runs {
+        let mut plan = Vec::new();
+        for (_, run, held) in candidates {
             if total <= target {
                 break;
             }
-            total -= tasks.len();
-            dropped += 1;
+            total -= held;
+            plan.push(run.to_owned());
         }
-        runs.into_iter()
-            .skip(dropped)
+        plan
+    }
+
+    /// Runs that compaction must not evict: the one being written, and every
+    /// run holding a task that is still executing.
+    ///
+    /// The liveness half is derived from the membership index itself rather than
+    /// from durable rows, and that is the point. A run whose nodes were all
+    /// `attached` to another run's tasks owns no rows at all — it is precisely
+    /// the run W-316 is about — so a rows-based liveness check would be blind to
+    /// exactly the runs this ledger exists to keep visible. Joining the index
+    /// against live task UUIDs is not.
+    fn protected_runs(&self, writing: &str, live_tasks: &BTreeSet<String>) -> BTreeSet<String> {
+        let mut protected = BTreeSet::from([writing.to_owned()]);
+        if live_tasks.is_empty() {
+            return protected;
+        }
+        for (run, tasks) in &self.by_run {
+            if tasks.keys().any(|task| live_tasks.contains(task)) {
+                protected.insert(run.clone());
+            }
+        }
+        protected
+    }
+
+    /// Consume the index into the records that survive dropping `evicted`.
+    fn without_runs(mut self, evicted: &[String]) -> Vec<FlowMembershipRecord> {
+        for run in evicted {
+            self.by_run.remove(run);
+        }
+        self.by_run
+            .into_values()
             .flat_map(BTreeMap::into_values)
             .collect()
     }
 }
 
-/// A run's age is its earliest membership record: the moment it first held a node.
-fn run_age(tasks: &BTreeMap<String, FlowMembershipRecord>) -> (&str, &str) {
+/// When a run was last handed a node: the ordering key for eviction.
+fn run_last_touched(tasks: &BTreeMap<String, FlowMembershipRecord>) -> (&str, &str) {
     tasks
         .values()
         .map(|record| (record.recorded_at.as_str(), record.flow_run_id.as_str()))
-        .min()
+        .max()
         .unwrap_or(("", ""))
 }
 
@@ -434,6 +531,11 @@ fn complete_prefix(bytes: &[u8]) -> usize {
 pub enum MembershipWrite {
     /// A new durable record was appended.
     Appended,
+    /// Appended, but the ledger is over its target and nothing could be
+    /// evicted: every run above the bound is either live or the one being
+    /// written. The ledger grows rather than deleting membership that is still
+    /// in use; the caller reports it, because this module does not log.
+    AppendedOverTarget,
     /// The run already durably held this task; nothing was written.
     AlreadyHeld,
 }
@@ -489,24 +591,30 @@ pub fn probe_appendable(path: &Path) -> Result<(), FlowMembershipError> {
 /// happy path nothing is cloned — one lookup, one append, one fsync, whatever
 /// the ledger's size. A duplicate written by a racing second writer is harmless;
 /// the read path is set-valued and collapses it.
+///
+/// `live_tasks` are task UUIDs still executing. Their runs are exempt from
+/// compaction; see [`FlowMembership::eviction_plan`].
 pub fn record_membership(
     path: &Path,
     record: &FlowMembershipRecord,
     held: FlowMembership,
+    live_tasks: &BTreeSet<String>,
 ) -> Result<(MembershipWrite, FlowMembership), FlowMembershipError> {
-    record_membership_bounded(path, record, held, FLOW_MEMBERSHIP_MAX_RECORDS)
+    record_membership_bounded(path, record, held, live_tasks, FLOW_MEMBERSHIP_MAX_RECORDS)
 }
 
 fn record_membership_bounded(
     path: &Path,
     record: &FlowMembershipRecord,
     mut held: FlowMembership,
+    live_tasks: &BTreeSet<String>,
     max_records: usize,
 ) -> Result<(MembershipWrite, FlowMembership), FlowMembershipError> {
     record.validate().map_err(FlowMembershipError::Invalid)?;
     if held.contains(&record.flow_run_id, &record.task_uuid) {
         return Ok((MembershipWrite::AlreadyHeld, held));
     }
+    let mut over_target = false;
     let parent = durable_parent(path);
     std::fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
     // 0600 like `lifecycle.jsonl`, `changes.jsonl`, and `flow-lineage.jsonl`.
@@ -521,16 +629,40 @@ fn record_membership_bounded(
         .map_err(|source| io_error(path, source))?;
 
     held.insert(record.clone());
-    // Counted, not cloned. The bound is a comparison on a `usize`; the first
+    // Counted, not cloned. The bound is a comparison on a `usize`; an earlier
     // draft cloned the whole index to answer it, on every admission, which is
     // what made admission linear in the ledger below the bound as well as above.
     if held.record_count() > max_records {
-        let kept = held.compact_to(flow_membership_compact_to(max_records));
-        rewrite_compacted(path, parent, &kept)?;
-        return Ok((
-            MembershipWrite::Appended,
-            FlowMembership::from_records(kept),
-        ));
+        // The protected set is computed here rather than per append because
+        // this is the only place it is consulted, and deriving it is linear in
+        // the index — affordable once per compaction, not once per admission.
+        let protected = held.protected_runs(&record.flow_run_id, live_tasks);
+        let plan = held.eviction_plan(flow_membership_compact_to(max_records), &protected);
+        if !plan.is_empty() {
+            let kept = held.without_runs(&plan);
+            rewrite_compacted(path, parent, &kept)?;
+            let compacted = FlowMembership::from_records(kept);
+            // The record was inserted before the plan was made and its run is
+            // in `protected`, so this cannot fire — which is exactly why it is
+            // asserted rather than assumed. Reporting `Appended` for a record
+            // the ledger does not hold is W-316 rebuilt inside its own fix, and
+            // silent; the caller must land on the degraded path instead.
+            if !compacted.contains(&record.flow_run_id, &record.task_uuid) {
+                return Err(FlowMembershipError::Invalid(format!(
+                    "compaction dropped the membership record it was asked to write \
+                     (run {}, task {}); the ledger was rewritten but this admission's \
+                     membership is not durable",
+                    record.flow_run_id, record.task_uuid
+                )));
+            }
+            return Ok((MembershipWrite::Appended, compacted));
+        }
+        // Nothing is evictable: every run over the bound is either live or the
+        // one being written. The ledger is allowed to exceed its target rather
+        // than delete membership that is still in use — and, critically, it
+        // falls through to an ordinary append rather than rewriting the whole
+        // file on this and every subsequent admission.
+        over_target = true;
     }
 
     // The read path skips a torn final line; here, holding the write lock, it
@@ -543,7 +675,14 @@ fn record_membership_bounded(
     file.write_all(&line)
         .map_err(|source| io_error(path, source))?;
     file.sync_all().map_err(|source| io_error(path, source))?;
-    Ok((MembershipWrite::Appended, held))
+    Ok((
+        if over_target {
+            MembershipWrite::AppendedOverTarget
+        } else {
+            MembershipWrite::Appended
+        },
+        held,
+    ))
 }
 
 /// Remove an unterminated final line, scanning the tail rather than the file.
@@ -629,6 +768,11 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// No task is executing, so compaction is free to evict by age alone.
+    fn no_live() -> BTreeSet<String> {
+        BTreeSet::new()
+    }
+
     fn record(run: &str, task: &str, disposition: MembershipDisposition) -> FlowMembershipRecord {
         FlowMembershipRecord::new(
             run.to_owned(),
@@ -652,10 +796,11 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
         let first = record("run-a", "task-1", MembershipDisposition::Attached);
-        let (write, held) = record_membership(&path, &first, FlowMembership::default()).unwrap();
+        let (write, held) =
+            record_membership(&path, &first, FlowMembership::default(), &no_live()).unwrap();
         assert_eq!(write, MembershipWrite::Appended);
         assert!(held.contains("run-a", "task-1"));
-        let (write, held) = record_membership(&path, &first, held).unwrap();
+        let (write, held) = record_membership(&path, &first, held, &no_live()).unwrap();
         assert_eq!(write, MembershipWrite::AlreadyHeld);
         assert_eq!(held.record_count(), 1);
         let reread = FlowMembership::read(&path).unwrap();
@@ -671,7 +816,9 @@ mod tests {
         let mut held = FlowMembership::default();
         for run in ["run-a", "run-b"] {
             let entry = record(run, "shared-task", MembershipDisposition::Attached);
-            held = record_membership(&path, &entry, held).unwrap().1;
+            held = record_membership(&path, &entry, held, &no_live())
+                .unwrap()
+                .1;
         }
         let reread = FlowMembership::read(&path).unwrap();
         assert!(reread.contains("run-a", "shared-task"));
@@ -684,7 +831,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
         let first = record("run-a", "task-1", MembershipDisposition::Created);
-        record_membership(&path, &first, FlowMembership::default()).unwrap();
+        record_membership(&path, &first, FlowMembership::default(), &no_live()).unwrap();
         let mut raw = std::fs::read(&path).unwrap();
         raw.extend_from_slice(br#"{"schemaVersion":1,"flowRunId":"run-a","taskUu"#);
         std::fs::write(&path, &raw).unwrap();
@@ -693,7 +840,7 @@ mod tests {
         assert_eq!(after_tear.record_count(), 1);
 
         let second = record("run-a", "task-2", MembershipDisposition::Attached);
-        record_membership(&path, &second, after_tear).unwrap();
+        record_membership(&path, &second, after_tear, &no_live()).unwrap();
         let repaired = FlowMembership::read(&path).unwrap();
         assert_eq!(repaired.record_count(), 2);
         assert_eq!(
@@ -770,8 +917,20 @@ mod tests {
                     "7c2f6f0e-0000-4000-8000-0000000000a2"
                 )
                 .unwrap()
+                .disposition(),
+            MembershipDisposition::Unknown,
+            "an unrecognised disposition parses as Unknown..."
+        );
+        assert_eq!(
+            membership
+                .record(
+                    "7c2f6f0e-0000-4000-8000-000000000002",
+                    "7c2f6f0e-0000-4000-8000-0000000000a2"
+                )
+                .unwrap()
                 .disposition,
-            MembershipDisposition::Unknown
+            "teleported",
+            "...while the record keeps what was actually written"
         );
         assert_eq!(
             membership.node_ordinal(
@@ -823,7 +982,7 @@ mod tests {
     }
 
     #[test]
-    fn compaction_drops_whole_runs_oldest_first_and_never_half_a_run() {
+    fn compaction_drops_whole_runs_least_recently_touched_first_and_never_half_a_run() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
         let mut held = FlowMembership::default();
@@ -839,7 +998,7 @@ mod tests {
                     MembershipDisposition::Created,
                 );
                 entry.recorded_at = format!("2026-08-04T00:00:{:02}.000Z", index * 2 + node);
-                held = record_membership_bounded(&path, &entry, held, 20)
+                held = record_membership_bounded(&path, &entry, held, &no_live(), 20)
                     .unwrap()
                     .1;
             }
@@ -851,7 +1010,7 @@ mod tests {
         // still above it, 19 - 2 = 17 is not.
         let mut overflow = record("run-10", "run-10-task-0", MembershipDisposition::Created);
         overflow.recorded_at = "2026-08-04T00:00:30.000Z".to_owned();
-        held = record_membership_bounded(&path, &overflow, held, 20)
+        held = record_membership_bounded(&path, &overflow, held, &no_live(), 20)
             .unwrap()
             .1;
 
@@ -890,7 +1049,7 @@ mod tests {
                 MembershipDisposition::Created,
             );
             entry.recorded_at = format!("2026-08-04T{:02}:{:02}:00.000Z", index / 60, index % 60);
-            record_membership_bounded(&path, &entry, held, 100)
+            record_membership_bounded(&path, &entry, held, &no_live(), 100)
                 .unwrap()
                 .1
         };
@@ -923,6 +1082,195 @@ mod tests {
         assert_eq!(held, FlowMembership::read(&path).unwrap());
     }
 
+    /// The eviction key must track when a run was **last** handed a node, not
+    /// when it was first. Keying on the earliest record makes the key
+    /// anti-correlated with liveness — the longer a campaign runs, the older its
+    /// first record — so the policy deletes the membership of exactly the runs
+    /// an operator is still watching.
+    #[test]
+    fn a_run_that_keeps_admitting_outlives_one_that_stopped_however_old_it_is() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
+        let mut held = FlowMembership::default();
+        let write = |held: FlowMembership, run: &str, task: &str, at: &str| {
+            let mut entry = record(run, task, MembershipDisposition::Created);
+            entry.recorded_at = at.to_owned();
+            record_membership_bounded(&path, &entry, held, &no_live(), 4)
+                .unwrap()
+                .1
+        };
+
+        // `long-lived` was born first and is still admitting; `stopped` was born
+        // later and has been quiet since. Under a birth-ordered key the
+        // long-lived run is evicted first, which is precisely backwards.
+        held = write(held, "long-lived", "task-0", "2026-08-01T00:00:00.000Z");
+        held = write(held, "stopped", "task-0", "2026-08-02T00:00:00.000Z");
+        held = write(held, "stopped", "task-1", "2026-08-02T00:00:01.000Z");
+        held = write(held, "long-lived", "task-1", "2026-08-03T00:00:00.000Z");
+        assert_eq!(held.record_count(), 4);
+
+        held = write(held, "long-lived", "task-2", "2026-08-04T00:00:00.000Z");
+        assert_eq!(
+            held.tasks("long-lived").collect::<Vec<_>>(),
+            vec!["task-0", "task-1", "task-2"],
+            "the run still admitting nodes must survive whole"
+        );
+        assert_eq!(
+            held.tasks("stopped").count(),
+            0,
+            "the quiet run is the one that ages out"
+        );
+        assert_eq!(held, FlowMembership::read(&path).unwrap());
+    }
+
+    /// A compaction must never evict the run it is being asked to write for,
+    /// and must never report `Appended` for a record the ledger does not hold.
+    #[test]
+    fn a_write_is_never_evicted_by_its_own_compaction() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
+        let mut held = FlowMembership::default();
+        // The writing run is the oldest thing in the ledger by every key: born
+        // first, last touched first. Nothing but the write-protects-itself rule
+        // keeps it alive.
+        for (index, (run, task)) in [
+            ("writer", "task-0"),
+            ("writer", "task-1"),
+            ("other-a", "task-0"),
+            ("other-b", "task-0"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut entry = record(run, task, MembershipDisposition::Attached);
+            entry.recorded_at = format!("2026-08-0{}T00:00:00.000Z", index + 1);
+            held = record_membership_bounded(&path, &entry, held, &no_live(), 4)
+                .unwrap()
+                .1;
+        }
+
+        let mut fresh = record("writer", "task-2", MembershipDisposition::Attached);
+        fresh.recorded_at = "2026-08-01T00:00:00.500Z".to_owned();
+        let (write, held) = record_membership_bounded(&path, &fresh, held, &no_live(), 4).unwrap();
+        assert_eq!(write, MembershipWrite::Appended);
+        assert!(
+            held.contains("writer", "task-2"),
+            "the record the caller was told is durable must be in the index"
+        );
+        assert!(
+            FlowMembership::read(&path)
+                .unwrap()
+                .contains("writer", "task-2"),
+            "...and in the ledger on disk"
+        );
+        assert_eq!(
+            held.tasks("writer").collect::<Vec<_>>(),
+            vec!["task-0", "task-1", "task-2"],
+            "the writing run survives whole, not half"
+        );
+    }
+
+    /// A run holding executing work is never evicted, however long it has been
+    /// since it last admitted anything. This is the case LRU alone cannot
+    /// cover: a campaign that admitted every node up front and has been running
+    /// ever since.
+    #[test]
+    fn a_run_holding_a_live_task_is_never_evicted() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
+        let live = BTreeSet::from(["task-still-running".to_owned()]);
+        let mut held = FlowMembership::default();
+        let write = |held: FlowMembership, run: &str, task: &str, at: &str| {
+            let mut entry = record(run, task, MembershipDisposition::Attached);
+            entry.recorded_at = at.to_owned();
+            record_membership_bounded(&path, &entry, held, &live, 4)
+                .unwrap()
+                .1
+        };
+
+        // `ancient` is the least-recently-touched run by a wide margin, but the
+        // task it holds is still executing.
+        held = write(
+            held,
+            "ancient",
+            "task-still-running",
+            "2019-01-01T00:00:00.000Z",
+        );
+        held = write(held, "recent-a", "task-0", "2026-08-02T00:00:00.000Z");
+        held = write(held, "recent-b", "task-0", "2026-08-03T00:00:00.000Z");
+        held = write(held, "recent-c", "task-0", "2026-08-04T00:00:00.000Z");
+        held = write(held, "recent-d", "task-0", "2026-08-05T00:00:00.000Z");
+
+        assert!(
+            held.contains("ancient", "task-still-running"),
+            "a run whose work is still executing must not be evicted: {:?}",
+            held.tasks("ancient").collect::<Vec<_>>()
+        );
+        assert_eq!(
+            held.tasks("recent-a").count(),
+            0,
+            "the oldest *idle* run is the one that goes instead"
+        );
+        assert_eq!(held, FlowMembership::read(&path).unwrap());
+    }
+
+    /// Reading a newer daemon's record is not enough: it has to survive being
+    /// written back. Compaction re-serializes everything it retains, so an older
+    /// daemon that merely ignored unknown fields would delete them on the first
+    /// compaction — and leave the higher `schemaVersion` in place, so the loss
+    /// would be undetectable after rolling the pin forward again.
+    #[test]
+    fn compaction_re_emits_a_newer_daemons_fields_and_disposition_verbatim() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
+        let future = concat!(
+            r#"{"schemaVersion":2,"flowRunId":"run-future","taskUuid":"task-f","#,
+            r#""disposition":"teleported","nodeOrdinal":4,"retractedBy":"run-newer","#,
+            r#""recordedAt":"2026-08-09T00:00:00.000Z"}"#,
+            "\n",
+        );
+        std::fs::write(&path, future).unwrap();
+        let mut held = FlowMembership::read(&path).unwrap();
+        assert_eq!(held.record_count(), 1);
+
+        // Force a compaction with the future record retained (it is the most
+        // recently touched run, so it survives on merit).
+        for index in 0..5 {
+            let mut entry = record(
+                &format!("run-{index}"),
+                "task-0",
+                MembershipDisposition::Created,
+            );
+            entry.recorded_at = format!("2026-08-0{}T00:00:00.000Z", index + 1);
+            held = record_membership_bounded(&path, &entry, held, &no_live(), 4)
+                .unwrap()
+                .1;
+        }
+        let rewritten = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            rewritten.lines().count() < 6,
+            "this test is only meaningful if a compaction happened: {rewritten}"
+        );
+
+        let survivor = FlowMembership::read(&path)
+            .unwrap()
+            .record("run-future", "task-f")
+            .cloned()
+            .expect("the newest run must survive compaction");
+        assert_eq!(
+            survivor.disposition, "teleported",
+            "a disposition this binary does not know must be written back verbatim, \
+             not flattened to \"unknown\""
+        );
+        assert_eq!(
+            survivor.extra.get("retractedBy"),
+            Some(&Value::String("run-newer".to_owned())),
+            "an unknown field must be re-emitted, not deleted: {survivor:?}"
+        );
+        assert_eq!(survivor.schema_version, 2);
+        assert_eq!(survivor.node_ordinal, Some(4));
+    }
+
     #[test]
     fn an_unwritable_ledger_is_an_error_rather_than_a_silent_skip() {
         let temp = tempdir().unwrap();
@@ -933,6 +1281,7 @@ mod tests {
             &path,
             &record("run-a", "task-1", MembershipDisposition::Attached),
             FlowMembership::default(),
+            &no_live(),
         )
         .unwrap_err();
         assert!(matches!(error, FlowMembershipError::Io { .. }), "{error}");
@@ -954,7 +1303,7 @@ mod tests {
         assert!(preflight(&path).unwrap().is_empty());
 
         let first = record("run-a", "task-1", MembershipDisposition::Created);
-        record_membership(&path, &first, FlowMembership::default()).unwrap();
+        record_membership(&path, &first, FlowMembership::default(), &no_live()).unwrap();
         assert_eq!(preflight(&path).unwrap().record_count(), 1);
 
         // One malformed complete line -- the state the runbook exists for, and

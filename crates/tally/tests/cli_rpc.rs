@@ -1949,11 +1949,11 @@ async fn query_jobs_names_the_item_it_cannot_render_and_exits_nonzero() {
 
 /// #247 repair, at the surface an operator actually reads: a `--flow-run`
 /// window that resolved to no member tasks must say so. Since #380 made
-/// membership a durable admission fact, a zero here means the run admitted
-/// nothing under that ID -- most often a mistyped or stale run ID -- rather
-/// than the old blind spot where a row-less admission left a live node out of
-/// its own run. The notice still has to fire: an empty window and a zero
-/// membership are different claims, and the operator reads only one of them.
+/// membership a durable admission fact, the commonest cause of a zero is a
+/// mistyped or stale run ID -- but the notice must not close the question,
+/// because a repaired or deleted ledger, a compacted-out idle run, and a
+/// degraded admission all produce a zero for a run that really did admit work,
+/// and a row-less node has no durable row to fall back on in any of them.
 #[tokio::test(flavor = "current_thread")]
 async fn an_empty_flow_run_window_says_the_run_resolved_to_no_members() {
     let temp = tempfile::tempdir().unwrap();
@@ -2002,8 +2002,14 @@ async fn an_empty_flow_run_window_says_the_run_resolved_to_no_members() {
                     "{args:?} presented an empty window as authoritative:\n{stderr}"
                 );
                 assert!(
-                    stderr.contains("Check the ID itself first"),
-                    "{args:?} did not name the first thing to check:\n{stderr}"
+                    stderr.contains("not evidence that the run is quiet"),
+                    "{args:?} presented a zero as proof the run is idle:\n{stderr}"
+                );
+                assert!(
+                    stderr.contains("membershipDegraded")
+                        && stderr.contains("flow-membership.jsonl"),
+                    "{args:?} did not name the states in which a zero is the daemon \
+                     having lost membership rather than the run having none:\n{stderr}"
                 );
             }
             server.await.unwrap();

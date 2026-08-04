@@ -113,7 +113,7 @@ use crate::flow_lineage::{
 };
 use crate::flow_membership::{
     record_membership, FlowMembership, FlowMembershipError, FlowMembershipRecord,
-    MembershipDisposition,
+    MembershipDisposition, MembershipWrite,
 };
 use crate::git_ai::GitAiExecution;
 use crate::history::{HistoryError, LifecycleStore};

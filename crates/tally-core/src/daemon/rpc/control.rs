@@ -611,7 +611,23 @@ impl DaemonHandler {
         &self,
         record: FlowMembershipRecord,
     ) -> Result<(), WireError> {
-        let path = self.context.read().await.paths.flow_membership_path();
+        // Task UUIDs still executing. Compaction refuses to evict any run that
+        // holds one, so a long-lived campaign cannot lose its membership to a
+        // bound crossed by unrelated traffic. Collected here because it is the
+        // daemon that knows liveness; it is cheap (bounded by concurrency) and
+        // only consulted if a compaction actually happens.
+        let (path, live_tasks) = {
+            let context = self.context.read().await;
+            (
+                context.paths.flow_membership_path(),
+                context
+                    .jobs
+                    .values()
+                    .filter(|job| job.state != JobState::Completed)
+                    .map(Job::stable_key)
+                    .collect::<BTreeSet<_>>(),
+            )
+        };
         // Scoped so the borrowed index is dropped before the cache is taken:
         // holding it here would keep the `Rc` strong count at two, `try_unwrap`
         // below would fail, and every admission would deep-clone the whole
@@ -630,8 +646,22 @@ impl DaemonHandler {
             // Only reachable if a concurrent reader invalidated it in between.
             None => FlowMembership::read(&path).map_err(membership_wire)?,
         };
-        match record_membership(&path, &record, owned) {
-            Ok((_, updated)) => {
+        match record_membership(&path, &record, owned, &live_tasks) {
+            Ok((write, updated)) => {
+                if write == MembershipWrite::AppendedOverTarget {
+                    // Not an error: the ledger is deliberately allowed to exceed
+                    // its target rather than evict membership for work that is
+                    // still running. Said out loud because an operator watching
+                    // disk should know why this file is above its documented
+                    // bound, and because it will not shrink until work completes.
+                    eprintln!(
+                        "tally: flow-membership is over its {}-record target with nothing \
+                         evictable ({} records; every run above the bound holds executing \
+                         work). It will compact once that work completes.",
+                        crate::flow_membership::FLOW_MEMBERSHIP_MAX_RECORDS,
+                        updated.record_count()
+                    );
+                }
                 // The cache is whatever the writer says the file now holds --
                 // including after a compaction, which is what stops the cache
                 // from staying permanently over the bound and rewriting the

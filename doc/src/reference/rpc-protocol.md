@@ -584,8 +584,10 @@ Every run-scoped `query.log` and `query.jobs` response reports the resolved memb
 flowRunTasks: <count of task UUIDs this flowRun resolved to>
 ```
 
-The field is absent when no `flowRun` filter was supplied. `flowRunTasks: 0` means nothing was
-admitted under that run ID; the CLI says so on stderr.
+The field is absent when no `flowRun` filter was supplied. `flowRunTasks: 0` means the daemon
+holds no membership for that run ID — usually a mistyped or stale ID, but also a repaired or
+deleted ledger, a compacted-out idle run, or an admission that reported `membershipDegraded`. The
+CLI says so on stderr.
 
 An unterminated final line in the ledger is an interrupted append and is skipped on read and
 truncated on the next append. A *complete* record that cannot be decoded fails the query with
@@ -595,11 +597,15 @@ higher `schemaVersion` are all read on the fields this daemon understands, so a 
 cannot take run-scoped queries out. Only a `schemaVersion` *below* the reader's is refused.
 
 The ledger is compacted when it passes 20,000 records — one per admitted flow node — by dropping
-whole runs, oldest first, down to 18,000. Never part of a run, because a partially-present run
-would report a membership count lower than the truth; and down to a low-water mark rather than to
-the bound, so a compaction is followed by thousands of ordinary appends rather than by another
-compaction. Compaction is a write-and-rename, so a reader sees the whole old ledger or the whole
-new one. A run dropped by compaction falls back to the row scan.
+whole runs down to 18,000, **least-recently-touched first**, and never a run holding a task that
+is still executing or the run whose record is being written. Never part of a run either, because a
+partially-present run reports a membership count lower than the truth. Down to a low-water mark
+rather than to the bound, so a compaction is followed by thousands of ordinary appends rather than
+by another compaction. Compaction is a write-and-rename, so a reader sees the whole old ledger or
+the whole new one, and it re-emits fields and disposition values written by a newer daemon
+verbatim rather than stripping them. If nothing is evictable — every run over the bound is live —
+the ledger exceeds its target rather than deleting membership that is in use. A run dropped by
+compaction falls back to the row scan, which for a row-less node is nothing.
 
 ### Watch cursors
 

@@ -489,21 +489,28 @@ fn report_page_completeness(envelope: &Value) -> Result<()> {
     report_empty_flow_run(envelope)
 }
 
-/// A `--flow-run` window that resolved to no member tasks says the run admitted
-/// nothing under that ID. Since #380 every admission under a `flowRunId` writes
-/// durable membership before it is acknowledged — including the row-less
-/// dispositions `attached`, and full-mode `reused` and `terminal`, which used
-/// to hand a run a task UUID that never joined it — so zero here is a fact
-/// about the run rather than the W-316 blind spot it used to be. It is still
-/// worth saying out loud, because the commonest cause is a mistyped or stale
-/// run ID.
+/// A `--flow-run` window that resolved to no member tasks means **the daemon
+/// holds no membership for this run ID** — which is not the same claim as "this
+/// run admitted nothing", and the difference is the whole subject of #380.
+///
+/// Since #380 every admission under a `flowRunId` writes durable membership
+/// before it is acknowledged, including the row-less dispositions `attached`,
+/// and full-mode `reused` and `terminal`, so the commonest cause of a zero is a
+/// mistyped or stale run ID. But the ledger can also be missing what the run
+/// really did: an operator following the `repair-flow-membership-ledger` runbook
+/// deletes a line or the whole file, compaction can evict a run that has been
+/// idle long enough, and an admission that degraded post-commit records nothing.
+/// A row-less node has no durable row to fall back on in any of those cases, so
+/// this notice must keep pointing at the seam rather than closing the question.
 fn report_empty_flow_run(envelope: &Value) -> Result<()> {
     if envelope["flowRunTasks"].as_u64() == Some(0) {
         errln!(
-            "notice: this flow run resolves to NO member tasks: nothing has been admitted \
-             under this run ID. Check the ID itself first — an empty window here is a fact \
-             about the run, not a blind spot. `tally query run <id>` and the runner unit are \
-             the corroborating views."
+            "notice: this flow run resolves to NO member tasks, so an empty window here is \
+             not evidence that the run is quiet. Most often the run ID is mistyped or stale \
+             — check that first. Otherwise the daemon may have lost membership it once had: \
+             a repaired or deleted `flow-membership.jsonl`, a compacted-out idle run, or an \
+             admission that reported `membershipDegraded`. Corroborate with \
+             `tally query run <id>`, the runner unit, or the node's own task UUID."
         );
     }
     Ok(())

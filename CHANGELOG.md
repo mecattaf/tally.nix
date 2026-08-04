@@ -47,9 +47,13 @@ authorized.
   `query jobs` now also reports `flowRunTasks` when a `flowRun` filter was
   supplied, matching `query log`.
 
-  Operator-visible consequences: `flowRunTasks: 0` now means *nothing was
-  admitted under that run ID* — suspect the ID before the daemon — and the CLI's
-  stderr notice says so. No row field changed, so no row migration is required.
+  Operator-visible consequences: `flowRunTasks: 0` means *the daemon holds no
+  membership for that run ID*. That is narrower than "the run admitted nothing",
+  and the difference is the point: the commonest cause is a mistyped or stale ID,
+  but a repaired or deleted ledger, a compacted-out idle run, and an admission
+  that reported `membershipDegraded` all produce a zero for a run that did admit
+  work. The CLI's stderr notice names all of them rather than closing the
+  question. No row field changed, so no row migration is required.
 
   A damaged or unwritable ledger is checked **before** the kernel commits, so a
   flow admission is refused outright — no durable row, no `enqueued` lifecycle
@@ -66,14 +70,27 @@ authorized.
   rollback cannot take run-scoped queries out.
 
   The ledger is compacted past 20,000 records — one per admitted flow node —
-  down to 18,000, dropping whole runs oldest first, never part of a run. The
-  bound is sized by the one-time parse (~200 ms at 20,000) rather than copied
-  from the rare-event lineage ledger, and the low-water mark means a compaction
-  is followed by thousands of ordinary appends instead of another compaction.
-  Compaction is a write-and-rename, so a crash mid-rewrite cannot leave a
-  silently smaller run set. Per-admission cost is flat in ledger size:
-  0.81–0.90 ms across ledgers of 0, 5,000, 20,000, and 25,000 records
-  (debug profile; `membership_admission_cost_sweep`).
+  down to 18,000, dropping whole runs **least-recently-touched** first. Never
+  part of a run, and never a run holding an executing task or the run whose
+  record is being written: keying eviction on a run's *first* record would make
+  it anti-correlated with liveness, deleting the membership of exactly the
+  campaigns still under observation, and a compaction that evicted its own
+  caller's run would report a durable membership that is not there. If nothing
+  is evictable the ledger exceeds its target rather than deleting membership in
+  use, and says so on the daemon journal. The bound is sized by the one-time
+  parse (~200 ms at 20,000) rather than copied from the rare-event lineage
+  ledger, and the low-water mark means a compaction is followed by thousands of
+  ordinary appends instead of another compaction. Compaction is a
+  write-and-rename, so a crash mid-rewrite cannot leave a silently smaller run
+  set, and it re-emits a newer daemon's unknown fields and disposition values
+  verbatim rather than stripping them. Per-admission cost is flat in ledger
+  size: 2.13 / 1.91 / 2.16 / 2.02 ms across ledgers of 0, 5,000, 20,000, and
+  25,000 records (debug profile; `membership_admission_cost_sweep`). The flatness
+  is the claim, not the constant — absolute numbers move with host load, and at
+  an empty ledger the figure is indistinguishable from the pre-#380 path because
+  at zero records there was nothing to improve. What was removed is the growth:
+  the same sweep against the first draft read 2.8 ms empty, 17.4 ms at 10,000,
+  77.5 ms at 50,000, and 977 ms past the bound.
 
 - **The systemd watchdog keepalive no longer shares the dispatch loop, so a
   busy daemon is no longer killed for being busy (#370).** `WATCHDOG=1` was

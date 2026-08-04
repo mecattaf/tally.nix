@@ -87,8 +87,10 @@ including the row-less ones — `attached`, and full-mode `reused` and `terminal
 A re-triggered campaign attaching to nodes still in flight used to get a window
 showing the same items forever with `nextCursor: null` while the work executed;
 that is the original #247 shape and it is **fixed**. Every run-scoped response
-still reports `flowRunTasks`, and `flowRunTasks: 0` now means nothing was
-admitted under that run ID — suspect the ID before you suspect the daemon. A
+still reports `flowRunTasks`, and `flowRunTasks: 0` means the daemon holds no
+membership for that run ID — usually a mistyped or stale ID, but also a
+repaired or deleted ledger, a compacted-out idle run, or an admission that
+reported `membershipDegraded`, so it is not proof the run is quiet. A
 count below the node count the runner reports is a real discrepancy: corroborate
 against `tally query run <id>`, runner-unit liveness, merged PRs, and capture
 `.err` files.

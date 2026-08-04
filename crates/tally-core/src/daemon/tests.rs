@@ -10960,8 +10960,19 @@ mod tests {
 
     /// Seed a ledger with `runs x nodes` records ending just before `now`.
     fn seed_membership_ledger(paths: &DaemonPaths, runs: usize, nodes: usize) -> usize {
+        seed_membership_ledger_with(paths, runs, nodes, "")
+    }
+
+    /// `prefix` is written verbatim ahead of the generated padding, so a test
+    /// can plant a specific run at a specific age.
+    fn seed_membership_ledger_with(
+        paths: &DaemonPaths,
+        runs: usize,
+        nodes: usize,
+        prefix: &str,
+    ) -> usize {
         std::fs::create_dir_all(&paths.data_dir).unwrap();
-        let mut text = String::new();
+        let mut text = prefix.to_owned();
         for run in 0..runs {
             for node in 0..nodes {
                 text.push_str(&format!(
@@ -10978,7 +10989,7 @@ mod tests {
             &text,
         )
         .unwrap();
-        runs * nodes
+        text.lines().filter(|line| !line.trim().is_empty()).count()
     }
 
     fn ledger_lines(paths: &DaemonPaths) -> usize {
@@ -11097,6 +11108,113 @@ mod tests {
             .await;
     }
 
+    /// A long-lived run whose membership is old must not lose it to a bound
+    /// crossed by unrelated traffic — and the record an admission is told is
+    /// durable must actually be in the ledger.
+    ///
+    /// This is the shape the divergence test above structurally cannot express,
+    /// because that one mints its runs with `Uuid::new_v4()` at test time, so
+    /// its runs are always the newest in the ledger and compaction never
+    /// considers them. A fixture wrong in the same direction as the code is the
+    /// class `AUGUST-02` §3 names, and this is the correction for it: the run
+    /// under test is planted as the *oldest* thing in the ledger, holds only
+    /// row-less nodes (so the scan half cannot rescue it), and is still live.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_compaction_never_evicts_a_live_run_or_the_record_it_is_writing() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let bound = crate::flow_membership::FLOW_MEMBERSHIP_MAX_RECORDS;
+                let watched = Uuid::new_v4().to_string();
+
+                // Four row-less nodes for the watched run, dated years before
+                // anything else. Row-less is the point: these have no capsule on
+                // any durable row, so if the ledger forgets them they are gone.
+                let mut prefix = String::new();
+                for node in 0..4 {
+                    prefix.push_str(&format!(
+                        "{{\"schemaVersion\":1,\"flowRunId\":\"{watched}\",\
+                         \"taskUuid\":\"attached-{node:04}\",\"disposition\":\"attached\",\
+                         \"nodeOrdinal\":{node},\"recordedAt\":\"2019-01-01T00:00:0{node}.000Z\"}}\n"
+                    ));
+                }
+                // Pad to exactly the bound, so the watched run's next admission
+                // is the one that crosses it.
+                let padding_runs = (bound - 4) / 4;
+                let seeded = seed_membership_ledger_with(&paths, padding_runs, 4, &prefix);
+                assert_eq!(seeded, bound);
+
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+
+                // The still-live run admits its next node.
+                let response = daemon
+                    .handler
+                    .enqueue_as_client(Some(monitor_node_payload(&watched, 4)))
+                    .await
+                    .unwrap();
+                let task_uuid = response["task_uuid"].as_str().unwrap().to_owned();
+
+                // If the write could not be honoured, the caller must be told;
+                // if it says nothing, the record has to be there.
+                assert!(
+                    response["membershipDegraded"].is_null(),
+                    "the admission reported degraded membership: {response}"
+                );
+                let ledger = crate::flow_membership::FlowMembership::read(
+                    &paths
+                        .data_dir
+                        .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+                )
+                .unwrap();
+                assert!(
+                    ledger.contains(&watched, &task_uuid),
+                    "the record the admission claimed to write is not in the ledger"
+                );
+
+                // And the run is whole, not half-present: its four old row-less
+                // nodes are still members alongside the one just admitted.
+                let mut members = ledger.tasks(&watched).collect::<Vec<_>>();
+                members.sort_unstable();
+                let mut expected = vec![
+                    "attached-0000",
+                    "attached-0001",
+                    "attached-0002",
+                    "attached-0003",
+                    task_uuid.as_str(),
+                ];
+                expected.sort_unstable();
+                assert_eq!(
+                    members, expected,
+                    "the live run lost membership to compaction"
+                );
+
+                // The count an operator actually reads.
+                let window = daemon
+                    .handler
+                    .query(
+                        "query.log",
+                        Some(json!({"flowRun": watched.clone(), "limit": 1000})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(window["flowRunTasks"], 5, "{window}");
+
+                // Compaction did happen -- otherwise this proves nothing.
+                assert!(
+                    ledger_lines(&paths) < bound,
+                    "the bound was never crossed, so nothing was under test"
+                );
+            })
+            .await;
+    }
+
     /// The per-admission cost of membership bookkeeping, at several ledger
     /// sizes. Ignored by default because it seeds tens of thousands of records
     /// and reports rather than asserts; run it with
@@ -11140,30 +11258,37 @@ mod tests {
                         .unwrap();
                     let first = opened.elapsed();
 
+                    // Every iteration must be a *distinct* `(run, task)` pair.
+                    // The first version of this harness re-submitted the same
+                    // six pairs, so 21 of its 30 samples took the `AlreadyHeld`
+                    // early return — no open, no flock, no fsync — and the
+                    // reported figure was ~2.8x too low. The ledger line count
+                    // in the output is the check: it must grow by `admissions`.
                     let admissions = 30_usize;
+                    let before_lines = ledger_lines(&paths);
                     let started = std::time::Instant::now();
-                    for ordinal in 0..admissions {
-                        let run = if ordinal % 6 == 0 {
-                            Uuid::new_v4().to_string()
-                        } else {
-                            warm_run.clone()
-                        };
-                        let _ = daemon
+                    for _ in 0..admissions {
+                        let run = Uuid::new_v4().to_string();
+                        daemon
                             .handler
-                            .enqueue_as_client(Some(monitor_node_payload(
-                                &run,
-                                ordinal % 6,
-                            )))
-                            .await;
+                            .enqueue_as_client(Some(monitor_node_payload(&run, 0)))
+                            .await
+                            .unwrap();
                     }
                     let elapsed = started.elapsed();
+                    let grew = ledger_lines(&paths).saturating_sub(before_lines);
                     eprintln!(
                         "MEMBERSHIP-COST {label:>14}: seeded {records:>6} records, \
                          open+first admission {first:>12.3?}, \
                          {admissions} admissions in {elapsed:>12.3?} \
-                         = {:>10.3?}/admission, ledger {} lines",
+                         = {:>10.3?}/admission, ledger {} lines (+{grew})",
                         elapsed / admissions as u32,
                         ledger_lines(&paths),
+                    );
+                    assert!(
+                        grew == admissions || ledger_lines(&paths) < before_lines,
+                        "{label}: only {grew} of {admissions} admissions actually \
+                         appended; this harness is measuring the wrong path again"
                     );
                 }
             })
@@ -11424,12 +11549,16 @@ mod tests {
     /// *between* the preflight and the append, so by the time the failure is
     /// known the admission has already happened.
     ///
-    /// The fault is injected at that seam by hand, and deliberately so: every
-    /// filesystem-level fault I can stage is caught by the preflight before the
-    /// kernel commits — which is the point of the preflight, and is what the
-    /// test above proves. What is left is a genuine race (the data directory
-    /// fills, or the file is replaced, in the window between the two calls), and
-    /// the only honest way to exercise it is to open the window explicitly.
+    /// The fault is injected at that seam by hand, and deliberately so. The
+    /// preflight catches the faults that are reachable *before* an admission —
+    /// an unopenable ledger and an unusable record, which the test above proves
+    /// — but it is a check, not a guarantee, and it does not cover everything.
+    /// Two known gaps: a ledger that is writable under a read-only parent
+    /// passes both the probe and an ordinary append and fails only when
+    /// compaction tries to create its temp file; and the data directory can
+    /// fill, or the file be replaced, in the window between the check and the
+    /// write. Both land here, which is why this path has to exist and be
+    /// correct rather than be treated as unreachable.
     ///
     /// What must hold: the caller is told the truth. The work was admitted, here
     /// is its task UUID, and this one node's membership is missing until the

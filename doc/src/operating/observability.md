@@ -400,9 +400,24 @@ $ tally query log --flow-run <id> --json | jq .flowRunTasks
 0
 ```
 
-**`flowRunTasks: 0` now means the run admitted nothing under that ID.** Check
-the run ID itself first — a mistyped or stale ID is the ordinary cause. The
-human path says so on stderr rather than making you look.
+**`flowRunTasks: 0` means the daemon holds no membership for that run ID.** That
+is a narrower claim than "the run admitted nothing", and the difference matters
+in exactly the incident this chapter exists for. A mistyped or stale ID is the
+ordinary cause and worth checking first, but the daemon can also have lost
+membership it once had:
+
+- the ledger was deleted, or a line removed, following the
+  [`repair-flow-membership-ledger`](troubleshooting.md#repair-flow-membership-ledger)
+  runbook;
+- compaction evicted the run, which it does only to runs that have been idle
+  and hold no executing work, but which it does do;
+- an admission reported `membershipDegraded`, meaning it was acknowledged with
+  its membership unrecorded.
+
+A node admitted as `created` still has its own durable row and is found by the
+scan in all of those cases. A row-less node — `attached`, or full-mode `reused`
+or `terminal` — does not, and is invisible again until the ledger is repaired.
+The human path says all this on stderr rather than making you look.
 
 A count *below* the number of nodes the runner reports submitting is a real
 discrepancy to chase, not an expected artefact: corroborate with `tally query
