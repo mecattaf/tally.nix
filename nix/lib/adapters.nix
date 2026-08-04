@@ -7,6 +7,7 @@ let
       stream ? "stdout",
       mode ? "regex",
       pattern,
+      fields ? { },
     }:
     assert lib.assertMsg (builtins.elem stream [
       "stdout"
@@ -20,9 +21,16 @@ let
     assert lib.assertMsg (
       builtins.isString pattern && pattern != ""
     ) "tally adapter scrape pattern must be a non-empty string";
+    assert lib.assertMsg (
+      builtins.isAttrs fields
+      && builtins.all (
+        paths: builtins.isList paths && paths != [ ] && builtins.all builtins.isString paths
+      ) (builtins.attrValues fields)
+    ) "tally adapter scrape fields must map each declared name to a non-empty list of paths";
     {
       inherit stream mode pattern;
-    };
+    }
+    // lib.optionalAttrs (fields != { }) { inherit fields; };
 
   mkAdapter =
     {
@@ -137,6 +145,13 @@ let
           mode = "jsonPath";
           pattern = "$..model";
         };
+        # No `fields` mapping yet: pi has never run a campaign here, and
+        # inventing its key names would be a fixture wrong in the same
+        # direction as the code. Until a real `pi --mode json` capture is on
+        # hand this capture keeps the legacy reading (total_tokens, else
+        # input_tokens plus output_tokens), which is what it had before the
+        # mapping existed. Declaring the real keys is an attrset here, not a
+        # Rust change.
         usage = mkScrapeCapture {
           mode = "jsonPath";
           pattern = "$..usage";
@@ -184,9 +199,26 @@ let
           mode = "jsonPath";
           pattern = "$..model";
         };
+        # claude-code reports the cached halves of the prompt beside an
+        # `input_tokens` figure that excludes both, so the exclusive spelling
+        # is the honest one here.
         usage = mkScrapeCapture {
           mode = "jsonPath";
           pattern = "$..usage";
+          fields = {
+            inputTokens = [ "input_tokens" ];
+            cacheReadTokens = [ "cache_read_input_tokens" ];
+            cacheWriteTokens = [ "cache_creation_input_tokens" ];
+            outputTokens = [ "output_tokens" ];
+          };
+        };
+        # Cost sits on the result event rather than inside `usage`, so it is
+        # its own capture feeding the same record. Tally never computes a
+        # dollar figure; this is only what the harness said.
+        usageCost = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'result'].total_cost_usd";
+          fields.costUsd = [ "$" ];
         };
         finalMessage = mkScrapeCapture {
           mode = "jsonPathLast";
@@ -231,9 +263,25 @@ let
           mode = "jsonPath";
           pattern = "$..model";
         };
+        # codex counts cached prompt tokens inside its own `input_tokens`
+        # figure, so the inclusive spelling is declared: the record subtracts
+        # the cache read to reach the same meaning claude-code's exclusive
+        # figure already has.
+        #
+        # All five keys real `codex exec --json` emits are declared. Every
+        # `turn.completed` in this project's own dispatch corpus carries the
+        # same five, `cache_write_input_tokens` among them with the value 0 —
+        # a measurement, which the record must state rather than leave absent.
         usage = mkScrapeCapture {
           mode = "jsonPath";
           pattern = "$..usage";
+          fields = {
+            inputTokensWithCacheRead = [ "input_tokens" ];
+            cacheReadTokens = [ "cached_input_tokens" ];
+            cacheWriteTokens = [ "cache_write_input_tokens" ];
+            outputTokens = [ "output_tokens" ];
+            reasoningTokens = [ "reasoning_output_tokens" ];
+          };
         };
         finalMessage = mkScrapeCapture {
           mode = "jsonPathLast";

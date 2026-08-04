@@ -6,6 +6,57 @@ authorized.
 
 ## [Unreleased]
 
+### Added
+
+- **Per-attempt harness usage is normalized at the adapter boundary and
+  persisted (#381).** Raw provider usage objects already landed in the advisory
+  attestation ledger, but nothing reconciled them across harness shapes, no
+  query surface exposed them, and the pool-meter feeder collapsed everything to
+  a single number. A capture may now declare a `fields` map — a logical field
+  name to the ordered candidate paths that carry it inside the captured value
+  (`$` or the empty string is the captured value itself; anything else is
+  dot-separated object keys, with numeric segments indexing arrays). The
+  normalizer reads `inputTokens` or `inputTokensWithCacheRead`,
+  `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`, `reasoningTokens`
+  (nested within output, never added to it), `totalTokens`, and `costUsd`.
+  Adding a harness is an attrset in `nix/lib/adapters.nix`, never a Rust match
+  on an adapter's name. The `codex` and `claude-code` presets declare every key
+  their real captures carry — for codex that is all five, including the
+  `cache_write_input_tokens` that is 0 on every real turn, because a measured
+  zero must be stated rather than left absent. `pi` declares none until a real
+  capture has been seen, and keeps the legacy reading.
+
+  The fixtures behind this are excerpts of real captures, not hand-authored
+  streams; see `test/fixtures/usage/README.md` for provenance and redaction.
+
+  The record distinguishes three states and renders none of them as a zero:
+  `not-declared` (the adapter configured no usage scrape), `not-reported` (a
+  scrape was declared and the stream carried none), and `reported` — where a
+  harness-reported zero lives, because it is a measurement. A total the harness
+  did not state is derived from the components and labelled `derived-from-
+  components`; a stated total its own components contradict is kept beside the
+  computed sum rather than either being corrected. Cost is only what the harness
+  reported: tally has no pricing table and computes no dollar figure.
+
+  The durable seat is the `adapter-scrape` attestation, which carries the record
+  beside the raw captures under the same task/attempt/lease-epoch key; the row
+  carries it in memory only, so the two typed absences read back as a missing
+  field after a restart rather than as a stated absence. `tally query job`
+  renders it as a `SourcedValue` with `advisory-provider-capture` authority and
+  `adapter-scrape` provenance; authorities are not collapsed and the witness
+  schema is unchanged. Records written before the field existed read back
+  unchanged and add no key.
+
+  The built-in pool meter now reads the normalized record and charges the same
+  number it charged before on every shape a harness emits — a harness-stated
+  total, else the harness's own input figure plus its output figure, never a
+  zero, and nothing at all when a figure arrives in a shape that is not a count.
+  A capture with no declared `fields` keeps that reading verbatim, so the richer
+  breakdown does not become a bigger bill on any pool. Two shapes no harness
+  emits do diverge, both upward: a key present with a JSON `null`, and a
+  whole-valued float, each of which the old reader refused to parse and this one
+  charges.
+
 ### Fixed
 
 - **Flow-run membership is now a durable admission fact, so a node a run

@@ -296,6 +296,23 @@ impl DaemonHandler {
                 .get(&job.row.adapter)
                 .is_some_and(|adapter| !adapter.scrape.is_empty());
             if !scrape_configured {
+                // An adapter with no captures at all declared no usage scrape.
+                // Record that as a value so a later reader is not left to infer
+                // it from a missing key.
+                let mut job = job;
+                job.row.usage = Some(UsageObservation::NotDeclared);
+                {
+                    let mut context = handler.context.write().await;
+                    if let Some(stored) = context.jobs.get_mut(&job.job_id) {
+                        stored.row.usage.clone_from(&job.row.usage);
+                    }
+                    if let Some(detail) = job
+                        .task_uuid
+                        .and_then(|task_uuid| context.query_details.get_mut(&task_uuid))
+                    {
+                        detail.usage.clone_from(&job.row.usage);
+                    }
+                }
                 handler.emit_post_ack(completed_event(&job, &result, evidence));
                 return;
             }
@@ -311,6 +328,16 @@ impl DaemonHandler {
                 let captures = AdapterEngine::new(&adapters)
                     .scrape_paths(&adapter, &paths)
                     .map_err(|error| error.to_string())?;
+                // Normalization runs against the adapter's own declared key
+                // mapping, so a harness the tree has never seen is a config
+                // entry rather than a Rust change. The three states are
+                // decided here, once, and every later reader sees the same
+                // one.
+                let usage = adapters
+                    .get(&adapter)
+                    .map_or(UsageObservation::NotDeclared, |config| {
+                        crate::usage::observe(config, &captures)
+                    });
                 let attestation_error = if captures.captures.is_empty() {
                     None
                 } else {
@@ -327,18 +354,19 @@ impl DaemonHandler {
                                 "attempt": attempt,
                                 "leaseEpoch": lease_epoch,
                                 "captures": captures.captures.clone(),
+                                "usage": usage.clone(),
                                 "usageAuthority": "advisory-only",
                             }))
                         })
                         .err()
                         .map(|error| error.to_string())
                 };
-                let meter_errors = feed_scraped_usage(&state_dir, &pools, &leased_pools, &captures);
-                Ok::<_, String>((captures, attestation_error, meter_errors))
+                let meter_errors = feed_scraped_usage(&state_dir, &pools, &leased_pools, &usage);
+                Ok::<_, String>((captures, usage, attestation_error, meter_errors))
             })
             .await;
 
-            let (captures, attestation_error, meter_errors) = match scraped {
+            let (captures, usage, attestation_error, meter_errors) = match scraped {
                 Ok(Ok(scraped)) => scraped,
                 Ok(Err(error)) => {
                     eprintln!(
@@ -382,6 +410,11 @@ impl DaemonHandler {
             if let Ok(Some(final_message)) = captures.final_message() {
                 enriched.row.final_message = Some(final_message.to_owned());
             }
+            // Unlike the three string captures, a usage observation is
+            // recorded even when it is an absence: a scraped attempt that
+            // carried no usage is a different fact from an attempt nobody
+            // scraped, and only recording the value keeps them apart.
+            enriched.row.usage = Some(usage);
             {
                 let mut context = handler.context.write().await;
                 if let Some(stored) = context.jobs.get_mut(&enriched.job_id) {
@@ -391,6 +424,7 @@ impl DaemonHandler {
                         .row
                         .final_message
                         .clone_from(&enriched.row.final_message);
+                    stored.row.usage.clone_from(&enriched.row.usage);
                 }
                 if let Some(task_uuid) = enriched.task_uuid {
                     if let Some(row) = context.query_rows.get_mut(&task_uuid) {
@@ -402,6 +436,7 @@ impl DaemonHandler {
                         detail.session_ref.clone_from(&enriched.row.session_ref);
                         detail.observed_model.clone_from(&enriched.row.model);
                         detail.final_message.clone_from(&enriched.row.final_message);
+                        detail.usage.clone_from(&enriched.row.usage);
                     }
                 }
             }

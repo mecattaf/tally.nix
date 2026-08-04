@@ -83,6 +83,17 @@ pub struct ScrapeCapture {
     #[serde(default)]
     pub mode: ScrapeMode,
     pub pattern: String,
+    /// Per-harness key mapping for this capture: a logical field name to the
+    /// ordered candidate paths that carry it inside the captured value. `$`
+    /// (or the empty string) is the captured value itself; anything else is
+    /// dot-separated object keys, with numeric segments indexing arrays. The
+    /// first candidate that resolves to a non-null value wins.
+    ///
+    /// This is how a harness's shape reaches tally without a Rust change:
+    /// `crate::usage` reads the logical names it declares, and a sibling
+    /// concern that needs its own keys declares them the same way.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub fields: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -250,6 +261,20 @@ impl ScrapeResult {
 
     pub fn final_message(&self) -> Result<Option<&str>, AdapterError> {
         self.string("finalMessage")
+    }
+
+    /// The raw provider usage object, if the stream carried one.
+    ///
+    /// `usage` is a declared capture in the adapter contract alongside
+    /// `sessionRef`, `model`, and `finalMessage`. Unlike those three it is not
+    /// constrained to a JSON string — harnesses report objects — so it carries
+    /// no type error and cannot fail a scrape that already succeeded. It is
+    /// declared rather than incidental so that an adapter with no usage scrape
+    /// is distinguishable from a harness that reported nothing; see
+    /// [`crate::usage`].
+    #[must_use]
+    pub fn usage(&self) -> Option<&Value> {
+        self.captures.get(crate::usage::USAGE_CAPTURE)
     }
 }
 
@@ -762,6 +787,26 @@ fn validate_adapter(name: &str, adapter: &AdapterConfig) -> Result<(), AdapterEr
                 })?;
             }
         }
+        for (field, paths) in &capture.fields {
+            if field.is_empty() || field.chars().any(char::is_control) {
+                return invalid_config(
+                    name,
+                    format!("capture {capture_name:?} declares an invalid field name {field:?}"),
+                );
+            }
+            if paths.is_empty() {
+                return invalid_config(
+                    name,
+                    format!("capture {capture_name:?} field {field:?} declares no path"),
+                );
+            }
+            if paths.iter().any(|path| path.chars().any(char::is_control)) {
+                return invalid_config(
+                    name,
+                    format!("capture {capture_name:?} field {field:?} declares a path containing a control character"),
+                );
+            }
+        }
     }
     if let Some(template) = &adapter.resume {
         for argument in template {
@@ -1138,6 +1183,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..attempt".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
                 (
@@ -1146,6 +1192,7 @@ mod tests {
                         stream: ScrapeStream::Stderr,
                         mode: ScrapeMode::Regex,
                         pattern: "(?m)^branch=(.+)$".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
                 (
@@ -1154,6 +1201,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..model".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
                 (
@@ -1162,6 +1210,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..session_id".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
                 (
@@ -1170,6 +1219,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..usage".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
             ]),
@@ -1610,6 +1660,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..model".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
                 (
@@ -1618,6 +1669,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..thread_id".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
             ]),

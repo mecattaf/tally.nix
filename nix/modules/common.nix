@@ -99,6 +99,26 @@ let
             interpreted according to this capture's mode.
           '';
         };
+        fields = mkOption {
+          type = types.attrsOf (types.listOf types.str);
+          default = { };
+          example.inputTokens = [ "input_tokens" ];
+          description = ''
+            Per-harness key mapping for this capture: each declared name maps
+            to the ordered candidate paths that carry it inside the captured
+            value. "$" (or the empty string) is the captured value itself;
+            anything else is dot-separated object keys, with numeric segments
+            indexing arrays. The first candidate that resolves to a non-null
+            value wins.
+
+            Declaring a harness's shape here is what keeps tally from learning
+            it in Rust. The usage record reads inputTokens,
+            inputTokensWithCacheRead, cacheReadTokens, cacheWriteTokens,
+            outputTokens, reasoningTokens, totalTokens, and costUsd; an adapter
+            that declares none of them, on a capture named usage, keeps the
+            legacy reading of total_tokens, input_tokens, and output_tokens.
+          '';
+        };
         _tallyAssertions = internalAssertionsOption;
       };
 
@@ -106,6 +126,10 @@ let
         {
           assertion = config.pattern != "";
           message = "tally adapter scrape ${name} requires a non-empty pattern";
+        }
+        {
+          assertion = builtins.all (paths: paths != [ ]) (builtins.attrValues config.fields);
+          message = "tally adapter scrape ${name} declares a field with no candidate path";
         }
       ];
     }
@@ -3309,9 +3333,13 @@ let
         extraWritablePaths
         ;
       launch = renderAdapterLaunch adapter.launch;
-      scrape = mapAttrs (_: capture: {
-        inherit (capture) stream mode pattern;
-      }) adapter.scrape;
+      scrape = mapAttrs (
+        _: capture:
+        {
+          inherit (capture) stream mode pattern;
+        }
+        // optionalAttrs (capture.fields != { }) { inherit (capture) fields; }
+      ) adapter.scrape;
     }
     // optionalAttrs (adapter.hardening != null) {
       inherit (adapter) hardening;

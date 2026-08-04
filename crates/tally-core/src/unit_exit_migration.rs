@@ -382,6 +382,7 @@ pub(crate) mod fixtures {
             related_trigger: None,
             evidence_class: None,
             manifest_hash: None,
+            usage: None,
         }
     }
 

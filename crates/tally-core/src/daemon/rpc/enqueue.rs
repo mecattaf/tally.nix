@@ -138,6 +138,14 @@ impl DaemonHandler {
         row.attempt = next_attempt;
         row.lease_epoch = context.epoch;
         row.job_token_hash = None;
+        // A usage record belongs to the attempt that produced it. Carrying one
+        // into a retry would render attempt N−1's tokens under attempt N with
+        // provider-capture authority — a measurement claimed for work that has
+        // not run. Today the cloned row is usage-free because completion
+        // writes only to `context.jobs`, so this line is currently redundant;
+        // it is here so the discipline survives anyone making completion write
+        // rows back.
+        row.usage = None;
 
         let engine = AdapterEngine::new(&context.config.adapters);
         let invocation = if row.resumed_from.is_some() {
@@ -786,6 +794,10 @@ impl DaemonHandler {
                 .as_ref()
                 .and_then(|job| job.row.session_ref.clone()),
             final_message: None,
+            // Usage is per attempt and is never inherited across a resume:
+            // the prior attempt's record stays on the prior row and in the
+            // attestation ledger.
+            usage: None,
             job_token_hash: None,
             lease_epoch: epoch,
             attempt: 1,

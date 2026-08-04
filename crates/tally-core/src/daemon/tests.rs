@@ -452,6 +452,7 @@ mod tests {
                         stream: ScrapeStream::Stderr,
                         mode: ScrapeMode::Regex,
                         pattern: "(?m)^branch=(.+)$".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
                 (
@@ -460,6 +461,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..model".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
                 (
@@ -468,6 +470,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..session_id".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
                 (
@@ -476,6 +479,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..usage".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
                 (
@@ -484,6 +488,7 @@ mod tests {
                         stream: ScrapeStream::Stdout,
                         mode: ScrapeMode::JsonPath,
                         pattern: "$..final_message".to_owned(),
+                        fields: Default::default(),
                     },
                 ),
             ]),
@@ -2114,6 +2119,7 @@ mod tests {
             related_trigger: None,
             evidence_class: None,
             manifest_hash: None,
+            usage: None,
         }
     }
 
@@ -3098,6 +3104,7 @@ mod tests {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..session_id".to_owned(),
+                                fields: Default::default(),
                             },
                         )]),
                         trace: None,
@@ -5489,6 +5496,7 @@ mod tests {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..thread_id".to_owned(),
+                                fields: Default::default(),
                             },
                         )]),
                         ..AdapterConfig::default()
@@ -5937,6 +5945,26 @@ mod tests {
                     999999
                 );
                 assert_eq!(attestation.payload["usageAuthority"], "advisory-only");
+                // The normalized record is persisted beside the raw capture,
+                // keyed by the same task/attempt/lease-epoch triple, and it
+                // says which of the three states this attempt is in.
+                assert_eq!(
+                    attestation.payload["usage"],
+                    json!({
+                        "state": "reported",
+                        "breakdown": {
+                            "shape": "components",
+                            "inputTokens": 999999,
+                            "inputTokensAsReported": 999999,
+                            "totalTokens": {
+                                "value": 999999,
+                                "source": "derived-from-components",
+                            },
+                        },
+                    })
+                );
+                assert_eq!(attestation.payload["attempt"], 1);
+                assert_eq!(attestation.payload["leaseEpoch"], 1);
                 let (report, witness) = read_verified_records(&paths.witness_path()).unwrap();
                 assert!(report.ok);
                 assert_eq!(witness.len(), 1);
@@ -5971,6 +5999,27 @@ mod tests {
                         "authority": "advisory-provider-capture",
                         "provenance": "adapter-scrape",
                     })
+                );
+                assert_eq!(
+                    before["job"]["usage"],
+                    json!({
+                        "value": {
+                            "state": "reported",
+                            "breakdown": {
+                                "shape": "components",
+                                "inputTokens": 999999,
+                                "inputTokensAsReported": 999999,
+                                "totalTokens": {
+                                    "value": 999999,
+                                    "source": "derived-from-components",
+                                },
+                            },
+                        },
+                        "authority": "advisory-provider-capture",
+                        "provenance": "adapter-scrape",
+                    }),
+                    "the breakdown renders as an advisory provider capture, never collapsed \
+                     into a canonical authority"
                 );
                 let canonical_before = json!({
                     "priority": before["job"]["priority"],
@@ -6790,6 +6839,26 @@ mod tests {
         assert_eq!(ignored["pools"][0]["remainingBudget"], 60);
     }
 
+    /// An adapter shaped exactly like every adapter that existed before the
+    /// usage mapping did: a `usage` capture and no declared field paths. What
+    /// it normalizes to is what the meter feeder must keep charging.
+    fn legacy_shaped_usage(captures: &ScrapeResult) -> crate::usage::UsageObservation {
+        let adapter = AdapterConfig {
+            argv: vec!["agent".to_owned()],
+            scrape: BTreeMap::from([(
+                "usage".to_owned(),
+                ScrapeCapture {
+                    stream: ScrapeStream::Stdout,
+                    mode: ScrapeMode::JsonPath,
+                    pattern: "$..usage".to_owned(),
+                    fields: Default::default(),
+                },
+            )]),
+            ..Default::default()
+        };
+        crate::usage::observe(&adapter, captures)
+    }
+
     #[test]
     fn built_in_usage_feeder_routes_tokens_and_can_only_clamp_headroom_downward() {
         let temp = tempdir().unwrap();
@@ -6802,7 +6871,12 @@ mod tests {
             )]),
         };
         assert!(
-            feed_scraped_usage(&state_dir, &config.pools, &["api".to_owned()], &captures,)
+            feed_scraped_usage(
+                &state_dir,
+                &config.pools,
+                &["api".to_owned()],
+                &legacy_shaped_usage(&captures),
+            )
                 .is_empty()
         );
         let event = read_usage_meter(&state_dir, "api", 3600, Utc::now()).unwrap();
@@ -6830,7 +6904,12 @@ mod tests {
             captures: BTreeMap::from([("usage".to_owned(), json!({"total_tokens": 10}))]),
         };
         assert!(
-            feed_scraped_usage(&state_dir, &config.pools, &["api".to_owned()], &low,).is_empty()
+            feed_scraped_usage(
+                &state_dir,
+                &config.pools,
+                &["api".to_owned()],
+                &legacy_shaped_usage(&low),
+            ).is_empty()
         );
         let low = read_usage_meter(&state_dir, "api", 3600, Utc::now()).unwrap();
         let projection = query_pools(&[PoolHeadroomFact {
@@ -6859,7 +6938,12 @@ mod tests {
                 captures: malformed.as_object().unwrap().clone().into_iter().collect(),
             };
             assert!(
-                feed_scraped_usage(&state_dir, &config.pools, &["api".to_owned()], &captures,)
+                feed_scraped_usage(
+                &state_dir,
+                &config.pools,
+                &["api".to_owned()],
+                &legacy_shaped_usage(&captures),
+            )
                     .is_empty()
             );
             assert_eq!(fs::read(&path).unwrap(), valid_bytes);
@@ -6872,7 +6956,12 @@ mod tests {
         });
         fs::remove_file(&path).unwrap();
         assert!(
-            feed_scraped_usage(&state_dir, &config.pools, &["api".to_owned()], &captures,)
+            feed_scraped_usage(
+                &state_dir,
+                &config.pools,
+                &["api".to_owned()],
+                &legacy_shaped_usage(&captures),
+            )
                 .is_empty()
         );
         assert!(
@@ -9330,6 +9419,127 @@ mod tests {
 
                 restart_shutdown_tx.send(true).unwrap();
                 restarted_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    /// A retry must not carry the previous attempt's usage forward.
+    ///
+    /// Today the cloned row is usage-free by accident: completion writes the
+    /// record into `context.jobs` and `context.query_details`, never into
+    /// `context.rows`. This test forces the premise that accident depends on —
+    /// it plants a record on the durable row, which is exactly what a
+    /// natural-looking "make completion write rows back too" change would
+    /// produce — and asserts the retry still renders no usage under the new
+    /// attempt. Without `row.usage = None` in the retry path, attempt N-1's
+    /// tokens would surface under attempt N with provider-capture authority.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retrying_a_job_does_not_carry_the_previous_attempts_usage_forward() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut daemon = fs1_daemon(&paths).await;
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["false"],
+                        "pool": "slot",
+                        "priority": "high",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "dedupKey": "retry-usage",
+                        "evidence": ["exit:0"],
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(5), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                let terminal = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": task_uuid.clone()})))
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["verdict"], "failed");
+                assert_eq!(terminal["attempt"], 1);
+
+                // Plant attempt 1's usage on the durable row and on its query
+                // detail, the state a row-writing completion path would leave.
+                let uuid = Uuid::parse_str(&task_uuid).unwrap();
+                let planted = crate::usage::observe(
+                    &AdapterConfig {
+                        argv: vec!["agent".to_owned()],
+                        scrape: BTreeMap::from([(
+                            "usage".to_owned(),
+                            ScrapeCapture {
+                                stream: ScrapeStream::Stdout,
+                                mode: ScrapeMode::JsonPath,
+                                pattern: "$..usage".to_owned(),
+                                fields: Default::default(),
+                            },
+                        )]),
+                        ..Default::default()
+                    },
+                    &ScrapeResult {
+                        captures: BTreeMap::from([(
+                            "usage".to_owned(),
+                            json!({"input_tokens": 4096, "output_tokens": 512}),
+                        )]),
+                    },
+                );
+                assert!(!planted.is_absent(), "the planted record is a measurement");
+                {
+                    let mut context = daemon.handler.context.write().await;
+                    context.rows.get_mut(&uuid).unwrap().usage = Some(planted.clone());
+                    context.query_details.get_mut(&uuid).unwrap().usage = Some(planted);
+                }
+                let before = daemon
+                    .handler
+                    .query("query.job", Some(json!({"id": task_uuid.clone()})))
+                    .await
+                    .unwrap();
+                assert_eq!(before["job"]["currentAttempt"], 1);
+                assert_eq!(
+                    before["job"]["usage"]["value"]["state"], "reported",
+                    "the planted record is visible for the attempt that produced it"
+                );
+
+                let retried = daemon
+                    .handler
+                    .retry_job(Some(json!({"task_uuid": task_uuid.clone()})))
+                    .await
+                    .unwrap();
+                assert_eq!(retried["attempt"], 2);
+                assert_eq!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .rows
+                        .get(&uuid)
+                        .unwrap()
+                        .usage,
+                    None,
+                    "the retried row must carry no usage of its own"
+                );
+                let after = daemon
+                    .handler
+                    .query("query.job", Some(json!({"id": task_uuid})))
+                    .await
+                    .unwrap();
+                assert_eq!(after["job"]["currentAttempt"], 2);
+                assert_eq!(
+                    after["job"].get("usage"),
+                    None,
+                    "a retried attempt must not report the previous attempt's tokens"
+                );
             })
             .await;
     }

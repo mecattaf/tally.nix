@@ -1,0 +1,6 @@
+{"type":"thread.started","thread_id":"codex-usage-thread"}
+{"type":"item.completed","item":{"id":"fixture_id","type":"error","message":"<redacted message>"}}
+{"type":"item.completed","item":{"id":"fixture_id","type":"error","message":"<redacted message>"}}
+{"type":"turn.started"}
+{"type":"error","message":"<redacted message>"}
+{"type":"turn.failed","error":{"message":"<redacted message>"}}

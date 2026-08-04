@@ -49,9 +49,59 @@ first two modes; the shipped enum is exactly `regex`, `jsonPath`, and
 `jsonPathLast`.
 
 Reserved captures `sessionRef`, `model`, and `finalMessage` must be JSON
-strings. `usage` may be structured data for the built-in token meter. Captures
-can enrich query rows, enable resume, and populate an attestation, but they
-cannot claim a verdict, artifact hash, evidence result, charge, or authorship.
+strings. `usage` is the fourth declared capture and holds structured data; it
+is what a normalized usage record is read from. Captures can enrich query rows,
+enable resume, and populate an attestation, but they cannot claim a verdict,
+artifact hash, evidence result, charge, or authorship.
+
+## Usage is normalized at the adapter boundary
+
+Harnesses disagree about token accounting. codex counts cached prompt tokens
+inside the `input_tokens` figure it reports; claude-code reports
+`cache_read_input_tokens` and `cache_creation_input_tokens` beside an
+`input_tokens` figure that excludes both. tally does not learn either shape in
+Rust. A capture may declare a `fields` map from a logical name to the ordered
+candidate paths that carry it inside the captured value — `$` (or the empty
+string) is the captured value itself, anything else is dot-separated object
+keys with numeric segments indexing arrays — and the first candidate that
+resolves to a non-null value wins. Adding a harness is an attrset in
+`nix/lib/adapters.nix`.
+
+The record reads `inputTokens` (input excluding cache), or
+`inputTokensWithCacheRead` where the harness's own figure already contains the
+cache read, plus `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`,
+`reasoningTokens` (nested within output, never added to it), `totalTokens`, and
+`costUsd`. Cost is only ever what the harness reported; tally has no pricing
+table and computes no dollar figure. A total the harness did not state is
+derived from the components and labelled as derived.
+
+`inputTokens` alone is not the cross-harness "fresh input" figure. claude-code's
+cache-write tokens are fresh, uncached prompt tokens its `input_tokens`
+excludes; codex has no cache-write category at all. A consumer comparing
+harnesses adds `inputTokens + cacheWriteTokens`.
+
+Three states are kept apart, and none of them is a zero:
+
+- `not-declared` — the adapter declared no usage scrape;
+- `not-reported` — a usage scrape was declared and the stream carried none;
+- `reported` — the harness reported usage, including when it reported zero.
+
+Only `reported` has a durable seat: it is persisted in the advisory attestation
+ledger beside the raw capture, keyed by task, attempt, and lease epoch. The two
+absences are recorded on the live row, so after a daemon restart they read back
+as a missing field rather than as a stated absence — both are recomputable from
+the adapter configuration, but a consumer counting coverage should treat a
+missing record and a `not-declared` record as the same answer.
+
+`tally query job` renders the record as a `SourcedValue` with
+`advisory-provider-capture` authority and `adapter-scrape` provenance. The
+built-in pool meter reads the same record and charges what it always charged: a
+harness-stated total, else the harness's own input figure plus its output
+figure. A capture with no declared `fields` keeps exactly that legacy reading.
+Two shapes no harness emits — a key present with a JSON `null`, and a
+whole-valued float — now charge a number where the old reader charged nothing;
+both diverge upward, which for a windowed-consumption pool is the conservative
+direction.
 
 An adapter may additionally declare a JSON-lines trace stream. Trace queries
 preserve event order and malformed/unknown payloads as advisory observations;

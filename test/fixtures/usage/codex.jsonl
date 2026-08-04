@@ -1,0 +1,10 @@
+{"type":"thread.started","thread_id":"codex-usage-thread"}
+{"type":"item.completed","item":{"id":"fixture_id","type":"error","message":"<redacted message>"}}
+{"type":"item.completed","item":{"id":"fixture_id","type":"error","message":"<redacted message>"}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"fixture_id","type":"agent_message","text":"<redacted text>"}}
+{"type":"item.completed","item":{"id":"fixture_id","type":"file_change","changes":[{"path":"<redacted path>","kind":"<redacted kind>"},{"path":"<redacted path>","kind":"<redacted kind>"},{"path":"<redacted path>","kind":"<redacted kind>"}],"status":"completed"}}
+{"type":"item.started","item":{"id":"fixture_id","type":"command_execution","command":"<redacted command>","aggregated_output":"<redacted aggregated_output>","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"fixture_id","type":"command_execution","command":"<redacted command>","aggregated_output":"<redacted aggregated_output>","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"fixture_id","type":"agent_message","text":"<redacted text>"}}
+{"type":"turn.completed","usage":{"input_tokens":7060166,"cached_input_tokens":6798080,"cache_write_input_tokens":0,"output_tokens":32842,"reasoning_output_tokens":15163}}
