@@ -8,6 +8,83 @@ authorized.
 
 ### Added
 
+- **The exit recorder fills `charge` and, for GPU-pool jobs, `gpuSeconds` from
+  real systemd cgroup accounting (#382).** These witness fields have existed
+  since the schema was designed but no write path ever set them: `charge` was
+  always `None`, and the daemon's own completion lifecycle event fabricated
+  `gpuSeconds: Some(0.0)` on every job regardless of whether anything was
+  measured. `__record-unit-exit`, run as `ExecStopPost` while the transient
+  unit is still queryable (before `--collect` can garbage-collect it), now
+  issues one `systemctl --user show --property=CPUUsageNSec
+  --property=ExecMainStartTimestampMonotonic
+  --property=ExecMainExitTimestampMonotonic` and embeds the result as a new
+  optional `accounting` field on `UnitExitRecord`. `CPUUsageNSec` becomes the
+  generic per-job `Charge{unit: "cpu-second", amount, class: "measured"}`; the
+  two monotonic timestamps become `gpuSeconds` for a job whose pool
+  **explicitly** declares `resource = "vram"`, measured as systemd's own
+  main-process wall-clock runtime rather than CPU-cgroup time, which would
+  understate a job that mostly waits on the device. That runtime is a lower
+  bound on how long the job actually held the pool's lease, not the lease
+  span itself — the lease is held from admission through completion
+  handling, which strictly contains it, so `gpuSeconds` understates true
+  occupancy by a small, fixed per-job overhead.
+  `witness::canonical_gpu_seconds` (unchanged) now sums a real,
+  non-fabricated figure.
+
+  `resource` is `PoolConfig`'s one field where "declared" and "effective"
+  must be told apart: `ResourceKind::Vram` is `resource`'s own default, so a
+  pool whose config says nothing about `resource` at all — `{"capacity": 4}`
+  — must not read as a GPU pool. `PoolConfig.resource` is now
+  `Option<ResourceKind>`; every admission decision that predates #382 reads
+  the unchanged effective value through the new `PoolConfig::resource()`
+  accessor (`unwrap_or_default()`, still `vram` when undeclared), while
+  `gpuSeconds` is gated on the new `LeaseEngine::declared_resource_kind`,
+  which answers only the narrower question and returns `None` for a pool
+  that declared nothing.
+
+  The NixOS/Home Manager `resource` pool option carries the same
+  distinction: it is now `nullOr (enum [...])` with `default = null`
+  (previously a required-shaped enum defaulting to the string `"vram"`), and
+  the rendered runtime config only emits a `resource` key when the operator
+  set one. Every one of the module's own admission-relevant assertions
+  (mutex shape, budget-gb, windowed-consumption, usage-meter, and the three
+  campaign-pool checks) reads the same defaulted-to-`vram` value they always
+  did, through a new `effectivePoolResource` helper — the Nix-side mirror of
+  `PoolConfig::resource()`. Only `gpuSeconds` sees the narrower, undefaulted
+  reading. A checked-in fixture
+  (`test/fixtures/pools/resource-declaration.golden.json`), re-rendered and
+  diffed on every `nix flake check` (`checks.pool-resource-declaration`) and
+  read back by a Rust test, pins that Nix's rendering and Rust's parsing of
+  it cannot drift apart silently.
+
+  A failed probe — a missing `systemctl`, a nonzero exit, a malformed
+  property — is a typed absence (`accounting: None`) logged to the job's
+  captured stderr, never a fabricated zero and never a reason to fail the
+  exit record itself: accounting is advisory to the verdict. `[not set]`
+  (accounting disabled for a specific property) reads the same way, and so
+  does a monotonic timestamp systemd reports as the literal `0` for a unit
+  that never ran — a real-but-non-obvious sentinel, confirmed against real
+  systemd, that would otherwise mint a `gpuSeconds: Some(0.0)` nobody
+  measured. The new `accounting` field is additive and optional with no
+  schema-version bump: a record an older binary wrote round-trips unchanged,
+  and a fixture pinned to that exact pre-#382 shape proves it.
+
+  `doc/src/reference/witness-format.md` documents both fields' exact
+  semantics: `gpuSeconds` is the declared-pool unit's main-process wall-clock
+  runtime — a lower bound on lease occupancy, not GPU compute time and not
+  an exact occupancy figure; `charge` is whole-cgroup CPU-seconds, including
+  the exit recorder's own overhead (single-digit milliseconds, dominant on
+  very short jobs, proportionally negligible on longer ones) — a known floor
+  left for the eventual billing-aggregation lane to decide whether to
+  subtract.
+
+  Two now-stale sentences in the #381 usage-breakdown documentation
+  (`crates/tally-core/src/usage.rs`, `doc/src/concepts/adapters.md`) said
+  "codex has no cache-write category at all"; #381 itself had already
+  falsified that by declaring codex's `cache_write_input_tokens` key. Both are
+  corrected: codex does declare a cache-write category, observed at 0 on
+  every real capture so far.
+
 - **Per-attempt harness usage is normalized at the adapter boundary and
   persisted (#381).** Raw provider usage objects already landed in the advisory
   attestation ledger, but nothing reconciled them across harness shapes, no

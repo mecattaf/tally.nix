@@ -126,7 +126,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
     let socket = opts.socket.unwrap_or_else(default_socket_path);
     match opts.command {
         Some(Command::RecordUnitExit(args)) => {
-            persist_exit_record_from_env(&args.record, &args.unit)?;
+            persist_exit_record_from_env(&args.record, &args.unit, &args.systemctl)?;
             Ok(())
         }
         Some(Command::RemoteExecutor) => {

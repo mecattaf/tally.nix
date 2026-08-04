@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -1009,6 +1010,18 @@ async fn internal_exit_recorder_is_silent_and_fail_closed() {
     let temp = tempfile::tempdir().unwrap();
     let record = temp.path().join("exit.json");
     let unit = "tally-job-recorder-test.service";
+    // A working accounting probe, so the recorder's happy path stays silent
+    // (#382): silence here is a property of nothing going wrong, not of the
+    // accounting probe being skipped. The probe's own failure-is-logged
+    // behavior is covered by
+    // `crates/tally/tests/record_unit_exit_accounting.rs`.
+    let systemctl = temp.path().join("fake-systemctl-ok");
+    std::fs::write(
+        &systemctl,
+        "#!/bin/sh\necho \"CPUUsageNSec=1000000000\"\necho \"ExecMainStartTimestampMonotonic=0\"\necho \"ExecMainExitTimestampMonotonic=1000000\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700)).unwrap();
     let success = Command::new(env!("CARGO_BIN_EXE_tally"))
         .args([
             "__record-unit-exit",
@@ -1016,6 +1029,8 @@ async fn internal_exit_recorder_is_silent_and_fail_closed() {
             record.to_str().unwrap(),
             "--unit",
             unit,
+            "--systemctl",
+            systemctl.to_str().unwrap(),
         ])
         .env_clear()
         .env("INVOCATION_ID", "recorder-test")
@@ -1032,6 +1047,7 @@ async fn internal_exit_recorder_is_silent_and_fail_closed() {
     assert!(success.stderr.is_empty());
     let json = std::fs::read_to_string(&record).unwrap();
     assert!(json.contains("\"invocationId\":\"recorder-test\""));
+    assert!(json.contains("\"cpuUsageNsec\":1000000000"));
     assert!(json.contains("\"attempt\":1"));
     assert!(json.contains("\"leaseEpoch\":7"));
 

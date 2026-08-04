@@ -1085,6 +1085,7 @@ fn job_result_from_witness(record: &WitnessRecord, executor: &Executor) -> JobRe
         model: record.model.clone(),
         completion: record.completion.clone(),
         stderr_excerpt,
+        gpu_seconds: record.gpu_seconds,
     }
 }
 

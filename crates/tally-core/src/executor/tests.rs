@@ -212,6 +212,7 @@ fn remote_executor(state_dir: &Path, transport: ScriptedRemoteTransport) -> Exec
 fn remote_completion(request: &ExecutionRequest, stdout: &[u8]) -> RemoteCompletion {
     let unit = format!("tally-job-{}.service", request.identity.unit_uuid());
     let record = UnitExitRecord {
+        accounting: None,
         schema_version: UNIT_EXIT_SCHEMA_VERSION,
         unit: unit.clone(),
         invocation_id: "remote-invocation".to_owned(),
@@ -1816,6 +1817,7 @@ async fn matching_durable_exit_is_adopted_without_reexecution() {
     std::fs::write(&paths.failure_stderr, b"legacy adapter stderr").unwrap();
     let unit = base.unit_name(&request.identity);
     let record = UnitExitRecord {
+        accounting: None,
         schema_version: UNIT_EXIT_SCHEMA_VERSION,
         unit: unit.clone(),
         invocation_id: "completed-invocation".to_owned(),
@@ -1877,6 +1879,7 @@ async fn adoption_waits_through_exit_record_visibility_race() {
     std::fs::write(&paths.stdout, b"retained-output").unwrap();
     let unit = base.unit_name(&request.identity);
     let record = UnitExitRecord {
+        accounting: None,
         schema_version: UNIT_EXIT_SCHEMA_VERSION,
         unit: unit.clone(),
         invocation_id: "recovered-invocation".to_owned(),
@@ -1948,6 +1951,7 @@ async fn loaded_prior_exit_blocks_represent_before_capture_truncation() {
     std::fs::write(&paths.stderr, b"preserve-completed-err").unwrap();
     let unit = base.unit_name(&request.identity);
     let record = UnitExitRecord {
+        accounting: None,
         schema_version: UNIT_EXIT_SCHEMA_VERSION,
         unit: unit.clone(),
         invocation_id: "prior-invocation".to_owned(),
@@ -2021,6 +2025,7 @@ fn systemd_probe_executes_user_show_and_correlates_rowless_exit() {
 
     let paths = executor.prepare_paths(&request.identity).unwrap();
     let record = UnitExitRecord {
+        accounting: None,
         schema_version: UNIT_EXIT_SCHEMA_VERSION,
         unit: unit.clone(),
         invocation_id: "durable-invocation".to_owned(),
@@ -2389,6 +2394,7 @@ fn malformed_mismatched_and_missing_exit_records_fail_closed() {
     std::fs::write(&path, b"{").unwrap();
     assert!(read_exit_record(&path, "unit.service").is_err());
     let record = UnitExitRecord {
+        accounting: None,
         schema_version: UNIT_EXIT_SCHEMA_VERSION,
         unit: "other.service".to_owned(),
         invocation_id: "id".to_owned(),
@@ -2410,6 +2416,7 @@ fn malformed_mismatched_and_missing_exit_records_fail_closed() {
 
     for invalid in [
         UnitExitRecord {
+            accounting: None,
             schema_version: UNIT_EXIT_SCHEMA_VERSION,
             unit: "unit.service".to_owned(),
             invocation_id: "id".to_owned(),
@@ -2420,6 +2427,7 @@ fn malformed_mismatched_and_missing_exit_records_fail_closed() {
             exit_status: Some("0".to_owned()),
         },
         UnitExitRecord {
+            accounting: None,
             schema_version: UNIT_EXIT_SCHEMA_VERSION,
             unit: "unit.service".to_owned(),
             invocation_id: "id".to_owned(),
@@ -2430,6 +2438,7 @@ fn malformed_mismatched_and_missing_exit_records_fail_closed() {
             exit_status: Some("0".to_owned()),
         },
         UnitExitRecord {
+            accounting: None,
             schema_version: UNIT_EXIT_SCHEMA_VERSION,
             unit: "unit.service".to_owned(),
             invocation_id: "id".to_owned(),
@@ -2445,6 +2454,7 @@ fn malformed_mismatched_and_missing_exit_records_fail_closed() {
     }
 
     let realtime_signal = UnitExitRecord {
+        accounting: None,
         schema_version: UNIT_EXIT_SCHEMA_VERSION,
         unit: "unit.service".to_owned(),
         invocation_id: "id".to_owned(),
@@ -2490,6 +2500,7 @@ fn startup_failure_without_main_process_metadata_is_durable() {
     assert!(json.contains("\"exitStatus\":null"));
 
     let protocol = UnitExitRecord {
+        accounting: None,
         schema_version: UNIT_EXIT_SCHEMA_VERSION,
         unit: "unit.service".to_owned(),
         invocation_id: "id".to_owned(),
@@ -2508,6 +2519,7 @@ fn startup_failure_without_main_process_metadata_is_durable() {
 #[test]
 fn timeout_records_map_to_runtime_exceeded() {
     let record = UnitExitRecord {
+        accounting: None,
         schema_version: UNIT_EXIT_SCHEMA_VERSION,
         unit: "unit.service".to_owned(),
         invocation_id: "id".to_owned(),
@@ -2963,4 +2975,198 @@ fn hardening_presets_grant_the_capture_lock_directory_only_where_documented() {
             lock.display()
         );
     }
+}
+
+#[test]
+fn parse_unit_accounting_reads_all_three_properties() {
+    let accounting = parse_unit_accounting(
+        "unit.service",
+        b"CPUUsageNSec=1500000000\n\
+          ExecMainStartTimestampMonotonic=1000000\n\
+          ExecMainExitTimestampMonotonic=3500000\n",
+    )
+    .unwrap();
+    assert_eq!(accounting.cpu_usage_nsec, Some(1_500_000_000));
+    assert_eq!(accounting.exec_main_start_monotonic_usec, Some(1_000_000));
+    assert_eq!(accounting.exec_main_exit_monotonic_usec, Some(3_500_000));
+    assert_eq!(accounting.cpu_seconds(), Some(1.5));
+    assert_eq!(accounting.wall_seconds(), Some(2.5));
+}
+
+#[test]
+fn parse_unit_accounting_treats_not_set_as_typed_absence() {
+    let accounting = parse_unit_accounting(
+        "unit.service",
+        b"CPUUsageNSec=[not set]\n\
+          ExecMainStartTimestampMonotonic=[not set]\n\
+          ExecMainExitTimestampMonotonic=[not set]\n",
+    )
+    .unwrap();
+    assert_eq!(accounting, UnitAccounting::default());
+    assert_eq!(accounting.cpu_seconds(), None);
+    assert_eq!(accounting.wall_seconds(), None);
+}
+
+/// LOW-1 (post-merge eval repair): `systemctl show` reports the monotonic
+/// timestamps of a unit it never ran as the literal `0`, not `[not set]` —
+/// confirmed against real systemd. Left unhandled, `wall_seconds()` would
+/// return `Some(0.0)`, a zero nobody measured, for exactly the shape
+/// acceptance bullet 4 forbids. `CPUUsageNSec=[not set]` in this same
+/// output is the real "never measured" marker for that property; `0` is
+/// only special-cased for the two timestamps.
+#[test]
+fn parse_unit_accounting_treats_a_zero_monotonic_timestamp_as_never_measured() {
+    let accounting = parse_unit_accounting(
+        "unit.service",
+        b"CPUUsageNSec=[not set]\n\
+          ExecMainStartTimestampMonotonic=0\n\
+          ExecMainExitTimestampMonotonic=0\n",
+    )
+    .unwrap();
+    assert_eq!(accounting.exec_main_start_monotonic_usec, None);
+    assert_eq!(accounting.exec_main_exit_monotonic_usec, None);
+    assert_eq!(
+        accounting.wall_seconds(),
+        None,
+        "a unit that never ran must never mint a measured-looking zero"
+    );
+}
+
+/// A genuinely zero `CPUUsageNSec` is a plausible real measurement (an
+/// exceptionally fast unit), unlike the two timestamps, so it is not
+/// special-cased the same way.
+#[test]
+fn parse_unit_accounting_keeps_a_real_zero_cpu_measurement() {
+    let accounting = parse_unit_accounting(
+        "unit.service",
+        b"CPUUsageNSec=0\n\
+          ExecMainStartTimestampMonotonic=100\n\
+          ExecMainExitTimestampMonotonic=200\n",
+    )
+    .unwrap();
+    assert_eq!(accounting.cpu_usage_nsec, Some(0));
+    assert_eq!(accounting.cpu_seconds(), Some(0.0));
+}
+
+#[test]
+fn parse_unit_accounting_never_computes_negative_wall_seconds_from_a_backwards_clock() {
+    // Timestamps out of order are not something a real systemd emits, but a
+    // parser that trusted them anyway would produce a nonsensical charge
+    // rather than a typed absence. `checked_sub` inside `wall_seconds` is
+    // exactly the guard this pins.
+    let accounting = parse_unit_accounting(
+        "unit.service",
+        b"CPUUsageNSec=[not set]\n\
+          ExecMainStartTimestampMonotonic=5000\n\
+          ExecMainExitTimestampMonotonic=1000\n",
+    )
+    .unwrap();
+    assert_eq!(accounting.wall_seconds(), None);
+}
+
+#[test]
+fn parse_unit_accounting_rejects_malformed_and_unexpected_output() {
+    assert!(parse_unit_accounting("unit.service", b"CPUUsageNSec=not-a-number\n").is_err());
+    assert!(parse_unit_accounting("unit.service", b"not a line at all\n").is_err());
+    assert!(parse_unit_accounting("unit.service", b"SomeOtherProperty=1\n").is_err());
+    assert!(parse_unit_accounting("unit.service", b"CPUUsageNSec=1\nCPUUsageNSec=2\n").is_err());
+}
+
+#[test]
+fn probe_unit_accounting_reports_a_typed_error_on_nonzero_exit() {
+    let temp = tempfile::tempdir().unwrap();
+    let systemctl = temp.path().join("fake-systemctl-fail");
+    write_fake_program(&systemctl, "exit 1\n");
+    assert!(probe_unit_accounting(&systemctl, "unit.service").is_err());
+}
+
+#[test]
+fn probe_unit_accounting_reports_a_typed_error_when_the_binary_is_missing() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing = temp.path().join("does-not-exist");
+    assert!(probe_unit_accounting(&missing, "unit.service").is_err());
+}
+
+#[test]
+fn probe_unit_accounting_issues_exactly_one_systemctl_show_with_the_accounting_properties() {
+    let temp = tempfile::tempdir().unwrap();
+    let systemctl = temp.path().join("fake-systemctl-accounting");
+    let calls = temp.path().join("calls.txt");
+    write_fake_program(
+        &systemctl,
+        &format!(
+            r#"printf '%s\n' "$*" >> {calls}
+echo "CPUUsageNSec=2000000000"
+echo "ExecMainStartTimestampMonotonic=100"
+echo "ExecMainExitTimestampMonotonic=100100"
+"#,
+            calls = calls.display()
+        ),
+    );
+    let accounting = probe_unit_accounting(&systemctl, "tally-job-example.service").unwrap();
+    assert_eq!(accounting.cpu_seconds(), Some(2.0));
+    assert_eq!(accounting.wall_seconds(), Some(0.1));
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert_eq!(
+        calls.lines().count(),
+        1,
+        "expected exactly one systemctl invocation, got: {calls:?}"
+    );
+    assert!(calls.contains("--user show"));
+    assert!(calls.contains("--property=CPUUsageNSec"));
+    assert!(calls.contains("--property=ExecMainStartTimestampMonotonic"));
+    assert!(calls.contains("--property=ExecMainExitTimestampMonotonic"));
+    assert!(calls.contains("tally-job-example.service"));
+}
+
+fn write_fake_program(path: &Path, body: &str) {
+    std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
+    let mut permissions = std::fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(path, permissions).unwrap();
+}
+
+/// An `N-1` fixture: the exact `UnitExitRecord` shape written before #382,
+/// with no `accounting` field in the JSON at all. A binary that gained the
+/// field must still read a record an older binary wrote.
+#[test]
+fn a_pre_382_exit_record_with_no_accounting_field_still_parses() {
+    let json = format!(
+        r#"{{"schemaVersion":{version},"unit":"unit.service","invocationId":"id","attempt":1,"leaseEpoch":1,"serviceResult":"success","exitCode":"exited","exitStatus":"0"}}"#,
+        version = UNIT_EXIT_SCHEMA_VERSION
+    );
+    let record: UnitExitRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(record.accounting, None);
+    record.validate("unit.service").unwrap();
+
+    // And the round trip: a record this binary writes with no measured
+    // accounting serializes exactly like the pre-#382 shape, so a fleet mid
+    // rollout never disagrees about what "unmeasured" looks like on disk.
+    assert!(!serde_json::to_string(&record)
+        .unwrap()
+        .contains("accounting"));
+}
+
+#[test]
+fn a_record_with_a_measured_accounting_sample_round_trips() {
+    let record = UnitExitRecord {
+        schema_version: UNIT_EXIT_SCHEMA_VERSION,
+        unit: "unit.service".to_owned(),
+        invocation_id: "id".to_owned(),
+        attempt: 1,
+        lease_epoch: 1,
+        service_result: "success".to_owned(),
+        exit_code: Some("exited".to_owned()),
+        exit_status: Some("0".to_owned()),
+        accounting: Some(UnitAccounting {
+            cpu_usage_nsec: Some(1_500_000_000),
+            exec_main_start_monotonic_usec: Some(1_000_000),
+            exec_main_exit_monotonic_usec: Some(3_500_000),
+        }),
+    };
+    record.validate("unit.service").unwrap();
+    let json = serde_json::to_string(&record).unwrap();
+    assert!(json.contains("\"cpuUsageNsec\":1500000000"));
+    let round_tripped: UnitExitRecord = serde_json::from_str(&json).unwrap();
+    assert_eq!(round_tripped, record);
 }

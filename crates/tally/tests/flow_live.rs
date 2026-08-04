@@ -172,7 +172,7 @@ impl RunningDaemon {
 
 fn config() -> Config {
     let pool = |resource| PoolConfig {
-        resource,
+        resource: Some(resource),
         capacity: 8,
         predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
         ..PoolConfig::default()
@@ -2493,7 +2493,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 config.pools.insert(
                     name.to_owned(),
                     PoolConfig {
-                        resource,
+                        resource: Some(resource),
                         capacity,
                         predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                         ..PoolConfig::default()
@@ -4546,7 +4546,7 @@ async fn spec_build_continuation_event_admits_one_pass_and_attaches_the_duplicat
             config.pools.insert(
                 "fixture-campaign".to_owned(),
                 PoolConfig {
-                    resource: ResourceKind::Mutex,
+                    resource: Some(ResourceKind::Mutex),
                     capacity: 1,
                     predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                     ..PoolConfig::default()

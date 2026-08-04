@@ -885,6 +885,8 @@ impl Executor {
             record.as_os_str(),
             OsStr::new("--unit"),
             OsStr::new(unit),
+            OsStr::new("--systemctl"),
+            self.systemctl.as_os_str(),
         ]
         .into_iter()
         .map(quote_systemd_exec_word)
@@ -1090,6 +1092,7 @@ impl Executor {
                             source,
                         })?;
                     let record = UnitExitRecord {
+                        accounting: None,
                         schema_version: UNIT_EXIT_SCHEMA_VERSION,
                         unit: self.unit_name(&request.identity),
                         invocation_id,

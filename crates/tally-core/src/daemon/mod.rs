@@ -26,10 +26,11 @@ pub(crate) use barriers::{await_registration, parse_job_barrier, single_job_barr
 use completion::execution_request;
 use completion::hash_job_token;
 use completion::{
-    append_context_witness, append_daemon_witness, canonical_job_model, canonical_verdict,
-    completed_event, effective_gate_manifest, enqueued_event, execution_fact_for_termination,
-    finalize_forced_locked, forced_witness, lock_gcroot_registration, release_child_charge,
-    substituted_witness, GhTerminalWork, TerminalWork,
+    accounting_witness_fields, append_context_witness, append_daemon_witness, canonical_job_model,
+    canonical_verdict, completed_event, effective_gate_manifest, enqueued_event,
+    execution_fact_for_termination, finalize_forced_locked, forced_witness,
+    lock_gcroot_registration, release_child_charge, substituted_witness, GhTerminalWork,
+    TerminalWork,
 };
 use completion::{append_orphan_attestation, append_orphan_retraction, gh_completion_id};
 pub(crate) use notify::WatchdogKeepalive;
@@ -98,7 +99,7 @@ use crate::completion::{
     evaluate_completion, ExecutionFact, ExecutionStatus, GateManifestSpec, GateSummaryStatus,
     SemanticCompletion,
 };
-use crate::config::{Config, GitAiConfig, PoolPredicate, Priority};
+use crate::config::{Config, GitAiConfig, PoolPredicate, Priority, ResourceKind};
 use crate::evidence::{
     parse_evidence_specs, probe_dedup, probe_full_pass, run_evidence_gate, CheckOutcome,
     DedupMissReason, RetryTrigger, RunOutcome,
@@ -106,7 +107,7 @@ use crate::evidence::{
 use crate::exec_attestation::ExecAttestationContext;
 use crate::executor::{
     ExecutionIdentity, ExecutionOutcome, ExecutionRequest, ExecutionTermination, Executor,
-    ExecutorError, UnitLimits, Uuid,
+    ExecutorError, UnitAccounting, UnitLimits, Uuid,
 };
 use crate::flow_lineage::{
     canonical_flow_run_id, record_supersede, FlowLineage, FlowLineageError, PredecessorPins,
@@ -167,7 +168,7 @@ use crate::wire::{
     WireError, WireErrorCode, WireIoError,
 };
 use crate::witness::{
-    current_host_id, read_verified_attestations, read_verified_records, AttestationLedger,
+    current_host_id, read_verified_attestations, read_verified_records, AttestationLedger, Charge,
     Derivation, LaborClass, Verdict, WitnessBody, WitnessError, WitnessLedger, WitnessRecord,
 };
 
@@ -412,6 +413,11 @@ pub struct JobResult {
     pub model: Option<String>,
     pub completion: Option<SemanticCompletion>,
     pub stderr_excerpt: Option<crate::executor::CaptureExcerpt>,
+    /// The same value just appended to the witness record: `None` unless
+    /// this attempt actually measured a declared GPU pool's main-process
+    /// runtime. Carried here so the completion lifecycle event can report it
+    /// truthfully instead of inventing a zero.
+    pub gpu_seconds: Option<f64>,
 }
 
 impl JobResult {

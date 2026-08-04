@@ -43,7 +43,7 @@ The known top-level fields have this order and shape:
 | `artifactContentHash` | no | Lowercase `sha256:` plus 64 hexadecimal digits. |
 | `storePaths` | no | Non-empty byte-ascending, unique array of valid Nix store paths. |
 | `drv` | no | `{drvPath, outputs:[{name,path}, ...]}`; output names are sorted and unique. |
-| `gpuSeconds` | no | Finite number observed for GPU use. |
+| `gpuSeconds` | no | Finite, non-negative seconds the unit's main process ran, for a **declared** `vram`-resource pool (see below); a lower bound on lease occupancy, not GPU compute time. |
 | `wallClock` | yes | Finite, non-negative seconds. |
 | `attempt` | yes | Positive integer. |
 | `leaseEpoch` | yes | Positive integer. |
@@ -57,7 +57,7 @@ The known top-level fields have this order and shape:
 | `pools` | yes | Non-empty canonical sorted array, even for a single pool. |
 | `executor` | no | Safe configured executor name. |
 | `hostId` | no | Bounded execution-host identifier. |
-| `charge` | no | `{unit, amount, class}` resource charge. |
+| `charge` | no | `{unit, amount, class}` resource charge — cgroup CPU-seconds, including tally's own exit recorder (see below). |
 | `model` | no | Canonical model observation, where one is trustworthy enough to witness. |
 | `evidenceClass` | no | Opaque evidence classification, hash-covered. |
 | `manifestHash` | no | Opaque manifest identity, hash-covered. |
@@ -91,6 +91,35 @@ substituted
 `laborClass: "substituted"`. Both require `exitCode: 0`. A substituted derivation record is
 stricter still: it has task/store/derivation evidence, attempt and lease epoch 1, zero wall
 clock, the `build` pool, and no artifact hash, GPU use, or charge.
+
+### What `gpuSeconds` and `charge` measure
+
+Both are filled by the exit recorder from one `systemctl show` of cgroup accounting
+properties, issued while the transient unit is still queryable
+(`ExecStopPost`, before `--collect` can garbage-collect it). Neither field observes a GPU;
+there is no vendor-neutral GPU accounting in systemd to read.
+
+`gpuSeconds` is the unit's **main-process wall-clock runtime**
+(`ExecMainExitTimestampMonotonic − ExecMainStartTimestampMonotonic`), for a pool the operator
+explicitly configured `resource = "vram"` — a job holding that pool while idle bills the same
+as one saturating the device. It is deliberately not CPU-cgroup time, which would understate a
+GPU-bound job that spends most of its wall clock waiting on the device. It is a **lower bound**
+on how long the job actually held the pool's lease, not the lease span itself: the lease is
+held from admission through completion handling, which strictly contains the main process's
+lifetime, so `gpuSeconds` understates true occupancy by a fixed per-job overhead — in the
+same reassuring-shortfall direction as `charge`'s recorder floor below. It is gated on the
+pool's *declared* resource, not the default: a pool whose config omits `resource` entirely
+never carries `gpuSeconds`, even though `vram` is `resource`'s default value for every other
+admission decision. Saying nothing about a pool's resource is not the same fact as declaring
+it a GPU pool.
+
+`charge` is the unit's whole-cgroup `CPUUsageNSec`, converted to seconds, for any pool
+regardless of resource kind. Because the exit recorder itself runs inside that cgroup as
+`ExecStopPost`, the figure includes the recorder's own CPU and the `systemctl` subprocess it
+spawns — a fixed overhead on the order of single-digit milliseconds, which dominates the
+charge on very short jobs and is proportionally negligible on longer ones. Nothing in the
+tree aggregates `charge` into a bill yet; the lane that does should decide whether to
+subtract a recorder baseline or state this as the number's known floor.
 
 ### Nested origin
 

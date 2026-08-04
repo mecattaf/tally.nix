@@ -431,6 +431,12 @@ pub(super) struct RecordUnitExitArgs {
     pub(super) record: PathBuf,
     #[arg(long)]
     pub(super) unit: String,
+    /// The `systemctl` program the accounting probe invokes. Defaults to
+    /// resolving `systemctl` on `PATH`; overridable so a test double can
+    /// stand in for the real binary the way `Executor::with_systemctl`
+    /// already lets the daemon's own liveness probe be faked.
+    #[arg(long, value_name = "PATH", default_value = "systemctl")]
+    pub(super) systemctl: PathBuf,
 }
 
 #[derive(Debug, Subcommand)]

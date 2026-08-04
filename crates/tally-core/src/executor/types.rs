@@ -258,6 +258,62 @@ pub struct ExecutionOutcome {
     pub captures_available: bool,
 }
 
+/// Cgroup accounting properties read from a single `systemctl show` issued by
+/// the exit recorder while the unit is still queryable (`ExecStopPost` runs
+/// before the transient unit is garbage-collected). Every field is the raw
+/// systemd property, in the units systemd reports it — nanoseconds and
+/// microseconds — so a value that was never measured stays a typed absence
+/// instead of a rounded, invented float. Seconds are derived at the point a
+/// witness charge is built, never stored here.
+///
+/// `Eq` matters here, not just `PartialEq`: `LocalUnitFact` and its
+/// containers derive it, and an `f64` field would silently make that
+/// impossible to satisfy correctly (`NaN != NaN`). Keeping every field an
+/// integer keeps the whole containment chain honestly comparable.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct UnitAccounting {
+    /// `CPUUsageNSec`. Absent when `CPUAccounting=` is off for the unit, or
+    /// when the probe itself failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_usage_nsec: Option<u64>,
+    /// `ExecMainStartTimestampMonotonic`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_main_start_monotonic_usec: Option<u64>,
+    /// `ExecMainExitTimestampMonotonic`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_main_exit_monotonic_usec: Option<u64>,
+}
+
+impl UnitAccounting {
+    /// CPU-seconds consumed by the unit's cgroup, the generic resource charge
+    /// for any job regardless of which pool it ran in.
+    #[must_use]
+    pub fn cpu_seconds(self) -> Option<f64> {
+        self.cpu_usage_nsec
+            .map(|nsec| nsec as f64 / 1_000_000_000.0)
+    }
+
+    /// Wall-clock seconds the unit's main process actually ran
+    /// (`ExecMainExitTimestampMonotonic − ExecMainStartTimestampMonotonic`),
+    /// measured by systemd's own monotonic clock rather than the daemon's
+    /// dispatch-side `Instant`. For a job that held a `vram`-resource pool
+    /// this is "GPU-seconds" — but it is the main process's runtime, a
+    /// **lower bound** on how long the job actually held the pool lease, not
+    /// the lease span itself: the lease is held from admission through
+    /// completion handling, which strictly contains this window. It is still
+    /// the right quantity to prefer over CPU-cgroup time (which would
+    /// understate a GPU job that is mostly waiting on the device by a much
+    /// larger, unbounded margin), just not an exact occupancy figure.
+    #[must_use]
+    pub fn wall_seconds(self) -> Option<f64> {
+        let start = self.exec_main_start_monotonic_usec?;
+        let exit = self.exec_main_exit_monotonic_usec?;
+        let usec = exit.checked_sub(start)?;
+        Some(usec as f64 / 1_000_000.0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UnitExitRecord {
@@ -269,6 +325,13 @@ pub struct UnitExitRecord {
     pub service_result: String,
     pub exit_code: Option<String>,
     pub exit_status: Option<String>,
+    /// Best-effort cgroup accounting, filled by the exit recorder from one
+    /// `systemctl show` call. `None` covers both "the probe never ran" (a
+    /// pre-#382 record) and "the probe ran and failed" — the failure is
+    /// logged to the job's captured stderr at the point it happens, and this
+    /// field never carries a value nobody measured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accounting: Option<UnitAccounting>,
 }
 
 impl UnitExitRecord {

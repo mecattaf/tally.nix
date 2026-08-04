@@ -59,7 +59,7 @@ fn config() -> Config {
         pools: BTreeMap::from([(
             "soak-slot".to_owned(),
             PoolConfig {
-                resource: ResourceKind::BuildSlot,
+                resource: Some(ResourceKind::BuildSlot),
                 predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                 ..PoolConfig::default()
             },

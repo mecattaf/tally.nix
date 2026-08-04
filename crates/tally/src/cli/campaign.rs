@@ -1657,7 +1657,7 @@ fn validate_host(
         }
     }
     let runner = &config.pools[&graph.manifest.pool];
-    if runner.resource != ResourceKind::Mutex || runner.capacity != 1 {
+    if runner.resource() != ResourceKind::Mutex || runner.capacity != 1 {
         return Err(invalid(format!(
             "campaign runner pool {:?} must be a capacity-1 mutex",
             graph.manifest.pool

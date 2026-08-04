@@ -358,8 +358,15 @@ pub struct UsageMeterConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct PoolConfig {
+    /// `None` when the operator declared no `resource` at all, distinct
+    /// from `Some(ResourceKind::Vram)`. `ResourceKind::Vram` is the
+    /// *effective* default for every admission decision that predates
+    /// #382 (see [`PoolConfig::resource`]) — but a witness fact that reads
+    /// "this job held a GPU pool" must not be derivable from an operator
+    /// saying nothing, so #382's `gpuSeconds` gate keys off this field
+    /// directly and only ever fires on an explicit `Some(Vram)`.
     #[serde(default)]
-    pub resource: ResourceKind,
+    pub resource: Option<ResourceKind>,
     #[serde(default = "default_capacity")]
     pub capacity: u32,
     #[serde(default)]
@@ -383,7 +390,7 @@ pub struct PoolConfig {
 impl Default for PoolConfig {
     fn default() -> Self {
         Self {
-            resource: ResourceKind::default(),
+            resource: None,
             capacity: default_capacity(),
             budget_gb: None,
             predicate: PoolPredicate::default(),
@@ -398,9 +405,18 @@ impl Default for PoolConfig {
 }
 
 impl PoolConfig {
+    /// The effective resource kind for admission and every other decision
+    /// this pool's shape drives — unchanged by #382. An undeclared
+    /// `resource` reads as `ResourceKind::default()` (`vram`) here exactly
+    /// as it always has; this is deliberately the *wide* reading, not the
+    /// narrow one `gpuSeconds` gates on (see the field doc).
+    pub fn resource(&self) -> ResourceKind {
+        self.resource.unwrap_or_default()
+    }
+
     pub fn auto_resume_enabled(&self) -> bool {
         self.auto_resume
-            .unwrap_or(matches!(self.resource, ResourceKind::Vram))
+            .unwrap_or(self.resource() == ResourceKind::Vram)
     }
 }
 
@@ -690,24 +706,24 @@ impl Config {
                 if window.window_sec == 0 || window.consumption_cap == 0 {
                     return Err(ConfigError::InvalidWindow { pool: name.clone() });
                 }
-                if pool.resource != ResourceKind::Budget {
+                if pool.resource() != ResourceKind::Budget {
                     return Err(ConfigError::InvalidWindowResource { pool: name.clone() });
                 }
             }
-            if pool.resource == ResourceKind::Mutex
+            if pool.resource() == ResourceKind::Mutex
                 && (pool.capacity != 1 || !matches!(pool.predicate, PoolPredicate::CoResidency(_)))
             {
                 return Err(ConfigError::InvalidMutex { pool: name.clone() });
             }
             if pool.budget_gb.is_some()
-                && (pool.resource != ResourceKind::Vram
+                && (pool.resource() != ResourceKind::Vram
                     || pool.capacity <= 1
                     || !matches!(pool.predicate, PoolPredicate::CoResidency(_)))
             {
                 return Err(ConfigError::InvalidBudgetGb { pool: name.clone() });
             }
             if let Some(meter) = &pool.usage_meter {
-                if pool.resource != ResourceKind::Budget
+                if pool.resource() != ResourceKind::Budget
                     || !matches!(pool.predicate, PoolPredicate::WindowedConsumption(_))
                 {
                     return Err(ConfigError::InvalidUsageMeterPool { pool: name.clone() });
@@ -755,7 +771,7 @@ impl Config {
                     detail: format!("workloadMutex references unknown pool {mutex_name:?}"),
                 });
             };
-            if pool.resource != ResourceKind::Mutex
+            if pool.resource() != ResourceKind::Mutex
                 || pool.capacity != 1
                 || !matches!(pool.predicate, PoolPredicate::CoResidency(_))
             {
@@ -1159,7 +1175,8 @@ mod tests {
         config.validate().unwrap();
 
         let pool = &config.pools["codex-window"];
-        assert_eq!(pool.resource, ResourceKind::Slot);
+        assert_eq!(pool.resource, Some(ResourceKind::Slot));
+        assert_eq!(pool.resource(), ResourceKind::Slot);
         assert_eq!(pool.capacity, 16);
         assert!(matches!(pool.predicate, PoolPredicate::CoResidency(_)));
         assert_eq!(
@@ -1383,5 +1400,37 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unknown executor"));
+    }
+
+    /// The pinned cross-language vector for #382's HIGH-1 repair.
+    ///
+    /// `test/fixtures/pools/resource-declaration.golden.json` is rendered by
+    /// `nix/modules/common.nix`'s `mkRuntimeConfig`/`renderPool` from a
+    /// pool that declares no `resource` and one that declares `"vram"`
+    /// explicitly (`.#checks.<system>.pool-resource-declaration` re-renders
+    /// it live and `cmp`s against this exact file, so Nix's rendering and
+    /// this fixture cannot drift apart silently). This test pins the other
+    /// half of the contract: that `PoolConfig`'s `Deserialize` reads that
+    /// exact rendered shape the way #382 requires — an absent `resource`
+    /// key as `None` (undeclared), never as `Some(Vram)` by way of
+    /// defaulting, and a present `"vram"` key as `Some(Vram)` (declared).
+    #[test]
+    fn pool_config_reads_the_nix_rendered_declared_vs_undeclared_fixture_correctly() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test/fixtures/pools/resource-declaration.golden.json");
+        let rendered: BTreeMap<String, PoolConfig> =
+            serde_json::from_str(&std::fs::read_to_string(fixture).unwrap()).unwrap();
+
+        let undeclared = &rendered["undeclared"];
+        assert_eq!(undeclared.resource, None);
+        assert_eq!(
+            undeclared.resource(),
+            ResourceKind::Vram,
+            "the effective admission reading stays vram, unchanged by #382"
+        );
+
+        let declared = &rendered["declared"];
+        assert_eq!(declared.resource, Some(ResourceKind::Vram));
+        assert_eq!(declared.resource(), ResourceKind::Vram);
     }
 }

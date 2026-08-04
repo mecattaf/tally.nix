@@ -35,7 +35,8 @@ mod tests {
         GH_CONTEXT_SCHEMA_VERSION, GH_ORIGIN_SCHEMA_VERSION,
     };
     use crate::witness::{
-        append_attestation, verify_attestations, Authorship, AuthorshipSession, AuthorshipStatus,
+        append_attestation, canonical_gpu_seconds, counts_toward_canonical_gpu_seconds,
+        verify_attestations, Authorship, AuthorshipSession, AuthorshipStatus,
     };
     use tally_client::RpcClient;
 
@@ -168,7 +169,7 @@ mod tests {
             pools: BTreeMap::from([(
                 "slot".to_owned(),
                 PoolConfig {
-                    resource: ResourceKind::BuildSlot,
+                    resource: Some(ResourceKind::BuildSlot),
                     predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                     ..PoolConfig::default()
                 },
@@ -188,7 +189,7 @@ mod tests {
         config.pools.insert(
             "zeta".to_owned(),
             PoolConfig {
-                resource: ResourceKind::BuildSlot,
+                resource: Some(ResourceKind::BuildSlot),
                 predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                 ..PoolConfig::default()
             },
@@ -201,7 +202,7 @@ mod tests {
             pools: BTreeMap::from([(
                 "api".to_owned(),
                 PoolConfig {
-                    resource: ResourceKind::Budget,
+                    resource: Some(ResourceKind::Budget),
                     predicate: PoolPredicate::WindowedConsumption(
                         crate::config::WindowedConsumptionPredicate {
                             window_sec: 60,
@@ -294,6 +295,7 @@ mod tests {
                         RemoteCompletion {
                             unit: unit.clone(),
                             record: UnitExitRecord {
+                                accounting: None,
                                 schema_version: UNIT_EXIT_SCHEMA_VERSION,
                                 unit,
                                 invocation_id: "remote-long-job".to_owned(),
@@ -382,6 +384,7 @@ mod tests {
                         RemoteExecutorResult::Completion(Box::new(RemoteCompletion {
                             unit: unit.clone(),
                             record: UnitExitRecord {
+                                accounting: None,
                                 schema_version: UNIT_EXIT_SCHEMA_VERSION,
                                 unit,
                                 invocation_id: expected_invocation_id,
@@ -1450,6 +1453,51 @@ mod tests {
     }
 
     #[test]
+    fn accounting_witness_fields_charges_cpu_seconds_regardless_of_pool() {
+        let accounting = UnitAccounting {
+            cpu_usage_nsec: Some(2_500_000_000),
+            exec_main_start_monotonic_usec: Some(1_000_000),
+            exec_main_exit_monotonic_usec: Some(4_500_000),
+        };
+        let (charge, gpu_seconds) = accounting_witness_fields(Some(accounting), false);
+        assert_eq!(
+            charge,
+            Some(Charge {
+                unit: "cpu-second".to_owned(),
+                amount: 2.5,
+                class_name: "measured".to_owned(),
+            })
+        );
+        assert_eq!(gpu_seconds, None, "not a GPU-pool job");
+    }
+
+    #[test]
+    fn accounting_witness_fields_fills_gpu_seconds_only_for_a_gpu_pool_job() {
+        let accounting = UnitAccounting {
+            cpu_usage_nsec: Some(2_500_000_000),
+            exec_main_start_monotonic_usec: Some(1_000_000),
+            exec_main_exit_monotonic_usec: Some(4_500_000),
+        };
+        let (charge, gpu_seconds) = accounting_witness_fields(Some(accounting), true);
+        assert_eq!(charge.map(|charge| charge.amount), Some(2.5));
+        assert_eq!(
+            gpu_seconds,
+            Some(3.5),
+            "main-process wall-clock runtime, not CPU time"
+        );
+    }
+
+    #[test]
+    fn accounting_witness_fields_never_fabricates_a_zero_when_unmeasured() {
+        let (charge, gpu_seconds) = accounting_witness_fields(None, true);
+        assert_eq!(charge, None);
+        assert_eq!(gpu_seconds, None);
+        let (charge, gpu_seconds) = accounting_witness_fields(None, false);
+        assert_eq!(charge, None);
+        assert_eq!(gpu_seconds, None);
+    }
+
+    #[test]
     fn retryable_accept_errors_are_explicit() {
         for errno in [libc::EMFILE, libc::ENFILE, libc::ECONNABORTED, libc::EINTR] {
             assert!(retryable_accept_error(&io::Error::from_raw_os_error(errno)));
@@ -1895,7 +1943,7 @@ mod tests {
         config.pools.insert(
             "build".to_owned(),
             PoolConfig {
-                resource: ResourceKind::BuildSlot,
+                resource: Some(ResourceKind::BuildSlot),
                 predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                 ..PoolConfig::default()
             },
@@ -3475,6 +3523,7 @@ mod tests {
                 write_exit_record(
                     &executor.paths(&identity).exit_record,
                     &UnitExitRecord {
+                        accounting: None,
                         schema_version: crate::executor::UNIT_EXIT_SCHEMA_VERSION,
                         unit: executor.unit_name(&identity),
                         invocation_id: "recorded-before-startup".to_owned(),
@@ -3689,6 +3738,7 @@ mod tests {
                 row.adapter = "codex".to_owned();
                 row.gh_origin = Some(gh_test_origin("item-1", GhItemType::Issue));
                 let result = JobResult {
+                    gpu_seconds: None,
                     task_uuid: Some(row.uuid.to_string()),
                     task_ref: None,
                     job_id: row.uuid.to_string(),
@@ -3873,6 +3923,7 @@ mod tests {
                 row.adapter = "codex".to_owned();
                 row.gh_origin = Some(gh_test_origin("item-1", GhItemType::Issue));
                 let result = JobResult {
+                    gpu_seconds: None,
                     task_uuid: Some(row.uuid.to_string()),
                     task_ref: None,
                     job_id: row.uuid.to_string(),
@@ -4077,6 +4128,7 @@ mod tests {
                 .unwrap();
                 daemon.handler.gh_program = gh;
                 let result = JobResult {
+                    gpu_seconds: None,
                     task_uuid: Some(delivered.uuid.to_string()),
                     task_ref: None,
                     job_id: delivered.uuid.to_string(),
@@ -5702,6 +5754,365 @@ mod tests {
                     completion.acceptance.status,
                     crate::completion::AcceptanceStatus::Rejected
                 );
+            })
+            .await;
+    }
+
+    /// Issue #382: a GPU-pool job's witness carries real, measured
+    /// `gpuSeconds` and `charge` — never the always-`None` and always-
+    /// fabricated-`Some(0.0)` these fields used to carry through this exact
+    /// completion path (`run.rs`'s `finish_job`).
+    ///
+    /// The exit recorder's own accounting probe is exercised end to end
+    /// elsewhere (`crates/tally/tests/record_unit_exit_accounting.rs`,
+    /// against the real `tally` binary and a fake `systemctl`). This test
+    /// instead proves the daemon-side wiring: a measured `UnitAccounting`
+    /// sample on the `ExecutionOutcome` reaches the witness record, the
+    /// completion lifecycle event, and `canonical_gpu_seconds`, gated
+    /// correctly on the job's pool actually being `vram`-resource. The
+    /// direct-fallback backend this suite otherwise uses never sets
+    /// `accounting` (it has no `ExecStopPost`), so the sample is placed on
+    /// `finished.outcome` the one place a test can reach it before
+    /// `finish_job` consumes it — the same shape a real systemd completion
+    /// would have handed the daemon.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_gpu_pool_jobs_witness_carries_measured_gpu_seconds_and_charge() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let mut config = one_pool_config();
+                config.pools.insert(
+                    "gpu".to_owned(),
+                    PoolConfig {
+                        resource: Some(ResourceKind::Vram),
+                        predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+                        ..PoolConfig::default()
+                    },
+                );
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                let history = daemon.handler.history.clone();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "gpu",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"],
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let mut finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                // The direct-fallback backend never probes systemd, so this
+                // stands in for what a real `ExecStopPost` accounting probe
+                // would have embedded in the exit record: 2.5 measured
+                // CPU-seconds, and 3.5 seconds of measured main-process
+                // wall-clock runtime for the GPU-pool job.
+                if let Some(Ok(outcome)) = finished.outcome.as_mut() {
+                    outcome.record.accounting = Some(UnitAccounting {
+                        cpu_usage_nsec: Some(2_500_000_000),
+                        exec_main_start_monotonic_usec: Some(1_000_000),
+                        exec_main_exit_monotonic_usec: Some(4_500_000),
+                    });
+                } else {
+                    panic!("expected a successful direct-fallback completion");
+                }
+                daemon.finish_job(finished).await.unwrap();
+                let terminal = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": task_uuid})))
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["verdict"], "pass");
+
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                let record = records
+                    .iter()
+                    .find(|record| record.task_uuid.as_deref() == Some(task_uuid.as_str()))
+                    .unwrap();
+                assert_eq!(record.gpu_seconds, Some(3.5));
+                assert_eq!(
+                    record.charge,
+                    Some(Charge {
+                        unit: "cpu-second".to_owned(),
+                        amount: 2.5,
+                        class_name: "measured".to_owned(),
+                    })
+                );
+                assert!(counts_toward_canonical_gpu_seconds(record));
+                assert_eq!(canonical_gpu_seconds(records.iter().cloned()), 3.5);
+
+                // The completion lifecycle event carries the same measured
+                // value, not the old fabricated `Some(0.0)`.
+                assert!(history.borrow().snapshot().records.iter().any(|entry| {
+                    entry.fields.task_uuid == task_uuid && entry.fields.gpu_seconds == Some(3.5)
+                }));
+            })
+            .await;
+    }
+
+    /// #382 HIGH-1 (post-merge repair): `vram` is `ResourceKind`'s default,
+    /// so a pool whose config omits `resource` entirely must NOT read as a
+    /// GPU pool. Before this repair, `resource_kind(pool) ==
+    /// Some(ResourceKind::Vram)` compared against the *effective*
+    /// (defaulted) resource, so a job in a pool that declared nothing at
+    /// all — `{"capacity": 2}`, no `resource` key — got a real,
+    /// non-fabricated-looking `gpuSeconds` on a host with no GPU. This pins
+    /// the fix: `declared_resource_kind` reads the raw `Option` the pool
+    /// config carries, so silence never reads as a declaration.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pool_that_declares_no_resource_never_gets_gpu_seconds() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let mut config = one_pool_config();
+                // No `resource` key at all — exactly the shape an operator
+                // writes when they never intended a GPU pool, e.g.
+                // `services.tally.pools.worker = { capacity = 2; };`.
+                config.pools.insert(
+                    "silent".to_owned(),
+                    PoolConfig {
+                        capacity: 2,
+                        predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+                        ..PoolConfig::default()
+                    },
+                );
+                assert_eq!(config.pools["silent"].resource, None);
+                assert_eq!(
+                    config.pools["silent"].resource(),
+                    ResourceKind::Vram,
+                    "the effective default is unchanged by this repair"
+                );
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "silent",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"],
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let mut finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                if let Some(Ok(outcome)) = finished.outcome.as_mut() {
+                    outcome.record.accounting = Some(UnitAccounting {
+                        cpu_usage_nsec: Some(1_000_000_000),
+                        exec_main_start_monotonic_usec: Some(1_000_000),
+                        exec_main_exit_monotonic_usec: Some(3_500_000),
+                    });
+                } else {
+                    panic!("expected a successful direct-fallback completion");
+                }
+                daemon.finish_job(finished).await.unwrap();
+                daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": task_uuid})))
+                    .await
+                    .unwrap();
+
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                let record = records
+                    .iter()
+                    .find(|record| record.task_uuid.as_deref() == Some(task_uuid.as_str()))
+                    .unwrap();
+                assert_eq!(
+                    record.gpu_seconds, None,
+                    "a pool that declared no resource must never carry gpuSeconds"
+                );
+                // The generic charge is unaffected: CPU accounting is not
+                // gated on the GPU-pool question at all.
+                assert_eq!(
+                    record.charge,
+                    Some(Charge {
+                        unit: "cpu-second".to_owned(),
+                        amount: 1.0,
+                        class_name: "measured".to_owned(),
+                    })
+                );
+            })
+            .await;
+    }
+
+    /// A non-GPU-pool job's measured accounting still charges CPU-seconds,
+    /// but never fills `gpuSeconds` — the field means "held a `vram` pool",
+    /// not "any job that happened to be measured".
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_non_gpu_pool_jobs_witness_carries_charge_but_no_gpu_seconds() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    one_pool_config(),
+                    paths.clone(),
+                    settings(),
+                    executor,
+                )
+                .await
+                .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"],
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let mut finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                if let Some(Ok(outcome)) = finished.outcome.as_mut() {
+                    outcome.record.accounting = Some(UnitAccounting {
+                        cpu_usage_nsec: Some(1_000_000_000),
+                        exec_main_start_monotonic_usec: Some(1_000_000),
+                        exec_main_exit_monotonic_usec: Some(2_000_000),
+                    });
+                } else {
+                    panic!("expected a successful direct-fallback completion");
+                }
+                daemon.finish_job(finished).await.unwrap();
+                daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": task_uuid})))
+                    .await
+                    .unwrap();
+
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                let record = records
+                    .iter()
+                    .find(|record| record.task_uuid.as_deref() == Some(task_uuid.as_str()))
+                    .unwrap();
+                assert_eq!(record.gpu_seconds, None);
+                assert_eq!(
+                    record.charge,
+                    Some(Charge {
+                        unit: "cpu-second".to_owned(),
+                        amount: 1.0,
+                        class_name: "measured".to_owned(),
+                    })
+                );
+            })
+            .await;
+    }
+
+    /// A probe that never measured anything (the exit recorder's
+    /// `systemctl` call failed, or this is a pre-#382 record) must never
+    /// surface as a fabricated `Some(0.0)` anywhere downstream — not on the
+    /// witness, and not on the completion lifecycle event.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unmeasured_accounting_never_fabricates_a_zero_on_witness_or_event() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let mut config = one_pool_config();
+                config.pools.insert(
+                    "gpu".to_owned(),
+                    PoolConfig {
+                        resource: Some(ResourceKind::Vram),
+                        predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+                        ..PoolConfig::default()
+                    },
+                );
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                let history = daemon.handler.history.clone();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "gpu",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"],
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                // Left as the direct-fallback backend produced it:
+                // `accounting: None`, exactly like a failed probe.
+                daemon.finish_job(finished).await.unwrap();
+                daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": task_uuid})))
+                    .await
+                    .unwrap();
+
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                let record = records
+                    .iter()
+                    .find(|record| record.task_uuid.as_deref() == Some(task_uuid.as_str()))
+                    .unwrap();
+                assert_eq!(record.gpu_seconds, None);
+                assert_eq!(record.charge, None);
+                assert!(history.borrow().snapshot().records.iter().any(|entry| {
+                    entry.fields.task_uuid == task_uuid && entry.fields.gpu_seconds.is_none()
+                }));
             })
             .await;
     }
@@ -9992,7 +10403,7 @@ mod tests {
                 config.pools.insert(
                     "flow".to_owned(),
                     PoolConfig {
-                        resource: ResourceKind::BuildSlot,
+                        resource: Some(ResourceKind::BuildSlot),
                         predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                         ..PoolConfig::default()
                     },

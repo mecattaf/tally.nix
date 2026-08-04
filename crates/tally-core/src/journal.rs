@@ -141,7 +141,11 @@ pub const TALLY_FIELD_MATRIX: &[(&str, FieldRequirement)] = &[
     ("TALLY_EXIT_CODE", FieldRequirement::AtCompletedOrFailed),
     ("TALLY_STDERR_TAIL", FieldRequirement::Conditional),
     ("TALLY_STDERR_TRUNCATED", FieldRequirement::Conditional),
-    ("TALLY_GPU_SECONDS", FieldRequirement::AtCompletedOrFailed),
+    // Was `AtCompletedOrFailed` until #382: every completion fabricated
+    // `Some(0.0)` to satisfy this, which is exactly the fabricated-zero
+    // pattern #382 removes. The field is real cgroup accounting for a
+    // GPU-pool job now, present only when the exit recorder measured it.
+    ("TALLY_GPU_SECONDS", FieldRequirement::Conditional),
     ("TALLY_LABOR_CLASS", FieldRequirement::AtCompletedOrFailed),
     ("TALLY_ARTIFACT_HASH", FieldRequirement::AtCompleted),
     ("TALLY_EVIDENCE", FieldRequirement::AtEvidence),

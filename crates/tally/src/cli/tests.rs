@@ -418,9 +418,10 @@ fn hidden_exit_recorder_command_parses() {
     .unwrap();
     assert!(matches!(
         options.command,
-        Some(Command::RecordUnitExit(RecordUnitExitArgs { record, unit }))
+        Some(Command::RecordUnitExit(RecordUnitExitArgs { record, unit, systemctl }))
             if record.as_path() == Path::new("/tmp/exit.json")
                 && unit == "tally-job-example.service"
+                && systemctl.as_path() == Path::new("systemctl")
     ));
 }
 

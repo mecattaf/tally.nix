@@ -938,7 +938,7 @@ fn pool_headroom_facts(context: &mut Context) -> Result<Vec<PoolHeadroomFact>, W
                     now,
                 ),
                 (None, PoolPredicate::WindowedConsumption(window))
-                    if pool.resource == crate::config::ResourceKind::Budget =>
+                    if pool.resource() == crate::config::ResourceKind::Budget =>
                 {
                     read_usage_meter(&context.paths.state_dir, &name, window.window_sec, now)
                 }
@@ -1054,7 +1054,8 @@ pub(crate) fn feed_scraped_usage(
             let PoolPredicate::WindowedConsumption(window) = &pool.predicate else {
                 return None;
             };
-            if pool.resource != crate::config::ResourceKind::Budget || pool.usage_meter.is_some() {
+            if pool.resource() != crate::config::ResourceKind::Budget || pool.usage_meter.is_some()
+            {
                 return None;
             }
             let reset_at = observed_at.checked_add_signed(chrono::Duration::seconds(

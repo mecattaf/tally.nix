@@ -1345,6 +1345,7 @@ mod tests {
 
     fn exit_fact(row: &RowSeed, attempt: u32, lease_epoch: u64, loaded: bool) -> LocalUnitFact {
         let record = UnitExitRecord {
+            accounting: None,
             schema_version: crate::executor::UNIT_EXIT_SCHEMA_VERSION,
             unit: unit_name(row),
             invocation_id: format!("invocation-{attempt}"),
@@ -2028,6 +2029,7 @@ mod tests {
         );
 
         let record = UnitExitRecord {
+            accounting: None,
             schema_version: crate::executor::UNIT_EXIT_SCHEMA_VERSION,
             unit: unit.clone(),
             invocation_id: "rowless-exited".to_owned(),

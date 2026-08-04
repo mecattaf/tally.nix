@@ -146,9 +146,10 @@ pub struct UsageBreakdown {
     /// This field alone is **not** the cross-harness "fresh input" figure, and
     /// a rollup that sums it alone understates any harness with a cache-write
     /// category. claude-code's `cache_creation_input_tokens` are fresh,
-    /// uncached prompt tokens that its `input_tokens` excludes; codex has no
-    /// cache-write category at all, so for codex this field already is the
-    /// whole fresh input. The comparable figure is
+    /// uncached prompt tokens that its `input_tokens` excludes; codex declares
+    /// its own cache-write category (`cache_write_input_tokens`), observed at
+    /// 0 on every real capture so far but not structurally absent. The
+    /// comparable figure for both harnesses is
     /// `input_tokens + cache_write_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
