@@ -93,6 +93,7 @@
             ./test/fixtures/shell-command-provider
             ./test/fixtures/spec-build
             ./test/fixtures/traces
+            ./test/fixtures/usage
           ];
         };
         adapterConfig = pkgs.writeText "tally-adapter-config.json" (
@@ -5175,6 +5176,17 @@
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.usage.mode' ${adapterConfig})" = jsonPath
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.finalMessage.mode' ${adapterConfig})" = jsonPathLast
             done
+            # The per-harness usage key mapping is a declaration, and these are
+            # the declarations. `crates/tally-core/src/usage.rs` mirrors these
+            # exact strings in its fixture tests, so a preset that drifts from
+            # the normalizer's expectations fails here rather than passing two
+            # agreeing-but-wrong suites.
+            test "$(jq -c '.adapters.codex.scrape.usage.fields' ${adapterConfig})" = '{"cacheReadTokens":["cached_input_tokens"],"inputTokensWithCacheRead":["input_tokens"],"outputTokens":["output_tokens"]}'
+            test "$(jq -c '.adapters["claude-code"].scrape.usage.fields' ${adapterConfig})" = '{"cacheReadTokens":["cache_read_input_tokens"],"cacheWriteTokens":["cache_creation_input_tokens"],"inputTokens":["input_tokens"],"outputTokens":["output_tokens"]}'
+            test "$(jq -c '.adapters["claude-code"].scrape.usageCost' ${adapterConfig})" = '{"fields":{"costUsd":["$"]},"mode":"jsonPathLast","pattern":"$[?@.type == '"'"'result'"'"'].total_cost_usd","stream":"stdout"}'
+            # pi has not been verified against a real capture yet, so it
+            # declares no mapping and keeps the legacy reading.
+            test "$(jq -r '.adapters.pi.scrape.usage.fields // "absent"' ${adapterConfig})" = absent
             test "$(jq -r '.adapters.shell.scrape.finalMessage // "absent"' ${adapterConfig})" = absent
             test "$(jq -r '.adapters.pi.scrape.sessionRef.pattern' ${adapterConfig})" = '$.id'
             test "$(jq -r '.adapters["claude-code"].scrape.sessionRef.pattern' ${adapterConfig})" = '$..session_id'

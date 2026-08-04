@@ -1953,6 +1953,7 @@ async fn structured_result_is_observed_after_terminal_ack_and_replayed_after_res
                             stream: ScrapeStream::Stdout,
                             mode: ScrapeMode::JsonPath,
                             pattern: "$..final_message".to_owned(),
+                            fields: Default::default(),
                         },
                     )]),
                     ..AdapterConfig::default()
@@ -2044,6 +2045,7 @@ async fn regex_result_is_observed_after_terminal_ack_without_restart() {
                             stream: ScrapeStream::Stdout,
                             mode: ScrapeMode::Regex,
                             pattern: "^TALLY_FINAL_MESSAGE=(.*)$".to_owned(),
+                            fields: Default::default(),
                         },
                     )]),
                     ..AdapterConfig::default()
@@ -2112,6 +2114,7 @@ async fn untyped_final_message_is_observed_after_terminal_ack() {
                             stream: ScrapeStream::Stdout,
                             mode: ScrapeMode::JsonPath,
                             pattern: "$..final_message".to_owned(),
+                            fields: Default::default(),
                         },
                     )]),
                     ..AdapterConfig::default()
@@ -2506,6 +2509,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                             stream: ScrapeStream::Stdout,
                             mode: ScrapeMode::Regex,
                             pattern: "^TALLY_FINAL_MESSAGE=(.*)$".to_owned(),
+                            fields: Default::default(),
                         },
                     )]),
                     ..AdapterConfig::default()
@@ -2526,6 +2530,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                             stream: ScrapeStream::Stdout,
                             mode: ScrapeMode::Regex,
                             pattern: "^TALLY_FINAL_MESSAGE=(.*)$".to_owned(),
+                            fields: Default::default(),
                         },
                     )]),
                     launch: AdapterLaunchConfig {

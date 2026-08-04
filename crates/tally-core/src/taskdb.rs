@@ -15,6 +15,7 @@ use crate::completion::GateManifestSpec;
 use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
 use crate::provenance::Orchestration;
+use crate::usage::UsageObservation;
 use crate::witness::{Derivation, WitnessError};
 
 pub mod migrations;
@@ -890,6 +891,12 @@ pub struct RowSeed {
     pub session_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_message: Option<String>,
+    /// Normalized usage for the attempt this row last recorded a scrape for.
+    /// Absent means no attempt has been scraped yet; a present typed absence
+    /// means an attempt was scraped and carried no usage. Rows written before
+    /// this field existed read back as the former, which is what they were.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<UsageObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_token_hash: Option<String>,
     pub lease_epoch: u64,
@@ -1758,6 +1765,7 @@ mod tests {
             related_trigger: None,
             evidence_class: Some(Value::String("artifact".to_owned())),
             manifest_hash: Some(Value::String("sha256:manifest".to_owned())),
+            usage: None,
         }
     }
 

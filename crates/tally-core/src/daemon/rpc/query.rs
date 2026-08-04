@@ -1030,13 +1030,20 @@ pub(crate) fn read_usage_meter(
     Some(event)
 }
 
+/// Feed the built-in usage meter from the normalized usage record.
+///
+/// The number charged to a pool is [`UsageObservation::meter_amount`], which
+/// reproduces the pre-normalization reader exactly: a harness-stated total,
+/// else the harness's own input figure plus its output figure, and never a
+/// zero. Normalization changed where the number is read from, not which number
+/// it is.
 pub(crate) fn feed_scraped_usage(
     state_dir: &Path,
     pools: &BTreeMap<String, crate::config::PoolConfig>,
     leased_pools: &[String],
-    captures: &ScrapeResult,
+    usage: &UsageObservation,
 ) -> Vec<String> {
-    let Some(amount) = scraped_token_amount(captures) else {
+    let Some(amount) = usage.meter_amount() else {
         return Vec::new();
     };
     let observed_at = Utc::now();
@@ -1067,24 +1074,6 @@ pub(crate) fn feed_scraped_usage(
                 .map(|error| format!("pool {name:?}: {error}"))
         })
         .collect()
-}
-
-fn scraped_token_amount(captures: &ScrapeResult) -> Option<u64> {
-    let usage = captures.captures.get("usage")?.as_object()?;
-    let amount = if let Some(total) = usage.get("total_tokens") {
-        total.as_u64()?
-    } else {
-        let input = match usage.get("input_tokens") {
-            Some(value) => value.as_u64()?,
-            None => 0,
-        };
-        let output = match usage.get("output_tokens") {
-            Some(value) => value.as_u64()?,
-            None => 0,
-        };
-        input.checked_add(output)?
-    };
-    (amount > 0).then_some(amount)
 }
 
 pub(crate) fn write_usage_meter(state_dir: &Path, event: &UsageMeterObservation) -> io::Result<()> {

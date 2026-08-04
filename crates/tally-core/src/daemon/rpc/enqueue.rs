@@ -786,6 +786,10 @@ impl DaemonHandler {
                 .as_ref()
                 .and_then(|job| job.row.session_ref.clone()),
             final_message: None,
+            // Usage is per attempt and is never inherited across a resume:
+            // the prior attempt's record stays on the prior row and in the
+            // attestation ledger.
+            usage: None,
             job_token_hash: None,
             lease_epoch: epoch,
             attempt: 1,

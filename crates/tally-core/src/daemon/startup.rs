@@ -927,7 +927,8 @@ pub(super) fn hydrate_completed_adapter_metadata(
             recovery.row.lease_epoch,
         ) {
             Ok(Some(captures)) => {
-                apply_adapter_metadata(&mut recovery.row, &captures);
+                let adapter = config.adapters.get(&recovery.row.adapter).cloned();
+                apply_adapter_metadata(&mut recovery.row, &captures, adapter.as_ref());
                 continue;
             }
             Ok(None) => {}
@@ -969,7 +970,10 @@ pub(super) fn hydrate_completed_adapter_metadata(
         }
         let paths = executor.paths(&identity);
         match engine.scrape_paths(&recovery.row.adapter, &paths) {
-            Ok(captures) => apply_adapter_metadata(&mut recovery.row, &captures),
+            Ok(captures) => {
+                let adapter = config.adapters.get(&recovery.row.adapter).cloned();
+                apply_adapter_metadata(&mut recovery.row, &captures, adapter.as_ref());
+            }
             Err(error) => eprintln!(
                 "tally: retained adapter metadata for {} could not be scraped: {error}",
                 recovery.row.uuid
@@ -978,7 +982,22 @@ pub(super) fn hydrate_completed_adapter_metadata(
     }
 }
 
-pub(super) fn apply_adapter_metadata(row: &mut RowSeed, captures: &ScrapeResult) {
+/// Re-apply the advisory metadata a retained capture or attestation carries
+/// onto a recovered row.
+///
+/// The usage record is recomputed from the captures against the adapter's
+/// current declared mapping rather than copied: the ledger holds the record as
+/// it was normalized when the attempt ran, and this row is the live view. A
+/// row whose adapter is gone from the configuration gets no usage statement at
+/// all, because nothing is left to declare one.
+pub(super) fn apply_adapter_metadata(
+    row: &mut RowSeed,
+    captures: &ScrapeResult,
+    adapter: Option<&AdapterConfig>,
+) {
+    if let Some(adapter) = adapter {
+        row.usage = Some(crate::usage::observe(adapter, captures));
+    }
     if let Ok(Some(session_ref)) = captures.session_ref() {
         row.session_ref = Some(session_ref.to_owned());
     }
@@ -1030,6 +1049,9 @@ pub(super) fn hydrate_represent_adapter_metadata(
         if final_message.is_some() {
             recovery.row.final_message = final_message;
         }
+        // No usage statement here. These captures belong to the session being
+        // resumed, not to the attempt this row is about to run; attributing
+        // them to it would report a previous attempt's tokens as this one's.
     }
     Ok(())
 }
@@ -1085,6 +1107,9 @@ pub(super) fn hydrate_adopted_adapter_metadata(
         if let Some(final_message) = captures.final_message()? {
             recovery.row.final_message = Some(final_message.to_owned());
         }
+        // Deliberately no usage statement: `captures` here is the newest
+        // attestation from *before* this attempt, kept for resume identity.
+        // The adopted attempt has not reported usage yet.
     }
     Ok(())
 }
@@ -1156,6 +1181,12 @@ pub(super) fn reconcile_retained_adapter_attestations(
                 continue;
             }
         };
+        let usage = config
+            .adapters
+            .get(&row.adapter)
+            .map_or(crate::usage::UsageObservation::NotDeclared, |adapter| {
+                crate::usage::observe(adapter, &captures)
+            });
         if let Err(error) = attestations.ledger().and_then(|ledger| {
             ledger.append(json!({
                 "kind": "adapter-scrape",
@@ -1165,6 +1196,7 @@ pub(super) fn reconcile_retained_adapter_attestations(
                 "attempt": record.attempt,
                 "leaseEpoch": record.lease_epoch,
                 "captures": captures.captures,
+                "usage": usage,
                 "usageAuthority": "advisory-only",
                 "reconciledAfterRestart": true,
             }))
@@ -1305,6 +1337,7 @@ pub(super) fn recovered_model_is_advisory(
 pub(super) fn ensure_verified_resume_attestation(
     attestations: &mut SharedAttestations,
     row: &RowSeed,
+    adapter: Option<&AdapterConfig>,
     attempt: u32,
     lease_epoch: u64,
     captures: &ScrapeResult,
@@ -1332,6 +1365,9 @@ pub(super) fn ensure_verified_resume_attestation(
         "attempt": attempt,
         "leaseEpoch": lease_epoch,
         "captures": captures.captures,
+        "usage": adapter.map_or(crate::usage::UsageObservation::NotDeclared, |adapter| {
+            crate::usage::observe(adapter, captures)
+        }),
         "usageAuthority": "advisory-only",
         "recoveryCheckpoint": true,
     }))?;
@@ -1758,6 +1794,7 @@ pub(super) fn recovery_adapter_invocation(
                         ensure_verified_resume_attestation(
                             attestations,
                             row,
+                            config.adapters.get(&row.adapter),
                             *previous_attempt,
                             *previous_lease_epoch,
                             &captures,

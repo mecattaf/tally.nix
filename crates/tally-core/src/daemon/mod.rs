@@ -90,7 +90,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, RwLock};
 use tokio::task::{JoinHandle, LocalSet};
 
 use crate::adapters::{
-    provisions_gate_manifest, AdapterEngine, AdapterError, AdapterInvocation, ScrapeResult,
+    provisions_gate_manifest, AdapterConfig, AdapterEngine, AdapterError, AdapterInvocation,
+    ScrapeResult,
 };
 use crate::brief::{self, PreparedBrief};
 use crate::completion::{
@@ -158,6 +159,7 @@ use crate::taskdb::{
     DurableEnqueueEvent, DurableRetry, EnqueueSource, RowSeed, TaskDbError,
 };
 use crate::trace::{query_trace, trace_availability, TraceError, TraceLane};
+use crate::usage::UsageObservation;
 use crate::watch::{ChangeError, ChangeKind, ChangeStore};
 use crate::wire::{
     canonical_payload_hash, serve_connection_with_limits, EnqueuePayload, GuardrailConfig,

@@ -17,6 +17,7 @@ use crate::taskdb::{
     related_trigger_from_gh_origin, AdmissionOrigin, ProducerOrigin, RelatedTrigger, RowSeed,
     WorkspaceMetadata,
 };
+use crate::usage::UsageObservation;
 use crate::witness::{
     counts_toward_canonical_gpu_seconds, AttestationRecord, AuthorshipSession, AuthorshipStatus,
     Charge, LaborClass, Verdict, VerifyReport, WitnessRecord,
@@ -68,6 +69,7 @@ pub struct RowDetailFact {
     pub observed_model: Option<String>,
     pub session_ref: Option<String>,
     pub final_message: Option<String>,
+    pub usage: Option<UsageObservation>,
     pub workspace: Option<WorkspaceMetadata>,
     pub attempt: u32,
     pub lease_epoch: u64,
@@ -113,6 +115,7 @@ impl RowDetailFact {
             observed_model: row.model.clone(),
             session_ref: row.session_ref.clone(),
             final_message: row.final_message.clone(),
+            usage: row.usage.clone(),
             workspace: row.workspace.clone(),
             attempt: row.attempt,
             lease_epoch: row.lease_epoch,
@@ -312,6 +315,11 @@ pub struct JobSummary {
     pub session_ref: Option<SourcedValue<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_message: Option<SourcedValue<String>>,
+    /// Normalized per-attempt usage. Advisory throughout: it is what the
+    /// harness said about itself, never a tally measurement, and its three
+    /// states stay distinct on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<SourcedValue<UsageObservation>>,
     pub current_attempt: Option<u32>,
     pub lease_epoch: Option<u64>,
     pub unit: Option<String>,
@@ -1994,6 +2002,15 @@ fn build_summary(
                 )
             })
         }),
+        usage: detail.and_then(|detail| {
+            detail.usage.clone().map(|value| {
+                SourcedValue::new(
+                    value,
+                    FactAuthority::AdvisoryProviderCapture,
+                    "adapter-scrape",
+                )
+            })
+        }),
         current_attempt,
         lease_epoch: current_lease_epoch,
         unit: live
@@ -2774,6 +2791,7 @@ mod tests {
                 github: None,
             },
             related_trigger: None,
+            usage: None,
         }
     }
 

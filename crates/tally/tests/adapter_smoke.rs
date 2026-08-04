@@ -80,6 +80,7 @@ fn smoke_config(root: &Path) -> Config {
         stream: ScrapeStream::Stdout,
         mode: ScrapeMode::Regex,
         pattern: pattern.to_owned(),
+        fields: Default::default(),
     };
     Config {
         pools: BTreeMap::from([(

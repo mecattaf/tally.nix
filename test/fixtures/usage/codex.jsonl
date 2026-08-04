@@ -1,0 +1,9 @@
+{"type":"thread.started","thread_id":"codex-usage-thread"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"reasoning","text":"Reading the failing test."}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/true","aggregated_output":"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"The fixture parses."}}
+{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":900,"output_tokens":150}}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"type":"agent_message","text":"Second turn, same thread."}}
+{"type":"turn.completed","usage":{"input_tokens":4096,"cached_input_tokens":3072,"output_tokens":512}}

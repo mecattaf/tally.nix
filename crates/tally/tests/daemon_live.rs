@@ -485,6 +485,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$.hook".to_owned(),
+                                fields: Default::default(),
                             },
                         ),
                         (
@@ -493,6 +494,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$.hook_status".to_owned(),
+                                fields: Default::default(),
                             },
                         ),
                         (
@@ -501,6 +503,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$.mode".to_owned(),
+                                fields: Default::default(),
                             },
                         ),
                         (
@@ -509,6 +512,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..model".to_owned(),
+                                fields: Default::default(),
                             },
                         ),
                         (
@@ -517,6 +521,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$.socket".to_owned(),
+                                fields: Default::default(),
                             },
                         ),
                         (
@@ -525,6 +530,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..session_id".to_owned(),
+                                fields: Default::default(),
                             },
                         ),
                         (
@@ -533,6 +539,7 @@ async fn real_user_manager_adapter_capture_scrape() {
                                 stream: ScrapeStream::Stdout,
                                 mode: ScrapeMode::JsonPath,
                                 pattern: "$..usage".to_owned(),
+                                fields: Default::default(),
                             },
                         ),
                     ]),
