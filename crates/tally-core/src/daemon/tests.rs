@@ -10410,26 +10410,29 @@ mod tests {
             .await;
     }
 
-    /// #247, reproduced exactly as reported: **same items, `nextCursor: null`,
-    /// ground truth advancing** — no truncation involved.
+    /// The wave-3 W-316 reproduction, now run against the fix (#380).
     ///
-    /// `--flow-run` membership is not a durable property of the run. It is
-    /// recomputed per call by scanning durable row details and witness records
-    /// for an orchestration capsule naming that `flowRunId`
-    /// (`query_v2::flow_run_tasks`), and a lifecycle event whose task is not in
-    /// that set is dropped outright (`lifecycle_matches`). An `attached`
-    /// admission writes no row (`enqueue::full_live_disposition` returns
-    /// before any `query_details.insert`), and the canonical payload hash
-    /// excludes the orchestration capsule (`wire::canonical_payload`), so a
-    /// second run submitting an identical node while the first is still in
-    /// flight is told `attached`, is handed the task UUID, and can never see
-    /// that task in its own window — not because the page was capped, but
-    /// because the node was never a member.
+    /// It used to assert the defect: a second run submitting an identical node
+    /// while the first was still in flight is told `attached`, is handed the
+    /// task UUID, and could never see that task in its own window — **same
+    /// items, `nextCursor: null`, ground truth advancing**, with no truncation
+    /// involved. The mechanism was that membership was recomputed per call by
+    /// scanning durable row details and witness records for an orchestration
+    /// capsule naming that `flowRunId` (`query_v2::flow_run_tasks`), a
+    /// lifecycle event whose task was not in that set was dropped outright
+    /// (`lifecycle_matches`), and an `attached` admission writes no row
+    /// (`enqueue::full_live_disposition` returns before any
+    /// `query_details.insert`) while the canonical payload hash excludes the
+    /// orchestration capsule (`wire::canonical_payload`).
     ///
-    /// This is the shape the crm report described and the one the stale-page-one
-    /// mechanism cannot produce: a null cursor means the page *is* the window.
+    /// Everything above the fix line still holds — the admission is still
+    /// `attached`, the row still belongs to the first run, the capsule is still
+    /// out of the payload hash. What changed is that the admission now also
+    /// writes durable membership, so the run that was handed the task UUID
+    /// resolves it back to itself. The assertions below are the old ones,
+    /// inverted.
     #[tokio::test(flavor = "current_thread")]
-    async fn repro_247_an_attached_node_is_invisible_to_the_run_that_submitted_it() {
+    async fn repro_316_an_attached_node_is_visible_to_the_run_that_submitted_it() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -10486,11 +10489,22 @@ mod tests {
                     }
                 };
 
-                // The reported symptom, asserted field by field.
+                // The inverted symptom, asserted field by field. The second run
+                // sees the node it was handed, in its own window, immediately.
                 let before = poll(second_run.clone()).await;
                 assert!(
-                    before["items"].as_array().unwrap().is_empty(),
-                    "expected the second run's window to be empty: {before}"
+                    !before["items"].as_array().unwrap().is_empty(),
+                    "the attaching run must see the node it was handed: {before}"
+                );
+                assert!(before["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| item["taskUuid"] == json!(shared_task)));
+                assert_eq!(
+                    before["flowRunTasks"], 1,
+                    "membership is durable at admission, not scanned off a row \
+                     that belongs to another run: {before}"
                 );
                 assert!(before["nextCursor"].is_null());
                 assert_eq!(before["truncated"], false);
@@ -10528,14 +10542,17 @@ mod tests {
                     "the events must be durable and visible to the run that owns the row"
                 );
 
-                // ...and the second run's window is byte-identical to before,
-                // still with a null cursor. Same items, no truncation signal,
-                // ground truth advancing: #247, with no page cap in sight.
+                // ...and the second run's window advances by exactly the same
+                // two events, because it is looking at the same real work. The
+                // frozen window is gone: this is what #247 should have shown.
                 let after = poll(second_run.clone()).await;
-                assert!(after["items"].as_array().unwrap().is_empty());
+                assert_eq!(
+                    after["items"].as_array().unwrap().len(),
+                    before["items"].as_array().unwrap().len() + 2,
+                    "the attaching run's window must advance with ground truth: {after}"
+                );
                 assert!(after["nextCursor"].is_null());
                 assert_eq!(after["truncated"], false);
-                assert_eq!(after["items"], before["items"]);
 
                 // The position still advances, because it is the head of the
                 // whole lifecycle stream rather than of this filter. That is
@@ -10547,15 +10564,64 @@ mod tests {
                     "the stream head must move even when the filtered window does not"
                 );
 
-                // What the repair gives a monitor: the run resolves to zero
-                // member tasks, so its empty window is legible as "this run
-                // has no members" rather than "this run is quiet". The run
-                // that owns the row still resolves to its one member.
+                // Both runs resolve to the one task they both hold. The count
+                // no longer distinguishes "attached-only run" from "quiet run",
+                // because there is no longer such a thing as an attached-only
+                // run: attaching joins.
+                assert_eq!(after["flowRunTasks"], 1);
+                assert_eq!(poll(first_run.clone()).await["flowRunTasks"], 1);
+
+                // `query jobs --flow-run` resolves the same membership, so the
+                // attaching run can see its node as a job and not only as a
+                // stream of events.
+                let jobs = daemon
+                    .handler
+                    .query(
+                        "query.jobs",
+                        Some(json!({"flowRun": second_run.clone(), "limit": 1000})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(jobs["flowRunTasks"], 1, "{jobs}");
                 assert_eq!(
-                    after["flowRunTasks"], 0,
-                    "an attached-only run must report that it resolved to nothing"
+                    jobs["items"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|item| item["anchor"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    vec![shared_task.as_str()],
+                    "{jobs}"
                 );
-                assert_eq!(poll(first_run).await["flowRunTasks"], 1);
+
+                // `query run` inherits the same membership: the attaching run
+                // is a real run with one node rather than an unknown job.
+                let run_view = daemon
+                    .handler
+                    .query("query.run", Some(json!({"id": second_run.clone()})))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    run_view["currentNodes"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|node| node["taskUuid"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    vec![shared_task.as_str()],
+                    "{run_view}"
+                );
+
+                // The durable fact behind all of it, on disk, named.
+                let ledger = std::fs::read_to_string(
+                    paths.data_dir.join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+                )
+                .unwrap();
+                assert!(
+                    ledger.contains(&format!(r#""flowRunId":"{second_run}""#))
+                        && ledger.contains(r#""disposition":"attached""#),
+                    "the attached admission must have written durable membership: {ledger}"
+                );
 
                 // An unfiltered query has no membership to report, so the
                 // field is absent rather than a misleading zero.
@@ -10565,6 +10631,1144 @@ mod tests {
                     .await
                     .unwrap();
                 assert!(unfiltered.get("flowRunTasks").is_none());
+            })
+            .await;
+    }
+
+    /// One flow node payload, submitted under a named run and ordinal.
+    fn flow_node_payload(
+        flow_run_id: &str,
+        ordinal: u64,
+        dedup_key: &str,
+        argv: &[&str],
+        evidence: impl IntoIterator<Item = String>,
+    ) -> Value {
+        let mut payload = fs1_full_payload(dedup_key, argv, evidence);
+        payload["source"] = json!("orchestrator");
+        payload["orchestration"] = json!({
+            "flowName": "membership-contract",
+            "flowRunId": flow_run_id,
+            "scriptHash": "sha256-membership-contract",
+            "nodeOrdinal": ordinal,
+            "nodeLabel": format!("node-{ordinal}"),
+            "maxNodes": 8,
+        });
+        payload
+    }
+
+    fn membership_ledger(paths: &DaemonPaths) -> Vec<Value> {
+        let path = paths
+            .data_dir
+            .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE);
+        match std::fs::read_to_string(path) {
+            Ok(text) => text
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("membership ledger unreadable: {error}"),
+        }
+    }
+
+    /// #380, the acceptance bullet in full: an admission under a `flowRunId`
+    /// makes the run's membership in its outcome durable, for **every**
+    /// disposition, including the three that write no row of their own.
+    ///
+    /// The corpus is built so its truth is known independently of anything the
+    /// query surface computes: each phase-one node's task UUID comes back in
+    /// its own admission response, and those UUIDs — not a count, and not a
+    /// diff against the old behaviour — are what the second run's window is
+    /// checked against.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_every_disposition_binds_the_run_to_the_task_it_was_handed() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let first_run = Uuid::new_v4().to_string();
+                let second_run = Uuid::new_v4().to_string();
+
+                // Phase one, run A. Two nodes run to a real terminal verdict --
+                // one passing, one failing -- because `reused` and `terminal`
+                // are decided by the governing witness, not by the row. A test
+                // that admitted and completed a node in the same breath would
+                // not reproduce the window under test at all.
+                let pass_payload = flow_node_payload(
+                    &first_run,
+                    0,
+                    "flow-380-pass",
+                    &["true"],
+                    ["exit:0".to_owned()],
+                );
+                let created_pass = client
+                    .call("queue.enqueue", Some(pass_payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(created_pass["disposition"], "created");
+                assert_eq!(fs1_wait(&client, &created_pass).await["verdict"], "pass");
+
+                let fail_payload = flow_node_payload(
+                    &first_run,
+                    1,
+                    "flow-380-fail",
+                    &["false"],
+                    ["exit:0".to_owned()],
+                );
+                let created_fail = client
+                    .call("queue.enqueue", Some(fail_payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(created_fail["disposition"], "created");
+                assert_ne!(fs1_wait(&client, &created_fail).await["verdict"], "pass");
+
+                // The third node stays live, which is what makes an `attached`
+                // disposition possible: pause the pool, then admit.
+                client
+                    .call("queue.pause", Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let live_payload = flow_node_payload(
+                    &first_run,
+                    2,
+                    "flow-380-live",
+                    &["true"],
+                    ["exit:0".to_owned()],
+                );
+                let created_live = client
+                    .call("queue.enqueue", Some(live_payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(created_live["disposition"], "created");
+
+                let task_of = |response: &Value| response["task_uuid"].as_str().unwrap().to_owned();
+                let pass_task = task_of(&created_pass);
+                let fail_task = task_of(&created_fail);
+                let live_task = task_of(&created_live);
+                let mut expected_members =
+                    vec![pass_task.clone(), fail_task.clone(), live_task.clone()];
+                expected_members.sort();
+
+                // Phase two, run B: the same three payloads under a new run ID.
+                // Only the capsule differs, and the capsule is not part of the
+                // payload hash, so each resolves to a row-less disposition.
+                let under_second_run = |payload: &Value, ordinal: u64| {
+                    let mut payload = payload.clone();
+                    payload["orchestration"]["flowRunId"] = json!(second_run);
+                    payload["orchestration"]["nodeOrdinal"] = json!(ordinal);
+                    payload["orchestration"]["nodeLabel"] = json!(format!("b-node-{ordinal}"));
+                    payload
+                };
+                let reused = client
+                    .call("queue.enqueue", Some(under_second_run(&pass_payload, 5)))
+                    .await
+                    .unwrap();
+                assert_eq!(reused["disposition"], "reused", "{reused}");
+                assert_eq!(task_of(&reused), pass_task);
+
+                let terminal = client
+                    .call("queue.enqueue", Some(under_second_run(&fail_payload, 6)))
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["disposition"], "terminal", "{terminal}");
+                assert_eq!(task_of(&terminal), fail_task);
+
+                let attached = client
+                    .call("queue.enqueue", Some(under_second_run(&live_payload, 7)))
+                    .await
+                    .unwrap();
+                assert_eq!(attached["disposition"], "attached", "{attached}");
+                assert_eq!(task_of(&attached), live_task);
+
+                // The fifth disposition. A conflict admits nothing, so it makes
+                // the run a member of nothing -- asserted, not assumed, because
+                // a conflict that silently joined a run would be a claim about
+                // work this run does not have.
+                let mut conflicting = under_second_run(&pass_payload, 8);
+                conflicting["argv"] = json!(["true", "different"]);
+                let error = client
+                    .call("queue.enqueue", Some(conflicting))
+                    .await
+                    .unwrap_err();
+                let conflict = fs1_conflict(error);
+                assert_eq!(conflict["dedupKey"], "flow-380-pass");
+
+                // The durable ledger, read off disk: exactly the bindings the
+                // two runs were handed, and nothing else.
+                let ledger = membership_ledger(&paths);
+                let mut second_run_records = ledger
+                    .iter()
+                    .filter(|record| record["flowRunId"] == json!(second_run))
+                    .map(|record| {
+                        (
+                            record["taskUuid"].as_str().unwrap().to_owned(),
+                            record["disposition"].as_str().unwrap().to_owned(),
+                            record["nodeOrdinal"].as_u64().unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                second_run_records.sort();
+                let mut expected_records = vec![
+                    (pass_task.clone(), "reused".to_owned(), 5),
+                    (fail_task.clone(), "terminal".to_owned(), 6),
+                    (live_task.clone(), "attached".to_owned(), 7),
+                ];
+                expected_records.sort();
+                assert_eq!(
+                    second_run_records, expected_records,
+                    "each row-less disposition must bind the submitting run to \
+                     the task it was handed, under the ordinal *it* submitted"
+                );
+                assert_eq!(
+                    ledger
+                        .iter()
+                        .filter(|record| record["flowRunId"] == json!(first_run))
+                        .count(),
+                    3,
+                    "created admissions are recorded too, so membership is one fact \
+                     for every disposition rather than a special case: {ledger:?}"
+                );
+
+                // And what the operator surfaces now say.
+                let members = |flow_run: String| {
+                    let client = &client;
+                    async move {
+                        let window = client
+                            .call(
+                                "query.log",
+                                Some(json!({"flowRun": flow_run, "limit": 1000})),
+                            )
+                            .await
+                            .unwrap();
+                        let mut tasks = window["items"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|item| item["taskUuid"].as_str().unwrap().to_owned())
+                            .collect::<Vec<_>>();
+                        tasks.sort();
+                        tasks.dedup();
+                        (window["flowRunTasks"].as_u64().unwrap(), tasks)
+                    }
+                };
+                let (second_count, second_tasks) = members(second_run.clone()).await;
+                assert_eq!(second_count, 3);
+                assert_eq!(
+                    second_tasks, expected_members,
+                    "the run's own window must show the tasks the run was handed"
+                );
+                let (first_count, first_tasks) = members(first_run.clone()).await;
+                assert_eq!(first_count, 3);
+                assert_eq!(
+                    first_tasks, expected_members,
+                    "and the run that created them keeps exactly what it had"
+                );
+
+                let jobs = client
+                    .call(
+                        "query.jobs",
+                        Some(json!({"flowRun": second_run.clone(), "limit": 1000})),
+                    )
+                    .await
+                    .unwrap();
+                let mut job_anchors = jobs["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["anchor"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                job_anchors.sort();
+                assert_eq!(job_anchors, expected_members, "{jobs}");
+                assert_eq!(jobs["flowRunTasks"], 3);
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    /// `queue.retry` is not one of the five dispositions, but it is an
+    /// admission decision, and a node retried under a run that predates the
+    /// membership ledger is how an older run's membership gets completed. It
+    /// records before it mutates anything, so a refused retry leaves nothing
+    /// behind but a fact its own row already implied.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_retrying_a_flow_node_backfills_the_runs_membership() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let flow_run = Uuid::new_v4().to_string();
+                let created = client
+                    .call(
+                        "queue.enqueue",
+                        Some(flow_node_payload(
+                            &flow_run,
+                            0,
+                            "flow-380-retry",
+                            &["false"],
+                            ["exit:0".to_owned()],
+                        )),
+                    )
+                    .await
+                    .unwrap();
+                let task_uuid = created["task_uuid"].as_str().unwrap().to_owned();
+                assert_ne!(fs1_wait(&client, &created).await["verdict"], "pass");
+
+                // Take the ledger away, so the retry is the only thing that can
+                // put the binding back: this is the N-1 row an estate advancing
+                // its pin actually has.
+                std::fs::remove_file(
+                    paths
+                        .data_dir
+                        .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+                )
+                .unwrap();
+                client
+                    .call("queue.pause", Some(json!({"pool": "slot", "all": false})))
+                    .await
+                    .unwrap();
+                let retry = client
+                    .call("queue.retry", Some(json!({"task_uuid": task_uuid.clone()})))
+                    .await
+                    .unwrap();
+                assert_eq!(retry["attempt"], 2);
+
+                let ledger = membership_ledger(&paths);
+                assert_eq!(ledger.len(), 1, "{ledger:?}");
+                assert_eq!(ledger[0]["flowRunId"], json!(flow_run));
+                assert_eq!(ledger[0]["taskUuid"], json!(task_uuid));
+                assert_eq!(ledger[0]["disposition"], "retried");
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    /// Seed a ledger with `runs x nodes` records ending just before `now`.
+    fn seed_membership_ledger(paths: &DaemonPaths, runs: usize, nodes: usize) -> usize {
+        seed_membership_ledger_with(paths, runs, nodes, "")
+    }
+
+    /// `prefix` is written verbatim ahead of the generated padding, so a test
+    /// can plant a specific run at a specific age.
+    fn seed_membership_ledger_with(
+        paths: &DaemonPaths,
+        runs: usize,
+        nodes: usize,
+        prefix: &str,
+    ) -> usize {
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let mut text = prefix.to_owned();
+        for run in 0..runs {
+            for node in 0..nodes {
+                text.push_str(&format!(
+                    "{{\"schemaVersion\":1,\"flowRunId\":\"seed-{run:06}\",\
+                     \"taskUuid\":\"seed-{run:06}-{node:04}\",\"disposition\":\"created\",\
+                     \"nodeOrdinal\":{node},\"recordedAt\":\"2020-01-01T00:00:00.000Z\"}}\n"
+                ));
+            }
+        }
+        std::fs::write(
+            paths
+                .data_dir
+                .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+            &text,
+        )
+        .unwrap();
+        text.lines().filter(|line| !line.trim().is_empty()).count()
+    }
+
+    fn ledger_lines(paths: &DaemonPaths) -> usize {
+        std::fs::read_to_string(
+            paths
+                .data_dir
+                .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+        )
+        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0)
+    }
+
+    fn ledger_inode(paths: &DaemonPaths) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(
+            paths
+                .data_dir
+                .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+        )
+        .unwrap()
+        .ino()
+    }
+
+    /// The HIGH-2 regression, at the level it actually bit.
+    ///
+    /// The daemon used to rebuild its cached index as *pre-append cache plus the
+    /// new record*, never from the compacted set. So once the ledger passed its
+    /// bound the cache stayed permanently over it, every later admission decided
+    /// it had to compact, and each one serialised and fsynced the entire ledger
+    /// — measured at 977 ms per admission against 151 ms for the identical file
+    /// after a restart. The cache also grew without limit and answered queries
+    /// with runs the file no longer contained.
+    ///
+    /// Three things are asserted, and the first is the root cause: the index the
+    /// daemon holds is the index the file holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_the_daemons_index_never_diverges_from_the_ledger_it_writes() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let bound = crate::flow_membership::FLOW_MEMBERSHIP_MAX_RECORDS;
+                // Seed exactly to the bound, in whole runs, so the next
+                // admission is the one that crosses it.
+                let seeded = seed_membership_ledger(&paths, bound / 4, 4);
+                assert_eq!(seeded, bound);
+
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+
+                // Two runs, because `monitor_node_payload` pins `maxNodes: 8`
+                // and the flow-node cap is not this test's subject.
+                let runs = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
+                let mut inodes = Vec::new();
+                for ordinal in 0..12 {
+                    daemon
+                        .handler
+                        .enqueue_as_client(Some(monitor_node_payload(
+                            &runs[ordinal / 6],
+                            ordinal % 6,
+                        )))
+                        .await
+                        .unwrap();
+                    inodes.push(ledger_inode(&paths));
+
+                    // The file is bounded...
+                    assert!(
+                        ledger_lines(&paths) <= bound,
+                        "ordinal {ordinal}: ledger grew past its bound"
+                    );
+                    // ...and the daemon's own index is exactly what the file
+                    // holds, every single time. This is the assertion the first
+                    // draft would have failed on the very first admission.
+                    let held = daemon.handler.flow_membership().await.unwrap();
+                    let on_disk = crate::flow_membership::FlowMembership::read(
+                        &paths
+                            .data_dir
+                            .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        *held, on_disk,
+                        "ordinal {ordinal}: the daemon's index diverged from the ledger \
+                         ({} records held vs {} on disk)",
+                        held.record_count(),
+                        on_disk.record_count()
+                    );
+                }
+
+                // A rewrite renames a new file into place, so the inode changes
+                // once per compaction. Twelve admissions past the bound must
+                // produce exactly one, not twelve.
+                inodes.dedup();
+                assert_eq!(
+                    inodes.len(),
+                    1,
+                    "the ledger was rewritten more than once in twelve admissions: \
+                     that is the every-append-rewrites loop, back again"
+                );
+
+                // And the runs still resolve, on a compacted ledger.
+                for run in runs {
+                    let window = daemon
+                        .handler
+                        .query("query.log", Some(json!({"flowRun": run, "limit": 1000})))
+                        .await
+                        .unwrap();
+                    assert_eq!(window["flowRunTasks"], 6, "{window}");
+                }
+            })
+            .await;
+    }
+
+    /// A long-lived run whose membership is old must not lose it to a bound
+    /// crossed by unrelated traffic — and the record an admission is told is
+    /// durable must actually be in the ledger.
+    ///
+    /// This is the shape the divergence test above structurally cannot express,
+    /// because that one mints its runs with `Uuid::new_v4()` at test time, so
+    /// its runs are always the newest in the ledger and compaction never
+    /// considers them. A fixture wrong in the same direction as the code is the
+    /// class `AUGUST-02` §3 names, and this is the correction for it: the run
+    /// under test is planted as the *oldest* thing in the ledger, holds only
+    /// row-less nodes (so the scan half cannot rescue it), and is still live.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_compaction_never_evicts_a_live_run_or_the_record_it_is_writing() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let bound = crate::flow_membership::FLOW_MEMBERSHIP_MAX_RECORDS;
+                let watched = Uuid::new_v4().to_string();
+
+                // Four row-less nodes for the watched run, dated years before
+                // anything else. Row-less is the point: these have no capsule on
+                // any durable row, so if the ledger forgets them they are gone.
+                let mut prefix = String::new();
+                for node in 0..4 {
+                    prefix.push_str(&format!(
+                        "{{\"schemaVersion\":1,\"flowRunId\":\"{watched}\",\
+                         \"taskUuid\":\"attached-{node:04}\",\"disposition\":\"attached\",\
+                         \"nodeOrdinal\":{node},\"recordedAt\":\"2019-01-01T00:00:0{node}.000Z\"}}\n"
+                    ));
+                }
+                // Pad to exactly the bound, so the watched run's next admission
+                // is the one that crosses it.
+                let padding_runs = (bound - 4) / 4;
+                let seeded = seed_membership_ledger_with(&paths, padding_runs, 4, &prefix);
+                assert_eq!(seeded, bound);
+
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+
+                // The still-live run admits its next node.
+                let response = daemon
+                    .handler
+                    .enqueue_as_client(Some(monitor_node_payload(&watched, 4)))
+                    .await
+                    .unwrap();
+                let task_uuid = response["task_uuid"].as_str().unwrap().to_owned();
+
+                // If the write could not be honoured, the caller must be told;
+                // if it says nothing, the record has to be there.
+                assert!(
+                    response["membershipDegraded"].is_null(),
+                    "the admission reported degraded membership: {response}"
+                );
+                let ledger = crate::flow_membership::FlowMembership::read(
+                    &paths
+                        .data_dir
+                        .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+                )
+                .unwrap();
+                assert!(
+                    ledger.contains(&watched, &task_uuid),
+                    "the record the admission claimed to write is not in the ledger"
+                );
+
+                // And the run is whole, not half-present: its four old row-less
+                // nodes are still members alongside the one just admitted.
+                let mut members = ledger.tasks(&watched).collect::<Vec<_>>();
+                members.sort_unstable();
+                let mut expected = vec![
+                    "attached-0000",
+                    "attached-0001",
+                    "attached-0002",
+                    "attached-0003",
+                    task_uuid.as_str(),
+                ];
+                expected.sort_unstable();
+                assert_eq!(
+                    members, expected,
+                    "the live run lost membership to compaction"
+                );
+
+                // The count an operator actually reads.
+                let window = daemon
+                    .handler
+                    .query(
+                        "query.log",
+                        Some(json!({"flowRun": watched.clone(), "limit": 1000})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(window["flowRunTasks"], 5, "{window}");
+
+                // Compaction did happen -- otherwise this proves nothing.
+                assert!(
+                    ledger_lines(&paths) < bound,
+                    "the bound was never crossed, so nothing was under test"
+                );
+            })
+            .await;
+    }
+
+    /// The per-admission cost of membership bookkeeping, at several ledger
+    /// sizes. Ignored by default because it seeds tens of thousands of records
+    /// and reports rather than asserts; run it with
+    /// `cargo test -p tally-core --lib membership_admission_cost_sweep
+    /// -- --ignored --nocapture`.
+    ///
+    /// It exists because "measure the hot path you added" is the lesson #379 is
+    /// open about, and because the numbers are the only honest way to size
+    /// `FLOW_MEMBERSHIP_MAX_RECORDS`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "seeds a large ledger; run explicitly with --ignored"]
+    async fn membership_admission_cost_sweep() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let bound = crate::flow_membership::FLOW_MEMBERSHIP_MAX_RECORDS;
+                for (label, records) in [
+                    ("empty", 0),
+                    ("quarter", bound / 4),
+                    ("at the bound", bound),
+                    ("past the bound", bound + bound / 4),
+                ] {
+                    let temp = tempdir().unwrap();
+                    let paths = fs1_paths(temp.path());
+                    if records > 0 {
+                        seed_membership_ledger(&paths, records / 4, 4);
+                    }
+                    let opened = std::time::Instant::now();
+                    let daemon = fs1_daemon(&paths).await;
+                    daemon
+                        .handler
+                        .pause(Some(json!({"all": true})))
+                        .await
+                        .unwrap();
+                    // The first flow admission is what parses the ledger.
+                    let warm_run = Uuid::new_v4().to_string();
+                    daemon
+                        .handler
+                        .enqueue_as_client(Some(monitor_node_payload(&warm_run, 0)))
+                        .await
+                        .unwrap();
+                    let first = opened.elapsed();
+
+                    // Every iteration must be a *distinct* `(run, task)` pair.
+                    // The first version of this harness re-submitted the same
+                    // six pairs, so 21 of its 30 samples took the `AlreadyHeld`
+                    // early return — no open, no flock, no fsync — and the
+                    // reported figure was ~2.8x too low. The ledger line count
+                    // in the output is the check: it must grow by `admissions`.
+                    let admissions = 30_usize;
+                    let before_lines = ledger_lines(&paths);
+                    let started = std::time::Instant::now();
+                    for _ in 0..admissions {
+                        let run = Uuid::new_v4().to_string();
+                        daemon
+                            .handler
+                            .enqueue_as_client(Some(monitor_node_payload(&run, 0)))
+                            .await
+                            .unwrap();
+                    }
+                    let elapsed = started.elapsed();
+                    let grew = ledger_lines(&paths).saturating_sub(before_lines);
+                    eprintln!(
+                        "MEMBERSHIP-COST {label:>14}: seeded {records:>6} records, \
+                         open+first admission {first:>12.3?}, \
+                         {admissions} admissions in {elapsed:>12.3?} \
+                         = {:>10.3?}/admission, ledger {} lines (+{grew})",
+                        elapsed / admissions as u32,
+                        ledger_lines(&paths),
+                    );
+                    assert!(
+                        grew == admissions || ledger_lines(&paths) < before_lines,
+                        "{label}: only {grew} of {admissions} admissions actually \
+                         appended; this harness is measuring the wrong path again"
+                    );
+                }
+            })
+            .await;
+    }
+
+    /// The frozen kernel's other half: an admission that names no run touches
+    /// none of this. No ledger, no file, no new failure mode.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_a_non_flow_admission_writes_no_membership_at_all() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let payload =
+                    fs1_full_payload("no-flow-380", &["true"], ["exit:0".to_owned()]);
+                let created = client
+                    .call("queue.enqueue", Some(payload.clone()))
+                    .await
+                    .unwrap();
+                assert_eq!(created["disposition"], "created");
+                assert_eq!(fs1_wait(&client, &created).await["verdict"], "pass");
+                let reused = client.call("queue.enqueue", Some(payload)).await.unwrap();
+                assert_eq!(reused["disposition"], "reused");
+                assert_eq!(reused["task_uuid"], created["task_uuid"]);
+
+                assert!(
+                    membership_ledger(&paths).is_empty(),
+                    "a non-flow admission must not create the membership ledger"
+                );
+                assert!(
+                    !paths
+                        .data_dir
+                        .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE)
+                        .exists(),
+                    "and must not even create the file"
+                );
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
+    /// Membership is durable, not cached: it survives a restart. And it is
+    /// exactly the *delta* over the old scan — remove the ledger and the
+    /// pre-#380 answer comes back, node for node, which is what makes an
+    /// estate that advances its pin across this commit safe in both
+    /// directions.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_membership_is_durable_and_is_exactly_the_delta_over_the_scan() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let first_run = Uuid::new_v4().to_string();
+                let second_run = Uuid::new_v4().to_string();
+                let shared_task;
+                {
+                    let daemon = fs1_daemon(&paths).await;
+                    daemon
+                        .handler
+                        .pause(Some(json!({"all": true})))
+                        .await
+                        .unwrap();
+                    let created = daemon
+                        .handler
+                        .enqueue_as_client(Some(monitor_node_payload(&first_run, 0)))
+                        .await
+                        .unwrap();
+                    assert_eq!(created["disposition"], "created");
+                    shared_task = created["task_uuid"].as_str().unwrap().to_owned();
+                    let mut resubmitted = monitor_node_payload(&first_run, 0);
+                    resubmitted["orchestration"]["flowRunId"] = json!(second_run);
+                    let attached = daemon
+                        .handler
+                        .enqueue_as_client(Some(resubmitted))
+                        .await
+                        .unwrap();
+                    assert_eq!(attached["disposition"], "attached");
+                }
+
+                let count = |handler: &DaemonHandler, flow_run: String| {
+                    let handler = handler.clone();
+                    async move {
+                        handler
+                            .query(
+                                "query.log",
+                                Some(json!({"flowRun": flow_run, "limit": 1000})),
+                            )
+                            .await
+                            .unwrap()["flowRunTasks"]
+                            .as_u64()
+                            .unwrap()
+                    }
+                };
+
+                // A fresh daemon on the same paths reads the ledger off disk.
+                let restarted = fs1_daemon(&paths).await;
+                assert_eq!(count(&restarted.handler, second_run.clone()).await, 1);
+                assert_eq!(count(&restarted.handler, first_run.clone()).await, 1);
+                drop(restarted);
+
+                // Now take the ledger away. The run whose row carries the
+                // capsule is unaffected -- the scan half is untouched -- and
+                // the attaching run falls back to exactly the pre-#380 answer.
+                std::fs::remove_file(
+                    paths
+                        .data_dir
+                        .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+                )
+                .unwrap();
+                let scan_only = fs1_daemon(&paths).await;
+                assert_eq!(
+                    count(&scan_only.handler, first_run).await,
+                    1,
+                    "the row scan must answer exactly as it did before #380"
+                );
+                assert_eq!(
+                    count(&scan_only.handler, second_run.clone()).await,
+                    0,
+                    "and the ledger must be the whole of the difference"
+                );
+                let window = scan_only
+                    .handler
+                    .query(
+                        "query.log",
+                        Some(json!({"flowRun": second_run, "limit": 1000})),
+                    )
+                    .await
+                    .unwrap();
+                assert!(window["items"].as_array().unwrap().is_empty());
+                assert!(!shared_task.is_empty());
+            })
+            .await;
+    }
+
+    /// A refusal has to leave nothing behind, and this test's whole job is to
+    /// ask what the daemon *kept* — the question the first version of it never
+    /// asked, which is how it certified a "refusal" that had already committed a
+    /// durable row, emitted the `enqueued` journal event, registered the job
+    /// with the dispatcher, and let it run to a passing witness.
+    ///
+    /// Both reachable faults are asserted: a ledger that cannot be opened at
+    /// all, and the one complete-but-unusable record that
+    /// `repair-flow-membership-ledger` actually exists for, which is the far
+    /// likelier trigger.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_a_membership_fault_refuses_before_the_kernel_commits_anything() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                for fault in ["unopenable", "malformed-record"] {
+                    let temp = tempdir().unwrap();
+                    let paths = fs1_paths(temp.path());
+                    let daemon = fs1_daemon(&paths).await;
+                    // The pool is NOT paused: if the kernel committed, the node
+                    // would dispatch and run, which is exactly what must not
+                    // survive the refusal.
+                    let ledger = paths
+                        .data_dir
+                        .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE);
+                    std::fs::create_dir_all(&paths.data_dir).unwrap();
+                    match fault {
+                        "unopenable" => std::fs::create_dir(&ledger).unwrap(),
+                        _ => std::fs::write(
+                            &ledger,
+                            "{\"schemaVersion\":1,\"flowRunId\":\"run-a\",\
+                             \"taskUuid\":\"task-1\",\"disposition\":\"attached\",\
+                             \"recordedAt\":\"not-a-timestamp\"}\n",
+                        )
+                        .unwrap(),
+                    }
+
+                    let flow_run = Uuid::new_v4().to_string();
+                    let error = daemon
+                        .handler
+                        .enqueue_as_client(Some(monitor_node_payload(&flow_run, 0)))
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        error.message.contains("flow membership"),
+                        "{fault}: the refusal must name the store that failed: {error:?}"
+                    );
+                    assert_eq!(
+                        error.data.as_ref().unwrap()["resolution"],
+                        "repair-flow-membership-ledger",
+                        "{fault}"
+                    );
+
+                    // What the daemon kept: nothing.
+                    let mut context = daemon.handler.context.write().await;
+                    assert!(
+                        context.rows.is_empty(),
+                        "{fault}: a refused admission left a durable row: {:?}",
+                        context.rows.keys().collect::<Vec<_>>()
+                    );
+                    assert!(
+                        context.jobs.is_empty(),
+                        "{fault}: a refused admission left a live job"
+                    );
+                    assert!(
+                        context.query_details.snapshot().is_empty(),
+                        "{fault}: a refused admission left a query projection"
+                    );
+                    drop(context);
+                    assert!(
+                        read_acknowledged_events(&paths.events_dir()).unwrap().is_empty(),
+                        "{fault}: a refused admission left a durable enqueue event"
+                    );
+                    assert!(
+                        daemon.handler.history.borrow().snapshot().records.is_empty(),
+                        "{fault}: a refused admission emitted a lifecycle event"
+                    );
+
+                    // And nothing observable claims the run exists.
+                    let window = daemon
+                        .handler
+                        .query(
+                            "query.log",
+                            Some(json!({"flowRun": flow_run.clone(), "limit": 1000})),
+                        )
+                        .await;
+                    match window {
+                        // A run-scoped query over a damaged ledger fails loudly;
+                        // it must never answer with a smaller run.
+                        Err(error) => assert!(error.message.contains("flow membership")),
+                        Ok(window) => {
+                            assert_eq!(window["flowRunTasks"], 0, "{fault}: {window}");
+                            assert!(window["items"].as_array().unwrap().is_empty());
+                        }
+                    }
+
+                    // A non-flow admission is unaffected either way.
+                    let unrelated = daemon
+                        .handler
+                        .enqueue_as_client(Some(fs1_full_payload(
+                            "no-flow-membership-fault",
+                            &["true"],
+                            ["exit:0".to_owned()],
+                        )))
+                        .await
+                        .unwrap();
+                    assert_eq!(unrelated["disposition"], "created", "{fault}");
+                }
+            })
+            .await;
+    }
+
+    /// The residue the preflight cannot take: the ledger becomes unusable
+    /// *between* the preflight and the append, so by the time the failure is
+    /// known the admission has already happened.
+    ///
+    /// The fault is injected at that seam by hand, and deliberately so. The
+    /// preflight catches the faults that are reachable *before* an admission —
+    /// an unopenable ledger and an unusable record, which the test above proves
+    /// — but it is a check, not a guarantee, and it does not cover everything.
+    /// Two known gaps: a ledger that is writable under a read-only parent
+    /// passes both the probe and an ordinary append and fails only when
+    /// compaction tries to create its temp file; and the data directory can
+    /// fill, or the file be replaced, in the window between the check and the
+    /// write. Both land here, which is why this path has to exist and be
+    /// correct rather than be treated as unreachable.
+    ///
+    /// What must hold: the caller is told the truth. The work was admitted, here
+    /// is its task UUID, and this one node's membership is missing until the
+    /// ledger is repaired. It is not told the admission failed while its node
+    /// executes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_a_membership_fault_after_the_commit_degrades_rather_than_lying() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+                let ledger = paths
+                    .data_dir
+                    .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE);
+                let flow_run = Uuid::new_v4().to_string();
+
+                // The preflight passes: the ledger is fine at this point.
+                daemon.handler.preflight_flow_membership().await.unwrap();
+
+                // The kernel commits. This is a real admission with a real row.
+                let mut response = daemon
+                    .handler
+                    .enqueue_as_client(Some(monitor_node_payload(&flow_run, 0)))
+                    .await
+                    .unwrap();
+                let task_uuid = response["task_uuid"].as_str().unwrap().to_owned();
+
+                // ...and only now does the ledger become unwritable.
+                std::fs::remove_file(&ledger).ok();
+                std::fs::create_dir(&ledger).unwrap();
+
+                let orchestration = crate::provenance::Orchestration::new(
+                    monitor_node_payload(&flow_run, 1)["orchestration"].clone(),
+                )
+                .unwrap();
+                let error = daemon
+                    .handler
+                    .record_admission_membership(&orchestration, &response)
+                    .await
+                    .expect_err("the membership write must fail for this test to mean anything");
+                daemon.handler.disclose_degraded_membership(
+                    &orchestration,
+                    &mut response,
+                    &error,
+                );
+
+                // The response still says what actually happened.
+                assert_eq!(response["disposition"], "created", "{response}");
+                assert_eq!(
+                    response["task_uuid"], json!(task_uuid),
+                    "an acknowledged admission must still hand back its task UUID: {response}"
+                );
+                let degraded = &response["membershipDegraded"];
+                assert_eq!(degraded["admitted"], true, "{response}");
+                assert_eq!(degraded["flowRunId"], json!(flow_run), "{response}");
+                assert_eq!(degraded["taskUuid"], json!(task_uuid), "{response}");
+                assert_eq!(
+                    degraded["resolution"], "repair-flow-membership-ledger",
+                    "{response}"
+                );
+                assert!(
+                    degraded["reason"].as_str().unwrap().contains("flow membership"),
+                    "{response}"
+                );
+
+                // The admission is real, and the daemon kept it -- which is the
+                // whole reason the caller must not be told it failed.
+                let context = daemon.handler.context.read().await;
+                assert_eq!(context.rows.len(), 1, "the admission did happen");
+                assert!(context.jobs.contains_key(&Uuid::parse_str(&task_uuid).unwrap()));
+            })
+            .await;
+    }
+
+    /// `positionGap` keeps meaning what it meant. It is decided by the held
+    /// position against retained history, never by the filtered window, so a
+    /// run whose membership just became durable reports the same gap it always
+    /// would have -- "history is missing" is not quietly replaced by "the
+    /// window is now reachable".
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_position_gap_is_retention_evidence_not_membership_evidence() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let first_run = Uuid::new_v4().to_string();
+                let second_run = Uuid::new_v4().to_string();
+                let shared_task;
+                let mark;
+                {
+                    let daemon = fs1_daemon(&paths).await;
+                    daemon
+                        .handler
+                        .pause(Some(json!({"all": true})))
+                        .await
+                        .unwrap();
+                    let created = daemon
+                        .handler
+                        .enqueue_as_client(Some(monitor_node_payload(&first_run, 0)))
+                        .await
+                        .unwrap();
+                    shared_task = created["task_uuid"].as_str().unwrap().to_owned();
+                    let mut resubmitted = monitor_node_payload(&first_run, 0);
+                    resubmitted["orchestration"]["flowRunId"] = json!(second_run);
+                    let attached = daemon
+                        .handler
+                        .enqueue_as_client(Some(resubmitted))
+                        .await
+                        .unwrap();
+                    assert_eq!(attached["disposition"], "attached");
+
+                    // Everything above this mark becomes unretained history.
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    mark = Utc::now();
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    for event in [TallyEvent::Started, TallyEvent::Heartbeat] {
+                        let mut emit = crate::journal::EmitEvent::enqueued(
+                            shared_task.clone(),
+                            Priority::High,
+                            EnqueueSource::Orchestrator,
+                        );
+                        emit.event = event;
+                        emit.agent = Some("shell".to_owned());
+                        emit.attempt = Some(1);
+                        emit.lease_epoch = Some(1);
+                        emit.job_id = Some(shared_task.clone());
+                        emit.unit = Some(format!("tally-job-{shared_task}.service"));
+                        daemon
+                            .handler
+                            .history
+                            .borrow_mut()
+                            .append_now(emit.into_fields().unwrap())
+                            .unwrap();
+                    }
+                }
+
+                // Drop the oldest lifecycle prefix for real, so a held position
+                // at the origin genuinely predates retained history.
+                let compaction =
+                    crate::history::compact_lifecycle(&paths.state_dir, &paths.data_dir, 0, mark)
+                        .unwrap();
+                assert!(compaction.dropped > 0, "{compaction:?}");
+
+                let daemon = fs1_daemon(&paths).await;
+                let origin = "log-v1:00000000000000000000:00000000000000000000";
+                let gapped = daemon
+                    .handler
+                    .query(
+                        "query.log",
+                        Some(json!({
+                            "flowRun": second_run.clone(),
+                            "after": origin,
+                            "limit": 1000,
+                        })),
+                    )
+                    .await
+                    .unwrap();
+                assert!(
+                    gapped["positionGap"].is_object(),
+                    "a held position before the retained floor is still a gap on a run \
+                     whose membership is durable: {gapped}"
+                );
+                assert_eq!(
+                    gapped["flowRunTasks"], 1,
+                    "the run still resolves to its member; the gap is about history, \
+                     not about membership"
+                );
+
+                // The gap decision is identical with and without the run
+                // filter: it is computed from the held position against the
+                // retained floor and never from the window the filter produced.
+                let unfiltered = daemon
+                    .handler
+                    .query(
+                        "query.log",
+                        Some(json!({"after": origin, "limit": 1000})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(gapped["positionGap"], unfiltered["positionGap"]);
+
+                // And a position at the head reports no gap, on the same run.
+                let head = daemon
+                    .handler
+                    .query(
+                        "query.log",
+                        Some(json!({"flowRun": second_run.clone(), "limit": 1000})),
+                    )
+                    .await
+                    .unwrap()["position"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let ungapped = daemon
+                    .handler
+                    .query(
+                        "query.log",
+                        Some(json!({"flowRun": second_run, "after": head, "limit": 1000})),
+                    )
+                    .await
+                    .unwrap();
+                assert!(ungapped.get("positionGap").is_none(), "{ungapped}");
             })
             .await;
     }

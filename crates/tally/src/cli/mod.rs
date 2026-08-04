@@ -2,7 +2,7 @@ mod adapter;
 mod args;
 mod campaign;
 mod daemon;
-mod enqueue;
+pub(crate) mod enqueue;
 mod exit;
 mod flow;
 mod out;

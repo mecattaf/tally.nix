@@ -1,4 +1,5 @@
 use super::*;
+use crate::cli::text::compact_text;
 
 pub(super) async fn run_enqueue(
     socket: &Path,
@@ -133,6 +134,38 @@ pub(super) async fn run_enqueue(
     .await
 }
 
+/// Say, at the point of degradation, that this admission's run membership was
+/// not recorded.
+///
+/// The admission succeeded and its work is running — that is why the daemon
+/// acknowledged it rather than refusing — but this node will be missing from
+/// `--flow-run` windows until the ledger is repaired. Without this line the only
+/// trace is a daemon journal entry the operator has to already know to grep for,
+/// which means the person who caused the degradation is the one person who does
+/// not learn about it.
+pub(crate) fn report_degraded_membership(result: &Value) -> Result<()> {
+    let Some(degraded) = result
+        .get("membershipDegraded")
+        .filter(|value| value.is_object())
+    else {
+        return Ok(());
+    };
+    errln!(
+        "warning: this node was admitted but its run membership was NOT recorded, so it \
+         will be missing from `--flow-run` windows for run {} until the ledger is repaired \
+         (task {}): {}. Resolution: {}.",
+        compact_text(degraded["flowRunId"].as_str().unwrap_or("<unknown>")),
+        compact_text(degraded["taskUuid"].as_str().unwrap_or("<unknown>")),
+        compact_text(degraded["reason"].as_str().unwrap_or("<unknown>")),
+        compact_text(
+            degraded["resolution"]
+                .as_str()
+                .unwrap_or("repair-flow-membership-ledger")
+        ),
+    );
+    Ok(())
+}
+
 pub(super) async fn submit_payload(
     socket: &Path,
     config_path: Option<&Path>,
@@ -145,6 +178,7 @@ pub(super) async fn submit_payload(
     let result = client
         .call(method, Some(serde_json::to_value(payload)?))
         .await?;
+    report_degraded_membership(&result)?;
     if !wait {
         outln!("{}", serde_json::to_string(&result)?);
         return Ok(());

@@ -111,6 +111,10 @@ use crate::flow_lineage::{
     canonical_flow_run_id, record_supersede, FlowLineage, FlowLineageError, PredecessorPins,
     SupersedeReason,
 };
+use crate::flow_membership::{
+    record_membership, FlowMembership, FlowMembershipError, FlowMembershipRecord,
+    MembershipDisposition, MembershipWrite,
+};
 use crate::git_ai::GitAiExecution;
 use crate::history::{HistoryError, LifecycleStore};
 use crate::journal::{EmitEvent, JournalEmitter, JournalEntry, TallyEvent};
@@ -270,6 +274,11 @@ impl DaemonPaths {
     /// supervisor that asked for it.
     pub fn flow_lineage_path(&self) -> PathBuf {
         self.data_dir.join(crate::flow_lineage::FLOW_LINEAGE_FILE)
+    }
+
+    pub fn flow_membership_path(&self) -> PathBuf {
+        self.data_dir
+            .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE)
     }
 
     pub fn lifecycle_path(&self) -> PathBuf {
@@ -588,6 +597,7 @@ struct DaemonHandler {
     exec_attestations: bool,
     attestations: Arc<std::sync::Mutex<SharedAttestations>>,
     flow_lineage_cache: Rc<RefCell<Option<CachedFlowLineage>>>,
+    flow_membership_cache: Rc<RefCell<Option<CachedFlowMembership>>>,
 }
 
 /// The parsed lineage index plus the file stamp it was parsed from.
@@ -598,6 +608,19 @@ struct DaemonHandler {
 pub(crate) struct CachedFlowLineage {
     stamp: Option<(u64, Option<std::time::SystemTime>)>,
     lineage: Rc<FlowLineage>,
+}
+
+/// The parsed membership index plus the file stamp it was parsed from.
+///
+/// Every run-scoped query reads this store and every flow admission writes to
+/// it, so unlike the lineage cache it is refreshed in place after this daemon's
+/// own append rather than dropped: re-parsing the whole ledger once per
+/// admission would make admission linear in the ledger. The stamp is still
+/// revalidated on every read, so an operator repairing the ledger by hand does
+/// not have to restart the daemon.
+pub(crate) struct CachedFlowMembership {
+    stamp: Option<(u64, Option<std::time::SystemTime>)>,
+    membership: Rc<FlowMembership>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

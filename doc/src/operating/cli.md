@@ -485,9 +485,14 @@ filter, and it is not `--cursor`, which is an ephemeral page offset; a page or w
 handed to `--after` is refused rather than misread. `--after` plus empty `items` means nothing after that
 position matched the filter; read `items` rather than `position`, which is the head of the whole
 lifecycle stream and advances whenever anything else on the daemon does. A run-scoped response
-also reports `flowRunTasks`, and `flowRunTasks: 0` means the window is not evidence about the run
-at all. See [Poll a flow run correctly](observability.md#poll-a-flow-run-correctly) for the full
-monitoring contract, including the membership seam behind #247.
+also reports `flowRunTasks`. Run membership is a durable admission fact, written for all five
+dispositions before the admission is acknowledged, so `flowRunTasks: 0` means the daemon holds no
+membership for that run ID — usually a mistyped or stale ID, but also a repaired or deleted
+ledger, a compacted-out idle run, or an admission that reported `membershipDegraded`. See [Poll a flow run
+correctly](observability.md#poll-a-flow-run-correctly) for the full monitoring contract and
+[Run membership is a durable admission
+fact](observability.md#run-membership-is-a-durable-admission-fact) for what replaced the #247
+seam.
 `query trace` also supports page cursors. Proof is not just a witness
 lookup: it reports whether a witness is expected, returns the canonical record when present,
 separates advisory attestations, and includes ledger verification state.

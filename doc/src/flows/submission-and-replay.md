@@ -87,6 +87,17 @@ A reused result retains its original verdict—normally `pass`—and original
 returns the recorded failure verdict. Full mode never turns that failure into a
 new attempt merely because the runner restarted.
 
+Whichever way a node is met, the run that submitted it becomes a durable member
+of the task it was handed: the admission appends `(flowRunId, taskUuid)` to
+`<dataDir>/flow-membership.jsonl` and fsyncs it before answering. That matters
+most for `attached`, `reused`, and `terminal`, which write no row of their own —
+the row belongs to whichever run created it, so without the membership record
+the submitting run could not see its own node in `tally query log --flow-run`,
+`query jobs --flow-run`, or `query run`. A `dedup-key-conflict` admits nothing
+and therefore joins the run to nothing. See [Run membership is a durable
+admission
+fact](../operating/observability.md#run-membership-is-a-durable-admission-fact).
+
 ## Replay from a killed runner
 
 Suppose a runner is killed after three completed nodes while a fourth is still

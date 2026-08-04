@@ -54,6 +54,28 @@ impl DaemonHandler {
         let params: Params = decode_params(params)?;
         let task_uuid = Uuid::parse_str(&params.task_uuid)
             .map_err(|_| WireError::invalid("task_uuid must be a UUID"))?;
+        // Backfill membership for a row admitted before the ledger existed,
+        // before any lock this call needs is taken. The fact is true whether or
+        // not the retry is then accepted — the row itself already carries this
+        // run's capsule — so recording it early costs a rejected retry nothing
+        // and gives a pin advance a way to complete an older run's membership.
+        let retried_orchestration = {
+            let context = self.context.read().await;
+            context
+                .rows
+                .get(&task_uuid)
+                .and_then(|row| row.orchestration.clone())
+        };
+        if let Some(orchestration) = retried_orchestration {
+            self.record_flow_membership(FlowMembershipRecord::new(
+                orchestration.flow_run_id().to_owned(),
+                task_uuid.to_string(),
+                MembershipDisposition::Retried,
+                orchestration.node_ordinal(),
+                orchestration_node_label(Some(&orchestration)).map(ToOwned::to_owned),
+            ))
+            .await?;
+        }
         let brief_root = self.context.read().await.paths.data_dir.clone();
         let _brief_lock = tokio::task::spawn_blocking(move || brief::acquire_shared(&brief_root))
             .await
@@ -318,7 +340,138 @@ impl DaemonHandler {
         Ok(response)
     }
 
+    /// Admit, then make the run's membership in the outcome durable.
+    ///
+    /// The enqueue kernel proper is [`Self::admit_payload`] and is unchanged:
+    /// the two-part key (`dedupKey` identity x `payloadHash` work-equality)
+    /// still resolves to exactly the same five dispositions, with the same
+    /// evidence-probed reuse, and this wrapper cannot alter which one a given
+    /// pair resolves to — it never inspects the key and never returns a
+    /// different disposition than the kernel decided.
+    ///
+    /// What it adds is the fact the kernel never wrote down. Three dispositions
+    /// hand the caller a task UUID without writing a row of their own —
+    /// `attached`, and full-mode `reused` and `terminal` — so the run that
+    /// submitted the node has, durably, nothing that says the node is its. That
+    /// is W-316. Recording membership *here* rather than at each of the
+    /// kernel's return sites is deliberate: a disposition added later cannot
+    /// forget to write it, and the kernel body stays byte-for-byte the code the
+    /// freeze settled.
+    ///
+    /// An admission carrying no orchestration capsule — every non-flow
+    /// admission — takes none of this path at all.
+    ///
+    /// **The ordering is the whole design.** The kernel cannot say which task
+    /// UUID a run is being handed until it has decided, and by then the row, the
+    /// `enqueued` journal event, and the dispatcher registration are durable —
+    /// so a membership failure at that point cannot be reported as a failed
+    /// admission without orphaning work that is already executing. Instead the
+    /// ledger is proved usable *before* the kernel commits, where a refusal is a
+    /// real refusal; and the narrow residue where it becomes unusable in between
+    /// is acknowledged, with the task UUID the caller needs and an explicit
+    /// warning, rather than denied. `queue.retry` has recorded before it mutates
+    /// from the start, and this is the same rule applied to the path that could
+    /// not simply be reordered.
     pub(crate) async fn enqueue_payload(
+        &self,
+        payload: EnqueuePayload,
+        ingress_id: Option<String>,
+        caller: CallerIdentity,
+    ) -> Result<Value, WireError> {
+        let submitted = payload.orchestration.clone();
+        if submitted.is_some() {
+            self.preflight_flow_membership().await?;
+        }
+        let mut response = self.admit_payload(payload, ingress_id, caller).await?;
+        let Some(orchestration) = submitted else {
+            return Ok(response);
+        };
+        if let Err(error) = self
+            .record_admission_membership(&orchestration, &response)
+            .await
+        {
+            self.disclose_degraded_membership(&orchestration, &mut response, &error);
+        }
+        Ok(response)
+    }
+
+    /// Bind the admitted task UUID to the run that submitted it.
+    ///
+    /// The record is durable before the response is handed back, so anything
+    /// that learns the task UUID from this response can already resolve it to
+    /// this run.
+    pub(crate) async fn record_admission_membership(
+        &self,
+        orchestration: &Orchestration,
+        response: &Value,
+    ) -> Result<(), WireError> {
+        let Some(task_uuid) = response
+            .get("taskUuid")
+            .or_else(|| response.get("task_uuid"))
+            .and_then(Value::as_str)
+        else {
+            // Every admission that resolves to work names the task it resolved
+            // to. One that does not has handed the run nothing to be a member.
+            return Ok(());
+        };
+        // Every admission response the kernel builds names its disposition; a
+        // future one that does not still records the membership rather than
+        // dropping it, because the binding is the fact and the label is colour.
+        let disposition = response
+            .get("disposition")
+            .and_then(Value::as_str)
+            .map_or(MembershipDisposition::Unknown, |value| {
+                MembershipDisposition::from_response(value)
+            });
+        self.record_flow_membership(FlowMembershipRecord::new(
+            orchestration.flow_run_id().to_owned(),
+            task_uuid.to_owned(),
+            disposition,
+            orchestration.node_ordinal(),
+            orchestration_node_label(Some(orchestration)).map(ToOwned::to_owned),
+        ))
+        .await
+    }
+
+    /// Acknowledge an admission whose membership could not be recorded, and say
+    /// so — in the response, and durably on the daemon's journal.
+    ///
+    /// The admission happened: the row is durable and the work is dispatching,
+    /// so the honest answer is the disposition the kernel decided plus the task
+    /// UUID. What is degraded is *observability of one node*, and only until the
+    /// ledger is repaired: this run's window will be missing this node, which is
+    /// exactly the pre-#380 status quo for that one node rather than a
+    /// regression. The typed field lets a runner log it; the journal line is the
+    /// durable record an operator greps to know what to backfill, because the
+    /// store that would ordinarily hold that fact is the one that just failed.
+    pub(crate) fn disclose_degraded_membership(
+        &self,
+        orchestration: &Orchestration,
+        response: &mut Value,
+        error: &WireError,
+    ) {
+        let flow_run_id = orchestration.flow_run_id();
+        let task_uuid = response
+            .get("taskUuid")
+            .or_else(|| response.get("task_uuid"))
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>")
+            .to_owned();
+        eprintln!(
+            "tally: flow-membership-degraded flowRunId={flow_run_id} taskUuid={task_uuid} \
+             admitted=true reason={}",
+            error.message
+        );
+        response["membershipDegraded"] = json!({
+            "flowRunId": flow_run_id,
+            "taskUuid": task_uuid,
+            "admitted": true,
+            "reason": error.message,
+            "resolution": "repair-flow-membership-ledger",
+        });
+    }
+
+    async fn admit_payload(
         &self,
         mut payload: EnqueuePayload,
         ingress_id: Option<String>,

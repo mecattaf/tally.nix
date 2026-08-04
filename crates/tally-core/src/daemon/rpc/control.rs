@@ -544,6 +544,158 @@ impl DaemonHandler {
         self.flow_lineage_cache.borrow_mut().take();
     }
 
+    /// The parsed run-membership ledger, re-read only when its bytes changed.
+    pub(crate) async fn flow_membership(&self) -> Result<Rc<FlowMembership>, WireError> {
+        let path = self.context.read().await.paths.flow_membership_path();
+        let stamp = membership_stamp(&path);
+        if let Some(cached) = self.flow_membership_cache.borrow().as_ref() {
+            if cached.stamp == stamp {
+                return Ok(cached.membership.clone());
+            }
+        }
+        let membership = Rc::new(FlowMembership::read(&path).map_err(membership_wire)?);
+        *self.flow_membership_cache.borrow_mut() = Some(CachedFlowMembership {
+            stamp,
+            membership: membership.clone(),
+        });
+        Ok(membership)
+    }
+
+    /// Prove the membership ledger is usable *before* the kernel commits.
+    ///
+    /// A flow admission cannot record membership until the kernel has decided
+    /// which task UUID the run is being handed, and by then the row, the
+    /// `enqueued` journal event, and the dispatcher registration are already
+    /// durable. Failing at that point and reporting an error to the caller is
+    /// not a refusal — it orphans live work. So the two faults that are actually
+    /// reachable, an unusable record and a ledger that cannot be opened for
+    /// append, are detected here, where returning an error refuses an admission
+    /// that has not happened yet.
+    pub(crate) async fn preflight_flow_membership(&self) -> Result<(), WireError> {
+        let path = self.context.read().await.paths.flow_membership_path();
+        let stamp = membership_stamp(&path);
+        if self
+            .flow_membership_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|cached| cached.stamp == stamp)
+        {
+            // The cache is current, so the ledger already parsed cleanly as of
+            // these bytes and re-parsing would be the very per-admission linear
+            // cost the cache exists to avoid. Only the appendability check is
+            // left, and it is one open.
+            return crate::flow_membership::probe_appendable(&path).map_err(membership_wire);
+        }
+        let membership =
+            Rc::new(crate::flow_membership::preflight(&path).map_err(membership_wire)?);
+        *self.flow_membership_cache.borrow_mut() = Some(CachedFlowMembership {
+            stamp: membership_stamp(&path),
+            membership,
+        });
+        Ok(())
+    }
+
+    /// Make `flow_run_id` durably hold `task_uuid`.
+    ///
+    /// The whole point of the record is that it is written for the dispositions
+    /// that write no row of their own: an `attached` caller handed a task UUID
+    /// it will never be able to see in its own window is W-316 all over again.
+    /// So this must not fail silently — but by the time it runs the admission
+    /// has already happened, so it must not fail *loudly to the caller* either.
+    /// [`Self::preflight_flow_membership`] takes the reachable faults before the
+    /// commit; what is left here is the narrow race where the ledger became
+    /// unusable in between, and the caller gets a degraded acknowledgement
+    /// rather than a false refusal. The error is returned for the admission path
+    /// to attach, never for it to propagate.
+    pub(crate) async fn record_flow_membership(
+        &self,
+        record: FlowMembershipRecord,
+    ) -> Result<(), WireError> {
+        let path = self.context.read().await.paths.flow_membership_path();
+        // Scoped so the borrowed index is dropped before the cache is taken:
+        // holding it here would keep the `Rc` strong count at two, `try_unwrap`
+        // below would fail, and every admission would deep-clone the whole
+        // index — linear in the ledger, which is the cost this repair removes.
+        let already_held = {
+            let held = self.flow_membership().await?;
+            held.contains(&record.flow_run_id, &record.task_uuid)
+        };
+        if already_held {
+            return Ok(());
+        }
+        // Every task the daemon holds that has not completed — `Running`,
+        // `Queued`, and `Paused` alike. Compaction refuses to evict any run
+        // holding one, so a campaign cannot lose its membership to a bound
+        // crossed by unrelated traffic while its work is still outstanding.
+        //
+        // The cost is one pass over `context.jobs`, which is never pruned and so
+        // grows with every job this daemon has admitted since it started. It is
+        // therefore *not* bounded by concurrency — the earlier comment here said
+        // it was, and was wrong. It is collected below the `already_held` return
+        // so a repeat admission, which writes nothing, pays nothing for it; it is
+        // still built on every admission that does write, because the writer
+        // cannot know in advance whether it will need to compact.
+        let live_tasks = {
+            let context = self.context.read().await;
+            context
+                .jobs
+                .values()
+                .filter(|job| job.state != JobState::Completed)
+                .map(Job::stable_key)
+                .collect::<BTreeSet<_>>()
+        };
+        let owned = match self.flow_membership_cache.borrow_mut().take() {
+            Some(cached) => {
+                Rc::try_unwrap(cached.membership).unwrap_or_else(|shared| (*shared).clone())
+            }
+            // Only reachable if a concurrent reader invalidated it in between.
+            None => FlowMembership::read(&path).map_err(membership_wire)?,
+        };
+        match record_membership(&path, &record, owned, &live_tasks) {
+            Ok((write, updated)) => {
+                if write == MembershipWrite::AppendedOverTarget {
+                    // Not an error: the ledger is deliberately allowed to exceed
+                    // its target rather than evict membership for work that has
+                    // not finished. Said out loud because an operator watching
+                    // disk should know why this file is above its documented
+                    // bound, and what would bring it back down.
+                    //
+                    // The wording is load-bearing. "Executing" was wrong here and
+                    // wrong in the reassuring direction: the commonest way to
+                    // reach this state is `queue pause --all`, where every job is
+                    // `Paused` — idle, not busy — and nothing completes until an
+                    // operator resumes. Telling them the daemon is working and to
+                    // wait would be advice to wait forever.
+                    eprintln!(
+                        "tally: flow-membership is over its {}-record target with nothing \
+                         evictable ({} records; every run above the bound holds work that \
+                         has not completed, which may be running, queued, or paused). It \
+                         grows by one record per flow admission until that work finishes, \
+                         and compacts on the next admission after it does. If the queue is \
+                         paused it will not drain on its own: `tally queue resume --all`.",
+                        crate::flow_membership::FLOW_MEMBERSHIP_MAX_RECORDS,
+                        updated.record_count()
+                    );
+                }
+                // The cache is whatever the writer says the file now holds --
+                // including after a compaction, which is what stops the cache
+                // from staying permanently over the bound and rewriting the
+                // whole ledger on every later admission.
+                *self.flow_membership_cache.borrow_mut() = Some(CachedFlowMembership {
+                    stamp: membership_stamp(&path),
+                    membership: Rc::new(updated),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                // The index went with the failed write; leave the cache empty so
+                // the next reader re-parses whatever survived on disk rather
+                // than trusting a projection of a write that did not land.
+                Err(membership_wire(error))
+            }
+        }
+    }
+
     pub(crate) async fn cancel_one(
         &self,
         task_uuid: &str,
@@ -835,6 +987,30 @@ pub(crate) fn lineage_wire(error: FlowLineageError) -> WireError {
             data: Some(json!({
                 "transient": false,
                 "resolution": "repair-lineage-ledger",
+            })),
+        },
+    }
+}
+
+fn membership_stamp(path: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    std::fs::metadata(path)
+        .ok()
+        .map(|metadata| (metadata.len(), metadata.modified().ok()))
+}
+
+/// A membership ledger that cannot be read or written is not an anonymous
+/// internal fault: it makes every run-scoped window under-report, which is the
+/// one direction an observability surface must never fail in. Name it, and name
+/// the bounded repair.
+pub(crate) fn membership_wire(error: FlowMembershipError) -> WireError {
+    match error {
+        FlowMembershipError::Invalid(message) => WireError::invalid(message),
+        other => WireError {
+            code: WireErrorCode::Internal,
+            message: other.to_string(),
+            data: Some(json!({
+                "transient": false,
+                "resolution": "repair-flow-membership-ledger",
             })),
         },
     }

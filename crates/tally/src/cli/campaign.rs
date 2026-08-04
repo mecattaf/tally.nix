@@ -2074,6 +2074,7 @@ async fn dispatch_campaign(
     let admitted = client
         .call("queue.enqueue", Some(serde_json::to_value(payload)?))
         .await?;
+    report_degraded_membership(&admitted)?;
     registration.last_observation = Some(revision);
     if !wait || admitted.get("verdict").and_then(Value::as_str).is_some() {
         return Ok(admitted);

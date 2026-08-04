@@ -8,6 +8,98 @@ authorized.
 
 ### Fixed
 
+- **Flow-run membership is now a durable admission fact, so a node a run
+  attached to or reused is visible in that run's own window (#380, W-316).**
+  Membership used to be recomputed on every query by scanning durable rows and
+  witness records for an orchestration capsule naming the run. Three admissions
+  write no row of their own — `attached`, and full-mode `reused` and `terminal`
+  — and each hands the caller a task UUID for work that is real and running
+  while the row, and therefore the scanned membership, stays with whichever run
+  created it. A re-triggered campaign that attached to nodes still in flight
+  from its previous run got a `query log --flow-run` window that showed the same
+  items forever, with `nextCursor: null` and nothing elided, while the work ran.
+  No page cap was involved, so none of the truncation machinery fired. That is
+  the #247 report, made legible by #316/#354 and now repaired at the root.
+
+  Every admission carrying an orchestration capsule appends
+  `{schemaVersion, flowRunId, taskUuid, disposition, nodeOrdinal?, nodeLabel?,
+  recordedAt}` to a new durable ledger, `<data-dir>/flow-membership.jsonl`, and
+  fsyncs it **before the admission is acknowledged** — for all five
+  dispositions. A `conflict` admits nothing and therefore records nothing, which
+  is asserted rather than assumed. `nodeOrdinal` and `nodeLabel` are the
+  *submitting* run's, which for a row-less admission is the only place they are
+  written down at all.
+
+  `query log --flow-run`, `query jobs --flow-run`, `query run`, and
+  `query proof --flow-run` resolve a run to the **union** of that ledger and the
+  original scan, so nothing regresses across an upgrade: a run whose rows were
+  written before the ledger existed still resolves exactly as it did, from its
+  rows. Removing the ledger restores the pre-#380 answer node for node.
+
+  The enqueue kernel is unchanged. The two-part key (`dedupKey` identity ×
+  `payloadHash` work-equality) resolves to the same five dispositions with the
+  same evidence-probed reuse; membership is recorded by a wrapper that never
+  inspects the key and cannot return a different disposition than the kernel
+  decided. An admission carrying no capsule takes none of this path and does not
+  create the file. The flow-node cap still counts durable rows, so attaching to
+  another run's node does not consume a node of the run that attached.
+
+  `query jobs` now also reports `flowRunTasks` when a `flowRun` filter was
+  supplied, matching `query log`.
+
+  Operator-visible consequences: `flowRunTasks: 0` means *the daemon holds no
+  membership for that run ID*. That is narrower than "the run admitted nothing",
+  and the difference is the point: the commonest cause is a mistyped or stale ID,
+  but a repaired or deleted ledger, a compacted-out idle run, and an admission
+  that reported `membershipDegraded` all produce a zero for a run that did admit
+  work. The CLI's stderr notice names all of them rather than closing the
+  question. No row field changed, so no row migration is required.
+
+  A damaged or unwritable ledger is checked **before** the kernel commits, so a
+  flow admission is refused outright — no durable row, no `enqueued` lifecycle
+  event, no dispatch — with `resolution: repair-flow-membership-ledger`. Which
+  task UUID a run is handed is not known until the admission has been decided,
+  so the write itself necessarily follows the commit; a ledger that becomes
+  unusable in that window yields an **acknowledged** admission carrying a
+  `membershipDegraded` object (and a journalled `flow-membership-degraded` line)
+  rather than a denial, because telling a caller its admission failed while the
+  node dispatches and runs would orphan live work. Every client that admits —
+  `tally enqueue`, `queue continue`, `adapter smoke`, `campaign`, and the live
+  flow runner, which is the path that produces flow-run membership at scale —
+  prints that warning on stderr, so the operator who caused the degradation
+  learns about it where they caused it rather than by grepping the journal. An interrupted append (torn
+  final line) is skipped on read and truncated on the next append; a record
+  written by a *newer* daemon — unknown field, unknown disposition, higher
+  `schemaVersion` — is read on the fields this daemon understands, so a pin
+  rollback cannot take run-scoped queries out.
+
+  The ledger is compacted past 20,000 records — one per admitted flow node —
+  down to 18,000, dropping whole runs **least-recently-touched** first. Never
+  part of a run, and never a run holding an executing task or the run whose
+  record is being written: keying eviction on a run's *first* record would make
+  it anti-correlated with liveness, deleting the membership of exactly the
+  campaigns still under observation, and a compaction that evicted its own
+  caller's run would report a durable membership that is not there. "Live" here
+  means every job that has not completed — running, queued, **or paused** — so a
+  queue an operator has paused keeps its membership. If nothing is evictable the
+  ledger exceeds its target rather than deleting membership in use: it grows by
+  one record per flow admission, says so on the daemon journal every time
+  (naming `queue resume` as the drain, since a paused queue does not finish on
+  its own), and compacts on the next admission after that work completes. The bound is sized by the one-time
+  parse (~200 ms at 20,000) rather than copied from the rare-event lineage
+  ledger, and the low-water mark means a compaction is followed by thousands of
+  ordinary appends instead of another compaction. Compaction is a
+  write-and-rename, so a crash mid-rewrite cannot leave a silently smaller run
+  set, and it re-emits a newer daemon's unknown fields and disposition values
+  verbatim rather than stripping them. Per-admission cost is flat in ledger
+  size: 2.13 / 1.91 / 2.16 / 2.02 ms across ledgers of 0, 5,000, 20,000, and
+  25,000 records (debug profile; `membership_admission_cost_sweep`). The flatness
+  is the claim, not the constant — absolute numbers move with host load, and at
+  an empty ledger the figure is indistinguishable from the pre-#380 path because
+  at zero records there was nothing to improve. What was removed is the growth:
+  the same sweep against the first draft read 2.8 ms empty, 17.4 ms at 10,000,
+  77.5 ms at 50,000, and 977 ms past the bound.
+
 - **The systemd watchdog keepalive no longer shares the dispatch loop, so a
   busy daemon is no longer killed for being busy (#370).** `WATCHDOG=1` was
   emitted from a `tokio::select!` arm in the daemon's dispatch loop. A
