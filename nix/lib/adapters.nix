@@ -267,19 +267,21 @@ let
         # figure, so the inclusive spelling is declared: the record subtracts
         # the cache read to reach the same meaning claude-code's exclusive
         # figure already has.
+        #
+        # All five keys real `codex exec --json` emits are declared. Every
+        # `turn.completed` in this project's own dispatch corpus carries the
+        # same five, `cache_write_input_tokens` among them with the value 0 —
+        # a measurement, which the record must state rather than leave absent.
         usage = mkScrapeCapture {
           mode = "jsonPath";
           pattern = "$..usage";
           fields = {
             inputTokensWithCacheRead = [ "input_tokens" ];
             cacheReadTokens = [ "cached_input_tokens" ];
+            cacheWriteTokens = [ "cache_write_input_tokens" ];
             outputTokens = [ "output_tokens" ];
+            reasoningTokens = [ "reasoning_output_tokens" ];
           };
-          # No reasoningTokens: the codex stream captured in this tree carries
-          # no reasoning field inside `usage`, and declaring a key that has not
-          # been seen would be a guess wearing a declaration's clothes. The
-          # record has the slot; the day a capture shows the key, one line
-          # fills it.
         };
         finalMessage = mkScrapeCapture {
           mode = "jsonPathLast";

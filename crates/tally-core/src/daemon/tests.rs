@@ -9423,6 +9423,127 @@ mod tests {
             .await;
     }
 
+    /// A retry must not carry the previous attempt's usage forward.
+    ///
+    /// Today the cloned row is usage-free by accident: completion writes the
+    /// record into `context.jobs` and `context.query_details`, never into
+    /// `context.rows`. This test forces the premise that accident depends on —
+    /// it plants a record on the durable row, which is exactly what a
+    /// natural-looking "make completion write rows back too" change would
+    /// produce — and asserts the retry still renders no usage under the new
+    /// attempt. Without `row.usage = None` in the retry path, attempt N-1's
+    /// tokens would surface under attempt N with provider-capture authority.
+    #[tokio::test(flavor = "current_thread")]
+    async fn retrying_a_job_does_not_carry_the_previous_attempts_usage_forward() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut daemon = fs1_daemon(&paths).await;
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["false"],
+                        "pool": "slot",
+                        "priority": "high",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "dedupKey": "retry-usage",
+                        "evidence": ["exit:0"],
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(5), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                let terminal = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": task_uuid.clone()})))
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["verdict"], "failed");
+                assert_eq!(terminal["attempt"], 1);
+
+                // Plant attempt 1's usage on the durable row and on its query
+                // detail, the state a row-writing completion path would leave.
+                let uuid = Uuid::parse_str(&task_uuid).unwrap();
+                let planted = crate::usage::observe(
+                    &AdapterConfig {
+                        argv: vec!["agent".to_owned()],
+                        scrape: BTreeMap::from([(
+                            "usage".to_owned(),
+                            ScrapeCapture {
+                                stream: ScrapeStream::Stdout,
+                                mode: ScrapeMode::JsonPath,
+                                pattern: "$..usage".to_owned(),
+                                fields: Default::default(),
+                            },
+                        )]),
+                        ..Default::default()
+                    },
+                    &ScrapeResult {
+                        captures: BTreeMap::from([(
+                            "usage".to_owned(),
+                            json!({"input_tokens": 4096, "output_tokens": 512}),
+                        )]),
+                    },
+                );
+                assert!(!planted.is_absent(), "the planted record is a measurement");
+                {
+                    let mut context = daemon.handler.context.write().await;
+                    context.rows.get_mut(&uuid).unwrap().usage = Some(planted.clone());
+                    context.query_details.get_mut(&uuid).unwrap().usage = Some(planted);
+                }
+                let before = daemon
+                    .handler
+                    .query("query.job", Some(json!({"id": task_uuid.clone()})))
+                    .await
+                    .unwrap();
+                assert_eq!(before["job"]["currentAttempt"], 1);
+                assert_eq!(
+                    before["job"]["usage"]["value"]["state"], "reported",
+                    "the planted record is visible for the attempt that produced it"
+                );
+
+                let retried = daemon
+                    .handler
+                    .retry_job(Some(json!({"task_uuid": task_uuid.clone()})))
+                    .await
+                    .unwrap();
+                assert_eq!(retried["attempt"], 2);
+                assert_eq!(
+                    daemon
+                        .handler
+                        .context
+                        .read()
+                        .await
+                        .rows
+                        .get(&uuid)
+                        .unwrap()
+                        .usage,
+                    None,
+                    "the retried row must carry no usage of its own"
+                );
+                let after = daemon
+                    .handler
+                    .query("query.job", Some(json!({"id": task_uuid})))
+                    .await
+                    .unwrap();
+                assert_eq!(after["job"]["currentAttempt"], 2);
+                assert_eq!(
+                    after["job"].get("usage"),
+                    None,
+                    "a retried attempt must not report the previous attempt's tokens"
+                );
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fleet_conformance_submission_legacy_behavior_remains_byte_and_behavior_compatible() {
         let local = LocalSet::new();

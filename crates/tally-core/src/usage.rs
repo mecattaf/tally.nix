@@ -18,6 +18,17 @@
 //!   stream was read, and it carried no usage.
 //! * [`UsageObservation::Reported`] — the harness reported usage. A reported
 //!   zero is a measurement and lives here, never in the other two.
+//!
+//! Durability differs by state, and a consumer that reads across a daemon
+//! restart must know which. `Reported` has a durable seat: it is written into
+//! the advisory attestation ledger beside the raw captures, keyed by task,
+//! attempt, and lease epoch. The two absences are recorded on the live row
+//! only — no attestation is written for an adapter that scrapes nothing, and
+//! recovery skips such adapters — so after a restart they read back as a
+//! missing field rather than as a stated absence. Both are recomputable from
+//! the adapter configuration, which is why this is a loss of statement rather
+//! than of fact, but a rollup counting coverage should treat a missing record
+//! and a `not-declared` record as the same answer.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
@@ -130,8 +141,15 @@ impl UsageCost {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UsageBreakdown {
     pub shape: UsageShape,
-    /// Input tokens excluding cache reads and cache writes. Comparable across
-    /// harnesses; this is the figure a rollup sums.
+    /// Input tokens excluding both cache reads and cache writes.
+    ///
+    /// This field alone is **not** the cross-harness "fresh input" figure, and
+    /// a rollup that sums it alone understates any harness with a cache-write
+    /// category. claude-code's `cache_creation_input_tokens` are fresh,
+    /// uncached prompt tokens that its `input_tokens` excludes; codex has no
+    /// cache-write category at all, so for codex this field already is the
+    /// whole fresh input. The comparable figure is
+    /// `input_tokens + cache_write_tokens`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_tokens: Option<u64>,
     /// The harness's own input-token figure under the harness's own
@@ -204,13 +222,22 @@ impl UsageObservation {
     /// The token amount the built-in pool-meter feeder charges to a windowed
     /// consumption pool.
     ///
-    /// This reproduces the pre-normalization reader exactly: a total the
-    /// harness stated, else the harness's own input figure plus its output
-    /// figure, and never a zero — a zero-token attempt writes no meter
-    /// observation, as it never did. A figure the harness emitted in a shape
-    /// that is not a count (a stringified total, a negative input) charges
-    /// nothing at all rather than charging the part that did parse, which is
-    /// also what it did before.
+    /// This reproduces the pre-normalization reader on every shape a harness
+    /// actually emits: a total the harness stated, else the harness's own
+    /// input figure plus its output figure, and never a zero — a zero-token
+    /// attempt writes no meter observation, as it never did. A figure the
+    /// harness emitted in a shape that is not a count (a stringified total, a
+    /// negative input) charges nothing at all rather than charging the part
+    /// that did parse, which is also what it did before.
+    ///
+    /// Two shapes no harness emits do diverge, and both diverge upward — the
+    /// old reader wrote no meter event and this one charges a number: a key
+    /// present with a JSON `null` value, which the old reader saw as present
+    /// and then failed to parse, and a whole-valued float, which
+    /// `Value::as_u64` rejected. For a windowed-consumption pool, charging is
+    /// the conservative direction; the old behaviour left a stale, lower
+    /// utilization in place. Pinned by
+    /// `the_meter_diverges_from_the_pre_normalization_reader_only_upward`.
     #[must_use]
     pub fn meter_amount(&self) -> Option<u64> {
         let breakdown = self.breakdown()?;
@@ -473,7 +500,13 @@ mod tests {
     use super::*;
     use crate::adapters::{AdapterEngine, ScrapeMode, ScrapeStream};
 
+    // Every fixture below is an order-preserving excerpt of a real capture from
+    // this project's own dispatch corpus, redacted for a public repository but
+    // with every `usage` object and `total_cost_usd` copied verbatim. See
+    // `test/fixtures/usage/README.md` for provenance.
     const CODEX_STREAM: &str = include_str!("../../../test/fixtures/usage/codex.jsonl");
+    const CODEX_QUIET_STREAM: &str =
+        include_str!("../../../test/fixtures/usage/codex-no-usage.jsonl");
     const CLAUDE_STREAM: &str = include_str!("../../../test/fixtures/usage/claude-code.jsonl");
     const CLAUDE_QUIET_STREAM: &str =
         include_str!("../../../test/fixtures/usage/claude-code-no-usage.jsonl");
@@ -483,7 +516,7 @@ mod tests {
     /// `nix/lib/adapters.nix` declare. The evaluated-configuration check in
     /// `flake.nix` pins the same JSON, so a preset that drifts from this
     /// mirror fails the gate rather than passing two agreeing-but-wrong tests.
-    const CODEX_USAGE_FIELDS: &str = r#"{"cacheReadTokens":["cached_input_tokens"],"inputTokensWithCacheRead":["input_tokens"],"outputTokens":["output_tokens"]}"#;
+    const CODEX_USAGE_FIELDS: &str = r#"{"cacheReadTokens":["cached_input_tokens"],"cacheWriteTokens":["cache_write_input_tokens"],"inputTokensWithCacheRead":["input_tokens"],"outputTokens":["output_tokens"],"reasoningTokens":["reasoning_output_tokens"]}"#;
     const CLAUDE_USAGE_FIELDS: &str = r#"{"cacheReadTokens":["cache_read_input_tokens"],"cacheWriteTokens":["cache_creation_input_tokens"],"inputTokens":["input_tokens"],"outputTokens":["output_tokens"]}"#;
     const CLAUDE_COST_FIELDS: &str = r#"{"costUsd":["$"]}"#;
 
@@ -552,31 +585,88 @@ mod tests {
         let breakdown = observation.breakdown().expect("codex reported usage");
         assert_eq!(breakdown.shape, UsageShape::Components);
         assert!(breakdown.unreadable_fields.is_empty());
-        // The last `turn.completed` in the stream is the one the scrape keeps:
-        // input_tokens 4096 (cache-inclusive), cached_input_tokens 3072,
-        // output_tokens 512. The earlier turn's 1200/900/150 must not survive.
-        assert_eq!(breakdown.input_tokens_as_reported, Some(4096));
-        assert_eq!(breakdown.input_tokens, Some(1024));
-        assert_eq!(breakdown.cache_read_tokens, Some(3072));
-        assert_eq!(breakdown.cache_write_tokens, None);
-        assert_eq!(breakdown.output_tokens, Some(512));
+        // The real `turn.completed` this capture ends with reports all five
+        // keys codex emits: input_tokens 7060166 (cache-inclusive),
+        // cached_input_tokens 6798080, cache_write_input_tokens 0,
+        // output_tokens 32842, reasoning_output_tokens 15163.
+        assert_eq!(breakdown.input_tokens_as_reported, Some(7060166));
+        assert_eq!(breakdown.input_tokens, Some(262086));
+        assert_eq!(breakdown.cache_read_tokens, Some(6798080));
+        // Zero is what the harness measured, so it is stated. An absent
+        // `cacheWriteTokens` here would be the absence-for-zero conflation the
+        // record exists to prevent.
+        assert_eq!(breakdown.cache_write_tokens, Some(0));
+        assert_eq!(breakdown.output_tokens, Some(32842));
+        assert_eq!(breakdown.reasoning_tokens, Some(15163));
         assert_eq!(
             breakdown.total_tokens,
             Some(UsageTotalTokens {
-                value: 4608,
+                value: 7093008,
                 source: UsageTotalSource::DerivedFromComponents,
             })
         );
         assert_eq!(
             breakdown.reconciliation(),
-            UsageReconciliation::Reconciled { total: 4608 }
+            UsageReconciliation::Reconciled { total: 7093008 }
         );
         // Independent arithmetic: codex's own convention totals a turn as
         // input_tokens + output_tokens, with the cached tokens already inside
-        // the input figure. 4096 + 512 is that number, computed without
-        // touching the components this record split apart.
-        assert_eq!(4096_u64 + 512, 4608);
+        // the input figure and reasoning already inside output. 7060166 +
+        // 32842 is that number, computed without touching the components this
+        // record split apart.
+        assert_eq!(7060166_u64 + 32842, 7093008);
+        // Reasoning is nested within output, never added to it: a total that
+        // double-counted it would be 7093008 + 15163.
+        assert_eq!(breakdown.component_sum(), Some(7093008));
         assert_eq!(breakdown.cost, None, "codex reports no cost");
+    }
+
+    #[test]
+    fn declaring_codex_cache_write_moves_neither_the_meter_nor_the_derived_total() {
+        // `cache_write_input_tokens` is 0 in every real codex turn in this
+        // project's corpus, but the record must not depend on that: pin what
+        // reading it does and does not change.
+        let with_cache_write = scraped(&codex_adapter(), "codex", CODEX_STREAM);
+        let mut narrower = codex_adapter();
+        narrower.scrape.insert(
+            "usage".to_owned(),
+            capture(
+                ScrapeMode::JsonPath,
+                "$..usage",
+                r#"{"inputTokensWithCacheRead":["input_tokens"],"cacheReadTokens":["cached_input_tokens"],"outputTokens":["output_tokens"]}"#,
+            ),
+        );
+        let without = scraped(&narrower, "codex", CODEX_STREAM);
+        assert_eq!(with_cache_write.meter_amount(), without.meter_amount());
+        assert_eq!(
+            with_cache_write.breakdown().unwrap().total_tokens,
+            without.breakdown().unwrap().total_tokens
+        );
+        // A nonzero cache write would move the derived total and still not the
+        // meter, which reads only the harness's own input and output figures.
+        let nonzero = observe(
+            &codex_adapter(),
+            &ScrapeResult {
+                captures: BTreeMap::from([(
+                    "usage".to_owned(),
+                    json!({
+                        "input_tokens": 7060166,
+                        "cached_input_tokens": 6798080,
+                        "cache_write_input_tokens": 1000,
+                        "output_tokens": 32842,
+                        "reasoning_output_tokens": 15163
+                    }),
+                )]),
+            },
+        );
+        assert_eq!(
+            nonzero.breakdown().unwrap().total_tokens,
+            Some(UsageTotalTokens {
+                value: 7094008,
+                source: UsageTotalSource::DerivedFromComponents,
+            })
+        );
+        assert_eq!(nonzero.meter_amount(), with_cache_write.meter_amount());
     }
 
     #[test]
@@ -585,41 +675,62 @@ mod tests {
         let breakdown = observation.breakdown().expect("claude-code reported usage");
         assert_eq!(breakdown.shape, UsageShape::Components);
         assert!(breakdown.unreadable_fields.is_empty());
-        // Three assistant turns carry usage and one user turn carries none;
-        // the result event's cumulative usage is the one that survives.
-        assert_eq!(breakdown.input_tokens, Some(12));
-        assert_eq!(breakdown.input_tokens_as_reported, Some(12));
-        assert_eq!(breakdown.cache_read_tokens, Some(41000));
-        assert_eq!(breakdown.cache_write_tokens, Some(23000));
-        assert_eq!(breakdown.output_tokens, Some(1300));
+        // Three assistant turns carry usage, a user turn and a rate-limit
+        // event carry none; the result event's cumulative usage is the one
+        // that survives. Its `iterations` array carries an `input_tokens` of
+        // its own — the record must read the top-level 83, not that 2.
+        assert_eq!(breakdown.input_tokens, Some(83));
+        assert_eq!(breakdown.input_tokens_as_reported, Some(83));
+        assert_eq!(breakdown.cache_read_tokens, Some(11093140));
+        assert_eq!(breakdown.cache_write_tokens, Some(265127));
+        assert_eq!(breakdown.output_tokens, Some(22298));
+        assert_eq!(
+            breakdown.reasoning_tokens, None,
+            "claude reports no separate reasoning figure; thinking is inside output"
+        );
         assert_eq!(
             breakdown.total_tokens,
             Some(UsageTotalTokens {
-                value: 65312,
+                value: 11380648,
                 source: UsageTotalSource::DerivedFromComponents,
             })
         );
-        assert_eq!(12_u64 + 41000 + 23000 + 1300, 65312);
+        assert_eq!(83_u64 + 11093140 + 265127 + 22298, 11380648);
         assert_eq!(
             breakdown.reconciliation(),
-            UsageReconciliation::Reconciled { total: 65312 }
+            UsageReconciliation::Reconciled { total: 11380648 }
         );
+        // The result event also carries a per-model `costUSD` nested under
+        // `modelUsage`. Cost comes from the harness's own `total_cost_usd` and
+        // is retained as the number that arrived, unrounded.
         let cost = breakdown.cost.as_ref().expect("claude-code reports cost");
         assert_eq!(cost.currency, "USD");
-        assert_eq!(cost.as_f64(), Some(0.4212));
+        assert_eq!(cost.as_f64(), Some(8.755705000000003));
+        assert_eq!(
+            serde_json::to_string(&cost.amount).unwrap(),
+            "8.755705000000003"
+        );
     }
 
     #[test]
     fn a_stream_with_no_usage_is_a_typed_absence_not_a_zero() {
-        let observation = scraped(&claude_adapter(), "claude-code", CLAUDE_QUIET_STREAM);
-        assert_eq!(observation, UsageObservation::NotReported);
-        assert!(observation.is_absent());
-        assert_eq!(observation.breakdown(), None);
-        assert_eq!(observation.meter_amount(), None);
-        assert_eq!(
-            serde_json::to_value(&observation).unwrap(),
-            json!({"state": "not-reported"})
-        );
+        // A complete real codex run that hit a rate limit: thread started,
+        // turn started, turn failed, no usage anywhere.
+        let codex = scraped(&codex_adapter(), "codex", CODEX_QUIET_STREAM);
+        // A real claude capture truncated before its first usage-bearing
+        // event, which is what the capture file holds when a job is preempted
+        // during its first turn.
+        let claude = scraped(&claude_adapter(), "claude-code", CLAUDE_QUIET_STREAM);
+        for observation in [&codex, &claude] {
+            assert_eq!(observation, &UsageObservation::NotReported);
+            assert!(observation.is_absent());
+            assert_eq!(observation.breakdown(), None);
+            assert_eq!(observation.meter_amount(), None);
+            assert_eq!(
+                serde_json::to_value(observation).unwrap(),
+                json!({"state": "not-reported"})
+            );
+        }
     }
 
     #[test]
@@ -883,16 +994,50 @@ mod tests {
     }
 
     #[test]
+    fn the_meter_diverges_from_the_pre_normalization_reader_only_upward() {
+        // The shapes where normalization does not reproduce the old reader.
+        // No harness in the corpus emits either — real codex and real
+        // claude-code both emit integers — but the divergence is real, so it
+        // is stated here rather than left to be discovered.
+        let divergent = [
+            (
+                json!({"total_tokens": null, "input_tokens": 100, "output_tokens": 50}),
+                150,
+            ),
+            (json!({"input_tokens": null, "output_tokens": 50}), 50),
+            (json!({"total_tokens": 100.0}), 100),
+            (json!({"input_tokens": 30.0, "output_tokens": 50}), 80),
+            (json!({"input_tokens": 30, "output_tokens": 50.0}), 80),
+        ];
+        let adapter = legacy_shaped_adapter();
+        for (usage, charged) in divergent {
+            let captures = ScrapeResult {
+                captures: BTreeMap::from([("usage".to_owned(), usage.clone())]),
+            };
+            assert_eq!(
+                legacy_scraped_token_amount(&captures),
+                None,
+                "the old reader wrote no meter event for {usage}"
+            );
+            assert_eq!(
+                observe(&adapter, &captures).meter_amount(),
+                Some(charged),
+                "{usage} now charges a number"
+            );
+        }
+    }
+
+    #[test]
     fn the_preset_mappings_do_not_move_the_number_the_meter_charges() {
         // A richer breakdown must not become a bigger bill. Both presets
         // charge exactly what the pre-normalization reader charged for the
         // same stream.
         let codex = scraped(&codex_adapter(), "codex", CODEX_STREAM);
-        assert_eq!(codex.meter_amount(), Some(4096 + 512));
+        assert_eq!(codex.meter_amount(), Some(7060166 + 32842));
         let claude = scraped(&claude_adapter(), "claude-code", CLAUDE_STREAM);
         assert_eq!(
             claude.meter_amount(),
-            Some(12 + 1300),
+            Some(83 + 22298),
             "the cache halves are recorded but never charged"
         );
     }
@@ -947,21 +1092,33 @@ mod tests {
 
         // The durable row gains an optional field, so an N-1 row still parses
         // and re-serializes to exactly the bytes it arrived as.
-        let row_json = fixture["row"].clone();
-        let row: crate::taskdb::RowSeed = serde_json::from_value(row_json.clone()).unwrap();
-        assert_eq!(row.usage, None, "no attempt was ever scraped for this row");
-        let reserialized = serde_json::to_value(&row).unwrap();
-        assert!(
-            reserialized.get("usage").is_none(),
-            "an absent usage record adds no key to a row that never had one"
-        );
-        for (key, value) in row_json.as_object().unwrap() {
+        // Two arms: the rowVersion current main writes, which is the true N-1
+        // shape, and the older one a pinned-behind estate may still hold.
+        for arm in ["row", "rowVersion3"] {
+            let row_json = fixture[arm].clone();
+            let row: crate::taskdb::RowSeed = serde_json::from_value(row_json.clone()).unwrap();
             assert_eq!(
-                reserialized.get(key),
-                Some(value),
-                "field {key} did not read back unchanged"
+                row.usage, None,
+                "{arm}: no attempt was ever scraped for this row"
             );
+            let reserialized = serde_json::to_value(&row).unwrap();
+            assert!(
+                reserialized.get("usage").is_none(),
+                "{arm}: an absent usage record adds no key to a row that never had one"
+            );
+            for (key, value) in row_json.as_object().unwrap() {
+                assert_eq!(
+                    reserialized.get(key),
+                    Some(value),
+                    "{arm}: field {key} did not read back unchanged"
+                );
+            }
         }
+        assert_eq!(
+            fixture["row"]["rowVersion"],
+            json!(crate::taskdb::CURRENT_ROW_VERSION),
+            "the N-1 arm must track the row version main actually writes"
+        );
 
         // The attestation payload gains a sibling key, so an N-1 payload keeps
         // producing the captures the daemon reads out of it.
@@ -974,7 +1131,7 @@ mod tests {
             serde_json::from_value(payload["captures"].clone()).unwrap();
         let captures = ScrapeResult { captures };
         assert_eq!(captures.session_ref().unwrap(), Some("codex-usage-thread"));
-        assert_eq!(captures.usage().unwrap()["input_tokens"], json!(4096));
+        assert_eq!(captures.usage().unwrap()["input_tokens"], json!(7060166));
 
         // And normalizing that retained capture reproduces the record a fresh
         // scrape of the same stream produces, so a restart does not change a

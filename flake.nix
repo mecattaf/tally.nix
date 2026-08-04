@@ -5181,7 +5181,7 @@
             # exact strings in its fixture tests, so a preset that drifts from
             # the normalizer's expectations fails here rather than passing two
             # agreeing-but-wrong suites.
-            test "$(jq -c '.adapters.codex.scrape.usage.fields' ${adapterConfig})" = '{"cacheReadTokens":["cached_input_tokens"],"inputTokensWithCacheRead":["input_tokens"],"outputTokens":["output_tokens"]}'
+            test "$(jq -c '.adapters.codex.scrape.usage.fields' ${adapterConfig})" = '{"cacheReadTokens":["cached_input_tokens"],"cacheWriteTokens":["cache_write_input_tokens"],"inputTokensWithCacheRead":["input_tokens"],"outputTokens":["output_tokens"],"reasoningTokens":["reasoning_output_tokens"]}'
             test "$(jq -c '.adapters["claude-code"].scrape.usage.fields' ${adapterConfig})" = '{"cacheReadTokens":["cache_read_input_tokens"],"cacheWriteTokens":["cache_creation_input_tokens"],"inputTokens":["input_tokens"],"outputTokens":["output_tokens"]}'
             test "$(jq -c '.adapters["claude-code"].scrape.usageCost' ${adapterConfig})" = '{"fields":{"costUsd":["$"]},"mode":"jsonPathLast","pattern":"$[?@.type == '"'"'result'"'"'].total_cost_usd","stream":"stdout"}'
             # pi has not been verified against a real capture yet, so it

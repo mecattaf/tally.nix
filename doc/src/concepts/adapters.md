@@ -75,19 +75,33 @@ cache read, plus `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`,
 table and computes no dollar figure. A total the harness did not state is
 derived from the components and labelled as derived.
 
+`inputTokens` alone is not the cross-harness "fresh input" figure. claude-code's
+cache-write tokens are fresh, uncached prompt tokens its `input_tokens`
+excludes; codex has no cache-write category at all. A consumer comparing
+harnesses adds `inputTokens + cacheWriteTokens`.
+
 Three states are kept apart, and none of them is a zero:
 
 - `not-declared` — the adapter declared no usage scrape;
 - `not-reported` — a usage scrape was declared and the stream carried none;
 - `reported` — the harness reported usage, including when it reported zero.
 
-The record is persisted in the advisory attestation ledger beside the raw
-capture, keyed by task, attempt, and lease epoch, and `tally query job` renders
-it as a `SourcedValue` with `advisory-provider-capture` authority and
-`adapter-scrape` provenance. The built-in pool meter reads the same record and
-charges what it always charged: a harness-stated total, else the harness's own
-input figure plus its output figure. A capture with no declared `fields` keeps
-exactly that legacy reading.
+Only `reported` has a durable seat: it is persisted in the advisory attestation
+ledger beside the raw capture, keyed by task, attempt, and lease epoch. The two
+absences are recorded on the live row, so after a daemon restart they read back
+as a missing field rather than as a stated absence — both are recomputable from
+the adapter configuration, but a consumer counting coverage should treat a
+missing record and a `not-declared` record as the same answer.
+
+`tally query job` renders the record as a `SourcedValue` with
+`advisory-provider-capture` authority and `adapter-scrape` provenance. The
+built-in pool meter reads the same record and charges what it always charged: a
+harness-stated total, else the harness's own input figure plus its output
+figure. A capture with no declared `fields` keeps exactly that legacy reading.
+Two shapes no harness emits — a key present with a JSON `null`, and a
+whole-valued float — now charge a number where the old reader charged nothing;
+both diverge upward, which for a windowed-consumption pool is the conservative
+direction.
 
 An adapter may additionally declare a JSON-lines trace stream. Trace queries
 preserve event order and malformed/unknown payloads as advisory observations;

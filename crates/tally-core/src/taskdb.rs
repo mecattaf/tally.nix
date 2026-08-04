@@ -895,6 +895,17 @@ pub struct RowSeed {
     /// Absent means no attempt has been scraped yet; a present typed absence
     /// means an attempt was scraped and carried no usage. Rows written before
     /// this field existed read back as the former, which is what they were.
+    ///
+    /// **Deliberately transport-only: no write path ever persists it.** The
+    /// daemon sets it on the in-memory row and on the query detail; the
+    /// durable seat for a usage record is the advisory attestation ledger,
+    /// keyed by task, attempt, and lease epoch. That is what makes it correct
+    /// for this field to arrive without a row migration — `RowSeed` is
+    /// `deny_unknown_fields` and `CURRENT_ROW_VERSION` did not move, so an
+    /// enqueue event carrying `usage` would be rejected outright by an N−1
+    /// daemon at the same row version. Anything that starts persisting it owes
+    /// a versioned migration and an N−1 fixture first
+    /// (`crate::taskdb::migrations`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
