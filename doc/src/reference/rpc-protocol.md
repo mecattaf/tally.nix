@@ -545,11 +545,28 @@ caller carries forward.
 
 Run membership is a durable admission fact. Every admission carrying an orchestration capsule
 appends `{schemaVersion, flowRunId, taskUuid, disposition, nodeOrdinal?, nodeLabel?, recordedAt}`
-to `<data-dir>/flow-membership.jsonl` and fsyncs it **before the admission is acknowledged**, for
-all five dispositions: `created`, `attached`, `reused`, `terminal`, and `conflict` — a conflict
-admits nothing and therefore records nothing. `nodeOrdinal`/`nodeLabel` are the submitting run's,
-which for a row-less admission is the only place they are written down at all. An admission
-carrying no capsule writes nothing and does not create the file.
+to `<data-dir>/flow-membership.jsonl` and fsyncs it before the admission is acknowledged, for all
+five dispositions: `created`, `attached`, `reused`, `terminal`, and `conflict` — a conflict admits
+nothing and therefore records nothing. `nodeOrdinal`/`nodeLabel` are the submitting run's, which
+for a row-less admission is the only place they are written down at all. An admission carrying no
+capsule writes nothing and does not create the file.
+
+The ledger is checked for readability and appendability **before** the kernel commits, so a
+damaged or unwritable ledger refuses a flow admission outright, leaving no row, no lifecycle
+event, and no dispatch. Which task UUID a run is handed is not known until the admission has been
+decided, so the write itself necessarily follows the commit; if the ledger becomes unusable in
+that window, the admission is **acknowledged with the degradation named** rather than denied:
+
+```json
+{"disposition": "created", "task_uuid": "...",
+ "membershipDegraded": {"flowRunId": "...", "taskUuid": "...", "admitted": true,
+                        "reason": "...", "resolution": "repair-flow-membership-ledger"}}
+```
+
+`membershipDegraded` is absent on every ordinary response. Denying an admission whose work is
+already dispatching would orphan it; what is degraded is one node's visibility in one run's
+window until the ledger is repaired. The daemon also journals
+`flow-membership-degraded flowRunId=… taskUuid=…` so the affected set survives the response.
 
 A `flowRun` filter resolves to the **union** of that ledger and the original scan of durable row
 details and witness records for a capsule naming the run. The union is what keeps an upgrade
@@ -572,10 +589,17 @@ admitted under that run ID; the CLI says so on stderr.
 
 An unterminated final line in the ledger is an interrupted append and is skipped on read and
 truncated on the next append. A *complete* record that cannot be decoded fails the query with
-`resolution: repair-flow-membership-ledger` rather than silently answering with a smaller run.
-The ledger is compacted at 100,000 records by dropping whole runs, oldest first — never part of a
-run, because a partially-present run would report a membership count lower than the truth. A run
-dropped by compaction falls back to the row scan.
+`resolution: repair-flow-membership-ledger` rather than silently answering with a smaller run. A
+record written by a **newer** daemon does not: unknown fields, an unknown `disposition`, and a
+higher `schemaVersion` are all read on the fields this daemon understands, so a pin rollback
+cannot take run-scoped queries out. Only a `schemaVersion` *below* the reader's is refused.
+
+The ledger is compacted when it passes 20,000 records — one per admitted flow node — by dropping
+whole runs, oldest first, down to 18,000. Never part of a run, because a partially-present run
+would report a membership count lower than the truth; and down to a low-water mark rather than to
+the bound, so a compaction is followed by thousands of ordinary appends rather than by another
+compaction. Compaction is a write-and-rename, so a reader sees the whole old ledger or the whole
+new one. A run dropped by compaction falls back to the row scan.
 
 ### Watch cursors
 

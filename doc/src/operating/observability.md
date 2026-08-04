@@ -412,8 +412,13 @@ run membership at all.
 
 If the ledger itself is damaged, run-scoped queries fail loudly with
 `repair-flow-membership-ledger` rather than quietly answering with a smaller
-run. It is plain JSONL: delete the offending line, or delete the file, in which
-case membership falls back to the row scan.
+run, and flow admissions are refused before they commit anything — so there is
+no half-admitted work to clean up, and re-submitting after the repair is the
+whole recovery. It is plain JSONL: delete the offending line, or delete the
+file, in which case membership falls back to the row scan. See
+[`repair-flow-membership-ledger`](troubleshooting.md#repair-flow-membership-ledger)
+for the runbook, including the one case that is acknowledged with a
+`membershipDegraded` warning instead of refused.
 
 ## Resume a watch
 

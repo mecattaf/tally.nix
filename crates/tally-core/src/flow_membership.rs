@@ -42,11 +42,33 @@ use thiserror::Error;
 pub const FLOW_MEMBERSHIP_SCHEMA_VERSION: u32 = 1;
 pub const FLOW_MEMBERSHIP_FILE: &str = "flow-membership.jsonl";
 
-/// Records kept when the ledger is compacted.
+/// Records kept before the ledger is compacted.
 ///
-/// One record per admitted flow node. At the pinned `maxNodes` of 51 that is
-/// roughly two thousand whole campaigns, and the file is a few megabytes at the
-/// bound. The bound also caps the in-memory index the daemon keeps hot.
+/// **Re-derived for what this store actually accumulates.** The first draft
+/// copied 100,000 from [`crate::flow_lineage`], which records *rollover* events
+/// — one per retired generation, rare by construction. Membership is one record
+/// per **admitted flow node**: a per-dispatch surface. Sizing a per-dispatch
+/// store with a rare-event bound is a named recurring class here.
+///
+/// What the bound is *not* sized by, any more, is the admission path. Appending
+/// is now one set lookup, one write, and one fsync, so per-admission cost is
+/// flat in the ledger's size — measured at 0.81–0.90 ms per admission across
+/// ledgers of 0, 5,000, 20,000, and 25,000 records (debug profile, ext4, via
+/// `membership_admission_cost_sweep`). What the bound *is* sized by is the cost
+/// that stayed linear:
+///
+/// - **The one-time parse**, paid at daemon open and again whenever the ledger
+///   changes underneath the cache: ~10 µs/record, so ~200 ms at 20,000 records
+///   and ~1 s at 100,000. That lands in the budget #379 is open about, and it is
+///   the binding constraint.
+/// - **Resident memory.** The parsed index is `BTreeMap<run, BTreeMap<task,
+///   record>>` over two UUID strings and a timestamp per record, held for the
+///   daemon's lifetime.
+///
+/// 20,000 records is roughly 390 whole campaigns at the pinned `maxNodes` of
+/// 51, a few megabytes on disk, ~200 ms to parse, and the horizon past which a
+/// run is old enough that its own rows and witnesses are the thing an operator
+/// reads anyway.
 ///
 /// Compaction drops **whole runs**, oldest first, never individual records.
 /// A run that is half-present would report a membership count lower than the
@@ -54,7 +76,24 @@ pub const FLOW_MEMBERSHIP_FILE: &str = "flow-membership.jsonl";
 /// outcome this whole store exists to remove. A run that is wholly absent falls
 /// back to the row scan, which is exactly what an operator got before this
 /// ledger existed and is what the observability chapter already documents.
-pub const FLOW_MEMBERSHIP_MAX_RECORDS: usize = 100_000;
+pub const FLOW_MEMBERSHIP_MAX_RECORDS: usize = 20_000;
+
+/// What a compaction compacts *down to*, as a fraction of the bound.
+///
+/// Compacting to exactly the bound is a trap this store fell into: drop the
+/// oldest run, land back on the bound, and the very next append compacts again.
+/// With single-node runs that degenerates to a full rewrite per admission —
+/// which is precisely the failure the first draft shipped, by a different
+/// route. Compacting to 90% of the bound means a rewrite is followed by at least
+/// `max_records / 10` ordinary appends, so the amortised cost of compaction is
+/// one rewrite per two thousand admissions rather than one per admission.
+///
+/// `flow_lineage` does not need this because its records arrive rarely enough
+/// that even the degenerate case is invisible; a per-dispatch store does.
+#[must_use]
+pub const fn flow_membership_compact_to(max_records: usize) -> usize {
+    max_records - max_records / 10
+}
 
 /// How much of the tail is scanned backwards to find the last record boundary.
 /// A single record is a few hundred bytes, so this never fails to find one in
@@ -123,8 +162,25 @@ impl std::fmt::Display for MembershipDisposition {
 /// `nodeOrdinal`/`nodeLabel` are the *submitting* run's, taken from the capsule
 /// on the request. For a row-less admission they are precisely what the durable
 /// row cannot say, because that row carries the creating run's capsule instead.
+///
+/// **Deliberately not `deny_unknown_fields`, and deliberately diverging from
+/// [`crate::flow_lineage`] here.** This store's stated purpose is surviving a
+/// pin move in *both* directions, and the module already goes out of its way to
+/// defend that for the disposition string. Rejecting an unknown field would
+/// reintroduce the same #371 failure one level down, and worse: `read` fails the
+/// whole ledger, so one field written by a newer daemon would take out every
+/// run-scoped query and every flow admission on an older one, not one record.
+///
+/// Ignoring the field instead is not silent record-dropping — nothing is
+/// skipped, and every field this binary understands is honoured. The residual
+/// risk is a future field that *narrows* membership (a retraction, say), which
+/// an older daemon would not apply and would therefore over-report. That is the
+/// tolerable direction: an operator sees a node that is no longer a member,
+/// which is visible and investigable, rather than a daemon-wide outage. A
+/// future version that needs the older daemon to refuse instead has the
+/// `schemaVersion` bump to say so with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase")]
 pub struct FlowMembershipRecord {
     pub schema_version: u32,
     pub flow_run_id: String,
@@ -158,9 +214,15 @@ impl FlowMembershipRecord {
     }
 
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != FLOW_MEMBERSHIP_SCHEMA_VERSION {
+        // Forward-tolerant, backward-strict. A record from a *newer* daemon is
+        // read on its known fields for the reason given on the struct: refusing
+        // it would turn a pin rollback into a daemon-wide query outage. A record
+        // claiming a version this binary predates cannot be reinterpreted
+        // safely, because the fields below would mean something else, so it is
+        // still a hard failure.
+        if self.schema_version < FLOW_MEMBERSHIP_SCHEMA_VERSION {
             return Err(format!(
-                "schemaVersion must be the integer {FLOW_MEMBERSHIP_SCHEMA_VERSION}"
+                "schemaVersion must be at least {FLOW_MEMBERSHIP_SCHEMA_VERSION}"
             ));
         }
         // Neither field is canonicalized. The scan this ledger is unioned with
@@ -312,29 +374,38 @@ impl FlowMembership {
         self.by_run.get(flow_run_id)?.get(task_uuid)
     }
 
-    /// Drop whole runs, oldest first, until the index fits `max_records`.
-    /// Returns the retained records in replay order when anything was dropped.
-    fn compacted(&self, max_records: usize) -> Option<Vec<FlowMembershipRecord>> {
-        if self.records <= max_records {
-            return None;
+    /// Build an index from records already known to be valid.
+    fn from_records(records: Vec<FlowMembershipRecord>) -> Self {
+        let mut membership = Self::default();
+        for record in records {
+            membership.insert(record);
         }
-        let mut runs = self.by_run.values().collect::<Vec<_>>();
+        membership
+    }
+
+    /// Drop whole runs, oldest first, until the index fits `target`.
+    ///
+    /// Consumes the index: the caller replaces it with one built from the
+    /// returned records, which is what keeps the daemon's cache and the file on
+    /// disk from diverging. Returning a borrowed view instead is what let the
+    /// first draft rebuild its cache from the *pre*-compaction index, so the
+    /// cache never shrank and every later append re-compacted forever.
+    fn compact_to(self, target: usize) -> Vec<FlowMembershipRecord> {
+        let mut runs = self.by_run.into_values().collect::<Vec<_>>();
         runs.sort_by(|left, right| run_age(left).cmp(&run_age(right)));
         let mut total = self.records;
         let mut dropped = 0_usize;
         for tasks in &runs {
-            if total <= max_records {
+            if total <= target {
                 break;
             }
             total -= tasks.len();
             dropped += 1;
         }
-        Some(
-            runs.into_iter()
-                .skip(dropped)
-                .flat_map(|tasks| tasks.values().cloned())
-                .collect(),
-        )
+        runs.into_iter()
+            .skip(dropped)
+            .flat_map(BTreeMap::into_values)
+            .collect()
     }
 }
 
@@ -367,31 +438,74 @@ pub enum MembershipWrite {
     AlreadyHeld,
 }
 
-/// Append one membership fact and fsync it.
+/// Prove the ledger is readable and appendable, and return the parsed index.
 ///
-/// Idempotent against `held`, the caller's already-parsed index: a run that is
-/// handed the same task twice writes once. The check is deliberately the
-/// caller's cached index rather than a re-read of the ledger, because this runs
-/// on the admission path and a re-read would make every admission linear in the
-/// ledger. A duplicate written by a racing second writer is harmless — the read
-/// path is set-valued and collapses it.
+/// Called *before* the enqueue kernel commits anything, because the alternative
+/// is telling a caller its admission failed while that admission's work is
+/// already dispatching. Both faults this catches are the realistic ones: a
+/// complete-but-unusable record (the state `repair-flow-membership-ledger`
+/// exists for) and a ledger that cannot be opened for append at all. What it
+/// cannot catch is a fault that arrives *between* here and the append — for that
+/// residue see the degraded acknowledgement in the daemon.
+///
+/// The read is not extra work: the same index is what the write path dedupes
+/// against and what the caller then holds.
+pub fn preflight(path: &Path) -> Result<FlowMembership, FlowMembershipError> {
+    let membership = FlowMembership::read(path)?;
+    probe_appendable(path)?;
+    Ok(membership)
+}
+
+/// The half of [`preflight`] that does not parse: can this ledger be appended to?
+///
+/// Split out because a caller whose parsed index is already current must not pay
+/// a full re-parse to answer an appendability question. Re-reading on every
+/// admission is exactly the linear-in-the-ledger cost the cache exists to avoid,
+/// and it does not stop being that cost because it is spelled `preflight`.
+pub fn probe_appendable(path: &Path) -> Result<(), FlowMembershipError> {
+    let parent = durable_parent(path);
+    std::fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
+    OpenOptions::new()
+        .create(true)
+        .read(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|source| io_error(path, source))?;
+    Ok(())
+}
+
+/// Append one membership fact, fsync it, and return the index that results.
+///
+/// Takes the caller's index **by value and hands it back** so the caller's cache
+/// is always the index the file now holds. The first draft returned only a
+/// disposition and left the caller to patch its own cache, which meant a
+/// compaction shrank the file but not the cache: the cache then stayed
+/// permanently over the bound and every later admission rewrote the whole
+/// ledger. Ownership makes that class unrepresentable.
+///
+/// Idempotent against the index: a run handed the same task twice writes once.
+/// The check is the caller's parsed index rather than a re-read, and on the
+/// happy path nothing is cloned — one lookup, one append, one fsync, whatever
+/// the ledger's size. A duplicate written by a racing second writer is harmless;
+/// the read path is set-valued and collapses it.
 pub fn record_membership(
     path: &Path,
     record: &FlowMembershipRecord,
-    held: &FlowMembership,
-) -> Result<MembershipWrite, FlowMembershipError> {
+    held: FlowMembership,
+) -> Result<(MembershipWrite, FlowMembership), FlowMembershipError> {
     record_membership_bounded(path, record, held, FLOW_MEMBERSHIP_MAX_RECORDS)
 }
 
 fn record_membership_bounded(
     path: &Path,
     record: &FlowMembershipRecord,
-    held: &FlowMembership,
+    mut held: FlowMembership,
     max_records: usize,
-) -> Result<MembershipWrite, FlowMembershipError> {
+) -> Result<(MembershipWrite, FlowMembership), FlowMembershipError> {
     record.validate().map_err(FlowMembershipError::Invalid)?;
     if held.contains(&record.flow_run_id, &record.task_uuid) {
-        return Ok(MembershipWrite::AlreadyHeld);
+        return Ok((MembershipWrite::AlreadyHeld, held));
     }
     let parent = durable_parent(path);
     std::fs::create_dir_all(parent).map_err(|source| io_error(parent, source))?;
@@ -406,13 +520,17 @@ fn record_membership_bounded(
     file.lock_exclusive()
         .map_err(|source| io_error(path, source))?;
 
-    // A projected index that already accounts for this record decides the
-    // bound, so the ledger is compacted *before* it can exceed it.
-    let mut projected = held.clone();
-    projected.insert(record.clone());
-    if let Some(kept) = projected.compacted(max_records) {
-        rewrite_locked(&mut file, path, parent, &kept)?;
-        return Ok(MembershipWrite::Appended);
+    held.insert(record.clone());
+    // Counted, not cloned. The bound is a comparison on a `usize`; the first
+    // draft cloned the whole index to answer it, on every admission, which is
+    // what made admission linear in the ledger below the bound as well as above.
+    if held.record_count() > max_records {
+        let kept = held.compact_to(flow_membership_compact_to(max_records));
+        rewrite_compacted(path, parent, &kept)?;
+        return Ok((
+            MembershipWrite::Appended,
+            FlowMembership::from_records(kept),
+        ));
     }
 
     // The read path skips a torn final line; here, holding the write lock, it
@@ -425,7 +543,7 @@ fn record_membership_bounded(
     file.write_all(&line)
         .map_err(|source| io_error(path, source))?;
     file.sync_all().map_err(|source| io_error(path, source))?;
-    Ok(MembershipWrite::Appended)
+    Ok((MembershipWrite::Appended, held))
 }
 
 /// Remove an unterminated final line, scanning the tail rather than the file.
@@ -465,32 +583,45 @@ fn truncate_torn_tail(file: &mut std::fs::File, path: &Path) -> Result<(), FlowM
     Ok(())
 }
 
-/// Replace the ledger contents atomically while holding the append lock.
-fn rewrite_locked(
-    file: &mut std::fs::File,
+/// Replace the ledger with the retained set, atomically.
+///
+/// Write-and-rename, exactly as [`crate::flow_lineage`] does, and for the reason
+/// that store states: a reader observes either the whole old file or the whole
+/// new one, never a half-written ledger. The first draft truncated in place and
+/// reasoned only about lock ownership, which is the wrong axis — the danger is
+/// not a concurrent reader racing the lock but a crash mid-rewrite, which leaves
+/// a short file that the read path accepts as a *smaller, valid* membership. A
+/// silently smaller run set is precisely the reassuring-direction lie this
+/// module's own doc comment says the store exists to remove, so the write path
+/// must not be able to manufacture it.
+fn rewrite_compacted(
     path: &Path,
     parent: &Path,
     kept: &[FlowMembershipRecord],
 ) -> Result<(), FlowMembershipError> {
-    let mut buffer = Vec::new();
+    let temporary = path.with_extension("jsonl.compact");
+    let mut bytes = Vec::new();
     for record in kept {
-        serde_json::to_writer(&mut buffer, record)
+        serde_json::to_writer(&mut bytes, record)
             .map_err(|error| FlowMembershipError::Invalid(error.to_string()))?;
-        buffer.push(b'\n');
+        bytes.push(b'\n');
     }
-    file.set_len(0).map_err(|source| io_error(path, source))?;
-    file.seek(SeekFrom::Start(0))
-        .map_err(|source| io_error(path, source))?;
-    file.write_all(&buffer)
-        .map_err(|source| io_error(path, source))?;
-    file.sync_all().map_err(|source| io_error(path, source))?;
-    // The truncate-in-place keeps the inode, so the lock other writers are
-    // blocked on stays the one guarding these bytes; syncing the directory is
-    // still worth it for the file that may have just been created.
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&temporary)
+        .map_err(|source| io_error(&temporary, source))?;
+    file.write_all(&bytes)
+        .map_err(|source| io_error(&temporary, source))?;
+    file.sync_all()
+        .map_err(|source| io_error(&temporary, source))?;
+    drop(file);
+    std::fs::rename(&temporary, path).map_err(|source| io_error(path, source))?;
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|source| io_error(parent, source))
 }
 
 #[cfg(test)]
@@ -517,20 +648,16 @@ mod tests {
     }
 
     #[test]
-    fn appending_is_idempotent_against_the_callers_index() {
+    fn appending_is_idempotent_and_hands_back_the_index_the_file_now_holds() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
-        let mut held = FlowMembership::default();
         let first = record("run-a", "task-1", MembershipDisposition::Attached);
-        assert_eq!(
-            record_membership(&path, &first, &held).unwrap(),
-            MembershipWrite::Appended
-        );
-        held.insert(first.clone());
-        assert_eq!(
-            record_membership(&path, &first, &held).unwrap(),
-            MembershipWrite::AlreadyHeld
-        );
+        let (write, held) = record_membership(&path, &first, FlowMembership::default()).unwrap();
+        assert_eq!(write, MembershipWrite::Appended);
+        assert!(held.contains("run-a", "task-1"));
+        let (write, held) = record_membership(&path, &first, held).unwrap();
+        assert_eq!(write, MembershipWrite::AlreadyHeld);
+        assert_eq!(held.record_count(), 1);
         let reread = FlowMembership::read(&path).unwrap();
         assert_eq!(reread.record_count(), 1);
         assert_eq!(reread.tasks("run-a").collect::<Vec<_>>(), vec!["task-1"]);
@@ -544,8 +671,7 @@ mod tests {
         let mut held = FlowMembership::default();
         for run in ["run-a", "run-b"] {
             let entry = record(run, "shared-task", MembershipDisposition::Attached);
-            record_membership(&path, &entry, &held).unwrap();
-            held.insert(entry);
+            held = record_membership(&path, &entry, held).unwrap().1;
         }
         let reread = FlowMembership::read(&path).unwrap();
         assert!(reread.contains("run-a", "shared-task"));
@@ -558,7 +684,7 @@ mod tests {
         let temp = tempdir().unwrap();
         let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
         let first = record("run-a", "task-1", MembershipDisposition::Created);
-        record_membership(&path, &first, &FlowMembership::default()).unwrap();
+        record_membership(&path, &first, FlowMembership::default()).unwrap();
         let mut raw = std::fs::read(&path).unwrap();
         raw.extend_from_slice(br#"{"schemaVersion":1,"flowRunId":"run-a","taskUu"#);
         std::fs::write(&path, &raw).unwrap();
@@ -567,7 +693,7 @@ mod tests {
         assert_eq!(after_tear.record_count(), 1);
 
         let second = record("run-a", "task-2", MembershipDisposition::Attached);
-        record_membership(&path, &second, &after_tear).unwrap();
+        record_membership(&path, &second, after_tear).unwrap();
         let repaired = FlowMembership::read(&path).unwrap();
         assert_eq!(repaired.record_count(), 2);
         assert_eq!(
@@ -656,13 +782,56 @@ mod tests {
         );
     }
 
+    /// A ledger written by a *newer* daemon must not take an older one's
+    /// queries out. Unknown fields are ignored and a higher `schemaVersion` is
+    /// read on the fields this binary understands; only a version this binary
+    /// predates is refused, because then these field names mean something else.
+    #[test]
+    fn a_newer_ledger_reads_on_the_fields_this_binary_understands() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"schemaVersion":2,"flowRunId":"run-future","taskUuid":"task-1","#,
+                r#""disposition":"attached","nodeOrdinal":4,"#,
+                r#""retractedBy":"some-future-field","supersedes":["x"],"#,
+                r#""recordedAt":"2026-08-04T00:00:00.000Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let membership = FlowMembership::read(&path).unwrap();
+        assert_eq!(membership.record_count(), 1);
+        assert!(membership.contains("run-future", "task-1"));
+        assert_eq!(membership.node_ordinal("run-future", "task-1"), Some(4));
+
+        // A version below this binary's is still a hard failure.
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"schemaVersion":0,"flowRunId":"run-old","taskUuid":"task-1","#,
+                r#""disposition":"attached","recordedAt":"2026-08-04T00:00:00.000Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        assert!(matches!(
+            FlowMembership::read(&path).unwrap_err(),
+            FlowMembershipError::Malformed { line: 1, .. }
+        ));
+    }
+
     #[test]
     fn compaction_drops_whole_runs_oldest_first_and_never_half_a_run() {
         let temp = tempdir().unwrap();
         let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
         let mut held = FlowMembership::default();
-        // Three runs of two nodes each, written oldest run first.
-        for (index, run) in ["run-a", "run-b", "run-c"].into_iter().enumerate() {
+        // Ten runs of two nodes each, written oldest run first.
+        let runs = (0..10)
+            .map(|index| format!("run-{index:02}"))
+            .collect::<Vec<_>>();
+        for (index, run) in runs.iter().enumerate() {
             for node in 0..2 {
                 let mut entry = record(
                     run,
@@ -670,23 +839,88 @@ mod tests {
                     MembershipDisposition::Created,
                 );
                 entry.recorded_at = format!("2026-08-04T00:00:{:02}.000Z", index * 2 + node);
-                record_membership_bounded(&path, &entry, &held, 6).unwrap();
-                held.insert(entry);
+                held = record_membership_bounded(&path, &entry, held, 20)
+                    .unwrap()
+                    .1;
             }
         }
-        assert_eq!(FlowMembership::read(&path).unwrap().record_count(), 6);
+        assert_eq!(FlowMembership::read(&path).unwrap().record_count(), 20);
 
-        // The seventh record crosses the bound: the oldest run goes whole.
-        let mut overflow = record("run-d", "run-d-task-0", MembershipDisposition::Created);
-        overflow.recorded_at = "2026-08-04T00:00:09.000Z".to_owned();
-        record_membership_bounded(&path, &overflow, &held, 6).unwrap();
+        // The twenty-first record crosses the bound. Compaction goes to the
+        // low-water mark (18), so two whole two-node runs go: 21 - 2 = 19 is
+        // still above it, 19 - 2 = 17 is not.
+        let mut overflow = record("run-10", "run-10-task-0", MembershipDisposition::Created);
+        overflow.recorded_at = "2026-08-04T00:00:30.000Z".to_owned();
+        held = record_membership_bounded(&path, &overflow, held, 20)
+            .unwrap()
+            .1;
 
         let compacted = FlowMembership::read(&path).unwrap();
-        assert_eq!(compacted.tasks("run-a").count(), 0, "oldest run is gone");
-        assert_eq!(compacted.tasks("run-b").count(), 2, "and it went whole");
-        assert_eq!(compacted.tasks("run-c").count(), 2);
-        assert_eq!(compacted.tasks("run-d").count(), 1);
-        assert_eq!(compacted.record_count(), 5);
+        assert_eq!(compacted.tasks("run-00").count(), 0, "oldest run is gone");
+        assert_eq!(compacted.tasks("run-01").count(), 0, "and so is the next");
+        assert_eq!(
+            compacted.tasks("run-02").count(),
+            2,
+            "every surviving run survives whole"
+        );
+        assert_eq!(compacted.tasks("run-10").count(), 1);
+        assert_eq!(compacted.record_count(), 17);
+        assert_eq!(
+            held, compacted,
+            "the index handed back must be the one the file holds -- a cache that \
+             kept the dropped run would stay over the bound and rewrite forever"
+        );
+    }
+
+    /// The regression behind HIGH-2: compacting to exactly the bound means the
+    /// next append compacts again, forever. The low-water mark is what makes a
+    /// rewrite rare, and "rare" has to be asserted, not asserted-about.
+    #[test]
+    fn a_compaction_is_followed_by_ordinary_appends_rather_than_more_compactions() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
+        let mut held = FlowMembership::default();
+        // Single-node runs: the degenerate case, where dropping the oldest run
+        // recovers exactly one record, so compacting to the bound itself would
+        // rewrite on every subsequent append.
+        let append = |held: FlowMembership, index: usize| {
+            let mut entry = record(
+                &format!("run-{index:04}"),
+                "task-0",
+                MembershipDisposition::Created,
+            );
+            entry.recorded_at = format!("2026-08-04T{:02}:{:02}:00.000Z", index / 60, index % 60);
+            record_membership_bounded(&path, &entry, held, 100)
+                .unwrap()
+                .1
+        };
+        for index in 0..100 {
+            held = append(held, index);
+        }
+        assert_eq!(held.record_count(), 100);
+
+        // Watch the inode across the next ten appends. A rewrite renames a new
+        // file into place, so the inode changes once and only once: the first
+        // append compacts to the 90-record low-water mark, and the nine after it
+        // are ordinary appends.
+        let inode = |path: &Path| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path).unwrap().ino()
+        };
+        let mut inodes = vec![inode(&path)];
+        for index in 100..110 {
+            held = append(held, index);
+            inodes.push(inode(&path));
+        }
+        inodes.dedup();
+        assert_eq!(
+            inodes.len(),
+            2,
+            "exactly one rewrite in ten appends past the bound; \
+             compacting to the bound itself would rewrite on every one"
+        );
+        assert_eq!(held.record_count(), 99);
+        assert_eq!(held, FlowMembership::read(&path).unwrap());
     }
 
     #[test]
@@ -698,9 +932,42 @@ mod tests {
         let error = record_membership(
             &path,
             &record("run-a", "task-1", MembershipDisposition::Attached),
-            &FlowMembership::default(),
+            FlowMembership::default(),
         )
         .unwrap_err();
         assert!(matches!(error, FlowMembershipError::Io { .. }), "{error}");
+        // And the same fault is visible to `preflight`, which is what lets the
+        // admission path refuse before the kernel commits anything.
+        assert!(matches!(
+            preflight(&path).unwrap_err(),
+            FlowMembershipError::Io { .. }
+        ));
+    }
+
+    #[test]
+    fn preflight_sees_the_faults_that_would_otherwise_surface_after_the_commit() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
+
+        // A ledger that does not exist yet is usable, and preflight returns the
+        // index the write path then dedupes against.
+        assert!(preflight(&path).unwrap().is_empty());
+
+        let first = record("run-a", "task-1", MembershipDisposition::Created);
+        record_membership(&path, &first, FlowMembership::default()).unwrap();
+        assert_eq!(preflight(&path).unwrap().record_count(), 1);
+
+        // One malformed complete line -- the state the runbook exists for, and
+        // the realistic trigger -- is caught before any admission commits.
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str(
+            "{\"schemaVersion\":1,\"flowRunId\":\"run-a\",\"taskUuid\":\"task-2\",\
+             \"disposition\":\"attached\",\"recordedAt\":\"nope\"}\n",
+        );
+        std::fs::write(&path, raw).unwrap();
+        assert!(matches!(
+            preflight(&path).unwrap_err(),
+            FlowMembershipError::Malformed { line: 2, .. }
+        ));
     }
 }

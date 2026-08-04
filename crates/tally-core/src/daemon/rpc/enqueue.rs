@@ -360,6 +360,18 @@ impl DaemonHandler {
     ///
     /// An admission carrying no orchestration capsule — every non-flow
     /// admission — takes none of this path at all.
+    ///
+    /// **The ordering is the whole design.** The kernel cannot say which task
+    /// UUID a run is being handed until it has decided, and by then the row, the
+    /// `enqueued` journal event, and the dispatcher registration are durable —
+    /// so a membership failure at that point cannot be reported as a failed
+    /// admission without orphaning work that is already executing. Instead the
+    /// ledger is proved usable *before* the kernel commits, where a refusal is a
+    /// real refusal; and the narrow residue where it becomes unusable in between
+    /// is acknowledged, with the task UUID the caller needs and an explicit
+    /// warning, rather than denied. `queue.retry` has recorded before it mutates
+    /// from the start, and this is the same rule applied to the path that could
+    /// not simply be reordered.
     pub(crate) async fn enqueue_payload(
         &self,
         payload: EnqueuePayload,
@@ -367,12 +379,19 @@ impl DaemonHandler {
         caller: CallerIdentity,
     ) -> Result<Value, WireError> {
         let submitted = payload.orchestration.clone();
-        let response = self.admit_payload(payload, ingress_id, caller).await?;
+        if submitted.is_some() {
+            self.preflight_flow_membership().await?;
+        }
+        let mut response = self.admit_payload(payload, ingress_id, caller).await?;
         let Some(orchestration) = submitted else {
             return Ok(response);
         };
-        self.record_admission_membership(&orchestration, &response)
-            .await?;
+        if let Err(error) = self
+            .record_admission_membership(&orchestration, &response)
+            .await
+        {
+            self.disclose_degraded_membership(&orchestration, &mut response, &error);
+        }
         Ok(response)
     }
 
@@ -412,6 +431,44 @@ impl DaemonHandler {
             orchestration_node_label(Some(orchestration)).map(ToOwned::to_owned),
         ))
         .await
+    }
+
+    /// Acknowledge an admission whose membership could not be recorded, and say
+    /// so — in the response, and durably on the daemon's journal.
+    ///
+    /// The admission happened: the row is durable and the work is dispatching,
+    /// so the honest answer is the disposition the kernel decided plus the task
+    /// UUID. What is degraded is *observability of one node*, and only until the
+    /// ledger is repaired: this run's window will be missing this node, which is
+    /// exactly the pre-#380 status quo for that one node rather than a
+    /// regression. The typed field lets a runner log it; the journal line is the
+    /// durable record an operator greps to know what to backfill, because the
+    /// store that would ordinarily hold that fact is the one that just failed.
+    pub(crate) fn disclose_degraded_membership(
+        &self,
+        orchestration: &Orchestration,
+        response: &mut Value,
+        error: &WireError,
+    ) {
+        let flow_run_id = orchestration.flow_run_id();
+        let task_uuid = response
+            .get("taskUuid")
+            .or_else(|| response.get("task_uuid"))
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>")
+            .to_owned();
+        eprintln!(
+            "tally: flow-membership-degraded flowRunId={flow_run_id} taskUuid={task_uuid} \
+             admitted=true reason={}",
+            error.message
+        );
+        response["membershipDegraded"] = json!({
+            "flowRunId": flow_run_id,
+            "taskUuid": task_uuid,
+            "admitted": true,
+            "reason": error.message,
+            "resolution": "repair-flow-membership-ledger",
+        });
     }
 
     async fn admit_payload(

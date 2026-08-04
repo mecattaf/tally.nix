@@ -49,12 +49,31 @@ authorized.
 
   Operator-visible consequences: `flowRunTasks: 0` now means *nothing was
   admitted under that run ID* — suspect the ID before the daemon — and the CLI's
-  stderr notice says so. A membership ledger that cannot be read or written
-  fails the call with `resolution: repair-flow-membership-ledger` rather than
-  quietly answering with a smaller run; an interrupted append (torn final line)
-  is skipped on read and truncated on the next append. The ledger is compacted
-  at 100,000 records by dropping whole runs, oldest first, never part of a run.
-  No row field changed, so no row migration is required.
+  stderr notice says so. No row field changed, so no row migration is required.
+
+  A damaged or unwritable ledger is checked **before** the kernel commits, so a
+  flow admission is refused outright — no durable row, no `enqueued` lifecycle
+  event, no dispatch — with `resolution: repair-flow-membership-ledger`. Which
+  task UUID a run is handed is not known until the admission has been decided,
+  so the write itself necessarily follows the commit; a ledger that becomes
+  unusable in that window yields an **acknowledged** admission carrying a
+  `membershipDegraded` object (and a journalled `flow-membership-degraded` line)
+  rather than a denial, because telling a caller its admission failed while the
+  node dispatches and runs would orphan live work. An interrupted append (torn
+  final line) is skipped on read and truncated on the next append; a record
+  written by a *newer* daemon — unknown field, unknown disposition, higher
+  `schemaVersion` — is read on the fields this daemon understands, so a pin
+  rollback cannot take run-scoped queries out.
+
+  The ledger is compacted past 20,000 records — one per admitted flow node —
+  down to 18,000, dropping whole runs oldest first, never part of a run. The
+  bound is sized by the one-time parse (~200 ms at 20,000) rather than copied
+  from the rare-event lineage ledger, and the low-water mark means a compaction
+  is followed by thousands of ordinary appends instead of another compaction.
+  Compaction is a write-and-rename, so a crash mid-rewrite cannot leave a
+  silently smaller run set. Per-admission cost is flat in ledger size:
+  0.81–0.90 ms across ledgers of 0, 5,000, 20,000, and 25,000 records
+  (debug profile; `membership_admission_cost_sweep`).
 
 - **The systemd watchdog keepalive no longer shares the dispatch loop, so a
   busy daemon is no longer killed for being busy (#370).** `WATCHDOG=1` was

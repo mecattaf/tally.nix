@@ -561,39 +561,94 @@ impl DaemonHandler {
         Ok(membership)
     }
 
-    /// Make `flow_run_id` durably hold `task_uuid`, before this admission is
-    /// acknowledged to its caller.
+    /// Prove the membership ledger is usable *before* the kernel commits.
+    ///
+    /// A flow admission cannot record membership until the kernel has decided
+    /// which task UUID the run is being handed, and by then the row, the
+    /// `enqueued` journal event, and the dispatcher registration are already
+    /// durable. Failing at that point and reporting an error to the caller is
+    /// not a refusal — it orphans live work. So the two faults that are actually
+    /// reachable, an unusable record and a ledger that cannot be opened for
+    /// append, are detected here, where returning an error refuses an admission
+    /// that has not happened yet.
+    pub(crate) async fn preflight_flow_membership(&self) -> Result<(), WireError> {
+        let path = self.context.read().await.paths.flow_membership_path();
+        let stamp = membership_stamp(&path);
+        if self
+            .flow_membership_cache
+            .borrow()
+            .as_ref()
+            .is_some_and(|cached| cached.stamp == stamp)
+        {
+            // The cache is current, so the ledger already parsed cleanly as of
+            // these bytes and re-parsing would be the very per-admission linear
+            // cost the cache exists to avoid. Only the appendability check is
+            // left, and it is one open.
+            return crate::flow_membership::probe_appendable(&path).map_err(membership_wire);
+        }
+        let membership =
+            Rc::new(crate::flow_membership::preflight(&path).map_err(membership_wire)?);
+        *self.flow_membership_cache.borrow_mut() = Some(CachedFlowMembership {
+            stamp: membership_stamp(&path),
+            membership,
+        });
+        Ok(())
+    }
+
+    /// Make `flow_run_id` durably hold `task_uuid`.
     ///
     /// The whole point of the record is that it is written for the dispositions
-    /// that write no row of their own, so a failure here cannot be swallowed:
-    /// an `attached` caller that is handed a task UUID it will never be able to
-    /// see in its own window is W-316 all over again, and the response would
-    /// say `ok` while lying. The error surfaces instead.
+    /// that write no row of their own: an `attached` caller handed a task UUID
+    /// it will never be able to see in its own window is W-316 all over again.
+    /// So this must not fail silently — but by the time it runs the admission
+    /// has already happened, so it must not fail *loudly to the caller* either.
+    /// [`Self::preflight_flow_membership`] takes the reachable faults before the
+    /// commit; what is left here is the narrow race where the ledger became
+    /// unusable in between, and the caller gets a degraded acknowledgement
+    /// rather than a false refusal. The error is returned for the admission path
+    /// to attach, never for it to propagate.
     pub(crate) async fn record_flow_membership(
         &self,
         record: FlowMembershipRecord,
     ) -> Result<(), WireError> {
         let path = self.context.read().await.paths.flow_membership_path();
-        let held = self.flow_membership().await?;
-        if held.contains(&record.flow_run_id, &record.task_uuid) {
+        // Scoped so the borrowed index is dropped before the cache is taken:
+        // holding it here would keep the `Rc` strong count at two, `try_unwrap`
+        // below would fail, and every admission would deep-clone the whole
+        // index — linear in the ledger, which is the cost this repair removes.
+        let already_held = {
+            let held = self.flow_membership().await?;
+            held.contains(&record.flow_run_id, &record.task_uuid)
+        };
+        if already_held {
             return Ok(());
         }
-        record_membership(&path, &record, &held).map_err(membership_wire)?;
-        // Refresh in place rather than dropping: the next reader is very often
-        // the very next admission, and re-parsing per admission is what the
-        // cache exists to avoid. Taking the cache first usually leaves this the
-        // only strong reference, so the update is in-place too.
-        let mut updated = self
-            .flow_membership_cache
-            .borrow_mut()
-            .take()
-            .map_or_else(|| (*held).clone(), |cached| (*cached.membership).clone());
-        updated.insert(record);
-        *self.flow_membership_cache.borrow_mut() = Some(CachedFlowMembership {
-            stamp: membership_stamp(&path),
-            membership: Rc::new(updated),
-        });
-        Ok(())
+        let owned = match self.flow_membership_cache.borrow_mut().take() {
+            Some(cached) => {
+                Rc::try_unwrap(cached.membership).unwrap_or_else(|shared| (*shared).clone())
+            }
+            // Only reachable if a concurrent reader invalidated it in between.
+            None => FlowMembership::read(&path).map_err(membership_wire)?,
+        };
+        match record_membership(&path, &record, owned) {
+            Ok((_, updated)) => {
+                // The cache is whatever the writer says the file now holds --
+                // including after a compaction, which is what stops the cache
+                // from staying permanently over the bound and rewriting the
+                // whole ledger on every later admission.
+                *self.flow_membership_cache.borrow_mut() = Some(CachedFlowMembership {
+                    stamp: membership_stamp(&path),
+                    membership: Rc::new(updated),
+                });
+                Ok(())
+            }
+            Err(error) => {
+                // The index went with the failed write; leave the cache empty so
+                // the next reader re-parses whatever survived on disk rather
+                // than trusting a projection of a write that did not land.
+                Err(membership_wire(error))
+            }
+        }
     }
 
     pub(crate) async fn cancel_one(

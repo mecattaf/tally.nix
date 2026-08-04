@@ -423,17 +423,49 @@ flow membership ledger <PATH> line <N> is unusable: <reason>
 The error carries `transient: false` with
 `resolution: "repair-flow-membership-ledger"` so automation escalates instead of
 retrying it every pass. The same resolution appears when the ledger cannot be
-*written* — a full or read-only data directory — in which case the admission is
-refused rather than acknowledged. That refusal is the point: an `attached`
-admission whose membership was not recorded would hand a run a task UUID it
-could never see in its own window, which is the W-316 failure the ledger exists
-to close.
+*opened for append* — a read-only or missing data directory.
 
-As with the lineage ledger, an *interrupted* append never causes this: an
+**A flow admission checks the ledger before it admits anything**, so both of
+those faults refuse the admission outright: no durable row, no `enqueued`
+lifecycle event, no dispatch. Nothing to clean up, and re-submitting after the
+repair is the whole recovery. Non-flow admissions are unaffected throughout.
+
+There is one narrow case the check cannot cover, because the ledger records
+which task UUID a run was handed and that is not known until the admission has
+been decided: the ledger becomes unusable in the window between the check and
+the write — the data directory fills, say. The admission has really happened by
+then, so it is **acknowledged rather than denied**, and the response carries the
+degradation explicitly:
+
+```json
+{"disposition": "created", "task_uuid": "...",
+ "membershipDegraded": {"flowRunId": "...", "taskUuid": "...", "admitted": true,
+                        "reason": "...", "resolution": "repair-flow-membership-ledger"}}
+```
+
+Telling the caller its admission failed while the node dispatches and runs would
+orphan live work — the runner either abandons a node that is executing or
+re-submits and is refused again. What is actually degraded is the visibility of
+that one node in that one run's window, until the ledger is repaired; that is
+the pre-#380 status quo for a single node, not lost work. The daemon also
+journals the fact, so the set of nodes needing attention survives the response:
+
+```console
+$ journalctl --user -u tally | grep flow-membership-degraded
+tally: flow-membership-degraded flowRunId=<uuid> taskUuid=<uuid> admitted=true reason=...
+```
+
+Repair the ledger, then re-submit those nodes: the admission is idempotent and
+answers `attached` or `reused`, which records the membership that was missed.
+
+As with the lineage ledger, an *interrupted* append never causes any of this: an
 unterminated final line is skipped on read and truncated by the next write. This
 message means a **complete** record cannot be decoded or validated. Failing
 closed is deliberate: skipping the line would answer a membership question with
-a number smaller than the truth.
+a number smaller than the truth. A record written by a *newer* daemon — an
+unknown field, an unknown disposition, or a higher `schemaVersion` — is not this
+error: it is read on the fields this daemon understands, so a pin rollback does
+not take run-scoped queries out.
 
 Repair it with the daemon stopped. The file is a plain JSONL index:
 

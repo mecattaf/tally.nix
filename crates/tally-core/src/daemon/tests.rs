@@ -10958,6 +10958,218 @@ mod tests {
             .await;
     }
 
+    /// Seed a ledger with `runs x nodes` records ending just before `now`.
+    fn seed_membership_ledger(paths: &DaemonPaths, runs: usize, nodes: usize) -> usize {
+        std::fs::create_dir_all(&paths.data_dir).unwrap();
+        let mut text = String::new();
+        for run in 0..runs {
+            for node in 0..nodes {
+                text.push_str(&format!(
+                    "{{\"schemaVersion\":1,\"flowRunId\":\"seed-{run:06}\",\
+                     \"taskUuid\":\"seed-{run:06}-{node:04}\",\"disposition\":\"created\",\
+                     \"nodeOrdinal\":{node},\"recordedAt\":\"2020-01-01T00:00:00.000Z\"}}\n"
+                ));
+            }
+        }
+        std::fs::write(
+            paths
+                .data_dir
+                .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+            &text,
+        )
+        .unwrap();
+        runs * nodes
+    }
+
+    fn ledger_lines(paths: &DaemonPaths) -> usize {
+        std::fs::read_to_string(
+            paths
+                .data_dir
+                .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+        )
+        .map(|text| text.lines().filter(|line| !line.trim().is_empty()).count())
+        .unwrap_or(0)
+    }
+
+    fn ledger_inode(paths: &DaemonPaths) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(
+            paths
+                .data_dir
+                .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+        )
+        .unwrap()
+        .ino()
+    }
+
+    /// The HIGH-2 regression, at the level it actually bit.
+    ///
+    /// The daemon used to rebuild its cached index as *pre-append cache plus the
+    /// new record*, never from the compacted set. So once the ledger passed its
+    /// bound the cache stayed permanently over it, every later admission decided
+    /// it had to compact, and each one serialised and fsynced the entire ledger
+    /// — measured at 977 ms per admission against 151 ms for the identical file
+    /// after a restart. The cache also grew without limit and answered queries
+    /// with runs the file no longer contained.
+    ///
+    /// Three things are asserted, and the first is the root cause: the index the
+    /// daemon holds is the index the file holds.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_the_daemons_index_never_diverges_from_the_ledger_it_writes() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let bound = crate::flow_membership::FLOW_MEMBERSHIP_MAX_RECORDS;
+                // Seed exactly to the bound, in whole runs, so the next
+                // admission is the one that crosses it.
+                let seeded = seed_membership_ledger(&paths, bound / 4, 4);
+                assert_eq!(seeded, bound);
+
+                let daemon = fs1_daemon(&paths).await;
+                daemon
+                    .handler
+                    .pause(Some(json!({"all": true})))
+                    .await
+                    .unwrap();
+
+                // Two runs, because `monitor_node_payload` pins `maxNodes: 8`
+                // and the flow-node cap is not this test's subject.
+                let runs = [Uuid::new_v4().to_string(), Uuid::new_v4().to_string()];
+                let mut inodes = Vec::new();
+                for ordinal in 0..12 {
+                    daemon
+                        .handler
+                        .enqueue_as_client(Some(monitor_node_payload(
+                            &runs[ordinal / 6],
+                            ordinal % 6,
+                        )))
+                        .await
+                        .unwrap();
+                    inodes.push(ledger_inode(&paths));
+
+                    // The file is bounded...
+                    assert!(
+                        ledger_lines(&paths) <= bound,
+                        "ordinal {ordinal}: ledger grew past its bound"
+                    );
+                    // ...and the daemon's own index is exactly what the file
+                    // holds, every single time. This is the assertion the first
+                    // draft would have failed on the very first admission.
+                    let held = daemon.handler.flow_membership().await.unwrap();
+                    let on_disk = crate::flow_membership::FlowMembership::read(
+                        &paths
+                            .data_dir
+                            .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        *held, on_disk,
+                        "ordinal {ordinal}: the daemon's index diverged from the ledger \
+                         ({} records held vs {} on disk)",
+                        held.record_count(),
+                        on_disk.record_count()
+                    );
+                }
+
+                // A rewrite renames a new file into place, so the inode changes
+                // once per compaction. Twelve admissions past the bound must
+                // produce exactly one, not twelve.
+                inodes.dedup();
+                assert_eq!(
+                    inodes.len(),
+                    1,
+                    "the ledger was rewritten more than once in twelve admissions: \
+                     that is the every-append-rewrites loop, back again"
+                );
+
+                // And the runs still resolve, on a compacted ledger.
+                for run in runs {
+                    let window = daemon
+                        .handler
+                        .query("query.log", Some(json!({"flowRun": run, "limit": 1000})))
+                        .await
+                        .unwrap();
+                    assert_eq!(window["flowRunTasks"], 6, "{window}");
+                }
+            })
+            .await;
+    }
+
+    /// The per-admission cost of membership bookkeeping, at several ledger
+    /// sizes. Ignored by default because it seeds tens of thousands of records
+    /// and reports rather than asserts; run it with
+    /// `cargo test -p tally-core --lib membership_admission_cost_sweep
+    /// -- --ignored --nocapture`.
+    ///
+    /// It exists because "measure the hot path you added" is the lesson #379 is
+    /// open about, and because the numbers are the only honest way to size
+    /// `FLOW_MEMBERSHIP_MAX_RECORDS`.
+    #[tokio::test(flavor = "current_thread")]
+    #[ignore = "seeds a large ledger; run explicitly with --ignored"]
+    async fn membership_admission_cost_sweep() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let bound = crate::flow_membership::FLOW_MEMBERSHIP_MAX_RECORDS;
+                for (label, records) in [
+                    ("empty", 0),
+                    ("quarter", bound / 4),
+                    ("at the bound", bound),
+                    ("past the bound", bound + bound / 4),
+                ] {
+                    let temp = tempdir().unwrap();
+                    let paths = fs1_paths(temp.path());
+                    if records > 0 {
+                        seed_membership_ledger(&paths, records / 4, 4);
+                    }
+                    let opened = std::time::Instant::now();
+                    let daemon = fs1_daemon(&paths).await;
+                    daemon
+                        .handler
+                        .pause(Some(json!({"all": true})))
+                        .await
+                        .unwrap();
+                    // The first flow admission is what parses the ledger.
+                    let warm_run = Uuid::new_v4().to_string();
+                    daemon
+                        .handler
+                        .enqueue_as_client(Some(monitor_node_payload(&warm_run, 0)))
+                        .await
+                        .unwrap();
+                    let first = opened.elapsed();
+
+                    let admissions = 30_usize;
+                    let started = std::time::Instant::now();
+                    for ordinal in 0..admissions {
+                        let run = if ordinal % 6 == 0 {
+                            Uuid::new_v4().to_string()
+                        } else {
+                            warm_run.clone()
+                        };
+                        let _ = daemon
+                            .handler
+                            .enqueue_as_client(Some(monitor_node_payload(
+                                &run,
+                                ordinal % 6,
+                            )))
+                            .await;
+                    }
+                    let elapsed = started.elapsed();
+                    eprintln!(
+                        "MEMBERSHIP-COST {label:>14}: seeded {records:>6} records, \
+                         open+first admission {first:>12.3?}, \
+                         {admissions} admissions in {elapsed:>12.3?} \
+                         = {:>10.3?}/admission, ledger {} lines",
+                        elapsed / admissions as u32,
+                        ledger_lines(&paths),
+                    );
+                }
+            })
+            .await;
+    }
+
     /// The frozen kernel's other half: an admission that names no run touches
     /// none of this. No ledger, no file, no new failure mode.
     #[tokio::test(flavor = "current_thread")]
@@ -11096,12 +11308,135 @@ mod tests {
             .await;
     }
 
-    /// A membership ledger that cannot be written refuses the admission rather
-    /// than acknowledging an `attached` task the run would never see. The
-    /// reassuring-direction failure is the one this whole lane exists to close,
-    /// so it must not be reintroduced by the repair's own error path.
+    /// A refusal has to leave nothing behind, and this test's whole job is to
+    /// ask what the daemon *kept* — the question the first version of it never
+    /// asked, which is how it certified a "refusal" that had already committed a
+    /// durable row, emitted the `enqueued` journal event, registered the job
+    /// with the dispatcher, and let it run to a passing witness.
+    ///
+    /// Both reachable faults are asserted: a ledger that cannot be opened at
+    /// all, and the one complete-but-unusable record that
+    /// `repair-flow-membership-ledger` actually exists for, which is the far
+    /// likelier trigger.
     #[tokio::test(flavor = "current_thread")]
-    async fn acceptance_380_an_unwritable_membership_ledger_refuses_the_admission() {
+    async fn acceptance_380_a_membership_fault_refuses_before_the_kernel_commits_anything() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                for fault in ["unopenable", "malformed-record"] {
+                    let temp = tempdir().unwrap();
+                    let paths = fs1_paths(temp.path());
+                    let daemon = fs1_daemon(&paths).await;
+                    // The pool is NOT paused: if the kernel committed, the node
+                    // would dispatch and run, which is exactly what must not
+                    // survive the refusal.
+                    let ledger = paths
+                        .data_dir
+                        .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE);
+                    std::fs::create_dir_all(&paths.data_dir).unwrap();
+                    match fault {
+                        "unopenable" => std::fs::create_dir(&ledger).unwrap(),
+                        _ => std::fs::write(
+                            &ledger,
+                            "{\"schemaVersion\":1,\"flowRunId\":\"run-a\",\
+                             \"taskUuid\":\"task-1\",\"disposition\":\"attached\",\
+                             \"recordedAt\":\"not-a-timestamp\"}\n",
+                        )
+                        .unwrap(),
+                    }
+
+                    let flow_run = Uuid::new_v4().to_string();
+                    let error = daemon
+                        .handler
+                        .enqueue_as_client(Some(monitor_node_payload(&flow_run, 0)))
+                        .await
+                        .unwrap_err();
+                    assert!(
+                        error.message.contains("flow membership"),
+                        "{fault}: the refusal must name the store that failed: {error:?}"
+                    );
+                    assert_eq!(
+                        error.data.as_ref().unwrap()["resolution"],
+                        "repair-flow-membership-ledger",
+                        "{fault}"
+                    );
+
+                    // What the daemon kept: nothing.
+                    let mut context = daemon.handler.context.write().await;
+                    assert!(
+                        context.rows.is_empty(),
+                        "{fault}: a refused admission left a durable row: {:?}",
+                        context.rows.keys().collect::<Vec<_>>()
+                    );
+                    assert!(
+                        context.jobs.is_empty(),
+                        "{fault}: a refused admission left a live job"
+                    );
+                    assert!(
+                        context.query_details.snapshot().is_empty(),
+                        "{fault}: a refused admission left a query projection"
+                    );
+                    drop(context);
+                    assert!(
+                        read_acknowledged_events(&paths.events_dir()).unwrap().is_empty(),
+                        "{fault}: a refused admission left a durable enqueue event"
+                    );
+                    assert!(
+                        daemon.handler.history.borrow().snapshot().records.is_empty(),
+                        "{fault}: a refused admission emitted a lifecycle event"
+                    );
+
+                    // And nothing observable claims the run exists.
+                    let window = daemon
+                        .handler
+                        .query(
+                            "query.log",
+                            Some(json!({"flowRun": flow_run.clone(), "limit": 1000})),
+                        )
+                        .await;
+                    match window {
+                        // A run-scoped query over a damaged ledger fails loudly;
+                        // it must never answer with a smaller run.
+                        Err(error) => assert!(error.message.contains("flow membership")),
+                        Ok(window) => {
+                            assert_eq!(window["flowRunTasks"], 0, "{fault}: {window}");
+                            assert!(window["items"].as_array().unwrap().is_empty());
+                        }
+                    }
+
+                    // A non-flow admission is unaffected either way.
+                    let unrelated = daemon
+                        .handler
+                        .enqueue_as_client(Some(fs1_full_payload(
+                            "no-flow-membership-fault",
+                            &["true"],
+                            ["exit:0".to_owned()],
+                        )))
+                        .await
+                        .unwrap();
+                    assert_eq!(unrelated["disposition"], "created", "{fault}");
+                }
+            })
+            .await;
+    }
+
+    /// The residue the preflight cannot take: the ledger becomes unusable
+    /// *between* the preflight and the append, so by the time the failure is
+    /// known the admission has already happened.
+    ///
+    /// The fault is injected at that seam by hand, and deliberately so: every
+    /// filesystem-level fault I can stage is caught by the preflight before the
+    /// kernel commits — which is the point of the preflight, and is what the
+    /// test above proves. What is left is a genuine race (the data directory
+    /// fills, or the file is replaced, in the window between the two calls), and
+    /// the only honest way to exercise it is to open the window explicitly.
+    ///
+    /// What must hold: the caller is told the truth. The work was admitted, here
+    /// is its task UUID, and this one node's membership is missing until the
+    /// ledger is repaired. It is not told the admission failed while its node
+    /// executes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_380_a_membership_fault_after_the_commit_degrades_rather_than_lying() {
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -11113,28 +11448,65 @@ mod tests {
                     .pause(Some(json!({"all": true})))
                     .await
                     .unwrap();
-                // A directory where the ledger file belongs: every open fails.
-                std::fs::create_dir_all(&paths.data_dir).unwrap();
-                std::fs::create_dir(
-                    paths
-                        .data_dir
-                        .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE),
-                )
-                .unwrap();
+                let ledger = paths
+                    .data_dir
+                    .join(crate::flow_membership::FLOW_MEMBERSHIP_FILE);
                 let flow_run = Uuid::new_v4().to_string();
-                let error = daemon
+
+                // The preflight passes: the ledger is fine at this point.
+                daemon.handler.preflight_flow_membership().await.unwrap();
+
+                // The kernel commits. This is a real admission with a real row.
+                let mut response = daemon
                     .handler
                     .enqueue_as_client(Some(monitor_node_payload(&flow_run, 0)))
                     .await
-                    .unwrap_err();
-                assert!(
-                    error.message.contains("flow membership"),
-                    "the refusal must name the store that failed: {error:?}"
+                    .unwrap();
+                let task_uuid = response["task_uuid"].as_str().unwrap().to_owned();
+
+                // ...and only now does the ledger become unwritable.
+                std::fs::remove_file(&ledger).ok();
+                std::fs::create_dir(&ledger).unwrap();
+
+                let orchestration = crate::provenance::Orchestration::new(
+                    monitor_node_payload(&flow_run, 1)["orchestration"].clone(),
+                )
+                .unwrap();
+                let error = daemon
+                    .handler
+                    .record_admission_membership(&orchestration, &response)
+                    .await
+                    .expect_err("the membership write must fail for this test to mean anything");
+                daemon.handler.disclose_degraded_membership(
+                    &orchestration,
+                    &mut response,
+                    &error,
                 );
+
+                // The response still says what actually happened.
+                assert_eq!(response["disposition"], "created", "{response}");
                 assert_eq!(
-                    error.data.as_ref().unwrap()["resolution"],
-                    "repair-flow-membership-ledger"
+                    response["task_uuid"], json!(task_uuid),
+                    "an acknowledged admission must still hand back its task UUID: {response}"
                 );
+                let degraded = &response["membershipDegraded"];
+                assert_eq!(degraded["admitted"], true, "{response}");
+                assert_eq!(degraded["flowRunId"], json!(flow_run), "{response}");
+                assert_eq!(degraded["taskUuid"], json!(task_uuid), "{response}");
+                assert_eq!(
+                    degraded["resolution"], "repair-flow-membership-ledger",
+                    "{response}"
+                );
+                assert!(
+                    degraded["reason"].as_str().unwrap().contains("flow membership"),
+                    "{response}"
+                );
+
+                // The admission is real, and the daemon kept it -- which is the
+                // whole reason the caller must not be told it failed.
+                let context = daemon.handler.context.read().await;
+                assert_eq!(context.rows.len(), 1, "the admission did happen");
+                assert!(context.jobs.contains_key(&Uuid::parse_str(&task_uuid).unwrap()));
             })
             .await;
     }
