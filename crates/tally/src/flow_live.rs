@@ -473,6 +473,13 @@ impl FlowClient for LiveFlowClient {
             match self.call("queue.enqueue", payload).await {
                 Ok(response) => {
                     validate_recorded_run_identity(&response, &submission)?;
+                    // The runner is the path that produces flow-run membership
+                    // at scale, so it is the path that must not swallow a
+                    // degradation. A failure to *print* the warning is not
+                    // allowed to fail the admission -- the daemon has journalled
+                    // it either way, and losing a node because stderr is closed
+                    // would be a worse trade than losing the line.
+                    let _ = crate::cli::enqueue::report_degraded_membership(&response);
                     let mut admission = parse_admission(&response)?;
                     if let Some(expectation) = result_expected {
                         self.result_expected.lock().await.insert(

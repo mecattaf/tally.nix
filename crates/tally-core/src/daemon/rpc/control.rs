@@ -611,23 +611,7 @@ impl DaemonHandler {
         &self,
         record: FlowMembershipRecord,
     ) -> Result<(), WireError> {
-        // Task UUIDs still executing. Compaction refuses to evict any run that
-        // holds one, so a long-lived campaign cannot lose its membership to a
-        // bound crossed by unrelated traffic. Collected here because it is the
-        // daemon that knows liveness; it is cheap (bounded by concurrency) and
-        // only consulted if a compaction actually happens.
-        let (path, live_tasks) = {
-            let context = self.context.read().await;
-            (
-                context.paths.flow_membership_path(),
-                context
-                    .jobs
-                    .values()
-                    .filter(|job| job.state != JobState::Completed)
-                    .map(Job::stable_key)
-                    .collect::<BTreeSet<_>>(),
-            )
-        };
+        let path = self.context.read().await.paths.flow_membership_path();
         // Scoped so the borrowed index is dropped before the cache is taken:
         // holding it here would keep the `Rc` strong count at two, `try_unwrap`
         // below would fail, and every admission would deep-clone the whole
@@ -639,6 +623,27 @@ impl DaemonHandler {
         if already_held {
             return Ok(());
         }
+        // Every task the daemon holds that has not completed — `Running`,
+        // `Queued`, and `Paused` alike. Compaction refuses to evict any run
+        // holding one, so a campaign cannot lose its membership to a bound
+        // crossed by unrelated traffic while its work is still outstanding.
+        //
+        // The cost is one pass over `context.jobs`, which is never pruned and so
+        // grows with every job this daemon has admitted since it started. It is
+        // therefore *not* bounded by concurrency — the earlier comment here said
+        // it was, and was wrong. It is collected below the `already_held` return
+        // so a repeat admission, which writes nothing, pays nothing for it; it is
+        // still built on every admission that does write, because the writer
+        // cannot know in advance whether it will need to compact.
+        let live_tasks = {
+            let context = self.context.read().await;
+            context
+                .jobs
+                .values()
+                .filter(|job| job.state != JobState::Completed)
+                .map(Job::stable_key)
+                .collect::<BTreeSet<_>>()
+        };
         let owned = match self.flow_membership_cache.borrow_mut().take() {
             Some(cached) => {
                 Rc::try_unwrap(cached.membership).unwrap_or_else(|shared| (*shared).clone())
@@ -650,14 +655,24 @@ impl DaemonHandler {
             Ok((write, updated)) => {
                 if write == MembershipWrite::AppendedOverTarget {
                     // Not an error: the ledger is deliberately allowed to exceed
-                    // its target rather than evict membership for work that is
-                    // still running. Said out loud because an operator watching
+                    // its target rather than evict membership for work that has
+                    // not finished. Said out loud because an operator watching
                     // disk should know why this file is above its documented
-                    // bound, and because it will not shrink until work completes.
+                    // bound, and what would bring it back down.
+                    //
+                    // The wording is load-bearing. "Executing" was wrong here and
+                    // wrong in the reassuring direction: the commonest way to
+                    // reach this state is `queue pause --all`, where every job is
+                    // `Paused` — idle, not busy — and nothing completes until an
+                    // operator resumes. Telling them the daemon is working and to
+                    // wait would be advice to wait forever.
                     eprintln!(
                         "tally: flow-membership is over its {}-record target with nothing \
-                         evictable ({} records; every run above the bound holds executing \
-                         work). It will compact once that work completes.",
+                         evictable ({} records; every run above the bound holds work that \
+                         has not completed, which may be running, queued, or paused). It \
+                         grows by one record per flow admission until that work finishes, \
+                         and compacts on the next admission after it does. If the queue is \
+                         paused it will not drain on its own: `tally queue resume --all`.",
                         crate::flow_membership::FLOW_MEMBERSHIP_MAX_RECORDS,
                         updated.record_count()
                     );

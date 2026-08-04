@@ -143,7 +143,7 @@ pub(super) async fn run_enqueue(
 /// trace is a daemon journal entry the operator has to already know to grep for,
 /// which means the person who caused the degradation is the one person who does
 /// not learn about it.
-pub(super) fn report_degraded_membership(result: &Value) -> Result<()> {
+pub(crate) fn report_degraded_membership(result: &Value) -> Result<()> {
     let Some(degraded) = result
         .get("membershipDegraded")
         .filter(|value| value.is_object())

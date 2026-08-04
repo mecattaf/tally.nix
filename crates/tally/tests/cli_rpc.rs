@@ -494,6 +494,101 @@ impl RpcHandler for FloodQueryHandler {
     }
 }
 
+/// Acknowledges an admission whose run membership could not be recorded.
+#[derive(Clone, Copy)]
+struct DegradedMembershipHandler {
+    degraded: bool,
+}
+
+impl RpcHandler for DegradedMembershipHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        let degraded = self.degraded;
+        Box::pin(async move {
+            assert_eq!(request.method.as_str(), "queue.enqueue");
+            let mut response = serde_json::json!({
+                "schemaVersion": 1,
+                "disposition": "created",
+                "task_uuid": "00000000-0000-4000-8000-000000000380",
+                "taskUuid": "00000000-0000-4000-8000-000000000380",
+                "job_id": "00000000-0000-4000-8000-000000000380",
+                "state": "queued",
+            });
+            if degraded {
+                response["membershipDegraded"] = serde_json::json!({
+                    "flowRunId": "8f2d1c40-0000-4000-8000-0000000003c0",
+                    "taskUuid": "00000000-0000-4000-8000-000000000380",
+                    "admitted": true,
+                    "reason": "flow membership I/O error: No space left on device",
+                    "resolution": "repair-flow-membership-ledger",
+                });
+            }
+            Ok(response)
+        })
+    }
+}
+
+/// #380: an admission the daemon acknowledged with its run membership
+/// unrecorded must say so to the operator who caused it, at the point they
+/// caused it. Otherwise the only trace is a daemon journal line they have to
+/// already know to grep for — which is the gap this warning exists to close.
+#[tokio::test(flavor = "current_thread")]
+async fn a_degraded_membership_admission_warns_the_caller_that_the_node_will_be_invisible() {
+    for degraded in [true, false] {
+        let temp = tempfile::tempdir().unwrap();
+        let socket = temp.path().join("tally.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let handler = DegradedMembershipHandler { degraded };
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let server = tokio::task::spawn_local(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(stream, handler).await.unwrap();
+                });
+                let output = run_tally(&socket, &["enqueue", "--pool", "slot", "--", "true"]).await;
+                let stderr = String::from_utf8(output.stderr).unwrap();
+                assert!(output.status.success(), "{stderr}");
+                if degraded {
+                    assert!(
+                        stderr.contains("run membership was NOT recorded"),
+                        "a degraded admission printed no warning:\n{stderr}"
+                    );
+                    // The three things an operator needs: which run is now
+                    // incomplete, which node is missing from it, and what to do.
+                    assert!(
+                        stderr.contains("8f2d1c40-0000-4000-8000-0000000003c0"),
+                        "the warning did not name the run:\n{stderr}"
+                    );
+                    assert!(
+                        stderr.contains("00000000-0000-4000-8000-000000000380"),
+                        "the warning did not name the task:\n{stderr}"
+                    );
+                    assert!(
+                        stderr.contains("repair-flow-membership-ledger"),
+                        "the warning did not name the resolution:\n{stderr}"
+                    );
+                    // And the admission still succeeded, because it did.
+                    assert!(
+                        String::from_utf8(output.stdout)
+                            .unwrap()
+                            .contains("00000000-0000-4000-8000-000000000380"),
+                        "a degraded admission must still return its task UUID"
+                    );
+                } else {
+                    assert!(
+                        stderr.is_empty(),
+                        "an ordinary admission must be silent:\n{stderr}"
+                    );
+                }
+                server.await.unwrap();
+            })
+            .await;
+    }
+}
+
 /// Answers the two methods that share `submit_payload`.
 #[derive(Clone, Copy)]
 struct SubmitHandler;

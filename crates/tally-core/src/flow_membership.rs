@@ -84,8 +84,9 @@ pub const FLOW_MEMBERSHIP_FILE: &str = "flow-membership.jsonl";
 /// Compaction drops **whole runs** — never part of one, because a half-present
 /// run reports a membership count lower than the truth, which is the
 /// reassuring-direction lie this store exists to remove. It drops
-/// least-recently-touched first and never touches a run that is still holding
-/// executing work; see [`FlowMembership::eviction_plan`]. A run that is wholly
+/// least-recently-touched first and never touches a run holding work that has
+/// not completed — running, queued, or paused alike; see
+/// [`FlowMembership::eviction_plan`]. A run that is wholly
 /// evicted falls back to the row scan, which is what an operator got before this
 /// ledger existed and is what the observability chapter documents — with the
 /// limit that a row-less admission has nothing to fall back to, which is why
@@ -443,9 +444,16 @@ impl FlowMembership {
     /// `protected` is never evicted whatever its age. It carries two things the
     /// timestamps cannot: the run being written right now (a compaction that
     /// evicts its own caller's run would report a durable membership that is not
-    /// there), and runs holding a task that is still executing. The second is
-    /// what covers a run that admitted everything early and has been quietly
-    /// running ever since, which LRU alone would eventually evict.
+    /// there), and runs holding a task that has not completed — running, queued,
+    /// or paused. The second is what covers a run that admitted everything early
+    /// and has been quietly working ever since, which LRU alone would eventually
+    /// evict. It is deliberately wider than "executing": a paused queue is a
+    /// state an operator can hold indefinitely, and membership for work they are
+    /// about to resume is exactly what must not be thrown away.
+    ///
+    /// When it covers *everything* above the target, nothing is evictable and
+    /// the caller appends anyway rather than deleting membership in use — see
+    /// [`MembershipWrite::AppendedOverTarget`].
     ///
     /// Returns the run IDs to drop, cheaply and without cloning any record, so
     /// the caller can skip the expensive rewrite when nothing is evictable.
@@ -532,9 +540,13 @@ pub enum MembershipWrite {
     /// A new durable record was appended.
     Appended,
     /// Appended, but the ledger is over its target and nothing could be
-    /// evicted: every run above the bound is either live or the one being
-    /// written. The ledger grows rather than deleting membership that is still
-    /// in use; the caller reports it, because this module does not log.
+    /// evicted: every run above the bound holds work that has not completed, or
+    /// is the run being written. The ledger grows by one record per admission
+    /// rather than deleting membership that is still in use, and compacts on the
+    /// next admission after that work finishes. The caller reports it, because
+    /// this module does not log — and the report has to say *not completed*
+    /// rather than *executing*, since the commonest way to get here is a paused
+    /// queue, which does not drain unattended.
     AppendedOverTarget,
     /// The run already durably held this task; nothing was written.
     AlreadyHeld,
@@ -1212,6 +1224,80 @@ mod tests {
             "the oldest *idle* run is the one that goes instead"
         );
         assert_eq!(held, FlowMembership::read(&path).unwrap());
+    }
+
+    /// When *everything* above the target is protected there is nothing to
+    /// evict, and the ledger grows rather than deleting membership that is still
+    /// in use. The contract has three parts and all three matter:
+    ///
+    /// 1. the record is still written — the admission is not failed;
+    /// 2. `AppendedOverTarget` is reported, so the daemon can say so on its
+    ///    journal (this module does not log);
+    /// 3. **no rewrite happens** — the file is appended to, not re-serialized.
+    ///    Rewriting the whole ledger on every admission because compaction
+    ///    cannot make progress would be round 1's HIGH-2 by a third route.
+    ///
+    /// The reachable operator state for this is `queue pause --all`: every job
+    /// is `Paused`, which counts as not-completed, so every run is protected. It
+    /// is deliberately not `Running` here — protecting paused work is the point.
+    #[test]
+    fn nothing_evictable_grows_the_ledger_and_says_so_instead_of_rewriting_it() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempdir().unwrap();
+        let path = temp.path().join(FLOW_MEMBERSHIP_FILE);
+        // Every task in the ledger is held by a job that has not completed.
+        let live = (0..8)
+            .map(|index| format!("paused-task-{index}"))
+            .collect::<BTreeSet<_>>();
+        let mut held = FlowMembership::default();
+        for index in 0..4 {
+            let mut entry = record(
+                &format!("run-{index}"),
+                &format!("paused-task-{index}"),
+                MembershipDisposition::Created,
+            );
+            entry.recorded_at = format!("2026-08-0{}T00:00:00.000Z", index + 1);
+            held = record_membership_bounded(&path, &entry, held, &live, 4)
+                .unwrap()
+                .1;
+        }
+        assert_eq!(held.record_count(), 4);
+        let inode_before = std::fs::metadata(&path).unwrap().ino();
+
+        // The fifth crosses the bound with nothing evictable.
+        let mut over = record("run-4", "paused-task-4", MembershipDisposition::Attached);
+        over.recorded_at = "2026-08-05T00:00:00.000Z".to_owned();
+        let (write, held) = record_membership_bounded(&path, &over, held, &live, 4).unwrap();
+
+        assert_eq!(
+            write,
+            MembershipWrite::AppendedOverTarget,
+            "the caller must be able to tell its operator why the ledger is growing"
+        );
+        assert!(
+            held.contains("run-4", "paused-task-4"),
+            "the admission's membership must still be durable"
+        );
+        assert_eq!(held.record_count(), 5, "nothing may be evicted");
+        assert_eq!(held, FlowMembership::read(&path).unwrap());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            inode_before,
+            "an over-target append must append, not rewrite: rewriting on every \
+             admission is the failure the low-water mark exists to prevent"
+        );
+
+        // ...and once the work completes, the very next admission compacts.
+        let mut after = record("run-5", "task-fresh", MembershipDisposition::Created);
+        after.recorded_at = "2026-08-06T00:00:00.000Z".to_owned();
+        let (write, held) = record_membership_bounded(&path, &after, held, &no_live(), 4).unwrap();
+        assert_eq!(write, MembershipWrite::Appended);
+        assert!(
+            held.record_count() <= flow_membership_compact_to(4) + 1,
+            "the ledger must self-heal on the next admission after the work finishes: {}",
+            held.record_count()
+        );
+        assert!(held.contains("run-5", "task-fresh"));
     }
 
     /// Reading a newer daemon's record is not enough: it has to survive being

@@ -598,13 +598,15 @@ cannot take run-scoped queries out. Only a `schemaVersion` *below* the reader's 
 
 The ledger is compacted when it passes 20,000 records — one per admitted flow node — by dropping
 whole runs down to 18,000, **least-recently-touched first**, and never a run holding a task that
-is still executing or the run whose record is being written. Never part of a run either, because a
+has not completed — running, queued, or paused alike — or the run whose record is being written. Never part of a run either, because a
 partially-present run reports a membership count lower than the truth. Down to a low-water mark
 rather than to the bound, so a compaction is followed by thousands of ordinary appends rather than
 by another compaction. Compaction is a write-and-rename, so a reader sees the whole old ledger or
 the whole new one, and it re-emits fields and disposition values written by a newer daemon
-verbatim rather than stripping them. If nothing is evictable — every run over the bound is live —
-the ledger exceeds its target rather than deleting membership that is in use. A run dropped by
+verbatim rather than stripping them. If nothing is evictable — every run over the bound holds work that has not
+completed — the ledger exceeds its target rather than deleting membership that is in use, growing
+by one record per flow admission, announcing it on the daemon journal each time, and compacting
+on the next admission after that work finishes. A run dropped by
 compaction falls back to the row scan, which for a row-less node is nothing.
 
 ### Watch cursors

@@ -63,7 +63,11 @@ authorized.
   unusable in that window yields an **acknowledged** admission carrying a
   `membershipDegraded` object (and a journalled `flow-membership-degraded` line)
   rather than a denial, because telling a caller its admission failed while the
-  node dispatches and runs would orphan live work. An interrupted append (torn
+  node dispatches and runs would orphan live work. Every client that admits —
+  `tally enqueue`, `queue continue`, `adapter smoke`, `campaign`, and the live
+  flow runner, which is the path that produces flow-run membership at scale —
+  prints that warning on stderr, so the operator who caused the degradation
+  learns about it where they caused it rather than by grepping the journal. An interrupted append (torn
   final line) is skipped on read and truncated on the next append; a record
   written by a *newer* daemon — unknown field, unknown disposition, higher
   `schemaVersion` — is read on the fields this daemon understands, so a pin
@@ -75,9 +79,13 @@ authorized.
   record is being written: keying eviction on a run's *first* record would make
   it anti-correlated with liveness, deleting the membership of exactly the
   campaigns still under observation, and a compaction that evicted its own
-  caller's run would report a durable membership that is not there. If nothing
-  is evictable the ledger exceeds its target rather than deleting membership in
-  use, and says so on the daemon journal. The bound is sized by the one-time
+  caller's run would report a durable membership that is not there. "Live" here
+  means every job that has not completed — running, queued, **or paused** — so a
+  queue an operator has paused keeps its membership. If nothing is evictable the
+  ledger exceeds its target rather than deleting membership in use: it grows by
+  one record per flow admission, says so on the daemon journal every time
+  (naming `queue resume` as the drain, since a paused queue does not finish on
+  its own), and compacts on the next admission after that work completes. The bound is sized by the one-time
   parse (~200 ms at 20,000) rather than copied from the rare-event lineage
   ledger, and the low-water mark means a compaction is followed by thousands of
   ordinary appends instead of another compaction. Compaction is a

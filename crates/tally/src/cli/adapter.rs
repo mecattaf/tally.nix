@@ -195,6 +195,7 @@ async fn run_adapter_smoke(
         )
         .await
         .map_err(|error| retained(error.into()))?;
+    report_degraded_membership(&admitted).map_err(retained)?;
     let terminal = if admitted.get("verdict").and_then(Value::as_str).is_some() {
         admitted
     } else {
