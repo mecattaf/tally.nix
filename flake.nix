@@ -5236,10 +5236,16 @@
             test "$(jq -c '.adapters.codex.scrape.usage.fields' ${adapterConfig})" = '{"cacheReadTokens":["cached_input_tokens"],"cacheWriteTokens":["cache_write_input_tokens"],"inputTokensWithCacheRead":["input_tokens"],"outputTokens":["output_tokens"],"reasoningTokens":["reasoning_output_tokens"]}'
             test "$(jq -c '.adapters["claude-code"].scrape.usage.fields' ${adapterConfig})" = '{"cacheReadTokens":["cache_read_input_tokens"],"cacheWriteTokens":["cache_creation_input_tokens"],"inputTokens":["input_tokens"],"outputTokens":["output_tokens"]}'
             test "$(jq -c '.adapters["claude-code"].scrape.usageCost' ${adapterConfig})" = '{"fields":{"costUsd":["$"]},"mode":"jsonPathLast","pattern":"$[?@.type == '"'"'result'"'"'].total_cost_usd","stream":"stdout"}'
+            test "$(jq -c '.adapters["claude-code"].scrape.contextWindow' ${adapterConfig})" = '{"fields":{"contextWindow":["$"]},"mode":"jsonPathLast","pattern":"$[?@.type == '"'"'result'"'"'].modelUsage.*.contextWindow","stream":"stdout"}'
             # pi has not been verified against a real capture yet, so it
             # declares no mapping and keeps the legacy reading.
             test "$(jq -r '.adapters.pi.scrape.usage.fields // "absent"' ${adapterConfig})" = absent
             test "$(jq -r '.adapters.shell.scrape.finalMessage // "absent"' ${adapterConfig})" = absent
+            # No real codex or pi capture has ever stated a context window,
+            # so neither preset declares the scrape -- an operator who knows
+            # the ceiling can still assert it via extraConfig.contextWindow.
+            test "$(jq -r '.adapters.codex.scrape.contextWindow // "absent"' ${adapterConfig})" = absent
+            test "$(jq -r '.adapters.pi.scrape.contextWindow // "absent"' ${adapterConfig})" = absent
             test "$(jq -r '.adapters.pi.scrape.sessionRef.pattern' ${adapterConfig})" = '$.id'
             test "$(jq -r '.adapters["claude-code"].scrape.sessionRef.pattern' ${adapterConfig})" = '$..session_id'
             test "$(jq -r '.adapters.codex.scrape.sessionRef.pattern' ${adapterConfig})" = '$..thread_id'

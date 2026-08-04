@@ -8,6 +8,42 @@ authorized.
 
 ### Added
 
+- **Context occupancy is recorded beside session identity, everywhere
+  `sessionRef` is (#383).** "Context is occupancy, not spend" — the number
+  that decides whether a session can absorb another task, not what it cost.
+  `contextTokens` is the last valid assistant turn's usage total: the same
+  figure `crate::usage::observe` (#381) already normalizes, read under its
+  occupancy meaning rather than its spend meaning, so it needs no adapter
+  declaration of its own — whenever an attempt's usage is `reported`, its
+  total is occupancy as of that turn. `contextWindow` is the ceiling that
+  total is measured against, with two independent, distinguishable
+  provenances: a harness that states its own window inside the captured
+  stream (the `claude-code` preset declares a `contextWindow` capture beside
+  `usage` and `usageCost`, resolved at `modelUsage.*.contextWindow` — a real
+  field in this project's own redacted corpus) and an operator-declared
+  ceiling in the adapter's `extraConfig.contextWindow`. A stream-stated
+  window wins when both are present; neither is fabricated, so `codex` and
+  `pi` declare no scrape for it — no real capture from either has ever stated
+  one, matching #381's precedent for `pi`'s usage mapping.
+
+  Both fields are independently optional: a scraped `contextTokens` with no
+  known `contextWindow` is legitimate and does not blank the first, and
+  absence never renders as zero. `journal.rs` task rows carry
+  `TALLY_CONTEXT_TOKENS`/`TALLY_CONTEXT_WINDOW` beside `TALLY_SESSION_REF`
+  (both `Conditional`, mirroring `TALLY_GPU_SECONDS`); `trace.rs` lanes carry
+  them beside `session_ref` on every `TraceLane` and `TraceRecord`, including
+  the journal-reconstructed fallback path a query surface falls back to after
+  retention trims the live row; `query_v2.rs`'s `JobSummary` and
+  `RowDetailFact` carry them beside `usage`, rendering as a `SourcedValue`
+  with `advisory-provider-capture` authority for a scraped window and
+  `durable-admission-fact` for a configured one. `query jobs --session` and
+  `query trace` both expose both fields. `RowSeed.contextTokens` /
+  `.contextWindow` are transport-only, for the same reason `usage` is: no
+  write path persists them, and both are recomputable from the adapter
+  configuration and the retained captures, so no row-version migration was
+  owed. Recording only — no scheduling or admission behavior reads these
+  fields; a future admission heuristic is a separate operator ruling.
+
 - **The exit recorder fills `charge` and, for GPU-pool jobs, `gpuSeconds` from
   real systemd cgroup accounting (#382).** These witness fields have existed
   since the schema was designed but no write path ever set them: `charge` was

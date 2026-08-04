@@ -14,6 +14,7 @@ use crate::adapters::AdapterJobOptions;
 use crate::completion::GateManifestSpec;
 use crate::config::Priority;
 use crate::evidence::parse_evidence_specs;
+use crate::occupancy::ContextWindow;
 use crate::provenance::Orchestration;
 use crate::usage::UsageObservation;
 use crate::witness::{Derivation, WitnessError};
@@ -908,6 +909,17 @@ pub struct RowSeed {
     /// (`crate::taskdb::migrations`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageObservation>,
+    /// Occupancy computed alongside `usage` at the same scrape, kept
+    /// separate because it answers a different question ("can this session
+    /// absorb another task", never "what did this attempt cost"). Transport-
+    /// only for the exact reason `usage` is: no write path persists it, both
+    /// are recomputable from the adapter configuration and the retained
+    /// captures, and adding them owed no row migration because nothing here
+    /// widens what an enqueue event may carry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<ContextWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_token_hash: Option<String>,
     pub lease_epoch: u64,
@@ -1777,6 +1789,8 @@ mod tests {
             evidence_class: Some(Value::String("artifact".to_owned())),
             manifest_hash: Some(Value::String("sha256:manifest".to_owned())),
             usage: None,
+            context_tokens: None,
+            context_window: None,
         }
     }
 

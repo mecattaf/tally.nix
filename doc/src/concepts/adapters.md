@@ -110,6 +110,36 @@ preserve event order and malformed/unknown payloads as advisory observations;
 a configured running local or remote trace is not silently reported as an
 empty successful trace.
 
+## Context occupancy is read from the same usage
+
+Context is occupancy, not spend: `contextTokens` is the last valid assistant
+turn's usage total, read under its occupancy meaning rather than its spend
+meaning. It needs no adapter declaration of its own — whenever an attempt's
+usage is `reported`, its total is occupancy as of that turn.
+
+`contextWindow` is the ceiling that total is measured against, and it has two
+independent, distinguishable provenances. A harness that states its own
+window inside the captured stream declares it the same way a usage field is —
+a capture's `fields` map, resolved through the exact mapping usage reads,
+never a parallel mechanism. The `claude-code` preset declares a `contextWindow`
+capture beside `usage` and `usageCost`, resolved at
+`modelUsage.<model>.contextWindow`, a field real captures carry. An operator
+may alternatively declare a ceiling in the adapter's `extraConfig.contextWindow`;
+a stream-stated window wins when both are present, because it is what the
+harness actually applied. `codex` and `pi` declare no `contextWindow` scrape:
+no real capture from either has ever stated one, and declaring a key nobody
+has observed is a guess wearing a declaration's clothes.
+
+Both fields are independently optional. A scraped `contextTokens` with no
+known `contextWindow` is a legitimate state and does not blank the first, and
+a `null` draws no bar rather than reading as zero. `contextTokens` and
+`contextWindow` are recorded everywhere `sessionRef` is: journal lifecycle
+events, `tally query trace` lanes, and `tally query job` /
+`tally query jobs --session`, the last two rendering `contextWindow` as a
+`SourcedValue` with `advisory-provider-capture` authority for a scraped window
+and `durable-admission-fact` authority for a configured one. Recording only —
+no admission or scheduling decision reads these fields.
+
 ## Configuration and proof
 
 `nix/lib/adapters.nix` defines the helper and presets.

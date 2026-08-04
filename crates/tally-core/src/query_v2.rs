@@ -9,6 +9,7 @@ use crate::flow_lineage::{FlowLineage, FlowSupersedeRecord};
 use crate::flow_membership::FlowMembership;
 use crate::history::{LifecycleRecord, LifecycleSnapshot, RetentionMetadata};
 use crate::journal::TallyEvent;
+use crate::occupancy::{ContextWindow, ContextWindowSource};
 use crate::provenance::{Orchestration, TaskRef};
 use crate::query::{
     GhOriginProjection, HeadroomSignal, RowStatus, QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
@@ -70,6 +71,8 @@ pub struct RowDetailFact {
     pub session_ref: Option<String>,
     pub final_message: Option<String>,
     pub usage: Option<UsageObservation>,
+    pub context_tokens: Option<u64>,
+    pub context_window: Option<ContextWindow>,
     pub workspace: Option<WorkspaceMetadata>,
     pub attempt: u32,
     pub lease_epoch: u64,
@@ -116,6 +119,8 @@ impl RowDetailFact {
             session_ref: row.session_ref.clone(),
             final_message: row.final_message.clone(),
             usage: row.usage.clone(),
+            context_tokens: row.context_tokens,
+            context_window: row.context_window,
             workspace: row.workspace.clone(),
             attempt: row.attempt,
             lease_epoch: row.lease_epoch,
@@ -320,6 +325,18 @@ pub struct JobSummary {
     /// states stay distinct on the wire.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<SourcedValue<UsageObservation>>,
+    /// Occupancy as of the attempt's last valid assistant turn: the same
+    /// total `usage` already normalizes, read under its occupancy meaning.
+    /// Independent of `context_window` — a session can report how full it
+    /// is without anyone stating how full it can get.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<SourcedValue<u64>>,
+    /// The ceiling `context_tokens` is measured against. Two provenances
+    /// stay distinguishable on the wire: `advisory-provider-capture` for a
+    /// harness that stated its own window, `durable-admission-fact` for an
+    /// operator-declared ceiling in adapter configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<SourcedValue<u64>>,
     pub current_attempt: Option<u32>,
     pub lease_epoch: Option<u64>,
     pub unit: Option<String>,
@@ -2011,6 +2028,17 @@ fn build_summary(
                 )
             })
         }),
+        context_tokens: detail.and_then(|detail| {
+            detail.context_tokens.map(|value| {
+                SourcedValue::new(
+                    value,
+                    FactAuthority::AdvisoryProviderCapture,
+                    "adapter-scrape",
+                )
+            })
+        }),
+        context_window: detail
+            .and_then(|detail| detail.context_window.map(context_window_sourced_value)),
         current_attempt,
         lease_epoch: current_lease_epoch,
         unit: live
@@ -2052,6 +2080,25 @@ fn build_summary(
         }),
         credential_names: detail.map_or_else(Vec::new, |detail| detail.credential_names.clone()),
         trace: TraceAvailability::default(),
+    }
+}
+
+/// A scraped ceiling is what the harness said about itself; a configured
+/// ceiling is what the operator asserted in adapter configuration before the
+/// attempt ever ran — the same authority `requested_model` carries for its
+/// `adapter-options` provenance.
+fn context_window_sourced_value(window: ContextWindow) -> SourcedValue<u64> {
+    match window.source {
+        ContextWindowSource::ProviderCapture => SourcedValue::new(
+            window.tokens,
+            FactAuthority::AdvisoryProviderCapture,
+            "adapter-scrape",
+        ),
+        ContextWindowSource::AdapterConfig => SourcedValue::new(
+            window.tokens,
+            FactAuthority::DurableAdmissionFact,
+            "adapter-config",
+        ),
     }
 }
 
@@ -2721,6 +2768,8 @@ mod tests {
                 .then(|| "actionable lifecycle failure\n".to_owned()),
             stderr_truncated: (event == TallyEvent::Failed).then_some(false),
             gpu_seconds: terminal.then_some(1.0),
+            context_tokens: None,
+            context_window: None,
             artifact_hash: (event == TallyEvent::Completed)
                 .then(|| format!("sha256:{}", "a".repeat(64))),
             evidence: event.is_evidence().then(|| "exit:0".to_owned()),
@@ -2792,6 +2841,8 @@ mod tests {
             },
             related_trigger: None,
             usage: None,
+            context_tokens: None,
+            context_window: None,
         }
     }
 

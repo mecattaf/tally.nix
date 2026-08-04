@@ -798,6 +798,8 @@ impl DaemonHandler {
             // the prior attempt's record stays on the prior row and in the
             // attestation ledger.
             usage: None,
+            context_tokens: None,
+            context_window: None,
             job_token_hash: None,
             lease_epoch: epoch,
             attempt: 1,

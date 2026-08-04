@@ -146,6 +146,12 @@ pub const TALLY_FIELD_MATRIX: &[(&str, FieldRequirement)] = &[
     // pattern #382 removes. The field is real cgroup accounting for a
     // GPU-pool job now, present only when the exit recorder measured it.
     ("TALLY_GPU_SECONDS", FieldRequirement::Conditional),
+    // Occupancy, recorded beside `TALLY_SESSION_REF` for the same reason: a
+    // query surface reconstructed after retention still needs it. Never
+    // required, since not every adapter declares a usage scrape and a
+    // config-declared context window is independent of one.
+    ("TALLY_CONTEXT_TOKENS", FieldRequirement::Conditional),
+    ("TALLY_CONTEXT_WINDOW", FieldRequirement::Conditional),
     ("TALLY_LABOR_CLASS", FieldRequirement::AtCompletedOrFailed),
     ("TALLY_ARTIFACT_HASH", FieldRequirement::AtCompleted),
     ("TALLY_EVIDENCE", FieldRequirement::AtEvidence),
@@ -222,6 +228,16 @@ pub struct TallyFields {
     #[serde(rename = "TALLY_GPU_SECONDS", skip_serializing_if = "Option::is_none")]
     pub gpu_seconds: Option<f64>,
     #[serde(
+        rename = "TALLY_CONTEXT_TOKENS",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_tokens: Option<u64>,
+    #[serde(
+        rename = "TALLY_CONTEXT_WINDOW",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub context_window: Option<u64>,
+    #[serde(
         rename = "TALLY_ARTIFACT_HASH",
         skip_serializing_if = "Option::is_none"
     )]
@@ -269,6 +285,8 @@ pub struct EmitEvent {
     pub stderr_tail: Option<String>,
     pub stderr_truncated: Option<bool>,
     pub gpu_seconds: Option<f64>,
+    pub context_tokens: Option<u64>,
+    pub context_window: Option<u64>,
     pub artifact_hash: Option<String>,
     pub evidence: Option<String>,
     pub attempt: Option<u32>,
@@ -296,6 +314,8 @@ impl EmitEvent {
             stderr_tail: None,
             stderr_truncated: None,
             gpu_seconds: None,
+            context_tokens: None,
+            context_window: None,
             artifact_hash: None,
             evidence: None,
             attempt: None,
@@ -328,6 +348,8 @@ impl EmitEvent {
             stderr_tail: self.stderr_tail,
             stderr_truncated: self.stderr_truncated,
             gpu_seconds: self.gpu_seconds,
+            context_tokens: self.context_tokens,
+            context_window: self.context_window,
             artifact_hash: self.artifact_hash,
             evidence: self.evidence,
             attempt: self.attempt,
@@ -430,6 +452,8 @@ fn field_present(fields: &TallyFields, name: &str) -> bool {
         "TALLY_STDERR_TAIL" => fields.stderr_tail.is_some(),
         "TALLY_STDERR_TRUNCATED" => fields.stderr_truncated.is_some(),
         "TALLY_GPU_SECONDS" => fields.gpu_seconds.is_some(),
+        "TALLY_CONTEXT_TOKENS" => fields.context_tokens.is_some(),
+        "TALLY_CONTEXT_WINDOW" => fields.context_window.is_some(),
         "TALLY_ARTIFACT_HASH" => fields
             .artifact_hash
             .as_deref()
@@ -761,6 +785,12 @@ fn native_fields(fields: &TallyFields) -> Result<Vec<(&'static str, String)>, Jo
     if let Some(value) = fields.gpu_seconds {
         values.push(("TALLY_GPU_SECONDS", value.to_string()));
     }
+    if let Some(value) = fields.context_tokens {
+        values.push(("TALLY_CONTEXT_TOKENS", value.to_string()));
+    }
+    if let Some(value) = fields.context_window {
+        values.push(("TALLY_CONTEXT_WINDOW", value.to_string()));
+    }
     push_optional(
         &mut values,
         "TALLY_ARTIFACT_HASH",
@@ -895,6 +925,8 @@ fn hydrate_fields(source: &Map<String, Value>) -> Result<TallyFields, JournalErr
     for name in [
         "TALLY_EXIT_CODE",
         "TALLY_GPU_SECONDS",
+        "TALLY_CONTEXT_TOKENS",
+        "TALLY_CONTEXT_WINDOW",
         "TALLY_ATTEMPT",
         "TALLY_LEASE_EPOCH",
     ] {
@@ -955,6 +987,8 @@ mod tests {
             stderr_tail: (event == TallyEvent::Failed).then(|| "failure detail\n".to_owned()),
             stderr_truncated: (event == TallyEvent::Failed).then_some(false),
             gpu_seconds: Some(12.5),
+            context_tokens: Some(1234),
+            context_window: Some(1_000_000),
             artifact_hash: Some("sha256:deadbeef".to_owned()),
             evidence: Some("pass artifact:/out/result".to_owned()),
             attempt: Some(1),
@@ -1042,6 +1076,8 @@ mod tests {
             "TALLY_AGENT",
             "TALLY_TASK_REF",
             "TALLY_SESSION_REF",
+            "TALLY_CONTEXT_TOKENS",
+            "TALLY_CONTEXT_WINDOW",
             "TALLY_JOB_ID",
             "TALLY_PARENT",
             "TALLY_POOL",
@@ -1253,6 +1289,8 @@ mod tests {
         for name in [
             "TALLY_EXIT_CODE",
             "TALLY_GPU_SECONDS",
+            "TALLY_CONTEXT_TOKENS",
+            "TALLY_CONTEXT_WINDOW",
             "TALLY_ATTEMPT",
             "TALLY_LEASE_EPOCH",
         ] {

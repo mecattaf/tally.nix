@@ -28,6 +28,8 @@ pub struct TraceLane {
     pub lease_epoch: u64,
     pub adapter: String,
     pub session_ref: Option<String>,
+    pub context_tokens: Option<u64>,
+    pub context_window: Option<u64>,
     pub running: bool,
     pub remote: bool,
 }
@@ -81,6 +83,14 @@ pub struct TraceRecord {
     pub lease_epoch: u64,
     pub adapter: String,
     pub session_ref: Option<String>,
+    /// Occupancy and its ceiling, carried beside `session_ref` for the same
+    /// reason: a query surface reconstructed after retention still needs
+    /// them, so both are recorded wherever `session_ref` is. Absence is
+    /// never zero; see `crate::occupancy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
     pub stream: ScrapeStream,
     pub framing: TraceFraming,
     pub record_index: u64,
@@ -388,6 +398,8 @@ pub fn query_trace(
                 lease_epoch: lane.lease_epoch,
                 adapter: lane.adapter.clone(),
                 session_ref: lane.session_ref.clone(),
+                context_tokens: lane.context_tokens,
+                context_window: lane.context_window,
                 stream: trace.stream,
                 framing: trace.framing,
                 record_index,
@@ -631,6 +643,8 @@ mod tests {
             lease_epoch: 7,
             adapter: "codex".to_owned(),
             session_ref: None,
+            context_tokens: None,
+            context_window: None,
             running: false,
             remote: false,
         };
@@ -709,6 +723,8 @@ mod tests {
                 lease_epoch: 7,
                 adapter: adapter.to_owned(),
                 session_ref: Some(format!("{adapter}-session")),
+                context_tokens: None,
+                context_window: None,
                 running: false,
                 remote: false,
             };
@@ -815,6 +831,8 @@ mod tests {
                 lease_epoch: 7,
                 adapter: "codex".to_owned(),
                 session_ref: None,
+                context_tokens: None,
+                context_window: None,
                 running: true,
                 remote,
             };
