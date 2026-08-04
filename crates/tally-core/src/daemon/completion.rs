@@ -1063,13 +1063,17 @@ pub(super) fn canonical_job_model(job: &Job) -> Option<String> {
 ///
 /// `charge` is the generic per-job cost — CPU-seconds, whenever a probe
 /// succeeded, regardless of which pool the job ran in. `gpu_seconds` is
-/// narrower: it is set only for a job that held a `vram`-resource pool, and
-/// it is the unit's wall-clock occupancy (`UnitAccounting::wall_seconds`),
-/// not CPU-cgroup time — a GPU-bound job that mostly waits on the device
-/// would otherwise be charged far fewer GPU-seconds than it actually held
-/// the pool for, wrong in exactly the reassuring direction. Neither field is
-/// ever a fabricated value: an unmeasured or non-GPU-pool input yields
-/// `None`, never `Some(0.0)`.
+/// narrower: it is set only for a job whose pool **explicitly** declared
+/// `resource = "vram"` (`gpu_pool_job` must already reflect that — see
+/// `LeaseEngine::declared_resource_kind`, never
+/// `PoolConfig::resource()`'s defaulted reading, since `vram` is
+/// `ResourceKind`'s own default and a pool that declared nothing must not
+/// register as a GPU pool). It is the unit's wall-clock occupancy
+/// (`UnitAccounting::wall_seconds`), not CPU-cgroup time — a GPU-bound job
+/// that mostly waits on the device would otherwise be charged far fewer
+/// GPU-seconds than it actually held the pool for, wrong in exactly the
+/// reassuring direction. Neither field is ever a fabricated value: an
+/// unmeasured or non-GPU-pool input yields `None`, never `Some(0.0)`.
 pub(super) fn accounting_witness_fields(
     accounting: Option<UnitAccounting>,
     gpu_pool_job: bool,

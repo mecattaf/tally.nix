@@ -438,9 +438,18 @@ pub(super) fn parse_unit_accounting(
             });
         }
     }
-    let parse_property = |name: &'static str| -> Result<Option<u64>, ExecutorError> {
+    // `ExecMain{Start,Exit}TimestampMonotonic` report an unknown/never-run
+    // unit's timestamp as the literal `0`, not `[not set]` — systemd's own
+    // "this never happened" for a monotonic clock that is never exactly
+    // zero at any real point after boot. `CPUUsageNSec` has no such
+    // sentinel: `0` there is a plausible real measurement, so only the two
+    // timestamp properties treat it as absence.
+    let parse_property = |name: &'static str,
+                          zero_is_unset: bool|
+     -> Result<Option<u64>, ExecutorError> {
         match properties.get(name).copied() {
             None | Some("[not set]") | Some("") => Ok(None),
+            Some("0") if zero_is_unset => Ok(None),
             Some(value) => value
                 .parse::<u64>()
                 .map(Some)
@@ -453,8 +462,8 @@ pub(super) fn parse_unit_accounting(
         }
     };
     Ok(UnitAccounting {
-        cpu_usage_nsec: parse_property("CPUUsageNSec")?,
-        exec_main_start_monotonic_usec: parse_property("ExecMainStartTimestampMonotonic")?,
-        exec_main_exit_monotonic_usec: parse_property("ExecMainExitTimestampMonotonic")?,
+        cpu_usage_nsec: parse_property("CPUUsageNSec", false)?,
+        exec_main_start_monotonic_usec: parse_property("ExecMainStartTimestampMonotonic", true)?,
+        exec_main_exit_monotonic_usec: parse_property("ExecMainExitTimestampMonotonic", true)?,
     })
 }

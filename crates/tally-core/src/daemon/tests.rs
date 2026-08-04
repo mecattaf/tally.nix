@@ -169,7 +169,7 @@ mod tests {
             pools: BTreeMap::from([(
                 "slot".to_owned(),
                 PoolConfig {
-                    resource: ResourceKind::BuildSlot,
+                    resource: Some(ResourceKind::BuildSlot),
                     predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                     ..PoolConfig::default()
                 },
@@ -189,7 +189,7 @@ mod tests {
         config.pools.insert(
             "zeta".to_owned(),
             PoolConfig {
-                resource: ResourceKind::BuildSlot,
+                resource: Some(ResourceKind::BuildSlot),
                 predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                 ..PoolConfig::default()
             },
@@ -202,7 +202,7 @@ mod tests {
             pools: BTreeMap::from([(
                 "api".to_owned(),
                 PoolConfig {
-                    resource: ResourceKind::Budget,
+                    resource: Some(ResourceKind::Budget),
                     predicate: PoolPredicate::WindowedConsumption(
                         crate::config::WindowedConsumptionPredicate {
                             window_sec: 60,
@@ -1939,7 +1939,7 @@ mod tests {
         config.pools.insert(
             "build".to_owned(),
             PoolConfig {
-                resource: ResourceKind::BuildSlot,
+                resource: Some(ResourceKind::BuildSlot),
                 predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                 ..PoolConfig::default()
             },
@@ -5786,7 +5786,7 @@ mod tests {
                 config.pools.insert(
                     "gpu".to_owned(),
                     PoolConfig {
-                        resource: ResourceKind::Vram,
+                        resource: Some(ResourceKind::Vram),
                         predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                         ..PoolConfig::default()
                     },
@@ -5860,6 +5860,107 @@ mod tests {
                 assert!(history.borrow().snapshot().records.iter().any(|entry| {
                     entry.fields.task_uuid == task_uuid && entry.fields.gpu_seconds == Some(3.5)
                 }));
+            })
+            .await;
+    }
+
+    /// #382 HIGH-1 (post-merge repair): `vram` is `ResourceKind`'s default,
+    /// so a pool whose config omits `resource` entirely must NOT read as a
+    /// GPU pool. Before this repair, `resource_kind(pool) ==
+    /// Some(ResourceKind::Vram)` compared against the *effective*
+    /// (defaulted) resource, so a job in a pool that declared nothing at
+    /// all — `{"capacity": 2}`, no `resource` key — got a real,
+    /// non-fabricated-looking `gpuSeconds` on a host with no GPU. This pins
+    /// the fix: `declared_resource_kind` reads the raw `Option` the pool
+    /// config carries, so silence never reads as a declaration.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pool_that_declares_no_resource_never_gets_gpu_seconds() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let mut config = one_pool_config();
+                // No `resource` key at all — exactly the shape an operator
+                // writes when they never intended a GPU pool, e.g.
+                // `services.tally.pools.worker = { capacity = 2; };`.
+                config.pools.insert(
+                    "silent".to_owned(),
+                    PoolConfig {
+                        capacity: 2,
+                        predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
+                        ..PoolConfig::default()
+                    },
+                );
+                assert_eq!(config.pools["silent"].resource, None);
+                assert_eq!(
+                    config.pools["silent"].resource(),
+                    ResourceKind::Vram,
+                    "the effective default is unchanged by this repair"
+                );
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon =
+                    Daemon::open_with_executor(config, paths.clone(), settings(), executor)
+                        .await
+                        .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "silent",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"],
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let mut finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                if let Some(Ok(outcome)) = finished.outcome.as_mut() {
+                    outcome.record.accounting = Some(UnitAccounting {
+                        cpu_usage_nsec: Some(1_000_000_000),
+                        exec_main_start_monotonic_usec: Some(1_000_000),
+                        exec_main_exit_monotonic_usec: Some(3_500_000),
+                    });
+                } else {
+                    panic!("expected a successful direct-fallback completion");
+                }
+                daemon.finish_job(finished).await.unwrap();
+                daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": task_uuid})))
+                    .await
+                    .unwrap();
+
+                let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
+                let record = records
+                    .iter()
+                    .find(|record| record.task_uuid.as_deref() == Some(task_uuid.as_str()))
+                    .unwrap();
+                assert_eq!(
+                    record.gpu_seconds, None,
+                    "a pool that declared no resource must never carry gpuSeconds"
+                );
+                // The generic charge is unaffected: CPU accounting is not
+                // gated on the GPU-pool question at all.
+                assert_eq!(
+                    record.charge,
+                    Some(Charge {
+                        unit: "cpu-second".to_owned(),
+                        amount: 1.0,
+                        class_name: "measured".to_owned(),
+                    })
+                );
             })
             .await;
     }
@@ -5959,7 +6060,7 @@ mod tests {
                 config.pools.insert(
                     "gpu".to_owned(),
                     PoolConfig {
-                        resource: ResourceKind::Vram,
+                        resource: Some(ResourceKind::Vram),
                         predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                         ..PoolConfig::default()
                     },
@@ -10298,7 +10399,7 @@ mod tests {
                 config.pools.insert(
                     "flow".to_owned(),
                     PoolConfig {
-                        resource: ResourceKind::BuildSlot,
+                        resource: Some(ResourceKind::BuildSlot),
                         predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                         ..PoolConfig::default()
                     },

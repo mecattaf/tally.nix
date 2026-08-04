@@ -20,25 +20,41 @@ authorized.
   --property=ExecMainExitTimestampMonotonic` and embeds the result as a new
   optional `accounting` field on `UnitExitRecord`. `CPUUsageNSec` becomes the
   generic per-job `Charge{unit: "cpu-second", amount, class: "measured"}`; the
-  two monotonic timestamps become `gpuSeconds` for a job that held a
-  `vram`-resource pool, measured as systemd's own wall-clock occupancy rather
-  than CPU-cgroup time, which would understate a job that mostly waits on the
-  device. `witness::canonical_gpu_seconds` (unchanged) now sums a real,
-  non-fabricated figure.
+  two monotonic timestamps become `gpuSeconds` for a job whose pool
+  **explicitly** declares `resource = "vram"`, measured as systemd's own
+  wall-clock occupancy rather than CPU-cgroup time, which would understate a
+  job that mostly waits on the device. `witness::canonical_gpu_seconds`
+  (unchanged) now sums a real, non-fabricated figure.
+
+  `resource` is `PoolConfig`'s one field where "declared" and "effective"
+  must be told apart: `ResourceKind::Vram` is `resource`'s own default, so a
+  pool whose config says nothing about `resource` at all — `{"capacity": 4}`
+  — must not read as a GPU pool. `PoolConfig.resource` is now
+  `Option<ResourceKind>`; every admission decision that predates #382 reads
+  the unchanged effective value through the new `PoolConfig::resource()`
+  accessor (`unwrap_or_default()`, still `vram` when undeclared), while
+  `gpuSeconds` is gated on the new `LeaseEngine::declared_resource_kind`,
+  which answers only the narrower question and returns `None` for a pool
+  that declared nothing.
 
   A failed probe — a missing `systemctl`, a nonzero exit, a malformed
   property — is a typed absence (`accounting: None`) logged to the job's
   captured stderr, never a fabricated zero and never a reason to fail the
   exit record itself: accounting is advisory to the verdict. `[not set]`
-  (accounting disabled for a specific property) reads the same way. The new
-  field is additive and optional with no schema-version bump: a record an
-  older binary wrote round-trips unchanged, and a fixture pinned to that exact
-  pre-#382 shape proves it.
+  (accounting disabled for a specific property) reads the same way, and so
+  does a monotonic timestamp systemd reports as the literal `0` for a unit
+  that never ran — a real-but-non-obvious sentinel, confirmed against real
+  systemd, that would otherwise mint a `gpuSeconds: Some(0.0)` nobody
+  measured. The new `accounting` field is additive and optional with no
+  schema-version bump: a record an older binary wrote round-trips unchanged,
+  and a fixture pinned to that exact pre-#382 shape proves it.
 
-  `LeaseEngine::resource_kind` is the one new accessor this needed — GPU-pool
-  membership was previously only visible to the lease engine's own admission
-  logic, and "GPU pool" has always meant a pool configured with `resource =
-  "vram"` (`doc/src/configuration/mechanisms.md`), not a name convention.
+  `doc/src/reference/witness-format.md` documents both fields' exact
+  semantics: `gpuSeconds` is declared-pool wall-clock occupancy, not GPU
+  compute time; `charge` is whole-cgroup CPU-seconds, including the exit
+  recorder's own overhead (single-digit milliseconds, dominant on very short
+  jobs, proportionally negligible on longer ones) — a known floor left for
+  the eventual billing-aggregation lane to decide whether to subtract.
 
   Two now-stale sentences in the #381 usage-breakdown documentation
   (`crates/tally-core/src/usage.rs`, `doc/src/concepts/adapters.md`) said

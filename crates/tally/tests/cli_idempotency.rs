@@ -57,7 +57,7 @@ fn config() -> Config {
         pools: BTreeMap::from([(
             "slot".to_owned(),
             PoolConfig {
-                resource: ResourceKind::BuildSlot,
+                resource: Some(ResourceKind::BuildSlot),
                 capacity: 1,
                 predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
                 ..PoolConfig::default()

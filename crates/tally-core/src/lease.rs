@@ -415,7 +415,7 @@ impl LeaseEngine {
                     "pool {name:?} has zero capacity"
                 )));
             }
-            if config.resource == ResourceKind::Mutex
+            if config.resource() == ResourceKind::Mutex
                 && (config.capacity != 1
                     || !matches!(config.predicate, PoolPredicate::CoResidency(_)))
             {
@@ -497,13 +497,18 @@ impl LeaseEngine {
         self.held.len()
     }
 
-    /// The configured resource kind for a pool, or `None` when the name
-    /// names no pool. `vram` is the codebase's one definition of "GPU pool"
-    /// (see `doc/src/configuration/mechanisms.md`); nothing in the runtime
-    /// pool state carries a separate GPU flag, so this is the single place a
-    /// caller determines GPU-pool membership from.
-    pub fn resource_kind(&self, pool: &str) -> Option<ResourceKind> {
-        self.pools.get(pool).map(|state| state.config.resource)
+    /// Whether a pool was **explicitly** configured `resource = "vram"` —
+    /// `None` both when the name names no pool and when the operator
+    /// declared no `resource` at all. `vram` is the codebase's one
+    /// definition of "GPU pool" (see `doc/src/configuration/mechanisms.md`),
+    /// but `vram` is also `ResourceKind`'s default: reading the *effective*
+    /// resource (`PoolConfig::resource()`) would make every pool that
+    /// declared nothing register as a GPU pool. This is the narrower
+    /// question #382's `gpuSeconds` gate needs — "did the operator say GPU
+    /// pool", not "assume GPU pool because nothing was said" — so it reads
+    /// the raw declared field, not the defaulted one.
+    pub fn declared_resource_kind(&self, pool: &str) -> Option<ResourceKind> {
+        self.pools.get(pool)?.config.resource
     }
 
     pub fn held_in_pool(&self, pool: &str) -> Result<usize, LeaseError> {
@@ -1439,7 +1444,7 @@ mod tests {
 
     fn pool(capacity: u32) -> PoolConfig {
         PoolConfig {
-            resource: ResourceKind::BuildSlot,
+            resource: Some(ResourceKind::BuildSlot),
             capacity,
             predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
             ..PoolConfig::default()
@@ -1448,7 +1453,7 @@ mod tests {
 
     fn window_pool(cap: u64) -> PoolConfig {
         PoolConfig {
-            resource: ResourceKind::Budget,
+            resource: Some(ResourceKind::Budget),
             predicate: PoolPredicate::WindowedConsumption(WindowedConsumptionPredicate {
                 window_sec: 60,
                 consumption_cap: cap,
@@ -1510,7 +1515,7 @@ mod tests {
     #[test]
     fn counted_external_slot_admits_up_to_its_capacity() {
         let slot = PoolConfig {
-            resource: ResourceKind::Slot,
+            resource: Some(ResourceKind::Slot),
             capacity: 3,
             predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
             ..PoolConfig::default()
@@ -1543,7 +1548,7 @@ mod tests {
     #[test]
     fn workload_mutex_replay_waits_behind_the_next_process_holder() {
         let mutex = PoolConfig {
-            resource: ResourceKind::Mutex,
+            resource: Some(ResourceKind::Mutex),
             capacity: 1,
             predicate: PoolPredicate::CoResidency(CoResidencyPredicate {}),
             ..PoolConfig::default()
@@ -1924,9 +1929,9 @@ mod tests {
     }
 
     #[test]
-    fn resource_kind_reports_a_configured_pools_resource_and_none_for_an_unknown_name() {
+    fn declared_resource_kind_reports_a_configured_pools_resource_and_none_for_an_unknown_name() {
         let gpu = PoolConfig {
-            resource: ResourceKind::Vram,
+            resource: Some(ResourceKind::Vram),
             capacity: 1,
             ..PoolConfig::default()
         };
@@ -1937,9 +1942,62 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(engine.resource_kind("gpu"), Some(ResourceKind::Vram));
-        assert_eq!(engine.resource_kind("cpu"), Some(ResourceKind::BuildSlot));
-        assert_eq!(engine.resource_kind("unknown"), None);
+        assert_eq!(
+            engine.declared_resource_kind("gpu"),
+            Some(ResourceKind::Vram)
+        );
+        assert_eq!(
+            engine.declared_resource_kind("cpu"),
+            Some(ResourceKind::BuildSlot)
+        );
+        assert_eq!(engine.declared_resource_kind("unknown"), None);
+    }
+
+    /// #382 HIGH-1: `vram` is `ResourceKind`'s default, so a pool that
+    /// declares no `resource` at all must read as "undeclared" here, not
+    /// silently as "GPU pool". `PoolConfig::resource()` (the *effective*,
+    /// defaulted reading every admission decision already used) still
+    /// resolves the same undeclared pool to `Vram` — that behavior is
+    /// unchanged by #382 and is asserted here precisely so the two readings
+    /// cannot drift back together by accident.
+    #[test]
+    fn declared_resource_kind_is_none_for_a_pool_that_declares_no_resource_at_all() {
+        let undeclared = PoolConfig {
+            capacity: 1,
+            ..PoolConfig::default()
+        };
+        assert_eq!(undeclared.resource, None);
+        assert_eq!(
+            undeclared.resource(),
+            ResourceKind::Vram,
+            "the effective reading used by admission is unchanged"
+        );
+        let engine = LeaseEngine::new(
+            1,
+            Duration::from_secs(20),
+            BTreeMap::from([("worker".to_owned(), undeclared)]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            engine.declared_resource_kind("worker"),
+            None,
+            "a pool that said nothing must not read as a declared GPU pool"
+        );
+    }
+
+    /// The same distinction, from the JSON an operator actually writes:
+    /// `{"capacity": 4}` with no `resource` key must deserialize to
+    /// `resource: None`, not to `Some(Vram)` by way of `#[serde(default)]`
+    /// reaching for `ResourceKind::default()`.
+    #[test]
+    fn pool_config_without_a_resource_key_deserializes_to_a_declared_none() {
+        let pool: PoolConfig = serde_json::from_str(r#"{"capacity": 4}"#).unwrap();
+        assert_eq!(pool.resource, None);
+        assert_eq!(pool.resource(), ResourceKind::Vram);
+
+        let declared: PoolConfig = serde_json::from_str(r#"{"resource": "vram"}"#).unwrap();
+        assert_eq!(declared.resource, Some(ResourceKind::Vram));
     }
 
     #[test]
@@ -2479,7 +2537,7 @@ mod tests {
     #[test]
     fn mutex_is_a_generic_single_holder_resource() {
         let mut mutex = pool(1);
-        mutex.resource = ResourceKind::Mutex;
+        mutex.resource = Some(ResourceKind::Mutex);
         let mut engine = LeaseEngine::new(
             1,
             Duration::from_secs(20),

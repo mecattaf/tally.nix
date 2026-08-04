@@ -552,10 +552,9 @@ impl Daemon {
             } else {
                 execution_host_id.clone()
             };
-            let gpu_pool_job =
-                job.row.pools.iter().any(|pool| {
-                    context.lease.engine().resource_kind(pool) == Some(ResourceKind::Vram)
-                });
+            let gpu_pool_job = job.row.pools.iter().any(|pool| {
+                context.lease.engine().declared_resource_kind(pool) == Some(ResourceKind::Vram)
+            });
             let (charge, gpu_seconds) = accounting_witness_fields(accounting, gpu_pool_job);
             let record = append_context_witness(
                 &mut context,

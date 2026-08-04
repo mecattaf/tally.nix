@@ -196,7 +196,7 @@ fn flow_check_cli_rejects_configured_windowed_consumption_pools() {
     config.pools.insert(
         "worker-gpu".to_owned(),
         PoolConfig {
-            resource: ResourceKind::Budget,
+            resource: Some(ResourceKind::Budget),
             predicate: PoolPredicate::WindowedConsumption(WindowedConsumptionPredicate {
                 window_sec: 18_000,
                 consumption_cap: 100,
@@ -230,7 +230,7 @@ fn flow_run_rejects_a_registered_workload_mutex_without_an_admitted_parent() {
     config.pools.insert(
         "monthly-review".to_owned(),
         PoolConfig {
-            resource: ResourceKind::Mutex,
+            resource: Some(ResourceKind::Mutex),
             capacity: 1,
             ..PoolConfig::default()
         },

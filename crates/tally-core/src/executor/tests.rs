@@ -3007,6 +3007,47 @@ fn parse_unit_accounting_treats_not_set_as_typed_absence() {
     assert_eq!(accounting.wall_seconds(), None);
 }
 
+/// LOW-1 (post-merge eval repair): `systemctl show` reports the monotonic
+/// timestamps of a unit it never ran as the literal `0`, not `[not set]` —
+/// confirmed against real systemd. Left unhandled, `wall_seconds()` would
+/// return `Some(0.0)`, a zero nobody measured, for exactly the shape
+/// acceptance bullet 4 forbids. `CPUUsageNSec=[not set]` in this same
+/// output is the real "never measured" marker for that property; `0` is
+/// only special-cased for the two timestamps.
+#[test]
+fn parse_unit_accounting_treats_a_zero_monotonic_timestamp_as_never_measured() {
+    let accounting = parse_unit_accounting(
+        "unit.service",
+        b"CPUUsageNSec=[not set]\n\
+          ExecMainStartTimestampMonotonic=0\n\
+          ExecMainExitTimestampMonotonic=0\n",
+    )
+    .unwrap();
+    assert_eq!(accounting.exec_main_start_monotonic_usec, None);
+    assert_eq!(accounting.exec_main_exit_monotonic_usec, None);
+    assert_eq!(
+        accounting.wall_seconds(),
+        None,
+        "a unit that never ran must never mint a measured-looking zero"
+    );
+}
+
+/// A genuinely zero `CPUUsageNSec` is a plausible real measurement (an
+/// exceptionally fast unit), unlike the two timestamps, so it is not
+/// special-cased the same way.
+#[test]
+fn parse_unit_accounting_keeps_a_real_zero_cpu_measurement() {
+    let accounting = parse_unit_accounting(
+        "unit.service",
+        b"CPUUsageNSec=0\n\
+          ExecMainStartTimestampMonotonic=100\n\
+          ExecMainExitTimestampMonotonic=200\n",
+    )
+    .unwrap();
+    assert_eq!(accounting.cpu_usage_nsec, Some(0));
+    assert_eq!(accounting.cpu_seconds(), Some(0.0));
+}
+
 #[test]
 fn parse_unit_accounting_never_computes_negative_wall_seconds_from_a_backwards_clock() {
     // Timestamps out of order are not something a real systemd emits, but a
