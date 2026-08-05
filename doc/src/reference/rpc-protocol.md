@@ -459,13 +459,26 @@ attempts apart: `attemptsReported`, `attemptsReportedWithoutFigures`, `attemptsN
 usage scrape was declared and the stream carried none), `attemptsNotDeclared` (the adapter
 declared no usage scrape), and `attemptsWithoutUsageRecord` (an attestation predating the usage
 record). `attemptsReportedWithoutFigures` is the subset of `attemptsReported` that contributed
-nothing: the harness reported usage and no declared field path resolved, which is the ordinary
-harness-drift shape — absence is not unreadability, so nothing lands in `unreadableFields` and the
-observation is still `reported`. Those attempts raise `reported-without-figures` rather than being
-counted as covered. `ledgerVerified` is false when the advisory chain did not verify or could not
-be read, and then nothing is summed at all rather than answered as a zero. Every reason the sums
-are partial also appears as a named entry in `caveats`; an empty `caveats` array claims only that
-the rollup covers every attempt the ledger could speak for.
+nothing: the harness reported usage and **no** declared field path resolved — absence is not
+unreadability, so nothing lands in `unreadableFields` and the observation is still `reported`.
+Those attempts raise `reported-without-figures` rather than being counted as covered. That bucket
+is **total** drift only; a harness that renames one key is at least as likely, and it lands
+elsewhere, because the attempt still contributes.
+
+Drift in one key is what the per-component `attempts` counts are for, and the rollup now reads
+them: when any of the four components the total is a sum of — `inputTokens`, `cacheReadTokens`,
+`cacheWriteTokens`, `outputTokens` — was reported by fewer attempts than `attemptsReported`, that
+component's sum is over a subset of the reporting attempts and the rollup raises
+`partial-components`. On a real claude-code capture, one renamed `cache_read_input_tokens` takes
+97% of the run's tokens out of the total while every other figure still resolves, so this is the
+difference between a partial sum that says so and one that does not. `reasoningTokens` is
+deliberately not in that check: claude-code reports no reasoning figure and it enters no total, so
+checking it would fire on every claude run.
+
+`ledgerVerified` is false when the advisory chain did not verify or could not be read, and then
+nothing is summed at all rather than answered as a zero. Every reason the sums are partial also
+appears as a named entry in `caveats`; an empty `caveats` array claims only that the rollup covers
+every attempt the ledger could speak for.
 
 `cost` is the harness's own `costUsd`, summed over the attempts that reported one. Its `basis`
 field states what it is not: tally's cgroup `charge` is a distinct quantity, is not summed here,

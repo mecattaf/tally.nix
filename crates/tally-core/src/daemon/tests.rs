@@ -6239,6 +6239,7 @@ mod tests {
     async fn acceptance_384_run_and_standup_roll_per_attempt_usage_up_to_the_run() {
         const RUN_A: &str = "00000000-0000-4000-8000-0000000003a0";
         const RUN_B: &str = "00000000-0000-4000-8000-0000000003b0";
+        const RUN_C: &str = "00000000-0000-4000-8000-0000000003c0";
         let local = LocalSet::new();
         local
             .run_until(async {
@@ -6276,7 +6277,29 @@ mod tests {
                         .unwrap(),
                     },
                 );
-                config.adapters.insert("usage-agent".to_owned(), adapter);
+                config
+                    .adapters
+                    .insert("usage-agent".to_owned(), adapter.clone());
+                // The same harness, read through a mapping that has drifted in
+                // exactly one key: `cacheReadTokens` names a path this stream
+                // does not carry. Every other declared path still resolves, so
+                // the attempt reports usage and contributes -- and the
+                // 11,093,140 cache-read tokens leave the total in silence
+                // unless the rollup checks per-component coverage.
+                let mut drifted = adapter;
+                drifted.scrape.insert(
+                    "usage".to_owned(),
+                    ScrapeCapture {
+                        stream: ScrapeStream::Stdout,
+                        mode: ScrapeMode::JsonPath,
+                        pattern: "$..usage".to_owned(),
+                        fields: serde_json::from_str(
+                            r#"{"inputTokens":["input_tokens"],"cacheReadTokens":["cache_read_input_tokens_v2"],"cacheWriteTokens":["cache_creation_input_tokens"],"outputTokens":["output_tokens"]}"#,
+                        )
+                        .unwrap(),
+                    },
+                );
+                config.adapters.insert("drift-agent".to_owned(), drifted);
                 let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
                     .with_unit_probe(ExitFileProbe);
@@ -6410,6 +6433,81 @@ mod tests {
                     assert_eq!(run["usage"]["tokens"]["totalTokens"]["value"], 11_380_648);
                     assert_eq!(run["usage"]["coverage"]["attemptsReported"], 1);
                 }
+
+                // Same harness, one drifted key. The attempt reports usage and
+                // contributes, so it is not `reportedWithoutFigures` -- and a
+                // rollup that only checked that bucket would grade this run
+                // complete while reporting 2.5% of what it cost.
+                let drifted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["work"],
+                        "pool": "slot",
+                        "adapter": "drift-agent",
+                        "source": "manual",
+                        "evidence": ["exit:0"],
+                        "orchestration": {
+                            "flowName": "spec-build",
+                            "flowRunId": RUN_C,
+                            "nodeOrdinal": 1,
+                            "nodeLabel": "agent-t02"
+                        }
+                    })))
+                    .await
+                    .unwrap();
+                let drifted_task = drifted["task_uuid"].as_str().unwrap().to_owned();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(5), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": drifted_task})))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let attested = fs::read_to_string(paths.attestations_path())
+                            .unwrap_or_default()
+                            .lines()
+                            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                            .any(|record| {
+                                record["payload"]["taskUuid"] == drifted_task.as_str()
+                            });
+                        if attested {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                })
+                .await
+                .unwrap();
+
+                let view = daemon
+                    .handler
+                    .query("query.run", Some(json!({"id": RUN_C})))
+                    .await
+                    .unwrap();
+                let usage = &view["usage"];
+                assert_eq!(usage["coverage"]["attemptsReported"], 1);
+                assert_eq!(
+                    usage["coverage"]["attemptsReportedWithoutFigures"], 0,
+                    "one key drifted, not all of them"
+                );
+                assert_eq!(usage["tokens"]["inputTokens"]["attempts"], 1);
+                assert_eq!(usage["tokens"]["cacheReadTokens"]["attempts"], 0);
+                assert_eq!(
+                    usage["tokens"]["totalTokens"]["value"],
+                    83 + 265_127 + 22_298,
+                    "the drifted component silently left the total"
+                );
+                assert_eq!(
+                    usage["caveats"],
+                    json!(["partial-components"]),
+                    "and the run must say so rather than grading itself complete"
+                );
             })
             .await;
     }

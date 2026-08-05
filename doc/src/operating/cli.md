@@ -470,8 +470,10 @@ line appears only where a harness reported cost, and carries the daemon's own ba
 which states that tally's cgroup `charge` is a separate figure that is not summed there and is a
 floor. A final `partial:` line names every reason the sums are incomplete: member tasks the
 attestation ledger holds nothing about, attempts that reported no usage, attempts whose reported
-usage no declared mapping could read, a total mixing harness-stated and derived figures. No
-`partial:` line means the rollup covers every attempt the ledger could speak for. `query standup` carries the same rollup per run
+usage no declared mapping could read, a component some reporting attempt did not report
+(`partial-components` — this is what one renamed harness key looks like, and the `--` beside it on
+the line above is the component that left the total), a total mixing harness-stated and derived
+figures. No `partial:` line means the rollup covers every attempt the ledger could speak for. `query standup` carries the same rollup per run
 its window touched, under `runs`. See the [RPC protocol
 reference](../reference/rpc-protocol.md#usage-rollups) for the full field set. A run retired by `tally flow supersede` reads `superseded` whatever its own
 node verdicts say, and names its successor above the board — a reader who misses that would wait

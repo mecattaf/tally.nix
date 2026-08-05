@@ -42,11 +42,22 @@ authorized.
     whether the chain verified at all. A ledger that failed verification or
     could not be read sums nothing and says so rather than answering with a
     confident zero. `attemptsReportedWithoutFigures` counts the attempts that
-    reported usage no declared field path resolved out of — the ordinary
-    harness-drift shape, where absence is not unreadability and the record is
-    still `reported`. Counting those as covered would grade a run whose
-    adapter mapping resolved nothing as complete and costless; they raise
-    `reported-without-figures` instead.
+    reported usage **no** declared field path resolved out of, where absence
+    is not unreadability and the record is still `reported`. Counting those as
+    covered would grade a run whose adapter mapping resolved nothing as
+    complete and costless; they raise `reported-without-figures` instead.
+    That bucket is *total* drift only.
+  - **A single renamed harness key is caught too.** When any of the four
+    components the total is a sum of — `inputTokens`, `cacheReadTokens`,
+    `cacheWriteTokens`, `outputTokens` — was reported by fewer attempts than
+    reported usage, that component's sum is over a subset of the reporting
+    attempts and the rollup raises `partial-components`. Drift in one key
+    leaves every other figure resolving, so the attempt still contributes and
+    is not in `attemptsReportedWithoutFigures`; on a real claude-code capture
+    one renamed `cache_read_input_tokens` silently removes 97% of the run's
+    tokens from the total. `reasoningTokens` is deliberately excluded from
+    that check, because claude-code reports no reasoning figure and it enters
+    no total, so checking it would fire on every claude run.
   - **Authority is graded, and the grade is about the adapter, not the
     harness's reputation.** The whole rollup is `advisory-provider-capture` —
     harnesses reporting on themselves. `totalTokens.source` is

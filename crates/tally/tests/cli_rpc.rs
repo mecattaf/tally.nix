@@ -1498,9 +1498,35 @@ impl RpcHandler for UsageEdgeQueryHandler {
                 "cost": {"attempts": 0, "basis": "harness-reported costUsd only"},
                 "caveats": ["attempts-without-usage"]
             });
+            // One declared key drifted: the attempt reported usage and
+            // contributed, the component left the total, and the run is not
+            // complete. Real claude-code numbers minus the cache-read half.
+            let one_key_drifted = serde_json::json!({
+                "authority": "advisory-provider-capture",
+                "provenance": "attestations", "composition": "composition",
+                "coverage": {
+                    "tasks": 1, "tasksWithReportedUsage": 1, "tasksWithoutAttestation": 0,
+                    "attemptsObserved": 1, "attemptsReported": 1,
+                    "attemptsReportedWithoutFigures": 0, "attemptsNotReported": 0,
+                    "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                    "ledgerVerified": true
+                },
+                "tokens": {
+                    "inputTokens": {"value": 83, "attempts": 1},
+                    "cacheReadTokens": {"value": 0, "attempts": 0},
+                    "cacheWriteTokens": {"value": 265127, "attempts": 1},
+                    "outputTokens": {"value": 22298, "attempts": 1},
+                    "reasoningTokens": {"value": 0, "attempts": 0},
+                    "freshInputTokens": {"value": 265210, "attemptsComplete": 1, "attemptsPartial": 0},
+                    "totalTokens": {"value": 287508, "attempts": 1, "source": "derived-from-components"}
+                },
+                "cost": {"attempts": 0, "basis": "harness-reported costUsd only"},
+                "caveats": ["partial-components"]
+            });
             let usage = match id.chars().last().unwrap() {
                 '1' => unmapped,
                 '2' => measured_zero,
+                '4' => one_key_drifted,
                 _ => nothing,
             };
             Ok(serde_json::json!({
@@ -1529,7 +1555,7 @@ async fn query_run_never_renders_an_absent_figure_as_a_measured_zero() {
     local
         .run_until(async {
             let server = tokio::task::spawn_local(async move {
-                for _ in 0..3 {
+                for _ in 0..4 {
                     let (stream, _) = listener.accept().await.unwrap();
                     serve_connection(stream, UsageEdgeQueryHandler)
                         .await
@@ -1599,6 +1625,24 @@ async fn query_run_never_renders_an_absent_figure_as_a_measured_zero() {
             );
             assert!(!text.contains("fresh input"), "{text}");
             assert!(text.contains("partial: attempts-without-usage"), "{text}");
+
+            // A total that looks like a total, one `--` component, and the
+            // `partial:` line that stops the reader trusting the number: this
+            // is the shape a single renamed harness key ships.
+            let drifted = run_tally(
+                &socket,
+                &["query", "run", "00000000-0000-4000-8000-000000000384"],
+            )
+            .await;
+            assert!(drifted.status.success(), "{drifted:?}");
+            let text = String::from_utf8(drifted.stdout).unwrap();
+            for expected in [
+                "Usage: 287508 tokens, derived-from-components (1 of 1 scraped attempt(s) over 1 member task(s), advisory adapter captures)",
+                "fresh input 265210 (= input 83 + cache write 265127)  cache read --  output 22298 (reasoning -- nested inside)",
+                "partial: partial-components",
+            ] {
+                assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+            }
             server.await.unwrap();
         })
         .await;

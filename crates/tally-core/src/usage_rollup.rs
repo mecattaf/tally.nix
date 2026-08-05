@@ -127,7 +127,9 @@ impl<'a> AttestationEvidence<'a> {
 ///
 /// `attempts` below `UsageCoverage::attempts_reported` means the harnesses that
 /// ran this run do not all report this component, and the sum is over the
-/// subset that does.
+/// subset that does. For the four components a total is a sum of, that is not
+/// merely informative — it is the completeness threshold, and it raises
+/// [`UsageRollupCaveat::PartialComponents`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UsageSum {
@@ -275,15 +277,19 @@ pub struct UsageCoverage {
     /// nothing: the harness reported usage and no figure this rollup sums
     /// survived the adapter's declared mapping.
     ///
-    /// This is the ordinary harness-drift shape, and it is why the reported
-    /// count alone is not a coverage statement. A harness renames a key, every
-    /// declared path resolves to absent — which is not the same as unreadable,
-    /// so nothing lands in `unreadableFields` — and
-    /// [`crate::usage::observe`] still returns `Reported`, with
+    /// This is **total** drift — every declared path resolved to absent, which
+    /// is not the same as unreadable, so nothing lands in `unreadableFields`
+    /// and [`crate::usage::observe`] still returns `Reported`, with
     /// [`crate::usage::UsageShape::Unmapped`]. Counting that attempt as covered
     /// would let a run whose mapping resolved nothing read as complete and
-    /// costless. It is counted here and raises
+    /// costless, so it is counted here and raises
     /// [`UsageRollupCaveat::ReportedWithoutFigures`] instead.
+    ///
+    /// Drift in **one** key is at least as ordinary, and it does not land here:
+    /// that attempt did contribute, just not everything it was supposed to.
+    /// [`UsageRollupCaveat::PartialComponents`] owns that case, and it is the
+    /// one that catches a single renamed key silently deleting a component from
+    /// the run total.
     pub attempts_reported_without_figures: usize,
     /// Attempts whose attestation states `not-reported`: a usage scrape was
     /// declared, the stream was read, and it carried no usage.
@@ -315,6 +321,22 @@ pub enum UsageRollupCaveat {
     /// adapter's declared mapping resolved nothing out of what the harness
     /// emitted. The sums are missing that attempt entirely.
     ReportedWithoutFigures,
+    /// A component that feeds the total was reported by fewer attempts than
+    /// reported usage, so **that component's sum is over a subset of the
+    /// reporting attempts** — the meaning [`UsageSum::attempts`] already
+    /// carries, promoted from a number a reader had to notice into a stated
+    /// caveat.
+    ///
+    /// This is what a single renamed harness key looks like. Every other
+    /// declared path still resolves, so the attempt contributes and is not in
+    /// `attemptsReportedWithoutFigures`; the one component silently drops out
+    /// of the total and, on a real claude-code capture, takes 97% of the run's
+    /// tokens with it. Checked over exactly the four components the total is a
+    /// sum of — `inputTokens`, `cacheReadTokens`, `cacheWriteTokens`,
+    /// `outputTokens`. `reasoningTokens` is deliberately excluded: claude-code
+    /// reports no reasoning figure at all and it enters no total, so including
+    /// it would fire on every claude run and mean nothing.
+    PartialComponents,
     /// Some attestation carries no readable usage record.
     UnreadableUsageRecord,
     /// An attempt named a declared field its harness emitted in an unusable
@@ -570,6 +592,23 @@ pub fn roll_up<'a>(
     if coverage.attempts_not_reported > 0 || coverage.attempts_not_declared > 0 {
         caveats.insert(UsageRollupCaveat::AttemptsWithoutUsage);
     }
+    // The completeness threshold. Every component the total is a sum of has to
+    // have been reported by every attempt that reported usage; a component
+    // reported by fewer is a sum over a subset, which is exactly what
+    // `UsageSum::attempts` has always meant and what nothing used to read.
+    // Reasoning is not in this list on purpose — it enters no total, and
+    // claude-code reports none, so checking it would fire on every claude run.
+    if [
+        tokens.input_tokens,
+        tokens.cache_read_tokens,
+        tokens.cache_write_tokens,
+        tokens.output_tokens,
+    ]
+    .iter()
+    .any(|component| component.attempts < coverage.attempts_reported)
+    {
+        caveats.insert(UsageRollupCaveat::PartialComponents);
+    }
     if saw_harness_total && saw_derived_total {
         caveats.insert(UsageRollupCaveat::MixedTotalAuthority);
     }
@@ -593,10 +632,65 @@ pub fn roll_up<'a>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use serde_json::json;
 
     use super::*;
-    use crate::usage::{UsageBreakdown, UsageCost, UsageShape, UsageTotalTokens};
+    use crate::adapters::{AdapterConfig, AdapterEngine, ScrapeCapture, ScrapeMode, ScrapeStream};
+    use crate::usage::{observe, UsageBreakdown, UsageCost, UsageShape, UsageTotalTokens};
+
+    /// The verbatim real claude-code capture `usage::tests` pins the shipped
+    /// preset's field map against. Used here so the completeness threshold is
+    /// exercised through the real `observe`, over the real declared mapping,
+    /// rather than over a breakdown this module hand-authored to suit itself.
+    const CLAUDE_STREAM: &str = include_str!("../../../test/fixtures/usage/claude-code.jsonl");
+
+    /// The `claude-code` preset's own field maps, byte-identical to the mirror
+    /// in `usage::tests` that the evaluated-configuration check in `flake.nix`
+    /// pins against `nix/lib/adapters.nix`.
+    const CLAUDE_USAGE_FIELDS: &str = r#"{"cacheReadTokens":["cache_read_input_tokens"],"cacheWriteTokens":["cache_creation_input_tokens"],"inputTokens":["input_tokens"],"outputTokens":["output_tokens"]}"#;
+    const CLAUDE_COST_FIELDS: &str = r#"{"costUsd":["$"]}"#;
+
+    fn scrape_capture(mode: ScrapeMode, pattern: &str, fields: &str) -> ScrapeCapture {
+        ScrapeCapture {
+            stream: ScrapeStream::Stdout,
+            mode,
+            pattern: pattern.to_owned(),
+            fields: serde_json::from_str(fields).expect("declared fields parse"),
+        }
+    }
+
+    fn claude_preset() -> AdapterConfig {
+        AdapterConfig {
+            argv: vec!["claude".to_owned()],
+            scrape: BTreeMap::from([
+                (
+                    "usage".to_owned(),
+                    scrape_capture(ScrapeMode::JsonPath, "$..usage", CLAUDE_USAGE_FIELDS),
+                ),
+                (
+                    "usageCost".to_owned(),
+                    scrape_capture(
+                        ScrapeMode::JsonPathLast,
+                        "$[?@.type == 'result'].total_cost_usd",
+                        CLAUDE_COST_FIELDS,
+                    ),
+                ),
+            ]),
+            ..Default::default()
+        }
+    }
+
+    /// Scrape and normalize one real stream through the real code path.
+    fn observed(stream: &str) -> Value {
+        let adapter = claude_preset();
+        let adapters = BTreeMap::from([("claude-code".to_owned(), adapter.clone())]);
+        let captures = AdapterEngine::new(&adapters)
+            .scrape_text("claude-code", stream, "")
+            .expect("fixture stream scrapes");
+        serde_json::to_value(observe(&adapter, &captures)).expect("observation serializes")
+    }
 
     fn attestation(seq: u64, task: &str, attempt: u64, usage: Value) -> AttestationRecord {
         AttestationRecord {
@@ -849,6 +943,90 @@ mod tests {
         assert_eq!(partial.coverage.tasks_with_reported_usage, 1);
         assert_eq!(partial.tokens.reasoning_tokens.value, 7);
         assert_eq!(partial.tokens.total_tokens, None);
+    }
+
+    /// A harness renaming **one** key must not read as a complete run.
+    ///
+    /// Driven end to end through the real declared mapping and the real
+    /// `observe`, against the verbatim claude-code capture, because the whole
+    /// defect is invisible to a hand-authored breakdown: every other declared
+    /// path still resolves, so the attempt contributes, stays out of
+    /// `attemptsReportedWithoutFigures`, and the component simply disappears
+    /// from the total.
+    #[test]
+    fn one_renamed_harness_key_deletes_a_component_and_is_not_a_complete_run() {
+        let honest = roll_up(
+            ["task"],
+            &AttestationEvidence::new(true, &[attestation(1, "task", 1, observed(CLAUDE_STREAM))]),
+        );
+        // The real capture, unmodified: every component the total sums was
+        // reported by the one attempt that reported usage, so nothing fires.
+        assert!(honest.is_complete(), "unexpected: {:?}", honest.caveats);
+        assert_eq!(honest.tokens.total_tokens.unwrap().value, 11_380_648);
+        assert_eq!(honest.tokens.cache_read_tokens.attempts, 1);
+        assert_eq!(
+            honest.tokens.reasoning_tokens.attempts, 0,
+            "claude reports no reasoning figure, and that alone must never caveat a run"
+        );
+
+        // Now the harness renames exactly one key. The declared path stops
+        // resolving; absence is not unreadability, so `unreadableFields` stays
+        // empty and the observation is still `reported` with components.
+        let drifted =
+            CLAUDE_STREAM.replace("cache_read_input_tokens", "cache_read_input_tokens_v2");
+        let rollup = roll_up(
+            ["task"],
+            &AttestationEvidence::new(true, &[attestation(1, "task", 1, observed(&drifted))]),
+        );
+        assert_eq!(rollup.coverage.attempts_reported, 1);
+        assert_eq!(
+            rollup.coverage.attempts_reported_without_figures, 0,
+            "the other declared keys still resolved, so this is not total drift"
+        );
+        assert_eq!(rollup.tokens.input_tokens.attempts, 1);
+        assert_eq!(rollup.tokens.cache_read_tokens.attempts, 0);
+        // 11,093,140 cache-read tokens left the total: it reports 287,508
+        // where the truth for the same attempt is 11,380,648.
+        assert_eq!(
+            rollup.tokens.total_tokens.unwrap().value,
+            83 + 265_127 + 22_298
+        );
+        assert!(
+            rollup
+                .caveats
+                .contains(&UsageRollupCaveat::PartialComponents),
+            "a component missing from every attempt must be stated: {:?}",
+            rollup.caveats
+        );
+        assert!(!rollup.is_complete());
+    }
+
+    /// The `contributed` predicate counts cost, so an attempt whose token
+    /// mapping drifted entirely but whose cost capture still resolves is not
+    /// `reportedWithoutFigures` — and used to grade complete with no token
+    /// figure at all.
+    #[test]
+    fn a_cost_only_attempt_is_not_a_complete_token_rollup() {
+        // Every declared token path drifts; `total_cost_usd` carries no
+        // `_tokens` and still resolves, so `observe` returns a `lump` of cost.
+        let drifted = CLAUDE_STREAM.replace("_tokens", "_tokens_v2");
+        let observation = observed(&drifted);
+        assert_eq!(observation["state"], "reported");
+        assert_eq!(observation["breakdown"]["shape"], "lump");
+        assert!(observation["breakdown"]["cost"].is_object());
+
+        let rollup = roll_up(
+            ["task"],
+            &AttestationEvidence::new(true, &[attestation(1, "task", 1, observation)]),
+        );
+        assert_eq!(rollup.coverage.attempts_reported, 1);
+        assert_eq!(rollup.coverage.attempts_reported_without_figures, 0);
+        assert_eq!(rollup.tokens, UsageTokenRollup::default());
+        assert_eq!(rollup.cost.attempts, 1);
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::PartialComponents));
+        assert!(!rollup.is_complete());
     }
 
     #[test]
