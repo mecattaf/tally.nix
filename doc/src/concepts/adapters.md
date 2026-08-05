@@ -110,19 +110,36 @@ preserve event order and malformed/unknown payloads as advisory observations;
 a configured running local or remote trace is not silently reported as an
 empty successful trace.
 
-## Context occupancy is read from the same usage
+## Context occupancy is a narrower read than usage
 
-Context is occupancy, not spend: `contextTokens` is the last valid assistant
-turn's usage total, read under its occupancy meaning rather than its spend
-meaning. It needs no adapter declaration of its own — whenever an attempt's
-usage is `reported`, its total is occupancy as of that turn.
+Context is occupancy, not spend, and it is **not** the same value `usage`
+normalizes under `totalTokens`. `usage`'s capture keeps the last `usage`
+object anywhere in the stream, which for claude-code is the `result` event's
+session-lifetime roll-up and for codex is the final `turn.completed`'s
+cumulative total — both grow without bound across a session and would render
+as many multiples of a fixed context window if read as occupancy.
+
+`contextTokens` instead reads the tokens resident in the context window as of
+the attempt's **last valid assistant turn**: input plus both cache halves,
+excluding that turn's own output (which has not yet been folded back into
+history at the moment this is measured). The `claude-code` preset declares a
+dedicated `occupancy` capture, scoped to only `type == "assistant"` events
+(`$[?@.type == 'assistant'].message.usage`) rather than `usage`'s
+stream-wide `$..usage`, under logical field names of its own
+(`residentInputTokens`, `residentCacheReadTokens`, `residentCacheWriteTokens`)
+so a lookup for one concern can never resolve against the other's declared
+capture. `codex exec --json` states no comparable per-turn figure — it emits
+exactly one `turn.completed` per exec, carrying only the cumulative shape —
+so the `codex` preset declares no `occupancy` capture, and `contextTokens`
+reads `None` for codex rather than restating the cumulative total under
+occupancy's name.
 
 `contextWindow` is the ceiling that total is measured against, and it has two
 independent, distinguishable provenances. A harness that states its own
 window inside the captured stream declares it the same way a usage field is —
 a capture's `fields` map, resolved through the exact mapping usage reads,
 never a parallel mechanism. The `claude-code` preset declares a `contextWindow`
-capture beside `usage` and `usageCost`, resolved at
+capture beside `usage`, `usageCost`, and `occupancy`, resolved at
 `modelUsage.<model>.contextWindow`, a field real captures carry. An operator
 may alternatively declare a ceiling in the adapter's `extraConfig.contextWindow`;
 a stream-stated window wins when both are present, because it is what the
@@ -137,8 +154,11 @@ a `null` draws no bar rather than reading as zero. `contextTokens` and
 events, `tally query trace` lanes, and `tally query job` /
 `tally query jobs --session`, the last two rendering `contextWindow` as a
 `SourcedValue` with `advisory-provider-capture` authority for a scraped window
-and `durable-admission-fact` authority for a configured one. Recording only —
-no admission or scheduling decision reads these fields.
+and `advisory-config` authority for a configured one — never
+`durable-admission-fact`, because a config ceiling is read from live adapter
+configuration and does not survive a daemon restart the way a durable row
+field does. Recording only — no admission or scheduling decision reads these
+fields.
 
 ## Configuration and proof
 

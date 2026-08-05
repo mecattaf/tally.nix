@@ -32,6 +32,14 @@ pub enum FactAuthority {
     CanonicalWitnessFact,
     AdvisoryAttestation,
     AdvisoryProviderCapture,
+    /// A value read from the daemon's live adapter configuration rather than
+    /// from a durable row, a witness, or a provider's own captured stream.
+    /// Unlike `DurableAdmissionFact` it does not survive a restart (nothing
+    /// persists it — see `RowSeed.context_window`'s transport-only
+    /// comment), and unlike `AdvisoryProviderCapture` it was never stated by
+    /// the harness that ran the attempt. It is the operator's own assertion,
+    /// advisory like the rest of this family.
+    AdvisoryConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2083,10 +2091,14 @@ fn build_summary(
     }
 }
 
-/// A scraped ceiling is what the harness said about itself; a configured
-/// ceiling is what the operator asserted in adapter configuration before the
-/// attempt ever ran — the same authority `requested_model` carries for its
-/// `adapter-options` provenance.
+/// A scraped ceiling is what the harness said about itself. A configured
+/// ceiling is the operator's own assertion, read from the daemon's live
+/// adapter configuration -- not `DurableAdmissionFact`: unlike
+/// `requested_model` (a durable `RowSeed` field, written at admission and
+/// read back from disk), `RowSeed.context_window` is transport-only and
+/// vanishes on a daemon restart, so labelling it durable and admission-time
+/// would over-claim exactly what a consumer ranking by authority would
+/// trust more, which is backwards for an unpersisted number.
 fn context_window_sourced_value(window: ContextWindow) -> SourcedValue<u64> {
     match window.source {
         ContextWindowSource::ProviderCapture => SourcedValue::new(
@@ -2096,7 +2108,7 @@ fn context_window_sourced_value(window: ContextWindow) -> SourcedValue<u64> {
         ),
         ContextWindowSource::AdapterConfig => SourcedValue::new(
             window.tokens,
-            FactAuthority::DurableAdmissionFact,
+            FactAuthority::AdvisoryConfig,
             "adapter-config",
         ),
     }

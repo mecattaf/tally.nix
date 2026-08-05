@@ -6443,23 +6443,26 @@ mod tests {
                     "the breakdown renders as an advisory provider capture, never collapsed \
                      into a canonical authority"
                 );
-                // Occupancy rides beside `usage`: the same total, advisory
-                // like the usage it is read from, and a context window whose
-                // provenance is distinguishable from a provider capture
-                // because nothing in this stream scraped one.
+                // Occupancy rides beside `usage`, but is read through its own
+                // narrower capture, never derived from `usage`'s
+                // session-lifetime total: this synthetic adapter declares no
+                // `occupancy` capture (it is not claude-code-shaped), so
+                // `contextTokens` is absent rather than reusing the same
+                // 999999 `usage` reports -- proof the two are no longer the
+                // same number under two names. `contextWindow` is
+                // config-declared here and renders with the advisory,
+                // non-durable authority true of a live-config value that
+                // vanishes on restart.
                 assert_eq!(
-                    before["job"]["contextTokens"],
-                    json!({
-                        "value": 999999,
-                        "authority": "advisory-provider-capture",
-                        "provenance": "adapter-scrape",
-                    })
+                    before["job"].get("contextTokens"),
+                    None,
+                    "no occupancy capture is declared for this adapter"
                 );
                 assert_eq!(
                     before["job"]["contextWindow"],
                     json!({
                         "value": 200000,
-                        "authority": "durable-admission-fact",
+                        "authority": "advisory-config",
                         "provenance": "adapter-config",
                     })
                 );
@@ -6505,8 +6508,9 @@ mod tests {
                     999999
                 );
                 // `query.trace` exposes both fields too, flattened beside
-                // `sessionRef` on the same lane.
-                assert_eq!(trace["items"][0]["contextTokens"], 999999);
+                // `sessionRef` on the same lane -- `contextTokens` absent for
+                // the same reason it is on `query.job`.
+                assert_eq!(trace["items"][0].get("contextTokens"), None);
                 assert_eq!(trace["items"][0]["contextWindow"], 200000);
                 let after = daemon
                     .handler

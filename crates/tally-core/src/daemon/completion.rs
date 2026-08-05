@@ -278,7 +278,40 @@ impl DaemonHandler {
         scrape_capture: bool,
     ) {
         if !scrape_capture {
-            self.emit_post_ack(completed_event(&job, &result, evidence));
+            // No capture is available for this attempt -- usage and the
+            // scraped half of context_window genuinely have nothing to read.
+            // A config-declared ceiling depends on none of that, so it is
+            // still checked here rather than silently narrowing the promise
+            // `crate::occupancy`'s doc makes ("the config ceiling still
+            // needs checking, because it depends on nothing scraped").
+            let handler = self.clone();
+            let task = tokio::task::spawn_local(async move {
+                let mut job = job;
+                job.row.context_window = {
+                    let context = handler.context.read().await;
+                    context
+                        .config
+                        .adapters
+                        .get(&job.row.adapter)
+                        .and_then(|adapter| occupancy::context_window(adapter, None))
+                };
+                if job.row.context_window.is_some() {
+                    let mut context = handler.context.write().await;
+                    if let Some(stored) = context.jobs.get_mut(&job.job_id) {
+                        stored.row.context_window = job.row.context_window;
+                    }
+                    if let Some(detail) = job
+                        .task_uuid
+                        .and_then(|task_uuid| context.query_details.get_mut(&task_uuid))
+                    {
+                        detail.context_window = job.row.context_window;
+                    }
+                }
+                handler.emit_post_ack(completed_event(&job, &result, evidence));
+            });
+            let mut tasks = self.post_ack_tasks.borrow_mut();
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(task);
             return;
         }
         let handler = self.clone();
@@ -344,10 +377,13 @@ impl DaemonHandler {
                     .map_or(UsageObservation::NotDeclared, |config| {
                         crate::usage::observe(config, &captures)
                     });
-                // Occupancy is computed from the same normalized usage and
-                // the same captures, never a second scrape: see
-                // `crate::occupancy`.
-                let context_tokens = occupancy::context_tokens(&usage);
+                // Occupancy reads the same captures usage was normalized
+                // from, but through its own narrower resolution -- it is not
+                // derived from `usage`, which keeps a session-lifetime
+                // roll-up under a spend meaning. See `crate::occupancy`.
+                let context_tokens = adapters
+                    .get(&adapter)
+                    .and_then(|config| occupancy::context_tokens(config, &captures));
                 let context_window = adapters
                     .get(&adapter)
                     .and_then(|config| occupancy::context_window(config, Some(&captures)));
