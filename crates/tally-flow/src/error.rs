@@ -202,7 +202,9 @@ pub fn is_supersession_code(code: &str) -> bool {
 /// and are never a caller's choice.
 #[derive(Debug, Clone, Default)]
 pub struct SupersessionDetails<'a> {
-    /// The run whose recorded identity is in question. Always known.
+    /// The run whose recorded identity is in question. Every raising site in
+    /// this tree knows it; empty renders as `null` rather than as an empty
+    /// string, and suppresses the `remedy` derived from it.
     pub flow_run_id: &'a str,
     /// The hash the ledger recorded for the divergent input.
     pub recorded_hash: Option<&'a str>,
@@ -271,21 +273,30 @@ pub fn supersession_error(
 /// fourteen fields are a guaranteed floor, never a filter that silently drops a
 /// diagnostic.
 fn complete_supersession_details(code: &str, details: &mut Map<String, Value>) {
+    // A producer that named no run — a foreign client, or a `details` payload
+    // that was not an object — leaves this absent, and an empty string is the
+    // same fact written differently. Both render as `null`: an error must not
+    // say it does not know which run this is and hand over a command to fix
+    // that run in the same breath.
     let flow_run_id = details
         .get("flowRunId")
         .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
+        .filter(|flow_run_id| !flow_run_id.is_empty())
+        .map(ToOwned::to_owned);
     let mut ordered = Map::new();
     for field in SUPERSESSION_DETAIL_FIELDS {
         let value = match field {
+            "flowRunId" => flow_run_id.clone().map_or(Value::Null, Value::String),
             "divergentInput" => family_divergent_input(code)
                 .map_or(Value::Null, |input| Value::String(input.to_owned())),
-            // A remedy is a command an operator can type. Only the three pins
-            // have one; `flow-run-superseded` names its successor instead, and
+            // A remedy is a command an operator can type, so it exists only when
+            // every argument of that command does. Only the three pins have one;
+            // `flow-run-superseded` names its successor instead, and
             // `replay-divergence` resolves by investigation.
-            "remedy" => divergent_input(code)
-                .map_or(Value::Null, |_| supersede_remedy(code, &flow_run_id).into()),
+            "remedy" => match (divergent_input(code), flow_run_id.as_deref()) {
+                (Some(_), Some(flow_run_id)) => supersede_remedy(code, flow_run_id).into(),
+                _ => Value::Null,
+            },
             "transient" => {
                 recovery_fact(code).map_or(Value::Null, |(transient, _)| transient.into())
             }

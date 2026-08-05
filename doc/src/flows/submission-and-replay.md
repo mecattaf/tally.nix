@@ -257,7 +257,7 @@ every raising site, with `null` where the code has nothing to say:
 
 | Field | Meaning |
 |---|---|
-| `flowRunId` | The run whose recorded identity is in question. |
+| `flowRunId` | The run whose recorded identity is in question. `null` only when the refusal reached the runner from a producer that named no run. |
 | `divergentInput` | `script`, `args`, `catalog`, or `payload`. `null` for `flow-run-superseded`, where nothing diverged. |
 | `recordedHash` | The hash the ledger recorded for that input. |
 | `currentHash` | The hash this runner computed for the same input, now. |
@@ -268,7 +268,7 @@ every raising site, with `null` where the code has nothing to say:
 | `reason` | The recorded rollover reason, from `flow.supersede`'s closed set. |
 | `recordedAt` | When the rollover was recorded. |
 | `kernelError` | The daemon's own message, when the refusal was found through a kernel dedup-key conflict rather than by the runner's own comparison. |
-| `remedy` | The `tally flow supersede` invocation that clears it, or `null` when no single command does. |
+| `remedy` | The `tally flow supersede` invocation that clears it, or `null` when no single command does — including when no `flowRunId` is known, since the command needs one. |
 | `transient` | Always `false` for this family. |
 | `resolution` | `supersede`, `run-successor`, or `investigate`. |
 

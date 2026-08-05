@@ -797,6 +797,19 @@ fn a_concurrent_identity_change_stops_the_admission_frontier() {
             crate::error::SUPERSESSION_DETAIL_FIELDS,
             "{code}"
         );
+        // Completion must not invent what the producer did not say. With no
+        // run named, there is no command that clears this, so `remedy` is null
+        // — a `tally flow supersede --flow-run-id <empty>` would not parse, and
+        // advertising it would be a claim computed from absent evidence.
+        assert!(error.details["flowRunId"].is_null(), "{code}");
+        assert!(error.details["remedy"].is_null(), "{code}");
+        for (key, value) in &error.details {
+            let Some(text) = value.as_str() else { continue };
+            assert!(
+                !text.contains("--flow-run-id"),
+                "{code}: {key} names a run this error does not know: {text}"
+            );
+        }
         assert_eq!(client.submissions.borrow().len(), 1);
     }
 }

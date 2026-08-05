@@ -291,12 +291,7 @@ pub fn run_script(
     Ok(report)
 }
 
-/// Structured facts a supervisor branches on without reading prose.
-///
-/// A run-identity refusal and a lost daemon connection both stop a runner, but
-/// only one of them can ever be resolved by retrying. These fields say which is
-/// which, and what the machine-actionable next step is, so an unattended queue
-/// does not spend a night re-observing a permanent answer.
+/// Refuse a start whose recorded identity hash and current one disagree.
 fn validate_startup_hash(
     code: &str,
     flow_run_id: &str,

@@ -235,6 +235,13 @@ fn flow_failure_taxonomy_has_distinguished_exit_codes() {
     assert_eq!(exit_code("args-changed-mid-run"), 20);
     assert_eq!(exit_code("catalog-changed-mid-run"), 20);
     assert_eq!(exit_code("flow-run-superseded"), 20);
+    // `SUPERSESSION_CODES` says of itself that `flow_error` maps exactly this
+    // list to exit 20, and the exit map is a hand-written arm in another crate.
+    // A sixth family member would otherwise inherit the fourteen-member details
+    // contract and the doc's exit-20 promise while silently exiting 1.
+    for code in tally_flow::SUPERSESSION_CODES {
+        assert_eq!(exit_code(code), 20, "{code}");
+    }
     assert_eq!(exit_code("flow-run-id-missing"), 2);
     assert_eq!(exit_code("runner-identity-incomplete"), 2);
     assert_eq!(exit_code("workload-mutex-parent-required"), 2);

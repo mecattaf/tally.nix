@@ -222,7 +222,11 @@ authorized.
   One shared constructor in `tally-flow` builds the map for every site, and
   `ClientError::into_flow` completes it for any refusal that reaches the runner
   from somewhere else, so a bare code with no details still lands on the
-  documented shape rather than a thinner one. The five codes keep their names,
+  documented shape rather than a thinner one. Completion fills, it never
+  invents: a refusal that named no run reports `flowRunId: null` — an empty
+  string is the same fact written differently and renders the same way — and
+  `remedy` is `null` with it, because `tally flow supersede --flow-run-id`
+  with nothing to put after it is not a command an operator can run. The five codes keep their names,
   their semantics, their exit code, and the message text `tally flow run`
   renders; `ordinal` remains a top-level field, present exactly when a node is
   implicated. `flow-run-superseded` has no mid-run site and `replay-divergence`
