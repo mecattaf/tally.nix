@@ -728,6 +728,119 @@ fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
     Ok(())
 }
 
+/// One rolled-up component, rendered so that "nobody measured this" and "a
+/// harness measured zero" cannot print the same characters.
+///
+/// The per-component `attempts` count is the only thing on the wire that
+/// separates the two, so a component no attempt reported renders `--`. Printing
+/// its `value` — which is `0` because nothing was added to it — would
+/// reintroduce at the render layer exactly the absence/zero conflation
+/// `crate::usage`'s typed absence exists to prevent.
+fn component(tokens: &serde_json::Map<String, Value>, key: &str) -> String {
+    let Some(component) = tokens.get(key) else {
+        return "--".to_owned();
+    };
+    if component["attempts"].as_u64() == Some(0) {
+        return "--".to_owned();
+    }
+    component["value"]
+        .as_u64()
+        .map_or_else(|| "--".to_owned(), |value| value.to_string())
+}
+
+/// The run header's answer to "what did this run cost".
+///
+/// Every number here is printed with the coverage it is over, because the
+/// terminal reader is exactly the one who will not go looking in `--json` for
+/// the coverage object — and an unqualified sum over partial, advisory captures
+/// reads as a bill. A daemon that predates the rollup sends no `usage` object
+/// at all; that prints nothing, because absence of the field is not a claim
+/// about the run.
+fn print_run_usage(usage: &Value) -> Result<()> {
+    let (Some(coverage), Some(tokens)) =
+        (usage["coverage"].as_object(), usage["tokens"].as_object())
+    else {
+        return Ok(());
+    };
+    let count = |key: &str| coverage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let tasks = count("tasks");
+    let observed = count("attemptsObserved");
+    let reported = count("attemptsReported");
+    if coverage.get("ledgerVerified").and_then(Value::as_bool) != Some(true) {
+        outln!("Usage: not summed -- the advisory attestation ledger did not verify");
+        return Ok(());
+    }
+    // Whether any attempt reported usage is `coverage.attemptsReported`'s
+    // answer and nothing else's. Reading it off `totalTokens` told an operator
+    // "no attempt reported usage" for an attempt that reported usage no
+    // declared mapping could read a total out of — and then printed a line of
+    // zeros underneath contradicting it.
+    if reported == 0 {
+        outln!(
+            "Usage: no attempt reported usage ({observed} scraped attempt(s) over {tasks} member task(s), advisory adapter captures)"
+        );
+    } else {
+        match tokens.get("totalTokens").and_then(Value::as_object) {
+            None => outln!(
+                "Usage: no total ({reported} of {observed} scraped attempt(s) reported usage over {tasks} member task(s), advisory adapter captures)"
+            ),
+            Some(total) => outln!(
+                "Usage: {} tokens, {} ({reported} of {observed} scraped attempt(s) over {tasks} member task(s), advisory adapter captures)",
+                total.get("value").and_then(Value::as_u64).unwrap_or(0),
+                compact_text(
+                    total
+                        .get("source")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown-source")
+                )
+            ),
+        }
+        let fresh = tokens.get("freshInputTokens").map_or_else(
+            || "--".to_owned(),
+            |fresh| {
+                let reported_halves = fresh["attemptsComplete"].as_u64().unwrap_or(0)
+                    + fresh["attemptsPartial"].as_u64().unwrap_or(0);
+                match fresh["value"].as_u64() {
+                    Some(value) if reported_halves > 0 => value.to_string(),
+                    _ => "--".to_owned(),
+                }
+            },
+        );
+        outln!(
+            "  fresh input {fresh} (= input {} + cache write {})  cache read {}  output {} (reasoning {} nested inside)",
+            component(tokens, "inputTokens"),
+            component(tokens, "cacheWriteTokens"),
+            component(tokens, "cacheReadTokens"),
+            component(tokens, "outputTokens"),
+            component(tokens, "reasoningTokens")
+        );
+    }
+    let cost = &usage["cost"];
+    if let Some(amount) = cost["amountUsd"].as_f64() {
+        // The basis sentence is the daemon's, not the CLI's: it carries the
+        // W-382-RECORDER charge-floor statement, and a daemon that revises it
+        // must not be misquoted by its own client.
+        outln!(
+            "  cost ${amount:.4} over {} attempt(s) -- {}",
+            cost["attempts"].as_u64().unwrap_or(0),
+            compact_text(cost["basis"].as_str().unwrap_or("basis not stated"))
+        );
+    }
+    let caveats = usage["caveats"].as_array().map_or(&[][..], Vec::as_slice);
+    if !caveats.is_empty() {
+        outln!(
+            "  partial: {}",
+            caveats
+                .iter()
+                .filter_map(Value::as_str)
+                .map(compact_text)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
     let flow_run_id = run["flowRunId"]
         .as_str()
@@ -785,6 +898,7 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
         counts["blocked"].as_u64().unwrap_or(0),
         counts["pending"].as_u64().unwrap_or(0)
     );
+    print_run_usage(&run["usage"])?;
 
     // Above the board, never inside it: a sub-issue closed with no merged
     // proof is a contradiction between what the forge shows a reader and what

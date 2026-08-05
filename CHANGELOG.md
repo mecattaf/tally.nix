@@ -8,6 +8,101 @@ authorized.
 
 ### Added
 
+- **`query run` and `query standup` answer "what did this run cost" (#384).**
+  `query.run` gains a `usage` object and `query.standup` gains a `runs` array
+  carrying the same object per flow run the window touched. Both are summed
+  **per attempt from the advisory attestation ledger**, keyed by
+  `taskUuid`/`attempt`/`leaseEpoch`, over the run's **durable membership**
+  (#391) — so a retried task is charged for every attempt the ledger holds,
+  not only for the latest attempt its durable row keeps, and a node a run was
+  handed but whose row names its creating run is inside the sum rather than
+  silently missing from it. The ledger is the whole of what the rollup can
+  see: it covers every attempt the ledger could speak for, and says so in
+  those terms rather than claiming every attempt that ever ran.
+
+  Three properties are load-bearing, because the failure this surface exists
+  to prevent is a figure computed from the wrong evidence, wrong in the
+  reassuring direction, and shaped exactly like a correct one:
+
+  - **`inputTokens` alone is not the fresh-input figure**, so the rollup
+    publishes `freshInputTokens = inputTokens + cacheWriteTokens` and states
+    that addition on the wire in `composition`. claude-code's
+    `cache_creation_input_tokens` are fresh, uncached prompt tokens its
+    `input_tokens` excludes; a sum over `inputTokens` alone understates any
+    cache-writing harness by its whole cache-write volume while printing a
+    number that looks directly comparable to codex's. `reasoningTokens` is
+    rolled up for visibility and never added to any total, because codex
+    nests it inside `output_tokens`. Each harness's own
+    `inputTokensAsReported` is deliberately not summed: the two conventions
+    are not commensurable.
+  - **Coverage is stated, never implied.** `coverage` counts member tasks,
+    observed attempts, and attempts that reported usage apart from each typed
+    absence (`not-reported`, `not-declared`, and an attestation predating the
+    usage record), plus the member tasks the ledger holds nothing about and
+    whether the chain verified at all. A ledger that failed verification or
+    could not be read sums nothing and says so rather than answering with a
+    confident zero. `attemptsReportedWithoutFigures` counts the attempts that
+    reported usage **no** declared field path resolved out of, where absence
+    is not unreadability and the record is still `reported`. Counting those as
+    covered would grade a run whose adapter mapping resolved nothing as
+    complete and costless; they raise `reported-without-figures` instead.
+    That bucket is *total* drift only.
+  - **A single renamed harness key is caught too.** When any of the four
+    components the total is a sum of — `inputTokens`, `cacheReadTokens`,
+    `cacheWriteTokens`, `outputTokens` — was reported by fewer attempts than
+    `attemptsReportedWithComponents`, that component's sum is over a subset of
+    those attempts and the rollup raises `partial-components`. Drift in one
+    key leaves every other figure resolving, so the attempt still contributes
+    and is not in `attemptsReportedWithoutFigures`; on a real claude-code
+    capture one renamed `cache_read_input_tokens` silently removes 97% of the
+    run's tokens from the total. Two exclusions are deliberate:
+    `reasoningTokens` is not checked, because claude-code reports no reasoning
+    figure and it enters no total, so checking it would fire on every claude
+    run; and the denominator excludes attempts whose harness stated a total of
+    its own and reported no component beside it — what an adapter declaring
+    only a `totalTokens` mapping produces — because such an attempt declared
+    no components to be missing.
+  - **An attempt that reported only a total, beside attempts that reported
+    components, raises `total-only-attempts`.** The exemption above is one
+    *reported* shape wide, which is not the same promise as "an adapter that
+    declared components is always judged": the rollup reads attestations, never
+    the declared field map, so an adapter declaring components *and* a total,
+    whose harness renames every component key at once, reports the exempted
+    shape. Whenever such an attempt sits beside attempts that did report
+    components, the component sums demonstrably cover fewer attempts than the
+    total does, and the run says so — whichever kind of adapter produced them.
+    Distinct from `partial-components` on purpose: that one means a component
+    is missing *within* the attempts being judged, this one means an attempt is
+    missing from the judgement altogether. The one case reported evidence
+    cannot separate is a run where *every* attempt is total-only, which needs
+    the declared field set the attestation does not carry.
+  - **Authority is graded, and the grade is about the adapter, not the
+    harness's reputation.** The whole rollup is `advisory-provider-capture` —
+    harnesses reporting on themselves. `totalTokens.source` is
+    `harness-reported` only when the adapter declared a `totalTokens` mapping
+    and the harness filled it. **No shipped preset declares one**: codex's
+    real `turn.completed` carries no `total_tokens`, and claude-code's
+    `result` event carries a cumulative usage object of components without a
+    total among them. So both presets read `derived-from-components` today,
+    including a run spanning both, and `harness-reported` / `mixed` are
+    reachable through an operator-defined adapter that declares the mapping.
+    Every reason the sums are partial is a named `caveats` entry.
+
+  `cost` is the harness's own `costUsd`, summed only where reported, and it
+  carries a `basis` statement onto the wire: tally's cgroup `charge` is a
+  distinct quantity, is not summed here, and is a **floor** that includes
+  tally's own exit-recorder overhead (waiver `W-382-RECORDER`, #382). The
+  human `tally query run` view prints the block with its coverage attached,
+  because a terminal reader is exactly the one who will not go looking for
+  the coverage object in `--json` — including the daemon's own `basis`
+  sentence rather than a copy of it, and `--` for any component no attempt
+  reported, so an absence and a measured zero never print the same
+  characters. A daemon that predates the field sends no
+  `usage` object and the human view prints nothing for it, since an absent
+  field is not a claim about the run. Cross-run and fleet aggregation,
+  budgeting, and enforcement remain out of scope.
+
+
 - **The `pi` preset declares its trace framing, and an occupancy capture, from
   a real `pi --mode json` capture (#387).** `pi` carried launch and resume
   argv and every scrape capture but no `trace = { stream; framing; }` block,

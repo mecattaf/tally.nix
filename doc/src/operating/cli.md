@@ -455,7 +455,33 @@ the remaining `runtimeMaxSec` budget, negative when a node has run past that bud
 section prints the retained failure capture path — or `<not retained>` when none exists — and
 the bounded stderr tail with its indentation intact. Terminal escape sequences written by an
 adapter are stripped from every human rendering. `--json` emits the same compact projection as a
-structured object. A run retired by `tally flow supersede` reads `superseded` whatever its own
+structured object.
+
+Under the task counts, `query run` answers what the run cost. The line is deliberately never a
+bare total: the token sum arrives with the attempts it covers, the member tasks those attempts
+belong to, and the grade of the evidence, because these numbers are advisory adapter captures
+summed per attempt, not a bill. Whether any attempt reported usage is read from the coverage
+count, so a run where none did prints exactly that and no component line underneath it. The second
+line spells out `fresh input N (= input N + cache write N)` — `inputTokens` alone understates any
+harness that writes to a prompt cache — and marks reasoning tokens as nested inside the output
+figure rather than beside it. A component **no attempt reported** prints `--`, never `0`: a
+measured zero is a measurement and keeps printing `0`, and the two must not read alike. A cost
+line appears only where a harness reported cost, and carries the daemon's own basis sentence,
+which states that tally's cgroup `charge` is a separate figure that is not summed there and is a
+floor. A final `partial:` line names every reason the sums are incomplete: member tasks the
+attestation ledger holds nothing about, attempts that reported no usage, attempts whose reported
+usage no declared mapping could read, a component some reporting attempt did not report
+(`partial-components` — this is what one renamed harness key looks like), an attempt that
+reported only a harness total beside attempts that reported components, so the component lines
+cover fewer attempts than the total does (`total-only-attempts`), a total mixing harness-stated
+and derived figures. To find which component drifted, read the per-component
+`attempts` counts in `--json`: it is the one whose `attempts` is below
+`coverage.attemptsReportedWithComponents`. Do **not** look for the `--` on the line above — that
+only appears when *no* attempt reported the component, so on any multi-attempt run the drifted
+component prints a real-looking partial number instead. No `partial:` line means the rollup covers
+every attempt the ledger could speak for. `query standup` carries the same rollup per run
+its window touched, under `runs`. See the [RPC protocol
+reference](../reference/rpc-protocol.md#usage-rollups) for the full field set. A run retired by `tally flow supersede` reads `superseded` whatever its own
 node verdicts say, and names its successor above the board — a reader who misses that would wait
 for progress that can never come.
 

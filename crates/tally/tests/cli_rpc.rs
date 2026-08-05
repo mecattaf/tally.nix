@@ -319,6 +319,34 @@ impl RpcHandler for HumanQueryHandler {
                     "repository": "mecattaf/tally.nix",
                     "state": "needs-attention",
                     "counts": {"done": 1, "running": 0, "blocked": 1, "pending": 0},
+                    "usage": {
+                        "authority": "advisory-provider-capture",
+                        "provenance": "adapter-scrape attestations, per attempt, keyed by taskUuid/attempt/leaseEpoch",
+                        "composition": "freshInputTokens = inputTokens + cacheWriteTokens",
+                        "coverage": {
+                            "tasks": 3, "tasksWithReportedUsage": 2, "tasksWithoutAttestation": 1,
+                            "attemptsObserved": 3, "attemptsReported": 2,
+                            "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 2,
+                            "attemptsNotReported": 1,
+                            "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                            "ledgerVerified": true
+                        },
+                        "tokens": {
+                            "inputTokens": {"value": 262169, "attempts": 2},
+                            "cacheReadTokens": {"value": 17891220, "attempts": 2},
+                            "cacheWriteTokens": {"value": 265127, "attempts": 2},
+                            "outputTokens": {"value": 55140, "attempts": 2},
+                            "reasoningTokens": {"value": 15163, "attempts": 1},
+                            "freshInputTokens": {"value": 527296, "attemptsComplete": 2, "attemptsPartial": 0},
+                            "totalTokens": {"value": 18473656, "attempts": 2, "source": "mixed"}
+                        },
+                        "cost": {
+                            "amountUsd": 8.755705,
+                            "attempts": 1,
+                            "basis": "harness-reported costUsd only, summed over the attempts that reported it. Tally's cgroup charge is a distinct quantity, is not summed here, and is a floor: it includes tally's own exit-recorder overhead and is not pure job cost"
+                        },
+                        "caveats": ["members-without-attestation", "attempts-without-usage", "mixed-total-authority", "partial-cost"]
+                    },
                     "tasks": [
                         {"taskRef": "crm/t01", "title": "Done task", "status": "done", "blockedBy": [], "pullRequest": "https://example.test/pr/1"},
                         {"taskRef": "crm/t02", "title": "Failed task", "status": "blocked", "blockedBy": [], "failureStage": "agent-t02"}
@@ -426,6 +454,28 @@ impl RpcHandler for HostileQueryHandler {
                     "campaign": "c\u{1b}]0;pwned\u{7}rm",
                     "state": "needs-\u{1b}[31mattention",
                     "counts": {"done": 0, "running": 1, "blocked": 0, "pending": 0},
+                    "usage": {
+                        "authority": "advisory-provider-capture",
+                        "provenance": "atte\u{1b}[2Jstations",
+                        "composition": "compo\u{1b}[2Jsition",
+                        "coverage": {
+                            "tasks": 1, "tasksWithReportedUsage": 1, "tasksWithoutAttestation": 0,
+                            "attemptsObserved": 1, "attemptsReported": 1, "attemptsNotReported": 0,
+                            "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                            "ledgerVerified": true
+                        },
+                        "tokens": {
+                            "inputTokens": {"value": 1, "attempts": 1},
+                            "cacheReadTokens": {"value": 2, "attempts": 1},
+                            "cacheWriteTokens": {"value": 3, "attempts": 1},
+                            "outputTokens": {"value": 4, "attempts": 1},
+                            "reasoningTokens": {"value": 5, "attempts": 1},
+                            "freshInputTokens": {"value": 4, "attemptsComplete": 1, "attemptsPartial": 0},
+                            "totalTokens": {"value": 10, "attempts": 1, "source": "harness-\u{1b}[2Jreported"}
+                        },
+                        "cost": {"amountUsd": 1.5, "attempts": 1, "basis": "ba\u{1b}[2Jsis"},
+                        "caveats": ["mixed-\u{9b}2Jtotal-authority"]
+                    },
                     "tasks": [{
                         "taskRef": "crm/t02", "title": "Hostile task",
                         "status": "bl\u{1b}[2Jocked", "blockedBy": [],
@@ -1303,6 +1353,19 @@ async fn query_run_human_view_includes_tasks_budget_and_failure_pointer() {
                 // buried in the pass projection.
                 "!! ANOMALIES: 1 closed sub-issue(s) hold no merged proof",
                 "https://example.test/issues/42",
+                // What the run cost, and never a bare total: the sum arrives
+                // with the attempts it is over and the grade of its evidence.
+                "Usage: 18473656 tokens, mixed (2 of 3 scraped attempt(s) over 3 member task(s), advisory adapter captures)",
+                // The fresh-input figure states its own addition, because
+                // `inputTokens` alone understates any cache-writing harness.
+                "fresh input 527296 (= input 262169 + cache write 265127)",
+                "output 55140 (reasoning 15163 nested inside)",
+                // Cost carries the charge-floor statement beside it, and the
+                // sentence is the daemon's own `cost.basis`, not a literal the
+                // client could drift from.
+                "cost $8.7557 over 1 attempt(s) -- harness-reported costUsd only",
+                "Tally's cgroup charge is a distinct quantity, is not summed here, and is a floor",
+                "partial: members-without-attestation, attempts-without-usage",
             ] {
                 assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
             }
@@ -1348,6 +1411,243 @@ async fn query_run_status_filter_narrows_the_board_but_not_the_counts() {
             assert!(text.contains("1 done, 0 running, 1 blocked, 0 pending"));
             assert!(text.contains("crm/t02"), "{text}");
             assert!(!text.contains("crm/t01"), "{text}");
+            server.await.unwrap();
+        })
+        .await;
+}
+
+/// Three usage shapes the run header must not flatten into each other, keyed
+/// by run ID: an attempt that reported usage no declared mapping could read, a
+/// run where nothing reported, and a component absence beside a measured zero.
+#[derive(Clone, Copy)]
+struct UsageEdgeQueryHandler;
+
+impl RpcHandler for UsageEdgeQueryHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        Box::pin(async move {
+            assert_eq!(request.method, "query.run");
+            let id = request.params.as_ref().unwrap()["id"].as_str().unwrap();
+            // An attempt that reported usage the adapter's mapping resolved
+            // nothing out of: reported == 1, every component over 0 attempts,
+            // no total.
+            let unmapped = serde_json::json!({
+                "authority": "advisory-provider-capture",
+                "provenance": "attestations", "composition": "composition",
+                "coverage": {
+                    "tasks": 1, "tasksWithReportedUsage": 0, "tasksWithoutAttestation": 0,
+                    "attemptsObserved": 1, "attemptsReported": 1,
+                    "attemptsReportedWithoutFigures": 1, "attemptsReportedWithComponents": 1,
+                    "attemptsNotReported": 0,
+                    "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                    "ledgerVerified": true
+                },
+                "tokens": {
+                    "inputTokens": {"value": 0, "attempts": 0},
+                    "cacheReadTokens": {"value": 0, "attempts": 0},
+                    "cacheWriteTokens": {"value": 0, "attempts": 0},
+                    "outputTokens": {"value": 0, "attempts": 0},
+                    "reasoningTokens": {"value": 0, "attempts": 0},
+                    "freshInputTokens": {"value": 0, "attemptsComplete": 0, "attemptsPartial": 0}
+                },
+                "cost": {"attempts": 0, "basis": "harness-reported costUsd only"},
+                "caveats": ["reported-without-figures"]
+            });
+            // A measured zero (attempts 1) beside an absence (attempts 0).
+            let measured_zero = serde_json::json!({
+                "authority": "advisory-provider-capture",
+                "provenance": "attestations", "composition": "composition",
+                "coverage": {
+                    "tasks": 1, "tasksWithReportedUsage": 1, "tasksWithoutAttestation": 0,
+                    "attemptsObserved": 1, "attemptsReported": 1,
+                    "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 1,
+                    "attemptsNotReported": 0,
+                    "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                    "ledgerVerified": true
+                },
+                "tokens": {
+                    "inputTokens": {"value": 262086, "attempts": 1},
+                    "cacheReadTokens": {"value": 6798080, "attempts": 1},
+                    "cacheWriteTokens": {"value": 0, "attempts": 1},
+                    "outputTokens": {"value": 32842, "attempts": 1},
+                    "reasoningTokens": {"value": 0, "attempts": 0},
+                    "freshInputTokens": {"value": 262086, "attemptsComplete": 1, "attemptsPartial": 0},
+                    "totalTokens": {"value": 7093008, "attempts": 1, "source": "derived-from-components"}
+                },
+                "cost": {"attempts": 0, "basis": "harness-reported costUsd only"},
+                "caveats": []
+            });
+            // Nothing reported at all: both attempts are typed absences.
+            let nothing = serde_json::json!({
+                "authority": "advisory-provider-capture",
+                "provenance": "attestations", "composition": "composition",
+                "coverage": {
+                    "tasks": 1, "tasksWithReportedUsage": 0, "tasksWithoutAttestation": 0,
+                    "attemptsObserved": 2, "attemptsReported": 0,
+                    "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 0,
+                    "attemptsNotReported": 2,
+                    "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                    "ledgerVerified": true
+                },
+                "tokens": {
+                    "inputTokens": {"value": 0, "attempts": 0},
+                    "cacheReadTokens": {"value": 0, "attempts": 0},
+                    "cacheWriteTokens": {"value": 0, "attempts": 0},
+                    "outputTokens": {"value": 0, "attempts": 0},
+                    "reasoningTokens": {"value": 0, "attempts": 0},
+                    "freshInputTokens": {"value": 0, "attemptsComplete": 0, "attemptsPartial": 0}
+                },
+                "cost": {"attempts": 0, "basis": "harness-reported costUsd only"},
+                "caveats": ["attempts-without-usage"]
+            });
+            // One declared key drifted: the attempt reported usage and
+            // contributed, the component left the total, and the run is not
+            // complete. Real claude-code numbers minus the cache-read half.
+            let one_key_drifted = serde_json::json!({
+                "authority": "advisory-provider-capture",
+                "provenance": "attestations", "composition": "composition",
+                "coverage": {
+                    "tasks": 1, "tasksWithReportedUsage": 1, "tasksWithoutAttestation": 0,
+                    "attemptsObserved": 1, "attemptsReported": 1,
+                    "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 1,
+                    "attemptsNotReported": 0,
+                    "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
+                    "ledgerVerified": true
+                },
+                "tokens": {
+                    "inputTokens": {"value": 83, "attempts": 1},
+                    "cacheReadTokens": {"value": 0, "attempts": 0},
+                    "cacheWriteTokens": {"value": 265127, "attempts": 1},
+                    "outputTokens": {"value": 22298, "attempts": 1},
+                    "reasoningTokens": {"value": 0, "attempts": 0},
+                    "freshInputTokens": {"value": 265210, "attemptsComplete": 1, "attemptsPartial": 0},
+                    "totalTokens": {"value": 287508, "attempts": 1, "source": "derived-from-components"}
+                },
+                "cost": {"attempts": 0, "basis": "harness-reported costUsd only"},
+                "caveats": ["partial-components"]
+            });
+            let usage = match id.chars().last().unwrap() {
+                '1' => unmapped,
+                '2' => measured_zero,
+                '4' => one_key_drifted,
+                _ => nothing,
+            };
+            Ok(serde_json::json!({
+                "schemaVersion": 1,
+                "protocolVersion": 4,
+                "flowRunId": id,
+                "flowName": "spec-build",
+                "state": "complete",
+                "counts": {"done": 1, "running": 0, "blocked": 0, "pending": 0},
+                "usage": usage,
+                "tasks": [],
+                "currentNodes": [],
+                "failures": [],
+                "snapshot": {}
+            }))
+        })
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn query_run_never_renders_an_absent_figure_as_a_measured_zero() {
+    let temp = tempfile::tempdir().unwrap();
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                for _ in 0..4 {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    serve_connection(stream, UsageEdgeQueryHandler)
+                        .await
+                        .unwrap();
+                }
+            });
+
+            // An adapter whose mapping drifted: the attempt DID report usage,
+            // so the header must not say otherwise, nothing may render as a
+            // zero, and the reader must be told the run is partial.
+            let unmapped = run_tally(
+                &socket,
+                &["query", "run", "00000000-0000-4000-8000-000000000381"],
+            )
+            .await;
+            assert!(unmapped.status.success(), "{unmapped:?}");
+            let text = String::from_utf8(unmapped.stdout).unwrap();
+            assert!(
+                !text.contains("no attempt reported usage"),
+                "one attempt did report usage:\n{text}"
+            );
+            for expected in [
+                "Usage: no total (1 of 1 scraped attempt(s) reported usage over 1 member task(s), advisory adapter captures)",
+                "fresh input -- (= input -- + cache write --)  cache read --  output -- (reasoning -- nested inside)",
+                "partial: reported-without-figures",
+            ] {
+                assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+            }
+            let usage_lines = text
+                .lines()
+                .skip_while(|line| !line.starts_with("Usage:"))
+                .take_while(|line| !line.starts_with("No reconciled"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                !usage_lines.contains('0'),
+                "an absence rendered as a zero:\n{usage_lines}"
+            );
+
+            // A measured zero is a measurement and keeps rendering as `0`;
+            // the component nobody reported beside it renders `--`.
+            let measured = run_tally(
+                &socket,
+                &["query", "run", "00000000-0000-4000-8000-000000000382"],
+            )
+            .await;
+            assert!(measured.status.success(), "{measured:?}");
+            let text = String::from_utf8(measured.stdout).unwrap();
+            assert!(
+                text.contains("fresh input 262086 (= input 262086 + cache write 0)  cache read 6798080  output 32842 (reasoning -- nested inside)"),
+                "{text}"
+            );
+            assert!(!text.contains("partial:"), "{text}");
+
+            // And a run where nothing reported says exactly that, with no
+            // component line of zeros underneath contradicting it.
+            let quiet = run_tally(
+                &socket,
+                &["query", "run", "00000000-0000-4000-8000-000000000383"],
+            )
+            .await;
+            assert!(quiet.status.success(), "{quiet:?}");
+            let text = String::from_utf8(quiet.stdout).unwrap();
+            assert!(
+                text.contains("Usage: no attempt reported usage (2 scraped attempt(s) over 1 member task(s), advisory adapter captures)"),
+                "{text}"
+            );
+            assert!(!text.contains("fresh input"), "{text}");
+            assert!(text.contains("partial: attempts-without-usage"), "{text}");
+
+            // A total that looks like a total, one `--` component, and the
+            // `partial:` line that stops the reader trusting the number: this
+            // is the shape a single renamed harness key ships.
+            let drifted = run_tally(
+                &socket,
+                &["query", "run", "00000000-0000-4000-8000-000000000384"],
+            )
+            .await;
+            assert!(drifted.status.success(), "{drifted:?}");
+            let text = String::from_utf8(drifted.stdout).unwrap();
+            for expected in [
+                "Usage: 287508 tokens, derived-from-components (1 of 1 scraped attempt(s) over 1 member task(s), advisory adapter captures)",
+                "fresh input 265210 (= input 83 + cache write 265127)  cache read --  output 22298 (reasoning -- nested inside)",
+                "partial: partial-components",
+            ] {
+                assert!(text.contains(expected), "missing {expected:?} in:\n{text}");
+            }
             server.await.unwrap();
         })
         .await;

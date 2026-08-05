@@ -140,10 +140,10 @@ use crate::query::{
     RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
 };
 use crate::query_v2::{
-    apply_run_lineage, collapse_lifecycle_echoes, log_position_floor, log_position_head,
-    query_flow_proofs, query_job as query_job_v2, query_jobs as query_jobs_v2, query_lifecycle_log,
-    query_proof, query_run, snapshot_metadata, JobsFilter, LifecycleLogFilter, LiveJobFact,
-    LogPosition, ObservabilityError, PositionGap, RowDetailFact,
+    apply_run_lineage, apply_standup_usage, collapse_lifecycle_echoes, log_position_floor,
+    log_position_head, query_flow_proofs, query_job as query_job_v2, query_jobs as query_jobs_v2,
+    query_lifecycle_log, query_proof, query_run, snapshot_metadata, JobsFilter, LifecycleLogFilter,
+    LiveJobFact, LogPosition, ObservabilityError, PositionGap, RowDetailFact,
 };
 use crate::recovery::{
     collect_durable_recovery_facts, collect_local_unit_facts, recover, DurableRecoveryFacts,
@@ -162,6 +162,7 @@ use crate::taskdb::{
 };
 use crate::trace::{query_trace, trace_availability, TraceError, TraceLane};
 use crate::usage::UsageObservation;
+use crate::usage_rollup::AttestationEvidence;
 use crate::watch::{ChangeError, ChangeKind, ChangeStore};
 use crate::wire::{
     canonical_payload_hash, serve_connection_with_limits, EnqueuePayload, GuardrailConfig,
@@ -169,8 +170,9 @@ use crate::wire::{
     WireError, WireErrorCode, WireIoError,
 };
 use crate::witness::{
-    current_host_id, read_verified_attestations, read_verified_records, AttestationLedger, Charge,
-    Derivation, LaborClass, Verdict, WitnessBody, WitnessError, WitnessLedger, WitnessRecord,
+    current_host_id, read_verified_attestations, read_verified_records, AttestationLedger,
+    AttestationRecord, AttestationVerifyReport, Charge, Derivation, LaborClass, Verdict,
+    WitnessBody, WitnessError, WitnessLedger, WitnessRecord,
 };
 
 /// The daemon's one cached handle per advisory attestation chain.

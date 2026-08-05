@@ -31,6 +31,7 @@ pub mod taskdb;
 pub mod trace;
 pub mod unit_exit_migration;
 pub mod usage;
+pub mod usage_rollup;
 pub mod watch;
 pub mod wire;
 pub mod witness;
