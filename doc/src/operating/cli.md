@@ -471,8 +471,10 @@ which states that tally's cgroup `charge` is a separate figure that is not summe
 floor. A final `partial:` line names every reason the sums are incomplete: member tasks the
 attestation ledger holds nothing about, attempts that reported no usage, attempts whose reported
 usage no declared mapping could read, a component some reporting attempt did not report
-(`partial-components` — this is what one renamed harness key looks like), a total mixing
-harness-stated and derived figures. To find which component drifted, read the per-component
+(`partial-components` — this is what one renamed harness key looks like), an attempt that
+reported only a harness total beside attempts that reported components, so the component lines
+cover fewer attempts than the total does (`total-only-attempts`), a total mixing harness-stated
+and derived figures. To find which component drifted, read the per-component
 `attempts` counts in `--json`: it is the one whose `attempts` is below
 `coverage.attemptsReportedWithComponents`. Do **not** look for the `--` on the line above — that
 only appears when *no* attempt reported the component, so on any multi-attempt run the drifted

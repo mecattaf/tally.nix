@@ -61,9 +61,21 @@ authorized.
     run; and the denominator excludes attempts whose harness stated a total of
     its own and reported no component beside it — what an adapter declaring
     only a `totalTokens` mapping produces — because such an attempt declared
-    no components to be missing. That exclusion is one shape wide: an attempt
-    reporting any component is judged even when its harness also stated a
-    total, so drift cannot hide behind a stated total.
+    no components to be missing.
+  - **An attempt that reported only a total, beside attempts that reported
+    components, raises `total-only-attempts`.** The exemption above is one
+    *reported* shape wide, which is not the same promise as "an adapter that
+    declared components is always judged": the rollup reads attestations, never
+    the declared field map, so an adapter declaring components *and* a total,
+    whose harness renames every component key at once, reports the exempted
+    shape. Whenever such an attempt sits beside attempts that did report
+    components, the component sums demonstrably cover fewer attempts than the
+    total does, and the run says so — whichever kind of adapter produced them.
+    Distinct from `partial-components` on purpose: that one means a component
+    is missing *within* the attempts being judged, this one means an attempt is
+    missing from the judgement altogether. The one case reported evidence
+    cannot separate is a run where *every* attempt is total-only, which needs
+    the declared field set the attestation does not carry.
   - **Authority is graded, and the grade is about the adapter, not the
     harness's reputation.** The whole rollup is `advisory-provider-capture` —
     harnesses reporting on themselves. `totalTokens.source` is

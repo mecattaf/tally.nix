@@ -481,9 +481,21 @@ And the denominator is `attemptsReportedWithComponents` rather than `attemptsRep
 excludes attempts whose harness stated a total of its own and reported no component beside it —
 the shape an adapter declaring only a `totalTokens` mapping produces. Such an attempt declared no
 components to be missing, so judging it against a component threshold would mark a run that
-reported everything it intended to as permanently incomplete. The exclusion is exactly that one
-shape wide: an attempt that reported any component is judged even when its harness also stated a
-total, so component drift cannot hide behind a stated total.
+reported everything it intended to as permanently incomplete.
+
+That exemption is one **reported** shape wide, which is not the same promise as "an adapter that
+declared components is always judged", and the difference matters: the rollup reads attestations,
+never the adapter's declared field map, so an adapter that declared components *and* a total,
+whose harness renamed every component key at once, reports exactly the exempted shape and leaves
+the denominator. `total-only-attempts` is what stops that passing silently. It is raised whenever
+an exempted attempt sits beside attempts that did report components — `attemptsReported -
+attemptsReportedWithComponents > 0` and `attemptsReportedWithComponents > 0` — because then the
+component sums demonstrably cover fewer attempts than the total does, whichever kind of adapter
+produced them. An attempt that reported any component is judged by the component threshold as
+usual, even when its harness also stated a total. The one case reported evidence cannot separate
+is a run in which *every* attempt is total-only: a legal total-only adapter and a wholly drifted
+component adapter are indistinguishable there without the declared field set, which the
+attestation does not carry.
 
 `ledgerVerified` is false when the advisory chain did not verify or could not be read, and then
 nothing is summed at all rather than answered as a zero. Every reason the sums are partial also

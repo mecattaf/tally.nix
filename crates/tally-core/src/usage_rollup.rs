@@ -299,22 +299,34 @@ pub struct UsageCoverage {
     /// per-component threshold behind
     /// [`UsageRollupCaveat::PartialComponents`] compares against.
     ///
-    /// It is below `attemptsReported` for exactly one shape: an attempt whose
-    /// harness stated a total of its own and reported no component beside it
+    /// It is below `attemptsReported` for exactly one **reported** shape: an
+    /// attempt that stated a harness total and reported no component beside it
     /// ([`crate::usage::UsageShape::Lump`] with a `harness-reported` total).
-    /// That is a legal adapter — `totalTokens` is a declarable field and
-    /// nothing obliges an adapter to declare components too — and for it,
-    /// every component being absent is the configuration working, not drift.
-    /// Comparing such an attempt against the component threshold made a run
-    /// that reported everything it ever intended to grade permanently
-    /// incomplete.
+    /// An adapter may legally declare `totalTokens` and no components, and for
+    /// that adapter every component being absent is the configuration working,
+    /// not drift; comparing such an attempt against the component threshold
+    /// made a run that reported everything it ever intended to grade
+    /// permanently incomplete.
     ///
-    /// The exclusion is deliberately that narrow. An attempt that reported
-    /// *any* component is in this denominator even when its harness also
-    /// stated a total, so real component drift cannot hide behind a
-    /// harness-stated total; and an attempt that stated no total either — the
-    /// cost-only and the fully-drifted shapes — is in it too, because those
-    /// are the drift cases the threshold exists to catch.
+    /// The exemption is one *reported* shape wide, and that is **not** the
+    /// same promise as "an adapter that declared components is always judged".
+    /// It cannot be: `roll_up` receives attestations, never the adapter's
+    /// declared field map, so an adapter that declared components *and* a
+    /// total, whose harness renamed every component key while keeping the
+    /// total, reports exactly this shape and leaves this denominator. What
+    /// stops that passing silently is
+    /// [`UsageRollupCaveat::TotalOnlyAttempts`], which fires whenever such an
+    /// attempt sits beside attempts that did report components — then the
+    /// component sums provably cover a strict subset of the run and the rollup
+    /// says so. The one case reported evidence cannot separate at all is a run
+    /// where *every* attempt is total-only: a legal total-only adapter and a
+    /// wholly drifted component adapter are indistinguishable without the
+    /// declared field set, which is not on the attestation.
+    ///
+    /// An attempt that reported *any* component is in this denominator even
+    /// when its harness also stated a total, and an attempt that stated no
+    /// total either — the cost-only and the fully-drifted shapes — is in it
+    /// too, because those are the drift cases the threshold exists to catch.
     pub attempts_reported_with_components: usize,
     /// Attempts whose attestation states `not-reported`: a usage scrape was
     /// declared, the stream was read, and it carried no usage.
@@ -369,6 +381,26 @@ pub enum UsageRollupCaveat {
     /// components is not told forever that components it never declared are
     /// missing.
     PartialComponents,
+    /// Some attempt contributed a harness-stated total and no component at
+    /// all, while other attempts of this run did report components — so the
+    /// component sums cover a strict subset of the attempts the total covers.
+    ///
+    /// Computed from published coverage counts only:
+    /// `attemptsReported - attemptsReportedWithComponents > 0` **and**
+    /// `attemptsReportedWithComponents > 0`. The evidence is what each attempt
+    /// *reported*, never what its adapter declared — `roll_up` never sees the
+    /// declared field map — which is exactly why the second conjunct is there.
+    /// A total-only attempt is either a legal total-only adapter or an adapter
+    /// whose component keys all drifted at once, and those two are
+    /// indistinguishable in isolation; beside an attempt that did report
+    /// components, they stop being indistinguishable in what matters, because
+    /// the component sums demonstrably do not cover the whole run.
+    ///
+    /// Distinct from [`UsageRollupCaveat::PartialComponents`] on purpose:
+    /// that one means a component is missing *within* the attempts being
+    /// judged, this one means an attempt is missing from the judgement
+    /// altogether. A run can raise either, both, or neither.
+    TotalOnlyAttempts,
     /// Some attestation carries no readable usage record.
     UnreadableUsageRecord,
     /// An attempt named a declared field its harness emitted in an unusable
@@ -654,6 +686,19 @@ pub fn roll_up<'a>(
     .any(|component| component.attempts < coverage.attempts_reported_with_components)
     {
         caveats.insert(UsageRollupCaveat::PartialComponents);
+    }
+    // The exemption above is decided from what an attempt reported, and a
+    // total-only report is produced both by a legal total-only adapter and by
+    // one whose component keys all drifted at once. In isolation those cannot
+    // be told apart — but beside an attempt that did report components they do
+    // not need to be: the component sums then cover strictly fewer attempts
+    // than the total does, which is a fact about this run and not a guess
+    // about its adapters.
+    let attempts_reported_without_components = coverage
+        .attempts_reported
+        .saturating_sub(coverage.attempts_reported_with_components);
+    if attempts_reported_without_components > 0 && coverage.attempts_reported_with_components > 0 {
+        caveats.insert(UsageRollupCaveat::TotalOnlyAttempts);
     }
     if saw_harness_total && saw_derived_total {
         caveats.insert(UsageRollupCaveat::MixedTotalAuthority);
@@ -945,11 +990,19 @@ mod tests {
         assert_eq!(harness.coverage.attempts_reported, 1);
         assert_eq!(harness.coverage.attempts_reported_with_components, 0);
         assert!(harness.is_complete(), "{:?}", harness.caveats);
+        // No attempt of this run reported components, so no component sum
+        // covers a subset of anything: the beside-ness the total-only caveat
+        // needs does not exist here.
+        assert!(!harness
+            .caveats
+            .contains(&UsageRollupCaveat::TotalOnlyAttempts));
 
         // And a run mixing that adapter with a preset is where `mixed` — and
         // its caveat — actually becomes reachable. The preset attempt is the
         // only one the component threshold judges, and it reported everything,
-        // so the run is still not partial.
+        // so no component is missing from within that judgement — but the
+        // component sums do cover one of the run's two attempts, and that is
+        // the total-only caveat's job to say.
         let records = [
             attestation(1, "declared", 1, declared_total_usage()),
             attestation(2, "preset", 1, codex_usage()),
@@ -969,10 +1022,12 @@ mod tests {
         assert!(!mixed
             .caveats
             .contains(&UsageRollupCaveat::PartialComponents));
+        assert!(mixed
+            .caveats
+            .contains(&UsageRollupCaveat::TotalOnlyAttempts));
 
-        // But the exclusion is exactly one shape wide: a drifted preset
-        // attempt beside the total-only one is still caught, so component
-        // drift cannot hide behind another adapter's harness total.
+        // But an exempted attempt hides nothing from the threshold either: a
+        // drifted preset attempt beside the total-only one is still caught.
         let drifted = CODEX_STREAM.replace("cached_input_tokens", "cached_input_tokens_v2");
         let records = [
             attestation(1, "declared", 1, declared_total_usage()),
@@ -991,6 +1046,102 @@ mod tests {
         assert!(hidden
             .caveats
             .contains(&UsageRollupCaveat::PartialComponents));
+    }
+
+    /// An adapter that declares components **and** a total, whose harness then
+    /// renames every component key at once.
+    ///
+    /// That attempt reports the same shape a legal total-only adapter does —
+    /// a lump with a harness-stated total — so it leaves the component
+    /// threshold's denominator, and `roll_up` cannot tell the two apart: it
+    /// never sees the declared field map. What it can see is that the
+    /// component sums now cover strictly fewer attempts than the total does,
+    /// which is a fact about this run. Without the total-only caveat this run
+    /// graded `complete` with an empty caveat list while half its tokens were
+    /// missing from every component sum.
+    #[test]
+    fn an_all_component_drift_behind_a_surviving_total_is_not_a_complete_run() {
+        let adapter = AdapterConfig {
+            argv: vec!["components-and-total-agent".to_owned()],
+            scrape: BTreeMap::from([(
+                "usage".to_owned(),
+                scrape_capture(
+                    ScrapeMode::JsonPath,
+                    "$..usage",
+                    r#"{"inputTokens":["input_tokens"],"cacheReadTokens":["cache_read_input_tokens"],"cacheWriteTokens":["cache_creation_input_tokens"],"outputTokens":["output_tokens"],"totalTokens":["total_tokens"]}"#,
+                ),
+            )]),
+            ..Default::default()
+        };
+        let stream = concat!(
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"#,
+            r#""cache_read_input_tokens":900000,"cache_creation_input_tokens":5000,"#,
+            r#""output_tokens":20,"total_tokens":905120}}"#
+        );
+        let drifted = [
+            "input_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+            "output_tokens",
+        ]
+        .iter()
+        .fold(stream.to_owned(), |stream, key| {
+            stream.replace(&format!("\"{key}\""), &format!("\"{key}_v2\""))
+        });
+
+        let honest = observed_with(&adapter, "components-and-total", stream);
+        assert_eq!(honest["breakdown"]["shape"], "components");
+        let after = observed_with(&adapter, "components-and-total", &drifted);
+        // The drifted attempt is indistinguishable, from its report alone,
+        // from a legal total-only adapter's attempt.
+        assert_eq!(after["breakdown"]["shape"], "lump");
+        assert_eq!(
+            after["breakdown"]["totalTokens"]["source"],
+            "harness-reported"
+        );
+
+        let records = [
+            attestation(1, "task", 1, honest),
+            attestation(2, "task", 2, after),
+        ];
+        let rollup = roll_up(["task"], &AttestationEvidence::new(true, &records));
+
+        assert_eq!(rollup.coverage.attempts_reported, 2);
+        assert_eq!(
+            rollup.coverage.attempts_reported_with_components, 1,
+            "the drifted attempt reported no component, so it left the denominator"
+        );
+        assert_eq!(rollup.coverage.attempts_reported_without_figures, 0);
+        // Half the run's tokens are absent from every component sum...
+        assert_eq!(
+            rollup.tokens.input_tokens,
+            UsageSum {
+                value: 100,
+                attempts: 1
+            }
+        );
+        assert_eq!(
+            rollup.tokens.cache_read_tokens,
+            UsageSum {
+                value: 900_000,
+                attempts: 1
+            }
+        );
+        assert_eq!(rollup.tokens.total_tokens.unwrap().value, 905_120 * 2);
+        // ...and nothing within the judged attempt is missing, so the
+        // per-component threshold is silent. Only the caveat that counts
+        // attempts *outside* it can speak here.
+        assert!(!rollup
+            .caveats
+            .contains(&UsageRollupCaveat::PartialComponents));
+        assert!(
+            rollup
+                .caveats
+                .contains(&UsageRollupCaveat::TotalOnlyAttempts),
+            "a component sum over half the run must not grade complete: {:?}",
+            rollup.caveats
+        );
+        assert!(!rollup.is_complete());
     }
 
     #[test]
