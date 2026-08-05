@@ -161,6 +161,8 @@ impl DaemonHandler {
                 if params.id.trim().is_empty() {
                     return Err(WireError::invalid("query run ID must not be empty"));
                 }
+                let (attestation_report, attestations) =
+                    read_attestations(&attestations_path).await?;
                 let mut result = query_run(
                     &params.id,
                     &details,
@@ -169,6 +171,7 @@ impl DaemonHandler {
                     &witness,
                     Utc::now(),
                     &membership,
+                    &AttestationEvidence::new(attestation_report.ok, &attestations),
                 )
                 .map_err(observability_wire)?;
                 let lineage = self.flow_lineage().await?;
@@ -270,14 +273,8 @@ impl DaemonHandler {
                         ));
                     }
                 };
-                let (attestation_report, attestations) = tokio::task::spawn_blocking(move || {
-                    read_verified_attestations(&attestations_path)
-                })
-                .await
-                .map_err(|error| {
-                    internal_wire(format!("attestation query worker failed: {error}"))
-                })?
-                .map_err(internal_wire)?;
+                let (attestation_report, attestations) =
+                    read_attestations(&attestations_path).await?;
                 if !attestation_report.ok {
                     return Err(internal_wire(
                         "attestation verification failed during proof query",
@@ -388,6 +385,15 @@ impl DaemonHandler {
                         entry.state.clone_from(state);
                     }
                 }
+                let (attestation_report, attestations) =
+                    read_attestations(&attestations_path).await?;
+                apply_standup_usage(
+                    &mut digest,
+                    &details,
+                    &witness,
+                    &membership,
+                    &AttestationEvidence::new(attestation_report.ok, &attestations),
+                );
                 serde_json::to_value(digest).map_err(internal_wire)
             }
             "query.pools" => {
@@ -405,6 +411,23 @@ impl DaemonHandler {
             _ => unreachable!("query methods are filtered by the RPC dispatcher"),
         }
     }
+}
+
+/// Read and verify the advisory attestation chain off the async runtime.
+///
+/// The verification report travels back with the records rather than being
+/// consumed here: `query.proof` fails closed on a chain that did not verify,
+/// while the usage rollup carries the same fact onto the wire, because a
+/// rollup that answered an unverified ledger with a confident zero would be
+/// the wrong-evidence defect this whole surface exists to avoid.
+async fn read_attestations(
+    path: &Path,
+) -> Result<(AttestationVerifyReport, Vec<AttestationRecord>), WireError> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || read_verified_attestations(&path))
+        .await
+        .map_err(|error| internal_wire(format!("attestation query worker failed: {error}")))?
+        .map_err(internal_wire)
 }
 
 // The shared read-only projection every fresh (non-continuation) query

@@ -410,6 +410,21 @@ impl FlowMembership {
             .flat_map(|tasks| tasks.keys().map(String::as_str))
     }
 
+    /// Every run that durably holds this task, ascending.
+    ///
+    /// The index is keyed run-first because that is the question nearly every
+    /// reader asks, so this walks it. It exists for the one reader that asks
+    /// the reverse question — a stand-up digest holds task UUIDs and needs the
+    /// runs they belong to — and a task's own row cannot answer it: a node one
+    /// run created and another was handed carries only the creating run's
+    /// orchestration capsule.
+    pub fn runs_holding<'a>(&'a self, task_uuid: &'a str) -> impl Iterator<Item = &'a str> {
+        self.by_run
+            .iter()
+            .filter(move |(_, tasks)| tasks.contains_key(task_uuid))
+            .map(|(flow_run_id, _)| flow_run_id.as_str())
+    }
+
     /// The node ordinal *this* run admitted the task under, which is not
     /// necessarily the ordinal on the task's durable row.
     #[must_use]

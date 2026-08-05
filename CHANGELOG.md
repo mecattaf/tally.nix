@@ -8,6 +8,54 @@ authorized.
 
 ### Added
 
+- **`query run` and `query standup` answer "what did this run cost" (#384).**
+  `query.run` gains a `usage` object and `query.standup` gains a `runs` array
+  carrying the same object per flow run the window touched. Both are summed
+  **per attempt from the advisory attestation ledger**, keyed by
+  `taskUuid`/`attempt`/`leaseEpoch`, over the run's **durable membership**
+  (#391) — so a retried task is charged for every attempt it made, and a node
+  a run was handed but whose row names its creating run is inside the sum
+  rather than silently missing from it.
+
+  Three properties are load-bearing, because the failure this surface exists
+  to prevent is a figure computed from the wrong evidence, wrong in the
+  reassuring direction, and shaped exactly like a correct one:
+
+  - **`inputTokens` alone is not the fresh-input figure**, so the rollup
+    publishes `freshInputTokens = inputTokens + cacheWriteTokens` and states
+    that addition on the wire in `composition`. claude-code's
+    `cache_creation_input_tokens` are fresh, uncached prompt tokens its
+    `input_tokens` excludes; a sum over `inputTokens` alone understates any
+    cache-writing harness by its whole cache-write volume while printing a
+    number that looks directly comparable to codex's. `reasoningTokens` is
+    rolled up for visibility and never added to any total, because codex
+    nests it inside `output_tokens`. Each harness's own
+    `inputTokensAsReported` is deliberately not summed: the two conventions
+    are not commensurable.
+  - **Coverage is stated, never implied.** `coverage` counts member tasks,
+    observed attempts, and attempts that reported usage apart from each typed
+    absence (`not-reported`, `not-declared`, and an attestation predating the
+    usage record), plus the member tasks the ledger holds nothing about and
+    whether the chain verified at all. A ledger that failed verification sums
+    nothing and says so rather than answering with a confident zero.
+  - **Authority is graded and mixed authority is named.** The whole rollup is
+    `advisory-provider-capture` — harnesses reporting on themselves — and
+    `totalTokens.source` is `harness-reported`, `derived-from-components`, or
+    `mixed` for a run whose nodes span claude-code (which states a total) and
+    codex (whose real `turn.completed` does not). Every reason the sums are
+    partial is a named `caveats` entry.
+
+  `cost` is the harness's own `costUsd`, summed only where reported, and it
+  carries a `basis` statement onto the wire: tally's cgroup `charge` is a
+  distinct quantity, is not summed here, and is a **floor** that includes
+  tally's own exit-recorder overhead (waiver `W-382-RECORDER`, #382). The
+  human `tally query run` view prints the block with its coverage attached,
+  because a terminal reader is exactly the one who will not go looking for
+  the coverage object in `--json`. A daemon that predates the field sends no
+  `usage` object and the human view prints nothing for it, since an absent
+  field is not a claim about the run. Cross-run and fleet aggregation,
+  budgeting, and enforcement remain out of scope.
+
 - **Context occupancy is recorded beside session identity, everywhere
   `sessionRef` is (#383).** "Context is occupancy, not spend" — the number
   that decides whether a session can absorb another task, not what it cost,

@@ -6231,6 +6231,185 @@ mod tests {
             .await;
     }
 
+    /// A run's cost, end to end: a real attempt is scraped, normalized, and
+    /// attested, and `query.run` and `query.standup` both sum it per attempt
+    /// over the run's **durable membership** — including for a run that owns
+    /// no row for the task at all, which is the W-316 shape.
+    #[tokio::test(flavor = "current_thread")]
+    async fn acceptance_384_run_and_standup_roll_per_attempt_usage_up_to_the_run() {
+        const RUN_A: &str = "00000000-0000-4000-8000-0000000003a0";
+        const RUN_B: &str = "00000000-0000-4000-8000-0000000003b0";
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let program = temp.path().join("usage-agent");
+                // The claude-code shape: `input_tokens` excludes both cache
+                // halves, so the fresh-prompt volume is only visible once
+                // `cache_creation_input_tokens` is added to it.
+                crate::test_support::install_shell_program(
+                    &program,
+                    concat!(
+                        "#!/bin/sh\n",
+                        "printf '%s\\n' '{\"event\":{\"session_id\":\"usage-session\",",
+                        "\"usage\":{\"input_tokens\":83,\"cache_creation_input_tokens\":265127,",
+                        "\"cache_read_input_tokens\":11093140,\"output_tokens\":22298}}}'\n",
+                        "printf '%s\\n' 'branch=usage' >&2\n"
+                    ),
+                );
+                let mut config = one_pool_config();
+                let mut adapter = structured_adapter(&program);
+                adapter.scrape.insert(
+                    "usage".to_owned(),
+                    ScrapeCapture {
+                        stream: ScrapeStream::Stdout,
+                        mode: ScrapeMode::JsonPath,
+                        pattern: "$..usage".to_owned(),
+                        fields: serde_json::from_str(
+                            r#"{"inputTokens":["input_tokens"],"cacheReadTokens":["cache_read_input_tokens"],"cacheWriteTokens":["cache_creation_input_tokens"],"outputTokens":["output_tokens"]}"#,
+                        )
+                        .unwrap(),
+                    },
+                );
+                config.adapters.insert("usage-agent".to_owned(), adapter);
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(
+                    config.clone(),
+                    paths.clone(),
+                    settings(),
+                    executor.clone(),
+                )
+                .await
+                .unwrap();
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["work"],
+                        "pool": "slot",
+                        "adapter": "usage-agent",
+                        "source": "manual",
+                        "evidence": ["exit:0"],
+                        "orchestration": {
+                            "flowName": "spec-build",
+                            "flowRunId": RUN_A,
+                            "nodeOrdinal": 1,
+                            "nodeLabel": "agent-t01"
+                        }
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(5), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                let terminal = daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": task_uuid})))
+                    .await
+                    .unwrap();
+                assert_eq!(terminal["verdict"], "pass");
+                // The scrape, the normalization, and the attestation append all
+                // happen post-ack, so wait for the ledger to actually hold this
+                // attempt rather than for the file to merely exist -- the
+                // daemon creates it empty at startup.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        let attested = fs::read_to_string(paths.attestations_path())
+                            .unwrap_or_default()
+                            .lines()
+                            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                            .any(|record| record["payload"]["taskUuid"] == task_uuid.as_str());
+                        if attested {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+
+                let view = daemon
+                    .handler
+                    .query("query.run", Some(json!({"id": RUN_A})))
+                    .await
+                    .unwrap();
+                let usage = &view["usage"];
+                assert_eq!(usage["authority"], "advisory-provider-capture");
+                assert_eq!(usage["coverage"]["ledgerVerified"], true);
+                assert_eq!(usage["coverage"]["tasks"], 1);
+                assert_eq!(usage["coverage"]["attemptsObserved"], 1);
+                assert_eq!(usage["coverage"]["attemptsReported"], 1);
+                assert_eq!(usage["tokens"]["inputTokens"]["value"], 83);
+                assert_eq!(usage["tokens"]["cacheWriteTokens"]["value"], 265_127);
+                assert_eq!(usage["tokens"]["cacheReadTokens"]["value"], 11_093_140);
+                assert_eq!(usage["tokens"]["outputTokens"]["value"], 22_298);
+                // The whole point: `inputTokens` alone would report 83 fresh
+                // input tokens for an attempt that sent 265,210 of them.
+                assert_eq!(usage["tokens"]["freshInputTokens"]["value"], 265_210);
+                assert_eq!(usage["tokens"]["totalTokens"]["value"], 11_380_648);
+                assert_eq!(
+                    usage["tokens"]["totalTokens"]["source"],
+                    "derived-from-components"
+                );
+                assert_eq!(usage["caveats"], json!([]));
+
+                // A second run was handed the same node and owns no row for
+                // it. Membership is the only place that fact is written down,
+                // and the rollup must charge run B for the attempt anyway.
+                let record = crate::flow_membership::FlowMembershipRecord::new(
+                    RUN_B.to_owned(),
+                    task_uuid.clone(),
+                    crate::flow_membership::MembershipDisposition::Attached,
+                    Some(7),
+                    Some("b-node-7".to_owned()),
+                );
+                crate::flow_membership::record_membership(
+                    &paths.flow_membership_path(),
+                    &record,
+                    crate::flow_membership::FlowMembership::default(),
+                    &BTreeSet::new(),
+                )
+                .unwrap();
+                let attached = daemon
+                    .handler
+                    .query("query.run", Some(json!({"id": RUN_B})))
+                    .await
+                    .unwrap();
+                assert_eq!(attached["usage"]["coverage"]["attemptsReported"], 1);
+                assert_eq!(attached["usage"]["tokens"]["freshInputTokens"]["value"], 265_210);
+
+                // And the stand-up window carries the same rollup for every
+                // run it touched, both the creating run and the attached one.
+                let digest = daemon
+                    .handler
+                    .query("query.standup", Some(json!({})))
+                    .await
+                    .unwrap();
+                let runs = digest["runs"].as_array().unwrap();
+                assert_eq!(
+                    runs.iter()
+                        .map(|run| run["flowRunId"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    [RUN_A, RUN_B]
+                );
+                for run in runs {
+                    assert_eq!(run["usage"]["tokens"]["totalTokens"]["value"], 11_380_648);
+                    assert_eq!(run["usage"]["coverage"]["attemptsReported"], 1);
+                }
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn acceptance_24_5_trace_and_scraped_usage_are_advisory_only() {
         let local = LocalSet::new();

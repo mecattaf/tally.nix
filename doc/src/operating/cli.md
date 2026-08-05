@@ -455,7 +455,21 @@ the remaining `runtimeMaxSec` budget, negative when a node has run past that bud
 section prints the retained failure capture path — or `<not retained>` when none exists — and
 the bounded stderr tail with its indentation intact. Terminal escape sequences written by an
 adapter are stripped from every human rendering. `--json` emits the same compact projection as a
-structured object. A run retired by `tally flow supersede` reads `superseded` whatever its own
+structured object.
+
+Under the task counts, `query run` answers what the run cost. The line is deliberately never a
+bare total: the token sum arrives with the attempts it covers, the member tasks those attempts
+belong to, and the grade of the evidence, because these numbers are advisory adapter captures
+summed per attempt, not a bill. The second line spells out `fresh input N (= input N + cache
+write N)` — `inputTokens` alone understates any harness that writes to a prompt cache — and marks
+reasoning tokens as nested inside the output figure rather than beside it. A cost line appears
+only where a harness reported cost, and states that tally's cgroup `charge` is a separate figure
+that is not summed there and is a floor. A final `partial:` line names every reason the sums are
+incomplete: member tasks the attestation ledger holds nothing about, attempts that reported no
+usage, a total mixing harness-stated and derived figures. No `partial:` line means the rollup
+covers every attempt the ledger could speak for. `query standup` carries the same rollup per run
+its window touched, under `runs`. See the [RPC protocol
+reference](../reference/rpc-protocol.md#usage-rollups) for the full field set. A run retired by `tally flow supersede` reads `superseded` whatever its own
 node verdicts say, and names its successor above the board — a reader who misses that would wait
 for progress that can never come.
 

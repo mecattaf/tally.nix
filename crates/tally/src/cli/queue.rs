@@ -728,6 +728,83 @@ fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
     Ok(())
 }
 
+/// The run header's answer to "what did this run cost".
+///
+/// Every number here is printed with the coverage it is over, because the
+/// terminal reader is exactly the one who will not go looking in `--json` for
+/// the coverage object — and an unqualified sum over partial, advisory captures
+/// reads as a bill. A daemon that predates the rollup sends no `usage` object
+/// at all; that prints nothing, because absence of the field is not a claim
+/// about the run.
+fn print_run_usage(usage: &Value) -> Result<()> {
+    let (Some(coverage), Some(tokens)) =
+        (usage["coverage"].as_object(), usage["tokens"].as_object())
+    else {
+        return Ok(());
+    };
+    let count = |key: &str| coverage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let tasks = count("tasks");
+    let observed = count("attemptsObserved");
+    let reported = count("attemptsReported");
+    if coverage.get("ledgerVerified").and_then(Value::as_bool) != Some(true) {
+        outln!("Usage: not summed -- the advisory attestation ledger did not verify");
+        return Ok(());
+    }
+    let sum = |key: &str| {
+        tokens
+            .get(key)
+            .and_then(|component| component["value"].as_u64())
+            .unwrap_or(0)
+    };
+    match tokens.get("totalTokens").and_then(Value::as_object) {
+        None => outln!(
+            "Usage: no attempt reported usage ({observed} scraped attempt(s) over {tasks} member task(s), advisory adapter captures)"
+        ),
+        Some(total) => outln!(
+            "Usage: {} tokens, {} ({reported} of {observed} scraped attempt(s) over {tasks} member task(s), advisory adapter captures)",
+            total.get("value").and_then(Value::as_u64).unwrap_or(0),
+            compact_text(
+                total
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown-source")
+            )
+        ),
+    }
+    outln!(
+        "  fresh input {} (= input {} + cache write {})  cache read {}  output {} (reasoning {} nested inside)",
+        tokens
+            .get("freshInputTokens")
+            .and_then(|fresh| fresh["value"].as_u64())
+            .unwrap_or(0),
+        sum("inputTokens"),
+        sum("cacheWriteTokens"),
+        sum("cacheReadTokens"),
+        sum("outputTokens"),
+        sum("reasoningTokens")
+    );
+    let cost = &usage["cost"];
+    if let Some(amount) = cost["amountUsd"].as_f64() {
+        outln!(
+            "  cost ${amount:.4} over {} attempt(s) -- harness-reported cost only; tally's cgroup charge is a separate figure, is not summed here, and is a floor",
+            cost["attempts"].as_u64().unwrap_or(0)
+        );
+    }
+    let caveats = usage["caveats"].as_array().map_or(&[][..], Vec::as_slice);
+    if !caveats.is_empty() {
+        outln!(
+            "  partial: {}",
+            caveats
+                .iter()
+                .filter_map(Value::as_str)
+                .map(compact_text)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
     let flow_run_id = run["flowRunId"]
         .as_str()
@@ -785,6 +862,7 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
         counts["blocked"].as_u64().unwrap_or(0),
         counts["pending"].as_u64().unwrap_or(0)
     );
+    print_run_usage(&run["usage"])?;
 
     // Above the board, never inside it: a sub-issue closed with no merged
     // proof is a contradiction between what the forge shows a reader and what

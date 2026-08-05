@@ -9,6 +9,7 @@ use crate::completion::{GateSummaryStatus, SemanticCompletion};
 use crate::journal::{JournalEntry, TallyEvent};
 use crate::provenance::{Orchestration, TaskRef};
 use crate::taskdb::{GhOrigin, RelatedTrigger, WorkspaceMetadata};
+use crate::usage_rollup::UsageRollup;
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
 pub const QUERY_SCHEMA_VERSION: u32 = 1;
@@ -847,6 +848,21 @@ pub struct InFlightEntry {
     pub gh_origin: Option<GhOriginProjection>,
 }
 
+/// One flow run touched by the window, with the same rollup `query run`
+/// returns for it.
+///
+/// The window selects *which* runs are listed; it does not narrow what is
+/// summed. A run's usage is a property of the run, so a digest that summed only
+/// the attempts inside the window would answer "what did this run cost" with a
+/// smaller number every time the window shrank — a partial sum wearing a
+/// total's name.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StandupRunUsage {
+    pub flow_run_id: String,
+    pub usage: UsageRollup,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StandupDigest {
@@ -859,6 +875,12 @@ pub struct StandupDigest {
     pub gate_fails: Vec<CompletedEntry>,
     pub cancelled: Vec<CompletedEntry>,
     pub canonical_gpu_seconds: f64,
+    /// Every flow run this window touched, in run-ID order. Filled by
+    /// [`crate::query_v2::apply_standup_usage`], which owns the durable
+    /// membership and attestation reads this projection has no access to; an
+    /// unfilled digest carries an empty list rather than a wrong one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runs: Vec<StandupRunUsage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1026,6 +1048,7 @@ pub fn query_standup(
         gate_fails,
         cancelled,
         canonical_gpu_seconds,
+        runs: Vec::new(),
     }
 }
 

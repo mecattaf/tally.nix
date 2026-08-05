@@ -413,6 +413,49 @@ dependencies, current/failing node, and merged pull request where available. Oth
 receive current nodes and failures but have an empty task table; for those runs `state` reaches
 `complete` when every admitted node holds a passing terminal verdict on its current attempt.
 
+`query.run` also returns `usage`: what the run cost, summed per attempt from the advisory
+attestation ledger — keyed by `taskUuid`/`attempt`/`leaseEpoch` — over the run's durable
+membership, so every attempt of a retried task is charged and a node the run was handed but whose
+row names its creating run is inside the sum. See [Usage rollups](#usage-rollups).
+
+### Usage rollups
+
+A rollup is `advisory-provider-capture`: harnesses reporting on themselves, never a bill tally
+verified. `provenance` and `composition` state where the numbers came from and exactly what the
+total is a sum over, on the wire rather than only in this document.
+
+`tokens` carries `inputTokens`, `cacheReadTokens`, `cacheWriteTokens`, `outputTokens`, and
+`reasoningTokens`, each as a `{value, attempts}` pair so a component no harness in the run reports
+is visibly summed over fewer attempts than the rest. Three compositions are fixed and must not be
+re-derived by a consumer:
+
+- `freshInputTokens` is `inputTokens + cacheWriteTokens`, and it is the cross-harness uncached
+  prompt volume. `inputTokens` alone is not: claude-code's `cache_creation_input_tokens` are
+  fresh, uncached prompt tokens its `input_tokens` excludes, so summing `inputTokens` alone
+  understates a cache-writing harness by its entire cache-write volume while producing a figure
+  that looks directly comparable to codex's. Its `attemptsComplete`/`attemptsPartial` split marks
+  attempts that reported only one of the two halves, whose share of the value is a floor.
+- `reasoningTokens` is nested inside `outputTokens` and is never added to any total.
+- `inputTokensAsReported` is not summed at all: each harness's own input convention means a
+  different thing, and the two are not commensurable.
+
+`totalTokens` sums each attempt's own total and names its `source`: `harness-reported`,
+`derived-from-components`, or `mixed` for a run whose nodes span claude-code, whose `result` event
+states a cumulative total, and codex, whose real `turn.completed` carries none.
+
+`coverage` is the statement that keeps a partial sum from reading as a total. It counts member
+`tasks`, `tasksWithReportedUsage`, `tasksWithoutAttestation`, `attemptsObserved`, and then the
+attempts apart: `attemptsReported`, `attemptsNotReported` (a usage scrape was declared and the
+stream carried none), `attemptsNotDeclared` (the adapter declared no usage scrape), and
+`attemptsWithoutUsageRecord` (an attestation predating the usage record). `ledgerVerified` is
+false when the advisory chain did not verify, and then nothing is summed at all rather than
+answered as a zero. Every reason the sums are partial also appears as a named entry in `caveats`;
+an empty `caveats` array is the only claim of completeness the rollup makes.
+
+`cost` is the harness's own `costUsd`, summed over the attempts that reported one. Its `basis`
+field states what it is not: tally's cgroup `charge` is a distinct quantity, is not summed here,
+and is a floor that includes tally's own exit-recorder overhead.
+
 `query.log` filters by `task`, `flowRun`, `attempt`, `session`, lifecycle `event`, `source`,
 `since`, and `until`, and accepts optional `provenance` and `after`. A `flowRun`-scoped response
 also reports `flowRunTasks`; see [Flow-run membership](#flow-run-membership). `after` is a durable
@@ -466,7 +509,13 @@ pretty-printed JSON object; the CLI unwraps that string before printing.
 `query.standup` returns a window, completed and in-flight entries, reuse and gate-failure
 summaries, cancellations, and canonical GPU seconds. The RPC accepts a `source` filter even
 though the current CLI exposes only `--since`. Each completed, in-flight, gate-failed, and
-cancelled entry includes optional `taskRef`.
+cancelled entry includes optional `taskRef`. `runs` carries one `{flowRunId, usage}` entry per
+flow run the window touched, whose `usage` is the same rollup `query.run` returns — see [Usage
+rollups](#usage-rollups). A run is touched when the window holds an entry for a task it created
+*or* a task its durable membership names, so a run that only attached a node is still listed. The
+window selects which runs appear; it does not narrow what is summed, because a run's cost is a
+property of the run and a window-narrowed sum would shrink with the window while still being
+labelled the run's total.
 
 ### Pagination cursors
 

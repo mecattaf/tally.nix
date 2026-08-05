@@ -161,6 +161,13 @@ spec-build reconciler's task table, any current nodes with elapsed time and rema
 budget, and failure capture pointers plus stderr tails. Use `--json` when a steering agent needs
 the same compact view as structured data.
 
+It also answers "what did this run cost", summed per attempt out of the advisory attestation
+ledger and scoped by the run's durable membership — so a retried task is charged for every
+attempt and a node the run attached rather than created is inside the sum. Read the coverage
+beside the number: it is a sum over advisory captures, it says how many attempts reported usage
+against how many it observed, and it names every reason it is partial. `query standup` carries
+the same rollup for every run its window touched.
+
 `query log` restricts the lifecycle stream to the run's nodes, resolved from the
 orchestration capsule on the durable rows and the witness chain, because a
 lifecycle event carries no capsule of its own. `query proof` returns one proof

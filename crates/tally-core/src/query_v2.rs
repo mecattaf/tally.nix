@@ -12,13 +12,15 @@ use crate::journal::TallyEvent;
 use crate::occupancy::{ContextWindow, ContextWindowSource};
 use crate::provenance::{Orchestration, TaskRef};
 use crate::query::{
-    GhOriginProjection, HeadroomSignal, RowStatus, QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
+    GhOriginProjection, HeadroomSignal, RowStatus, StandupDigest, StandupRunUsage,
+    QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
 };
 use crate::taskdb::{
     related_trigger_from_gh_origin, AdmissionOrigin, ProducerOrigin, RelatedTrigger, RowSeed,
     WorkspaceMetadata,
 };
 use crate::usage::UsageObservation;
+use crate::usage_rollup::{roll_up, AttestationEvidence, UsageRollup};
 use crate::witness::{
     counts_toward_canonical_gpu_seconds, AttestationRecord, AuthorshipSession, AuthorshipStatus,
     Charge, LaborClass, Verdict, VerifyReport, WitnessRecord,
@@ -1099,6 +1101,10 @@ pub struct RunView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes: Option<FlowSupersedeRecord>,
     pub counts: RunTaskCounts,
+    /// What the run cost, summed per attempt over its durable membership.
+    /// Advisory by construction and partial by default; see
+    /// [`crate::usage_rollup`].
+    pub usage: UsageRollup,
     pub tasks: Vec<RunTaskProjection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anomalies: Vec<RunAnomalyProjection>,
@@ -1157,6 +1163,12 @@ struct ReconcileCheckpointTask {
 /// provenance fields carried by the general job collection. For spec-build,
 /// the schema-validated reconciliation result is the task-state source; live
 /// rows and canonical terminal witnesses only advance or block that view.
+///
+/// `attestations` is the advisory ledger the usage rollup sums, per attempt,
+/// over the run's durable membership. A caller with no ledger to offer passes
+/// [`AttestationEvidence::unavailable`] and gets a rollup that says it summed
+/// nothing, never one that reads as a zero-cost run.
+#[allow(clippy::too_many_arguments)]
 pub fn query_run(
     flow_run: &str,
     details: &[RowDetailFact],
@@ -1165,6 +1177,7 @@ pub fn query_run(
     witness: &[WitnessRecord],
     now: DateTime<Utc>,
     membership: &FlowMembership,
+    attestations: &AttestationEvidence<'_>,
 ) -> Result<RunView, ObservabilityError> {
     let flow_tasks = flow_run_tasks(flow_run, details, witness, membership);
     let parent_detail = details.iter().find(|detail| detail.task_uuid == flow_run);
@@ -1537,6 +1550,10 @@ pub fn query_run(
         superseded_by: None,
         supersedes: None,
         counts,
+        // Over `flow_tasks`, which is durable membership unioned with the rows
+        // and witnesses that name the run — so a node this run was handed but
+        // whose row names its creating run (the W-316 shape) is inside the sum.
+        usage: roll_up(flow_tasks.iter().map(String::as_str), attestations),
         tasks,
         anomalies,
         current_nodes,
@@ -1557,6 +1574,64 @@ pub fn apply_run_lineage(view: &mut RunView, lineage: &FlowLineage) {
     if view.superseded_by.is_some() {
         view.state = RunState::Superseded;
     }
+}
+
+/// Attach one usage rollup per flow run the stand-up window touched.
+///
+/// Kept out of [`crate::query::query_standup`] for the same reason lineage is
+/// kept out of [`query_run`]: durable membership and the attestation ledger are
+/// different stores from the rows, journal, and witness that projection reads,
+/// and the handler is where they are joined.
+///
+/// "Touched" is decided per entry, from two sources that disagree on purpose.
+/// A row's orchestration capsule names the run that *created* the node, while
+/// the membership ledger names every run that was *handed* it — so a node one
+/// run created and another attached (the W-316 shape) appears under both, and
+/// the run that only attached it does not silently drop out of the digest.
+pub fn apply_standup_usage(
+    digest: &mut StandupDigest,
+    details: &[RowDetailFact],
+    witness: &[WitnessRecord],
+    membership: &FlowMembership,
+    attestations: &AttestationEvidence<'_>,
+) {
+    let flow_run_by_task = details
+        .iter()
+        .filter_map(|detail| {
+            let flow_run = detail.orchestration.as_ref()?.flow_run_id().to_owned();
+            Some((detail.task_uuid.as_str(), flow_run))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let touched_tasks = digest
+        .completed
+        .iter()
+        .chain(&digest.gate_fails)
+        .chain(&digest.cancelled)
+        .filter_map(|entry| entry.task_uuid.as_deref())
+        .chain(
+            digest
+                .in_flight
+                .iter()
+                .filter_map(|entry| entry.task_uuid.as_deref()),
+        )
+        .collect::<BTreeSet<_>>();
+    let mut runs = BTreeSet::new();
+    for task in touched_tasks {
+        if let Some(flow_run) = flow_run_by_task.get(task) {
+            runs.insert(flow_run.clone());
+        }
+        runs.extend(membership.runs_holding(task).map(ToOwned::to_owned));
+    }
+    digest.runs = runs
+        .into_iter()
+        .map(|flow_run| {
+            let tasks = flow_run_tasks(&flow_run, details, witness, membership);
+            StandupRunUsage {
+                usage: roll_up(tasks.iter().map(String::as_str), attestations),
+                flow_run_id: flow_run,
+            }
+        })
+        .collect();
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -3318,6 +3393,7 @@ mod tests {
             &[],
             parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
 
@@ -3382,6 +3458,7 @@ mod tests {
             // 460 s elapsed against a 60 s budget.
             parse_timestamp("2026-08-01T10:07:40.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
 
@@ -3407,6 +3484,7 @@ mod tests {
             &[],
             parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
         assert!(pending.tasks.is_empty());
@@ -3420,6 +3498,7 @@ mod tests {
             &[witness],
             parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
         assert!(finished.tasks.is_empty());
@@ -3446,6 +3525,7 @@ mod tests {
                 std::slice::from_ref(&witness),
                 now,
                 &FlowMembership::default(),
+                &AttestationEvidence::unavailable(),
             )
             .unwrap()
         };
@@ -3577,6 +3657,7 @@ mod tests {
             &[],
             parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
 
@@ -3625,6 +3706,7 @@ mod tests {
             &[witness],
             parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
 
@@ -3683,6 +3765,7 @@ mod tests {
             &[],
             parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
 
@@ -3735,6 +3818,7 @@ mod tests {
             &[],
             parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
 
@@ -3800,6 +3884,7 @@ mod tests {
             &[witness],
             parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
 
@@ -3863,6 +3948,7 @@ mod tests {
             &[],
             parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
         assert_eq!(active.counts.done, 1);
@@ -3887,6 +3973,7 @@ mod tests {
             &[witness],
             parse_timestamp("2026-08-01T10:00:14.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
         assert_eq!(failed.counts.done, 1);
@@ -3917,6 +4004,7 @@ mod tests {
             &[witness],
             parse_timestamp("2026-08-01T10:00:13.000Z").unwrap(),
             &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
         )
         .unwrap();
 
@@ -4163,5 +4251,245 @@ mod tests {
             Some(0),
             "the row still carries the creating run's ordinal, unchanged"
         );
+    }
+
+    /// One scraped attempt as the exit recorder writes it: real codex numbers
+    /// from `test/fixtures/usage`, normalized the way `usage::observe` does.
+    fn scrape_attestation(
+        seq: u64,
+        task: &str,
+        attempt: u32,
+        output_tokens: u64,
+    ) -> AttestationRecord {
+        AttestationRecord {
+            observed_at: "2026-08-01T10:00:12.000Z".to_owned(),
+            payload: serde_json::json!({
+                "kind": "adapter-scrape",
+                "taskUuid": task,
+                "jobId": task,
+                "adapter": "codex",
+                "attempt": attempt,
+                "leaseEpoch": 7,
+                "captures": {},
+                "usage": {
+                    "state": "reported",
+                    "breakdown": {
+                        "shape": "components",
+                        "inputTokens": 262_086,
+                        "inputTokensAsReported": 7_060_166,
+                        "cacheReadTokens": 6_798_080,
+                        "cacheWriteTokens": 0,
+                        "outputTokens": output_tokens,
+                        "reasoningTokens": 15_163,
+                        "totalTokens": {
+                            "value": 262_086 + 6_798_080 + output_tokens,
+                            "source": "derived-from-components"
+                        }
+                    }
+                },
+                "usageAuthority": "advisory-only",
+            }),
+            seq,
+            prev_hash: "sha256:prev".to_owned(),
+            hash: "sha256:hash".to_owned(),
+        }
+    }
+
+    #[test]
+    fn acceptance_384_a_run_sums_the_usage_of_a_task_only_its_membership_names() {
+        // The W-316 shape: run B was handed a node run A created, so B owns no
+        // row for it and the scan is blind. The rollup must charge B for it
+        // anyway, because the durable membership says B ran it.
+        let run_a = "00000000-0000-4000-8000-0000000003a0";
+        let run_b = "00000000-0000-4000-8000-0000000003b0";
+        let shared = "00000000-0000-4000-8000-000000000250";
+        let details = vec![reconciliation_detail(run_a)];
+        assert_eq!(details[0].task_uuid, shared);
+
+        let mut ledger = FlowMembership::default();
+        ledger.insert(crate::flow_membership::FlowMembershipRecord::new(
+            run_b.to_owned(),
+            shared.to_owned(),
+            crate::flow_membership::MembershipDisposition::Attached,
+            Some(7),
+            Some("b-node-7".to_owned()),
+        ));
+        let records = [scrape_attestation(1, shared, 1, 32_842)];
+        let evidence = AttestationEvidence::new(true, &records);
+
+        let view = query_run(
+            run_b,
+            &details,
+            &[],
+            &history(),
+            &[],
+            parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &ledger,
+            &evidence,
+        )
+        .unwrap();
+        assert_eq!(view.usage.coverage.tasks, 1);
+        assert_eq!(view.usage.coverage.attempts_reported, 1);
+        assert_eq!(view.usage.coverage.tasks_without_attestation, 0);
+        assert_eq!(view.usage.tokens.output_tokens.value, 32_842);
+        assert_eq!(
+            view.usage.authority,
+            FactAuthority::AdvisoryProviderCapture,
+            "a rollup over advisory captures is graded as one"
+        );
+
+        // Without the membership ledger the same query sees no member at all,
+        // which is what makes the sum above membership's doing and not the
+        // scan's.
+        let scan_only = query_run(
+            run_b,
+            &details,
+            &[],
+            &history(),
+            &[],
+            parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &FlowMembership::default(),
+            &evidence,
+        );
+        assert!(matches!(scan_only, Err(ObservabilityError::UnknownJob(_))));
+    }
+
+    #[test]
+    fn a_run_rollup_counts_every_attempt_and_names_the_members_it_cannot_see() {
+        let flow_run = "00000000-0000-4000-8000-000000000249";
+        let node = flow_node_detail(flow_run, RowStatus::Completed);
+        let reconciliation = reconciliation_detail(flow_run);
+        let unscraped = reconciliation.task_uuid.clone();
+        let records = [
+            scrape_attestation(1, &node.task_uuid, 1, 100),
+            scrape_attestation(2, &node.task_uuid, 2, 200),
+        ];
+        let view = query_run(
+            flow_run,
+            &[node, reconciliation],
+            &[],
+            &history(),
+            &[],
+            parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &FlowMembership::default(),
+            &AttestationEvidence::new(true, &records),
+        )
+        .unwrap();
+
+        // Two members, two attempts of one of them, and the retry is charged.
+        assert_eq!(view.usage.coverage.tasks, 2);
+        assert_eq!(view.usage.coverage.attempts_observed, 2);
+        assert_eq!(view.usage.coverage.attempts_reported, 2);
+        assert_eq!(view.usage.tokens.output_tokens.value, 300);
+        // The member with no attestation is stated, never quietly dropped.
+        assert_eq!(view.usage.coverage.tasks_without_attestation, 1);
+        assert!(view
+            .usage
+            .caveats
+            .contains(&crate::usage_rollup::UsageRollupCaveat::MembersWithoutAttestation));
+        assert!(!view.usage.is_complete());
+        assert!(!unscraped.is_empty());
+    }
+
+    #[test]
+    fn a_run_view_built_without_the_ledger_reports_no_usage_rather_than_zero_usage() {
+        let flow_run = "00000000-0000-4000-8000-000000000249";
+        let node = flow_node_detail(flow_run, RowStatus::Completed);
+        let view = query_run(
+            flow_run,
+            &[node],
+            &[],
+            &history(),
+            &[],
+            parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
+        )
+        .unwrap();
+        assert!(!view.usage.coverage.ledger_verified);
+        assert_eq!(view.usage.tokens.total_tokens, None);
+        assert!(view
+            .usage
+            .caveats
+            .contains(&crate::usage_rollup::UsageRollupCaveat::LedgerUnverified));
+    }
+
+    fn standup_fixture(task_uuid: &str) -> StandupDigest {
+        StandupDigest {
+            schema_version: QUERY_SCHEMA_VERSION,
+            protocol_version: QUERY_PROTOCOL_VERSION,
+            window: crate::query::StandupWindow {
+                since: None,
+                until: "2026-08-01T10:00:12.000Z".to_owned(),
+            },
+            completed: vec![crate::query::CompletedEntry {
+                task_uuid: Some(task_uuid.to_owned()),
+                task_ref: None,
+                gpu_seconds: None,
+                verdict: Verdict::Pass,
+                session_ref: None,
+                gh_origin: None,
+            }],
+            in_flight: Vec::new(),
+            reused: 0,
+            gate_fails: Vec::new(),
+            cancelled: Vec::new(),
+            canonical_gpu_seconds: 0.0,
+            runs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn acceptance_384_standup_carries_one_rollup_per_run_the_window_touched() {
+        let run_a = "00000000-0000-4000-8000-0000000003a0";
+        let run_b = "00000000-0000-4000-8000-0000000003b0";
+        let shared = "00000000-0000-4000-8000-000000000250";
+        let details = vec![reconciliation_detail(run_a)];
+        let mut ledger = FlowMembership::default();
+        ledger.insert(crate::flow_membership::FlowMembershipRecord::new(
+            run_b.to_owned(),
+            shared.to_owned(),
+            crate::flow_membership::MembershipDisposition::Attached,
+            Some(7),
+            Some("b-node-7".to_owned()),
+        ));
+        let records = [scrape_attestation(1, shared, 1, 32_842)];
+
+        let mut digest = standup_fixture(shared);
+        apply_standup_usage(
+            &mut digest,
+            &details,
+            &[],
+            &ledger,
+            &AttestationEvidence::new(true, &records),
+        );
+
+        // Both runs touched the task: A created it, B was handed it. Neither
+        // is dropped, and each gets the same rollup `query run` would return.
+        assert_eq!(
+            digest
+                .runs
+                .iter()
+                .map(|run| run.flow_run_id.as_str())
+                .collect::<Vec<_>>(),
+            [run_a, run_b]
+        );
+        for run in &digest.runs {
+            assert_eq!(run.usage.coverage.attempts_reported, 1);
+            assert_eq!(run.usage.tokens.output_tokens.value, 32_842);
+            assert_eq!(run.usage.authority, FactAuthority::AdvisoryProviderCapture);
+        }
+
+        // A digest whose entries belong to no run lists no run, rather than an
+        // empty rollup that reads as a costless window.
+        let mut orphan = standup_fixture("00000000-0000-4000-8000-000000000024");
+        apply_standup_usage(
+            &mut orphan,
+            &details,
+            &[],
+            &ledger,
+            &AttestationEvidence::new(true, &records),
+        );
+        assert!(orphan.runs.is_empty());
     }
 }
