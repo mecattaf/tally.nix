@@ -8,6 +8,42 @@ authorized.
 
 ### Added
 
+- **The `pi` preset declares its trace framing, and an occupancy capture, from
+  a real `pi --mode json` capture (#387).** `pi` carried launch and resume
+  argv and every scrape capture but no `trace = { stream; framing; }` block,
+  so a pi node produced no `TraceGeneration` and no `TraceLane` and
+  `tally query trace` rendered no lane for it — an observability hole that
+  read as "nothing happened" rather than as "nothing was declared", in the one
+  adapter that has not yet run a campaign here. It now declares
+  `stdout`/`json-lines`, which is what pi's own `docs/json.md` documents and
+  what the capture now checked in at `test/fixtures/traces/pi.jsonl` does: 21
+  retained lines on stdout, zero bytes on stderr. Config only; no Rust change
+  was needed or made.
+
+  The same capture settles pi's usage key names — every assistant message
+  carries `{ input, output, cacheRead, cacheWrite, reasoning, totalTokens,
+  cost }`, with `input` exclusive of both cache halves (second turn: input
+  190, cacheRead 842, output 46, totalTokens 1078) — and settles something
+  else: pi states usage **per assistant message and never per attempt**.
+  There is no `turn.completed`-style roll-up anywhere in its stream. A
+  declared spend mapping would therefore report one turn as an attempt's
+  usage and understate every multi-turn pi node, so `usage` stays
+  unmapped — now for a stated reason rather than for want of evidence. The
+  honest reading of a per-turn figure is occupancy, and `pi` declares one,
+  scoped to assistant `message_end` events under
+  `residentInputTokens`/`residentCacheReadTokens`/`residentCacheWriteTokens`,
+  which resolves to 1032 resident tokens on the checked-in capture. The
+  capture also excludes turns pi marks `aborted` (and, by analogy with SSSF's
+  `calculateContextTokens`, `error`): pi zero-fills every token field on an
+  aborted turn, and `context_tokens` returns `None` only when all three
+  resident fields are *absent*, so an unguarded scrape would report `Some(0)`
+  — a fabricated empty context — for a session carrying a full one.
+  `test/fixtures/traces/pi-aborted-turn.jsonl` is that stream, and the
+  `adapter-presets` flake check asserts the guarded capture resolves it to
+  the last valid turn. That check renders the preset against both fixtures
+  and asserts every resolved value, so the declaration is proved against
+  recorded bytes rather than against a stream written to agree with it.
+
 - **Context occupancy is recorded beside session identity, everywhere
   `sessionRef` is (#383).** "Context is occupancy, not spend" — the number
   that decides whether a session can absorb another task, not what it cost,
@@ -192,6 +228,26 @@ authorized.
   charges.
 
 ### Fixed
+
+- **The `pi` preset's launch and resume argv could not run (#387).** Both
+  ended in `--`, tally's option-terminator convention across presets. pi has
+  no end-of-options separator: it rejects one with `Error: Unknown option:
+  --`, exits 1, and writes zero bytes to stdout — so every pi node was a dead
+  launch, no capture was ever produced, and `sessionRef`, `occupancy` and
+  `finalMessage` could never resolve. The trailing `--` is dropped from both
+  argv lists and from the operator-facing preset table. The cost of dropping
+  it is stated rather than absorbed: pi parses a workload argv whose first
+  element begins with `-` as a flag, and nothing enforces otherwise.
+
+  Two adjacent pi behaviours are now documented rather than fixed, because
+  no configuration can fix them. pi keys its session store by the directory
+  it was launched in, so a resume from a different cwd prints
+  `Session found in different project` on stdout, prompts on stderr, and
+  exits 0 having done nothing; pinning `--session-dir` does not change this,
+  because pi still requires exact equality with the session's recorded cwd
+  (`sessionCwdMatches`) and otherwise falls through to the same
+  cross-project branch. A pi node must be resumed in the directory it was
+  launched in, and pi exposes no cwd flag for `launch.cwdArgv` to assert it.
 
 - **The exit-20 flow refusals now carry one `details` contract, identical at
   every raising site (#390).** `script-changed-mid-run`,

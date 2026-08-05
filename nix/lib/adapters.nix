@@ -120,12 +120,50 @@ let
 
   presets = {
     pi = mkAdapter {
+      # `pi --mode json` emits its session events as JSON lines on stdout --
+      # its own `docs/json.md` says so ("Outputs all session events as JSON
+      # lines to stdout"), and the capture in `test/fixtures/traces/pi.jsonl`
+      # is a real run that did exactly that, 21 retained lines on stdout and
+      # an empty stderr. Without this block a pi node produced no
+      # `TraceGeneration` and no `TraceLane`, so `query trace` rendered no
+      # lane for it.
+      #
+      # "JSON lines on stdout" is the framing, not an invariant pi holds on
+      # every path: a resume whose cwd no longer matches the session's prints
+      # the plain-text line `Session found in different project: <dir>` on
+      # stdout and asks `Fork this session into current directory? [y/N]` on
+      # stderr, then exits 0. Tally records a non-JSON line as a malformed
+      # advisory observation, which is the honest handling, so the framing
+      # declaration stands -- but see the resume argv below for what that
+      # path costs.
+      trace = {
+        stream = "stdout";
+        framing = "json-lines";
+      };
+      # No trailing `--`: pi has no end-of-options separator and rejects one
+      # outright (`Error: Unknown option: --`, exit 1, zero bytes on stdout),
+      # so the `--`-terminated argv this preset used to declare could never
+      # produce the stream the trace block above describes. The cost of
+      # dropping it is real and is not enforced anywhere: a workload argv
+      # whose first element begins with `-` is parsed by pi as a flag. That
+      # is a narrowing on leading-dash payloads; the alternative was an argv
+      # that failed on every payload.
       argv = [
         "pi"
         "--mode"
         "json"
-        "--"
       ];
+      # pi keys its session store by the directory it was launched in, and
+      # `--session <id>` resolves against that key first. A resume from a
+      # different cwd therefore does not fail: pi reports
+      # `Session found in different project`, prompts on stderr, and exits 0
+      # having done nothing -- a successful attempt that did no work. Pinning
+      # `--session-dir` does not close this: with a custom session dir pi
+      # still filters by the session's recorded cwd
+      # (`sessionCwdMatches(session.cwd, resolvedCwd)`, exact path equality)
+      # and falls through to the same cross-project branch. A pi node must be
+      # resumed in the cwd it was launched in; nothing in this preset can
+      # assert that, and pi offers no cwd flag for `launch.cwdArgv` to use.
       resume = [
         "pi"
         "--mode"
@@ -134,7 +172,6 @@ let
         "%<sessionRef>%"
         "--model"
         "%<model>%"
-        "--"
       ];
       scrape = {
         sessionRef = mkScrapeCapture {
@@ -145,16 +182,54 @@ let
           mode = "jsonPath";
           pattern = "$..model";
         };
-        # No `fields` mapping yet: pi has never run a campaign here, and
-        # inventing its key names would be a fixture wrong in the same
-        # direction as the code. Until a real `pi --mode json` capture is on
-        # hand this capture keeps the legacy reading (total_tokens, else
-        # input_tokens plus output_tokens), which is what it had before the
-        # mapping existed. Declaring the real keys is an attrset here, not a
-        # Rust change.
+        # Still no `fields` mapping, and now for a stated reason rather than
+        # for want of evidence. A real `pi --mode json` capture is on hand
+        # (`test/fixtures/traces/pi.jsonl`) and it settles the key names:
+        # every assistant message carries
+        # `usage = { input, output, cacheRead, cacheWrite, reasoning,
+        # totalTokens, cost }`, with `input` exclusive of both cache halves
+        # (the capture's second turn reports input 190, cacheRead 842,
+        # output 46, totalTokens 1078 = 190 + 46 + 842 + 0).
+        #
+        # What the capture also settles is that pi states usage **per
+        # assistant message and never per attempt**: there is no
+        # `turn.completed`-style roll-up anywhere in the stream, so this
+        # capture's last match is one turn's figures, not the attempt's
+        # spend. Declaring `inputTokens = [ "input" ]` here would report a
+        # single turn as an attempt's usage and understate every multi-turn
+        # pi node -- the mirror image of the mistake `codex` declines when it
+        # refuses to report a cumulative total as occupancy. The honest
+        # reading of a per-turn figure is occupancy, which is declared below.
         usage = mkScrapeCapture {
           mode = "jsonPath";
           pattern = "$..usage";
+        };
+        # Occupancy is exactly what pi's per-message usage is: the tokens
+        # resident in the context window as of one assistant turn. The
+        # capture is scoped to assistant `message_end` events so its last
+        # match is the last completed assistant turn rather than the
+        # zero-filled `message_start` placeholder or a `toolResult` message,
+        # and the field names are occupancy's own so a spend lookup can never
+        # resolve against it -- see `crate::occupancy`'s module doc.
+        #
+        # The `stopReason` guards are what make "last assistant turn" mean
+        # "last **valid** assistant turn", which is what `context_tokens`
+        # documents itself as. pi zero-fills the usage object on a turn it
+        # marks `aborted`, and `context_tokens` returns `None` only when all
+        # three resident fields are absent -- three resolved zeroes are
+        # `Some(0)`, a fabricated emptiness for a session that was thousands
+        # of tokens full. `test/fixtures/traces/pi-aborted-turn.jsonl` is that
+        # stream. `aborted` is proven from real pi data on this host;
+        # `error` is guarded by analogy with SSSF's `calculateContextTokens`,
+        # which skips both, and has not been observed here.
+        occupancy = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.usage";
+          fields = {
+            residentInputTokens = [ "input" ];
+            residentCacheReadTokens = [ "cacheRead" ];
+            residentCacheWriteTokens = [ "cacheWrite" ];
+          };
         };
         finalMessage = mkScrapeCapture {
           mode = "jsonPathLast";
