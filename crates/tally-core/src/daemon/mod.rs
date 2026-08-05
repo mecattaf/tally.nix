@@ -125,6 +125,7 @@ use crate::lease::{
     LeaseRequest, LeaseSchedulingGroup, LocalLease, SystemdUnitLiveness,
 };
 use crate::nix_store::{DerivationAvailability, NixStore};
+use crate::occupancy;
 use crate::pagination::{PageCache, PaginationError};
 use crate::producer_query::query_producers;
 use crate::producers::{

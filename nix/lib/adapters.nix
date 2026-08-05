@@ -220,6 +220,31 @@ let
           pattern = "$[?@.type == 'result'].total_cost_usd";
           fields.costUsd = [ "$" ];
         };
+        # Occupancy needs a narrower capture than `usage`: `usage` keeps the
+        # last `usage` object anywhere in the stream, which is the `result`
+        # event's session-lifetime roll-up, not a turn. This capture is
+        # scoped to only `type == "assistant"` events, so its last match is
+        # genuinely the last assistant turn. The field names are spelled
+        # differently from `usage`'s own (`residentInputTokens` rather than
+        # `inputTokens`) so a lookup for one can never resolve against the
+        # other's declared capture -- see `crate::occupancy`'s module doc.
+        occupancy = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'assistant'].message.usage";
+          fields = {
+            residentInputTokens = [ "input_tokens" ];
+            residentCacheReadTokens = [ "cache_read_input_tokens" ];
+            residentCacheWriteTokens = [ "cache_creation_input_tokens" ];
+          };
+        };
+        # The result event's per-model usage breakdown carries the harness's
+        # own context window beside its cost, so this is a stated fact, not
+        # a guess: real captures put it at `modelUsage.<model>.contextWindow`.
+        contextWindow = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'result'].modelUsage.*.contextWindow";
+          fields.contextWindow = [ "$" ];
+        };
         finalMessage = mkScrapeCapture {
           mode = "jsonPathLast";
           pattern = "$[?@.type == 'result'].result";
@@ -287,6 +312,18 @@ let
           mode = "jsonPathLast";
           pattern = "$[?@.type == 'item.completed' && @.item.type == 'agent_message'].item.text";
         };
+        # No `contextWindow` capture: no `turn.completed` in this project's
+        # corpus has ever stated one, and declaring a key nobody has observed
+        # is a guess wearing a declaration's clothes. An operator who knows
+        # the model's ceiling can still assert it via `extraConfig.contextWindow`.
+        #
+        # No `occupancy` capture either: `codex exec --json` emits exactly
+        # one `turn.completed` per exec, carrying only the cumulative
+        # `total_token_usage` shape codex's own rollout journal keeps beside
+        # a true per-turn `last_token_usage` -- a shape the exec stream never
+        # exposes. Declaring occupancy from the cumulative total would state
+        # a number that grows without bound against a fixed window, so it is
+        # left undeclared, matching `pi`'s usage mapping precedent.
       };
       yieldHook = checkpointHook;
       launch = {

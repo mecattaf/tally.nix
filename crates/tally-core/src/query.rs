@@ -1128,6 +1128,8 @@ mod tests {
                 stderr_tail: None,
                 stderr_truncated: None,
                 gpu_seconds: Some(4.0),
+                context_tokens: Some(4096),
+                context_window: Some(200_000),
                 artifact_hash: Some("sha256:artifact".to_owned()),
                 evidence: Some("exit:0".to_owned()),
                 attempt: Some(1),

@@ -432,7 +432,11 @@ fn field_paths<'a>(capture_name: &str, capture: &'a ScrapeCapture, logical: &str
         .map_or_else(Vec::new, |paths| paths.iter().map(String::as_str).collect())
 }
 
-fn resolve<'a>(
+/// Resolve one logical field against an adapter's declared captures. Public
+/// within the crate so a sibling concern with its own logical field names —
+/// [`crate::occupancy`] is the first — reads through the same mapping
+/// [`observe`] does rather than growing a parallel resolver.
+pub(crate) fn resolve<'a>(
     adapter: &AdapterConfig,
     captures: &'a ScrapeResult,
     logical: &str,
@@ -475,7 +479,7 @@ fn resolve_path<'a>(root: &'a Value, path: &str) -> Option<&'a Value> {
 /// A token count is a non-negative integer. A float that happens to be a whole
 /// number is accepted because JSON writers do emit them; anything else is
 /// unreadable rather than silently zero.
-fn as_count(value: &Value) -> Option<u64> {
+pub(crate) fn as_count(value: &Value) -> Option<u64> {
     if let Some(count) = value.as_u64() {
         return Some(count);
     }
@@ -1102,10 +1106,17 @@ mod tests {
                 row.usage, None,
                 "{arm}: no attempt was ever scraped for this row"
             );
+            assert_eq!(row.context_tokens, None, "{arm}: occupancy is N-1 too");
+            assert_eq!(row.context_window, None, "{arm}: occupancy is N-1 too");
             let reserialized = serde_json::to_value(&row).unwrap();
             assert!(
                 reserialized.get("usage").is_none(),
                 "{arm}: an absent usage record adds no key to a row that never had one"
+            );
+            assert!(
+                reserialized.get("contextTokens").is_none()
+                    && reserialized.get("contextWindow").is_none(),
+                "{arm}: absent occupancy adds no keys to a row that never had them"
             );
             for (key, value) in row_json.as_object().unwrap() {
                 assert_eq!(

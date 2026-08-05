@@ -1469,6 +1469,8 @@ mod tests {
             evidence_class: None,
             manifest_hash: None,
             usage: None,
+            context_tokens: None,
+            context_window: None,
         })
         .unwrap()
     }

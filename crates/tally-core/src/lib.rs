@@ -16,6 +16,7 @@ pub mod history;
 pub mod journal;
 pub mod lease;
 pub mod nix_store;
+pub mod occupancy;
 pub mod pagination;
 pub mod poolset;
 pub mod producer_query;

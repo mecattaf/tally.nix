@@ -833,6 +833,8 @@ fn trace_lanes(
                 lease_epoch: detail.lease_epoch,
                 adapter: detail.adapter.clone(),
                 session_ref: detail.session_ref.clone(),
+                context_tokens: detail.context_tokens,
+                context_window: detail.context_window.map(|window| window.tokens),
                 running: false,
                 remote: detail.executor.is_some(),
             },
@@ -856,6 +858,8 @@ fn trace_lanes(
                 .clone()
                 .unwrap_or_else(|| "unknown".to_owned()),
             session_ref: record.fields.session_ref.clone(),
+            context_tokens: record.fields.context_tokens,
+            context_window: record.fields.context_window,
             running: false,
             remote: record.fields.executor.is_some(),
         });
@@ -870,6 +874,12 @@ fn trace_lanes(
         }
         if record.fields.session_ref.is_some() {
             lane.session_ref.clone_from(&record.fields.session_ref);
+        }
+        if record.fields.context_tokens.is_some() {
+            lane.context_tokens = record.fields.context_tokens;
+        }
+        if record.fields.context_window.is_some() {
+            lane.context_window = record.fields.context_window;
         }
         lane.remote |= record.fields.executor.is_some();
     }

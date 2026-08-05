@@ -278,7 +278,40 @@ impl DaemonHandler {
         scrape_capture: bool,
     ) {
         if !scrape_capture {
-            self.emit_post_ack(completed_event(&job, &result, evidence));
+            // No capture is available for this attempt -- usage and the
+            // scraped half of context_window genuinely have nothing to read.
+            // A config-declared ceiling depends on none of that, so it is
+            // still checked here rather than silently narrowing the promise
+            // `crate::occupancy`'s doc makes ("the config ceiling still
+            // needs checking, because it depends on nothing scraped").
+            let handler = self.clone();
+            let task = tokio::task::spawn_local(async move {
+                let mut job = job;
+                job.row.context_window = {
+                    let context = handler.context.read().await;
+                    context
+                        .config
+                        .adapters
+                        .get(&job.row.adapter)
+                        .and_then(|adapter| occupancy::context_window(adapter, None))
+                };
+                if job.row.context_window.is_some() {
+                    let mut context = handler.context.write().await;
+                    if let Some(stored) = context.jobs.get_mut(&job.job_id) {
+                        stored.row.context_window = job.row.context_window;
+                    }
+                    if let Some(detail) = job
+                        .task_uuid
+                        .and_then(|task_uuid| context.query_details.get_mut(&task_uuid))
+                    {
+                        detail.context_window = job.row.context_window;
+                    }
+                }
+                handler.emit_post_ack(completed_event(&job, &result, evidence));
+            });
+            let mut tasks = self.post_ack_tasks.borrow_mut();
+            tasks.retain(|task| !task.is_finished());
+            tasks.push(task);
             return;
         }
         let handler = self.clone();
@@ -298,19 +331,25 @@ impl DaemonHandler {
             if !scrape_configured {
                 // An adapter with no captures at all declared no usage scrape.
                 // Record that as a value so a later reader is not left to infer
-                // it from a missing key.
+                // it from a missing key. A config-declared context window does
+                // not depend on a scrape, so it is still checked here.
                 let mut job = job;
                 job.row.usage = Some(UsageObservation::NotDeclared);
+                job.row.context_window = adapters
+                    .get(&job.row.adapter)
+                    .and_then(|adapter| occupancy::context_window(adapter, None));
                 {
                     let mut context = handler.context.write().await;
                     if let Some(stored) = context.jobs.get_mut(&job.job_id) {
                         stored.row.usage.clone_from(&job.row.usage);
+                        stored.row.context_window = job.row.context_window;
                     }
                     if let Some(detail) = job
                         .task_uuid
                         .and_then(|task_uuid| context.query_details.get_mut(&task_uuid))
                     {
                         detail.usage.clone_from(&job.row.usage);
+                        detail.context_window = job.row.context_window;
                     }
                 }
                 handler.emit_post_ack(completed_event(&job, &result, evidence));
@@ -338,6 +377,16 @@ impl DaemonHandler {
                     .map_or(UsageObservation::NotDeclared, |config| {
                         crate::usage::observe(config, &captures)
                     });
+                // Occupancy reads the same captures usage was normalized
+                // from, but through its own narrower resolution -- it is not
+                // derived from `usage`, which keeps a session-lifetime
+                // roll-up under a spend meaning. See `crate::occupancy`.
+                let context_tokens = adapters
+                    .get(&adapter)
+                    .and_then(|config| occupancy::context_tokens(config, &captures));
+                let context_window = adapters
+                    .get(&adapter)
+                    .and_then(|config| occupancy::context_window(config, Some(&captures)));
                 let attestation_error = if captures.captures.is_empty() {
                     None
                 } else {
@@ -362,29 +411,37 @@ impl DaemonHandler {
                         .map(|error| error.to_string())
                 };
                 let meter_errors = feed_scraped_usage(&state_dir, &pools, &leased_pools, &usage);
-                Ok::<_, String>((captures, usage, attestation_error, meter_errors))
+                Ok::<_, String>((
+                    captures,
+                    usage,
+                    context_tokens,
+                    context_window,
+                    attestation_error,
+                    meter_errors,
+                ))
             })
             .await;
 
-            let (captures, usage, attestation_error, meter_errors) = match scraped {
-                Ok(Ok(scraped)) => scraped,
-                Ok(Err(error)) => {
-                    eprintln!(
-                        "tally: post-ack adapter scrape failed for {}: {error}",
-                        job.stable_key()
-                    );
-                    handler.emit_post_ack(completed_event(&job, &result, evidence));
-                    return;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "tally: post-ack adapter scrape worker failed for {}: {error}",
-                        job.stable_key()
-                    );
-                    handler.emit_post_ack(completed_event(&job, &result, evidence));
-                    return;
-                }
-            };
+            let (captures, usage, context_tokens, context_window, attestation_error, meter_errors) =
+                match scraped {
+                    Ok(Ok(scraped)) => scraped,
+                    Ok(Err(error)) => {
+                        eprintln!(
+                            "tally: post-ack adapter scrape failed for {}: {error}",
+                            job.stable_key()
+                        );
+                        handler.emit_post_ack(completed_event(&job, &result, evidence));
+                        return;
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "tally: post-ack adapter scrape worker failed for {}: {error}",
+                            job.stable_key()
+                        );
+                        handler.emit_post_ack(completed_event(&job, &result, evidence));
+                        return;
+                    }
+                };
             for error in meter_errors {
                 eprintln!(
                     "tally: built-in usage meter feeder failed for {}: {error}",
@@ -415,6 +472,8 @@ impl DaemonHandler {
             // carried no usage is a different fact from an attempt nobody
             // scraped, and only recording the value keeps them apart.
             enriched.row.usage = Some(usage);
+            enriched.row.context_tokens = context_tokens;
+            enriched.row.context_window = context_window;
             {
                 let mut context = handler.context.write().await;
                 if let Some(stored) = context.jobs.get_mut(&enriched.job_id) {
@@ -425,6 +484,8 @@ impl DaemonHandler {
                         .final_message
                         .clone_from(&enriched.row.final_message);
                     stored.row.usage.clone_from(&enriched.row.usage);
+                    stored.row.context_tokens = enriched.row.context_tokens;
+                    stored.row.context_window = enriched.row.context_window;
                 }
                 if let Some(task_uuid) = enriched.task_uuid {
                     if let Some(row) = context.query_rows.get_mut(&task_uuid) {
@@ -437,6 +498,8 @@ impl DaemonHandler {
                         detail.observed_model.clone_from(&enriched.row.model);
                         detail.final_message.clone_from(&enriched.row.final_message);
                         detail.usage.clone_from(&enriched.row.usage);
+                        detail.context_tokens = enriched.row.context_tokens;
+                        detail.context_window = enriched.row.context_window;
                     }
                 }
             }
@@ -1036,6 +1099,8 @@ fn execution_event(job: &Job, event: TallyEvent) -> EmitEvent {
         stderr_tail: None,
         stderr_truncated: None,
         gpu_seconds: None,
+        context_tokens: None,
+        context_window: None,
         artifact_hash: None,
         evidence: None,
         attempt: Some(job.row.attempt),
@@ -1335,6 +1400,8 @@ fn evidence_event(job: &Job, check: &CheckOutcome) -> EmitEvent {
         stderr_tail: None,
         stderr_truncated: None,
         gpu_seconds: None,
+        context_tokens: None,
+        context_window: None,
         artifact_hash: None,
         evidence: Some(check.spec.clone()),
         attempt: Some(job.row.attempt),
@@ -1368,6 +1435,8 @@ pub(super) fn completed_event(job: &Job, result: &JobResult, evidence: String) -
             .as_ref()
             .map(|excerpt| excerpt.truncated),
         gpu_seconds: result.gpu_seconds,
+        context_tokens: job.row.context_tokens,
+        context_window: job.row.context_window.as_ref().map(|window| window.tokens),
         artifact_hash: result.artifact_content_hash.clone(),
         evidence: Some(evidence),
         attempt: Some(result.attempt),

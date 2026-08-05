@@ -2168,6 +2168,8 @@ mod tests {
             evidence_class: None,
             manifest_hash: None,
             usage: None,
+            context_tokens: None,
+            context_window: None,
         }
     }
 
@@ -2194,6 +2196,8 @@ mod tests {
             stderr_tail: None,
             stderr_truncated: None,
             gpu_seconds: terminal.then_some(0.0),
+            context_tokens: None,
+            context_window: None,
             artifact_hash: (event == TallyEvent::Completed)
                 .then(|| format!("sha256:{}", "a".repeat(64))),
             evidence: event.is_evidence().then(|| "exit:0".to_owned()),
@@ -6261,6 +6265,13 @@ mod tests {
                     stream: ScrapeStream::Stdout,
                     framing: TraceFraming::JsonLines,
                 });
+                // No `contextWindow` scrape is declared, so the config
+                // ceiling is what this attempt's `query.job` should render —
+                // proof the config provenance path is real end to end, not
+                // only unit-tested against a synthetic `ScrapeResult`.
+                adapter
+                    .extra_config
+                    .insert("contextWindow".to_owned(), json!(200_000));
                 config.adapters.insert("from-nix".to_owned(), adapter);
                 let executor = direct_executor(&paths.state_dir)
                     .with_systemd_run(temp.path().join("absent-systemd-run"))
@@ -6432,6 +6443,29 @@ mod tests {
                     "the breakdown renders as an advisory provider capture, never collapsed \
                      into a canonical authority"
                 );
+                // Occupancy rides beside `usage`, but is read through its own
+                // narrower capture, never derived from `usage`'s
+                // session-lifetime total: this synthetic adapter declares no
+                // `occupancy` capture (it is not claude-code-shaped), so
+                // `contextTokens` is absent rather than reusing the same
+                // 999999 `usage` reports -- proof the two are no longer the
+                // same number under two names. `contextWindow` is
+                // config-declared here and renders with the advisory,
+                // non-durable authority true of a live-config value that
+                // vanishes on restart.
+                assert_eq!(
+                    before["job"].get("contextTokens"),
+                    None,
+                    "no occupancy capture is declared for this adapter"
+                );
+                assert_eq!(
+                    before["job"]["contextWindow"],
+                    json!({
+                        "value": 200000,
+                        "authority": "advisory-config",
+                        "provenance": "adapter-config",
+                    })
+                );
                 let canonical_before = json!({
                     "priority": before["job"]["priority"],
                     "pool": before["job"]["pool"],
@@ -6473,6 +6507,11 @@ mod tests {
                     trace["items"][0]["payload"]["event"]["claimed_charge"],
                     999999
                 );
+                // `query.trace` exposes both fields too, flattened beside
+                // `sessionRef` on the same lane -- `contextTokens` absent for
+                // the same reason it is on `query.job`.
+                assert_eq!(trace["items"][0].get("contextTokens"), None);
+                assert_eq!(trace["items"][0]["contextWindow"], 200000);
                 let after = daemon
                     .handler
                     .query("query.job", Some(json!({"id": task_uuid})))
