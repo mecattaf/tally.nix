@@ -6376,6 +6376,7 @@ mod tests {
                 assert_eq!(usage["coverage"]["tasks"], 1);
                 assert_eq!(usage["coverage"]["attemptsObserved"], 1);
                 assert_eq!(usage["coverage"]["attemptsReported"], 1);
+                assert_eq!(usage["coverage"]["attemptsReportedWithComponents"], 1);
                 assert_eq!(usage["tokens"]["inputTokens"]["value"], 83);
                 assert_eq!(usage["tokens"]["cacheWriteTokens"]["value"], 265_127);
                 assert_eq!(usage["tokens"]["cacheReadTokens"]["value"], 11_093_140);
@@ -6495,6 +6496,10 @@ mod tests {
                 assert_eq!(
                     usage["coverage"]["attemptsReportedWithoutFigures"], 0,
                     "one key drifted, not all of them"
+                );
+                assert_eq!(
+                    usage["coverage"]["attemptsReportedWithComponents"], 1,
+                    "the attempt reported components, so the threshold judges it"
                 );
                 assert_eq!(usage["tokens"]["inputTokens"]["attempts"], 1);
                 assert_eq!(usage["tokens"]["cacheReadTokens"]["attempts"], 0);

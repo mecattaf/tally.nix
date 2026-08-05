@@ -50,14 +50,20 @@ authorized.
   - **A single renamed harness key is caught too.** When any of the four
     components the total is a sum of — `inputTokens`, `cacheReadTokens`,
     `cacheWriteTokens`, `outputTokens` — was reported by fewer attempts than
-    reported usage, that component's sum is over a subset of the reporting
-    attempts and the rollup raises `partial-components`. Drift in one key
-    leaves every other figure resolving, so the attempt still contributes and
-    is not in `attemptsReportedWithoutFigures`; on a real claude-code capture
-    one renamed `cache_read_input_tokens` silently removes 97% of the run's
-    tokens from the total. `reasoningTokens` is deliberately excluded from
-    that check, because claude-code reports no reasoning figure and it enters
-    no total, so checking it would fire on every claude run.
+    `attemptsReportedWithComponents`, that component's sum is over a subset of
+    those attempts and the rollup raises `partial-components`. Drift in one
+    key leaves every other figure resolving, so the attempt still contributes
+    and is not in `attemptsReportedWithoutFigures`; on a real claude-code
+    capture one renamed `cache_read_input_tokens` silently removes 97% of the
+    run's tokens from the total. Two exclusions are deliberate:
+    `reasoningTokens` is not checked, because claude-code reports no reasoning
+    figure and it enters no total, so checking it would fire on every claude
+    run; and the denominator excludes attempts whose harness stated a total of
+    its own and reported no component beside it — what an adapter declaring
+    only a `totalTokens` mapping produces — because such an attempt declared
+    no components to be missing. That exclusion is one shape wide: an attempt
+    reporting any component is judged even when its harness also stated a
+    total, so drift cannot hide behind a stated total.
   - **Authority is graded, and the grade is about the adapter, not the
     harness's reputation.** The whole rollup is `advisory-provider-capture` —
     harnesses reporting on themselves. `totalTokens.source` is

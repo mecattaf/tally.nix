@@ -455,10 +455,10 @@ than on which harness it believes ran.
 
 `coverage` is the statement that keeps a partial sum from reading as a total. It counts member
 `tasks`, `tasksWithReportedUsage`, `tasksWithoutAttestation`, `attemptsObserved`, and then the
-attempts apart: `attemptsReported`, `attemptsReportedWithoutFigures`, `attemptsNotReported` (a
-usage scrape was declared and the stream carried none), `attemptsNotDeclared` (the adapter
-declared no usage scrape), and `attemptsWithoutUsageRecord` (an attestation predating the usage
-record). `attemptsReportedWithoutFigures` is the subset of `attemptsReported` that contributed
+attempts apart: `attemptsReported`, `attemptsReportedWithoutFigures`,
+`attemptsReportedWithComponents`, `attemptsNotReported` (a usage scrape was declared and the
+stream carried none), `attemptsNotDeclared` (the adapter declared no usage scrape), and
+`attemptsWithoutUsageRecord` (an attestation predating the usage record). `attemptsReportedWithoutFigures` is the subset of `attemptsReported` that contributed
 nothing: the harness reported usage and **no** declared field path resolved — absence is not
 unreadability, so nothing lands in `unreadableFields` and the observation is still `reported`.
 Those attempts raise `reported-without-figures` rather than being counted as covered. That bucket
@@ -467,13 +467,23 @@ elsewhere, because the attempt still contributes.
 
 Drift in one key is what the per-component `attempts` counts are for, and the rollup now reads
 them: when any of the four components the total is a sum of — `inputTokens`, `cacheReadTokens`,
-`cacheWriteTokens`, `outputTokens` — was reported by fewer attempts than `attemptsReported`, that
-component's sum is over a subset of the reporting attempts and the rollup raises
-`partial-components`. On a real claude-code capture, one renamed `cache_read_input_tokens` takes
-97% of the run's tokens out of the total while every other figure still resolves, so this is the
-difference between a partial sum that says so and one that does not. `reasoningTokens` is
-deliberately not in that check: claude-code reports no reasoning figure and it enters no total, so
-checking it would fire on every claude run.
+`cacheWriteTokens`, `outputTokens` — was reported by fewer attempts than
+`attemptsReportedWithComponents`, that component's sum is over a subset of those attempts and the
+rollup raises `partial-components`. On a real claude-code capture, one renamed
+`cache_read_input_tokens` takes 97% of the run's tokens out of the total while every other figure
+still resolves, so this is the difference between a partial sum that says so and one that does
+not. A consumer diagnosing the caveat compares the per-component `attempts` against
+`attemptsReportedWithComponents`; the drifted component is the one below it.
+
+Two exclusions from that check, both deliberate. `reasoningTokens` is not in it: claude-code
+reports no reasoning figure and it enters no total, so checking it would fire on every claude run.
+And the denominator is `attemptsReportedWithComponents` rather than `attemptsReported`, which
+excludes attempts whose harness stated a total of its own and reported no component beside it —
+the shape an adapter declaring only a `totalTokens` mapping produces. Such an attempt declared no
+components to be missing, so judging it against a component threshold would mark a run that
+reported everything it intended to as permanently incomplete. The exclusion is exactly that one
+shape wide: an attempt that reported any component is judged even when its harness also stated a
+total, so component drift cannot hide behind a stated total.
 
 `ledgerVerified` is false when the advisory chain did not verify or could not be read, and then
 nothing is summed at all rather than answered as a zero. Every reason the sums are partial also

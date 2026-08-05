@@ -326,7 +326,8 @@ impl RpcHandler for HumanQueryHandler {
                         "coverage": {
                             "tasks": 3, "tasksWithReportedUsage": 2, "tasksWithoutAttestation": 1,
                             "attemptsObserved": 3, "attemptsReported": 2,
-                            "attemptsReportedWithoutFigures": 0, "attemptsNotReported": 1,
+                            "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 2,
+                            "attemptsNotReported": 1,
                             "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
                             "ledgerVerified": true
                         },
@@ -1438,7 +1439,8 @@ impl RpcHandler for UsageEdgeQueryHandler {
                 "coverage": {
                     "tasks": 1, "tasksWithReportedUsage": 0, "tasksWithoutAttestation": 0,
                     "attemptsObserved": 1, "attemptsReported": 1,
-                    "attemptsReportedWithoutFigures": 1, "attemptsNotReported": 0,
+                    "attemptsReportedWithoutFigures": 1, "attemptsReportedWithComponents": 1,
+                    "attemptsNotReported": 0,
                     "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
                     "ledgerVerified": true
                 },
@@ -1460,7 +1462,8 @@ impl RpcHandler for UsageEdgeQueryHandler {
                 "coverage": {
                     "tasks": 1, "tasksWithReportedUsage": 1, "tasksWithoutAttestation": 0,
                     "attemptsObserved": 1, "attemptsReported": 1,
-                    "attemptsReportedWithoutFigures": 0, "attemptsNotReported": 0,
+                    "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 1,
+                    "attemptsNotReported": 0,
                     "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
                     "ledgerVerified": true
                 },
@@ -1483,7 +1486,8 @@ impl RpcHandler for UsageEdgeQueryHandler {
                 "coverage": {
                     "tasks": 1, "tasksWithReportedUsage": 0, "tasksWithoutAttestation": 0,
                     "attemptsObserved": 2, "attemptsReported": 0,
-                    "attemptsReportedWithoutFigures": 0, "attemptsNotReported": 2,
+                    "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 0,
+                    "attemptsNotReported": 2,
                     "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
                     "ledgerVerified": true
                 },
@@ -1507,7 +1511,8 @@ impl RpcHandler for UsageEdgeQueryHandler {
                 "coverage": {
                     "tasks": 1, "tasksWithReportedUsage": 1, "tasksWithoutAttestation": 0,
                     "attemptsObserved": 1, "attemptsReported": 1,
-                    "attemptsReportedWithoutFigures": 0, "attemptsNotReported": 0,
+                    "attemptsReportedWithoutFigures": 0, "attemptsReportedWithComponents": 1,
+                    "attemptsNotReported": 0,
                     "attemptsNotDeclared": 0, "attemptsWithoutUsageRecord": 0,
                     "ledgerVerified": true
                 },

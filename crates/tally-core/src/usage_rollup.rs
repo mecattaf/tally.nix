@@ -65,7 +65,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::query_v2::FactAuthority;
-use crate::usage::{UsageObservation, UsageReconciliation, UsageTotalSource};
+use crate::usage::{UsageObservation, UsageReconciliation, UsageShape, UsageTotalSource};
 use crate::witness::AttestationRecord;
 
 /// Payload kind the exit recorder writes one of per scraped attempt.
@@ -129,7 +129,10 @@ impl<'a> AttestationEvidence<'a> {
 /// ran this run do not all report this component, and the sum is over the
 /// subset that does. For the four components a total is a sum of, that is not
 /// merely informative — it is the completeness threshold, and it raises
-/// [`UsageRollupCaveat::PartialComponents`].
+/// [`UsageRollupCaveat::PartialComponents`]. The threshold's exact denominator
+/// is [`UsageCoverage::attempts_reported_with_components`], which is
+/// `attemptsReported` minus the attempts whose harness stated a total and
+/// declared no components at all.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct UsageSum {
@@ -291,6 +294,28 @@ pub struct UsageCoverage {
     /// one that catches a single renamed key silently deleting a component from
     /// the run total.
     pub attempts_reported_without_figures: usize,
+    /// The subset of [`UsageCoverage::attempts_reported`] whose adapter was
+    /// reporting components at all, and therefore the denominator the
+    /// per-component threshold behind
+    /// [`UsageRollupCaveat::PartialComponents`] compares against.
+    ///
+    /// It is below `attemptsReported` for exactly one shape: an attempt whose
+    /// harness stated a total of its own and reported no component beside it
+    /// ([`crate::usage::UsageShape::Lump`] with a `harness-reported` total).
+    /// That is a legal adapter — `totalTokens` is a declarable field and
+    /// nothing obliges an adapter to declare components too — and for it,
+    /// every component being absent is the configuration working, not drift.
+    /// Comparing such an attempt against the component threshold made a run
+    /// that reported everything it ever intended to grade permanently
+    /// incomplete.
+    ///
+    /// The exclusion is deliberately that narrow. An attempt that reported
+    /// *any* component is in this denominator even when its harness also
+    /// stated a total, so real component drift cannot hide behind a
+    /// harness-stated total; and an attempt that stated no total either — the
+    /// cost-only and the fully-drifted shapes — is in it too, because those
+    /// are the drift cases the threshold exists to catch.
+    pub attempts_reported_with_components: usize,
     /// Attempts whose attestation states `not-reported`: a usage scrape was
     /// declared, the stream was read, and it carried no usage.
     pub attempts_not_reported: usize,
@@ -322,8 +347,8 @@ pub enum UsageRollupCaveat {
     /// emitted. The sums are missing that attempt entirely.
     ReportedWithoutFigures,
     /// A component that feeds the total was reported by fewer attempts than
-    /// reported usage, so **that component's sum is over a subset of the
-    /// reporting attempts** — the meaning [`UsageSum::attempts`] already
+    /// were reporting components at all, so **that component's sum is over a
+    /// subset of those attempts** — the meaning [`UsageSum::attempts`] already
     /// carries, promoted from a number a reader had to notice into a stated
     /// caveat.
     ///
@@ -333,9 +358,16 @@ pub enum UsageRollupCaveat {
     /// of the total and, on a real claude-code capture, takes 97% of the run's
     /// tokens with it. Checked over exactly the four components the total is a
     /// sum of — `inputTokens`, `cacheReadTokens`, `cacheWriteTokens`,
-    /// `outputTokens`. `reasoningTokens` is deliberately excluded: claude-code
-    /// reports no reasoning figure at all and it enters no total, so including
-    /// it would fire on every claude run and mean nothing.
+    /// `outputTokens`.
+    ///
+    /// Two exclusions, both load-bearing. `reasoningTokens` is not checked:
+    /// claude-code reports no reasoning figure at all and it enters no total,
+    /// so checking it would fire on every claude run and mean nothing. And the
+    /// comparison is against
+    /// [`UsageCoverage::attempts_reported_with_components`], not against every
+    /// reported attempt, so an adapter that declares a harness total and no
+    /// components is not told forever that components it never declared are
+    /// missing.
     PartialComponents,
     /// Some attestation carries no readable usage record.
     UnreadableUsageRecord,
@@ -496,6 +528,19 @@ pub fn roll_up<'a>(
             coverage.attempts_reported_without_figures += 1;
             caveats.insert(UsageRollupCaveat::ReportedWithoutFigures);
         }
+        // An attempt whose harness stated a total and reported no component
+        // beside it declared no components to be missing. It is the one shape
+        // the per-component threshold must not judge; every other reported
+        // attempt is in that denominator, including one that reported a
+        // component *and* a harness total, so drift cannot hide behind a
+        // stated total.
+        let states_only_a_harness_total = breakdown.shape == UsageShape::Lump
+            && breakdown
+                .total_tokens
+                .is_some_and(|total| total.source == UsageTotalSource::HarnessReported);
+        if !states_only_a_harness_total {
+            coverage.attempts_reported_with_components += 1;
+        }
 
         saturated |= !tokens.input_tokens.add(breakdown.input_tokens);
         saturated |= !tokens.cache_read_tokens.add(breakdown.cache_read_tokens);
@@ -593,11 +638,12 @@ pub fn roll_up<'a>(
         caveats.insert(UsageRollupCaveat::AttemptsWithoutUsage);
     }
     // The completeness threshold. Every component the total is a sum of has to
-    // have been reported by every attempt that reported usage; a component
-    // reported by fewer is a sum over a subset, which is exactly what
-    // `UsageSum::attempts` has always meant and what nothing used to read.
-    // Reasoning is not in this list on purpose — it enters no total, and
-    // claude-code reports none, so checking it would fire on every claude run.
+    // have been reported by every attempt that was reporting components at
+    // all; a component reported by fewer is a sum over a subset, which is
+    // exactly what `UsageSum::attempts` has always meant and what nothing used
+    // to read. Reasoning is not in this list on purpose — it enters no total,
+    // and claude-code reports none, so checking it would fire on every claude
+    // run.
     if [
         tokens.input_tokens,
         tokens.cache_read_tokens,
@@ -605,7 +651,7 @@ pub fn roll_up<'a>(
         tokens.output_tokens,
     ]
     .iter()
-    .any(|component| component.attempts < coverage.attempts_reported)
+    .any(|component| component.attempts < coverage.attempts_reported_with_components)
     {
         caveats.insert(UsageRollupCaveat::PartialComponents);
     }
@@ -638,7 +684,7 @@ mod tests {
 
     use super::*;
     use crate::adapters::{AdapterConfig, AdapterEngine, ScrapeCapture, ScrapeMode, ScrapeStream};
-    use crate::usage::{observe, UsageBreakdown, UsageCost, UsageShape, UsageTotalTokens};
+    use crate::usage::{observe, UsageBreakdown, UsageCost, UsageTotalTokens};
 
     /// The verbatim real claude-code capture `usage::tests` pins the shipped
     /// preset's field map against. Used here so the completeness threshold is
@@ -780,27 +826,33 @@ mod tests {
     }
 
     /// An **operator-defined** adapter that declares a `totalTokens` mapping
-    /// its harness fills. No shipped preset does, which is why this fixture
-    /// names no harness: it exists to exercise the one path that produces
-    /// `harness-reported`, and pretending a preset produces it is what the
-    /// first draft of this module got wrong.
+    /// and nothing else — legal, since `totalTokens` is a declarable field and
+    /// nothing obliges an adapter to declare components beside it.
+    ///
+    /// Produced by the real [`observe`] over that real declared map, not
+    /// hand-authored. The first draft of this fixture asserted `shape:
+    /// components` with all four components set, which the real path cannot
+    /// produce for a total-only mapping: it produces a `lump` with every
+    /// component absent. That gap is what let a completeness regression against
+    /// this exact configuration pass a green suite.
     fn declared_total_usage() -> Value {
-        serde_json::to_value(UsageObservation::Reported(UsageBreakdown {
-            shape: UsageShape::Components,
-            input_tokens: Some(100),
-            input_tokens_as_reported: Some(100),
-            cache_read_tokens: Some(0),
-            cache_write_tokens: Some(0),
-            output_tokens: Some(20),
-            reasoning_tokens: None,
-            total_tokens: Some(UsageTotalTokens {
-                value: 120,
-                source: UsageTotalSource::HarnessReported,
-            }),
-            cost: None,
-            unreadable_fields: Vec::new(),
-        }))
-        .unwrap()
+        let adapter = AdapterConfig {
+            argv: vec!["declared-total-agent".to_owned()],
+            scrape: BTreeMap::from([(
+                "usage".to_owned(),
+                scrape_capture(
+                    ScrapeMode::JsonPath,
+                    "$..usage",
+                    r#"{"totalTokens":["total_tokens"]}"#,
+                ),
+            )]),
+            ..Default::default()
+        };
+        observed_with(
+            &adapter,
+            "declared-total",
+            r#"{"type":"turn.completed","usage":{"total_tokens":120}}"#,
+        )
     }
 
     #[test]
@@ -874,16 +926,30 @@ mod tests {
         // Nothing a shipped preset produces can reach `harness-reported`: the
         // grade comes from a declared `totalTokens` mapping, and neither
         // preset declares one. An operator-defined adapter that does can.
-        let declared = [attestation(1, "declared", 1, declared_total_usage())];
+        // The real path's shape for a total-only mapping: a lump, with every
+        // component absent because none was ever declared.
+        let observation = declared_total_usage();
+        assert_eq!(observation["breakdown"]["shape"], "lump");
+        assert!(observation["breakdown"]["inputTokens"].is_null());
+
+        let declared = [attestation(1, "declared", 1, observation)];
         let harness = roll_up(["declared"], &AttestationEvidence::new(true, &declared));
         assert_eq!(
             harness.tokens.total_tokens.unwrap().source,
             UsageRollupTotalSource::HarnessReported
         );
+        // Nothing about this run is partial: it reported every figure it
+        // declared. Judging it against a component threshold it declared no
+        // components for would tell an operator forever that a complete run is
+        // incomplete, which is the caveat's own meaning inverted.
+        assert_eq!(harness.coverage.attempts_reported, 1);
+        assert_eq!(harness.coverage.attempts_reported_with_components, 0);
         assert!(harness.is_complete(), "{:?}", harness.caveats);
 
         // And a run mixing that adapter with a preset is where `mixed` — and
-        // its caveat — actually becomes reachable.
+        // its caveat — actually becomes reachable. The preset attempt is the
+        // only one the component threshold judges, and it reported everything,
+        // so the run is still not partial.
         let records = [
             attestation(1, "declared", 1, declared_total_usage()),
             attestation(2, "preset", 1, codex_usage()),
@@ -895,9 +961,36 @@ mod tests {
         let total = mixed.tokens.total_tokens.expect("both attempts total");
         assert_eq!(total.value, 120 + 7_093_008);
         assert_eq!(total.source, UsageRollupTotalSource::Mixed);
+        assert_eq!(mixed.coverage.attempts_reported, 2);
+        assert_eq!(mixed.coverage.attempts_reported_with_components, 1);
         assert!(mixed
             .caveats
             .contains(&UsageRollupCaveat::MixedTotalAuthority));
+        assert!(!mixed
+            .caveats
+            .contains(&UsageRollupCaveat::PartialComponents));
+
+        // But the exclusion is exactly one shape wide: a drifted preset
+        // attempt beside the total-only one is still caught, so component
+        // drift cannot hide behind another adapter's harness total.
+        let drifted = CODEX_STREAM.replace("cached_input_tokens", "cached_input_tokens_v2");
+        let records = [
+            attestation(1, "declared", 1, declared_total_usage()),
+            attestation(
+                2,
+                "preset",
+                1,
+                observed_with(&codex_preset(), "codex", &drifted),
+            ),
+        ];
+        let hidden = roll_up(
+            ["declared", "preset"],
+            &AttestationEvidence::new(true, &records),
+        );
+        assert_eq!(hidden.coverage.attempts_reported_with_components, 1);
+        assert!(hidden
+            .caveats
+            .contains(&UsageRollupCaveat::PartialComponents));
     }
 
     #[test]
@@ -1016,6 +1109,49 @@ mod tests {
             rollup.caveats
         );
         assert!(!rollup.is_complete());
+
+        // Every one of the four components the total is a sum of, one at a
+        // time. Pinning only the cache-read arm would leave the other three
+        // deletable from the threshold's list against a green suite — the same
+        // "one component silently leaves" defect, one level up. The rename
+        // carries the surrounding quotes so that renaming `input_tokens` does
+        // not also rename `cache_read_input_tokens` and
+        // `cache_creation_input_tokens`, which contain it as a substring: each
+        // arm must drift exactly one declared key.
+        for (key, component) in [
+            ("input_tokens", "inputTokens"),
+            ("cache_read_input_tokens", "cacheReadTokens"),
+            ("cache_creation_input_tokens", "cacheWriteTokens"),
+            ("output_tokens", "outputTokens"),
+        ] {
+            let drifted = CLAUDE_STREAM.replace(&format!("\"{key}\""), &format!("\"{key}_v2\""));
+            assert_ne!(drifted, CLAUDE_STREAM, "{key} is not in the capture");
+            let rollup = roll_up(
+                ["task"],
+                &AttestationEvidence::new(true, &[attestation(1, "task", 1, observed(&drifted))]),
+            );
+            let tokens = serde_json::to_value(rollup.tokens).unwrap();
+            assert_eq!(
+                tokens[component]["attempts"], 0,
+                "{key}: the drifted component should have left the sums"
+            );
+            assert_eq!(
+                rollup.coverage.attempts_reported_with_components, 1,
+                "{key}: the attempt still reported components, so it is judged"
+            );
+            assert_eq!(
+                rollup.coverage.attempts_reported_without_figures, 0,
+                "{key}: one key drifted, not all of them"
+            );
+            assert!(
+                rollup
+                    .caveats
+                    .contains(&UsageRollupCaveat::PartialComponents),
+                "{key}: drift in this component is not stated: {:?}",
+                rollup.caveats
+            );
+            assert!(!rollup.is_complete(), "{key}: graded complete");
+        }
     }
 
     /// The same drift on codex, where the total stays right **by accident** and
