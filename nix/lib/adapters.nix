@@ -120,6 +120,17 @@ let
 
   presets = {
     pi = mkAdapter {
+      # `pi --mode json` writes one JSON object per line to stdout and nothing
+      # to stderr -- its own `docs/json.md` says so ("Outputs all session
+      # events as JSON lines to stdout"), and the capture in
+      # `test/fixtures/traces/pi.jsonl` is a real run that behaved that way,
+      # 21 lines on stdout and an empty stderr. Without this block a pi node
+      # produced no `TraceGeneration` and no `TraceLane`, so `query trace`
+      # rendered no lane for it.
+      trace = {
+        stream = "stdout";
+        framing = "json-lines";
+      };
       argv = [
         "pi"
         "--mode"
@@ -145,16 +156,43 @@ let
           mode = "jsonPath";
           pattern = "$..model";
         };
-        # No `fields` mapping yet: pi has never run a campaign here, and
-        # inventing its key names would be a fixture wrong in the same
-        # direction as the code. Until a real `pi --mode json` capture is on
-        # hand this capture keeps the legacy reading (total_tokens, else
-        # input_tokens plus output_tokens), which is what it had before the
-        # mapping existed. Declaring the real keys is an attrset here, not a
-        # Rust change.
+        # Still no `fields` mapping, and now for a stated reason rather than
+        # for want of evidence. A real `pi --mode json` capture is on hand
+        # (`test/fixtures/traces/pi.jsonl`) and it settles the key names:
+        # every assistant message carries
+        # `usage = { input, output, cacheRead, cacheWrite, reasoning,
+        # totalTokens, cost }`, with `input` exclusive of both cache halves
+        # (the capture's second turn reports input 190, cacheRead 842,
+        # output 46, totalTokens 1078 = 190 + 46 + 842 + 0).
+        #
+        # What the capture also settles is that pi states usage **per
+        # assistant message and never per attempt**: there is no
+        # `turn.completed`-style roll-up anywhere in the stream, so this
+        # capture's last match is one turn's figures, not the attempt's
+        # spend. Declaring `inputTokens = [ "input" ]` here would report a
+        # single turn as an attempt's usage and understate every multi-turn
+        # pi node -- the mirror image of the mistake `codex` declines when it
+        # refuses to report a cumulative total as occupancy. The honest
+        # reading of a per-turn figure is occupancy, which is declared below.
         usage = mkScrapeCapture {
           mode = "jsonPath";
           pattern = "$..usage";
+        };
+        # Occupancy is exactly what pi's per-message usage is: the tokens
+        # resident in the context window as of one assistant turn. The
+        # capture is scoped to assistant `message_end` events so its last
+        # match is the last completed assistant turn rather than the
+        # zero-filled `message_start` placeholder or a `toolResult` message,
+        # and the field names are occupancy's own so a spend lookup can never
+        # resolve against it -- see `crate::occupancy`'s module doc.
+        occupancy = mkScrapeCapture {
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant'].message.usage";
+          fields = {
+            residentInputTokens = [ "input" ];
+            residentCacheReadTokens = [ "cacheRead" ];
+            residentCacheWriteTokens = [ "cacheWrite" ];
+          };
         };
         finalMessage = mkScrapeCapture {
           mode = "jsonPathLast";

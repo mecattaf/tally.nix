@@ -292,7 +292,7 @@ check. Angle-bracketed values are adapter placeholders, not shell expansion.
 | Preset | Fresh `argv` | `resume` | Scrape and trace shape |
 |---|---|---|---|
 | `shell` | empty pass-through prefix | none | no captures, trace, or yield hook |
-| `pi` | `pi --mode json --` | `pi --mode json --session %<sessionRef>% --model %<model>% --` | `sessionRef`, `model`, and `usage` use `jsonPath`; `finalMessage` uses `jsonPathLast`; no trace |
+| `pi` | `pi --mode json --` | `pi --mode json --session %<sessionRef>% --model %<model>% --` | `sessionRef`, `model`, and `usage` use `jsonPath`; `finalMessage` and `occupancy` use `jsonPathLast`; stdout `json-lines` trace |
 | `claude-code` | `claude --print --verbose --output-format stream-json --` | `claude --resume %<sessionRef>% --model %<model>% --print --verbose --output-format stream-json --` | the same four capture modes; stdout `json-lines` trace |
 | `codex` | `codex exec --json --` | `codex -C %<cwd>% exec resume --json --model %<model>% %<sessionRef>% --` | the same four capture modes; stdout `json-lines` trace |
 
@@ -301,6 +301,15 @@ For the session capture, `pi` uses `$.id`, `claude-code` uses
 also install `tally lease status` as their cooperative `yieldHook`. `codex`
 declares cwd argv and named approval and sandbox policies; the presets do not
 silently authorize arbitrary job-supplied flags.
+
+`pi` declares no `usage` key mapping, and that is now a finding rather than a
+gap. A real `pi --mode json` capture is checked in at
+`test/fixtures/traces/pi.jsonl`, and it shows pi stating
+`{ input, output, cacheRead, cacheWrite, reasoning, totalTokens, cost }` on
+every assistant message and no attempt-level roll-up anywhere in the stream.
+A declared spend mapping would therefore report one turn as an attempt's
+usage. The per-turn reading those numbers do support is occupancy, which `pi`
+declares against the same objects, scoped to assistant `message_end` events.
 
 ## Coordinator-wide controls
 

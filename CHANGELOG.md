@@ -8,6 +8,35 @@ authorized.
 
 ### Added
 
+- **The `pi` preset declares its trace framing, and an occupancy capture, from
+  a real `pi --mode json` capture (#387).** `pi` carried launch and resume
+  argv and every scrape capture but no `trace = { stream; framing; }` block,
+  so a pi node produced no `TraceGeneration` and no `TraceLane` and
+  `tally query trace` rendered no lane for it — an observability hole that
+  read as "nothing happened" rather than as "nothing was declared", in the one
+  adapter that has not yet run a campaign here. It now declares
+  `stdout`/`json-lines`, which is what pi's own `docs/json.md` documents and
+  what the capture now checked in at `test/fixtures/traces/pi.jsonl` does: 21
+  retained lines on stdout, zero bytes on stderr. Config only; no Rust change
+  was needed or made.
+
+  The same capture settles pi's usage key names — every assistant message
+  carries `{ input, output, cacheRead, cacheWrite, reasoning, totalTokens,
+  cost }`, with `input` exclusive of both cache halves (second turn: input
+  190, cacheRead 842, output 46, totalTokens 1078) — and settles something
+  else: pi states usage **per assistant message and never per attempt**.
+  There is no `turn.completed`-style roll-up anywhere in its stream. A
+  declared spend mapping would therefore report one turn as an attempt's
+  usage and understate every multi-turn pi node, so `usage` stays
+  unmapped — now for a stated reason rather than for want of evidence. The
+  honest reading of a per-turn figure is occupancy, and `pi` declares one:
+  `$[?@.type == 'message_end' && @.message.role == 'assistant'].message.usage`
+  under `residentInputTokens`/`residentCacheReadTokens`/`residentCacheWriteTokens`,
+  which resolves to 1032 resident tokens on the checked-in capture. The
+  `adapter-presets` flake check renders the preset against that capture and
+  asserts every resolved value, so the declaration is proved against recorded
+  bytes rather than against a stream written to agree with it.
+
 - **Context occupancy is recorded beside session identity, everywhere
   `sessionRef` is (#383).** "Context is occupancy, not spend" — the number
   that decides whether a session can absorb another task, not what it cost,

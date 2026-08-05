@@ -108,7 +108,11 @@ direction.
 An adapter may additionally declare a JSON-lines trace stream. Trace queries
 preserve event order and malformed/unknown payloads as advisory observations;
 a configured running local or remote trace is not silently reported as an
-empty successful trace.
+empty successful trace. All three structured presets declare one: `pi`,
+`claude-code`, and `codex` each emit JSON lines on stdout. An adapter that
+declares no trace produces no `TraceGeneration` and no lane in
+`tally query trace` — silence that reads as "nothing happened" rather than as
+"nothing was declared", which is why the presets declare it.
 
 ## Context occupancy is a narrower read than usage
 
@@ -133,6 +137,15 @@ exactly one `turn.completed` per exec, carrying only the cumulative shape —
 so the `codex` preset declares no `occupancy` capture, and `contextTokens`
 reads `None` for codex rather than restating the cumulative total under
 occupancy's name.
+
+`pi` sits at the opposite end of the same argument. Its stream states usage
+per assistant message and never per attempt, so the figures it does carry are
+occupancy figures. The `pi` preset declares an `occupancy` capture scoped to
+assistant `message_end` events
+(`$[?@.type == 'message_end' && @.message.role == 'assistant'].message.usage`)
+reading `input`, `cacheRead`, and `cacheWrite`, and declares no `usage` key
+mapping at all: reporting one turn as an attempt's spend would be the same
+error codex declines in the other direction.
 
 `contextWindow` is the ceiling that total is measured against, and it has two
 independent, distinguishable provenances. A harness that states its own
