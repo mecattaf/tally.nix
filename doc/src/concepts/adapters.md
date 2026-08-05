@@ -109,7 +109,11 @@ An adapter may additionally declare a JSON-lines trace stream. Trace queries
 preserve event order and malformed/unknown payloads as advisory observations;
 a configured running local or remote trace is not silently reported as an
 empty successful trace. All three structured presets declare one: `pi`,
-`claude-code`, and `codex` each emit JSON lines on stdout. An adapter that
+`claude-code`, and `codex` each emit their event stream as JSON lines on
+stdout. Framing is what the declaration states, not a promise that every
+byte on that stream parses — pi, for one, prints a plain-text line when a
+resume lands in the wrong directory, and tally records such a line as a
+malformed advisory observation rather than dropping it. An adapter that
 declares no trace produces no `TraceGeneration` and no lane in
 `tally query trace` — silence that reads as "nothing happened" rather than as
 "nothing was declared", which is why the presets declare it.
@@ -141,11 +145,17 @@ occupancy's name.
 `pi` sits at the opposite end of the same argument. Its stream states usage
 per assistant message and never per attempt, so the figures it does carry are
 occupancy figures. The `pi` preset declares an `occupancy` capture scoped to
-assistant `message_end` events
-(`$[?@.type == 'message_end' && @.message.role == 'assistant'].message.usage`)
-reading `input`, `cacheRead`, and `cacheWrite`, and declares no `usage` key
-mapping at all: reporting one turn as an attempt's spend would be the same
-error codex declines in the other direction.
+assistant `message_end` events reading `input`, `cacheRead`, and `cacheWrite`,
+and declares no `usage` key mapping at all: reporting one turn as an
+attempt's spend would be the same error codex declines in the other
+direction.
+
+That capture additionally excludes turns whose `stopReason` is `aborted` or
+`error`, which is what makes it a read of the last **valid** turn. pi
+zero-fills every token field on an aborted turn, and `context_tokens` returns
+`None` only when all three resident fields are *absent* — three resolved
+zeroes are `Some(0)`. Without the guard a session carrying a full context
+would report as empty, which is the one reading occupancy exists to prevent.
 
 `contextWindow` is the ceiling that total is measured against, and it has two
 independent, distinguishable provenances. A harness that states its own

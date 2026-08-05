@@ -29,13 +29,20 @@ authorized.
   declared spend mapping would therefore report one turn as an attempt's
   usage and understate every multi-turn pi node, so `usage` stays
   unmapped — now for a stated reason rather than for want of evidence. The
-  honest reading of a per-turn figure is occupancy, and `pi` declares one:
-  `$[?@.type == 'message_end' && @.message.role == 'assistant'].message.usage`
-  under `residentInputTokens`/`residentCacheReadTokens`/`residentCacheWriteTokens`,
+  honest reading of a per-turn figure is occupancy, and `pi` declares one,
+  scoped to assistant `message_end` events under
+  `residentInputTokens`/`residentCacheReadTokens`/`residentCacheWriteTokens`,
   which resolves to 1032 resident tokens on the checked-in capture. The
-  `adapter-presets` flake check renders the preset against that capture and
-  asserts every resolved value, so the declaration is proved against recorded
-  bytes rather than against a stream written to agree with it.
+  capture also excludes turns pi marks `aborted` (and, by analogy with SSSF's
+  `calculateContextTokens`, `error`): pi zero-fills every token field on an
+  aborted turn, and `context_tokens` returns `None` only when all three
+  resident fields are *absent*, so an unguarded scrape would report `Some(0)`
+  — a fabricated empty context — for a session carrying a full one.
+  `test/fixtures/traces/pi-aborted-turn.jsonl` is that stream, and the
+  `adapter-presets` flake check asserts the guarded capture resolves it to
+  the last valid turn. That check renders the preset against both fixtures
+  and asserts every resolved value, so the declaration is proved against
+  recorded bytes rather than against a stream written to agree with it.
 
 - **Context occupancy is recorded beside session identity, everywhere
   `sessionRef` is (#383).** "Context is occupancy, not spend" — the number
@@ -221,6 +228,26 @@ authorized.
   charges.
 
 ### Fixed
+
+- **The `pi` preset's launch and resume argv could not run (#387).** Both
+  ended in `--`, tally's option-terminator convention across presets. pi has
+  no end-of-options separator: it rejects one with `Error: Unknown option:
+  --`, exits 1, and writes zero bytes to stdout — so every pi node was a dead
+  launch, no capture was ever produced, and `sessionRef`, `occupancy` and
+  `finalMessage` could never resolve. The trailing `--` is dropped from both
+  argv lists and from the operator-facing preset table. The cost of dropping
+  it is stated rather than absorbed: pi parses a workload argv whose first
+  element begins with `-` as a flag, and nothing enforces otherwise.
+
+  Two adjacent pi behaviours are now documented rather than fixed, because
+  no configuration can fix them. pi keys its session store by the directory
+  it was launched in, so a resume from a different cwd prints
+  `Session found in different project` on stdout, prompts on stderr, and
+  exits 0 having done nothing; pinning `--session-dir` does not change this,
+  because pi still requires exact equality with the session's recorded cwd
+  (`sessionCwdMatches`) and otherwise falls through to the same
+  cross-project branch. A pi node must be resumed in the directory it was
+  launched in, and pi exposes no cwd flag for `launch.cwdArgv` to assert it.
 
 - **Flow-run membership is now a durable admission fact, so a node a run
   attached to or reused is visible in that run's own window (#380, W-316).**

@@ -5208,8 +5208,12 @@
             grep -F '"codex"' ${adapterConfig} >/dev/null
             grep -F '"pi"' ${adapterConfig} >/dev/null
             grep -F '"shell"' ${adapterConfig} >/dev/null
-            test "$(jq -c '.adapters.pi.argv' ${adapterConfig})" = '["pi","--mode","json","--"]'
-            test "$(jq -c '.adapters.pi.resume' ${adapterConfig})" = '["pi","--mode","json","--session","%<sessionRef>%","--model","%<model>%","--"]'
+            # No trailing `--` in either: pi has no end-of-options separator
+            # and exits 1 on one, writing nothing to stdout, so a `--`-suffixed
+            # argv could never produce the stream the trace declaration below
+            # describes.
+            test "$(jq -c '.adapters.pi.argv' ${adapterConfig})" = '["pi","--mode","json"]'
+            test "$(jq -c '.adapters.pi.resume' ${adapterConfig})" = '["pi","--mode","json","--session","%<sessionRef>%","--model","%<model>%"]'
             test "$(jq -c '.adapters["claude-code"].argv' ${adapterConfig})" = '["claude","--print","--verbose","--output-format","stream-json","--"]'
             test "$(jq -c '.adapters["claude-code"].resume' ${adapterConfig})" = '["claude","--resume","%<sessionRef>%","--model","%<model>%","--print","--verbose","--output-format","stream-json","--"]'
             test "$(jq -c '.adapters["claude-code"].trace' ${adapterConfig})" = '{"framing":"json-lines","stream":"stdout"}'
@@ -5262,7 +5266,7 @@
             # -- so occupancy is precisely what its usage objects are.
             test "$(jq -r '.adapters.codex.scrape.occupancy // "absent"' ${adapterConfig})" = absent
             test "$(jq -c '.adapters.pi.scrape.occupancy.fields' ${adapterConfig})" = '{"residentCacheReadTokens":["cacheRead"],"residentCacheWriteTokens":["cacheWrite"],"residentInputTokens":["input"]}'
-            test "$(jq -r '.adapters.pi.scrape.occupancy.pattern' ${adapterConfig})" = "\$[?@.type == 'message_end' && @.message.role == 'assistant'].message.usage"
+            test "$(jq -r '.adapters.pi.scrape.occupancy.pattern' ${adapterConfig})" = "\$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.usage"
             test "$(jq -r '.adapters.pi.scrape.sessionRef.pattern' ${adapterConfig})" = '$.id'
             test "$(jq -r '.adapters["claude-code"].scrape.sessionRef.pattern' ${adapterConfig})" = '$..session_id'
             test "$(jq -r '.adapters.codex.scrape.sessionRef.pattern' ${adapterConfig})" = '$..thread_id'
@@ -5284,7 +5288,7 @@
               '{"type":"message_end","message":{"role":"user","content":[{"type":"text","text":"ignore user"}]}}' \
               '{"type":"message_end","message":{"role":"assistant","model":"Pi/Exact.Model","content":[{"type":"text","text":"pi final"}],"usage":{"input_tokens":11}}}' > pi.jsonl
             pi_render="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render pi --scrape-stdout "$PWD/pi.jsonl" --scrape-stderr "$PWD/empty.err" -- work)"
-            test "$(printf '%s' "$pi_render" | jq -c '.argv')" = '["pi","--mode","json","--session","pi-session","--model","Pi/Exact.Model","--","work"]'
+            test "$(printf '%s' "$pi_render" | jq -c '.argv')" = '["pi","--mode","json","--session","pi-session","--model","Pi/Exact.Model","work"]'
             test "$(printf '%s' "$pi_render" | jq -c '.captures.usage')" = '{"input_tokens":11}'
             test "$(printf '%s' "$pi_render" | jq -r '.captures.finalMessage')" = 'pi final'
             test "$(printf '%s' "$pi_render" | jq -r '.defaultGateManifest')" = false
@@ -5297,7 +5301,7 @@
             # placeholder, and the final assistant text. See
             # test/fixtures/traces/README.md for the capture's provenance.
             pi_real="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render pi --scrape-stdout ${./test/fixtures/traces/pi.jsonl} --scrape-stderr "$PWD/empty.err" -- work)"
-            test "$(printf '%s' "$pi_real" | jq -c '.argv')" = '["pi","--mode","json","--session","019f0000-0000-7000-8000-000000000001","--model","qwen3.6-35b-a3b","--","work"]'
+            test "$(printf '%s' "$pi_real" | jq -c '.argv')" = '["pi","--mode","json","--session","019f0000-0000-7000-8000-000000000001","--model","qwen3.6-35b-a3b","work"]'
             pi_last_turn_usage='{"input":190,"output":46,"cacheRead":842,"cacheWrite":0,"reasoning":0,"totalTokens":1078,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}}'
             test "$(printf '%s' "$pi_real" | jq -c '.captures.occupancy')" = "$pi_last_turn_usage"
             # The two captures coincide for pi, and that is the finding, not
@@ -5308,6 +5312,22 @@
             # differ: its `usage` lands on the `result` roll-up.)
             test "$(printf '%s' "$pi_real" | jq -c '.captures.usage')" = "$pi_last_turn_usage"
             test "$(printf '%s' "$pi_real" | jq -r '.captures.finalMessage')" = 'The file notes.txt contains 42.'
+            # A stream that ends on a turn pi marked `aborted` must resolve
+            # occupancy to the last VALID turn, not to the aborted turn's
+            # zero-filled usage object: three resolved zeroes are `Some(0)`,
+            # which reads as an empty context for a session that was over a
+            # thousand tokens full. The fixture is the capture above with one
+            # real aborted assistant message appended -- see
+            # test/fixtures/traces/README.md.
+            pi_aborted="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render pi --scrape-stdout ${./test/fixtures/traces/pi-aborted-turn.jsonl} --scrape-stderr "$PWD/empty.err" -- work)"
+            test "$(printf '%s' "$pi_aborted" | jq -c '.captures.occupancy')" = "$pi_last_turn_usage"
+            test "$(printf '%s' "$pi_aborted" | jq -r '.captures.occupancy.input')" != 0
+            # `usage` is deliberately unguarded, and this is what that costs:
+            # the stream-wide `$..usage` does land on the aborted turn. It is
+            # never read as occupancy, and no spend mapping is declared for
+            # pi, so it states nothing -- but the asymmetry is asserted here
+            # rather than left for a reader to discover.
+            test "$(printf '%s' "$pi_aborted" | jq -r '.captures.usage.totalTokens')" = 0
             printf '%s\n' \
               '{"type":"system","subtype":"init","session_id":"claude-session","model":"Claude/Exact.Model"}' \
               '{"type":"result","result":"claude first"}' \

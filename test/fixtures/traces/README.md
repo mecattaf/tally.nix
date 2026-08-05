@@ -1,9 +1,9 @@
 # Trace fixtures — provenance
 
-`pi.jsonl` is the only fixture in this directory this file makes a claim
-about. `claude-code.jsonl` and `codex.jsonl` predate it and are described by
-the tests that read them, not here; nothing below should be read as a
-statement about their origin.
+`pi.jsonl` and `pi-aborted-turn.jsonl` are the only fixtures in this
+directory this file makes a claim about. `claude-code.jsonl` and
+`codex.jsonl` predate it and are described by the tests that read them, not
+here; nothing below should be read as a statement about their origin.
 
 ## `pi.jsonl`
 
@@ -40,3 +40,34 @@ and not a transcript.
 Read by the `adapter-presets` flake check, which renders the `pi` preset
 against this file and asserts the resolved `sessionRef`, `model`, `usage`,
 `occupancy`, and `finalMessage` captures.
+
+## `pi-aborted-turn.jsonl`
+
+**Composed from two real sources, and not a single capture.** Saying so
+exactly is the point of this section. It is `pi.jsonl` above with its final
+`agent_settled` removed, then two appended lines:
+
+1. One **real** assistant message with `stopReason: "aborted"`, lifted
+   verbatim from a different real pi session on the machine this fixture was
+   built on (a session tally did not produce), and reframed as a
+   `message_end` stream event — the framing `--mode json` uses for the same
+   message object. Its `usage` is verbatim: pi zero-fills every token field
+   on an aborted turn, `{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,
+   "totalTokens":0,...}`, with no `reasoning` key. Its `errorMessage`
+   (`"Operation aborted"`), `api`, `provider`, `model`, `stopReason` and
+   `timestamp` are verbatim too. Its `thinking` body is redacted to the same
+   constant fixture string used above. The `model` differs from the rest of
+   the stream (`qwen3-vl-8b-ocr`) because it genuinely came from another
+   session; that is left as it is rather than rewritten to look seamless.
+2. `{"type":"agent_settled"}`, to close the stream.
+
+Nothing here is invented: no synthesised usage numbers, no hand-written
+aborted turn. What is synthetic is the **splice** — these two real fragments
+did not occur in one run.
+
+It exists because a `jsonPathLast` scrape cannot say "last *valid* turn" on
+its own. Without a `stopReason` guard the `pi` preset's occupancy capture
+lands on the aborted turn's zeroes and `occupancy::context_tokens` returns
+`Some(0)` — a fabricated empty context for a session carrying 1032 resident
+tokens — rather than `None`. The `adapter-presets` flake check asserts that
+the guarded pattern resolves this stream to the last valid turn instead.

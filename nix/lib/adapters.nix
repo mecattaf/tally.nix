@@ -120,23 +120,50 @@ let
 
   presets = {
     pi = mkAdapter {
-      # `pi --mode json` writes one JSON object per line to stdout and nothing
-      # to stderr -- its own `docs/json.md` says so ("Outputs all session
-      # events as JSON lines to stdout"), and the capture in
-      # `test/fixtures/traces/pi.jsonl` is a real run that behaved that way,
-      # 21 lines on stdout and an empty stderr. Without this block a pi node
-      # produced no `TraceGeneration` and no `TraceLane`, so `query trace`
-      # rendered no lane for it.
+      # `pi --mode json` emits its session events as JSON lines on stdout --
+      # its own `docs/json.md` says so ("Outputs all session events as JSON
+      # lines to stdout"), and the capture in `test/fixtures/traces/pi.jsonl`
+      # is a real run that did exactly that, 21 retained lines on stdout and
+      # an empty stderr. Without this block a pi node produced no
+      # `TraceGeneration` and no `TraceLane`, so `query trace` rendered no
+      # lane for it.
+      #
+      # "JSON lines on stdout" is the framing, not an invariant pi holds on
+      # every path: a resume whose cwd no longer matches the session's prints
+      # the plain-text line `Session found in different project: <dir>` on
+      # stdout and asks `Fork this session into current directory? [y/N]` on
+      # stderr, then exits 0. Tally records a non-JSON line as a malformed
+      # advisory observation, which is the honest handling, so the framing
+      # declaration stands -- but see the resume argv below for what that
+      # path costs.
       trace = {
         stream = "stdout";
         framing = "json-lines";
       };
+      # No trailing `--`: pi has no end-of-options separator and rejects one
+      # outright (`Error: Unknown option: --`, exit 1, zero bytes on stdout),
+      # so the `--`-terminated argv this preset used to declare could never
+      # produce the stream the trace block above describes. The cost of
+      # dropping it is real and is not enforced anywhere: a workload argv
+      # whose first element begins with `-` is parsed by pi as a flag. That
+      # is a narrowing on leading-dash payloads; the alternative was an argv
+      # that failed on every payload.
       argv = [
         "pi"
         "--mode"
         "json"
-        "--"
       ];
+      # pi keys its session store by the directory it was launched in, and
+      # `--session <id>` resolves against that key first. A resume from a
+      # different cwd therefore does not fail: pi reports
+      # `Session found in different project`, prompts on stderr, and exits 0
+      # having done nothing -- a successful attempt that did no work. Pinning
+      # `--session-dir` does not close this: with a custom session dir pi
+      # still filters by the session's recorded cwd
+      # (`sessionCwdMatches(session.cwd, resolvedCwd)`, exact path equality)
+      # and falls through to the same cross-project branch. A pi node must be
+      # resumed in the cwd it was launched in; nothing in this preset can
+      # assert that, and pi offers no cwd flag for `launch.cwdArgv` to use.
       resume = [
         "pi"
         "--mode"
@@ -145,7 +172,6 @@ let
         "%<sessionRef>%"
         "--model"
         "%<model>%"
-        "--"
       ];
       scrape = {
         sessionRef = mkScrapeCapture {
@@ -185,9 +211,20 @@ let
         # zero-filled `message_start` placeholder or a `toolResult` message,
         # and the field names are occupancy's own so a spend lookup can never
         # resolve against it -- see `crate::occupancy`'s module doc.
+        #
+        # The `stopReason` guards are what make "last assistant turn" mean
+        # "last **valid** assistant turn", which is what `context_tokens`
+        # documents itself as. pi zero-fills the usage object on a turn it
+        # marks `aborted`, and `context_tokens` returns `None` only when all
+        # three resident fields are absent -- three resolved zeroes are
+        # `Some(0)`, a fabricated emptiness for a session that was thousands
+        # of tokens full. `test/fixtures/traces/pi-aborted-turn.jsonl` is that
+        # stream. `aborted` is proven from real pi data on this host;
+        # `error` is guarded by analogy with SSSF's `calculateContextTokens`,
+        # which skips both, and has not been observed here.
         occupancy = mkScrapeCapture {
           mode = "jsonPathLast";
-          pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant'].message.usage";
+          pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.usage";
           fields = {
             residentInputTokens = [ "input" ];
             residentCacheReadTokens = [ "cacheRead" ];

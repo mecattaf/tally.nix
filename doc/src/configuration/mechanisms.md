@@ -292,7 +292,7 @@ check. Angle-bracketed values are adapter placeholders, not shell expansion.
 | Preset | Fresh `argv` | `resume` | Scrape and trace shape |
 |---|---|---|---|
 | `shell` | empty pass-through prefix | none | no captures, trace, or yield hook |
-| `pi` | `pi --mode json --` | `pi --mode json --session %<sessionRef>% --model %<model>% --` | `sessionRef`, `model`, and `usage` use `jsonPath`; `finalMessage` and `occupancy` use `jsonPathLast`; stdout `json-lines` trace |
+| `pi` | `pi --mode json` | `pi --mode json --session %<sessionRef>% --model %<model>%` | `sessionRef`, `model`, and `usage` use `jsonPath`; `finalMessage` and `occupancy` use `jsonPathLast`; stdout `json-lines` trace |
 | `claude-code` | `claude --print --verbose --output-format stream-json --` | `claude --resume %<sessionRef>% --model %<model>% --print --verbose --output-format stream-json --` | the same four capture modes; stdout `json-lines` trace |
 | `codex` | `codex exec --json --` | `codex -C %<cwd>% exec resume --json --model %<model>% %<sessionRef>% --` | the same four capture modes; stdout `json-lines` trace |
 
@@ -309,7 +309,19 @@ gap. A real `pi --mode json` capture is checked in at
 every assistant message and no attempt-level roll-up anywhere in the stream.
 A declared spend mapping would therefore report one turn as an attempt's
 usage. The per-turn reading those numbers do support is occupancy, which `pi`
-declares against the same objects, scoped to assistant `message_end` events.
+declares against the same objects, scoped to assistant `message_end` events
+whose `stopReason` is neither `aborted` nor `error` — pi zero-fills the usage
+object on an aborted turn, and an unguarded scrape would report a fabricated
+empty context for a session that is thousands of tokens full.
+
+`pi` is also the one preset with no trailing `--`: it has no end-of-options
+separator and exits 1 on one. A pi workload argv whose first element begins
+with `-` is therefore parsed by pi as a flag. `pi` additionally keys its
+session store by the directory it was launched in, so a resume from a
+different working directory prints `Session found in different project`,
+prompts on stderr, and exits 0 without doing any work; pinning
+`--session-dir` does not change that, because pi still matches the session's
+recorded cwd exactly. Resume a pi node in the directory it was launched in.
 
 ## Coordinator-wide controls
 
