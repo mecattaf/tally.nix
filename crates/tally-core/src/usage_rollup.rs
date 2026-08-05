@@ -652,6 +652,9 @@ mod tests {
     const CLAUDE_USAGE_FIELDS: &str = r#"{"cacheReadTokens":["cache_read_input_tokens"],"cacheWriteTokens":["cache_creation_input_tokens"],"inputTokens":["input_tokens"],"outputTokens":["output_tokens"]}"#;
     const CLAUDE_COST_FIELDS: &str = r#"{"costUsd":["$"]}"#;
 
+    const CODEX_STREAM: &str = include_str!("../../../test/fixtures/usage/codex.jsonl");
+    const CODEX_USAGE_FIELDS: &str = r#"{"cacheReadTokens":["cached_input_tokens"],"cacheWriteTokens":["cache_write_input_tokens"],"inputTokensWithCacheRead":["input_tokens"],"outputTokens":["output_tokens"],"reasoningTokens":["reasoning_output_tokens"]}"#;
+
     fn scrape_capture(mode: ScrapeMode, pattern: &str, fields: &str) -> ScrapeCapture {
         ScrapeCapture {
             stream: ScrapeStream::Stdout,
@@ -682,14 +685,28 @@ mod tests {
         }
     }
 
+    fn codex_preset() -> AdapterConfig {
+        AdapterConfig {
+            argv: vec!["codex".to_owned()],
+            scrape: BTreeMap::from([(
+                "usage".to_owned(),
+                scrape_capture(ScrapeMode::JsonPath, "$..usage", CODEX_USAGE_FIELDS),
+            )]),
+            ..Default::default()
+        }
+    }
+
     /// Scrape and normalize one real stream through the real code path.
-    fn observed(stream: &str) -> Value {
-        let adapter = claude_preset();
-        let adapters = BTreeMap::from([("claude-code".to_owned(), adapter.clone())]);
+    fn observed_with(adapter: &AdapterConfig, name: &str, stream: &str) -> Value {
+        let adapters = BTreeMap::from([(name.to_owned(), adapter.clone())]);
         let captures = AdapterEngine::new(&adapters)
-            .scrape_text("claude-code", stream, "")
+            .scrape_text(name, stream, "")
             .expect("fixture stream scrapes");
-        serde_json::to_value(observe(&adapter, &captures)).expect("observation serializes")
+        serde_json::to_value(observe(adapter, &captures)).expect("observation serializes")
+    }
+
+    fn observed(stream: &str) -> Value {
+        observed_with(&claude_preset(), "claude-code", stream)
     }
 
     fn attestation(seq: u64, task: &str, attempt: u64, usage: Value) -> AttestationRecord {
@@ -998,6 +1015,63 @@ mod tests {
             "a component missing from every attempt must be stated: {:?}",
             rollup.caveats
         );
+        assert!(!rollup.is_complete());
+    }
+
+    /// The same drift on codex, where the total stays right **by accident** and
+    /// the caveat is the only thing that betrays it.
+    ///
+    /// codex's `input_tokens` is cache-inclusive, so `observe` derives the
+    /// exclusive figure by subtracting the cache read; an absent cache read
+    /// subtracts zero. The derived total therefore lands on the same number it
+    /// would have without the drift, while `inputTokens` and `freshInputTokens`
+    /// are both reported at the cache-inclusive figure — 26.9× the truth. No
+    /// number on the wire looks wrong; the coverage count is what says so.
+    #[test]
+    fn a_drifted_codex_key_leaves_the_total_right_and_the_input_figure_wrong() {
+        let honest = roll_up(
+            ["task"],
+            &AttestationEvidence::new(
+                true,
+                &[attestation(
+                    1,
+                    "task",
+                    1,
+                    observed_with(&codex_preset(), "codex", CODEX_STREAM),
+                )],
+            ),
+        );
+        assert!(honest.is_complete(), "unexpected: {:?}", honest.caveats);
+        assert_eq!(honest.tokens.input_tokens.value, 262_086);
+        assert_eq!(honest.tokens.total_tokens.unwrap().value, 7_093_008);
+
+        let drifted = CODEX_STREAM.replace("cached_input_tokens", "cached_input_tokens_v2");
+        let rollup = roll_up(
+            ["task"],
+            &AttestationEvidence::new(
+                true,
+                &[attestation(
+                    1,
+                    "task",
+                    1,
+                    observed_with(&codex_preset(), "codex", &drifted),
+                )],
+            ),
+        );
+        assert_eq!(
+            rollup.tokens.total_tokens.unwrap().value,
+            7_093_008,
+            "the total is unchanged, so it cannot be what warns anyone"
+        );
+        assert_eq!(
+            rollup.tokens.input_tokens.value, 7_060_166,
+            "the cache-inclusive figure is promoted to the exclusive one"
+        );
+        assert_eq!(rollup.tokens.fresh_input_tokens.attempts_partial, 0);
+        assert_eq!(rollup.tokens.cache_read_tokens.attempts, 0);
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::PartialComponents));
         assert!(!rollup.is_complete());
     }
 
