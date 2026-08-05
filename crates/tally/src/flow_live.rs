@@ -11,7 +11,7 @@ use tally_core::query::QUERY_PROTOCOL_VERSION;
 use tally_core::taskdb::RelatedTrigger;
 use tally_flow::{
     Admission, ClientError, Disposition, FlowClient, FlowFuture, FlowSubmission, LifecycleSink,
-    NodeFailure, NodeResult, RunInspection, RunSupersede, TaskRef, Verdict,
+    NodeFailure, NodeResult, RunInspection, RunSupersede, SupersessionDetails, TaskRef, Verdict,
 };
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -750,6 +750,10 @@ fn validate_identity_capsule(
     Ok(())
 }
 
+/// The mid-run twin of the runner's startup identity pin.
+///
+/// It builds its `details` with the same shared constructor as the startup
+/// site, so the two raising sites cannot drift into two wire contracts.
 fn changed_hash_error(
     code: &str,
     flow_run_id: &str,
@@ -763,12 +767,15 @@ fn changed_hash_error(
             tally_flow::identity_refusal_remedy_sentence(code, flow_run_id)
         ),
     )
-    .with_details(json!({
-        "flowRunId": flow_run_id,
-        "recordedHash": recorded_hash,
-        "currentHash": current_hash,
-        "remedy": tally_flow::supersede_remedy(code, flow_run_id),
-    }))
+    .with_details(Value::Object(tally_flow::supersession_details(
+        code,
+        &SupersessionDetails {
+            flow_run_id,
+            recorded_hash: Some(recorded_hash),
+            current_hash: Some(current_hash),
+            ..SupersessionDetails::default()
+        },
+    )))
 }
 
 fn changed_catalog_identity_error(
@@ -785,12 +792,15 @@ fn changed_catalog_identity_error(
             tally_flow::identity_refusal_remedy_sentence("catalog-changed-mid-run", flow_run_id)
         ),
     )
-    .with_details(json!({
-        "flowRunId": flow_run_id,
-        "recordedHash": recorded_hash,
-        "currentHash": current_hash,
-        "remedy": tally_flow::supersede_remedy("catalog-changed-mid-run", flow_run_id),
-    }))
+    .with_details(Value::Object(tally_flow::supersession_details(
+        "catalog-changed-mid-run",
+        &SupersessionDetails {
+            flow_run_id,
+            recorded_hash,
+            current_hash,
+            ..SupersessionDetails::default()
+        },
+    )))
 }
 
 fn parse_node_result(value: &Value, disposition: Disposition) -> Result<NodeResult, ClientError> {
@@ -914,14 +924,19 @@ fn submission_error(submission: &FlowSubmission, error: WireIoError) -> ClientEr
                     submission.orchestration.node_ordinal, submission.payload_hash, recorded_hash
                 ),
             )
-            .with_details(json!({
-                "expectedHash": submission.payload_hash,
-                "recordedHash": recorded_hash,
-                "expectedLabel": submission.spec.label,
-                "recordedLabel": recorded_label,
-                "taskUuid": recorded.get("taskUuid").cloned().unwrap_or(Value::Null),
-                "kernelError": message,
-            }));
+            .with_details(Value::Object(tally_flow::supersession_details(
+                "replay-divergence",
+                &SupersessionDetails {
+                    flow_run_id: &submission.orchestration.flow_run_id,
+                    recorded_hash: Some(recorded_hash),
+                    current_hash: Some(&submission.payload_hash),
+                    recorded_label: Some(recorded_label),
+                    current_label: Some(submission.spec.label.as_deref().unwrap_or_default()),
+                    task_uuid: recorded.get("taskUuid").and_then(Value::as_str),
+                    kernel_error: Some(message),
+                    ..SupersessionDetails::default()
+                },
+            )));
         }
     }
     client_error(error)
@@ -1777,7 +1792,7 @@ export const meta = {
         let translated = submission_error(&submission(), error);
         assert_eq!(translated.code, "replay-divergence");
         assert_eq!(
-            translated.details.as_ref().unwrap()["expectedHash"],
+            translated.details.as_ref().unwrap()["currentHash"],
             "sha256:expected"
         );
         assert_eq!(
@@ -1785,7 +1800,7 @@ export const meta = {
             "sha256:recorded"
         );
         assert_eq!(
-            translated.details.as_ref().unwrap()["expectedLabel"],
+            translated.details.as_ref().unwrap()["currentLabel"],
             "first"
         );
         assert_eq!(
@@ -1937,6 +1952,285 @@ export const meta = {
 
         response["recordedOrchestration"]["catalogHash"] = Value::Null;
         validate_recorded_run_identity(&response, &submission()).unwrap();
+    }
+
+    // ---- the one exit-20 `details` contract --------------------------------
+    //
+    // Every exit-20 refusal is raised either by the runner's startup identity
+    // scan or by an admission mid-run. These cases drive both sites through the
+    // production constructors on both sides of the crate boundary — the engine
+    // raises the startup refusals, `flow_live` raises the mid-run ones — and
+    // assert one shape.
+
+    const CONTRACT_RUN: &str = "00000000-0000-4000-8000-0000000000c0";
+    const CONTRACT_SUCCESSOR: &str = "00000000-0000-4000-8000-0000000000c1";
+    const CONTRACT_TASK: &str = "00000000-0000-4000-8000-0000000000c2";
+    const RECORDED_PAYLOAD: &str = "sha256:recorded-payload";
+
+    fn contract_source() -> String {
+        "export const meta = {\n\
+         name: 'contract-flow',\n\
+         description: 'exit-20 details contract',\n\
+         pools: ['cpu'],\n\
+         argsSchema: {type: 'object'},\n\
+         selectors: []\n\
+         };\n\
+         (async () => sh(['one'], {pools: ['cpu'], label: 'current-label'}))()"
+            .to_owned()
+    }
+
+    fn contract_sha256(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("sha256:{:x}", Sha256::digest(bytes))
+    }
+
+    #[derive(Clone)]
+    enum MidRun {
+        /// The run reaches its node and the stub answers normally.
+        None,
+        /// The client refuses admission with one of its own identity errors.
+        Refused(ClientError),
+        /// The daemon answers the dedup key with a live row for this same
+        /// ordinal, and `submission_error` reads divergence out of it.
+        KernelConflict,
+        /// Admission succeeds but reports a different payload hash, which the
+        /// engine's own comparison turns into divergence.
+        DivergentAdmission,
+    }
+
+    struct ContractClient {
+        inspection: RunInspection,
+        mid_run: MidRun,
+    }
+
+    impl ContractClient {
+        fn startup(inspection: RunInspection) -> Rc<Self> {
+            Rc::new(Self {
+                inspection,
+                mid_run: MidRun::None,
+            })
+        }
+
+        /// A run whose recorded identity matches, so evaluation reaches the node.
+        fn mid_run(source: &str, mid_run: MidRun) -> Rc<Self> {
+            Rc::new(Self {
+                inspection: RunInspection {
+                    script_hash: Some(contract_sha256(source.as_bytes())),
+                    args_hash: Some(contract_sha256(b"{}")),
+                    catalog_hash: None,
+                    supersede: None,
+                },
+                mid_run,
+            })
+        }
+    }
+
+    impl FlowClient for ContractClient {
+        fn inspect_run<'a>(
+            &'a self,
+            _flow_run_id: &'a str,
+        ) -> FlowFuture<'a, Result<RunInspection, ClientError>> {
+            Box::pin(std::future::ready(Ok(self.inspection.clone())))
+        }
+
+        fn submit<'a>(
+            &'a self,
+            submission: FlowSubmission,
+        ) -> FlowFuture<'a, Result<Admission, ClientError>> {
+            let answer = match self.mid_run.clone() {
+                MidRun::None => Err(ClientError::new(
+                    "unexpected-submission",
+                    "this case is meant to refuse before admission",
+                )),
+                MidRun::Refused(error) => Err(error),
+                MidRun::KernelConflict => Err(submission_error(
+                    &submission,
+                    WireIoError::Rpc(
+                        WireErrorCode::DedupKeyConflict,
+                        "dedup key already governs a live row".to_owned(),
+                        Some(json!({
+                            "existing": [{
+                                "taskUuid": CONTRACT_TASK,
+                                "payloadHash": RECORDED_PAYLOAD,
+                                "nodeLabel": "recorded-label",
+                                "orchestration": {
+                                    "flowRunId": CONTRACT_RUN,
+                                    "scriptHash": submission.orchestration.script_hash,
+                                    "argsHash": submission.orchestration.args_hash,
+                                    "catalogHash": null,
+                                    "nodeOrdinal": submission.orchestration.node_ordinal,
+                                }
+                            }]
+                        })),
+                    ),
+                )),
+                MidRun::DivergentAdmission => Ok(Admission {
+                    schema_version: 1,
+                    disposition: Disposition::Attached,
+                    task_uuid: CONTRACT_TASK.to_owned(),
+                    task_ref: None,
+                    payload_hash: RECORDED_PAYLOAD.to_owned(),
+                    attempt: 1,
+                    terminal: None,
+                    recorded_label: Some("recorded-label".to_owned()),
+                    reused_rejected: None,
+                }),
+            };
+            Box::pin(std::future::ready(answer))
+        }
+
+        fn await_terminal<'a>(
+            &'a self,
+            task_uuid: &'a str,
+            _attempt: u32,
+        ) -> FlowFuture<'a, Result<NodeResult, ClientError>> {
+            Box::pin(std::future::ready(Err(ClientError::new(
+                "unexpected-await",
+                task_uuid,
+            ))))
+        }
+    }
+
+    fn contract_refusal(client: Rc<ContractClient>) -> tally_flow::FlowError {
+        run_script(
+            &contract_source(),
+            Some(Path::new("contract-flow.js")),
+            client,
+            Rc::new(VecLifecycleSink::default()),
+            RunOptions::new(CONTRACT_RUN, json!({})),
+        )
+        .expect_err("every contract case refuses")
+    }
+
+    fn detail_fields(error: &tally_flow::FlowError) -> Vec<&str> {
+        error.details.keys().map(String::as_str).collect()
+    }
+
+    /// One `details` shape for the whole exit-20 family, at every raising site.
+    #[test]
+    fn every_exit_twenty_refusal_carries_the_same_details_contract() {
+        let source = contract_source();
+        let script_hash = contract_sha256(source.as_bytes());
+        let args_hash = contract_sha256(b"{}");
+        let contract = tally_flow::SUPERSESSION_DETAIL_FIELDS.to_vec();
+
+        // The three identity pins exist at both sites. Given the same recorded
+        // and current hashes, the two sites must produce the same map — not
+        // merely the same keys.
+        let pins: [(&str, RunInspection, ClientError); 3] = [
+            (
+                "script-changed-mid-run",
+                RunInspection {
+                    script_hash: Some("sha256:other-script".to_owned()),
+                    ..RunInspection::default()
+                },
+                changed_hash_error(
+                    "script-changed-mid-run",
+                    CONTRACT_RUN,
+                    "sha256:other-script",
+                    &script_hash,
+                ),
+            ),
+            (
+                "args-changed-mid-run",
+                RunInspection {
+                    script_hash: Some(script_hash.clone()),
+                    args_hash: Some("sha256:other-args".to_owned()),
+                    ..RunInspection::default()
+                },
+                changed_hash_error(
+                    "args-changed-mid-run",
+                    CONTRACT_RUN,
+                    "sha256:other-args",
+                    &args_hash,
+                ),
+            ),
+            (
+                "catalog-changed-mid-run",
+                RunInspection {
+                    script_hash: Some(script_hash.clone()),
+                    args_hash: Some(args_hash.clone()),
+                    catalog_hash: Some("sha256:other-catalog".to_owned()),
+                    supersede: None,
+                },
+                changed_catalog_identity_error(CONTRACT_RUN, Some("sha256:other-catalog"), None),
+            ),
+        ];
+        for (code, inspection, refusal) in pins {
+            let startup = contract_refusal(ContractClient::startup(inspection));
+            let mid_run =
+                contract_refusal(ContractClient::mid_run(&source, MidRun::Refused(refusal)));
+            assert_eq!(startup.code, code);
+            assert_eq!(mid_run.code, code);
+            assert_eq!(detail_fields(&startup), contract, "startup {code}");
+            assert_eq!(detail_fields(&mid_run), contract, "mid-run {code}");
+            assert_eq!(
+                startup.details, mid_run.details,
+                "{code} must not depend on its raising site"
+            );
+            assert_eq!(
+                startup.details["divergentInput"],
+                code.split('-').next().unwrap()
+            );
+            assert_eq!(startup.details["transient"], false);
+            assert_eq!(startup.details["resolution"], "supersede");
+        }
+
+        // `flow-run-superseded` has no mid-run site: the rollover is read once
+        // by `run_script`'s `inspect_run` scan, before the script is evaluated,
+        // and admission never re-reads lineage. That is deliberate and
+        // documented ("The scope of the refusal" in submission-and-replay.md):
+        // a rollover recorded while a run is in flight stops the *next* start,
+        // not this one. So there is only a startup site to compare.
+        let superseded = contract_refusal(ContractClient::startup(RunInspection {
+            script_hash: Some(script_hash),
+            args_hash: Some(args_hash),
+            catalog_hash: None,
+            supersede: Some(RunSupersede {
+                successor_flow_run_id: CONTRACT_SUCCESSOR.to_owned(),
+                reason: "generation-change".to_owned(),
+                recorded_at: "2026-08-05T00:00:00Z".to_owned(),
+            }),
+        }));
+        assert_eq!(superseded.code, "flow-run-superseded");
+        assert_eq!(detail_fields(&superseded), contract);
+        assert_eq!(superseded.details["successorFlowRunId"], CONTRACT_SUCCESSOR);
+        assert_eq!(superseded.details["reason"], "generation-change");
+        assert_eq!(superseded.details["resolution"], "run-successor");
+        // Nothing diverged and no single command clears it; the successor is
+        // named instead.
+        assert!(superseded.details["divergentInput"].is_null());
+        assert!(superseded.details["remedy"].is_null());
+
+        // `replay-divergence` has no startup site either, for the opposite
+        // reason: it is a statement about one ordinal's payload, and at startup
+        // no ordinal has been derived yet. `run_script` only compares recorded
+        // identity hashes; the payload comparison lives in `execute_submission`,
+        // after admission answers. Both of its mid-run sites are checked here.
+        let conflict = contract_refusal(ContractClient::mid_run(&source, MidRun::KernelConflict));
+        let admission =
+            contract_refusal(ContractClient::mid_run(&source, MidRun::DivergentAdmission));
+        for divergence in [&conflict, &admission] {
+            assert_eq!(divergence.code, "replay-divergence");
+            assert_eq!(detail_fields(divergence), contract);
+            assert_eq!(divergence.details["flowRunId"], CONTRACT_RUN);
+            assert_eq!(divergence.details["divergentInput"], "payload");
+            assert_eq!(divergence.details["recordedHash"], RECORDED_PAYLOAD);
+            assert_eq!(divergence.details["recordedLabel"], "recorded-label");
+            assert_eq!(divergence.details["currentLabel"], "current-label");
+            assert_eq!(divergence.details["taskUuid"], CONTRACT_TASK);
+            assert_eq!(divergence.details["resolution"], "investigate");
+            assert!(divergence.details["remedy"].is_null());
+        }
+        // The two discovery paths agree on the hash that moved. `kernelError`
+        // is the one member only the dedup-conflict path can fill: the engine's
+        // own comparison has no daemon message to quote.
+        assert_eq!(
+            conflict.details["currentHash"],
+            admission.details["currentHash"]
+        );
+        assert!(conflict.details["kernelError"].is_string());
+        assert!(admission.details["kernelError"].is_null());
     }
 
     #[test]

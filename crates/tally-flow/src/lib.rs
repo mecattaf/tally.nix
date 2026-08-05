@@ -24,8 +24,9 @@ pub use client::{FlowClient, FlowFuture};
 pub use dialect::{check_script, validate_flow_pool_predicates, CheckOptions, CheckedFlow, Meta};
 pub use engine::{run_script, LifecycleSink, RunOptions, VecLifecycleSink};
 pub use error::{
-    identity_refusal_remedy_sentence, supersede_remedy, with_recovery_facts, FlowError,
-    SourceLocation,
+    identity_refusal_remedy_sentence, is_supersession_code, supersede_remedy, supersession_details,
+    supersession_error, with_recovery_facts, FlowError, SourceLocation, SupersessionDetails,
+    SUPERSESSION_CODES, SUPERSESSION_DETAIL_FIELDS,
 };
 pub use model::{
     flow_canonical_payload_fields, node_spec_fields, sugar_reserved_fields, Admission, ClientError,

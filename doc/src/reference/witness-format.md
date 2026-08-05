@@ -163,7 +163,11 @@ JSON serialization of parsed arguments. `catalogHash` covers the exact catalog b
 `null` when no catalog was supplied. Before evaluating a run, the runner queries existing nodes
 for that `flowRunId`. If any recorded identity differs from the current script, arguments, or
 catalog, it stops with the corresponding `*-changed-mid-run` code (CLI exit 20) before admitting
-more work. The witness capsule therefore ties a proved node to all three generation-pinned
+more work. That refusal reports the disagreement as `details.recordedHash` and
+`details.currentHash` — the same members, in the same shape, whether the runner's startup scan
+or an admission mid-run raised it; see
+[one `details` shape for every exit-20 refusal](../flows/submission-and-replay.md#one-details-shape-for-every-exit-20-refusal).
+The witness capsule therefore ties a proved node to all three generation-pinned
 inputs that produced its ordinal. Prompt and skill revisions perform the same role for resolved
 agent inputs when those revisions are known. `taskRef`, when present, is the
 validated campaign-scoped human reference `<campaign>/<task-id>`; it remains
