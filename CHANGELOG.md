@@ -13,9 +13,12 @@ authorized.
   carrying the same object per flow run the window touched. Both are summed
   **per attempt from the advisory attestation ledger**, keyed by
   `taskUuid`/`attempt`/`leaseEpoch`, over the run's **durable membership**
-  (#391) — so a retried task is charged for every attempt it made, and a node
-  a run was handed but whose row names its creating run is inside the sum
-  rather than silently missing from it.
+  (#391) — so a retried task is charged for every attempt the ledger holds,
+  not only for the latest attempt its durable row keeps, and a node a run was
+  handed but whose row names its creating run is inside the sum rather than
+  silently missing from it. The ledger is the whole of what the rollup can
+  see: it covers every attempt the ledger could speak for, and says so in
+  those terms rather than claiming every attempt that ever ran.
 
   Three properties are load-bearing, because the failure this surface exists
   to prevent is a figure computed from the wrong evidence, wrong in the
@@ -36,14 +39,25 @@ authorized.
     observed attempts, and attempts that reported usage apart from each typed
     absence (`not-reported`, `not-declared`, and an attestation predating the
     usage record), plus the member tasks the ledger holds nothing about and
-    whether the chain verified at all. A ledger that failed verification sums
-    nothing and says so rather than answering with a confident zero.
-  - **Authority is graded and mixed authority is named.** The whole rollup is
-    `advisory-provider-capture` — harnesses reporting on themselves — and
-    `totalTokens.source` is `harness-reported`, `derived-from-components`, or
-    `mixed` for a run whose nodes span claude-code (which states a total) and
-    codex (whose real `turn.completed` does not). Every reason the sums are
-    partial is a named `caveats` entry.
+    whether the chain verified at all. A ledger that failed verification or
+    could not be read sums nothing and says so rather than answering with a
+    confident zero. `attemptsReportedWithoutFigures` counts the attempts that
+    reported usage no declared field path resolved out of — the ordinary
+    harness-drift shape, where absence is not unreadability and the record is
+    still `reported`. Counting those as covered would grade a run whose
+    adapter mapping resolved nothing as complete and costless; they raise
+    `reported-without-figures` instead.
+  - **Authority is graded, and the grade is about the adapter, not the
+    harness's reputation.** The whole rollup is `advisory-provider-capture` —
+    harnesses reporting on themselves. `totalTokens.source` is
+    `harness-reported` only when the adapter declared a `totalTokens` mapping
+    and the harness filled it. **No shipped preset declares one**: codex's
+    real `turn.completed` carries no `total_tokens`, and claude-code's
+    `result` event carries a cumulative usage object of components without a
+    total among them. So both presets read `derived-from-components` today,
+    including a run spanning both, and `harness-reported` / `mixed` are
+    reachable through an operator-defined adapter that declares the mapping.
+    Every reason the sums are partial is a named `caveats` entry.
 
   `cost` is the harness's own `costUsd`, summed only where reported, and it
   carries a `basis` statement onto the wire: tally's cgroup `charge` is a
@@ -51,7 +65,10 @@ authorized.
   tally's own exit-recorder overhead (waiver `W-382-RECORDER`, #382). The
   human `tally query run` view prints the block with its coverage attached,
   because a terminal reader is exactly the one who will not go looking for
-  the coverage object in `--json`. A daemon that predates the field sends no
+  the coverage object in `--json` — including the daemon's own `basis`
+  sentence rather than a copy of it, and `--` for any component no attempt
+  reported, so an absence and a measured zero never print the same
+  characters. A daemon that predates the field sends no
   `usage` object and the human view prints nothing for it, since an absent
   field is not a claim about the run. Cross-run and fleet aggregation,
   budgeting, and enforcement remain out of scope.

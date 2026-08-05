@@ -415,8 +415,11 @@ receive current nodes and failures but have an empty task table; for those runs 
 
 `query.run` also returns `usage`: what the run cost, summed per attempt from the advisory
 attestation ledger — keyed by `taskUuid`/`attempt`/`leaseEpoch` — over the run's durable
-membership, so every attempt of a retried task is charged and a node the run was handed but whose
-row names its creating run is inside the sum. See [Usage rollups](#usage-rollups).
+membership, so every attempt of a retried task **that the ledger holds** is charged — not only the
+task's latest, which is all its durable row keeps — and a node the run was handed but whose row
+names its creating run is inside the sum. The ledger is the whole of what the rollup can see; it
+covers every attempt the ledger could speak for and no more. See [Usage
+rollups](#usage-rollups).
 
 ### Usage rollups
 
@@ -439,18 +442,30 @@ re-derived by a consumer:
 - `inputTokensAsReported` is not summed at all: each harness's own input convention means a
   different thing, and the two are not commensurable.
 
-`totalTokens` sums each attempt's own total and names its `source`: `harness-reported`,
-`derived-from-components`, or `mixed` for a run whose nodes span claude-code, whose `result` event
-states a cumulative total, and codex, whose real `turn.completed` carries none.
+`totalTokens` sums each attempt's own total and names its `source`. A total is
+`harness-reported` only when the adapter declared a `totalTokens` field mapping and the harness
+filled it; otherwise tally derives it from the components and grades it
+`derived-from-components`. **No shipped preset declares `totalTokens`** — codex's real
+`turn.completed` carries no `total_tokens` at all, and claude-code's `result` event carries a
+cumulative usage object whose members are components, not a total — so every run over the shipped
+presets reads `derived-from-components` today, including a run spanning both. `harness-reported`,
+and the `mixed` grade a run combining the two kinds produces, are reachable through an
+operator-defined adapter that declares the mapping. A consumer should branch on the field rather
+than on which harness it believes ran.
 
 `coverage` is the statement that keeps a partial sum from reading as a total. It counts member
 `tasks`, `tasksWithReportedUsage`, `tasksWithoutAttestation`, `attemptsObserved`, and then the
-attempts apart: `attemptsReported`, `attemptsNotReported` (a usage scrape was declared and the
-stream carried none), `attemptsNotDeclared` (the adapter declared no usage scrape), and
-`attemptsWithoutUsageRecord` (an attestation predating the usage record). `ledgerVerified` is
-false when the advisory chain did not verify, and then nothing is summed at all rather than
-answered as a zero. Every reason the sums are partial also appears as a named entry in `caveats`;
-an empty `caveats` array is the only claim of completeness the rollup makes.
+attempts apart: `attemptsReported`, `attemptsReportedWithoutFigures`, `attemptsNotReported` (a
+usage scrape was declared and the stream carried none), `attemptsNotDeclared` (the adapter
+declared no usage scrape), and `attemptsWithoutUsageRecord` (an attestation predating the usage
+record). `attemptsReportedWithoutFigures` is the subset of `attemptsReported` that contributed
+nothing: the harness reported usage and no declared field path resolved, which is the ordinary
+harness-drift shape — absence is not unreadability, so nothing lands in `unreadableFields` and the
+observation is still `reported`. Those attempts raise `reported-without-figures` rather than being
+counted as covered. `ledgerVerified` is false when the advisory chain did not verify or could not
+be read, and then nothing is summed at all rather than answered as a zero. Every reason the sums
+are partial also appears as a named entry in `caveats`; an empty `caveats` array claims only that
+the rollup covers every attempt the ledger could speak for.
 
 `cost` is the harness's own `costUsd`, summed over the attempts that reported one. Its `basis`
 field states what it is not: tally's cgroup `charge` is a distinct quantity, is not summed here,

@@ -35,13 +35,23 @@
 //! inside the 221). It is rolled up so an operator can see how much of the
 //! output was reasoning; it is never part of any total.
 //!
-//! **4. Say where each number came from.** Codex's real `turn.completed`
-//! carries no `total_tokens`, so a codex run's total is
-//! `derived-from-components`; claude-code's `result` event carries a cumulative
-//! usage object, so its total is `harness-reported`. A run whose nodes span
-//! both harnesses has a total that is [`UsageRollupTotalSource::Mixed`], and it
-//! says so. The whole rollup is graded [`FactAuthority::AdvisoryProviderCapture`]:
-//! it is what harnesses said about themselves, never a bill tally verified.
+//! **4. Say where each number came from.** A total is `harness-reported` only
+//! when the adapter declared a `totalTokens` mapping and the harness filled it;
+//! otherwise tally derives the total from the components and grades it
+//! `derived-from-components`. **No shipped preset declares `totalTokens`** —
+//! not `codex`, whose real `turn.completed` carries no `total_tokens` at all,
+//! and not `claude-code`, whose `result` event carries a cumulative usage
+//! object of components without a total among them. So every run over the
+//! shipped presets reads `derived-from-components` today, including a run
+//! spanning both harnesses. `harness-reported`, and the
+//! [`UsageRollupTotalSource::Mixed`] grade that a run mixing the two produces,
+//! are reserved for an operator-defined adapter that declares the mapping
+//! (`extraConfig`-style adapter authoring, documented at
+//! `nix/modules/common.nix`). The grade is published either way, because a
+//! consumer must not have to know which kind of adapter ran to know what the
+//! number is. The whole rollup is graded
+//! [`FactAuthority::AdvisoryProviderCapture`]: it is what harnesses said about
+//! themselves, never a bill tally verified.
 //!
 //! Cost is summed only where a harness reported it, and it is the harness's own
 //! `costUsd`. Tally's cgroup `charge` is a different quantity, is not summed
@@ -163,15 +173,23 @@ pub struct UsageFreshInput {
 }
 
 /// Where a run total came from, once every attempt's own total is summed.
+///
+/// Reachability depends on the adapter, not on the harness's reputation for
+/// verbosity: only a declared `totalTokens` mapping produces
+/// [`Self::HarnessReported`]. No shipped preset declares one, so the shipped
+/// presets always produce [`Self::DerivedFromComponents`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum UsageRollupTotalSource {
-    /// Every contributing attempt's total was stated by its harness.
+    /// Every contributing attempt's total was stated by its harness, through a
+    /// declared `totalTokens` mapping.
     HarnessReported,
     /// Every contributing attempt's total was derived from its components.
+    /// What both shipped presets produce.
     DerivedFromComponents,
-    /// Both kinds are inside this sum. Real for any run whose nodes span
-    /// claude-code (which states a total) and codex (which does not).
+    /// Both kinds are inside this sum: a run whose nodes span an
+    /// operator-defined adapter that declares `totalTokens` and one that does
+    /// not.
     Mixed,
 }
 
@@ -239,7 +257,10 @@ impl Default for UsageCostRollup {
 pub struct UsageCoverage {
     /// Tasks the run durably holds.
     pub tasks: usize,
-    /// Member tasks with at least one attempt that reported usage.
+    /// Member tasks with at least one attempt that contributed a figure to
+    /// these sums. An attempt that reported usage the declared mapping could
+    /// read nothing out of does not make its task one of these — see
+    /// [`UsageCoverage::attempts_reported_without_figures`].
     pub tasks_with_reported_usage: usize,
     /// Member tasks the ledger holds no attempt for at all. An attempt whose
     /// adapter captured nothing writes no attestation, and a task whose
@@ -250,6 +271,20 @@ pub struct UsageCoverage {
     pub attempts_observed: usize,
     /// Attempts whose attestation carries a `reported` usage record.
     pub attempts_reported: usize,
+    /// The subset of [`UsageCoverage::attempts_reported`] that contributed
+    /// nothing: the harness reported usage and no figure this rollup sums
+    /// survived the adapter's declared mapping.
+    ///
+    /// This is the ordinary harness-drift shape, and it is why the reported
+    /// count alone is not a coverage statement. A harness renames a key, every
+    /// declared path resolves to absent — which is not the same as unreadable,
+    /// so nothing lands in `unreadableFields` — and
+    /// [`crate::usage::observe`] still returns `Reported`, with
+    /// [`crate::usage::UsageShape::Unmapped`]. Counting that attempt as covered
+    /// would let a run whose mapping resolved nothing read as complete and
+    /// costless. It is counted here and raises
+    /// [`UsageRollupCaveat::ReportedWithoutFigures`] instead.
+    pub attempts_reported_without_figures: usize,
     /// Attempts whose attestation states `not-reported`: a usage scrape was
     /// declared, the stream was read, and it carried no usage.
     pub attempts_not_reported: usize,
@@ -276,6 +311,10 @@ pub enum UsageRollupCaveat {
     MembersWithoutAttestation,
     /// Some observed attempt reported no usage, by either typed absence.
     AttemptsWithoutUsage,
+    /// Some attempt reported usage that yielded no figure at all — the
+    /// adapter's declared mapping resolved nothing out of what the harness
+    /// emitted. The sums are missing that attempt entirely.
+    ReportedWithoutFigures,
     /// Some attestation carries no readable usage record.
     UnreadableUsageRecord,
     /// An attempt named a declared field its harness emitted in an unusable
@@ -416,7 +455,25 @@ pub fn roll_up<'a>(
             UsageObservation::Reported(breakdown) => breakdown,
         };
         coverage.attempts_reported += 1;
-        tasks_with_usage.insert(*task);
+        // Reported is a discriminant, not a measurement. Whether this attempt
+        // contributes anything is decided by the figures that survived the
+        // adapter's declared mapping, and it is decided over exactly the
+        // fields this rollup sums: `inputTokensAsReported` is excluded because
+        // it is never summed, so an attempt carrying only that would be
+        // claiming a contribution the sums do not contain.
+        let contributed = breakdown.input_tokens.is_some()
+            || breakdown.cache_read_tokens.is_some()
+            || breakdown.cache_write_tokens.is_some()
+            || breakdown.output_tokens.is_some()
+            || breakdown.reasoning_tokens.is_some()
+            || breakdown.total_tokens.is_some()
+            || breakdown.cost.is_some();
+        if contributed {
+            tasks_with_usage.insert(*task);
+        } else {
+            coverage.attempts_reported_without_figures += 1;
+            caveats.insert(UsageRollupCaveat::ReportedWithoutFigures);
+        }
 
         saturated |= !tokens.input_tokens.add(breakdown.input_tokens);
         saturated |= !tokens.cache_read_tokens.add(breakdown.cache_read_tokens);
@@ -582,8 +639,13 @@ mod tests {
         .unwrap()
     }
 
-    /// The real claude-code `result` shape: cache write is a large fresh-input
-    /// volume that `input_tokens` excludes, and a cost is stated.
+    /// The real claude-code `result` shape, exactly as
+    /// `usage::tests::claude_code_capture_reconciles_components_and_keeps_reported_cost`
+    /// pins it against the verbatim fixture: cache write is a large fresh-input
+    /// volume that `input_tokens` excludes, a cost is stated, and the total is
+    /// **derived** — the `result` event's usage object carries no
+    /// `total_tokens` and the `claude-code` preset declares no `totalTokens`
+    /// mapping, so nothing about it is harness-reported.
     fn claude_usage() -> Value {
         serde_json::to_value(UsageObservation::Reported(UsageBreakdown {
             shape: UsageShape::Components,
@@ -595,7 +657,7 @@ mod tests {
             reasoning_tokens: None,
             total_tokens: Some(UsageTotalTokens {
                 value: 11_380_648,
-                source: UsageTotalSource::HarnessReported,
+                source: UsageTotalSource::DerivedFromComponents,
             }),
             cost: Some(UsageCost {
                 amount: serde_json::Number::from_f64(8.755_705).unwrap(),
@@ -606,8 +668,32 @@ mod tests {
         .unwrap()
     }
 
+    /// An **operator-defined** adapter that declares a `totalTokens` mapping
+    /// its harness fills. No shipped preset does, which is why this fixture
+    /// names no harness: it exists to exercise the one path that produces
+    /// `harness-reported`, and pretending a preset produces it is what the
+    /// first draft of this module got wrong.
+    fn declared_total_usage() -> Value {
+        serde_json::to_value(UsageObservation::Reported(UsageBreakdown {
+            shape: UsageShape::Components,
+            input_tokens: Some(100),
+            input_tokens_as_reported: Some(100),
+            cache_read_tokens: Some(0),
+            cache_write_tokens: Some(0),
+            output_tokens: Some(20),
+            reasoning_tokens: None,
+            total_tokens: Some(UsageTotalTokens {
+                value: 120,
+                source: UsageTotalSource::HarnessReported,
+            }),
+            cost: None,
+            unreadable_fields: Vec::new(),
+        }))
+        .unwrap()
+    }
+
     #[test]
-    fn a_two_harness_run_sums_components_and_states_the_mixed_total_authority() {
+    fn a_two_harness_run_sums_every_component_and_grades_both_totals_derived() {
         let records = [
             attestation(1, "task-codex", 1, codex_usage()),
             attestation(2, "task-claude", 1, claude_usage()),
@@ -654,8 +740,10 @@ mod tests {
         let total = rollup.tokens.total_tokens.expect("both attempts total");
         assert_eq!(total.value, 7_093_008 + 11_380_648);
         assert_eq!(total.attempts, 2);
-        assert_eq!(total.source, UsageRollupTotalSource::Mixed);
-        assert!(rollup
+        // Both shipped presets derive their total, so the two-preset run is
+        // not `mixed` — it is uniformly derived, and the caveat stays silent.
+        assert_eq!(total.source, UsageRollupTotalSource::DerivedFromComponents);
+        assert!(!rollup
             .caveats
             .contains(&UsageRollupCaveat::MixedTotalAuthority));
 
@@ -668,6 +756,99 @@ mod tests {
             rollup.cost.basis.contains("floor"),
             "the charge floor caveat travels with the cost figure"
         );
+    }
+
+    #[test]
+    fn only_a_declared_total_mapping_reaches_the_harness_reported_grade() {
+        // Nothing a shipped preset produces can reach `harness-reported`: the
+        // grade comes from a declared `totalTokens` mapping, and neither
+        // preset declares one. An operator-defined adapter that does can.
+        let declared = [attestation(1, "declared", 1, declared_total_usage())];
+        let harness = roll_up(["declared"], &AttestationEvidence::new(true, &declared));
+        assert_eq!(
+            harness.tokens.total_tokens.unwrap().source,
+            UsageRollupTotalSource::HarnessReported
+        );
+        assert!(harness.is_complete(), "{:?}", harness.caveats);
+
+        // And a run mixing that adapter with a preset is where `mixed` — and
+        // its caveat — actually becomes reachable.
+        let records = [
+            attestation(1, "declared", 1, declared_total_usage()),
+            attestation(2, "preset", 1, codex_usage()),
+        ];
+        let mixed = roll_up(
+            ["declared", "preset"],
+            &AttestationEvidence::new(true, &records),
+        );
+        let total = mixed.tokens.total_tokens.expect("both attempts total");
+        assert_eq!(total.value, 120 + 7_093_008);
+        assert_eq!(total.source, UsageRollupTotalSource::Mixed);
+        assert!(mixed
+            .caveats
+            .contains(&UsageRollupCaveat::MixedTotalAuthority));
+    }
+
+    #[test]
+    fn an_attempt_whose_mapping_resolved_nothing_is_not_a_complete_costless_run() {
+        // Harness drift: the `usage` capture resolves, no declared path is
+        // present in what the harness emitted, and absence is not
+        // unreadability -- so `observe` returns `Reported` with an `unmapped`
+        // shape, every component `None`, and an empty `unreadableFields`.
+        // Counting that as covered would grade a run whose mapping resolved
+        // nothing as complete and costless.
+        let unmapped = serde_json::to_value(UsageObservation::Reported(UsageBreakdown {
+            shape: UsageShape::Unmapped,
+            input_tokens: None,
+            input_tokens_as_reported: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: None,
+            reasoning_tokens: None,
+            total_tokens: None,
+            cost: None,
+            unreadable_fields: Vec::new(),
+        }))
+        .unwrap();
+        let rollup = roll_up(
+            ["task"],
+            &AttestationEvidence::new(true, &[attestation(1, "task", 1, unmapped)]),
+        );
+        assert_eq!(rollup.coverage.attempts_reported, 1);
+        assert_eq!(rollup.coverage.attempts_reported_without_figures, 1);
+        assert_eq!(
+            rollup.coverage.tasks_with_reported_usage, 0,
+            "an attempt that contributed nothing does not make its task covered"
+        );
+        assert_eq!(rollup.tokens, UsageTokenRollup::default());
+        assert!(rollup
+            .caveats
+            .contains(&UsageRollupCaveat::ReportedWithoutFigures));
+        assert!(!rollup.is_complete());
+
+        // The weaker same-shaped variant: a breakdown with one component and
+        // no total still contributes, so it is not in this bucket.
+        let reasoning_only = serde_json::to_value(UsageObservation::Reported(UsageBreakdown {
+            shape: UsageShape::Components,
+            input_tokens: None,
+            input_tokens_as_reported: None,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            output_tokens: None,
+            reasoning_tokens: Some(7),
+            total_tokens: None,
+            cost: None,
+            unreadable_fields: Vec::new(),
+        }))
+        .unwrap();
+        let partial = roll_up(
+            ["task"],
+            &AttestationEvidence::new(true, &[attestation(1, "task", 1, reasoning_only)]),
+        );
+        assert_eq!(partial.coverage.attempts_reported_without_figures, 0);
+        assert_eq!(partial.coverage.tasks_with_reported_usage, 1);
+        assert_eq!(partial.tokens.reasoning_tokens.value, 7);
+        assert_eq!(partial.tokens.total_tokens, None);
     }
 
     #[test]
@@ -779,8 +960,11 @@ mod tests {
             "unexpected caveats: {:?}",
             rollup.caveats
         );
-        let total = rollup.tokens.total_tokens.expect("claude states a total");
-        assert_eq!(total.source, UsageRollupTotalSource::HarnessReported);
+        let total = rollup
+            .tokens
+            .total_tokens
+            .expect("the components derive a total");
+        assert_eq!(total.source, UsageRollupTotalSource::DerivedFromComponents);
         assert_eq!(rollup.cost.attempts, 1);
     }
 
@@ -815,6 +999,9 @@ mod tests {
 
     #[test]
     fn a_mismatched_and_unreadable_attempt_names_both_problems() {
+        // A mismatch is only representable for a declared-total adapter: with
+        // no `totalTokens` mapping there is no stated total to disagree with
+        // the components, which is why this fixture states one.
         let usage = serde_json::to_value(UsageObservation::Reported(UsageBreakdown {
             shape: UsageShape::Components,
             input_tokens: Some(10),

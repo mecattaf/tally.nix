@@ -728,6 +728,26 @@ fn print_lifecycle_human(envelope: &Value, provenance: bool) -> Result<()> {
     Ok(())
 }
 
+/// One rolled-up component, rendered so that "nobody measured this" and "a
+/// harness measured zero" cannot print the same characters.
+///
+/// The per-component `attempts` count is the only thing on the wire that
+/// separates the two, so a component no attempt reported renders `--`. Printing
+/// its `value` — which is `0` because nothing was added to it — would
+/// reintroduce at the render layer exactly the absence/zero conflation
+/// `crate::usage`'s typed absence exists to prevent.
+fn component(tokens: &serde_json::Map<String, Value>, key: &str) -> String {
+    let Some(component) = tokens.get(key) else {
+        return "--".to_owned();
+    };
+    if component["attempts"].as_u64() == Some(0) {
+        return "--".to_owned();
+    }
+    component["value"]
+        .as_u64()
+        .map_or_else(|| "--".to_owned(), |value| value.to_string())
+}
+
 /// The run header's answer to "what did this run cost".
 ///
 /// Every number here is printed with the coverage it is over, because the
@@ -750,44 +770,60 @@ fn print_run_usage(usage: &Value) -> Result<()> {
         outln!("Usage: not summed -- the advisory attestation ledger did not verify");
         return Ok(());
     }
-    let sum = |key: &str| {
-        tokens
-            .get(key)
-            .and_then(|component| component["value"].as_u64())
-            .unwrap_or(0)
-    };
-    match tokens.get("totalTokens").and_then(Value::as_object) {
-        None => outln!(
+    // Whether any attempt reported usage is `coverage.attemptsReported`'s
+    // answer and nothing else's. Reading it off `totalTokens` told an operator
+    // "no attempt reported usage" for an attempt that reported usage no
+    // declared mapping could read a total out of — and then printed a line of
+    // zeros underneath contradicting it.
+    if reported == 0 {
+        outln!(
             "Usage: no attempt reported usage ({observed} scraped attempt(s) over {tasks} member task(s), advisory adapter captures)"
-        ),
-        Some(total) => outln!(
-            "Usage: {} tokens, {} ({reported} of {observed} scraped attempt(s) over {tasks} member task(s), advisory adapter captures)",
-            total.get("value").and_then(Value::as_u64).unwrap_or(0),
-            compact_text(
-                total
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown-source")
-            )
-        ),
+        );
+    } else {
+        match tokens.get("totalTokens").and_then(Value::as_object) {
+            None => outln!(
+                "Usage: no total ({reported} of {observed} scraped attempt(s) reported usage over {tasks} member task(s), advisory adapter captures)"
+            ),
+            Some(total) => outln!(
+                "Usage: {} tokens, {} ({reported} of {observed} scraped attempt(s) over {tasks} member task(s), advisory adapter captures)",
+                total.get("value").and_then(Value::as_u64).unwrap_or(0),
+                compact_text(
+                    total
+                        .get("source")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown-source")
+                )
+            ),
+        }
+        let fresh = tokens.get("freshInputTokens").map_or_else(
+            || "--".to_owned(),
+            |fresh| {
+                let reported_halves = fresh["attemptsComplete"].as_u64().unwrap_or(0)
+                    + fresh["attemptsPartial"].as_u64().unwrap_or(0);
+                match fresh["value"].as_u64() {
+                    Some(value) if reported_halves > 0 => value.to_string(),
+                    _ => "--".to_owned(),
+                }
+            },
+        );
+        outln!(
+            "  fresh input {fresh} (= input {} + cache write {})  cache read {}  output {} (reasoning {} nested inside)",
+            component(tokens, "inputTokens"),
+            component(tokens, "cacheWriteTokens"),
+            component(tokens, "cacheReadTokens"),
+            component(tokens, "outputTokens"),
+            component(tokens, "reasoningTokens")
+        );
     }
-    outln!(
-        "  fresh input {} (= input {} + cache write {})  cache read {}  output {} (reasoning {} nested inside)",
-        tokens
-            .get("freshInputTokens")
-            .and_then(|fresh| fresh["value"].as_u64())
-            .unwrap_or(0),
-        sum("inputTokens"),
-        sum("cacheWriteTokens"),
-        sum("cacheReadTokens"),
-        sum("outputTokens"),
-        sum("reasoningTokens")
-    );
     let cost = &usage["cost"];
     if let Some(amount) = cost["amountUsd"].as_f64() {
+        // The basis sentence is the daemon's, not the CLI's: it carries the
+        // W-382-RECORDER charge-floor statement, and a daemon that revises it
+        // must not be misquoted by its own client.
         outln!(
-            "  cost ${amount:.4} over {} attempt(s) -- harness-reported cost only; tally's cgroup charge is a separate figure, is not summed here, and is a floor",
-            cost["attempts"].as_u64().unwrap_or(0)
+            "  cost ${amount:.4} over {} attempt(s) -- {}",
+            cost["attempts"].as_u64().unwrap_or(0),
+            compact_text(cost["basis"].as_str().unwrap_or("basis not stated"))
         );
     }
     let caveats = usage["caveats"].as_array().map_or(&[][..], Vec::as_slice);

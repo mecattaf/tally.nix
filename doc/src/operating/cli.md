@@ -460,14 +460,18 @@ structured object.
 Under the task counts, `query run` answers what the run cost. The line is deliberately never a
 bare total: the token sum arrives with the attempts it covers, the member tasks those attempts
 belong to, and the grade of the evidence, because these numbers are advisory adapter captures
-summed per attempt, not a bill. The second line spells out `fresh input N (= input N + cache
-write N)` — `inputTokens` alone understates any harness that writes to a prompt cache — and marks
-reasoning tokens as nested inside the output figure rather than beside it. A cost line appears
-only where a harness reported cost, and states that tally's cgroup `charge` is a separate figure
-that is not summed there and is a floor. A final `partial:` line names every reason the sums are
-incomplete: member tasks the attestation ledger holds nothing about, attempts that reported no
-usage, a total mixing harness-stated and derived figures. No `partial:` line means the rollup
-covers every attempt the ledger could speak for. `query standup` carries the same rollup per run
+summed per attempt, not a bill. Whether any attempt reported usage is read from the coverage
+count, so a run where none did prints exactly that and no component line underneath it. The second
+line spells out `fresh input N (= input N + cache write N)` — `inputTokens` alone understates any
+harness that writes to a prompt cache — and marks reasoning tokens as nested inside the output
+figure rather than beside it. A component **no attempt reported** prints `--`, never `0`: a
+measured zero is a measurement and keeps printing `0`, and the two must not read alike. A cost
+line appears only where a harness reported cost, and carries the daemon's own basis sentence,
+which states that tally's cgroup `charge` is a separate figure that is not summed there and is a
+floor. A final `partial:` line names every reason the sums are incomplete: member tasks the
+attestation ledger holds nothing about, attempts that reported no usage, attempts whose reported
+usage no declared mapping could read, a total mixing harness-stated and derived figures. No
+`partial:` line means the rollup covers every attempt the ledger could speak for. `query standup` carries the same rollup per run
 its window touched, under `runs`. See the [RPC protocol
 reference](../reference/rpc-protocol.md#usage-rollups) for the full field set. A run retired by `tally flow supersede` reads `superseded` whatever its own
 node verdicts say, and names its successor above the board — a reader who misses that would wait

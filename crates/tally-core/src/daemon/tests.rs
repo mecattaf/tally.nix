@@ -6332,7 +6332,11 @@ mod tests {
                         if attested {
                             break;
                         }
-                        tokio::task::yield_now().await;
+                        // Sleep rather than spin: this suite runs in parallel
+                        // with tests that measure cgroup CPU seconds, and a
+                        // busy poll burning a core is a plausible amplifier of
+                        // their timing flakes.
+                        tokio::time::sleep(Duration::from_millis(5)).await;
                     }
                 })
                 .await
