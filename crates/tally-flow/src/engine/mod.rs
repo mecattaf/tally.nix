@@ -18,7 +18,7 @@ use serde_json::{json, Map, Value};
 
 use crate::catalog::sha256;
 use crate::dialect::validate_instance;
-use crate::error::with_recovery_facts;
+use crate::error::SupersessionDetails;
 use crate::executor::FlowJobExecutor;
 use crate::model::{
     flow_canonical_payload_fields, is_nix_store_path, node_spec_fields, sugar_reserved_fields,
@@ -291,16 +291,7 @@ pub fn run_script(
     Ok(report)
 }
 
-/// Structured facts a supervisor branches on without reading prose.
-///
-/// A run-identity refusal and a lost daemon connection both stop a runner, but
-/// only one of them can ever be resolved by retrying. These fields say which is
-/// which, and what the machine-actionable next step is, so an unattended queue
-/// does not spend a night re-observing a permanent answer.
-fn replay_facts(error: FlowError, flow_run_id: &str) -> FlowError {
-    with_recovery_facts(error.detail("flowRunId", flow_run_id))
-}
-
+/// Refuse a start whose recorded identity hash and current one disagree.
 fn validate_startup_hash(
     code: &str,
     flow_run_id: &str,
@@ -310,21 +301,20 @@ fn validate_startup_hash(
     if recorded_hash == current_hash {
         return Ok(());
     }
-    Err(replay_facts(
-        FlowError::new(
-            "FlowReplayError",
-            code,
-            format!(
-                "flow run {flow_run_id} is pinned to {recorded_hash}, not {current_hash}{}",
-                crate::error::identity_refusal_remedy_sentence(code, flow_run_id)
-            ),
-        )
-        .at(RUNTIME_ERROR_LOCATION)
-        .detail("recordedHash", recorded_hash)
-        .detail("currentHash", current_hash)
-        .detail("remedy", crate::error::supersede_remedy(code, flow_run_id)),
-        flow_run_id,
-    ))
+    Err(crate::error::supersession_error(
+        code,
+        format!(
+            "flow run {flow_run_id} is pinned to {recorded_hash}, not {current_hash}{}",
+            crate::error::identity_refusal_remedy_sentence(code, flow_run_id)
+        ),
+        &SupersessionDetails {
+            flow_run_id,
+            recorded_hash: Some(recorded_hash),
+            current_hash: Some(current_hash),
+            ..SupersessionDetails::default()
+        },
+    )
+    .at(RUNTIME_ERROR_LOCATION))
 }
 
 fn changed_catalog_error(
@@ -334,27 +324,20 @@ fn changed_catalog_error(
 ) -> FlowError {
     let rendered_recorded = recorded_hash.unwrap_or("<none>");
     let rendered_current = current_hash.unwrap_or("<none>");
-    replay_facts(
-        FlowError::new(
-            "FlowReplayError",
-            "catalog-changed-mid-run",
-            format!(
-                "flow run {flow_run_id} is pinned to {rendered_recorded}, not {rendered_current}{}",
-                crate::error::identity_refusal_remedy_sentence(
-                    "catalog-changed-mid-run",
-                    flow_run_id
-                )
-            ),
-        )
-        .at(RUNTIME_ERROR_LOCATION)
-        .detail("recordedHash", recorded_hash)
-        .detail("currentHash", current_hash)
-        .detail(
-            "remedy",
-            crate::error::supersede_remedy("catalog-changed-mid-run", flow_run_id),
+    crate::error::supersession_error(
+        "catalog-changed-mid-run",
+        format!(
+            "flow run {flow_run_id} is pinned to {rendered_recorded}, not {rendered_current}{}",
+            crate::error::identity_refusal_remedy_sentence("catalog-changed-mid-run", flow_run_id)
         ),
-        flow_run_id,
+        &SupersessionDetails {
+            flow_run_id,
+            recorded_hash,
+            current_hash,
+            ..SupersessionDetails::default()
+        },
     )
+    .at(RUNTIME_ERROR_LOCATION)
 }
 
 /// Refuse to start a run that a durable rollover already retired.
@@ -362,23 +345,21 @@ fn changed_catalog_error(
 /// This is the one replay refusal that carries its own remedy: the successor is
 /// named, so a supervisor switches to it instead of escalating to a human.
 fn superseded_error(flow_run_id: &str, supersede: &RunSupersede) -> FlowError {
-    let error = FlowError::new(
-        "FlowReplayError",
+    crate::error::supersession_error(
         "flow-run-superseded",
         format!(
             "flow run {flow_run_id} was superseded by {} ({}) at {}; run the successor",
             supersede.successor_flow_run_id, supersede.reason, supersede.recorded_at
         ),
+        &SupersessionDetails {
+            flow_run_id,
+            successor_flow_run_id: Some(supersede.successor_flow_run_id.as_str()),
+            reason: Some(supersede.reason.as_str()),
+            recorded_at: Some(supersede.recorded_at.as_str()),
+            ..SupersessionDetails::default()
+        },
     )
     .at(RUNTIME_ERROR_LOCATION)
-    .detail("flowRunId", flow_run_id)
-    .detail(
-        "successorFlowRunId",
-        supersede.successor_flow_run_id.as_str(),
-    )
-    .detail("reason", supersede.reason.as_str())
-    .detail("recordedAt", supersede.recorded_at.as_str());
-    with_recovery_facts(error)
 }
 
 fn evaluate_script(source: &str, path: Option<&Path>, context: &mut Context) -> JsResult<JsValue> {

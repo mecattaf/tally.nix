@@ -950,15 +950,9 @@ impl ClientError {
             .at(location)
             .with_ordinal(ordinal);
         if let Some(details) = self.details {
-            if matches!(
-                error.code.as_str(),
-                "replay-divergence"
-                    | "script-changed-mid-run"
-                    | "args-changed-mid-run"
-                    | "catalog-changed-mid-run"
-                    | "flow-run-superseded"
-                    | "flow-lineage-unusable"
-            ) {
+            if crate::error::is_supersession_code(&error.code)
+                || error.code == "flow-lineage-unusable"
+            {
                 if let Value::Object(details) = details {
                     error.details.extend(details);
                 } else {

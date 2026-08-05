@@ -246,6 +246,49 @@ than wall-clock promise polling. `Promise.all` still returns values in input ord
 Run-identity and payload failures deliberately stop a run before it can create a
 new history.
 
+### One `details` shape for every exit-20 refusal
+
+The five codes below are one family: `script-changed-mid-run`,
+`args-changed-mid-run`, `catalog-changed-mid-run`, `flow-run-superseded`, and
+`replay-divergence`. Each is raised either by the runner's startup scan, before
+the script is evaluated, or by an admission mid-run — and a driver must not have
+to know which. All five therefore carry the same fourteen `details` members at
+every raising site, with `null` where the code has nothing to say:
+
+| Field | Meaning |
+|---|---|
+| `flowRunId` | The run whose recorded identity is in question. `null` only when the refusal reached the runner from a producer that named no run. |
+| `divergentInput` | `script`, `args`, `catalog`, or `payload`. `null` for `flow-run-superseded`, where nothing diverged. |
+| `recordedHash` | The hash the ledger recorded for that input. |
+| `currentHash` | The hash this runner computed for the same input, now. |
+| `recordedLabel` | The node label the ledger recorded. |
+| `currentLabel` | The node label this runner derived, now. |
+| `taskUuid` | The durable row the refusal is about, where one is identified. |
+| `successorFlowRunId` | The run that replaces a retired one. |
+| `reason` | The recorded rollover reason, from `flow.supersede`'s closed set. |
+| `recordedAt` | When the rollover was recorded. |
+| `kernelError` | The daemon's own message, when the refusal was found through a kernel dedup-key conflict rather than by the runner's own comparison. |
+| `remedy` | The `tally flow supersede` invocation that clears it, or `null` when no single command does — including when no `flowRunId` is known, since the command needs one. |
+| `transient` | Always `false` for this family. |
+| `resolution` | `supersede`, `run-successor`, or `investigate`. |
+
+So `details.recordedHash` and `details.currentHash` name the two sides of the
+disagreement for all five codes, whichever one fired and wherever it fired. The
+[error reference](../reference/errors.md#branching-on-a-failure-without-reading-prose)
+lists which members each code populates.
+
+Two members of the family have only one raising site, because the state machine
+allows only one, and that is a decision rather than a gap:
+
+- `flow-run-superseded` is startup-only. Lineage is read once by the same
+  `inspect_run` scan as the three pins; admission never re-reads it. See
+  [the scope of the refusal](#the-scope-of-the-refusal).
+- `replay-divergence` is mid-run only. It is a statement about one ordinal's
+  payload, and at startup no ordinal has been derived yet.
+
+`ordinal` is a top-level field of the error, not part of `details`. It is present
+exactly when a node is implicated, so a startup refusal has none.
+
 ### `script-changed-mid-run` — exit 20
 
 Before evaluating the script, the runner queries every durable node with the

@@ -150,7 +150,184 @@ const RECOVERY_FACTS: &[(&str, bool, &str)] = &[
     ("daemon-epoch-changed", true, "retry"),
 ];
 
-/// Which identity-bearing input diverged, for the codes where that is fixed.
+/// The exit-20 family: run supersession and replay divergence.
+///
+/// These five codes share one wire contract because they share one operator
+/// answer — the run's recorded identity and the work in front of it disagree,
+/// so continuing would write a second history. `cli::flow::flow_error` maps
+/// exactly this list to exit 20.
+pub const SUPERSESSION_CODES: [&str; 5] = [
+    "script-changed-mid-run",
+    "args-changed-mid-run",
+    "catalog-changed-mid-run",
+    "flow-run-superseded",
+    "replay-divergence",
+];
+
+/// Every member of the exit-20 `details` contract, in emission order.
+///
+/// All fourteen are present on every exit-20 error at every raising site, with
+/// `null` where the code has nothing to say. A monitor therefore reads one
+/// shape and never asks where the refusal came from — which is the whole point:
+/// the shape used to depend on whether the runner's startup scan or a mid-run
+/// admission raised it, so a driver had to special-case the site to find the
+/// hash that moved.
+pub const SUPERSESSION_DETAIL_FIELDS: [&str; 14] = [
+    "flowRunId",
+    "divergentInput",
+    "recordedHash",
+    "currentHash",
+    "recordedLabel",
+    "currentLabel",
+    "taskUuid",
+    "successorFlowRunId",
+    "reason",
+    "recordedAt",
+    "kernelError",
+    "remedy",
+    "transient",
+    "resolution",
+];
+
+/// Is this one of the five codes that carries the exit-20 details contract?
+#[must_use]
+pub fn is_supersession_code(code: &str) -> bool {
+    SUPERSESSION_CODES.contains(&code)
+}
+
+/// The site-supplied members of the exit-20 `details` contract.
+///
+/// A raising site fills what it knows and leaves the rest; the derived members
+/// (`divergentInput`, `remedy`, `transient`, `resolution`) are fixed by the code
+/// and are never a caller's choice.
+#[derive(Debug, Clone, Default)]
+pub struct SupersessionDetails<'a> {
+    /// The run whose recorded identity is in question. Every raising site in
+    /// this tree knows it; empty renders as `null` rather than as an empty
+    /// string, and suppresses the `remedy` derived from it.
+    pub flow_run_id: &'a str,
+    /// The hash the ledger recorded for the divergent input.
+    pub recorded_hash: Option<&'a str>,
+    /// The hash this runner computed for the same input, now.
+    pub current_hash: Option<&'a str>,
+    /// The node label the ledger recorded.
+    pub recorded_label: Option<&'a str>,
+    /// The node label this runner derived, now.
+    pub current_label: Option<&'a str>,
+    /// The durable row the refusal is about, where one is identified.
+    pub task_uuid: Option<&'a str>,
+    /// The run that replaces a retired one.
+    pub successor_flow_run_id: Option<&'a str>,
+    /// The recorded rollover reason, one of the closed `flow.supersede` set.
+    pub reason: Option<&'a str>,
+    /// When the rollover was recorded.
+    pub recorded_at: Option<&'a str>,
+    /// The daemon's own message, when the refusal was discovered through a
+    /// kernel dedup-key conflict rather than by the runner's own comparison.
+    pub kernel_error: Option<&'a str>,
+}
+
+/// Build the full exit-20 `details` map for one code.
+#[must_use]
+pub fn supersession_details(code: &str, fields: &SupersessionDetails<'_>) -> Map<String, Value> {
+    let mut details = Map::new();
+    let mut set = |key: &str, value: Option<&str>| {
+        if let Some(value) = value {
+            details.insert(key.to_owned(), Value::String(value.to_owned()));
+        }
+    };
+    set("flowRunId", Some(fields.flow_run_id));
+    set("recordedHash", fields.recorded_hash);
+    set("currentHash", fields.current_hash);
+    set("recordedLabel", fields.recorded_label);
+    set("currentLabel", fields.current_label);
+    set("taskUuid", fields.task_uuid);
+    set("successorFlowRunId", fields.successor_flow_run_id);
+    set("reason", fields.reason);
+    set("recordedAt", fields.recorded_at);
+    set("kernelError", fields.kernel_error);
+    complete_supersession_details(code, &mut details);
+    details
+}
+
+/// One exit-20 error, carrying the whole contract.
+///
+/// Every code in the family is a `FlowReplayError`; the caller supplies the
+/// location and, mid-run, the ordinal.
+#[must_use]
+pub fn supersession_error(
+    code: &str,
+    message: impl Into<String>,
+    fields: &SupersessionDetails<'_>,
+) -> FlowError {
+    let mut error = FlowError::new("FlowReplayError", code, message);
+    error.details = supersession_details(code, fields);
+    error
+}
+
+/// Bring a partially populated exit-20 `details` map onto the contract.
+///
+/// Missing members become `null`, the derived members are (re)stated from the
+/// code, and the whole map is re-emitted in `SUPERSESSION_DETAIL_FIELDS` order.
+/// Anything a producer supplied beyond the contract is preserved after it: the
+/// fourteen fields are a guaranteed floor, never a filter that silently drops a
+/// diagnostic.
+fn complete_supersession_details(code: &str, details: &mut Map<String, Value>) {
+    // A producer that named no run — a foreign client, or a `details` payload
+    // that was not an object — leaves this absent, and an empty string is the
+    // same fact written differently. Both render as `null`: an error must not
+    // say it does not know which run this is and hand over a command to fix
+    // that run in the same breath.
+    let flow_run_id = details
+        .get("flowRunId")
+        .and_then(Value::as_str)
+        .filter(|flow_run_id| !flow_run_id.is_empty())
+        .map(ToOwned::to_owned);
+    let mut ordered = Map::new();
+    for field in SUPERSESSION_DETAIL_FIELDS {
+        let value = match field {
+            "flowRunId" => flow_run_id.clone().map_or(Value::Null, Value::String),
+            "divergentInput" => family_divergent_input(code)
+                .map_or(Value::Null, |input| Value::String(input.to_owned())),
+            // A remedy is a command an operator can type, so it exists only when
+            // every argument of that command does. Only the three pins have one;
+            // `flow-run-superseded` names its successor instead, and
+            // `replay-divergence` resolves by investigation.
+            "remedy" => match (divergent_input(code), flow_run_id.as_deref()) {
+                (Some(_), Some(flow_run_id)) => supersede_remedy(code, flow_run_id).into(),
+                _ => Value::Null,
+            },
+            "transient" => {
+                recovery_fact(code).map_or(Value::Null, |(transient, _)| transient.into())
+            }
+            "resolution" => recovery_fact(code)
+                .map_or(Value::Null, |(_, resolution)| resolution.to_owned().into()),
+            _ => details.get(field).cloned().unwrap_or(Value::Null),
+        };
+        ordered.insert(field.to_owned(), value);
+    }
+    for (key, value) in details.iter() {
+        if !ordered.contains_key(key) {
+            ordered.insert(key.clone(), value.clone());
+        }
+    }
+    *details = ordered;
+}
+
+/// The identity-bearing input that disagrees, across the whole exit-20 family.
+///
+/// `replay-divergence` is the payload member: the same ordinal re-derived
+/// different canonical work. `flow-run-superseded` has none — nothing diverged,
+/// the run was retired by decision.
+fn family_divergent_input(code: &str) -> Option<&'static str> {
+    match code {
+        "replay-divergence" => Some("payload"),
+        other => divergent_input(other),
+    }
+}
+
+/// Which identity-bearing input diverged, for the three pins whose remedy is a
+/// `flow.supersede` reason from the closed set.
 fn divergent_input(code: &str) -> Option<&'static str> {
     match code {
         "script-changed-mid-run" => Some("script"),
@@ -158,6 +335,13 @@ fn divergent_input(code: &str) -> Option<&'static str> {
         "catalog-changed-mid-run" => Some("catalog"),
         _ => None,
     }
+}
+
+fn recovery_fact(code: &str) -> Option<(bool, &'static str)> {
+    RECOVERY_FACTS
+        .iter()
+        .find(|(known, _, _)| *known == code)
+        .map(|(_, transient, resolution)| (*transient, *resolution))
 }
 
 /// The `tally flow supersede` invocation that clears one identity refusal.
@@ -204,21 +388,22 @@ pub fn identity_refusal_remedy_sentence(code: &str, flow_run_id: &str) -> String
 /// wire code never has two different `details` contracts depending on where it
 /// was raised. A code with no entry is left unstamped, and `errors.md` says that
 /// absence means unclassified rather than transient.
+///
+/// For the exit-20 family this also completes the whole `details` contract, so
+/// even a refusal that reached the runner from somewhere other than tally's own
+/// raising sites arrives on the documented shape.
 #[must_use]
-pub fn with_recovery_facts(error: FlowError) -> FlowError {
-    let Some((_, transient, resolution)) = RECOVERY_FACTS
-        .iter()
-        .find(|(code, _, _)| *code == error.code)
-    else {
+pub fn with_recovery_facts(mut error: FlowError) -> FlowError {
+    if is_supersession_code(&error.code) {
+        complete_supersession_details(&error.code, &mut error.details);
+        return error;
+    }
+    let Some((transient, resolution)) = recovery_fact(&error.code) else {
         return error;
     };
-    let error = error
-        .detail("transient", *transient)
-        .detail("resolution", *resolution);
-    match divergent_input(&error.code) {
-        Some(input) => error.detail("divergentInput", input),
-        None => error,
-    }
+    error
+        .detail("transient", transient)
+        .detail("resolution", resolution)
 }
 
 fn banned_global_remedy(global: &str) -> &'static str {

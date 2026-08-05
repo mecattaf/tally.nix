@@ -566,22 +566,20 @@ fn payload_divergence_stops_admission_at_the_mismatched_ordinal() {
     assert_eq!(error.name, "FlowReplayError");
     assert_eq!(error.code, "replay-divergence");
     assert_eq!(error.ordinal, Some(1));
+    // Divergence carries the whole exit-20 contract, exactly like the startup
+    // identity pins do.
     assert_eq!(
         error.details.keys().map(String::as_str).collect::<Vec<_>>(),
-        [
-            "expectedHash",
-            "recordedHash",
-            "expectedLabel",
-            "recordedLabel",
-            "transient",
-            "resolution",
-        ]
+        crate::error::SUPERSESSION_DETAIL_FIELDS
     );
+    assert_eq!(error.details["flowRunId"], "run-1");
+    assert_eq!(error.details["divergentInput"], "payload");
+    assert_eq!(error.details["recordedHash"], "sha256:divergent");
     // A rollover does not clear a payload divergence, so the resolution differs
     // from the identity pins' — but it is still permanent, and says so.
     assert_eq!(error.details["transient"], false);
     assert_eq!(error.details["resolution"], "investigate");
-    assert!(!error.details.contains_key("divergentInput"));
+    assert!(error.details["remedy"].is_null());
     assert_eq!(client.submissions.borrow().len(), 2);
 }
 
@@ -791,6 +789,27 @@ fn a_concurrent_identity_change_stops_the_admission_frontier() {
             code.trim_end_matches("-changed-mid-run"),
             "{code}"
         );
+        // This mock refuses with a bare code and no details at all — the shape
+        // an older or foreign producer could hand back. The contract is
+        // completed on the way in, so a monitor still reads one map.
+        assert_eq!(
+            error.details.keys().map(String::as_str).collect::<Vec<_>>(),
+            crate::error::SUPERSESSION_DETAIL_FIELDS,
+            "{code}"
+        );
+        // Completion must not invent what the producer did not say. With no
+        // run named, there is no command that clears this, so `remedy` is null
+        // — a `tally flow supersede --flow-run-id <empty>` would not parse, and
+        // advertising it would be a claim computed from absent evidence.
+        assert!(error.details["flowRunId"].is_null(), "{code}");
+        assert!(error.details["remedy"].is_null(), "{code}");
+        for (key, value) in &error.details {
+            let Some(text) = value.as_str() else { continue };
+            assert!(
+                !text.contains("--flow-run-id"),
+                "{code}: {key} names a run this error does not know: {text}"
+            );
+        }
         assert_eq!(client.submissions.borrow().len(), 1);
     }
 }

@@ -249,6 +249,47 @@ authorized.
   cross-project branch. A pi node must be resumed in the directory it was
   launched in, and pi exposes no cwd flag for `launch.cwdArgv` to assert it.
 
+- **The exit-20 flow refusals now carry one `details` contract, identical at
+  every raising site (#390).** `script-changed-mid-run`,
+  `args-changed-mid-run`, `catalog-changed-mid-run`, `flow-run-superseded`, and
+  `replay-divergence` all exit 20 and all mean the same thing to an operator —
+  the run's recorded identity and the work in front of it disagree — but their
+  `details` shape depended on where the refusal was raised. The three identity
+  pins reported `recordedHash`/`currentHash`; `replay-divergence` reported the
+  same disagreement as `expectedHash`/`recordedHash` and named no `flowRunId`
+  at all; and its two mid-run discovery paths disagreed with *each other*, one
+  carrying `taskUuid` and `kernelError` and the other neither. A monitor
+  branching on an exit-20 reason had to special-case the site to find the hash
+  that moved — two eras of error plumbing coexisting on a code family every
+  daily-driven flow can hit.
+
+  All five now emit the same fourteen members at every site, `null` where a
+  code has nothing to say: `flowRunId`, `divergentInput`, `recordedHash`,
+  `currentHash`, `recordedLabel`, `currentLabel`, `taskUuid`,
+  `successorFlowRunId`, `reason`, `recordedAt`, `kernelError`, `remedy`,
+  `transient`, `resolution`. `divergentInput` extends to `payload` for
+  `replay-divergence`, so the member that says *what* disagrees is populated
+  for four of the five; `flow-run-superseded` leaves it `null` because nothing
+  diverged — the run was retired by decision, and its successor is named
+  instead. The rename is on the wire: divergence's `expectedHash` and
+  `expectedLabel` are now `currentHash` and `currentLabel`, the same names the
+  identity pins already used for "what this runner computed now".
+
+  One shared constructor in `tally-flow` builds the map for every site, and
+  `ClientError::into_flow` completes it for any refusal that reaches the runner
+  from somewhere else, so a bare code with no details still lands on the
+  documented shape rather than a thinner one. Completion fills, it never
+  invents: a refusal that named no run reports `flowRunId: null` — an empty
+  string is the same fact written differently and renders the same way — and
+  `remedy` is `null` with it, because `tally flow supersede --flow-run-id`
+  with nothing to put after it is not a command an operator can run. The five codes keep their names,
+  their semantics, their exit code, and the message text `tally flow run`
+  renders; `ordinal` remains a top-level field, present exactly when a node is
+  implicated. `flow-run-superseded` has no mid-run site and `replay-divergence`
+  no startup site — lineage is read once by the startup `inspect_run` scan, and
+  a payload cannot diverge before an ordinal exists — and the contract test
+  says so in place of asserting a site that cannot happen.
+
 - **Flow-run membership is now a durable admission fact, so a node a run
   attached to or reused is visible in that run's own window (#380, W-316).**
   Membership used to be recomputed on every query by scanning durable rows and

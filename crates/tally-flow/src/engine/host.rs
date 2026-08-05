@@ -564,23 +564,26 @@ impl HostShared {
                 .detail("recordedHash", admission.payload_hash.clone())
                 .detail("label", expected_label.clone().unwrap_or_default())
             } else {
-                FlowError::new(
-                    "FlowReplayError",
+                crate::error::supersession_error(
                     "replay-divergence",
                     format!(
                         "ordinal {} re-derived payload {} but the ledger recorded {}",
                         plan.ordinal, expected_hash, admission.payload_hash
                     ),
+                    &crate::error::SupersessionDetails {
+                        flow_run_id: &self.flow_run_id,
+                        recorded_hash: Some(&admission.payload_hash),
+                        current_hash: Some(&expected_hash),
+                        recorded_label: Some(
+                            admission.recorded_label.as_deref().unwrap_or_default(),
+                        ),
+                        current_label: Some(expected_label.as_deref().unwrap_or_default()),
+                        task_uuid: Some(&admission.task_uuid),
+                        ..crate::error::SupersessionDetails::default()
+                    },
                 )
                 .at(plan.location)
                 .with_ordinal(plan.ordinal)
-                .detail("expectedHash", expected_hash)
-                .detail("recordedHash", admission.payload_hash.clone())
-                .detail("expectedLabel", expected_label.clone().unwrap_or_default())
-                .detail(
-                    "recordedLabel",
-                    admission.recorded_label.clone().unwrap_or_default(),
-                )
             };
             let error = crate::error::with_recovery_facts(error);
             self.set_fatal(error.clone());
