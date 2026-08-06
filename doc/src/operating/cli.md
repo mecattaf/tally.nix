@@ -379,6 +379,12 @@ code. `tally queue drain` is unchanged and still exits 3 on an unreachable socke
 carries `ConditionPathExists` on the socket, so a drain scheduled while the daemon is down is
 recorded as a skipped start rather than being invoked at all.
 
+The limit of that, on the record: a daemon that crashed and left its socket file behind satisfies
+the condition, is then refused at connect, and is absorbed as an absence like any other — so a
+quiet `tally-drain` no longer distinguishes a healthy daemon from a dead one whose socket outlived
+it. The alarm for that case is `tally-daemon`'s own unit failure, which is where it belongs; drain
+silence is not evidence the daemon is up.
+
 `await-job` and `await-barrier` print raw terminal JSON. Unlike `enqueue --wait`, they do not map
 a failed returned verdict to a non-zero process exit; inspect the JSON in scripts. Job awaits
 use the same bounded reconnect/re-arm window as `enqueue --wait`. Exhausting that window is an

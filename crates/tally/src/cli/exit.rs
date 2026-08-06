@@ -148,3 +148,59 @@ pub(super) fn default_data_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("HOME and XDG_DATA_HOME are both unset")?;
     Ok(PathBuf::from(home).join(".local/share/tally"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Issue #411: the absorption is scoped to "there is no daemon there", and
+    /// that scope is the whole of what keeps it honest.
+    ///
+    /// `RearmDeadlineExceeded` maps to the same exit code 3 and is the reason
+    /// this cannot be written as "is the exit code 3" — it describes a daemon
+    /// that is present and not answering, which is a real fault and must keep
+    /// failing the drain. Nothing else in the tree pins that distinction: a
+    /// widened predicate leaves every `tally` test binary green, because the
+    /// only fixture that reaches this path is an absent socket.
+    #[test]
+    fn only_a_connect_time_absence_counts_as_an_absent_daemon() {
+        let absent = anyhow::Error::new(WireIoError::Unreachable {
+            path: PathBuf::from("/run/user/0/tally/tally.sock"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        });
+        assert!(is_daemon_absent(&absent));
+        assert_eq!(error_exit_code(&absent), 3);
+
+        // Present, and not answering. Same exit code, not an absence.
+        let wedged = anyhow::Error::new(WireIoError::RearmDeadlineExceeded {
+            method: "queue.drain".to_owned(),
+            path: PathBuf::from("/run/user/0/tally/tally.sock"),
+            window: Duration::from_secs(5),
+        });
+        assert_eq!(
+            error_exit_code(&wedged),
+            3,
+            "the point of this test is that the exit code cannot tell them apart"
+        );
+        assert!(
+            !is_daemon_absent(&wedged),
+            "a daemon that is listening and not answering is a fault, not an absence"
+        );
+
+        // Answering, and refusing.
+        let refused = anyhow::Error::new(WireIoError::Rpc(
+            WireErrorCode::InvalidParams,
+            "drain refused".to_owned(),
+            None,
+        ));
+        assert!(!is_daemon_absent(&refused));
+
+        // Wrapped in context the way the call sites raise it.
+        let wrapped = anyhow::Error::new(WireIoError::Unreachable {
+            path: PathBuf::from("/run/user/0/tally/tally.sock"),
+            source: std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        })
+        .context("draining the queue");
+        assert!(is_daemon_absent(&wrapped));
+    }
+}
