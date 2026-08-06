@@ -9758,6 +9758,128 @@ mod tests {
             .await;
     }
 
+    /// Issue #395, the guard the prune's neutrality actually rests on.
+    ///
+    /// `finish_job` reads the job, then awaits the scrape, the capture and the
+    /// accounting **with the context lock dropped**, then re-checks under the
+    /// write lock. Before the prune the job was still in the map when it
+    /// reached a terminal disposition mid-flight, so `is_some_and` was the
+    /// right polarity there; after it, a job retired underneath that window is
+    /// *absent*, and reading absence as "still eligible" falls straight through
+    /// to `append_context_witness` — a **second canonical witness for one
+    /// execution**, on top of the cancelled witness the forced path already
+    /// appended.
+    ///
+    /// That is durable, on the append-only ledger `query run`, `query proof`,
+    /// the standup rollup and the attestation chain all sum over, and it is
+    /// reachable only under a race — so no ordinary fixture reaches it. Every
+    /// other forced-cancel test in this file retires the job *before*
+    /// `finish_job` runs and is answered by its **first** lookup, which is why
+    /// they cannot see this branch at all.
+    ///
+    /// This one steps into the window on purpose: hold `finish_job` between its
+    /// two phases, force-cancel the job there, let it resume, and count the
+    /// canonical witnesses for that exact `(task, attempt, leaseEpoch)`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_retired_between_finish_jobs_two_phases_is_witnessed_exactly_once() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut daemon = fs1_daemon(&paths).await;
+                let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+                let (release_tx, release_rx) = watch::channel(false);
+                daemon.finish_job_hook = Some(FinishJobHook {
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let attempt = finished.attempt;
+                let lease_epoch = finished.lease_epoch;
+
+                // Phase one has read the job and dropped the lock. Everything
+                // after this point in `finish_job` is the window.
+                let finishing = daemon.finish_job(finished);
+                tokio::pin!(finishing);
+                tokio::select! {
+                    result = &mut finishing => {
+                        panic!("finish_job must stall in its own window, returned {result:?}")
+                    }
+                    entered = entered_rx.recv() => {
+                        entered.expect("finish_job must reach the window");
+                    }
+                }
+
+                // Retire it inside the window, through the real path that does
+                // it: a forced cancel. This is the shape the guard exists for.
+                let cancelled = daemon.handler.cancel_one(&task_uuid, true).await.unwrap();
+                assert_eq!(cancelled["affected"], 1, "{cancelled}");
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert!(
+                        !context
+                            .jobs
+                            .contains_key(&Uuid::parse_str(&task_uuid).unwrap()),
+                        "the forced cancel must have retired the job before finish_job resumes"
+                    );
+                }
+
+                // Let the second phase run against the map it now finds.
+                release_tx.send(true).unwrap();
+                // Held, not unwrapped yet: the ledger is the property under
+                // test, and a `finish_job` that both double-witnesses *and*
+                // fails afterwards must be reported as the double-witness it
+                // is, not as whatever it tripped over next.
+                let outcome = finishing.await;
+                daemon.handler.drain_post_ack_tasks().await;
+
+                let (report, records) = read_verified_records(&paths.witness_path()).unwrap();
+                assert!(report.ok);
+                let for_execution = records
+                    .iter()
+                    .filter(|record| {
+                        record.task_uuid.as_deref() == Some(task_uuid.as_str())
+                            && record.attempt == attempt
+                            && record.lease_epoch == lease_epoch
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    for_execution.len(),
+                    1,
+                    "one execution must leave exactly one canonical witness; got {:?}",
+                    for_execution
+                        .iter()
+                        .map(|record| record.verdict)
+                        .collect::<Vec<_>>()
+                );
+                // And it is the forced one, not a second verdict invented by
+                // the execution that lost the race.
+                assert_eq!(for_execution[0].verdict, Verdict::Cancelled);
+                // The execution that lost the race is a quiet no-op, not an
+                // error: nothing went wrong, it simply has nothing left to do.
+                outcome.expect("a job retired mid-flight is a no-op for finish_job");
+            })
+            .await;
+    }
+
     /// Issue #395: `context.jobs` is the daemon's *live* set, and stays one.
     ///
     /// It used to keep every job the daemon had admitted since it started, for

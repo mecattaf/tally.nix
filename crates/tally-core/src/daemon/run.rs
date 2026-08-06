@@ -12,6 +12,38 @@ pub(super) struct LeaseTickHook {
     pub(super) release: watch::Receiver<bool>,
 }
 
+/// Hold `finish_job` open between its first job read and its second-phase
+/// re-check.
+///
+/// The re-check exists because the whole scrape/capture/accounting stretch
+/// between the two is awaited with the context lock dropped, so the job can
+/// reach a terminal disposition and be retired (#395) underneath it. That
+/// window is real but it is not something a test can time, so this makes it
+/// enterable: the hook announces that phase one is done and blocks until the
+/// test says go.
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct FinishJobHook {
+    pub(super) entered: mpsc::UnboundedSender<()>,
+    pub(super) release: watch::Receiver<bool>,
+}
+
+#[cfg(test)]
+impl FinishJobHook {
+    async fn between_phases(&self) {
+        let mut release = self.release.clone();
+        if *release.borrow() {
+            return;
+        }
+        let _ = self.entered.send(());
+        while !*release.borrow() {
+            if release.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+}
+
 /// Hold one `select!` arm's body open, the way a slow terminal transaction or a
 /// lifecycle compaction holds it open on the estate. Nothing else in the loop
 /// runs while a body is held, which is exactly the condition the watchdog
@@ -358,6 +390,15 @@ impl Daemon {
             }
             job
         };
+        // Stands in for the window this function really has: the lock is
+        // dropped above and everything from here to the second-phase re-check
+        // is awaited without it, so the job can be retired underneath us. A
+        // test cannot time that window; this lets it hold the window open and
+        // step into it deterministically (#395).
+        #[cfg(test)]
+        if let Some(hook) = &self.finish_job_hook {
+            hook.between_phases().await;
+        }
         let evidence_spec = parse_evidence_specs(&job.row.evidence)
             .map_err(|error| DaemonError::Invalid(error.to_string()))?;
         let scrape_capture = matches!(

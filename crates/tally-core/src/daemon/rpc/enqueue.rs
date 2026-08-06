@@ -141,10 +141,12 @@ impl DaemonHandler {
         // A usage record belongs to the attempt that produced it. Carrying one
         // into a retry would render attempt N−1's tokens under attempt N with
         // provider-capture authority — a measurement claimed for work that has
-        // not run. Today the cloned row is usage-free because completion
-        // writes only to `context.jobs`, so this line is currently redundant;
-        // it is here so the discipline survives anyone making completion write
-        // rows back.
+        // not run. Today the cloned row is usage-free because nothing writes a
+        // scraped usage record back into `context.rows` at all: completion
+        // records it on the query fact instead (#395 removed the last writes it
+        // made to `context.jobs`), and `context.rows` is only written before
+        // execution. So this line is currently redundant; it is here so the
+        // discipline survives anyone making completion write rows back.
         row.usage = None;
 
         let engine = AdapterEngine::new(&context.config.adapters);

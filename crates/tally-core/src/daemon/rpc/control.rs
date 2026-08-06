@@ -628,12 +628,16 @@ impl DaemonHandler {
         // holding one, so a campaign cannot lose its membership to a bound
         // crossed by unrelated traffic while its work is still outstanding.
         //
-        // The cost is one pass over `context.jobs`, which is never pruned and so
-        // grows with every job this daemon has admitted since it started. It is
-        // therefore *not* bounded by concurrency — the earlier comment here said
-        // it was, and was wrong. It is collected below the `already_held` return
-        // so a repeat admission, which writes nothing, pays nothing for it; it is
-        // still built on every admission that does write, because the writer
+        // The cost is one pass over `context.jobs`. That map used to keep every
+        // job this daemon had admitted since it started, which made this pass
+        // grow without bound — a comment here once claimed it was bounded by
+        // concurrency, and for as long as the map was never pruned that was
+        // wrong. #395 retired terminal jobs out of it, so the map is now the
+        // live set and this pass is bounded by outstanding work after all. The
+        // filter below is what that prune removes, so the set it produces is
+        // unchanged. It is still collected below the `already_held` return so a
+        // repeat admission, which writes nothing, pays nothing for it, and it
+        // is still built on every admission that does write, because the writer
         // cannot know in advance whether it will need to compact.
         let live_tasks = {
             let context = self.context.read().await;

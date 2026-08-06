@@ -54,7 +54,7 @@ use run::{
     resume_paused_jobs_locked,
 };
 #[cfg(test)]
-use run::{DispatchStallHook, LeaseTickHook};
+use run::{DispatchStallHook, FinishJobHook, LeaseTickHook};
 #[cfg(test)]
 use startup::{
     acquire_daemon_lock, hydrate_adopted_adapter_metadata, hydrate_completed_adapter_metadata,
@@ -1027,6 +1027,8 @@ pub struct Daemon {
     connection_count_hook: Option<mpsc::UnboundedSender<usize>>,
     #[cfg(test)]
     dispatch_stall_hook: Option<DispatchStallHook>,
+    #[cfg(test)]
+    finish_job_hook: Option<FinishJobHook>,
 }
 
 #[cfg(test)]
