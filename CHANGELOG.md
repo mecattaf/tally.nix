@@ -45,6 +45,41 @@ outcome-first grammar check at all.
   for every kind by name, so a 12th event added later fails loudly instead
   of shipping unaudited.
 
+#### #386 — a tree-delta permission gate around campaign agent nodes
+
+The SSSF `permissions.py` import: permission is verified the way every other
+claim in this system is — after the fact, against the repo itself. Tally's
+hardening presets are preventive; this is the detective complement, and it
+lands where the unified worktree manager already owns lane lifecycle.
+
+- `campaign_worktrees.py` gained `change_set_fingerprint()` (a path → sha256
+  digest for every tracked and untracked file), a persisted before/after
+  snapshot pair, and `change_set_delta()`, which reports every path that
+  appeared, disappeared, or changed — content-based, so a reversion of an
+  uncommitted change back to its prior bytes is caught the same as a forward
+  edit no commit history could ever see.
+- `prep` now fingerprints the worktree immediately before every implementation
+  task's agent node runs; a new `treeDelta` driver action compares that
+  snapshot against the worktree's content once the agent node and the
+  ownership gate have both finished, and fails, naming every offending path,
+  on any delta outside the task's allowlist.
+- The allowlist is per-task and never silently permissive: a task's declared
+  `conflictDomains` (non-empty) is the allowlist; an explicitly empty
+  `conflictDomains` allows nothing; an absent `conflictDomains` falls back to
+  exactly the paths the ownership node just certified as the task's own
+  committed change-set — the agent's proven work is self-authorizing, nothing
+  else is.
+- A breach aborts the lane rather than buying a retry or a steering attempt —
+  the write already happened, so there is nothing to redo. It reuses the
+  existing diagnosis ledger: `steer` posts both the attempt-1 and attempt-2
+  diagnosis receipts atomically for a breach, so the task is permanently
+  blocked as of this pass, the offending paths are witnessed in the posted
+  comment and in the failing `treeDelta` job's own evidence (`query
+  job`/`query proof` show it like any other campaign gate failure), and the
+  path list still reaches the steward's diagnose slot.
+- A new e2e scenario proves the reversion case against a real worktree and a
+  real `git checkout` reversion, not a mocked file-state dict.
+
 ### Recurring-cost hygiene (#396, #411, #395, #404)
 
 One lane of four fixes with a shared shape: each one makes something the fleet

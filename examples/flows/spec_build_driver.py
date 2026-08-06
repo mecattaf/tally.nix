@@ -3655,6 +3655,86 @@ def diagnosis_fallback_note(reason: str, gate_id: str | None, path: str | None) 
     return note
 
 
+def post_diagnosis_comment(
+    config: dict[str, Any],
+    repository: str,
+    thread_number: str,
+    campaign: str,
+    issue_number: str,
+    task_id: str,
+    attempt: int,
+    heading: str,
+    text: str,
+) -> str:
+    """Post one machine receipt, GitHub or local forge, and return its address.
+
+    GitHub reads receipts back by parsing the marker and heading off the
+    first lines of the comment body; the local forge reads structured fields
+    off the blob directly, so only `text` -- never the marker-prefixed body
+    -- is what it stores. Both the ordinary steering path and the breach
+    path (#386, which posts up to two of these atomically) share this.
+    """
+    if config["forge"] == "github":
+        marker = diagnosis_marker(campaign, issue_number, task_id, attempt)
+        body = f"{marker}\n\n{heading}\n\n{text}"
+        posted = run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                thread_number,
+                "--repo",
+                repository,
+                "--body",
+                body,
+            ]
+        )
+        return required_string(
+            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
+            "machine diagnosis comment URL",
+        )
+    ref = f"{local_state_prefix(campaign, issue_number)}/diagnosis/{task_id}/{attempt}"
+    created, _ = write_local_blob(
+        config,
+        ref,
+        {
+            "schemaVersion": 1,
+            "kind": "diagnosis",
+            "campaign": campaign,
+            "issueNumber": issue_number,
+            "taskId": task_id,
+            "attempt": attempt,
+            "diagnosis": text,
+            "redaction": PUBLIC_REDACTION,
+        },
+    )
+    if not created:
+        fail(f"local forge diagnosis {ref!r} appeared concurrently")
+    return f"local://{repository}/{ref}"
+
+
+def breach_note(diagnosis: str, detail_text: str) -> str:
+    """The posted breach body: a deterministic label plus witnessed evidence.
+
+    #386: an out-of-allowlist delta aborts the lane -- a breach, not a
+    gate-fail, because the write already happened and gates are for redoable
+    work. The offending paths must be witnessed regardless of what the model
+    wrote, so the driver's own tree-delta detail is always appended verbatim
+    rather than merely required as a substring the model might paraphrase
+    away. The heading stays `diagnosis_heading`'s ordinary shape -- the forge
+    read-back parses that exact prefix -- so the breach identifies itself
+    through this leading sentence instead of a second heading grammar.
+    """
+    parts = [
+        "Aborted the lane: a tree-delta permission breach found "
+        "out-of-allowlist change(s), so this task will not be retried.",
+        diagnosis,
+    ]
+    if detail_text:
+        parts.append(f"Witnessed evidence: {detail_text}")
+    return "\n\n".join(parts)
+
+
 def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     brief, capabilities = take_capabilities(brief)
     fields = {
@@ -3670,6 +3750,10 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         fields.add("taskIssue")
     if "gateEvidence" in brief:
         fields.add("gateEvidence")
+    if "breach" in brief:
+        fields.add("breach")
+    if "breachDetail" in brief:
+        fields.add("breachDetail")
     data = object_exact(brief, seam_fields(brief, fields), "steer brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
@@ -3691,6 +3775,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     attempt = data.get("attempt")
     if attempt not in {1, 2}:
         fail("attempt must equal 1 or 2")
+    breach = bool(data.get("breach", False))
     thread_number, threads = steering_thread(
         repository, config, data, capabilities, task_id
     )
@@ -3698,6 +3783,64 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         repository, config, campaign, issue["number"], None, threads
     )
     task_receipts = [receipt for receipt in existing if receipt["taskId"] == task_id]
+
+    if breach:
+        # #386: a breach aborts the lane -- it is not a redoable gate-fail,
+        # so it never spends only one of the task's two ordinary steering
+        # attempts and waits for a second failure to block. It reuses the
+        # same diagnosis ledger the ordinary path writes (so the reconciler's
+        # existing `attempt == 2` block rule needs no change at all) by
+        # posting whichever of attempt 1 and attempt 2 do not exist yet, both
+        # in this one call, so the task is permanently blocked as of this
+        # pass and `contiguous_receipts` never sees a lone attempt 2.
+        already_blocked = next(
+            (receipt for receipt in task_receipts if receipt["attempt"] == 2), None
+        )
+        if already_blocked is not None:
+            return {
+                "taskId": task_id,
+                "attempt": 2,
+                "comment": already_blocked["comment"],
+                "blocked": True,
+                "posted": False,
+                "redacted": False,
+            }
+        diagnosis = required_text(
+            data.get("diagnosis"), "diagnosis", MAX_DIAGNOSIS_CHARS
+        )
+        diagnosis, redacted_diagnosis = redact_public_text(diagnosis)
+        diagnosis = bound_public_diagnosis(diagnosis)
+        detail = data.get("breachDetail")
+        detail_text = ""
+        redacted_detail = False
+        if isinstance(detail, str) and detail.strip():
+            detail_text, redacted_detail = redact_public_text(detail)
+            detail_text = bound_public_diagnosis(detail_text)
+        composed = breach_note(diagnosis, detail_text)
+        posted_comment: str | None = None
+        for post_attempt in (1, 2):
+            if any(receipt["attempt"] == post_attempt for receipt in task_receipts):
+                continue
+            posted_comment = post_diagnosis_comment(
+                config,
+                repository,
+                thread_number,
+                campaign,
+                issue["number"],
+                task_id,
+                post_attempt,
+                diagnosis_heading(task_id, post_attempt),
+                composed,
+            )
+        return {
+            "taskId": task_id,
+            "attempt": 2,
+            "comment": posted_comment,
+            "blocked": True,
+            "posted": True,
+            "redacted": redacted_diagnosis or redacted_detail,
+        }
+
     if any(receipt["attempt"] == attempt for receipt in task_receipts):
         receipt = next(
             receipt for receipt in task_receipts if receipt["attempt"] == attempt
@@ -3737,47 +3880,17 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         validation_reason = f"diagnosis omits the offending path {required_path!r}"
     if validation_reason:
         diagnosis = diagnosis_fallback_note(validation_reason, required_id, required_path)
-    marker = diagnosis_marker(campaign, issue["number"], task_id, attempt)
-    body = f"{marker}\n\n{diagnosis_heading(task_id, attempt)}\n\n{diagnosis}"
-    if config["forge"] == "github":
-        posted = run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                thread_number,
-                "--repo",
-                repository,
-                "--body",
-                body,
-            ]
-        )
-        comment = required_string(
-            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
-            "machine diagnosis comment URL",
-        )
-    else:
-        ref = (
-            f"{local_state_prefix(campaign, issue['number'])}/diagnosis/"
-            f"{task_id}/{attempt}"
-        )
-        created, _ = write_local_blob(
-            config,
-            ref,
-            {
-                "schemaVersion": 1,
-                "kind": "diagnosis",
-                "campaign": campaign,
-                "issueNumber": issue["number"],
-                "taskId": task_id,
-                "attempt": attempt,
-                "diagnosis": diagnosis,
-                "redaction": PUBLIC_REDACTION,
-            },
-        )
-        if not created:
-            fail(f"local forge diagnosis {ref!r} appeared concurrently")
-        comment = f"local://{repository}/{ref}"
+    comment = post_diagnosis_comment(
+        config,
+        repository,
+        thread_number,
+        campaign,
+        issue["number"],
+        task_id,
+        attempt,
+        diagnosis_heading(task_id, attempt),
+        diagnosis,
+    )
     return {
         "taskId": task_id,
         "attempt": attempt,
@@ -4333,6 +4446,20 @@ def worktree_call(operation: Any, *arguments: Any, **keywords: Any) -> Any:
         return operation(*arguments, **keywords)
     except worktrees.WorktreeError as error:
         fail(error.message)
+
+
+def snapshot_before_agent(worktree: Path) -> None:
+    """The pre-agent change-set fingerprint the tree-delta gate compares
+    against (#386). Called once per `prep`, whether the lane is fresh or
+    resumed: on a resumed lane the worktree may already carry legitimate
+    uncommitted content from an earlier pass, and that is exactly the state
+    the gate must be able to tell a reversion of apart later, so every prep
+    of an implementation task takes a fresh baseline right before its own
+    agent dispatch -- the earliest point after the lane is known-good and
+    the latest point before anything the gate must witness could happen.
+    """
+    fingerprint = worktree_call(worktrees.change_set_fingerprint, worktree)
+    worktree_call(worktrees.write_change_set_snapshot, worktree, fingerprint)
 
 
 def tally_executable(value: Any) -> Path:
@@ -5036,6 +5163,8 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
             check=False,
         ).returncode:
             fail("resumed lane base does not descend from the witnessed worklist revision")
+        if identity["taskKind"] == "implementation":
+            snapshot_before_agent(worktree)
         return {
             "taskId": identity["taskId"],
             "baseRev": resumed_base,
@@ -5078,6 +5207,8 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     if not GIT_OID.fullmatch(base_rev):
         fail(f"cannot derive a base revision for campaign lane {branch!r}")
     worktree_call(worktrees.write_identity, worktree, {**expected, "baserev": base_rev})
+    if identity["taskKind"] == "implementation":
+        snapshot_before_agent(worktree)
     return {
         "taskId": identity["taskId"],
         "baseRev": base_rev,
@@ -5499,6 +5630,106 @@ def action_ownership(brief: dict[str, Any]) -> dict[str, Any]:
         data.get("domainsRequired"),
         current_base_revision(worktree, config),
     )
+
+
+def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
+    """The tree-delta permission gate around the campaign agent node (#386).
+
+    Detective, not preventive -- the SSSF `permissions.py` import: "permission
+    is verified the way every other claim in this system is -- after the
+    fact, against the repo itself." `prep` fingerprinted the worktree's full
+    tracked-and-untracked content before the agent ran; this compares that
+    fingerprint against the worktree's content right now. A path appearing,
+    disappearing, or changing all count identically, so a reversion of an
+    uncommitted change back to its prior content is caught the same as a
+    forward edit no commit ever recorded.
+
+    The allowlist is per-task, derived from the brief/worklist entry, with no
+    silently permissive default -- an absent allowlist and an empty one are
+    different outcomes, not the same "anything goes":
+      - `task.conflictDomains` declared and non-empty: those glob patterns,
+        identical semantics to the ownership gate's own allowlist.
+      - `task.conflictDomains` declared and explicitly empty (`[]`): the
+        allowlist is empty, so any delta at all is a breach.
+      - `task.conflictDomains` absent: the allowlist falls back to exactly
+        `ownedPaths`, the paths the ownership node just certified as this
+        task's own committed change-set. The agent's proven work is
+        self-authorizing; nothing else is.
+
+    An out-of-allowlist delta fails this node with every offending path
+    named -- the same mechanism every other campaign gate uses to become
+    queryable via `query job`/`query proof`, since this driver runs as an
+    ordinary witnessed job like any other campaign node.
+    """
+    data = object_exact(
+        brief, {"task", "workspace", "ownedPaths"}, "tree-delta brief"
+    )
+    task = data.get("task")
+    if not isinstance(task, dict):
+        fail("task must be an object")
+    task_id = required_string(task.get("id"), "task.id")
+    if not TASK_ID.fullmatch(task_id):
+        fail("task.id is not safe")
+    workspace = object_exact(
+        data.get("workspace"),
+        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
+        "workspace",
+    )
+    if workspace.get("taskId") != task_id:
+        fail("workspace.taskId does not match task.id")
+    worktree = Path(required_string(workspace.get("worktreePath"), "workspace.worktreePath"))
+    if not worktree.is_absolute() or not worktree.is_dir():
+        fail("workspace.worktreePath must be an absolute existing directory")
+    git(worktree, "rev-parse", "--git-dir")
+
+    before = worktree_call(worktrees.read_change_set_snapshot, worktree)
+    if before is None:
+        fail(
+            "no change-set snapshot was recorded before the agent node; "
+            "cannot evaluate the tree-delta gate"
+        )
+    after = worktree_call(worktrees.change_set_fingerprint, worktree)
+    deltas = worktrees.change_set_delta(before, after)
+
+    raw_domains = task.get("conflictDomains")
+    if isinstance(raw_domains, list) and raw_domains:
+        allowlist = normalize_conflict_domains(
+            raw_domains, "task.conflictDomains", required=True
+        )
+        basis = "declared"
+    elif isinstance(raw_domains, list):
+        allowlist = []
+        basis = "declared-empty"
+    else:
+        owned = data.get("ownedPaths")
+        allowlist = list(string_list(owned, "ownedPaths")) if owned is not None else []
+        basis = "owned-paths-fallback"
+
+    breaches = [
+        delta
+        for delta in deltas
+        if not any(domains_overlap(delta["path"], domain) for domain in allowlist)
+    ]
+    # The snapshot's job is done the instant this pass reads it, whether the
+    # gate passes or fails: a stale snapshot from this attempt must never be
+    # compared against a later attempt's "after" state.
+    worktree_call(worktrees.clear_change_set_snapshot, worktree)
+    if breaches:
+        preview = "; ".join(
+            f"{item['kind']} {json.dumps(item['path'])}" for item in breaches[:20]
+        )
+        if len(breaches) > 20:
+            preview += f"; and {len(breaches) - 20} more"
+        fail(
+            f"tree-delta gate detected {len(breaches)} out-of-allowlist change(s) "
+            f"({basis} allowlist): {preview}"
+        )
+    return {
+        "taskId": task_id,
+        "checkedPaths": len(deltas),
+        "allowlistBasis": basis,
+        "allowlist": allowlist,
+    }
 
 
 def evaluate_forbid_paths(
@@ -7323,6 +7554,7 @@ def main() -> int:
             "prep",
             "cleanup",
             "ownership",
+            "treeDelta",
             "constraint",
             "checkpoint",
             "publish",
@@ -7344,6 +7576,7 @@ def main() -> int:
         "preflight": action_preflight,
         "prep": action_prep,
         "ownership": action_ownership,
+        "treeDelta": action_tree_delta,
         "constraint": action_constraint,
         "checkpoint": action_checkpoint,
         "cleanup": action_cleanup,

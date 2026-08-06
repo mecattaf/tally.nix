@@ -74,10 +74,15 @@ if role == "diagnosis":
     if task == "task-1":
         if "build/transient.db" not in failure["captureStderr"]:
             raise SystemExit("task 1 diagnosis omitted constraint stderr")
-        # Names a task id containing "sk-", a git object id, and prose about a
-        # token bug. Redaction must keep all three and drop only the credential.
+        # #385: outcome-first leading sentence naming the failing check id
+        # (`conflict-domains`, the ownership gate's own gateId) -- the
+        # constructive-correction shape the validator now requires. Also
+        # names a task id containing "sk-", a git object id, and prose about
+        # a token bug; redaction must keep all three and drop only the
+        # credential.
         steering = (
-            "task-1 left build/transient.db behind; the subtask-2 cleanup never ran.\n"
+            "Diagnosed a conflict-domains breach: task-1 left build/transient.db "
+            "behind because the subtask-2 cleanup never ran.\n"
             "Rebase onto 6347cbb9f4a2b1c0d5e6f70819a2b3c4d5e6f708 and rerun the gates.\n"
             "The auth token bug is unrelated to this failure.\n"
             "Do not expose ghp_0123456789abcdefghijklmnopqrstuvwxyz in public output."
@@ -85,12 +90,19 @@ if role == "diagnosis":
     elif task == "task-2":
         if "task 2 deterministic gate failure" not in failure["captureStderr"]:
             raise SystemExit("task 2 diagnosis omitted command-gate stderr")
-        steering = "The deterministic task 2 gate remains red; inspect build/two.txt and retry."
+        # #385: names the failing gate id (`fixture-first`) the validator now
+        # requires.
+        steering = (
+            "Diagnosed a fixture-first gate failure: build/two.txt needs "
+            "inspection before the retry."
+        )
     elif task == "phase-one-checkpoint":
         if "phase one checkpoint has no prior steering" not in failure["captureStderr"]:
             raise SystemExit("checkpoint diagnosis omitted checkpoint stderr")
+        # #385: names the checkpoint's own task id, its gateId.
         steering = (
-            "The phase-one checkpoint reached its own attempt without durable steering. "
+            "Diagnosed phase-one-checkpoint: it reached its own attempt without "
+            "durable steering. "
             "Retry now that the accumulated tree is settled."
         )
     else:

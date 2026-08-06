@@ -3328,17 +3328,24 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
 
             assert_eq!(
                 second_submitted.len(),
-                26,
+                // #386: `tree-delta-task-3` is a new node in the chain
+                // between `ownership` and the campaign's own gates -- one
+                // more submitted node per implementation task that reaches
+                // it. task-1 never reaches it (its ownership fails first),
+                // so this pass gains exactly one.
+                27,
                 "unexpected second-pass nodes: {:?}",
                 second_submitted
                     .iter()
                     .map(|event| event["label"].as_str().unwrap_or("<missing>"))
                     .collect::<Vec<_>>()
             );
-            let second_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_2, 26).await;
+            let second_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_2, 27).await;
             assert_eq!(
                 second_items.len(),
-                26,
+                // #386: `tree-delta-task-3` (see the `second_submitted`
+                // count above).
+                27,
                 "unexpected durable second-pass nodes: {:?}",
                 json!({
                     "durable": second_items
@@ -3370,7 +3377,8 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-3")
                     .count(),
-                10
+                // #386: `tree-delta-task-3` carries task-3's own taskRef.
+                11
             );
             assert_eq!(
                 second_submitted
@@ -3392,7 +3400,8 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .iter()
                     .filter(|item| item["taskRef"] == "fixture/task-3")
                     .count(),
-                10
+                // #386: `tree-delta-task-3` carries task-3's own taskRef.
+                11
             );
             let mut failed_constraint = None;
             for item in &second_items {
@@ -3558,13 +3567,15 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(third_value["diagnoses"], json!([]));
             assert!(control.join("task-1-steering-visible").exists());
             let third_submitted = runner_events(&third, "node-submitted");
-            assert_eq!(third_submitted.len(), 13);
+            // #386: `tree-delta-task-1` is a new node in the chain now that
+            // task-1's ownership passes and it reaches the gate.
+            assert_eq!(third_submitted.len(), 14);
             assert_eq!(
                 third_submitted
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-1")
                     .count(),
-                10
+                11
             );
             assert_eq!(
                 third_submitted
@@ -3573,13 +3584,13 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .count(),
                 3
             );
-            let third_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_3, 13).await;
+            let third_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_3, 14).await;
             assert_eq!(
                 third_items
                     .iter()
                     .filter(|item| item["taskRef"] == "fixture/task-1")
                     .count(),
-                10
+                11
             );
             assert_eq!(
                 third_items
@@ -3647,7 +3658,9 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(fourth_value["retries"], json!([]));
             assert_eq!(fourth_value["continuation"]["created"], true);
             let fourth_submitted = runner_events(&fourth, "node-submitted");
-            assert_eq!(fourth_submitted.len(), 29);
+            // #386: `tree-delta-task-4` and `tree-delta-task-6` are new nodes
+            // now that both tasks' ownership passes and each reaches the gate.
+            assert_eq!(fourth_submitted.len(), 31);
             assert!(fourth_submitted
                 .iter()
                 .all(|event| event["disposition"] == "created"));
@@ -3664,14 +3677,14 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-4")
                     .count(),
-                10
+                11
             );
             assert_eq!(
                 fourth_submitted
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-6")
                     .count(),
-                13
+                14
             );
             assert_eq!(
                 fourth_submitted
@@ -3687,7 +3700,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                 .iter()
                 .any(|event| event["label"] == "checkpoint-phase-one-checkpoint"));
 
-            let fourth_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_4, 29).await;
+            let fourth_items = wait_for_flow_items(&client, SPEC_BUILD_RUN_4, 31).await;
             let failed_checkpoint = fourth_items
                 .iter()
                 .find(|item| {
@@ -3900,7 +3913,9 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(sixth_value["diagnoses"][0]["blocked"], false);
             assert_eq!(sixth_value["continuation"]["created"], true);
             let sixth_submitted = runner_events(&sixth, "node-submitted");
-            assert_eq!(sixth_submitted.len(), 12);
+            // #386: `tree-delta-task-2` -- task-2 passes ownership this pass,
+            // so it reaches the gate.
+            assert_eq!(sixth_submitted.len(), 13);
             assert!(sixth_submitted
                 .iter()
                 .all(|event| event["disposition"] == "created"));
@@ -3909,7 +3924,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-2")
                     .count(),
-                9
+                10
             );
             assert_eq!(
                 sixth_submitted
@@ -3981,7 +3996,7 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(replayed.len(), 1);
             assert_eq!(replayed[0]["label"], "spec-build-sweep");
             assert_eq!(replayed[0]["disposition"], "reused");
-            assert_eq!(flow_items(&client, SPEC_BUILD_RUN_4).await.len(), 29);
+            assert_eq!(flow_items(&client, SPEC_BUILD_RUN_4).await.len(), 31);
 
             let seventh = runner(
                 &config_path,
@@ -4019,13 +4034,15 @@ async fn spec_build_campaign_reconciles_forge_state_across_parallel_fresh_runs()
             assert_eq!(seventh_value["diagnoses"][0]["blocked"], true);
             assert_eq!(seventh_value["continuation"]["created"], true);
             let seventh_submitted = runner_events(&seventh, "node-submitted");
-            assert_eq!(seventh_submitted.len(), 12);
+            // #386: `tree-delta-task-2` -- task-2 passes ownership this pass
+            // too, so it reaches the gate again before blocking.
+            assert_eq!(seventh_submitted.len(), 13);
             assert_eq!(
                 seventh_submitted
                     .iter()
                     .filter(|event| event["taskRef"] == "fixture/task-2")
                     .count(),
-                9
+                10
             );
             assert_eq!(
                 seventh_submitted

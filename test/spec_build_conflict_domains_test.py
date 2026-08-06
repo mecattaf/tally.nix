@@ -940,5 +940,126 @@ class SquashBasePublicationNarrationTests(PublicationNarrationTests):
     BASE_MERGE_METHOD = "squash"
 
 
+class TreeDeltaGateTests(PublicationHarness):
+    """#386: the tree-delta permission gate, against a real worktree.
+
+    `PublicationHarness.checkout` is a real git worktree on a real branch --
+    exactly the "shaped like production" fixture the issue requires for the
+    reversion case, not a mocked file-state dict.
+    """
+
+    def snapshot(self) -> None:
+        driver.snapshot_before_agent(self.checkout)
+
+    def workspace_brief(
+        self, task_value: dict[str, Any], *, owned_paths: object = MISSING
+    ) -> dict[str, Any]:
+        brief: dict[str, Any] = {
+            "task": task_value,
+            "workspace": {
+                "taskId": task_value["id"],
+                "baseRev": self.base_rev,
+                "branch": self.local_branch,
+                "worktreePath": str(self.checkout),
+            },
+        }
+        if owned_paths is not MISSING:
+            brief["ownedPaths"] = owned_paths
+        return brief
+
+    def test_a_reversion_of_an_uncommitted_change_is_a_breach(self) -> None:
+        # A prior partial pass left a legitimate uncommitted edit sitting in
+        # the worktree -- the shape a resumed lane actually carries.
+        touched = self.checkout / "internal/cli/root.go"
+        touched.write_text("package cli\n// pending review\n", encoding="utf-8")
+        self.snapshot()
+        # The agent's node discards it with a real `git checkout`, the exact
+        # reversion #386 requires a fixture for.
+        git("checkout", "--", "internal/cli/root.go", cwd=self.checkout)
+        # And commits unrelated, in-allowlist work, so the lane otherwise
+        # looks clean to every other gate.
+        (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+        self.commit("fixture: deliver the feature")
+
+        brief = self.workspace_brief(task("conflict-domain", ["README.md"]))
+        with self.assertRaises(driver.DriverError) as raised:
+            driver.action_tree_delta(brief)
+        message = str(raised.exception)
+        self.assertIn("changed", message)
+        self.assertIn("internal/cli/root.go", message)
+        self.assertIn("declared", message)
+        # The breach is terminal, not redoable: the snapshot is consumed
+        # either way, so a retry of this same node never compares against a
+        # stale baseline.
+        self.assertIsNone(driver.worktrees.read_change_set_snapshot(self.checkout))
+
+    def test_a_change_within_the_declared_allowlist_is_not_a_breach(self) -> None:
+        self.snapshot()
+        (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+        self.commit("fixture: deliver the feature")
+
+        result = driver.action_tree_delta(
+            self.workspace_brief(task("conflict-domain", ["README.md"]))
+        )
+        self.assertEqual(result["allowlistBasis"], "declared")
+        self.assertIn("README.md", result["allowlist"])
+
+    def test_a_declared_empty_allowlist_rejects_every_delta(self) -> None:
+        self.snapshot()
+        (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+        self.commit("fixture: deliver the feature")
+
+        with self.assertRaisesRegex(driver.DriverError, "declared-empty"):
+            driver.action_tree_delta(
+                self.workspace_brief(task("conflict-domain", []))
+            )
+
+    def test_an_absent_allowlist_falls_back_to_owned_paths_not_to_permissive(
+        self,
+    ) -> None:
+        self.snapshot()
+        (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+        self.commit("fixture: deliver the feature")
+        brief = self.workspace_brief(
+            task("conflict-domain"), owned_paths=["README.md"]
+        )
+
+        result = driver.action_tree_delta(brief)
+        self.assertEqual(result["allowlistBasis"], "owned-paths-fallback")
+        self.assertEqual(result["allowlist"], ["README.md"])
+
+        # Absent never means permissive: a delta the fallback allowlist does
+        # not name is still a breach even though the task declared no domains
+        # at all. A fresh pass takes a fresh snapshot, exactly as `prep` does
+        # on every attempt.
+        self.snapshot()
+        touched = self.checkout / "internal/cli/root.go"
+        touched.write_text("package cli\n// stray write\n", encoding="utf-8")
+        self.commit("fixture: an unrelated stray write")
+        with self.assertRaisesRegex(driver.DriverError, "owned-paths-fallback"):
+            driver.action_tree_delta(brief)
+
+    def test_an_appearing_untracked_file_outside_the_allowlist_is_a_breach(
+        self,
+    ) -> None:
+        self.snapshot()
+        (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+        stray = self.checkout / "internal/stray.txt"
+        stray.write_text("never committed\n", encoding="utf-8")
+        # Only README.md is committed -- the stray file stays untracked,
+        # exactly the "never even reaches a commit" shape the gate must
+        # still catch since it fingerprints the raw worktree, not history.
+        git("add", "README.md", cwd=self.checkout)
+        git("commit", "-m", "fixture: deliver the feature", cwd=self.checkout)
+
+        with self.assertRaises(driver.DriverError) as raised:
+            driver.action_tree_delta(
+                self.workspace_brief(task("conflict-domain", ["README.md"]))
+            )
+        message = str(raised.exception)
+        self.assertIn("appeared", message)
+        self.assertIn("internal/stray.txt", message)
+
+
 if __name__ == "__main__":
     unittest.main()

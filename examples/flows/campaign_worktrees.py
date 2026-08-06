@@ -23,12 +23,19 @@ Nothing here posts, publishes, or decides policy. Callers translate
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
+
+# The file the change-set snapshot lives in, alongside `config.worktree`: both
+# are per-worktree git-dir state, both are irrelevant outside the lane's own
+# lifecycle, and neither is ever a campaign artifact a reader sees.
+CHANGE_SET_SNAPSHOT_NAME = "tally-changeset-snapshot.json"
 
 # Identity fields are written as `tally.<key>`. Git folds a configuration key
 # to lower case, so the keys are lower case here too and round-trip byte for
@@ -442,3 +449,87 @@ def remove(checkout: Path, worktree: Path, branch: str | None) -> None:
 
 def prune(checkout: Path) -> None:
     _git(checkout, "worktree", "prune", check=False)
+
+
+def change_set_fingerprint(worktree: Path) -> dict[str, str]:
+    """A path -> sha256 content digest for every tracked and untracked file.
+
+    Comparable before and after an agent node runs (#386): a path's digest
+    changing, a path disappearing, or a path appearing are all detectable
+    this way, regardless of whether the change was ever committed -- a
+    reversion of an uncommitted change back to its prior content shows up
+    exactly the same as a forward edit, which a commit-history diff cannot
+    see at all. Ignored paths never enter it, matching what a commit could
+    ever contain. This is one fingerprint of whatever is on disk right now;
+    nothing here reads history or watches writes as they happen.
+    """
+    listed = _git(
+        worktree, "ls-files", "--cached", "--others", "--exclude-standard", "-z"
+    ).stdout
+    fingerprint: dict[str, str] = {}
+    for relative in (path for path in listed.split("\0") if path):
+        digest = hashlib.sha256()
+        try:
+            with (worktree / relative).open("rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError:
+            # Listed by git, gone by the time this reads it: the same fact a
+            # second listing after the read would report, so it is dropped
+            # rather than failing a fingerprint over a benign race.
+            continue
+        fingerprint[relative] = digest.hexdigest()
+    return fingerprint
+
+
+def change_set_snapshot_path(worktree: Path) -> Path:
+    git_dir = Path(_git(worktree, "rev-parse", "--absolute-git-dir").stdout.strip())
+    return git_dir / CHANGE_SET_SNAPSHOT_NAME
+
+
+def write_change_set_snapshot(worktree: Path, fingerprint: dict[str, str]) -> None:
+    """Persist one fingerprint atomically, the same way `write_identity` does."""
+    path = change_set_snapshot_path(worktree)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(json.dumps(fingerprint, sort_keys=True), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def read_change_set_snapshot(worktree: Path) -> dict[str, str] | None:
+    """The fingerprint written before this lane's agent node ran, or `None`."""
+    path = change_set_snapshot_path(worktree)
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+
+
+def clear_change_set_snapshot(worktree: Path) -> None:
+    change_set_snapshot_path(worktree).unlink(missing_ok=True)
+
+
+def change_set_delta(
+    before: dict[str, str], after: dict[str, str]
+) -> list[dict[str, str]]:
+    """Every path whose content differs between the two fingerprints (#386).
+
+    Appearing, disappearing, and changing are reported uniformly -- the
+    caller decides which of them are authorized; this module only reports
+    facts, exactly as its module docstring promises.
+    """
+    deltas: list[dict[str, str]] = []
+    for path in sorted(set(before) | set(after)):
+        before_hash = before.get(path)
+        after_hash = after.get(path)
+        if before_hash == after_hash:
+            continue
+        kind = (
+            "appeared"
+            if before_hash is None
+            else "disappeared" if after_hash is None else "changed"
+        )
+        deltas.append({"path": path, "kind": kind})
+    return deltas
