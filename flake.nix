@@ -5272,6 +5272,13 @@
             test "$(jq -r '.adapters.codex.scrape.occupancy // "absent"' ${adapterConfig})" = absent
             test "$(jq -c '.adapters.pi.scrape.occupancy.fields' ${adapterConfig})" = '{"residentCacheReadTokens":["cacheRead"],"residentCacheWriteTokens":["cacheWrite"],"residentInputTokens":["input"]}'
             test "$(jq -r '.adapters.pi.scrape.occupancy.pattern' ${adapterConfig})" = "\$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.usage"
+            # The valid-turn guard is applied to every capture an operator
+            # reads, not only to occupancy: `finalMessage` would otherwise
+            # report an aborted turn's partial text as the node's answer and
+            # `model` would pin a model no valid turn used. `usage` stays
+            # unguarded on purpose -- see the aborted-fixture render below.
+            test "$(jq -r '.adapters.pi.scrape.finalMessage.pattern' ${adapterConfig})" = "\$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.content[?@.type == 'text'].text"
+            test "$(jq -r '.adapters.pi.scrape.model.pattern' ${adapterConfig})" = "\$..[?@.role == 'assistant' && @.stopReason != 'aborted' && @.stopReason != 'error'].model"
             test "$(jq -r '.adapters.pi.scrape.sessionRef.pattern' ${adapterConfig})" = '$.id'
             test "$(jq -r '.adapters["claude-code"].scrape.sessionRef.pattern' ${adapterConfig})" = '$..session_id'
             test "$(jq -r '.adapters.codex.scrape.sessionRef.pattern' ${adapterConfig})" = '$..thread_id'
@@ -5337,6 +5344,23 @@
             pi_aborted="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render pi --scrape-stdout ${./test/fixtures/traces/pi-aborted-turn.jsonl} --scrape-stderr "$PWD/empty.err" -- work)"
             test "$(printf '%s' "$pi_aborted" | jq -c '.captures.occupancy')" = "$pi_last_turn_usage"
             test "$(printf '%s' "$pi_aborted" | jq -r '.captures.occupancy.input')" != 0
+            # The guard is on every capture an operator reads, not just on
+            # occupancy. `finalMessage` must be the last VALID turn's answer:
+            # the aborted turn in this fixture carries partial text
+            # (`The file notes.txt cont`), and reporting that truncated
+            # fragment as the node's answer -- unmarked, indistinguishable
+            # from a complete one -- is what the clauses on that capture
+            # prevent.
+            test "$(printf '%s' "$pi_aborted" | jq -r '.captures.finalMessage')" = 'The file notes.txt contains 42.'
+            # And this argv is where the same defect on `model` became
+            # operator-visible. The spliced aborted turn genuinely came from
+            # another session and states `qwen3-vl-8b-ocr`; an unguarded
+            # `$..model` pinned it, so the resume tally would have run named
+            # a model no valid turn of this session ever used. Asserting the
+            # whole argv rather than the capture is deliberate: the argv is
+            # the surface an operator sees.
+            test "$(printf '%s' "$pi_aborted" | jq -c '.argv')" = '["pi","--mode","json","--session","019f0000-0000-7000-8000-000000000001","--model","qwen3.6-35b-a3b","work"]'
+            test "$(printf '%s' "$pi_aborted" | jq -r '.argv | index("qwen3-vl-8b-ocr") // "absent"')" = absent
             # `usage` is deliberately unguarded, and this is what that costs:
             # the stream-wide `$..usage` does land on the aborted turn. It is
             # never read as occupancy, and no spend mapping is declared for

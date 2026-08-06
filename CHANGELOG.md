@@ -52,6 +52,44 @@ turn's length, so a long pi campaign reaches the 16 MiB trace read bound far
 sooner than a codex or claude-code one. Truncation is reported rather than
 hidden, so that is a sizing note, not a defect.
 
+#### #406 — the valid-turn guard now covers every pi capture an operator reads
+
+#387 guarded `occupancy` against `stopReason: aborted` and `error` and left
+`finalMessage` reading every assistant `message_end`. An attempt that ended on
+an aborted turn carrying partial text therefore reported that truncated
+fragment as the node's answer, unmarked and indistinguishable from a complete
+one, while occupancy correctly held at the last valid turn. `model`
+(`$..model`, last match) had the same shape and a louder consequence: it
+pinned a model from an excluded turn, and the rendered resume argv carried it.
+Both filters now carry the same two `stopReason` clauses. `model` stays a
+descendant filter rather than being scoped to `message_end`, so the model is
+still recoverable from a `message_start` on an attempt that never reached an
+assistant `message_end`. `usage` stays unguarded, as before and for the stated
+reason. The `adapter-presets` check asserts the aborted fixture's whole
+rendered argv, not just the capture, because the argv is where the wrong model
+became operator-visible.
+
+`test/fixtures/traces/pi-aborted-turn.jsonl` could not observe any of this.
+Its real aborted message was aborted during model load, so it carried no
+`text` block at all and `finalMessage` fell through to the last valid turn
+whether guarded or not. It now carries a partial `text` block — the one piece
+of synthesised content in either pi fixture, labelled as such in the
+directory's README beside the splice it already documented. That README also
+now answers, once, what these fixtures structurally cannot see: the `error`
+half of the guard, the echo's growth at campaign scale, anything about resume
+behaviour, and anything about redaction.
+
+Two comment corrections. The occupancy guard's evidence ordering was inverted:
+for a non-interactive `pi --mode json`, `error` is the reachable in-stream
+invalid-turn branch (pi's own context-overflow signal), while an in-stream
+`aborted` `message_end` cannot be produced headlessly at all — SIGINT
+truncates before any assistant `message_end`, exit 130 — so the aborted turn's
+provenance is pi's session store, and the comment now says that instead of
+"proven from real pi data". And the leading-dash narrowing has a quiet half
+worth naming: a payload that *is* a pi flag is consumed as that flag and pi
+launches a fresh session with no work to do, where a non-flag leading-dash
+payload fails loudly.
+
 ### Recurring-cost hygiene (#396, #411, #395, #404)
 
 One lane of four fixes with a shared shape: each one makes something the fleet
