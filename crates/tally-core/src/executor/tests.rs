@@ -3176,3 +3176,84 @@ fn a_record_with_a_measured_accounting_sample_round_trips() {
     let round_tripped: UnitExitRecord = serde_json::from_str(&json).unwrap();
     assert_eq!(round_tripped, record);
 }
+
+/// #378: what a pre-label campaign row's captures are actually reachable by.
+///
+/// `664463b` changed `capture_stem` in the same edit that changed `unit_stem`.
+/// #371 fixed the `unit_stem` half. This is the other half: a row whose
+/// orchestration carries a `taskRef` had its captures written by the old binary
+/// at `capture/<uuid>.*`, and the current binary derives
+/// `capture/<uuid>.<task_id>.*`.
+///
+/// The question the issue leaves open is whether that strands anything an
+/// operator can see. It does. `retained_capture_paths` is what `query.run`
+/// calls to attach `capturePath` and `stderrTail` to a failure, and it resolves
+/// every stream through `capture_stem` with no fallback to the bare-uuid name —
+/// the only fallbacks it carries are `.err`-versus-`.adapter.err` suffix ones.
+/// The capture generation is keyed on the bare uuid, so it still matches, which
+/// is exactly what makes the failure quiet: the lookup succeeds and reports no
+/// failure capture rather than reporting that it could not find one.
+#[test]
+fn pre_label_campaign_captures_are_unreachable_through_the_current_derivation() {
+    let temp = tempfile::tempdir().unwrap();
+    let executor = Executor::new(temp.path(), "/nix/store/example/bin/tally");
+    let unit_uuid = uuid("00000000-0000-4000-8000-000000000002");
+    let labeled = ExecutionIdentity {
+        job_id: unit_uuid,
+        task_uuid: Some(unit_uuid),
+        task_ref: crate::provenance::TaskRef::new("crm/t07").ok(),
+    };
+    // What the old binary derived for the same row: no task label in the stem.
+    let pre_label = ExecutionIdentity {
+        job_id: unit_uuid,
+        task_uuid: Some(unit_uuid),
+        task_ref: None,
+    };
+    assert_eq!(pre_label.capture_stem(), unit_uuid.to_string());
+    assert_eq!(labeled.capture_stem(), format!("{unit_uuid}.t07"));
+
+    let old = executor.paths(&pre_label);
+    std::fs::create_dir_all(old.stdout.parent().unwrap()).unwrap();
+    std::fs::create_dir_all(old.capture_generation.parent().unwrap()).unwrap();
+    std::fs::write(&old.stdout, b"pre-label stdout\n").unwrap();
+    std::fs::write(&old.failure_stderr, b"pre-label failure stderr\n").unwrap();
+    // The exit record and the capture generation are keyed on the bare uuid in
+    // both binaries, so this survives the rename untouched.
+    write_capture_generation(
+        &old.capture_generation,
+        CaptureGeneration {
+            attempt: 1,
+            lease_epoch: 7,
+        },
+    )
+    .unwrap();
+
+    // The files are on disk and readable.
+    assert!(old.failure_stderr.exists());
+
+    // And the current derivation cannot see them. The generation matches, so
+    // the lookup returns paths rather than nothing -- and every one of them
+    // names a file that does not exist.
+    let resolved = executor
+        .retained_capture_paths(&labeled, 1, 7)
+        .unwrap()
+        .expect("the bare-uuid capture generation still matches");
+    assert!(resolved.current);
+    assert!(!resolved.stdout.exists());
+    assert!(!resolved.stderr.exists());
+    assert_eq!(
+        resolved.failure_stderr, None,
+        "query.run skips a failure with no resolvable capture, so nothing says the data exists"
+    );
+
+    // The same call against the pre-label derivation finds all of it, which is
+    // what makes this a naming gap rather than a data-loss one.
+    let old_resolution = executor
+        .retained_capture_paths(&pre_label, 1, 7)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(old_resolution.failure_stderr.unwrap()).unwrap(),
+        b"pre-label failure stderr\n"
+    );
+}

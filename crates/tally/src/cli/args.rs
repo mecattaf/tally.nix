@@ -101,6 +101,9 @@ pub(super) enum MigrateCommand {
     /// Rewrite pre-label `unit-exit/` records to the labeled unit names the
     /// current binary derives for rows carrying a campaign `taskRef`.
     UnitExitLabels(MigrateUnitExitLabelsArgs),
+    /// Move pre-label `capture/` entries to the labeled capture stems the
+    /// current binary derives for rows carrying a campaign `taskRef`.
+    CaptureLabels(MigrateCaptureLabelsArgs),
 }
 
 #[derive(Debug, Args)]
@@ -109,6 +112,16 @@ pub(super) struct MigrateUnitExitLabelsArgs {
     #[arg(long, value_name = "PATH")]
     pub(super) state_dir: Option<PathBuf>,
     /// Write the plan. Without it the plan is printed and nothing changes.
+    #[arg(long)]
+    pub(super) apply: bool,
+}
+
+#[derive(Debug, Args)]
+pub(super) struct MigrateCaptureLabelsArgs {
+    /// Tally state directory holding `events/` and `capture/`.
+    #[arg(long, value_name = "PATH")]
+    pub(super) state_dir: Option<PathBuf>,
+    /// Apply the plan. Without it the plan is printed and nothing moves.
     #[arg(long)]
     pub(super) apply: bool,
 }

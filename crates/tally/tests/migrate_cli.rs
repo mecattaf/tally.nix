@@ -284,3 +284,85 @@ fn a_remote_owned_row_reports_the_hand_repair_and_never_claims_to_have_made_it()
     );
     assert!(reason.contains("cannot reach or repair"), "{reason}");
 }
+
+/// `tally migrate capture-labels` is the other half of the same generation gap
+/// (#378), and unlike its sibling no startup error names it: the daemon starts
+/// clean and `tally query run` simply reports a pre-label campaign failure as
+/// having no capture. So it is exercised the way an operator finds it — through
+/// the real binary, against captures an older tally left behind.
+#[test]
+fn capture_labels_moves_pre_label_captures_and_is_idempotent() {
+    let temp = tempfile::tempdir().unwrap();
+    let state_dir = temp.path().join("state");
+    let uuid = seed(&state_dir, Some("issue253-live/task-1"), |identity| {
+        identity.unit_name()
+    });
+    let capture_dir = state_dir.join("capture");
+    std::fs::create_dir_all(capture_dir.join("archive").join(uuid.to_string())).unwrap();
+    for name in [
+        format!("{uuid}.out"),
+        format!("{uuid}.adapter.err"),
+        format!("{uuid}.err"),
+    ] {
+        std::fs::write(capture_dir.join(&name), format!("{name}\n")).unwrap();
+    }
+    std::fs::write(
+        capture_dir
+            .join("archive")
+            .join(uuid.to_string())
+            .join("attempt-0000000001-epoch-00000000000000000003.err"),
+        b"archived\n",
+    )
+    .unwrap();
+
+    let migrate = |apply: bool| -> Value {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_tally"));
+        command
+            .arg("migrate")
+            .arg("capture-labels")
+            .arg("--state-dir")
+            .arg(&state_dir);
+        if apply {
+            command.arg("--apply");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "migrate failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).unwrap()
+    };
+
+    let plan = migrate(false);
+    assert_eq!(plan["applied"], json!(false));
+    assert_eq!(plan["labeledRows"], json!(1));
+    assert_eq!(plan["renamed"].as_array().unwrap().len(), 4);
+    assert!(capture_dir.join(format!("{uuid}.err")).exists());
+
+    let applied = migrate(true);
+    assert_eq!(applied["applied"], json!(true));
+    assert_eq!(applied["renamed"].as_array().unwrap().len(), 4);
+    for suffix in ["out", "adapter.err", "err"] {
+        assert!(!capture_dir.join(format!("{uuid}.{suffix}")).exists());
+        assert_eq!(
+            std::fs::read_to_string(capture_dir.join(format!("{uuid}.task-1.{suffix}"))).unwrap(),
+            format!("{uuid}.{suffix}\n")
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(
+            capture_dir
+                .join("archive")
+                .join(format!("{uuid}.task-1"))
+                .join("attempt-0000000001-epoch-00000000000000000003.err")
+        )
+        .unwrap(),
+        "archived\n"
+    );
+
+    let again = migrate(true);
+    assert_eq!(again["renamed"].as_array().unwrap().len(), 0);
+    assert_eq!(again["alreadyLabeled"], json!(1));
+    assert_eq!(again["skipped"].as_array().unwrap().len(), 0);
+}

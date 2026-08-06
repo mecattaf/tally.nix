@@ -217,6 +217,52 @@ The pre-label name is a pure function of the record's file name
 (`unit-exit/<uuid>.json` → `tally-job-<uuid>.service`), so no backup copy is
 written: it would carry nothing the surviving file does not.
 
+### The same rows' captures are stranded too, and nothing says so
+
+Campaign task labels entered the *capture* stem in the same edit that changed
+the unit name. `tally migrate unit-exit-labels` repairs the exit records, and it
+is enough to bring a wedged coordinator back up — but it does not touch the
+captures, which is a separate and much quieter loss.
+
+For a row whose orchestration carries a `taskRef`:
+
+- captures written by the old binary are at `capture/<uuid>.out`,
+  `capture/<uuid>.adapter.err`, `capture/<uuid>.err`, archived under
+  `capture/archive/<uuid>/`
+- the current binary derives `capture/<uuid>.<task>.out` and so on
+
+`tally query run` attaches `capturePath` and `stderrTail` to a failure by
+resolving those names, and it has no fallback to the bare-uuid form. The capture
+*generation* marker is keyed on the bare uuid in both binaries, so it still
+matches — which is exactly what makes this quiet. The lookup succeeds and
+reports that the failure has no capture, rather than reporting that it could not
+find one. Nothing in the daemon's log, no startup refusal, and no field in the
+query output says the bytes are still on disk.
+
+Run the sibling one-shot to move them:
+
+```console
+$ tally migrate capture-labels --state-dir <STATE_DIR>
+$ tally migrate capture-labels --state-dir <STATE_DIR> --apply
+```
+
+The first form prints the plan as JSON and moves nothing; read `renamed` first.
+The second renames each entry within its own directory. Nothing is rewritten:
+contents, modes and mtimes are untouched, and `unit-exit/<uuid>.json` and
+`unit-exit/<uuid>.capture.json` — which are keyed on the bare uuid under both
+binaries — are deliberately left alone. Running it again is a no-op
+(`alreadyLabeled`). Where both the old and the new name exist for the same
+stream, the entry is listed under `skipped` and left for a human: the command
+does not choose between two captures.
+
+The same `--state-dir` and ownership rules as `unit-exit-labels` apply — copy
+the absolute path from the module's `stateDir` and run as the user that owns it,
+because captures are mode 0600 and nothing repairs ownership afterwards.
+
+The affected population is bounded by the historical count of rows carrying a
+`taskRef`, so this is residue rather than a growth surface: a row dispatched by
+the current binary has never had a bare-uuid stem.
+
 ### Rows dispatched to a remote executor
 
 **The migration cannot repair these, on either host.** The labeled name is

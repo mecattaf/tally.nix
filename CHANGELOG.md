@@ -6,7 +6,7 @@ authorized.
 
 ## [Unreleased]
 
-### Daemon startup & generation residue (#419, #379, #407)
+### Daemon startup & generation residue (#419, #379, #407, #378)
 
 One lane about work that runs at daemon startup, and state written under one
 regime and judged under another.
@@ -111,6 +111,41 @@ read that marker as "recoverable" at every start, forever.
 The richer answer for the log line would have been a `TALLY_EVENT` journal
 record with real fields. That was deliberately not done: adding an event type
 this phase would collide with the audit of the existing eleven.
+
+#### #378 — pre-label campaign captures are stranded, and `tally migrate capture-labels` moves them
+
+The issue claimed no impact and asked for the trace first. The trace says the
+data is operator-visible and silently unreachable.
+
+`retained_capture_paths` is what `query.run` calls to attach `capturePath` and
+`stderrTail` to a failure, and it resolves every stream through `capture_stem`
+with no fallback to the bare-uuid name — the only fallbacks it carries are
+`.err`-versus-`.adapter.err` suffix ones. `query.log` does not resolve captures
+at all, so the surface named in the issue was the wrong one; the affected
+surfaces are `query.run`, `query.trace`, and the recovery-time stderr excerpt.
+The capture *generation* marker is keyed on the bare uuid in both binaries, so
+it still matches, and that is what makes this quiet: the lookup succeeds and
+reports the failure as having no capture rather than reporting that it could
+not find one. So the answer is (a) — genuinely unreachable — with the sting
+that nothing anywhere says the bytes are still on disk.
+
+- `tally migrate capture-labels` is the `unit-exit-labels` sibling the issue
+  predicted. It moves `capture/<uuid>.*` and `capture/archive/<uuid>/` to the
+  `<uuid>.<task>` stem, plan-first, idempotent, coordinator-only, with
+  remote-owned rows reported rather than claimed. The rename is a prefix
+  substitution, so a stream this migration has never heard of moves with the
+  rest; nothing is rewritten, and the bare-uuid-keyed `unit-exit/` records are
+  deliberately untouched.
+- An entry present under both stems is reported in `skipped[]`, not resolved:
+  the command does not choose between two captures.
+- Strict derivation stays. A permanent bare-uuid read-path fallback was
+  rejected under the policy #371 settled — it would make every future reader
+  carry a historical naming scheme, and would silently resolve a different
+  row's capture on a stem collision.
+- `doc/src/operating/recovery.md` and `doc/src/operating/cli.md` record the
+  finding and the procedure. Unlike its sibling, no startup error names this
+  command, because nothing refuses — which is precisely why the finding had to
+  be written down.
 
 ### Recurring-cost hygiene (#396, #411, #395, #404)
 
