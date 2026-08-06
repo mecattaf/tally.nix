@@ -248,13 +248,14 @@ new history.
 
 ### One `details` shape for every exit-20 refusal
 
-The five codes below are one family: `script-changed-mid-run`,
+The five codes below are one family: <!-- supersession-codes:start -->`script-changed-mid-run`,
 `args-changed-mid-run`, `catalog-changed-mid-run`, `flow-run-superseded`, and
-`replay-divergence`. Each is raised either by the runner's startup scan, before
+`replay-divergence`<!-- supersession-codes:end -->. Each is raised either by the runner's startup scan, before
 the script is evaluated, or by an admission mid-run — and a driver must not have
 to know which. All five therefore carry the same fourteen `details` members at
 every raising site, with `null` where the code has nothing to say:
 
+<!-- supersession-detail-fields:start -->
 | Field | Meaning |
 |---|---|
 | `flowRunId` | The run whose recorded identity is in question. `null` only when the refusal reached the runner from a producer that named no run. |
@@ -268,9 +269,10 @@ every raising site, with `null` where the code has nothing to say:
 | `reason` | The recorded rollover reason, from `flow.supersede`'s closed set. |
 | `recordedAt` | When the rollover was recorded. |
 | `kernelError` | The daemon's own message, when the refusal was found through a kernel dedup-key conflict rather than by the runner's own comparison. |
-| `remedy` | The `tally flow supersede` invocation that clears it, or `null` when no single command does — including when no `flowRunId` is known, since the command needs one. |
+| `remedy` | The `tally flow supersede` invocation that clears it, or <!-- remedy-nullity:start -->`null` when no single command does — including when no `flowRunId` is known, since the command needs one<!-- remedy-nullity:end -->. |
 | `transient` | Always `false` for this family. |
 | `resolution` | `supersede`, `run-successor`, or `investigate`. |
+<!-- supersession-detail-fields:end -->
 
 So `details.recordedHash` and `details.currentHash` name the two sides of the
 disagreement for all five codes, whichever one fired and wherever it fired. The

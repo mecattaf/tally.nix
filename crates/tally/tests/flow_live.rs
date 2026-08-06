@@ -32,7 +32,7 @@ use tally_core::taskdb::{
 };
 use tally_core::wire::EnqueuePayload;
 use tally_core::witness::{read_verified_attestations, read_verified_records};
-use tally_flow::BRIEF_SENTINEL;
+use tally_flow::{BRIEF_SENTINEL, SUPERSESSION_DETAIL_FIELDS};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
@@ -77,6 +77,7 @@ const DRV_SUBSTITUTE_RUN: &str = "00000000-0000-4000-8000-000000000506";
 const STRUCTURED_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000507";
 const UNTYPED_RESULT_RUN: &str = "00000000-0000-4000-8000-000000000508";
 const CREDENTIAL_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000509";
+const REPLAY_DIVERGENCE_RUN: &str = "00000000-0000-4000-8000-000000000538";
 const AUTO_REQUEUE_RUN: &str = "00000000-0000-4000-8000-000000000510";
 const CANCELLED_RUN: &str = "00000000-0000-4000-8000-000000000511";
 const CAP_REPLAY_RUN: &str = "00000000-0000-4000-8000-000000000512";
@@ -1804,6 +1805,179 @@ async fn credentialed_pool_replays_the_same_flow_as_reused() {
             let proofs = proofs["items"].as_array().unwrap();
             assert_eq!(proofs.len(), 1);
             assert_eq!(proofs[0]["taskUuid"], items[0]["taskUuid"]);
+
+            daemon.stop().await;
+        })
+        .await;
+}
+
+/// The one wire rename in the exit-20 family, proved by a real process.
+///
+/// `replay-divergence` renamed `expectedHash`/`expectedLabel` to
+/// `currentHash`/`currentLabel`, and every other live exit-20 assertion in this
+/// suite is an identity pin — so the renamed members were only ever exercised
+/// against in-process stubs, which agree with whatever name the code picks. This
+/// drives a genuine daemon, a genuine runner process, and a genuine ledger
+/// conflict, and reads the names off the runner's own stdout.
+///
+/// Reaching a payload divergence needs an input that is inside the canonical
+/// payload and outside the three identity hashes, or the startup pins refuse the
+/// replay first. A pool credential is exactly that: it is hashed into the
+/// payload and it comes from the client config rather than from the script, the
+/// args, or the catalog. Granting the pool a second credential between the two
+/// runs — an ordinary operator edit — is therefore the smallest honest way to
+/// make one admitted ordinal re-derive different work.
+#[tokio::test(flavor = "current_thread")]
+async fn a_live_replay_divergence_names_the_current_hash_and_label_on_the_wire() {
+    let _environment = ENVIRONMENT_LOCK.lock().await;
+    tokio::task::LocalSet::new()
+        .run_until(async {
+            let temp = tempfile::tempdir().unwrap();
+            let daemon_paths = paths(&temp.path().join("daemon"));
+            let recorded_credential = temp.path().join("alpha-token");
+            fs::write(&recorded_credential, "test-only-token").unwrap();
+            let granted_credential = temp.path().join("alpha-second-token");
+            fs::write(&granted_credential, "test-only-token").unwrap();
+
+            let mut config = config();
+            config.attestations.exec.enable = false;
+            config
+                .pools
+                .get_mut("alpha")
+                .unwrap()
+                .credentials
+                .insert("api-token".to_owned(), recorded_credential);
+            config.validate().unwrap();
+            let config_path = temp.path().join("config.json");
+            fs::write(&config_path, serde_json::to_vec(&config).unwrap()).unwrap();
+
+            // Same script, same args, same (absent) catalog — so the run-level
+            // identity scan admits the replay and the divergence is about the
+            // ordinal's payload rather than about the run's identity. The pool's
+            // original credential is left exactly as the daemon knows it, so the
+            // admission is refused for the divergence and not for a credential
+            // the daemon and the client disagree about.
+            let mut replay_config = config.clone();
+            replay_config
+                .pools
+                .get_mut("alpha")
+                .unwrap()
+                .credentials
+                .insert("rotation-token".to_owned(), granted_credential);
+            replay_config.validate().unwrap();
+            let replay_config_path = temp.path().join("replay-config.json");
+            fs::write(
+                &replay_config_path,
+                serde_json::to_vec(&replay_config).unwrap(),
+            )
+            .unwrap();
+
+            let script = temp.path().join("replay-divergence.js");
+            fs::write(&script, task_ref_one_node_source()).unwrap();
+            let systemd_run = install_fake_systemd_run(temp.path(), &daemon_paths.state_dir);
+            let daemon = start_daemon_with_systemd_run(&daemon_paths, config, systemd_run).await;
+
+            let recorded = runner(
+                &config_path,
+                &daemon_paths.socket,
+                &script,
+                REPLAY_DIVERGENCE_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let recorded = runner_output(recorded).await;
+            assert!(
+                recorded.status.success(),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&recorded.stdout),
+                String::from_utf8_lossy(&recorded.stderr)
+            );
+            assert_eq!(
+                flow_report(&recorded)["report"]["finalValue"]["disposition"],
+                "created"
+            );
+            let recorded_task_uuid = runner_events(&recorded, "node-submitted")[0]["taskUuid"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+
+            let diverged = runner(
+                &replay_config_path,
+                &daemon_paths.socket,
+                &script,
+                REPLAY_DIVERGENCE_RUN,
+                "{}",
+                1,
+            )
+            .spawn()
+            .unwrap();
+            let diverged = runner_output(diverged).await;
+            assert_eq!(
+                diverged.status.code(),
+                Some(20),
+                "stdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&diverged.stdout),
+                String::from_utf8_lossy(&diverged.stderr)
+            );
+            let error = flow_failure(&diverged)["error"].clone();
+            assert_eq!(error["code"], "replay-divergence");
+            assert_eq!(error["name"], "FlowReplayError");
+            assert_eq!(error["ordinal"], 0);
+
+            let details = error["details"].as_object().unwrap();
+            // The whole contract, in emission order, off a real process's stdout.
+            assert_eq!(
+                details.keys().map(String::as_str).collect::<Vec<_>>(),
+                SUPERSESSION_DETAIL_FIELDS
+            );
+            // The rename, on the wire: the runner's side of the disagreement is
+            // `currentHash`/`currentLabel`, and the pre-rename names are absent.
+            // These four are spelled out rather than read through the constant
+            // on purpose — comparing the wire with the constant the wire is
+            // built from would agree with whatever name the code picked.
+            let current_hash = details
+                .get("currentHash")
+                .and_then(Value::as_str)
+                .expect("a live replay divergence names currentHash on the wire");
+            let recorded_hash = details
+                .get("recordedHash")
+                .and_then(Value::as_str)
+                .expect("a live replay divergence names recordedHash on the wire");
+            assert!(current_hash.starts_with("sha256:"));
+            assert!(recorded_hash.starts_with("sha256:"));
+            assert_ne!(current_hash, recorded_hash);
+            assert_eq!(
+                details.get("currentLabel").and_then(Value::as_str),
+                Some("task-ref-child")
+            );
+            assert_eq!(
+                details.get("recordedLabel").and_then(Value::as_str),
+                Some("task-ref-child")
+            );
+            assert!(details.get("expectedHash").is_none());
+            assert!(details.get("expectedLabel").is_none());
+            // The rest of the family contract, from the same real refusal.
+            assert_eq!(details["flowRunId"], REPLAY_DIVERGENCE_RUN);
+            assert_eq!(details["divergentInput"], "payload");
+            assert_eq!(details["taskUuid"], recorded_task_uuid);
+            assert!(details["kernelError"]
+                .as_str()
+                .unwrap()
+                .contains("dedup-key-conflict"));
+            assert_eq!(details["transient"], false);
+            assert_eq!(details["resolution"], "investigate");
+            // A rollover does not clear a divergence, so there is no command to
+            // advertise even though the refusal knows exactly which run it is.
+            assert!(details["remedy"].is_null());
+
+            // The refusal wrote no second row: the ledger still holds the one
+            // node the recorded run created.
+            let client = rpc(&daemon_paths.socket).await;
+            let items = flow_items(&client, REPLAY_DIVERGENCE_RUN).await;
+            assert_eq!(items.len(), 1);
+            assert_eq!(items[0]["taskUuid"], recorded_task_uuid);
 
             daemon.stop().await;
         })

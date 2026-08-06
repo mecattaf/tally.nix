@@ -324,6 +324,34 @@ authorized.
 
 ### Fixed
 
+- **The exit-20 `details` contract is now held to evidence instead of to
+  itself (#400).** #397 gave the five supersession codes one fourteen-member
+  `details` shape and documented it in two pages. What it could not give was a
+  reason to believe either claim: the contract test compared production output
+  with the same constant production iterates over, so a member could be added
+  or reordered while every assertion passed and all three prose copies rotted,
+  and the family's one wire rename was exercised only by in-process stubs that
+  would have agreed with any name.
+
+  - **#400 — the prose copies are pinned to the constant, and the rename is
+    proved by a real process.** `crates/tally-flow/tests/supersession_docs.rs`
+    parses the marker-delimited member table in
+    `doc/src/flows/submission-and-replay.md` and the per-code table in
+    `doc/src/reference/errors.md` and holds both to
+    `SUPERSESSION_DETAIL_FIELDS` / `SUPERSESSION_CODES` — membership, order,
+    and the derived members whose *values* the docs state (`transient`,
+    `resolution`, `divergentInput`, and whether a code advertises a `remedy`).
+    The `remedy` nullity rule is now stated once, in one wording, in both
+    pages, and the test fails if the two copies drift apart or if the shipped
+    code stops obeying the sentence. `errors.md` names `recordedLabel` and
+    `currentLabel` where it used to say "both labels", so its `replay-divergence`
+    row also carries the renamed members. A live daemon-driven
+    `replay-divergence` (`flow_live::a_live_replay_divergence_names_the_current_hash_and_label_on_the_wire`)
+    replays an admitted ordinal whose payload changed and asserts
+    `currentHash` / `currentLabel` — and the absence of the pre-rename
+    `expectedHash` / `expectedLabel` — on a real runner's stdout, the first
+    live exit-20 assertion in the suite that is not an identity pin.
+
 - **The `pi` preset's launch and resume argv could not run (#387).** Both
   ended in `--`, tally's option-terminator convention across presets. pi has
   no end-of-options separator: it rejects one with `Error: Unknown option:
