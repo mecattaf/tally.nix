@@ -363,9 +363,17 @@ authorized.
     `tally flow supersede` missing its `--flow-run-id` value — exit 2 in an
     operator's hands. It now returns the why-clause without the command. Both
     guards test blankness as `trim().is_empty()`, which is what `run_script`
-    has always meant by it, so a whitespace-only or flag-shaped `flowRunId`
-    from a foreign producer no longer renders an inert command either. Neither
-    was reachable from any in-tree call site; both functions are public.
+    has always meant by it, so a whitespace-only `flowRunId` from a foreign
+    producer no longer renders an inert command either. Neither was reachable
+    from any in-tree call site; both functions are public.
+
+    A **flag-shaped** `flowRunId` — a foreign producer sending `--reason` or
+    `-h` as the run id — is *not* closed by this, and is not claimed to be: it
+    is not blank under anyone's definition, so both the `remedy` and the
+    message still render a command that exits 2. Suppressing it would
+    contradict the ruling below, and validating the member as a UUID is a wider
+    contract change than this asked for, so the correct behaviour is left to be
+    decided rather than assumed.
 
     A `flowRunId` a producer sent as something other than a string is now
     preserved rather than replaced with `null`. Every other member of the
