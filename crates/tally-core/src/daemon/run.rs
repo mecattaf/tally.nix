@@ -333,9 +333,23 @@ impl Daemon {
     pub(super) async fn finish_job(&self, finished: ExecutionFinished) -> Result<(), DaemonError> {
         let job = {
             let context = self.handler.context.read().await;
-            let job = context.jobs.get(&finished.job_id).cloned().ok_or_else(|| {
-                DaemonError::Invalid(format!("unknown completed job {}", finished.job_id))
-            })?;
+            let Some(job) = context.jobs.get(&finished.job_id).cloned() else {
+                // Retired: the job already reached a terminal disposition, most
+                // often a forced cancel that raced this execution's own exit
+                // (#395). Absence from the live map is the same fact the
+                // `Completed` check below reports, so it takes the same exit.
+                // An id the daemon never admitted is still an error.
+                return if context.rows.contains_key(&finished.job_id)
+                    || context.query_rows.contains_key(&finished.job_id)
+                {
+                    Ok(())
+                } else {
+                    Err(DaemonError::Invalid(format!(
+                        "unknown completed job {}",
+                        finished.job_id
+                    )))
+                };
+            };
             if job.state == JobState::Completed
                 || job.row.attempt != finished.attempt
                 || job.row.lease_epoch != finished.lease_epoch
@@ -538,7 +552,12 @@ impl Daemon {
 
         let (result, evidence, launches, auto_requeue) = {
             let mut context = self.handler.context.write().await;
-            if context.jobs.get(&finished.job_id).is_some_and(|job| {
+            // Re-checked under the write lock, because everything between here
+            // and the read above was awaited without it. `is_none_or`, not
+            // `is_some_and`: a job retired while this ran (#395) is terminal,
+            // and reading its absence as "still eligible" would append a second
+            // canonical witness for one execution.
+            if context.jobs.get(&finished.job_id).is_none_or(|job| {
                 job.state == JobState::Completed
                     || job.row.attempt != finished.attempt
                     || job.row.lease_epoch != finished.lease_epoch
@@ -621,8 +640,11 @@ impl Daemon {
             if !auto_requeue {
                 context.barriers.complete_job(&stable, result.value());
             }
-            let stored = context.jobs.get_mut(&finished.job_id).expect("job exists");
-            stored.state = JobState::Completed;
+            // Terminal: the job leaves the live map (#395). Everything below
+            // reads the `job` clone taken above, and the two verbs that can
+            // still ask about a finished job read `context.rows` and
+            // `context.query_rows`, which keep it.
+            retire_job(&mut context, finished.job_id);
             release_child_charge(&mut context, &job)?;
             context.guardrails.retire_parent(&job.stable_key());
             if let Some(task_uuid) = job.task_uuid {
