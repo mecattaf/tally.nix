@@ -8,6 +8,26 @@ authorized.
 
 ### Added
 
+- **Lane: operator conveniences — evals gain a checkable coverage-manifest
+  schema and a deterministic checker (#388).** A findings file (an eval's
+  plain-Markdown output) can now carry a `<!-- eval-coverage-manifest:v1 -->`
+  fenced-JSON section stating, per acceptance bullet and per reviewed file,
+  `covered` / `reused` / `failed`-with-a-typed-class
+  (`timeout` / `budget` / `input` / `unknown`, the last a mandatory
+  catch-all) — an item-level taxonomy kept separate from a run-level one
+  (`timeout` / `budget` / `crash` / `unknown`) covering the eval run itself.
+  `test/eval_manifest_check.py` validates a findings file's manifest section
+  and reports uncovered surface: an `expected` block naming the bullets/files
+  the eval was supposed to account for, cross-checked against what the
+  manifest actually covers. Proven to reject a manifest that omits a reviewed
+  file entirely and one that types a failure with an unrecognized class
+  (`test/eval_manifest_check_test.py`, `test/fixtures/eval-manifest/`). Not
+  wired into `nix flake check` or `test/fleet-gate.sh` — the issue's explicit
+  cap is no gate-side change; an orchestrator close-out names the checker
+  instead of vouching for the claim by hand. Emitting the manifest from a
+  real eval is an adoption step for the next dispatched wave, not a code
+  change this lane can claim.
+
 - **`query run` and `query standup` answer "what did this run cost" (#384).**
   `query.run` gains a `usage` object and `query.standup` gains a `runs` array
   carrying the same object per flow run the window touched. Both are summed
