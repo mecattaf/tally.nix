@@ -1020,9 +1020,69 @@ pub struct StandupDigest {
     /// unfilled digest carries an empty list rather than a wrong one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<StandupRunUsage>,
+    /// How many TASK ENTRIES (summed across `completed`, `gateFails`,
+    /// `cancelled`, `inFlight`) this call hid because their creating run is
+    /// archived operator reader-state. Filled by
+    /// [`crate::query_v2::apply_reader_state_to_standup`], which owns the
+    /// reader-state store this projection has no access to; an unfilled
+    /// digest carries zero rather than a wrong count. Accumulated as those
+    /// four collections are filtered, by the same call that filters them
+    /// and never by a separate recount — see that function's doc comment
+    /// for why a recount cannot be substituted here.
+    ///
+    /// That accumulation is unconditional: the helper those collections are
+    /// filtered through cannot remove an entry without counting it. Behind
+    /// it sits a conservation check for removals that bypass the helper
+    /// entirely; it covers the fields its enumerator names (a new
+    /// `StandupDigest` field does not compile until that enumerator names
+    /// it) and binds only where `debug_assertions` is on, so it is a
+    /// development-time backstop rather than a property of the shipped
+    /// binary.
+    ///
+    /// This does NOT count `runs` entries removed; see
+    /// [`Self::archived_runs_hidden`] for that, a deliberately separate
+    /// number because the two lists are not the same unit (one archived run
+    /// can hold several task entries).
+    ///
+    /// Two window-wide aggregates are deliberately NOT reader-state
+    /// filtered and this count says nothing about them: `reused` and
+    /// `canonical_gpu_seconds` are both summed once, over the whole
+    /// window, before this call removes anything — an archived run's GPU
+    /// seconds and reuse count remain in those totals even once its
+    /// entries and cost row are hidden. Window cost is currently
+    /// reader-state-independent by construction; see
+    /// `doc/src/operating/observability.md`'s "Archive a run" section.
+    #[serde(default)]
+    pub archived_hidden: usize,
+    /// How many `runs` entries (per-run usage rollups) this call hid
+    /// because that run is archived operator reader-state — counted
+    /// directly from `runs`'s own filter, independent of
+    /// [`Self::archived_hidden`]'s task-entry attribution. `runs` is
+    /// populated from two sources on purpose (the creating run AND every
+    /// run that attached the task via durable membership — the W-316
+    /// shape), so a run that only attached a task still has its cost row
+    /// hidden and counted here even when no task entry was hidden for it.
+    #[serde(default)]
+    pub archived_runs_hidden: usize,
     /// The three statements every entry in `runs` would otherwise repeat
-    /// verbatim, stated once (#404). Present exactly when `runs` is, and
-    /// filled by the same function.
+    /// verbatim, stated once (#404).
+    ///
+    /// **Present exactly when `runs` is non-empty.** That is an invariant of
+    /// the *composition* of the two calls that build a digest, not of either
+    /// alone: [`crate::query_v2::apply_standup_usage`] sets it when it leaves
+    /// a non-empty `runs`, and
+    /// [`crate::query_v2::apply_reader_state_to_standup`] clears it again if
+    /// it hides every run — a digest that shows no run must not carry a
+    /// statement about how its runs were summed. Both fields are skipped on
+    /// the wire when empty, so they appear and disappear together.
+    ///
+    /// That is a statement about what THIS build emits, not a rule a reader
+    /// may apply to any payload: a producer predating the field emits `runs`
+    /// with no basis at all, stating the three constants inline on each entry
+    /// instead. So absence must not be read as "this digest has no runs".
+    /// Among digests this build produces, what separates a window that
+    /// touched no run from one whose runs were all hidden is
+    /// [`Self::archived_runs_hidden`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_basis: Option<StandupUsageBasis>,
 }
@@ -1034,8 +1094,18 @@ impl StandupDigest {
     /// digest states them once, so on the way back in the entries have to be
     /// told what they were. They are told by `usage_basis` — the copy that
     /// travelled with the payload — and only by this build's own constants
-    /// when a payload carries no basis at all, which is what a digest produced
-    /// before `usageBasis` existed looks like. The alternative, filling from
+    /// when a payload carries no basis at all. A payload like that is not
+    /// necessarily an old one: a current producer emits no basis whenever the
+    /// digest has no `runs` (see [`StandupDigest::usage_basis`]), and then the
+    /// loop below is zero-trip.
+    ///
+    /// The `unwrap_or_default()` is nevertheless live, and must not be deleted
+    /// as unreachable. A basis-less payload from a producer that predates the
+    /// field carries a NON-empty `runs`, so the loop does run over it — it
+    /// simply substitutes nothing, because each of that producer's entries
+    /// states all three constants inline and the `is_empty()` guards never
+    /// fire. The default is what makes that path total rather than a panic.
+    /// The alternative, filling from
     /// the reader's constants while the payload's basis says otherwise, would
     /// make the digest state one thing and every entry in it state another,
     /// across exactly the mixed-generation fleet this runs on.
@@ -1246,6 +1316,8 @@ pub fn query_standup(
         cancelled,
         canonical_gpu_seconds,
         runs: Vec::new(),
+        archived_hidden: 0,
+        archived_runs_hidden: 0,
         // Both are filled together by `query_v2::apply_standup_usage`; an
         // unfilled digest states no basis rather than one it never applied.
         usage_basis: None,

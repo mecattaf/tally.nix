@@ -204,6 +204,8 @@ pub(super) async fn run_query(
             limit,
             cursor,
             json,
+            archived,
+            no_archived: _,
         } => {
             let params = json!({
                 "liveState": state,
@@ -220,6 +222,7 @@ pub(super) async fn run_query(
                 "until": until,
                 "limit": limit,
                 "cursor": cursor,
+                "archived": archived,
             });
             let client = connect_rpc(socket, config_path).await?;
             // A caller that supplied its own cursor, or asked for `--json`,
@@ -399,13 +402,17 @@ pub(super) async fn run_query(
             }
             Ok(())
         }
-        QueryCommand::Standup { since } => {
+        QueryCommand::Standup {
+            since,
+            archived,
+            no_archived: _,
+        } => {
             print_rpc(
                 socket,
                 config_path,
                 rpc_timeout,
                 "query.standup",
-                Some(json!({"since": since})),
+                Some(json!({"since": since, "archived": archived})),
             )
             .await
         }
@@ -855,6 +862,18 @@ fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {
         compact_text(flow_run_id),
         compact_text(state)
     );
+
+    // Directly under the header: archived is operator reader-state, not a
+    // fact about execution, but a reader who missed archiving it themselves
+    // (or inherited the archive from someone else) should not be surprised.
+    if run["archived"].as_bool() == Some(true) {
+        outln!(
+            "-- ARCHIVED{}",
+            run["triageTag"]
+                .as_str()
+                .map_or_else(String::new, |tag| format!(" ({})", compact_text(tag)))
+        );
+    }
 
     // Directly under the header, before any task board: a superseded run is
     // terminal, and a reader who misses that fact will wait for progress that
