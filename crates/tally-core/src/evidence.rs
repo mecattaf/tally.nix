@@ -1445,15 +1445,21 @@ mod tests {
     /// `evidence_event` always passes `Some(check.reason.clone())`, so
     /// `synthesize_message`'s default -- which `journal.rs`'s own audit
     /// covers -- is unreachable for those two of the eleven event kinds.
-    /// These six strings are what an operator actually reads for them, so
-    /// they are held to the same outcome-first shape that audit pins: a
+    /// These strings are what an operator actually reads for them, so they
+    /// are held to the same outcome-first shape that audit pins: a
     /// past-tense opening verb and no exclamation mark.
     ///
-    /// Reasons this module does NOT author are deliberately out of scope: a
-    /// failed `hash_artifact_file` reports `error.to_string()` and a rejected
-    /// store path reports the `StoreValidity` impl's own text. Both are
-    /// error vocabularies owned elsewhere, so the assertion below drives only
-    /// the paths whose text is written here.
+    /// Two failing arms are excluded, and not because they come from
+    /// somewhere else -- tally authors both. A failed `hash_artifact_file`
+    /// reports `EvidenceError::ArtifactIo`'s `Display` (`cannot read
+    /// artifact {path}: {source}`, declared in this same file), and a
+    /// rejected store path reports `NixStoreError`'s `Display` (declared in
+    /// `nix_store.rs`, same crate). They are left alone because that text is
+    /// shared with every other display site of those errors, so rewording it
+    /// to suit the journal would change error prose on surfaces that have
+    /// nothing to do with the journal. The assertion below therefore drives
+    /// only the reasons written inline here, where the journal is the only
+    /// consumer.
     #[test]
     fn evidence_check_reasons_lead_with_a_past_tense_outcome() {
         fn assert_outcome_first(reason: &str, label: &str) {

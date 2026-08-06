@@ -45,14 +45,18 @@ outcome-first grammar check at all.
   format for every kind by name so a 12th event added later fails loudly
   instead of shipping unaudited. That default is unreachable for
   `evidence_pass`/`evidence_fail`, whose `MESSAGE` is always the evidence
-  check's own reason, so every reason string
-  `crates/tally-core/src/evidence.rs` authors was reworded to lead with an
-  outcome too (`Matched exit code 0 == 0`, `Recorded a witness span of
-  0.25s`, `Confirmed the artifact exists (…)`, `Validated the store path`,
-  `Matched the content hash …`, and their failing forms) and is held to the
-  same shape by its own test, which drives the passing and failing arm of
-  every check kind. Reasons this crate does not author — a failed artifact
-  read, a rejected store path — keep their upstream error vocabulary.
+  check's own reason, so every reason string written inline in
+  `crates/tally-core/src/evidence.rs` was reworded to lead with an outcome
+  too (`Matched exit code 0 == 0`, `Recorded a witness span of 0.25s`,
+  `Confirmed the artifact exists (…)`, `Validated the store path`, `Matched
+  the content hash …`, and their failing forms) and is held to the same
+  shape by its own test, which drives the passing and failing arm of every
+  check kind. Two failing arms keep their existing wording: a failed
+  artifact read and a rejected store path report `EvidenceError`'s and
+  `NixStoreError`'s `Display` text, which tally does author but shares with
+  every other display site of those errors — rewording it to suit the
+  journal would change error prose on surfaces that have nothing to do with
+  the journal.
 
 #### #386 — a tree-delta permission gate around campaign agent nodes
 
