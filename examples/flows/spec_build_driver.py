@@ -3713,6 +3713,30 @@ def post_diagnosis_comment(
     return f"local://{repository}/{ref}"
 
 
+def validated_diagnosis(diagnosis: str, gate_evidence: Any) -> str:
+    """#385's content contract on one steering note, or its fallback.
+
+    Total: returns either the diagnosis unchanged or a deterministic,
+    grammar-compliant note naming the one reason it was refused. Both the
+    ordinary steering path and #386's breach path run it, so the same bad
+    diagnosis is refused identically on both. A breach branch that returned
+    before this ran was the round-1 F3 hole: unvalidated steward prose went
+    straight into a public forge comment on the single most severe campaign
+    event, holding #385's own guarantee open from inside the same lane.
+    """
+    required_id, required_path = gate_evidence_requirements(gate_evidence)
+    reason = validate_outcome_first(
+        diagnosis, max_chars=MAX_DIAGNOSIS_CHARS, context="diagnosis"
+    )
+    if not reason and required_id and required_id not in diagnosis:
+        reason = f"diagnosis omits the failing check id {required_id!r}"
+    if not reason and required_path and required_path not in diagnosis:
+        reason = f"diagnosis omits the offending path {required_path!r}"
+    if reason:
+        return diagnosis_fallback_note(reason, required_id, required_path)
+    return diagnosis
+
+
 def breach_note(diagnosis: str, detail_text: str) -> str:
     """The posted breach body: a deterministic label plus witnessed evidence.
 
@@ -3728,11 +3752,34 @@ def breach_note(diagnosis: str, detail_text: str) -> str:
     parts = [
         "Aborted the lane: a tree-delta permission breach found "
         "out-of-allowlist change(s), so this task will not be retried.",
-        diagnosis,
     ]
+    if diagnosis:
+        parts.append(diagnosis)
     if detail_text:
         parts.append(f"Witnessed evidence: {detail_text}")
     return "\n\n".join(parts)
+
+
+def bounded_breach_note(diagnosis: str, detail_text: str) -> str:
+    """`breach_note` held to the same public bound the ordinary path keeps.
+
+    The ordinary steering path posts `bound_public_diagnosis(diagnosis)`, so
+    a breach must not post ~2x that just because it concatenates two bounded
+    strings. The squeeze is deliberately asymmetric: the label sentence and
+    the witnessed evidence are driver-authored and load-bearing -- the
+    offending paths live in the evidence -- so the steward's elastic prose is
+    what gives way, rather than truncating the paths off the end of the one
+    comment that exists to name them.
+    """
+    composed = breach_note(diagnosis, detail_text)
+    overflow = len(composed) - MAX_DIAGNOSIS_CHARS
+    if overflow > 0:
+        kept = max(0, len(diagnosis) - overflow)
+        composed = breach_note(diagnosis[:kept].rstrip(), detail_text)
+    # Backstop for the pathological case where the evidence alone exceeds the
+    # bound: truncation there is unavoidable, and `bound_public_diagnosis`
+    # leaves a visible marker rather than trimming silently.
+    return bound_public_diagnosis(composed)
 
 
 def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
@@ -3810,13 +3857,19 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         )
         diagnosis, redacted_diagnosis = redact_public_text(diagnosis)
         diagnosis = bound_public_diagnosis(diagnosis)
+        # #385's content contract governs this comment too. Rejection replaces
+        # the steward's prose with the durable fallback note and nothing more:
+        # the breach still aborts, still posts both receipts, and still
+        # witnesses its paths, because the label sentence and the evidence
+        # below are the node's own and never the model's to lose.
+        diagnosis = validated_diagnosis(diagnosis, data.get("gateEvidence"))
         detail = data.get("breachDetail")
         detail_text = ""
         redacted_detail = False
         if isinstance(detail, str) and detail.strip():
             detail_text, redacted_detail = redact_public_text(detail)
             detail_text = bound_public_diagnosis(detail_text)
-        composed = breach_note(diagnosis, detail_text)
+        composed = bounded_breach_note(diagnosis, detail_text)
         posted_comment: str | None = None
         for post_attempt in (1, 2):
             if any(receipt["attempt"] == post_attempt for receipt in task_receipts):
@@ -3869,17 +3922,9 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     # failing check (and offending path, when the gate evidence names one)
     # rather than describe the failure in the abstract. A validation failure
     # spends the attempt exactly as an unusable steward proposal spends the
-    # narrate slot, and the fallback is never a silent template.
-    required_id, required_path = gate_evidence_requirements(data.get("gateEvidence"))
-    validation_reason = validate_outcome_first(
-        diagnosis, max_chars=MAX_DIAGNOSIS_CHARS, context="diagnosis"
-    )
-    if not validation_reason and required_id and required_id not in diagnosis:
-        validation_reason = f"diagnosis omits the failing check id {required_id!r}"
-    if not validation_reason and required_path and required_path not in diagnosis:
-        validation_reason = f"diagnosis omits the offending path {required_path!r}"
-    if validation_reason:
-        diagnosis = diagnosis_fallback_note(validation_reason, required_id, required_path)
+    # narrate slot, and the fallback is never a silent template. The breach
+    # path above runs the identical check.
+    diagnosis = validated_diagnosis(diagnosis, data.get("gateEvidence"))
     comment = post_diagnosis_comment(
         config,
         repository,
@@ -5644,11 +5689,19 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
     uncommitted change back to its prior content is caught the same as a
     forward edit no commit ever recorded.
 
+    Scope, stated so it is not read wider than it is: this node runs after
+    the agent node passes and after `ownership`, so a pass whose agent node
+    fails returns before it and its uncommitted writes are not judged here.
+    A committed stray is still caught by `ownership` on the next pass; the
+    uncommitted case on a failing pass is open. Refs #424.
+
     The allowlist is per-task, derived from the brief/worklist entry, with no
     silently permissive default -- an absent allowlist and an empty one are
     different outcomes, not the same "anything goes":
-      - `task.conflictDomains` declared and non-empty: those glob patterns,
-        identical semantics to the ownership gate's own allowlist.
+      - `task.conflictDomains` declared and non-empty: those path prefixes,
+        compared with `domains_overlap` at path-component boundaries and
+        case-folded -- identical semantics to the ownership gate's own
+        allowlist, and not glob matching.
       - `task.conflictDomains` declared and explicitly empty (`[]`): the
         allowlist is empty, so any delta at all is a breach.
       - `task.conflictDomains` absent: the allowlist falls back to exactly

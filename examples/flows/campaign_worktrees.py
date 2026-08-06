@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -451,8 +452,27 @@ def prune(checkout: Path) -> None:
     _git(checkout, "worktree", "prune", check=False)
 
 
+def _unreadable_digest(status: os.stat_result) -> str:
+    """A metadata-derived stand-in for content this process cannot read.
+
+    An unreadable path must still occupy a row in the fingerprint, or the
+    gate that compares two fingerprints silently stops judging it. Content is
+    unavailable by definition, so the digest is over what `lstat` does say:
+    the file type, the mode, the size, and the modification time. Creating
+    such a path makes it `appeared`; rewriting one moves its mtime and size
+    and makes it `changed`. The residual blind spot is an in-place rewrite
+    that restores size and mtime exactly, which needs deliberate `utimes`
+    forgery rather than an ordinary write.
+    """
+    identity = (
+        f"{stat.S_IFMT(status.st_mode)}:{status.st_mode:o}:"
+        f"{status.st_size}:{status.st_mtime_ns}"
+    )
+    return "unreadable:" + hashlib.sha256(identity.encode()).hexdigest()
+
+
 def change_set_fingerprint(worktree: Path) -> dict[str, str]:
-    """A path -> sha256 content digest for every tracked and untracked file.
+    """A path -> digest for every tracked and untracked entry git lists.
 
     Comparable before and after an agent node runs (#386): a path's digest
     changing, a path disappearing, or a path appearing are all detectable
@@ -462,21 +482,56 @@ def change_set_fingerprint(worktree: Path) -> dict[str, str]:
     see at all. Ignored paths never enter it, matching what a commit could
     ever contain. This is one fingerprint of whatever is on disk right now;
     nothing here reads history or watches writes as they happen.
+
+    **Every entry git lists gets a row.** A regular file is digested by its
+    content; a symlink by its target string, never by following it; anything
+    this process cannot read -- a mode-000 file, a directory (a submodule
+    gitlink is listed by `--cached` as one), a fifo, a device -- by
+    `_unreadable_digest`. Dropping those rows was the round-1 hole: a
+    dangling symlink and a mode-000 file are permanent states an agent
+    creates with one write, git lists both, and a gate that discarded them
+    reported a reassuring `checkedPaths: 0` for precisely the writes it had
+    failed to inspect.
     """
     listed = _git(
         worktree, "ls-files", "--cached", "--others", "--exclude-standard", "-z"
     ).stdout
     fingerprint: dict[str, str] = {}
     for relative in (path for path in listed.split("\0") if path):
+        target = worktree / relative
+        try:
+            status = os.lstat(target)
+        except OSError:
+            # Listed by git, already gone by the time this reads it. Omitting
+            # it is the honest fingerprint of what is on disk now, and it is
+            # the fail-closed direction: a path that vanished after the
+            # pre-agent snapshot still reports as `disappeared` and is judged
+            # against the allowlist like any other delta.
+            continue
+        if stat.S_ISLNK(status.st_mode):
+            # Fingerprint the link, never the target's bytes. A symlink can
+            # point outside the worktree or nowhere at all, so following it
+            # would both miss the write that created it and read a file this
+            # gate has no business opening.
+            try:
+                link = os.readlink(target)
+            except OSError:
+                fingerprint[relative] = _unreadable_digest(status)
+            else:
+                fingerprint[relative] = (
+                    "symlink:"
+                    + hashlib.sha256(
+                        link.encode("utf-8", "surrogateescape")
+                    ).hexdigest()
+                )
+            continue
         digest = hashlib.sha256()
         try:
-            with (worktree / relative).open("rb") as handle:
+            with target.open("rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                     digest.update(chunk)
         except OSError:
-            # Listed by git, gone by the time this reads it: the same fact a
-            # second listing after the read would report, so it is dropped
-            # rather than failing a fingerprint over a benign race.
+            fingerprint[relative] = _unreadable_digest(status)
             continue
         fingerprint[relative] = digest.hexdigest()
     return fingerprint

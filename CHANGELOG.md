@@ -60,17 +60,25 @@ claim in this system is — after the fact, against the repo itself. Tally's
 hardening presets are preventive; this is the detective complement, and it
 lands where the unified worktree manager already owns lane lifecycle.
 
-- `campaign_worktrees.py` gained `change_set_fingerprint()` (a path → sha256
-  digest for every tracked and untracked file), a persisted before/after
+- `campaign_worktrees.py` gained `change_set_fingerprint()` (a path → digest
+  for every entry git lists, tracked or untracked), a persisted before/after
   snapshot pair, and `change_set_delta()`, which reports every path that
   appeared, disappeared, or changed — content-based, so a reversion of an
   uncommitted change back to its prior bytes is caught the same as a forward
-  edit no commit history could ever see.
+  edit no commit history could ever see. Every listed entry gets a row: a
+  regular file by its content, a symlink by its target string (never
+  followed, so the gate cannot be walked out of the worktree), and anything
+  unreadable — a mode-000 file, a directory, a fifo — by a metadata-derived
+  stand-in, so a write the driver cannot open is still judged rather than
+  dropped.
 - `prep` now fingerprints the worktree immediately before every implementation
   task's agent node runs; a new `treeDelta` driver action compares that
   snapshot against the worktree's content once the agent node and the
   ownership gate have both finished, and fails, naming every offending path,
-  on any delta outside the task's allowlist.
+  on any delta outside the task's allowlist. A pass whose agent node fails
+  returns before this node, so its uncommitted writes are not judged by it —
+  a committed stray is still caught by the ownership gate on the next pass;
+  the uncommitted case on a failing pass is open (refs #424).
 - The allowlist is per-task and never silently permissive: a task's declared
   `conflictDomains` (non-empty) is the allowlist; an explicitly empty
   `conflictDomains` allows nothing; an absent `conflictDomains` falls back to
@@ -84,7 +92,10 @@ lands where the unified worktree manager already owns lane lifecycle.
   blocked as of this pass, the offending paths are witnessed in the posted
   comment and in the failing `treeDelta` job's own evidence (`query
   job`/`query proof` show it like any other campaign gate failure), and the
-  path list still reaches the steward's diagnose slot.
+  path list still reaches the steward's diagnose slot. The breach comment is
+  held to #385's content contract and to the same public length bound the
+  ordinary steering path guarantees; where the steward's prose is refused,
+  the refusal replaces the prose without swallowing the breach.
 - A new e2e scenario proves the reversion case against a real worktree and a
   real `git checkout` reversion, not a mocked file-state dict.
 

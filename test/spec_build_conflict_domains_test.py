@@ -1060,6 +1060,62 @@ class TreeDeltaGateTests(PublicationHarness):
         self.assertIn("appeared", message)
         self.assertIn("internal/stray.txt", message)
 
+    def test_a_write_the_driver_cannot_read_is_still_judged_not_dropped(self) -> None:
+        """Round-1 F2: the reassuring-zero hole.
+
+        A dangling symlink and a mode-000 file are permanent states an agent
+        creates with a single write, and git lists both. Dropping them from
+        the fingerprint made the gate pass with `checkedPaths: 0` for exactly
+        the writes it had failed to inspect.
+        """
+        self.snapshot()
+        exfil = self.checkout / "internal/exfil.link"
+        exfil.symlink_to("/nonexistent/target")
+        locked = self.checkout / "internal/locked.txt"
+        locked.write_text("unreadable\n", encoding="utf-8")
+        locked.chmod(0o000)
+
+        # Both are untracked and outside the declared allowlist. git lists
+        # them; the fingerprint must too.
+        fingerprint = driver.worktrees.change_set_fingerprint(self.checkout)
+        self.assertIn("internal/exfil.link", fingerprint)
+        self.assertIn("internal/locked.txt", fingerprint)
+        # The symlink is fingerprinted by its target string, never followed:
+        # its digest cannot be the sha256 of any file's contents.
+        self.assertTrue(fingerprint["internal/exfil.link"].startswith("symlink:"))
+        self.assertTrue(fingerprint["internal/locked.txt"].startswith("unreadable:"))
+
+        with self.assertRaises(driver.DriverError) as raised:
+            driver.action_tree_delta(
+                self.workspace_brief(task("conflict-domain", ["README.md"]))
+            )
+        message = str(raised.exception)
+        self.assertIn("internal/exfil.link", message)
+        self.assertIn("internal/locked.txt", message)
+        self.assertIn("appeared", message)
+        self.assertIn("2 out-of-allowlist change(s)", message)
+
+    def test_an_unreadable_path_that_does_not_change_is_not_a_delta(self) -> None:
+        """The sentinel must not manufacture a delta out of a quiet file.
+
+        A mode-000 file already present at snapshot time and untouched by the
+        agent has to compare equal, or every lane carrying one would breach on
+        a write that never happened.
+        """
+        locked = self.checkout / "internal/locked.txt"
+        locked.write_text("unreadable\n", encoding="utf-8")
+        locked.chmod(0o000)
+        self.snapshot()
+
+        (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+        git("add", "README.md", cwd=self.checkout)
+        git("commit", "-m", "fixture: deliver the feature", cwd=self.checkout)
+
+        result = driver.action_tree_delta(
+            self.workspace_brief(task("conflict-domain", ["README.md"]))
+        )
+        self.assertEqual(result["allowlistBasis"], "declared")
+
 
 if __name__ == "__main__":
     unittest.main()

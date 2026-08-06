@@ -4006,6 +4006,146 @@ class SteeringGrammarTests(unittest.TestCase):
             self.assertEqual(body, diagnosis)
 
 
+class BreachSteeringTests(unittest.TestCase):
+    """#386's breach-abort surface, pinned. Round-1 F3 and F5.
+
+    The eval mutated `breach = False` and dropped the witnessed evidence from
+    the posted comment; every suite stayed green both times, so the whole
+    downstream of `failureClass` returning `"breach"` was unpinned. These
+    tests run `action_steer` against the local-forge harness as a real
+    process would.
+    """
+
+    DETAIL = (
+        "tree-delta gate detected 2 out-of-allowlist change(s) (declared "
+        'allowlist): changed "internal/cli/root.go"; appeared "secrets/leak.pem"'
+    )
+
+    def brief(self, checkout: Path, **overrides: object) -> dict[str, object]:
+        base = {
+            "campaign": "fixture",
+            "repository": "acme/spec",
+            "repositoryConfig": repository_config(checkout, "local"),
+            "issue": issue(),
+            "taskId": "task-1",
+            "attempt": 1,
+            "diagnosis": "Investigated the out-of-allowlist writes.",
+            "breach": True,
+            "breachDetail": self.DETAIL,
+        }
+        base.update(overrides)
+        return base
+
+    def blob(self, config: dict[str, object], attempt: int) -> dict[str, object]:
+        prefix = DRIVER.local_state_prefix("fixture", "7")
+        return DRIVER.read_local_blob(config, f"{prefix}/diagnosis/task-1/{attempt}")
+
+    def test_a_breach_posts_both_receipts_in_one_call_and_blocks(self) -> None:
+        """Kills MUT-4: a breach handled as an ordinary one-attempt gate-fail.
+
+        Attempt 2 must exist as of this single call, because the reconciler's
+        `attempt == 2` rule is what makes the task permanently blocked. One
+        receipt would leave the lane redispatchable — a retried breach, which
+        is the distinction the whole issue turns on.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout, "local"))
+
+            steered = DRIVER.action_steer(self.brief(checkout))
+
+            self.assertTrue(steered["posted"])
+            self.assertTrue(steered["blocked"])
+            self.assertEqual(steered["attempt"], 2)
+            # Both receipts, from this one call. `contiguous_receipts` would
+            # drop a lone attempt 2, so attempt 1 has to be there too.
+            for attempt in (1, 2):
+                blob = self.blob(config, attempt)
+                self.assertEqual(blob["kind"], "diagnosis")
+                self.assertEqual(blob["attempt"], attempt)
+            # And the reconciler reads them back as a blocking pair.
+            diagnoses, _, _, _ = DRIVER.forge_campaign_state(
+                "acme/spec", config, "fixture", "7", {"task-1"}
+            )
+            self.assertEqual(
+                [(item["taskId"], item["attempt"]) for item in diagnoses],
+                [("task-1", 1), ("task-1", 2)],
+            )
+
+    def test_the_offending_paths_are_witnessed_in_the_posted_breach_body(self) -> None:
+        """Kills MUT-3b: the witnessed evidence dropped from the comment.
+
+        The gate's own failure message naming the paths is already pinned;
+        this pins the other surface the issue requires — the paths reaching
+        the comment a human actually opens.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout, "local"))
+
+            DRIVER.action_steer(self.brief(checkout))
+
+            for attempt in (1, 2):
+                body = self.blob(config, attempt)["diagnosis"]
+                self.assertIn("Aborted the lane", body)
+                self.assertIn("will not be retried", body)
+                self.assertIn("Witnessed evidence:", body)
+                self.assertIn("internal/cli/root.go", body)
+                self.assertIn("secrets/leak.pem", body)
+
+    def test_a_breach_with_a_rejected_diagnosis_still_aborts_and_witnesses(self) -> None:
+        """Round-1 F3: the breach path ran no validation at all.
+
+        The same prose the ordinary path refuses outright was redacted,
+        bounded and posted verbatim. Now it is refused identically — and
+        refusing it must replace the prose without swallowing the breach.
+        """
+        bad = "fix it now!!! this lane is a disaster and I will not explain why"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout, "local"))
+
+            steered = DRIVER.action_steer(self.brief(checkout, diagnosis=bad))
+
+            body = self.blob(config, 1)["diagnosis"]
+            self.assertNotIn("disaster", body)
+            self.assertIn("Rejected the steward's diagnosis", body)
+            self.assertIn("exclamation mark", body)
+            # Rejection replaces the prose; it does not swallow the breach.
+            self.assertTrue(steered["blocked"])
+            self.assertTrue(steered["posted"])
+            self.assertIn("Aborted the lane", body)
+            self.assertIn("secrets/leak.pem", body)
+
+    def test_the_composed_breach_body_respects_the_public_length_bound(self) -> None:
+        """The ordinary path bounds what it posts; the breach path must too.
+
+        Concatenating two separately bounded strings gave ~2x the bound. The
+        squeeze falls on the steward's prose, never on the evidence.
+        """
+        # The largest diagnosis the input validator admits. Composed with the
+        # label and the evidence it overflows, which is the case that used to
+        # post ~2x the bound.
+        lead = "Investigated the writes. "
+        prose = lead + ("x" * (DRIVER.MAX_DIAGNOSIS_CHARS - len(lead)))
+        self.assertEqual(len(prose), DRIVER.MAX_DIAGNOSIS_CHARS)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = DRIVER.repo_config(repository_config(checkout, "local"))
+
+            DRIVER.action_steer(self.brief(checkout, diagnosis=prose))
+
+            body = self.blob(config, 1)["diagnosis"]
+            self.assertLessEqual(len(body), DRIVER.MAX_DIAGNOSIS_CHARS)
+            # The load-bearing halves survived the squeeze.
+            self.assertIn("Aborted the lane", body)
+            self.assertIn("secrets/leak.pem", body)
+
+
 class SquashMergeTests(unittest.TestCase):
     """Squash integration, and the proofs that replace head ancestry."""
 
