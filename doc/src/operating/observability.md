@@ -166,8 +166,10 @@ ledger and scoped by the run's durable membership — so a retried task is charg
 attempt and a node the run attached rather than created is inside the sum. Read the coverage
 beside the number: it is a sum over advisory captures, it says how many attempts reported usage
 against how many it observed, and it names every reason it is partial. `query standup` carries
-the same rollup for every run its window touched, with the three fixed statements every entry
-would repeat stated once instead in a digest-level `usageBasis`.
+the same rollup for every run its window touched and reader-state did not hide (see
+[Archive a run](#archive-a-run) below, and `archivedRunsHidden` for how many were withheld),
+with the three fixed statements every entry would repeat stated once instead in a digest-level
+`usageBasis`.
 
 `query log` restricts the lifecycle stream to the run's nodes, resolved from the
 orchestration capsule on the durable rows and the witness chain, because a
@@ -179,6 +181,78 @@ task UUIDs the operator is trying to discover; it is mutually exclusive with
 Both spellings of the run ID work everywhere: `--flow-run` and `--flow-run-id`
 are aliases on `tally query jobs`, `tally query log`, `tally query proof`, and
 `tally flow run`.
+
+## Archive a run
+
+Once a run is dealt with, mark it so it stops crowding the standup and job
+lists. Every verb below targets the daemon's own **data directory**, not the
+socket — `tally reader-state` never talks to the daemon at all, so pass
+`--data-dir` explicitly if it differs from the default
+(`$XDG_DATA_HOME/tally`, else `~/.local/share/tally`); a NixOS deployment's
+daemon normally runs against `/var/lib/tally/data`. Omitting it against a
+different data directory than the one the daemon reads is not an error — it
+creates a fresh, unrelated store, prints a normal-looking success line, and
+changes nothing any `query` command shows. Making that misdirection harder
+to hit (an env var for the whole direct-file verb family) is tracked as
+issue #416:
+
+```console
+$ tally reader-state archive <flow-run-uuid> --tag flaky-fixture --data-dir /var/lib/tally/data
+$ tally reader-state unarchive <flow-run-uuid> --data-dir /var/lib/tally/data
+$ tally reader-state tag <flow-run-uuid> needs-followup --data-dir /var/lib/tally/data
+$ tally reader-state untag <flow-run-uuid> --data-dir /var/lib/tally/data
+$ tally reader-state show <flow-run-uuid> --data-dir /var/lib/tally/data
+```
+
+This is **reader-state**, not evidence: `archived` and the triage tag live in
+their own file (`reader-state.jsonl`), outside the witness and attestation
+ledgers and excluded from every hash chain. Nothing durable about the run
+itself changes, and no daemon or reconciler code path can write this file —
+only the CLI verb above, which writes it directly. `query run` always exposes
+the current `archived` flag and `triageTag` (and prints a loud `-- ARCHIVED`
+banner in its human text view, however you got to that run); `query jobs` and
+`query standup` default to **hiding** archived runs, add `--archived` to see
+them, or `--no-archived` to say the default explicitly.
+
+`query standup`'s digest carries two separate hidden counts, because they
+count different lists at different granularity — one archived run holding
+three tasks removes one `runs` row and up to three task entries, and merging
+the two numbers would make either a claim about a list it does not describe:
+
+- **`archivedHidden`** — task entries hidden, summed across `completed`,
+  `gateFails`, `cancelled`, and `inFlight`.
+- **`archivedRunsHidden`** — `runs` rows (per-run cost rollups) hidden.
+  `runs` is populated from both the *creating* run and every run that
+  merely *attached* the task (durable membership, the W-316 shape), so a
+  run that only attached a task still has its cost row hidden and counted
+  here even when no task entry moved.
+
+Both are accumulated as the collections are filtered, by the same call that
+filters them and never by a separate recount — so "the list looks short" is
+never silently indistinguishable from "the list is short." Two window-wide
+aggregates are the deliberate exception: `reused` and `canonicalGpuSeconds`
+are summed once over the whole window, before either hidden count is
+applied, so an archived run's GPU seconds and reuse count remain in those
+totals even once its rows are hidden elsewhere in the same digest. Window
+cost is currently reader-state-independent by construction; treat
+`reused`/`canonicalGpuSeconds` as window totals, not as totals over what the
+digest currently shows.
+
+`query jobs --flow-run <archived-run-id>` has a related sharp edge: it
+returns `items: []` exactly as it would for a quiet run or one with no
+members, and `flowRunTasks` still reports the run's true (unfiltered)
+membership size with nothing in the response distinguishing "quiet," "no
+members," and "archived and withheld." Unlike `query run`, which always
+exposes `archived` rather than hiding content, an explicit `--flow-run`
+filter on `query jobs` currently withholds silently. This is a known,
+unresolved tension in the design (`query run`'s own argument is that an
+explicit by-id request must not silently withhold what was asked for) and is
+tracked as issue #415 rather than fixed here.
+
+A reader-state store that is missing, empty, truncated, or hand-edited into
+garbage degrades every query that consults it to "nothing is archived" rather
+than failing the query; it carries no weight `witness verify` or `tally
+attest` care about either way.
 
 For one node, inspect all attempt lanes:
 
@@ -470,6 +544,7 @@ snapshot, then start a new watch. Do not pretend the stream was continuous.
 | Data | Home Manager default | NixOS default | Retention |
 |---|---|---|---|
 | Witness and attestation ledgers | `~/.local/share/tally/` | `/var/lib/tally/data/` | Append-only |
+| Reader-state (`archived`, triage tag) | same data directory, `reader-state.jsonl` | same data directory | Self-compacts to one record per run past `READER_STATE_COMPACT_THRESHOLD`; outside every hash chain, written only by `tally reader-state` |
 | Lifecycle history and watch log | same data directory | same data directory | Lifecycle compacts an old prefix after `lifecycleMaxBytes`, preserving `lifecycleHorizon`; watch keeps 4,096 records |
 | Enqueue events, captures, unit exits, meters | `~/.local/state/tally/` | `/var/lib/tally/state/` | Selected sets only; see retention policy |
 | Current stdout/raw adapter stderr | Ordinary: `<stateDir>/capture/<uuid>.out` and `.adapter.err`; task-ref node: `<uuid>.<task-id>.out` and `.adapter.err` | same layout | Accumulates |

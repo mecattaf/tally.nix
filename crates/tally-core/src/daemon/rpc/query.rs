@@ -1,4 +1,8 @@
 use super::super::*;
+use crate::query_v2::{
+    apply_reader_state_to_jobs, apply_reader_state_to_run, apply_reader_state_to_standup,
+};
+use crate::reader_state::{reader_state_path, ReaderState};
 
 /// What one `query.proof` call is asking about.
 enum ProofTarget {
@@ -194,6 +198,8 @@ impl DaemonHandler {
                 .map_err(observability_wire)?;
                 let lineage = self.flow_lineage().await?;
                 apply_run_lineage(&mut result, &lineage);
+                let reader_state = self.reader_state_advisory().await;
+                apply_reader_state_to_run(&mut result, &reader_state);
                 for failure in &mut result.failures {
                     let (Some(attempt), Some(lease_epoch), Ok(uuid)) = (
                         failure.attempt,
@@ -365,8 +371,13 @@ impl DaemonHandler {
                     since: Option<String>,
                     #[serde(default)]
                     source: Option<String>,
+                    /// Include entries and runs archived as operator
+                    /// reader-state. Default `false` hides them.
+                    #[serde(default)]
+                    archived: bool,
                 }
                 let params: Params = decode_params(params)?;
+                let include_archived = params.archived;
                 let since_realtime_us = params
                     .since
                     .as_deref()
@@ -420,6 +431,13 @@ impl DaemonHandler {
                     &witness,
                     &membership,
                     &AttestationEvidence::new(ledger_verified, &attestations),
+                );
+                let reader_state = self.reader_state_advisory().await;
+                apply_reader_state_to_standup(
+                    &mut digest,
+                    &details,
+                    &reader_state,
+                    include_archived,
                 );
                 serde_json::to_value(digest).map_err(internal_wire)
             }
@@ -591,6 +609,12 @@ impl DaemonHandler {
             limit: Option<usize>,
             #[serde(default)]
             cursor: Option<String>,
+            /// Include jobs whose creating run is archived operator
+            /// reader-state. The default (`false`) hides them, so this must
+            /// be part of the fingerprint below: two calls that differ only
+            /// here must never share a cached page.
+            #[serde(default)]
+            archived: bool,
         }
         let params: Params = decode_params(params)?;
         let fingerprint = serde_json::to_string(&json!({
@@ -606,6 +630,7 @@ impl DaemonHandler {
             "session": params.session.clone(),
             "since": params.since.clone(),
             "until": params.until.clone(),
+            "archived": params.archived,
         }))
         .map_err(internal_wire)?;
         if let Some(cursor) = params.cursor.as_deref() {
@@ -663,6 +688,8 @@ impl DaemonHandler {
         for item in &mut result.items {
             item.trace = trace_availability(&item.anchor, &lanes, &adapters, &self.executor);
         }
+        let reader_state = self.reader_state_advisory().await;
+        apply_reader_state_to_jobs(&mut result.items, &reader_state, params.archived);
         let envelope = Some(serde_json::to_value(result).map_err(internal_wire)?);
         self.pages
             .borrow_mut()
@@ -838,6 +865,23 @@ impl DaemonHandler {
             .borrow_mut()
             .page("query.trace", &fingerprint, params.limit, None, envelope)
             .map_err(pagination_wire)
+    }
+}
+
+impl DaemonHandler {
+    /// The operator reader-state store, read fresh on every call.
+    ///
+    /// Unlike [`Self::flow_lineage`] and [`Self::flow_membership`] this is not
+    /// cached: the store holds at most a few hundred toggled runs (it folds
+    /// itself at [`crate::reader_state::READER_STATE_COMPACT_THRESHOLD`]) and
+    /// query volume never approaches the per-flow-start rate that caching
+    /// those ledgers exists to absorb. A read failure — a missing file, a
+    /// truncated line, an operator's hand edit gone wrong — degrades to
+    /// "nothing is archived" rather than failing the query that asked; see
+    /// [`ReaderState::read_advisory`].
+    async fn reader_state_advisory(&self) -> ReaderState {
+        let data_dir = self.context.read().await.paths.data_dir.clone();
+        ReaderState::read_advisory(&reader_state_path(&data_dir))
     }
 }
 

@@ -101,12 +101,137 @@ the `(task, attempt, leaseEpoch)`.
   `usageBasis` is what an omitted entry field is filled from on the way back in
   — the **producer's** copy, which travelled with the payload — and a reader
   falls back to its own compiled constants only for a digest that carries no
-  basis at all, which is one produced before the field existed. Filling from the
-  reader's constants instead would make the digest and its own entries disagree
-  whenever the two builds differ, which on a fleet whose coordinator pin trails
-  its workers is the ordinary case rather than the exotic one.
+  basis at all. Filling from the reader's constants instead would make the
+  digest and its own entries disagree whenever the two builds differ, which on a
+  fleet whose coordinator pin trails its workers is the ordinary case rather
+  than the exotic one.
+
+  On any payload a current build produces, `usageBasis` is present exactly when
+  `runs` is non-empty, and both are omitted from the wire when empty — because
+  the window touched no flow run, or because reader-state hid every run it had
+  (`archivedRunsHidden` separates those two). That is a property of what this
+  build emits, not a rule for reading any payload: **a producer that predates the
+  field emits `runs` with no basis**, stating the three constants inline on each
+  entry, so a reader must not infer an empty `runs` from an absent `usageBasis`.
+  In both cases there is nothing for the reader's own constants to displace —
+  the entries carry their own statements, or there are no entries.
 
 ### Added
+
+- **Lane: operator conveniences — evals gain a checkable coverage-manifest
+  schema and a deterministic checker (#388).** A findings file (an eval's
+  plain-Markdown output) can now carry a `<!-- eval-coverage-manifest:v1 -->`
+  fenced-JSON section stating, per acceptance bullet and per reviewed file,
+  `covered` / `reused` / `failed`-with-a-typed-class
+  (`timeout` / `budget` / `input` / `unknown`, the last a mandatory
+  catch-all) — an item-level taxonomy kept separate from a run-level one
+  (`timeout` / `budget` / `crash` / `unknown`) covering the eval run itself.
+  `test/eval_manifest_check.py` validates a findings file's manifest section
+  and reports uncovered surface: an `expected` block naming the bullets/files
+  the eval was supposed to account for, cross-checked against what the
+  manifest actually covers. Proven to reject a manifest that omits a reviewed
+  file entirely and one that types a failure with an unrecognized class
+  (`test/eval_manifest_check_test.py`, `test/fixtures/eval-manifest/`). Not
+  wired into `nix flake check` or `test/fleet-gate.sh` — the issue's explicit
+  cap is no gate-side change; an orchestrator close-out names the checker
+  instead of vouching for the claim by hand. Emitting the manifest from a
+  real eval is an adoption step for the next dispatched wave, not a code
+  change this lane can claim.
+
+  *Round-1 repair:* the success line no longer prints a bare `ok` — a
+  manifest with no `expected` surface declared (or one declaring only empty
+  lists) now says so explicitly ("coverage NOT checked") instead of reading
+  identically to a manifest whose declared surface was fully accounted for.
+  The checker also now refuses a findings file carrying more than one marked
+  block instead of silently grading the first — the adoption path of quoting
+  this module's own docstring example inside a findings file previously
+  meant the quoted example got graded, not the real manifest.
+
+  *Round-2 repair:* the round-1 success line described the **declared**
+  surface count as "N/N covered", but `covered` is one of the schema's three
+  status terms and a declared key is satisfied by an entry of *any* status —
+  so a manifest whose every declared bullet `failed` printed "2/2 bullets
+  covered" beside `failed=3`. The clause now reads
+  `N/N bullets accounted for (M covered, K reused, F failed)`, computed from
+  the statuses of the entries themselves, and declared keys are deduplicated
+  so repeating one cannot inflate the denominator. Separately, the two
+  success cases were textually distinct but **mechanically identical** — both
+  exited 0 and both matched `: ok` — so the orchestrator close-out this
+  checker exists for could not tell them apart. Exit codes are now a
+  documented contract (`0` every declared surface accounted for — which is
+  not the same as verified; `1` refused; `2` usage; `3` schema-valid but
+  coverage not checked), and each success line carries a stable
+  `coverage=checked` / `coverage=unchecked` token.
+
+  *Round-3 repair:* the exit-code table said exit 0 "licenses 'the eval
+  covered what it said it would'" — round 2's own word conflation surviving
+  in the one place its sweep did not reach, the machine-facing contract. A
+  manifest whose every declared item `failed` exits 0. The exit-0 row now
+  states what the code guarantees (every declared surface *accounted for*)
+  and says plainly that accounted-for is not verified, pointing at the
+  `covered=`/`reused=`/`failed=` tokens for how many actually were. Doc
+  only; the exit codes themselves are unchanged.
+
+- **Lane: operator conveniences — reader-state (`archived`, a free-form
+  triage tag) on flow runs, never set by a run (#389).** A new durable store
+  (`crates/tally-core/src/reader_state.rs`, `reader-state.jsonl` in the
+  daemon's data directory) holds per-flow-run `archived` and a triage tag,
+  outside the witness/attestation ledgers and excluded from every hash
+  chain. It is written **only** by a new `tally reader-state
+  {archive,unarchive,tag,untag,show}` CLI verb, which writes the file
+  directly against the daemon's data directory (pass `--data-dir` if it is
+  not the default) — no daemon socket, no RPC call, so no daemon or
+  reconciler code path can touch it. `query run` now exposes `archived` and
+  `triageTag` (and prints a loud `-- ARCHIVED` banner in its human text
+  view); `query jobs` and `query standup` gain `--archived`/`--no-archived`
+  (default: hidden) and filter on it. `query standup`'s digest gains two
+  separate hidden counts — `archivedHidden` (task entries hidden, across
+  `completed`/`gateFails`/`cancelled`/`inFlight`) and `archivedRunsHidden`
+  (`runs` cost rows hidden, including a run that only *attached* a task
+  rather than creating it) — each accumulated as the collections are
+  filtered, by the same call that filters them and never by a separate
+  recount; two window-wide aggregates, `reused` and `canonicalGpuSeconds`, are
+  deliberately **not** reader-state filtered and remain window totals. A
+  corrupt or missing reader-state store degrades every reader to "nothing is
+  archived" rather than failing the query (`ReaderState::read_advisory`),
+  and the store self-compacts past `READER_STATE_COMPACT_THRESHOLD` records
+  so a scripted toggle loop cannot grow it forever. Runs only, by design: no
+  UI, no cross-host sync, no per-task granularity.
+
+  *Round-1 repair:* the initial `archivedHidden` count omitted `runs` row
+  removals entirely — a run that only attached a task (durable membership,
+  not its orchestration capsule) had its cost row silently dropped with the
+  count staying zero. Split into `archivedHidden`/`archivedRunsHidden` and
+  covered by a regression test reproducing exactly that shape
+  (`apply_reader_state_to_standup_counts_an_attach_only_archived_run_that_hides_no_task_entry`).
+  A second test now pins that `archivedHidden` is a before/after difference
+  and not a recount over `details`, and a third pins the `query.jobs`
+  pagination cache-key fingerprint against dropping `archived`. `query jobs
+  --flow-run <archived-run>` silently withholding items with no signal in
+  the response is issue #415, not fixed in this repair; the direct-file
+  verbs' data-directory default is issue #416.
+
+  *Round-2 repair:* the "every removal is counted" property was pinned for
+  one of the five collections the filter touches — dropping `cancelled`,
+  `gateFails` or `inFlight` from the count, or adding any further uncounted
+  filter, left the whole suite green while the digest under-reported what it
+  had withheld. Rather than adding one test per hole, filtering and counting
+  are now a single operation (`retain_counting`) — a removal made through
+  that helper cannot miss its counter — and the function closes with a
+  `debug_assertions`-only conservation check that catches a removal
+  bypassing the helper in any of the collections its enumerator names. That
+  enumerator destructures `StandupDigest` exhaustively, so a new field does
+  not compile until it is named; binding it to `_` is then a visible
+  decision that the field is not filtered here.
+
+  *Seam with #404:* reader-state filtering can empty `runs` after
+  `apply_standup_usage` has already stated a `usageBasis` for it, which would
+  have left a digest claiming how its runs were summed while showing no runs.
+  The invariant `usageBasis` documents — present exactly when `runs` is
+  non-empty — is kept rather than weakened: the reader-state pass clears the
+  basis when it hides the last run. It is now a property of the *composition*
+  of the two calls, pinned by a composition-level test, since each lane tested
+  its own function in isolation and neither gate could see the pair.
 
 - **`query run` and `query standup` answer "what did this run cost" (#384).**
   `query.run` gains a `usage` object and `query.standup` gains a `runs` array
