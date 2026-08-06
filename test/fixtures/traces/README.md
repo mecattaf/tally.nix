@@ -85,7 +85,13 @@ exactly is the point of this section. It is `pi.jsonl` above with its final
    zeroed, and the `message_update` carrying a `text_end`
    `assistantMessageEvent` for the partial text above. No value in either is
    invented — every one is copied from the real `message_end` or is the
-   literal pi writes at that point in the lifecycle.
+   literal pi writes at that point in the lifecycle, with one qualification:
+   the `message_update`'s `stopReason` is carried over as the
+   `message_start` states it (`pending`). In the one real capture on hand
+   every `*_end` assistant event carries the message's *final* stopReason,
+   so the `text_end`-with-`pending` pairing is not attestable here and is
+   not claimed as literal capture provenance. It costs nothing: all three
+   captures are `message_end`-scoped, so no capture reads this field.
 
    They are here because **a bare spliced `message_end` is not a shape
    `pi --mode json` can produce.** pi's own `docs/json.md` message lifecycle

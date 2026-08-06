@@ -226,8 +226,18 @@ let
         # indistinguishable from an open valid turn's until its
         # `message_end` arrives -- so there is no pattern that both excludes
         # the first and recovers from the second. Refusing beats pinning a
-        # model no completed turn is known to have used; a job may still
-        # pin one explicitly through `launch.model`.
+        # model no completed turn is known to have used.
+        #
+        # Say the rest of it plainly, because this preset offers no way out.
+        # A pi-DERIVED adapter that declares `launch.model` can have a job
+        # pin one; this preset declares `launch = {}`, so a job-supplied
+        # model is refused before any template renders --
+        # `model override is not authorized by this adapter`. So a pi
+        # attempt whose stream never closed an assistant `message_end`
+        # cannot be resumed by tally at all. The operator re-runs it from
+        # scratch, or hand-authors a pi-derived adapter that declares
+        # `launch.model`. Nothing here makes that cheaper; it is the cost of
+        # not fabricating a model, and it is stated rather than discovered.
         model = mkScrapeCapture {
           mode = "jsonPathLast";
           pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.model";

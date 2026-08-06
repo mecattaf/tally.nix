@@ -36,9 +36,11 @@ top level).
 Placing a pre-prompt option on an adapter whose argv has no `--` terminator no
 longer fails. `render_launch_prefix` required a trailing `--` to place
 `prePromptArgv`, `approvalPolicy`, `sandboxPolicy`, `launch.cwdArgv`,
-`launch.model` or `launch.effort`, which made `pi` — the one preset that
-declares no terminator, because pi rejects one outright — refuse every
-pre-prompt option with an error naming a convention it abandoned on purpose.
+`launch.model` or `launch.effort`, which made a **pi-derived** adapter — pi is
+the one preset that declares no terminator, because pi rejects one outright —
+refuse every pre-prompt option with an error naming a convention it abandoned
+on purpose. (The shipped `pi` preset never reached that error: it declares
+`launch = {}`, so a pre-prompt option is refused earlier, on authorization.)
 Options are now appended at the end of a terminator-less prefix, which is where
 a harness expects its own flags; a prefix that does end in `--` still gets them
 before the terminator, and an adapter with no argv at all still fails, now
@@ -79,8 +81,18 @@ no `model` capture, so its resume refuses with `resume capture "model" is
 absent` instead of rendering one. Such a stream states only the model of a
 turn whose outcome is unknown, and an aborted turn's mid-stream records are
 indistinguishable from an open valid turn's until its `message_end` arrives,
-so no pattern both excludes the first and recovers from the second. A job can
-still pin a model explicitly through `launch.model`.
+so no pattern both excludes the first and recovers from the second.
+
+There is no way out of that on this preset, and the consequence is worth
+stating rather than leaving to be discovered. A pi-*derived* adapter that
+declares `launch.model` can have a job pin one, but the shipped `pi` preset
+declares `launch = {}`, so a job-supplied model is refused before any template
+renders — `model override is not authorized by this adapter`. A pi attempt
+whose stream never closed an assistant `message_end` therefore cannot be
+resumed by tally at all: the operator re-runs it from scratch, or hand-authors
+a pi-derived adapter that declares `launch.model`. That is a real narrowing
+against the previous `$..model`, which did render such a resume — pinned to a
+model no completed turn was known to have used.
 
 `test/fixtures/traces/pi-aborted-turn.jsonl` could not observe any of this.
 Its real aborted message was aborted during model load, so it carried no
