@@ -1521,7 +1521,18 @@ mod tests {
             "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"model\":\"valid\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}}\n",
             "{\"type\":\"message_end\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"ignore\"}]}}\n",
             "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"model\":\"valid\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"final\"}]}}\n",
+            // The aborted and errored turns carry the mid-stream lifecycle pi
+            // emits for every message: `message_start` and `message_update`
+            // repeat the same `AgentMessage`, so they carry the same role and
+            // the same model under `stopReason: pending` until the message
+            // closes. Without these records a guard that is not scoped to
+            // `message_end` looks correct here; with them it reads the
+            // excluded turn's model straight back out of them.
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"model\":\"excluded\",\"stopReason\":\"pending\",\"content\":[]}}\n",
+            "{\"type\":\"message_update\",\"message\":{\"role\":\"assistant\",\"model\":\"excluded\",\"stopReason\":\"pending\",\"content\":[{\"type\":\"text\",\"text\":\"fin\"}]}}\n",
             "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"model\":\"excluded\",\"stopReason\":\"aborted\",\"content\":[{\"type\":\"text\",\"text\":\"fin\"}]}}\n",
+            "{\"type\":\"message_start\",\"message\":{\"role\":\"assistant\",\"model\":\"excluded\",\"stopReason\":\"pending\",\"content\":[]}}\n",
+            "{\"type\":\"message_update\",\"message\":{\"role\":\"assistant\",\"model\":\"excluded\",\"stopReason\":\"pending\",\"content\":[{\"type\":\"text\",\"text\":\"fi\"}]}}\n",
             "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"model\":\"excluded\",\"stopReason\":\"error\",\"content\":[{\"type\":\"text\",\"text\":\"fi\"}]}}\n",
         );
         assert_eq!(
@@ -1532,24 +1543,37 @@ mod tests {
             .unwrap(),
             Some(Value::String("final".to_owned()))
         );
-        // `model` carries the same two clauses, as a descendant filter so it
-        // still resolves from a `message_start` on an attempt that never
-        // reached an assistant `message_end`. A stream with no stopReason at
-        // all is not excluded: an absent member compares unequal to both
-        // literals, which is what keeps the small synthetic streams in
-        // flake.nix's adapter-presets check resolving.
+        // `model` carries the same two clauses under the same `message_end`
+        // scoping, and the scoping is the load-bearing half. A stream with no
+        // `stopReason` at all is still not excluded: an absent member
+        // compares unequal to both literals, which is what keeps the small
+        // synthetic streams in flake.nix's adapter-presets check resolving.
+        assert_eq!(
+            scrape_json_path_last(
+                "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.model",
+                pi,
+            )
+            .unwrap(),
+            Some(Value::String("valid".to_owned()))
+        );
+        // Both patterns the scoped one replaced, and why neither works. The
+        // bare `$..model` takes the excluded turn outright; the descendant
+        // filter excludes that turn's `message_end` and then reads the same
+        // model back out of its `pending` `message_update`, which is the
+        // failure this stream exists to hold down.
+        assert_eq!(
+            scrape_json_path("$..model", pi).unwrap(),
+            Some(Value::String("excluded".to_owned())),
+            "unguarded: takes the excluded turn"
+        );
         assert_eq!(
             scrape_json_path(
                 "$..[?@.role == 'assistant' && @.stopReason != 'aborted' && @.stopReason != 'error'].model",
                 pi,
             )
             .unwrap(),
-            Some(Value::String("valid".to_owned()))
-        );
-        assert_eq!(
-            scrape_json_path("$..model", pi).unwrap(),
             Some(Value::String("excluded".to_owned())),
-            "the unguarded pattern is what the guard replaced"
+            "descendant filter: excludes the message_end, keeps the pending records"
         );
     }
 

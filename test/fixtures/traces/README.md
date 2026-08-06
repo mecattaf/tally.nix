@@ -47,7 +47,12 @@ against this file and asserts the resolved `sessionRef`, `model`, `usage`,
 exactly is the point of this section. It is `pi.jsonl` above with its final
 `agent_settled` removed, then two appended lines:
 
-1. One assistant message with `stopReason: "aborted"`, lifted
+1. One aborted assistant **turn**, in the three-record shape pi emits for
+   every message (`message_start`, `message_update`, `message_end`), preceded
+   by a bare `{"type":"turn_start"}`.
+
+   The `message_end` is the real one: one assistant message with
+   `stopReason: "aborted"`, lifted
    verbatim from a different real pi session on the machine this fixture was
    built on (a session tally did not produce), and reframed as a
    `message_end` stream event — the framing `--mode json` uses for the same
@@ -72,11 +77,33 @@ exactly is the point of this section. It is `pi.jsonl` above with its final
    (`The file notes.txt contains 42.`), which is what a mid-generation abort
    actually leaves behind, and it is short enough that a reader who ever
    sees it rendered can tell it is a fragment.
+
+   **The `message_start` and `message_update` are derived, not captured**,
+   and they matter more than they look. Each is that same real message with
+   the fields pi sets mid-stream: `stopReason: "pending"`, no
+   `errorMessage`, `content: []` on the `message_start` with its `usage`
+   zeroed, and the `message_update` carrying a `text_end`
+   `assistantMessageEvent` for the partial text above. No value in either is
+   invented — every one is copied from the real `message_end` or is the
+   literal pi writes at that point in the lifecycle.
+
+   They are here because **a bare spliced `message_end` is not a shape
+   `pi --mode json` can produce.** pi's own `docs/json.md` message lifecycle
+   emits `message_start` → `message_update`* → `message_end` for every
+   message, each carrying the same `AgentMessage` — so the same `role` and
+   the same `model`, under `stopReason: "pending"` until the message closes.
+   A fixture without them cannot see a guard that excludes an invalid turn's
+   `message_end` and then reads that turn's model straight back out of its
+   `pending` records; that is exactly the defect that shipped in this
+   fixture's first version and was caught in review. It is doubly required
+   now that the message carries partial text, which under pi's streaming
+   model exists *because* `message_update` deltas produced it.
 2. `{"type":"agent_settled"}`, to close the stream.
 
 What is synthetic in this file is therefore the **splice** — these real
-fragments did not occur in one run — and that one `text` block. No usage
-number is synthesised and no aborted turn is hand-written.
+fragments did not occur in one run — that one `text` block, and the two
+derived lifecycle records described above. No usage number is synthesised
+and no aborted turn is hand-written.
 
 It exists because a `jsonPathLast` scrape cannot say "last *valid* turn" on
 its own. Without a `stopReason` guard the `pi` preset's occupancy capture
@@ -89,6 +116,16 @@ session used, which the rendered resume argv then carries. The
 `adapter-presets` flake check asserts that all three guarded patterns
 resolve this stream to the last valid turn instead, and asserts the argv
 whole because the argv is where the wrong model became operator-visible.
+
+For all three, the guard is the `stopReason` clauses **and** the scoping to
+assistant `message_end` together; neither half is sufficient. A
+clause-guarded filter that also matches `message_start` / `message_update`
+resolves the excluded turn's model out of its `pending` records — which is
+what makes the lifecycle records above load-bearing rather than cosmetic.
+One consequence is worth stating here too: an attempt whose stream never
+closed an assistant `message_end` yields no `model` capture at all, so its
+resume refuses rather than rendering. No fixture in this directory has that
+shape.
 
 ### What these fixtures still cannot see
 
@@ -108,6 +145,11 @@ rediscovering it per finding.
   session store by launch cwd and states that cwd in the session header, but
   a captured stream is one process's output — a cross-cwd resume is a
   property of the *next* launch, which no fixture observes.
+* Neither fixture has a stream that ends with an assistant turn still open —
+  a `message_start` with no matching `message_end`, which is what a
+  SIGINT-truncated run leaves. That is the shape where the `message_end`
+  scoping costs something (no `model` capture, so the resume refuses), and
+  no committed fixture exercises it.
 * `pi.jsonl`'s redactions mean no fixture here carries a real session UUID,
   response id, working directory or free-text body, so nothing in this
   directory can be used to check tally's redaction paths; those have their

@@ -60,24 +60,42 @@ an aborted turn carrying partial text therefore reported that truncated
 fragment as the node's answer, unmarked and indistinguishable from a complete
 one, while occupancy correctly held at the last valid turn. `model`
 (`$..model`, last match) had the same shape and a louder consequence: it
-pinned a model from an excluded turn, and the rendered resume argv carried it.
-Both filters now carry the same two `stopReason` clauses. `model` stays a
-descendant filter rather than being scoped to `message_end`, so the model is
-still recoverable from a `message_start` on an attempt that never reached an
-assistant `message_end`. `usage` stays unguarded, as before and for the stated
-reason. The `adapter-presets` check asserts the aborted fixture's whole
-rendered argv, not just the capture, because the argv is where the wrong model
-became operator-visible.
+pinned a model from an excluded turn, and both the rendered resume argv and
+the model recorded for the completed job carried it. All three captures now
+carry the same two `stopReason` clauses **and** the same scoping to assistant
+`message_end`, and the scoping is the half that does the work: pi emits
+`message_start` / `message_update` / `message_end` for every message, all
+carrying the same `AgentMessage` and so the same model, under
+`stopReason: pending` until the message closes. A filter that matches those
+mid-stream records excludes an invalid turn's `message_end` and then reads the
+same model straight back out of its `pending` records. `usage` stays
+unguarded, as before and for the stated reason. The `adapter-presets` check
+asserts the aborted fixture's whole rendered argv, not just the capture,
+because the argv is where the wrong model became operator-visible.
+
+The scoping narrows one case, deliberately: an attempt whose stream never
+closed an assistant `message_end` — a SIGINT-truncated run, say — now yields
+no `model` capture, so its resume refuses with `resume capture "model" is
+absent` instead of rendering one. Such a stream states only the model of a
+turn whose outcome is unknown, and an aborted turn's mid-stream records are
+indistinguishable from an open valid turn's until its `message_end` arrives,
+so no pattern both excludes the first and recovers from the second. A job can
+still pin a model explicitly through `launch.model`.
 
 `test/fixtures/traces/pi-aborted-turn.jsonl` could not observe any of this.
 Its real aborted message was aborted during model load, so it carried no
 `text` block at all and `finalMessage` fell through to the last valid turn
-whether guarded or not. It now carries a partial `text` block — the one piece
-of synthesised content in either pi fixture, labelled as such in the
-directory's README beside the splice it already documented. That README also
-now answers, once, what these fixtures structurally cannot see: the `error`
-half of the guard, the echo's growth at campaign scale, anything about resume
-behaviour, and anything about redaction.
+whether guarded or not. It now carries a partial `text` block, and the aborted
+turn is spliced in as a whole turn — `message_start`, `message_update`,
+`message_end` — rather than as a bare `message_end`, because that bare shape
+is not one `pi --mode json` can emit and a fixture without the mid-stream
+records cannot see a `model` guard reading an excluded turn's model out of
+them. The added block and the two derived lifecycle records are labelled in
+the directory's README beside the splice it already documented. That README
+also now answers, once, what these fixtures structurally cannot see: the
+`error` half of the guard, a turn left open at end of stream, the echo's
+growth at campaign scale, anything about resume behaviour, and anything about
+redaction.
 
 Two comment corrections. The occupancy guard's evidence ordering was inverted:
 for a non-interactive `pi --mode json`, `error` is the reachable in-stream

@@ -193,20 +193,44 @@ let
           mode = "jsonPath";
           pattern = "$.id";
         };
-        # Guarded by the same two `stopReason` clauses as `occupancy` and
-        # `finalMessage` below, and for the same reason: a bare `$..model`
-        # takes the last `model` anywhere in the stream, so a stream ending
-        # on an invalid turn pins that turn's model. On
+        # Scoped to assistant `message_end` and guarded by the same two
+        # `stopReason` clauses as `occupancy` and `finalMessage`, because a
+        # bare `$..model` takes the last `model` anywhere in the stream and
+        # so pins the model of a turn the other two captures exclude. On
         # `test/fixtures/traces/pi-aborted-turn.jsonl` that is
         # `qwen3-vl-8b-ocr`, a model no valid turn of that session ever used,
-        # and it reaches an operator: the rendered resume argv carries it.
-        # The filter stays a descendant one rather than being scoped to
-        # `message_end` like the other two, because the model is still worth
-        # recovering from a `message_start` (`stopReason: pending`) on an
-        # attempt that never reached an assistant `message_end` at all.
+        # and it reaches an operator: the rendered resume argv carries it,
+        # and `daemon/completion.rs` records it as the job's model.
+        #
+        # The scoping is what makes the guard work, and a descendant filter
+        # does not, however it is clause-guarded. pi emits three records per
+        # assistant message -- `message_start`, `message_update`,
+        # `message_end` -- all carrying the same `AgentMessage`, so all
+        # carrying `role: assistant` and the same `model`, with `stopReason`
+        # `pending` until the message closes (pi's own `docs/json.md`
+        # message lifecycle, and visible in `pi.jsonl`). An aborted turn
+        # therefore contributes `pending` records *after* the last valid
+        # turn, and a descendant filter that excludes only `aborted`/`error`
+        # relocates the read to the same turn's `message_update` and
+        # resolves the identical model. Excluding `pending` as a third
+        # clause does not rescue it either: measured against a stream
+        # truncated mid-turn, that variant resolves no model at all, exactly
+        # like this one -- which is the point below.
+        #
+        # The cost, stated because it is a real narrowing: an attempt whose
+        # stream never closed an assistant `message_end` now yields no
+        # `model` capture, so a resume refuses loudly with
+        # `resume capture "model" is absent` instead of rendering. That is
+        # deliberate. Such a stream states only the model of a turn whose
+        # outcome is unknown, and an aborted turn's mid-stream records are
+        # indistinguishable from an open valid turn's until its
+        # `message_end` arrives -- so there is no pattern that both excludes
+        # the first and recovers from the second. Refusing beats pinning a
+        # model no completed turn is known to have used; a job may still
+        # pin one explicitly through `launch.model`.
         model = mkScrapeCapture {
-          mode = "jsonPath";
-          pattern = "$..[?@.role == 'assistant' && @.stopReason != 'aborted' && @.stopReason != 'error'].model";
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.model";
         };
         # Still no `fields` mapping, and now for a stated reason rather than
         # for want of evidence. A real `pi --mode json` capture is on hand
