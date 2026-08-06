@@ -386,11 +386,16 @@ pub fn run_evidence_gate_with_store(
     checks.push(CheckOutcome {
         spec: format!("exit:{expected_exit}"),
         passed: exit_ok,
+        // #385: every evidence-check reason leads with a past-tense outcome.
+        // These strings are what `evidence_pass`/`evidence_fail` put in the
+        // journal's MESSAGE field -- `evidence_event` always supplies them
+        // explicitly, so `synthesize_message`'s default never runs for those
+        // two kinds and this is the text an operator actually reads.
         reason: if exit_ok {
-            format!("exit code {} == {expected_exit}", outcome.exit_code)
+            format!("Matched exit code {} == {expected_exit}", outcome.exit_code)
         } else {
             format!(
-                "exit code {} != expected {expected_exit}",
+                "Mismatched exit code {}, expected {expected_exit}",
                 outcome.exit_code
             )
         },
@@ -401,9 +406,9 @@ pub fn run_evidence_gate_with_store(
         spec: "witness-span".to_owned(),
         passed: span_ok,
         reason: if span_ok {
-            format!("witness span {}s recorded", outcome.wall_clock_seconds)
+            format!("Recorded a witness span of {}s", outcome.wall_clock_seconds)
         } else {
-            "witness span is absent, negative, or non-finite".to_owned()
+            "Rejected a witness span that is absent, negative, or non-finite".to_owned()
         },
     });
 
@@ -416,7 +421,7 @@ pub fn run_evidence_gate_with_store(
                 checks.push(CheckOutcome {
                     spec: format!("artifact:{}", path.display()),
                     passed: true,
-                    reason: format!("artifact exists ({hash})"),
+                    reason: format!("Confirmed the artifact exists ({hash})"),
                 });
                 hashes.push(hash);
             }
@@ -445,7 +450,7 @@ pub fn run_evidence_gate_with_store(
                 checks.push(CheckOutcome {
                     spec: format!("store:{}", path.display()),
                     passed: true,
-                    reason: "store path is valid".to_owned(),
+                    reason: "Validated the store path".to_owned(),
                 });
                 passing_store_paths.push(path.to_string_lossy().into_owned());
             }
@@ -1432,5 +1437,96 @@ mod tests {
         record.evidence_class = Some(Value::String("capture".to_owned()));
         record.manifest_hash = Some(Value::String("opaque".to_owned()));
         assert!(probe_dedup(Some("same"), &evidence, &[record]).hit);
+    }
+
+    /// #385: the reasons this module authors ARE the journal's `MESSAGE` for
+    /// `evidence_pass`/`evidence_fail`.
+    ///
+    /// `evidence_event` always passes `Some(check.reason.clone())`, so
+    /// `synthesize_message`'s default -- which `journal.rs`'s own audit
+    /// covers -- is unreachable for those two of the eleven event kinds.
+    /// These six strings are what an operator actually reads for them, so
+    /// they are held to the same outcome-first shape that audit pins: a
+    /// past-tense opening verb and no exclamation mark.
+    ///
+    /// Reasons this module does NOT author are deliberately out of scope: a
+    /// failed `hash_artifact_file` reports `error.to_string()` and a rejected
+    /// store path reports the `StoreValidity` impl's own text. Both are
+    /// error vocabularies owned elsewhere, so the assertion below drives only
+    /// the paths whose text is written here.
+    #[test]
+    fn evidence_check_reasons_lead_with_a_past_tense_outcome() {
+        fn assert_outcome_first(reason: &str, label: &str) {
+            let opening = reason.split(' ').next().unwrap_or_default();
+            assert!(
+                opening.ends_with("ed"),
+                "{label} reason {reason:?} does not open with a past-tense verb"
+            );
+            assert!(
+                !reason.contains('!'),
+                "{label} reason {reason:?} contains an exclamation mark"
+            );
+            assert!(
+                !reason.is_empty() && reason.len() <= 512,
+                "{label} reason {reason:?} is not bounded"
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("artifact");
+        fs::write(&artifact, b"content").unwrap();
+        const STORE: &str = "/nix/store/00000000000000000000000000000000-first";
+        let evidence = parse(&[
+            "exit:0",
+            &format!("artifact:{}", artifact.display()),
+            &format!("store:{STORE}"),
+        ]);
+
+        // The passing arm: matched exit, recorded span, confirmed artifact,
+        // validated store path -- four of the six.
+        let passing = run_evidence_gate_with_store(
+            RunOutcome {
+                exit_code: 0,
+                wall_clock_seconds: 0.25,
+                evidence: &evidence,
+            },
+            &FakeStore::with_valid([STORE]),
+        );
+        assert!(passing.passed);
+        for check in &passing.checks {
+            assert_outcome_first(&check.reason, &check.spec);
+        }
+
+        // The failing arms this module authors: a mismatched exit code and a
+        // non-finite witness span. A wrong exit code alone would leave the
+        // span reason on its passing branch, so both are forced at once.
+        let failing = run_evidence_gate_with_store(
+            RunOutcome {
+                exit_code: 3,
+                wall_clock_seconds: f64::NAN,
+                evidence: &evidence,
+            },
+            &FakeStore::with_valid([STORE]),
+        );
+        assert!(!failing.passed);
+        let exit_reason = &failing
+            .checks
+            .iter()
+            .find(|check| check.spec == "exit:0")
+            .expect("the exit check is always present")
+            .reason;
+        assert!(
+            exit_reason.contains("3") && exit_reason.contains('0'),
+            "the mismatched-exit reason must still name both codes: {exit_reason:?}"
+        );
+        let span_reason = &failing
+            .checks
+            .iter()
+            .find(|check| check.spec == "witness-span")
+            .expect("the span check is always present")
+            .reason;
+        for (reason, label) in [(exit_reason, "exit:0"), (span_reason, "witness-span")] {
+            assert_outcome_first(reason, label);
+        }
     }
 }

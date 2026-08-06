@@ -3554,6 +3554,28 @@ class NarrationValidatorTests(unittest.TestCase):
                 },
                 "@mention",
             ),
+            # #385: the body is PR prose and the squash commit body -- the one
+            # surface where the outcome-first grammar reaches a public pull
+            # request. `OutcomeFirstGrammarTests` exercises the rules in
+            # isolation; these four prove `validated_narration` itself refuses
+            # a body that breaks each one, so the call site cannot be deleted
+            # while the suite stays green.
+            "body-present-tense-opening": (
+                {"type": "feat", "subject": "do a thing", "body": "fixing the drift."},
+                "past-tense verb",
+            ),
+            "body-opens-with-a-list": (
+                {"type": "feat", "subject": "do a thing", "body": "- fixed the drift"},
+                "must open with a sentence, not a list",
+            ),
+            "body-leading-sentence-unterminated": (
+                {"type": "feat", "subject": "do a thing", "body": "Fixed the drift"},
+                "leading sentence must end with a period",
+            ),
+            "body-exclamation": (
+                {"type": "feat", "subject": "do a thing", "body": "Fixed the drift!"},
+                "exclamation mark",
+            ),
         }
         for name, (proposal, expected) in cases.items():
             with self.subTest(name):

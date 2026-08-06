@@ -38,12 +38,20 @@ outcome-first grammar check at all.
   evidence names a check id (and, for a `forbidPaths` rejection, an
   offending path), the diagnosis must name it too or it is replaced with a
   deterministic fallback note carrying the rejection reason.
-- Audited the daemon's own default `MESSAGE` templates
-  (`crates/tally-core/src/journal.rs`): all 11 `TallyEvent` kinds now open
-  with a past-tense verb (`Enqueued`, `Dispatched`, `Recorded a heartbeat
-  for`, `Passed the evidence check for`, …); a new test asserts the format
-  for every kind by name, so a 12th event added later fails loudly instead
-  of shipping unaudited.
+- Audited the daemon-authored `MESSAGE` strings on both paths that produce
+  them. `crates/tally-core/src/journal.rs`'s synthesized default now opens
+  with a past-tense verb for all 11 `TallyEvent` kinds (`Enqueued`,
+  `Dispatched`, `Recorded a heartbeat for`, …), with a test asserting the
+  format for every kind by name so a 12th event added later fails loudly
+  instead of shipping unaudited. That default is unreachable for
+  `evidence_pass`/`evidence_fail`, whose `MESSAGE` is always the evidence
+  check's own reason, so the six reason strings
+  `crates/tally-core/src/evidence.rs` authors were reworded to lead with an
+  outcome too (`Matched exit code 0 == 0`, `Recorded a witness span of
+  0.25s`, `Confirmed the artifact exists (…)`, `Validated the store path`,
+  and the two failing forms) and are held to the same shape by their own
+  test. Reasons this driver does not author — a failed artifact hash, a
+  rejected store path — keep their upstream error vocabulary.
 
 #### #386 — a tree-delta permission gate around campaign agent nodes
 
