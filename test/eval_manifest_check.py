@@ -100,10 +100,17 @@ Usage: eval_manifest_check.py <findings-file.md>...
 Exit codes (the contract for a mechanical consumer; the worst outcome across
 all files given wins):
 
-    0  every manifest is schema-valid, every declared surface is accounted
-       for, AND both categories declared a surface -- i.e. coverage was
-       actually checked. This is the only code that licenses "the eval
-       covered what it said it would."
+    0  every manifest is schema-valid, both categories declared a surface,
+       and every declared surface is ACCOUNTED FOR -- each declared key has
+       an entry. Accounted for is not verified: those entries may be
+       `covered`, `reused` or `failed`, so exit 0 licenses "the eval wrote
+       down an outcome for every surface it named", NOT "the eval covered
+       what it said it would". How many were actually verified is on the
+       line, in the `covered=` / `reused=` / `failed=` tokens; a consumer
+       that needs "and they passed" must read those, because a manifest
+       whose every declared item `failed` exits 0 (see
+       `test/fixtures/eval-manifest/all-declared-failed.md`, and
+       `test_a_wholly_failed_declared_surface_reports_zero_covered`).
     1  at least one file was refused: schema-invalid, unparsable, missing a
        manifest, carrying more than one, or declaring a surface with no
        matching entry.

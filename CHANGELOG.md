@@ -48,9 +48,19 @@ authorized.
   success cases were textually distinct but **mechanically identical** — both
   exited 0 and both matched `: ok` — so the orchestrator close-out this
   checker exists for could not tell them apart. Exit codes are now a
-  documented contract (`0` coverage checked, `1` refused, `2` usage, `3`
-  schema-valid but coverage not checked), and each success line carries a
-  stable `coverage=checked` / `coverage=unchecked` token.
+  documented contract (`0` every declared surface accounted for — which is
+  not the same as verified; `1` refused; `2` usage; `3` schema-valid but
+  coverage not checked), and each success line carries a stable
+  `coverage=checked` / `coverage=unchecked` token.
+
+  *Round-3 repair:* the exit-code table said exit 0 "licenses 'the eval
+  covered what it said it would'" — round 2's own word conflation surviving
+  in the one place its sweep did not reach, the machine-facing contract. A
+  manifest whose every declared item `failed` exits 0. The exit-0 row now
+  states what the code guarantees (every declared surface *accounted for*)
+  and says plainly that accounted-for is not verified, pointing at the
+  `covered=`/`reused=`/`failed=` tokens for how many actually were. Doc
+  only; the exit codes themselves are unchanged.
 
 - **Lane: operator conveniences — reader-state (`archived`, a free-form
   triage tag) on flow runs, never set by a run (#389).** A new durable store
