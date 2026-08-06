@@ -6,6 +6,104 @@ authorized.
 
 ## [Unreleased]
 
+### Steward driver gates (#385, #386)
+
+Two mechanisms that both live at the boundary between an unattended agent and
+the campaign's public or repository state: one holds every prose surface the
+steward publishes to a machine-checkable grammar, the other detects a lane
+that wrote outside its authorized paths after the write already happened.
+
+#### #385 — the narrate slot's content contract extends to PR prose, the closing summary, and steering notes
+
+The steward narrate slot already validated conventional-commit messages
+deterministically; PR prose, the closing summary, and steering notes had no
+outcome-first grammar check at all.
+
+- Added `validate_outcome_first()` to `spec_build_driver.py`: a leading
+  sentence before any list, a past-tense opening verb, no exclamation mark,
+  and a bounded length — the managed-agents content contract, made
+  machine-checkable and applied uniformly to steward-proposed and
+  driver-rendered text alike.
+- `validated_narration()` now enforces it on the proposal body (PR prose and
+  the squash commit body); a narrator whose proposal fails both attempts
+  falls back to the task-id template as before, but the fallback body now
+  carries a durable, bounded fact that it fired and why — no silent
+  template, per the AUGUST-02 lesson.
+- The closing summary's leading sentence now reads outcome-first ("Settled N
+  of M task(s) against durable merge/checkpoint facts.") and self-validates
+  against the same grammar, so a future template edit that drifts from the
+  contract fails the node loudly instead of publishing unchecked prose.
+- Steering notes (the diagnose slot's output) are now validated the same
+  way, and are constructive-correction shaped: when the failing task's gate
+  evidence names a check id (and, for a `forbidPaths` rejection, an
+  offending path), the diagnosis must name it too or it is replaced with a
+  deterministic fallback note carrying the rejection reason.
+- Audited the daemon-authored `MESSAGE` strings on both paths that produce
+  them. `crates/tally-core/src/journal.rs`'s synthesized default now opens
+  with a past-tense verb for all 11 `TallyEvent` kinds (`Enqueued`,
+  `Dispatched`, `Recorded a heartbeat for`, …), with a test asserting the
+  format for every kind by name so a 12th event added later fails loudly
+  instead of shipping unaudited. That default is unreachable for
+  `evidence_pass`/`evidence_fail`, whose `MESSAGE` is always the evidence
+  check's own reason, so every reason string written inline in
+  `crates/tally-core/src/evidence.rs` was reworded to lead with an outcome
+  too (`Matched exit code 0 == 0`, `Recorded a witness span of 0.25s`,
+  `Confirmed the artifact exists (…)`, `Validated the store path`, `Matched
+  the content hash …`, and their failing forms) and is held to the same
+  shape by its own test, which drives the passing and failing arm of every
+  check kind. Two failing arms keep their existing wording: a failed
+  artifact read and a rejected store path report `EvidenceError`'s and
+  `NixStoreError`'s `Display` text, which tally does author but shares with
+  every other display site of those errors — rewording it to suit the
+  journal would change error prose on surfaces that have nothing to do with
+  the journal.
+
+#### #386 — a tree-delta permission gate around campaign agent nodes
+
+The SSSF `permissions.py` import: permission is verified the way every other
+claim in this system is — after the fact, against the repo itself. Tally's
+hardening presets are preventive; this is the detective complement, and it
+lands where the unified worktree manager already owns lane lifecycle.
+
+- `campaign_worktrees.py` gained `change_set_fingerprint()` (a path → digest
+  for every entry git lists, tracked or untracked), a persisted before/after
+  snapshot pair, and `change_set_delta()`, which reports every path that
+  appeared, disappeared, or changed — content-based, so a reversion of an
+  uncommitted change back to its prior bytes is caught the same as a forward
+  edit no commit history could ever see. Every listed entry gets a row: a
+  regular file by its content, a symlink by its target string (never
+  followed, so the gate cannot be walked out of the worktree), and anything
+  unreadable — a mode-000 file, a directory, a fifo — by a metadata-derived
+  stand-in, so a write the driver cannot open is still judged rather than
+  dropped.
+- `prep` now fingerprints the worktree immediately before every implementation
+  task's agent node runs; a new `treeDelta` driver action compares that
+  snapshot against the worktree's content once the agent node and the
+  ownership gate have both finished, and fails, naming every offending path,
+  on any delta outside the task's allowlist. A pass whose agent node fails
+  returns before this node, so its uncommitted writes are not judged by it —
+  a committed stray is still caught by the ownership gate on the next pass;
+  the uncommitted case on a failing pass is open (refs #424).
+- The allowlist is per-task and never silently permissive: a task's declared
+  `conflictDomains` (non-empty) is the allowlist; an explicitly empty
+  `conflictDomains` allows nothing; an absent `conflictDomains` falls back to
+  exactly the paths the ownership node just certified as the task's own
+  committed change-set — the agent's proven work is self-authorizing, nothing
+  else is.
+- A breach aborts the lane rather than buying a retry or a steering attempt —
+  the write already happened, so there is nothing to redo. It reuses the
+  existing diagnosis ledger: `steer` posts both the attempt-1 and attempt-2
+  diagnosis receipts atomically for a breach, so the task is permanently
+  blocked as of this pass, the offending paths are witnessed in the posted
+  comment and in the failing `treeDelta` job's own evidence (`query
+  job`/`query proof` show it like any other campaign gate failure), and the
+  path list still reaches the steward's diagnose slot. The breach comment is
+  held to #385's content contract and to the same public length bound the
+  ordinary steering path guarantees; where the steward's prose is refused,
+  the refusal replaces the prose without swallowing the breach.
+- A new e2e scenario proves the reversion case against a real worktree and a
+  real `git checkout` reversion, not a mocked file-state dict.
+
 ### pi adapter residue (#405, #406)
 
 The follow-ups the #387 lane's config-only cap deferred. #405 is the Rust-side

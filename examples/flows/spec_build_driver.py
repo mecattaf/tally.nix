@@ -159,6 +159,66 @@ NARRATION_CLOSING_KEYWORD = re.compile(
 )
 NARRATION_MENTION = re.compile(r"(?<![0-9A-Za-z._-])@[0-9A-Za-z][0-9A-Za-z-]*")
 
+# #385: the managed-agents content guidelines the chips-and-log rendering
+# assumes -- an outcome-first leading sentence, a past-tense opening verb, no
+# exclamation, a bounded length -- made machine-checkable and applied to every
+# prose surface that crosses the publish boundary: PR prose (the narrate
+# slot's proposal body), the closing summary, and steering notes. One
+# validator, three callers, so the contract lives in exactly one place.
+OUTCOME_FIRST_LIST_MARKER = re.compile(r"^\s*(?:[-*]\s+|\d+[.)]\s+)")
+# Regular past-tense verbs end in "ed"; the irregulars below are the ones this
+# driver's own templates and a steward's plausible vocabulary actually use.
+# The set is deliberately not exhaustive prose-wide -- it only has to cover
+# what a campaign's own surfaces say -- and growing it never tightens an
+# already-accepted proposal, only widens what a future one may open with.
+OUTCOME_FIRST_IRREGULAR_VERBS = frozenset(
+    {
+        "began", "bound", "brought", "bought", "built", "came", "caught",
+        "chose", "cut", "did", "fell", "found", "gave", "grew", "held",
+        "hit", "kept", "knew", "left", "lost", "made", "met", "put", "ran",
+        "read", "said", "sat", "saw", "sent", "set", "shut", "spent",
+        "stood", "sold", "sought", "spoke", "spent", "taught", "thought",
+        "took", "understood", "went", "won", "wrote",
+    }
+)
+OUTCOME_FIRST_VERB = re.compile(
+    r"^(?:[A-Za-z]+ed|" + "|".join(sorted(OUTCOME_FIRST_IRREGULAR_VERBS)) + r")\b",
+    re.IGNORECASE,
+)
+OUTCOME_FIRST_LEAD_MAX = 240
+
+
+def validate_outcome_first(text: Any, *, max_chars: int, context: str) -> str | None:
+    """The machine-checkable half of the managed-agents content contract.
+
+    Returns `None` when `text` satisfies it, or the one reason it does not.
+    The four checks are independent and each names itself: a leading sentence
+    (ending `.` or `:`) precedes any list rather than a list opening the text,
+    that sentence opens with a past-tense verb, nothing in the text carries an
+    exclamation mark, and the whole text stays under `max_chars`. Applied
+    uniformly whether the text is steward-proposed or driver-rendered, so a
+    template that drifts from its own contract fails loudly instead of
+    shipping unchecked.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return f"{context} must be non-empty text"
+    if len(text) > max_chars:
+        return f"{context} is over the {max_chars} character cap"
+    if "!" in text:
+        return f"{context} contains an exclamation mark"
+    first_line = text.strip().split("\n", 1)[0].strip()
+    if OUTCOME_FIRST_LIST_MARKER.match(first_line):
+        return f"{context} must open with a sentence, not a list"
+    first_sentence = re.split(r"(?<=[.:])\s", first_line, maxsplit=1)[0].strip()
+    if not first_sentence.endswith((".", ":")):
+        return f"{context} leading sentence must end with a period"
+    if len(first_sentence) > OUTCOME_FIRST_LEAD_MAX:
+        return f"{context} leading sentence is over {OUTCOME_FIRST_LEAD_MAX} characters"
+    opening = re.match(r"^[A-Za-z]+", first_sentence)
+    if not opening or not OUTCOME_FIRST_VERB.match(opening.group(0)):
+        return f"{context} must open with a past-tense verb"
+    return None
+
 
 class DriverError(RuntimeError):
     pass
@@ -983,16 +1043,57 @@ def validated_narration(value: Any) -> tuple[dict[str, str] | None, str | None]:
             return None, "proposal contains a GitHub closing keyword"
         if NARRATION_MENTION.search(text):
             return None, "proposal contains an @mention"
+    if body:
+        # The body is PR prose (§3's crossing point splices it into the pull
+        # request) as well as the squash commit body, so it is where the
+        # outcome-first content contract applies -- the header stays
+        # conventional-commit-shaped (lower-case, no trailing period), which
+        # is a different, narrower grammar than a sentence. Checked last: a
+        # forged marker or trailer is the more serious refusal and names
+        # itself first when a proposal manages to trip both.
+        outcome_reason = validate_outcome_first(
+            body, max_chars=NARRATION_BODY_MAX, context="proposal body"
+        )
+        if outcome_reason:
+            return None, outcome_reason
     return {"subject": header, "body": body}, None
 
 
-def template_narration(task: dict[str, Any]) -> dict[str, Any]:
-    """The brief-derived fallback: exactly the pre-steward publication text."""
+def template_narration(task: dict[str, Any], *, body: str = "") -> dict[str, Any]:
+    """The brief-derived fallback: exactly the pre-steward publication text.
+
+    `body` defaults to empty: no steward configured, nothing to say. A
+    narrate() call that spent both attempts passes a durable fallback note
+    instead (#385) -- refusing loudly beats degrading silently, so the fact
+    that the fallback fired is never silent.
+    """
     return {
         "source": "template",
         "subject": f"{task['id']}: {task['title']}",
-        "body": "",
+        "body": body,
     }
+
+
+def narration_fallback_note(transcript: list[dict[str, Any]]) -> str:
+    """The durable fact a steward's narration fallback fires (#385).
+
+    Bounded and deterministic -- built from the driver's own rejection
+    reasons, never from the model's raw, unvalidated text -- and itself
+    outcome-first grammar-shaped, so it survives being spliced into the same
+    PR body and squash commit the steward's own prose would have occupied.
+    """
+    reasons = "; ".join(
+        f"attempt {entry['attempt']} ({entry['status']}): {entry['reason']}"
+        for entry in transcript
+        if entry.get("reason")
+    )
+    note = (
+        f"Rejected {len(transcript)} steward narration proposal(s) and used "
+        f"the task-id template instead. Reasons: {reasons}."
+    )
+    if len(note) > NARRATION_BODY_MAX:
+        note = note[: NARRATION_BODY_MAX - 1].rstrip() + "…"
+    return note
 
 
 def narrate(
@@ -1071,7 +1172,13 @@ def narrate(
             continue
         transcript.append({"attempt": attempt, "status": "accepted", "reason": None})
         return {"source": "steward", **narration}, transcript
-    return template_narration(task), transcript
+    fallback_body = narration_fallback_note(transcript)
+    self_check = validate_outcome_first(
+        fallback_body, max_chars=NARRATION_BODY_MAX, context="narration fallback note"
+    )
+    if self_check:
+        fail(f"narration fallback note violates its own grammar: {self_check}")
+    return template_narration(task, body=fallback_body), transcript
 
 
 def forge_gates(value: Any) -> list[dict[str, Any]]:
@@ -2817,22 +2924,39 @@ def render_campaign_summary(digest: dict[str, Any]) -> str:
     # keeps the one-line form it always had.
     worklist_source = digest["source"]
     worklist_repository = worklist_source.get("repository")
+    # #385: the closing summary is driver-rendered, not steward-proposed, but
+    # the outcome-first content contract governs it the same as PR prose and
+    # steering notes -- the outcome leads, in a past-tense sentence, before
+    # the provenance detail. `validate_outcome_first` below is a self-check:
+    # a future edit that drifts from the contract fails this node loudly
+    # instead of publishing a summary nothing enforced.
+    outcome_sentence = (
+        f"Settled {settled} of {digest['taskCount']} task(s) against durable "
+        "merge/checkpoint facts."
+    )
+    provenance_sentence = (
+        f"Worklist `{worklist_source['sha256']}` at "
+        f"`{worklist_source['revision']}`."
+        if worklist_repository is None
+        else (
+            f"Worklist `{worklist_source['sha256']}` at "
+            f"`{worklist_source['revision']}` in `{worklist_repository}`; "
+            f"code base `{digest['baseRevision']}` in "
+            f"`{digest['repository']}`."
+        )
+    )
+    outcome_reason = validate_outcome_first(
+        f"{outcome_sentence}\n{provenance_sentence}",
+        max_chars=2_000,
+        context="closing summary intro",
+    )
+    if outcome_reason:
+        fail(f"closing summary intro violates the outcome-first grammar: {outcome_reason}")
     lines = [
         heading,
         "",
-        (
-            f"Worklist `{worklist_source['sha256']}` at "
-            f"`{worklist_source['revision']}`."
-            if worklist_repository is None
-            else (
-                f"Worklist `{worklist_source['sha256']}` at "
-                f"`{worklist_source['revision']}` in `{worklist_repository}`; "
-                f"code base `{digest['baseRevision']}` in "
-                f"`{digest['repository']}`."
-            )
-        ),
-        f"{settled} of {digest['taskCount']} task(s) are bound to durable "
-        "merge/checkpoint facts.",
+        outcome_sentence,
+        provenance_sentence,
         "",
     ]
     if not complete:
@@ -3482,6 +3606,182 @@ def steering_thread(
     }
 
 
+FORBID_PATHS_DETAIL = re.compile(
+    r'forbidPaths gate \S+ rejected \d+ changed path\(s\): "((?:[^"\\]|\\.)*)"'
+)
+
+
+def gate_evidence_requirements(evidence: Any) -> tuple[str | None, str | None]:
+    """What a steering note must name, when gate evidence supplies it (#385).
+
+    Returns `(required_id, required_path)`, either half `None` when the
+    caller supplied nothing to require. `evidence` is
+    `{"id": <failing check id>, "detail": <raw gate failure text>}`: the id
+    is always structural (the failing gate's own identifier, e.g. from
+    `failure.stage`); the path is extracted only when the detail is shaped
+    like a `forbidPaths` rejection (`evaluate_forbid_paths`'s own message
+    format), since that is the only gate kind this driver runs that names an
+    offending path at all.
+    """
+    if not isinstance(evidence, dict):
+        return None, None
+    gate_id = evidence.get("id")
+    gate_id = gate_id if isinstance(gate_id, str) and gate_id else None
+    detail = evidence.get("detail")
+    path = None
+    if isinstance(detail, str):
+        matched = FORBID_PATHS_DETAIL.search(detail)
+        if matched:
+            path = matched.group(1)
+    return gate_id, path
+
+
+def diagnosis_fallback_note(reason: str, gate_id: str | None, path: str | None) -> str:
+    """The durable fact a steering note's validation failure fires (#385).
+
+    Deterministic and never model-authored -- built only from the driver's
+    own rejection reason and the gate evidence it was already given -- and
+    itself outcome-first shaped, so it survives being posted in the same
+    comment the rejected diagnosis would have occupied. AUGUST-02: refusing
+    loudly beats degrading silently, so this is never a silent template.
+    """
+    where = ""
+    if gate_id:
+        where = f" Investigate check {gate_id!r} directly"
+        where += f", path {path!r}." if path else "."
+    note = f"Rejected the steward's diagnosis: {reason}.{where}"
+    if len(note) > MAX_DIAGNOSIS_CHARS:
+        note = note[: MAX_DIAGNOSIS_CHARS - 1].rstrip() + "…"
+    return note
+
+
+def post_diagnosis_comment(
+    config: dict[str, Any],
+    repository: str,
+    thread_number: str,
+    campaign: str,
+    issue_number: str,
+    task_id: str,
+    attempt: int,
+    heading: str,
+    text: str,
+) -> str:
+    """Post one machine receipt, GitHub or local forge, and return its address.
+
+    GitHub reads receipts back by parsing the marker and heading off the
+    first lines of the comment body; the local forge reads structured fields
+    off the blob directly, so only `text` -- never the marker-prefixed body
+    -- is what it stores. Both the ordinary steering path and the breach
+    path (#386, which posts up to two of these atomically) share this.
+    """
+    if config["forge"] == "github":
+        marker = diagnosis_marker(campaign, issue_number, task_id, attempt)
+        body = f"{marker}\n\n{heading}\n\n{text}"
+        posted = run(
+            [
+                "gh",
+                "issue",
+                "comment",
+                thread_number,
+                "--repo",
+                repository,
+                "--body",
+                body,
+            ]
+        )
+        return required_string(
+            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
+            "machine diagnosis comment URL",
+        )
+    ref = f"{local_state_prefix(campaign, issue_number)}/diagnosis/{task_id}/{attempt}"
+    created, _ = write_local_blob(
+        config,
+        ref,
+        {
+            "schemaVersion": 1,
+            "kind": "diagnosis",
+            "campaign": campaign,
+            "issueNumber": issue_number,
+            "taskId": task_id,
+            "attempt": attempt,
+            "diagnosis": text,
+            "redaction": PUBLIC_REDACTION,
+        },
+    )
+    if not created:
+        fail(f"local forge diagnosis {ref!r} appeared concurrently")
+    return f"local://{repository}/{ref}"
+
+
+def validated_diagnosis(diagnosis: str, gate_evidence: Any) -> str:
+    """#385's content contract on one steering note, or its fallback.
+
+    Total: returns either the diagnosis unchanged or a deterministic,
+    grammar-compliant note naming the one reason it was refused. Both the
+    ordinary steering path and #386's breach path run it, so the same bad
+    diagnosis is refused identically on both. A breach branch that returned
+    before this ran was the round-1 F3 hole: unvalidated steward prose went
+    straight into a public forge comment on the single most severe campaign
+    event, holding #385's own guarantee open from inside the same lane.
+    """
+    required_id, required_path = gate_evidence_requirements(gate_evidence)
+    reason = validate_outcome_first(
+        diagnosis, max_chars=MAX_DIAGNOSIS_CHARS, context="diagnosis"
+    )
+    if not reason and required_id and required_id not in diagnosis:
+        reason = f"diagnosis omits the failing check id {required_id!r}"
+    if not reason and required_path and required_path not in diagnosis:
+        reason = f"diagnosis omits the offending path {required_path!r}"
+    if reason:
+        return diagnosis_fallback_note(reason, required_id, required_path)
+    return diagnosis
+
+
+def breach_note(diagnosis: str, detail_text: str) -> str:
+    """The posted breach body: a deterministic label plus witnessed evidence.
+
+    #386: an out-of-allowlist delta aborts the lane -- a breach, not a
+    gate-fail, because the write already happened and gates are for redoable
+    work. The offending paths must be witnessed regardless of what the model
+    wrote, so the driver's own tree-delta detail is always appended verbatim
+    rather than merely required as a substring the model might paraphrase
+    away. The heading stays `diagnosis_heading`'s ordinary shape -- the forge
+    read-back parses that exact prefix -- so the breach identifies itself
+    through this leading sentence instead of a second heading grammar.
+    """
+    parts = [
+        "Aborted the lane: a tree-delta permission breach found "
+        "out-of-allowlist change(s), so this task will not be retried.",
+    ]
+    if diagnosis:
+        parts.append(diagnosis)
+    if detail_text:
+        parts.append(f"Witnessed evidence: {detail_text}")
+    return "\n\n".join(parts)
+
+
+def bounded_breach_note(diagnosis: str, detail_text: str) -> str:
+    """`breach_note` held to the same public bound the ordinary path keeps.
+
+    The ordinary steering path posts `bound_public_diagnosis(diagnosis)`, so
+    a breach must not post ~2x that just because it concatenates two bounded
+    strings. The squeeze is deliberately asymmetric: the label sentence and
+    the witnessed evidence are driver-authored and load-bearing -- the
+    offending paths live in the evidence -- so the steward's elastic prose is
+    what gives way, rather than truncating the paths off the end of the one
+    comment that exists to name them.
+    """
+    composed = breach_note(diagnosis, detail_text)
+    overflow = len(composed) - MAX_DIAGNOSIS_CHARS
+    if overflow > 0:
+        kept = max(0, len(diagnosis) - overflow)
+        composed = breach_note(diagnosis[:kept].rstrip(), detail_text)
+    # Backstop for the pathological case where the evidence alone exceeds the
+    # bound: truncation there is unavoidable, and `bound_public_diagnosis`
+    # leaves a visible marker rather than trimming silently.
+    return bound_public_diagnosis(composed)
+
+
 def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     brief, capabilities = take_capabilities(brief)
     fields = {
@@ -3495,6 +3795,12 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     }
     if "taskIssue" in brief:
         fields.add("taskIssue")
+    if "gateEvidence" in brief:
+        fields.add("gateEvidence")
+    if "breach" in brief:
+        fields.add("breach")
+    if "breachDetail" in brief:
+        fields.add("breachDetail")
     data = object_exact(brief, seam_fields(brief, fields), "steer brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
@@ -3516,6 +3822,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     attempt = data.get("attempt")
     if attempt not in {1, 2}:
         fail("attempt must equal 1 or 2")
+    breach = bool(data.get("breach", False))
     thread_number, threads = steering_thread(
         repository, config, data, capabilities, task_id
     )
@@ -3523,6 +3830,70 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         repository, config, campaign, issue["number"], None, threads
     )
     task_receipts = [receipt for receipt in existing if receipt["taskId"] == task_id]
+
+    if breach:
+        # #386: a breach aborts the lane -- it is not a redoable gate-fail,
+        # so it never spends only one of the task's two ordinary steering
+        # attempts and waits for a second failure to block. It reuses the
+        # same diagnosis ledger the ordinary path writes (so the reconciler's
+        # existing `attempt == 2` block rule needs no change at all) by
+        # posting whichever of attempt 1 and attempt 2 do not exist yet, both
+        # in this one call, so the task is permanently blocked as of this
+        # pass and `contiguous_receipts` never sees a lone attempt 2.
+        already_blocked = next(
+            (receipt for receipt in task_receipts if receipt["attempt"] == 2), None
+        )
+        if already_blocked is not None:
+            return {
+                "taskId": task_id,
+                "attempt": 2,
+                "comment": already_blocked["comment"],
+                "blocked": True,
+                "posted": False,
+                "redacted": False,
+            }
+        diagnosis = required_text(
+            data.get("diagnosis"), "diagnosis", MAX_DIAGNOSIS_CHARS
+        )
+        diagnosis, redacted_diagnosis = redact_public_text(diagnosis)
+        diagnosis = bound_public_diagnosis(diagnosis)
+        # #385's content contract governs this comment too. Rejection replaces
+        # the steward's prose with the durable fallback note and nothing more:
+        # the breach still aborts, still posts both receipts, and still
+        # witnesses its paths, because the label sentence and the evidence
+        # below are the node's own and never the model's to lose.
+        diagnosis = validated_diagnosis(diagnosis, data.get("gateEvidence"))
+        detail = data.get("breachDetail")
+        detail_text = ""
+        redacted_detail = False
+        if isinstance(detail, str) and detail.strip():
+            detail_text, redacted_detail = redact_public_text(detail)
+            detail_text = bound_public_diagnosis(detail_text)
+        composed = bounded_breach_note(diagnosis, detail_text)
+        posted_comment: str | None = None
+        for post_attempt in (1, 2):
+            if any(receipt["attempt"] == post_attempt for receipt in task_receipts):
+                continue
+            posted_comment = post_diagnosis_comment(
+                config,
+                repository,
+                thread_number,
+                campaign,
+                issue["number"],
+                task_id,
+                post_attempt,
+                diagnosis_heading(task_id, post_attempt),
+                composed,
+            )
+        return {
+            "taskId": task_id,
+            "attempt": 2,
+            "comment": posted_comment,
+            "blocked": True,
+            "posted": True,
+            "redacted": redacted_diagnosis or redacted_detail,
+        }
+
     if any(receipt["attempt"] == attempt for receipt in task_receipts):
         receipt = next(
             receipt for receipt in task_receipts if receipt["attempt"] == attempt
@@ -3546,47 +3917,25 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     )
     diagnosis, redacted = redact_public_text(diagnosis)
     diagnosis = bound_public_diagnosis(diagnosis)
-    marker = diagnosis_marker(campaign, issue["number"], task_id, attempt)
-    body = f"{marker}\n\n{diagnosis_heading(task_id, attempt)}\n\n{diagnosis}"
-    if config["forge"] == "github":
-        posted = run(
-            [
-                "gh",
-                "issue",
-                "comment",
-                thread_number,
-                "--repo",
-                repository,
-                "--body",
-                body,
-            ]
-        )
-        comment = required_string(
-            posted.stdout.strip().splitlines()[-1] if posted.stdout.strip() else "",
-            "machine diagnosis comment URL",
-        )
-    else:
-        ref = (
-            f"{local_state_prefix(campaign, issue['number'])}/diagnosis/"
-            f"{task_id}/{attempt}"
-        )
-        created, _ = write_local_blob(
-            config,
-            ref,
-            {
-                "schemaVersion": 1,
-                "kind": "diagnosis",
-                "campaign": campaign,
-                "issueNumber": issue["number"],
-                "taskId": task_id,
-                "attempt": attempt,
-                "diagnosis": diagnosis,
-                "redaction": PUBLIC_REDACTION,
-            },
-        )
-        if not created:
-            fail(f"local forge diagnosis {ref!r} appeared concurrently")
-        comment = f"local://{repository}/{ref}"
+    # #385: the same content contract that governs PR prose governs a
+    # steering note, plus a constructive-correction shape -- it must name the
+    # failing check (and offending path, when the gate evidence names one)
+    # rather than describe the failure in the abstract. A validation failure
+    # spends the attempt exactly as an unusable steward proposal spends the
+    # narrate slot, and the fallback is never a silent template. The breach
+    # path above runs the identical check.
+    diagnosis = validated_diagnosis(diagnosis, data.get("gateEvidence"))
+    comment = post_diagnosis_comment(
+        config,
+        repository,
+        thread_number,
+        campaign,
+        issue["number"],
+        task_id,
+        attempt,
+        diagnosis_heading(task_id, attempt),
+        diagnosis,
+    )
     return {
         "taskId": task_id,
         "attempt": attempt,
@@ -4142,6 +4491,20 @@ def worktree_call(operation: Any, *arguments: Any, **keywords: Any) -> Any:
         return operation(*arguments, **keywords)
     except worktrees.WorktreeError as error:
         fail(error.message)
+
+
+def snapshot_before_agent(worktree: Path) -> None:
+    """The pre-agent change-set fingerprint the tree-delta gate compares
+    against (#386). Called once per `prep`, whether the lane is fresh or
+    resumed: on a resumed lane the worktree may already carry legitimate
+    uncommitted content from an earlier pass, and that is exactly the state
+    the gate must be able to tell a reversion of apart later, so every prep
+    of an implementation task takes a fresh baseline right before its own
+    agent dispatch -- the earliest point after the lane is known-good and
+    the latest point before anything the gate must witness could happen.
+    """
+    fingerprint = worktree_call(worktrees.change_set_fingerprint, worktree)
+    worktree_call(worktrees.write_change_set_snapshot, worktree, fingerprint)
 
 
 def tally_executable(value: Any) -> Path:
@@ -4845,6 +5208,8 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
             check=False,
         ).returncode:
             fail("resumed lane base does not descend from the witnessed worklist revision")
+        if identity["taskKind"] == "implementation":
+            snapshot_before_agent(worktree)
         return {
             "taskId": identity["taskId"],
             "baseRev": resumed_base,
@@ -4887,6 +5252,8 @@ def action_prep(brief: dict[str, Any]) -> dict[str, Any]:
     if not GIT_OID.fullmatch(base_rev):
         fail(f"cannot derive a base revision for campaign lane {branch!r}")
     worktree_call(worktrees.write_identity, worktree, {**expected, "baserev": base_rev})
+    if identity["taskKind"] == "implementation":
+        snapshot_before_agent(worktree)
     return {
         "taskId": identity["taskId"],
         "baseRev": base_rev,
@@ -5308,6 +5675,114 @@ def action_ownership(brief: dict[str, Any]) -> dict[str, Any]:
         data.get("domainsRequired"),
         current_base_revision(worktree, config),
     )
+
+
+def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
+    """The tree-delta permission gate around the campaign agent node (#386).
+
+    Detective, not preventive -- the SSSF `permissions.py` import: "permission
+    is verified the way every other claim in this system is -- after the
+    fact, against the repo itself." `prep` fingerprinted the worktree's full
+    tracked-and-untracked content before the agent ran; this compares that
+    fingerprint against the worktree's content right now. A path appearing,
+    disappearing, or changing all count identically, so a reversion of an
+    uncommitted change back to its prior content is caught the same as a
+    forward edit no commit ever recorded.
+
+    Scope, stated so it is not read wider than it is: this node runs after
+    the agent node passes and after `ownership`, so a pass whose agent node
+    fails returns before it and its uncommitted writes are not judged here.
+    A committed stray is still caught by `ownership` on the next pass; the
+    uncommitted case on a failing pass is open. Refs #424.
+
+    The allowlist is per-task, derived from the brief/worklist entry, with no
+    silently permissive default -- an absent allowlist and an empty one are
+    different outcomes, not the same "anything goes":
+      - `task.conflictDomains` declared and non-empty: those path prefixes,
+        compared with `domains_overlap` at path-component boundaries and
+        case-folded -- identical semantics to the ownership gate's own
+        allowlist, and not glob matching.
+      - `task.conflictDomains` declared and explicitly empty (`[]`): the
+        allowlist is empty, so any delta at all is a breach.
+      - `task.conflictDomains` absent: the allowlist falls back to exactly
+        `ownedPaths`, the paths the ownership node just certified as this
+        task's own committed change-set. The agent's proven work is
+        self-authorizing; nothing else is.
+
+    An out-of-allowlist delta fails this node with every offending path
+    named -- the same mechanism every other campaign gate uses to become
+    queryable via `query job`/`query proof`, since this driver runs as an
+    ordinary witnessed job like any other campaign node.
+    """
+    data = object_exact(
+        brief, {"task", "workspace", "ownedPaths"}, "tree-delta brief"
+    )
+    task = data.get("task")
+    if not isinstance(task, dict):
+        fail("task must be an object")
+    task_id = required_string(task.get("id"), "task.id")
+    if not TASK_ID.fullmatch(task_id):
+        fail("task.id is not safe")
+    workspace = object_exact(
+        data.get("workspace"),
+        {"taskId", "baseRev", "branch", "publishBranch", "worktreePath"},
+        "workspace",
+    )
+    if workspace.get("taskId") != task_id:
+        fail("workspace.taskId does not match task.id")
+    worktree = Path(required_string(workspace.get("worktreePath"), "workspace.worktreePath"))
+    if not worktree.is_absolute() or not worktree.is_dir():
+        fail("workspace.worktreePath must be an absolute existing directory")
+    git(worktree, "rev-parse", "--git-dir")
+
+    before = worktree_call(worktrees.read_change_set_snapshot, worktree)
+    if before is None:
+        fail(
+            "no change-set snapshot was recorded before the agent node; "
+            "cannot evaluate the tree-delta gate"
+        )
+    after = worktree_call(worktrees.change_set_fingerprint, worktree)
+    deltas = worktrees.change_set_delta(before, after)
+
+    raw_domains = task.get("conflictDomains")
+    if isinstance(raw_domains, list) and raw_domains:
+        allowlist = normalize_conflict_domains(
+            raw_domains, "task.conflictDomains", required=True
+        )
+        basis = "declared"
+    elif isinstance(raw_domains, list):
+        allowlist = []
+        basis = "declared-empty"
+    else:
+        owned = data.get("ownedPaths")
+        allowlist = list(string_list(owned, "ownedPaths")) if owned is not None else []
+        basis = "owned-paths-fallback"
+
+    breaches = [
+        delta
+        for delta in deltas
+        if not any(domains_overlap(delta["path"], domain) for domain in allowlist)
+    ]
+    # The snapshot's job is done the instant this pass reads it, whether the
+    # gate passes or fails: a stale snapshot from this attempt must never be
+    # compared against a later attempt's "after" state.
+    worktree_call(worktrees.clear_change_set_snapshot, worktree)
+    if breaches:
+        preview = "; ".join(
+            f"{item['kind']} {json.dumps(item['path'])}" for item in breaches[:20]
+        )
+        if len(breaches) > 20:
+            preview += f"; and {len(breaches) - 20} more"
+        fail(
+            f"tree-delta gate detected {len(breaches)} out-of-allowlist change(s) "
+            f"({basis} allowlist): {preview}"
+        )
+    return {
+        "taskId": task_id,
+        "checkedPaths": len(deltas),
+        "allowlistBasis": basis,
+        "allowlist": allowlist,
+    }
 
 
 def evaluate_forbid_paths(
@@ -7132,6 +7607,7 @@ def main() -> int:
             "prep",
             "cleanup",
             "ownership",
+            "treeDelta",
             "constraint",
             "checkpoint",
             "publish",
@@ -7153,6 +7629,7 @@ def main() -> int:
         "preflight": action_preflight,
         "prep": action_prep,
         "ownership": action_ownership,
+        "treeDelta": action_tree_delta,
         "constraint": action_constraint,
         "checkpoint": action_checkpoint,
         "cleanup": action_cleanup,

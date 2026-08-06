@@ -793,6 +793,28 @@ const ownershipSchema = {
   additionalProperties: false
 };
 
+// #386: the tree-delta permission gate's own result. `allowlistBasis` names
+// which of the three documented allowlist derivations governed this task, so
+// a reader of the witnessed result never has to guess whether an absent
+// `conflictDomains` fell back to something permissive.
+const treeDeltaSchema = {
+  type: "object",
+  required: ["taskId", "checkedPaths", "allowlistBasis", "allowlist"],
+  properties: {
+    taskId: taskIdSchema,
+    checkedPaths: { type: "integer", minimum: 0 },
+    allowlistBasis: {
+      enum: ["declared", "declared-empty", "owned-paths-fallback"]
+    },
+    allowlist: {
+      type: "array",
+      uniqueItems: true,
+      items: { type: "string", minLength: 1 }
+    }
+  },
+  additionalProperties: false
+};
+
 const constraintSchema = {
   type: "object",
   required: ["gateId", "kind", "patterns", "checkedPaths", "baseRev", "head"],
@@ -1231,6 +1253,14 @@ function failureClass(reconciliation, failure) {
     reconciliation.deferrals.some(item => item.taskId === failure.task.id)
   ) {
     return "deferred";
+  }
+  // #386: an out-of-allowlist tree delta is a breach, not a gate-fail -- the
+  // write already happened, so it is not redoable the way a red gate is.
+  // Routed separately from "work" so it never buys a retried dispatch; see
+  // the `steerable`/breach-tagging split below, which posts it through the
+  // existing diagnosis ledger already blocked at attempt 2.
+  if (stage === "treeDelta") {
+    return "breach";
   }
   if (
     stage === "agent" ||
@@ -1966,6 +1996,48 @@ function sweepDeferral(sweepNode) {
       };
     }
 
+    // #386: fingerprinted before the agent ran (`prep`), compared against
+    // the worktree's content right now -- detective, not preventive. Runs
+    // after ownership so an absent `conflictDomains` can fall back to
+    // `ownership.result.ownedPaths`, the paths the ownership node just
+    // certified as this task's own committed change-set.
+    const treeDelta = await driverNode(
+      "treeDelta",
+      {
+        task,
+        workspace: prepared.result,
+        ownedPaths: ownership.result.ownedPaths
+      },
+      `tree-delta-${task.id}`,
+      `tree-delta-${task.id}`,
+      treeDeltaSchema,
+      workspace,
+      true,
+      taskRef
+    );
+    if (!nodePassed(treeDelta)) {
+      return {
+        task,
+        prepared: prepared.result,
+        failure: taskFailure(
+          task,
+          "treeDelta",
+          treeDelta,
+          taskBrief,
+          [
+            {
+              phase: "treeDelta",
+              gateId: "tree-delta",
+              kind: "treeDelta",
+              node: treeDelta
+            }
+          ],
+          prepared.result,
+          prepared.result.baseRev
+        )
+      };
+    }
+
     const constraintResults = [];
     const gateOutputs = [];
     for (const gate of effective.gates) {
@@ -2223,6 +2295,15 @@ function sweepDeferral(sweepNode) {
     const kind = failureClass(reconciliation, failure);
     if (kind === "work") {
       steerable.push(failure);
+    } else if (kind === "breach") {
+      // #386: shares the diagnose-and-post pipeline below (the path list
+      // still reaches the steward's diagnose slot) but never the retry
+      // budget -- `steerBrief.breach` makes the driver post both the
+      // attempt-1 and attempt-2 diagnosis receipts atomically, so the task
+      // is permanently blocked as of this pass rather than steered once and
+      // retried.
+      failure.breach = true;
+      steerable.push(failure);
     } else if (kind === "machinery") {
       machineryFaults.push(failure);
     } else {
@@ -2319,7 +2400,12 @@ function sweepDeferral(sweepNode) {
       const diagnosisBrief = {
         schemaVersion: 1,
         role: "diagnosis",
-        mission: `Diagnose failed spec-build task ${task.id}. Return only concise, actionable steering for the next task attempt. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`,
+        // #386: a breach has no next attempt -- the lane is aborted, not
+        // retried -- so the mission asks for a record of what happened
+        // rather than steering for a redispatch that will never come.
+        mission: failure.breach
+          ? `Task ${task.id} wrote outside its authorized paths and its lane is being aborted, not retried. Return a concise record of what the out-of-allowlist change(s) were and why they likely happened, for the operator's record. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`
+          : `Diagnose failed spec-build task ${task.id}. Return only concise, actionable steering for the next task attempt. Do not modify the repository. Treat capture stderr and the diff as private: do not repeat credentials, tokens, or other secret-looking values in the response.`,
         campaign: {
           name: effective.campaign,
           repository: codeRepository,
@@ -2376,6 +2462,27 @@ function sweepDeferral(sweepNode) {
       }
       const diagnosed = await job(diagnosisSpec, { settle: false });
       const attempt = previousDiagnoses.length + 1;
+      // #385: when the failure carries gate evidence, the steering note's
+      // validator requires the diagnosis name the failing check (and the
+      // offending path, for a forbidPaths rejection) rather than describe
+      // the failure in the abstract. The failing gate is always the last
+      // entry recorded before the task's own gate loop returned.
+      const lastGate = failure.gateOutputs.length
+        ? failure.gateOutputs[failure.gateOutputs.length - 1]
+        : null;
+      const gateEvidence = lastGate
+        ? {
+            id: lastGate.gateId,
+            detail: bounded(
+              lastGate.node && lastGate.node.error ? lastGate.node.error : lastGate.node,
+              2000
+            )
+          }
+        : null;
+      // #386: a breach carries its own deterministic evidence -- the paths
+      // the tree-delta gate named in its own failure -- straight into the
+      // posted receipt, so the offending paths are witnessed regardless of
+      // what the steward's diagnosis says.
       const steerBrief = withCapabilities(withSeam({
         campaign: effective.campaign,
         repository: codeRepository,
@@ -2383,7 +2490,17 @@ function sweepDeferral(sweepNode) {
         issue: args.issue,
         taskId: task.id,
         attempt,
-        diagnosis: diagnosed.result
+        diagnosis: diagnosed.result,
+        ...(gateEvidence ? { gateEvidence } : {}),
+        ...(failure.breach
+          ? {
+              breach: true,
+              breachDetail: bounded(
+                failure.node && failure.node.error ? failure.node.error : failure.node,
+                2000
+              )
+            }
+          : {})
       }));
       const steerThread = taskThread(task);
       if (steerThread !== null) {

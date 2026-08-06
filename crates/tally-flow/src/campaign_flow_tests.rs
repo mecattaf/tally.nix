@@ -146,6 +146,25 @@ fn an_undeferred_checkpoint_lane_still_spends_its_budget() {
     );
 }
 
+/// #386: a tree-delta permission breach is priced separately from an
+/// ordinary work failure -- it must never be routed through the retry or
+/// steering-attempt budget the way a red gate is, because the write already
+/// happened and there is nothing to redo.
+#[test]
+fn a_tree_delta_failure_is_priced_as_a_breach_not_work() {
+    let mut realm = CampaignFlowRealm::new(&json!({}));
+    let quiet = json!({"deferrals": []});
+    let failure = json!({
+        "task": {"id": "build", "kind": "implementation"},
+        "stage": "treeDelta",
+        "node": {"verdict": "fail"},
+    });
+    assert_eq!(
+        realm.call("failureClass", &[quiet, failure]),
+        json!("breach")
+    );
+}
+
 /// An implementation lane is never deferred, whatever the deferral set says.
 #[test]
 fn an_implementation_lane_is_priced_by_its_stage_alone() {
