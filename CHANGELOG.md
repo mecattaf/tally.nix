@@ -27,8 +27,12 @@ Rather than retry through the race, `fake_gh` and the three remaining
 write-then-`chmod` helpers now use the idiom #117 introduced for exactly this:
 the behaviour is published through a non-executable sidecar and the exec target
 is a symlink to a checked-in provider nothing ever opens for writing, so the
-window never opens. A new test pins both directions deterministically, by
-holding the write fd open instead of waiting for load to hold it.
+window never opens. That property — the exec target is a file this process
+never opens at all — is asserted at both shared installers, so all four
+converted helpers are covered by construction; asserting only that the program
+runs would have passed for a written-then-`chmod`ed one too, which is the whole
+race. A test also holds a write fd open to show the hazard is real rather than
+theorised, instead of waiting for load to hold it.
 
 #### #411 — a periodic drain that finds no daemon is a skip, not a failure
 
@@ -68,6 +72,14 @@ session, both from the row seed and query fact that already outlive the job and
 are restored across a restart. An id the daemon never admitted is still not
 found.
 
+One guard changes meaning with the prune and is worth naming, because it is
+durable if it is wrong: `finish_job` re-checks the job under the write lock
+after awaiting the scrape, capture and accounting without it, and a job retired
+inside that window must end that execution quietly rather than append a second
+canonical witness for it. That window is now reachable in a test, which
+force-cancels the job inside it and asserts exactly one canonical witness for
+the `(task, attempt, leaseEpoch)`.
+
 #### #404 — the attestation chain is not read before it is needed, and a standup states its constants once
 
 - **Deferred read.** `read_attestations` parsed and hash-verified the whole
@@ -85,6 +97,14 @@ found.
   whose statements ever differ carries its own inline rather than inheriting a
   digest-level claim that would be false for it. `query run`, which returns one
   rollup, still carries all three inline.
+
+  `usageBasis` is what an omitted entry field is filled from on the way back in
+  — the **producer's** copy, which travelled with the payload — and a reader
+  falls back to its own compiled constants only for a digest that carries no
+  basis at all, which is one produced before the field existed. Filling from the
+  reader's constants instead would make the digest and its own entries disagree
+  whenever the two builds differ, which on a fleet whose coordinator pin trails
+  its workers is the ordinary case rather than the exotic one.
 
 ### Added
 
