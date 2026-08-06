@@ -1115,6 +1115,43 @@ class TreeDeltaGateTests(PublicationHarness):
             self.workspace_brief(task("conflict-domain", ["README.md"]))
         )
         self.assertEqual(result["allowlistBasis"], "declared")
+        # The witnessed count is the number of deltas judged, not the number
+        # of paths the driver managed to read: README.md moved, the mode-000
+        # file did not. Asserted once, here, because nothing else pins it.
+        self.assertEqual(result["checkedPaths"], 1)
+
+    def test_an_unreadable_path_rewritten_in_place_is_a_breach(self) -> None:
+        """Round-2 F8: the `changed` direction of the sentinel digest.
+
+        `_unreadable_digest` exists to make an unreadable path *comparable*,
+        not merely present. The `appeared` and no-delta directions were
+        already pinned; this pins the one that took the design work, and the
+        one a reader simplifying toward round-1's own suggested wording
+        (`a sentinel digest (e.g. "unreadable")`) would silently re-open.
+        """
+        locked = self.checkout / "internal/locked.txt"
+        locked.write_text("aaaa\n", encoding="utf-8")
+        locked.chmod(0o000)
+        self.snapshot()
+
+        # An in-place rewrite of a file the driver still cannot read. The mode
+        # is identical on both sides, so only the content-derived half of the
+        # identity can tell these two states apart.
+        locked.chmod(0o644)
+        locked.write_text("bbbbbbbbbbbbbb\n", encoding="utf-8")
+        locked.chmod(0o000)
+        (self.checkout / "README.md").write_text("base\nfeature\n", encoding="utf-8")
+        git("add", "README.md", cwd=self.checkout)
+        git("commit", "-m", "fixture: deliver the feature", cwd=self.checkout)
+
+        with self.assertRaises(driver.DriverError) as raised:
+            driver.action_tree_delta(
+                self.workspace_brief(task("conflict-domain", ["README.md"]))
+            )
+        message = str(raised.exception)
+        self.assertIn("changed", message)
+        self.assertIn("internal/locked.txt", message)
+        self.assertIn("1 out-of-allowlist change(s)", message)
 
 
 if __name__ == "__main__":
