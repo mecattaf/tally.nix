@@ -1508,10 +1508,15 @@ mod tests {
         // The last *valid* assistant turn, not the last assistant turn. A
         // turn pi marks `aborted` or `error` can still carry partial text,
         // and reporting that fragment as the node's answer is unmarked and
-        // indistinguishable from a complete one. These are the exact strings
-        // the `pi` preset declares in `nix/lib/adapters.nix`, so a preset
-        // that drifts from them fails here rather than passing two
-        // agreeing-but-wrong suites.
+        // indistinguishable from a complete one.
+        //
+        // What this pins is the JSONPath *selection semantics* these
+        // patterns depend on, against a stream in pi's shape. It does not
+        // pin the `pi` preset: it holds its own copy of the strings and
+        // never reads `nix/lib/adapters.nix`, so a preset that drifts from
+        // them still passes here. The `adapter-presets` flake check is what
+        // catches drift — it asserts the preset's pattern strings literally
+        // and then renders the fixtures through them.
         let pi = concat!(
             "{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"model\":\"valid\",\"stopReason\":\"stop\",\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}}\n",
             "{\"type\":\"message_end\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"ignore\"}]}}\n",
