@@ -15,6 +15,7 @@ use crate::query::{
     GhOriginProjection, HeadroomSignal, RowStatus, StandupDigest, StandupRunUsage,
     StandupUsageBasis, QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
 };
+use crate::reader_state::ReaderState;
 use crate::taskdb::{
     related_trigger_from_gh_origin, AdmissionOrigin, ProducerOrigin, RelatedTrigger, RowSeed,
     WorkspaceMetadata,
@@ -371,6 +372,13 @@ pub struct JobSummary {
     pub canonical_gpu_seconds: Option<f64>,
     pub credential_names: Vec<String>,
     pub trace: TraceAvailability,
+    /// True when the flow run that created this job (per its orchestration
+    /// capsule) is archived reader-state. Set post-projection by
+    /// [`apply_reader_state_to_jobs`], which owns the reader-state store this
+    /// projection has no access to; an unfilled summary carries `false`
+    /// rather than a wrong value.
+    #[serde(default)]
+    pub archived: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -423,6 +431,19 @@ pub struct CollectionEnvelope<T> {
     /// because the run is quiet and one that is empty because the run has no
     /// members at all — which now means the run really admitted nothing, rather
     /// than that its nodes went missing.
+    ///
+    /// A THIRD case this count cannot distinguish from either of those, as of
+    /// #389: a run with members whose items were all withheld because the run
+    /// itself is archived operator reader-state. `items` comes back empty
+    /// exactly as it would for a quiet or member-less run, and this field
+    /// still reports the true (unfiltered) membership size — so
+    /// `flowRunTasks: 1, items: []` for an explicit `--flow-run <archived>`
+    /// currently reads as one of the first two cases when it is really the
+    /// third, with nothing in the envelope saying so. Filed as issue #415
+    /// rather than resolved here: whether an explicit `--flow-run` filter
+    /// should withhold archived items at all — `query run <id>`
+    /// deliberately does not — is a design question for a ruling, not a
+    /// doc-comment fix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_run_tasks: Option<usize>,
     pub snapshot: QuerySnapshotMetadata,
@@ -1111,6 +1132,14 @@ pub struct RunView {
     pub current_nodes: Vec<RunNodeProjection>,
     pub failures: Vec<RunFailureProjection>,
     pub snapshot: QuerySnapshotMetadata,
+    /// Operator reader-state, overlaid by [`apply_reader_state_to_run`] the
+    /// same way [`apply_run_lineage`] overlays supersession: durable
+    /// reader-state is a different store from the rows, history, and witness
+    /// this projection reads, and the handler joins them.
+    #[serde(default)]
+    pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub triage_tag: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1584,6 +1613,8 @@ pub fn query_run(
         current_nodes,
         failures,
         snapshot: snapshot_metadata(history, witness),
+        archived: false,
+        triage_tag: None,
     })
 }
 
@@ -1678,6 +1709,262 @@ pub fn apply_standup_usage(
     // only when there is a list to state it for, so a digest that touched no
     // run carries no claim about how its runs were summed.
     digest.usage_basis = (!digest.runs.is_empty()).then(StandupUsageBasis::default);
+}
+
+/// Overlay operator reader-state onto a projected run view: whether it is
+/// archived, and its free-form triage tag.
+///
+/// Kept out of [`query_run`] for the same reason lineage is: the reader-state
+/// store is a different file from the rows, history, and witness this
+/// projection reads, and the handler is where they are joined. Unlike
+/// lineage this never changes `view.state` — reader-state is not a fact
+/// about execution, so it must never read as one.
+pub fn apply_reader_state_to_run(view: &mut RunView, reader_state: &ReaderState) {
+    view.archived = reader_state.is_archived(&view.flow_run_id);
+    view.triage_tag = reader_state
+        .triage_tag(&view.flow_run_id)
+        .map(ToOwned::to_owned);
+}
+
+/// Overlay operator reader-state onto a page of jobs, filtering out jobs
+/// whose *creating* run (the orchestration capsule's `flowRunId`, the same
+/// single source [`crate::query::query_standup`]'s primary attribution uses)
+/// is archived, unless the caller opted in with `include_archived`. Every
+/// item's `archived` field is set first, so a caller who did opt in still
+/// sees which of the returned jobs are archived.
+///
+/// Returns how many jobs this call actually removed — computed from the same
+/// pass that built the returned list, never from a separate count that could
+/// disagree with the rows beside it.
+pub fn apply_reader_state_to_jobs(
+    items: &mut Vec<JobSummary>,
+    reader_state: &ReaderState,
+    include_archived: bool,
+) -> usize {
+    for item in items.iter_mut() {
+        item.archived = item
+            .orchestration
+            .as_ref()
+            .is_some_and(|orchestration| reader_state.is_archived(orchestration.flow_run_id()));
+    }
+    if include_archived {
+        return 0;
+    }
+    let before = items.len();
+    items.retain(|item| !item.archived);
+    before - items.len()
+}
+
+/// Remove every entry `keep` rejects from `items`, adding the number removed
+/// to `hidden`.
+///
+/// Filtering and counting are deliberately ONE operation, and *this* part is
+/// unconditional: a caller cannot remove an entry through this helper without
+/// the removal reaching the counter it passed. Round-2 HIGH-11 found the
+/// previous shape — a `retain` here, a `before`/`after` sum over a
+/// hand-written list of collections there — pinned for exactly one of the
+/// five collections it filtered: dropping `cancelled`, `gate_fails` or
+/// `in_flight` from the sum left the whole suite green while the digest
+/// under-reported what it had withheld.
+///
+/// A sum over the digest's collections still exists — [`filterable_entries`],
+/// which the conservation backstop compares before and after. What changed is
+/// that the sum can no longer silently omit a field: it destructures
+/// `StandupDigest` exhaustively, so a new field is a compile error there
+/// rather than a quiet blind spot. Using this helper is what keeps the two
+/// numbers in agreement; the exhaustive destructure is what keeps the
+/// enumeration honest. Neither alone is the whole guarantee.
+fn retain_counting<T>(items: &mut Vec<T>, hidden: &mut usize, keep: impl FnMut(&T) -> bool) {
+    let before = items.len();
+    items.retain(keep);
+    *hidden += before - items.len();
+}
+
+/// Every entry [`apply_reader_state_to_standup`] could remove, summed across
+/// the digest's filterable collections.
+///
+/// Deliberately written as an exhaustive destructure rather than a sum of
+/// field accesses. Round-3 (MUTATION H) showed why: when the enumerator is a
+/// hand-written list, a removal from a collection it does not mention changes
+/// neither side of the conservation check, so the backstop was blind to
+/// exactly the case it was introduced for. Destructuring without `..` makes a
+/// new `StandupDigest` field a compile error here —
+/// `error[E0027]: pattern does not mention field ...` — so the decision about
+/// whether that field is filterable is *forced and visible*.
+///
+/// What this does **not** buy: an author facing that error can bind the new
+/// field to `_` and move on, and nothing here will notice a bare `retain` on
+/// it later. The honest invariant is only this:
+///
+/// > A new `Vec` field on [`StandupDigest`] does not compile until this
+/// > function names it. Naming it `_` is a deliberate, visible decision that
+/// > the field is not filterable here.
+///
+/// Do not add `..` to this pattern; `..` is precisely the escape hatch that
+/// restores the blindness MUTATION H found.
+fn filterable_entries(digest: &StandupDigest) -> usize {
+    let StandupDigest {
+        schema_version: _,
+        protocol_version: _,
+        window: _,
+        completed,
+        in_flight,
+        reused: _,
+        gate_fails,
+        cancelled,
+        canonical_gpu_seconds: _,
+        runs,
+        archived_hidden: _,
+        archived_runs_hidden: _,
+        // Not a collection of entries: one optional statement about how the
+        // `runs` rollups were summed (#404). Nothing is ever removed *from*
+        // it, so it contributes no filterable entries. It is not independent
+        // of `runs`, though — see the basis clear at the end of
+        // `apply_reader_state_to_standup`.
+        usage_basis: _,
+    } = digest;
+    runs.len() + completed.len() + gate_fails.len() + cancelled.len() + in_flight.len()
+}
+
+/// Overlay operator reader-state onto a stand-up digest, filtering entries
+/// whose creating run is archived unless `include_archived` is set, and
+/// setting [`StandupDigest::archived_hidden`] and
+/// [`StandupDigest::archived_runs_hidden`] to exactly how many *task
+/// entries* and how many *per-run cost rows* this call removed,
+/// respectively — two counts, because they count different lists at
+/// different granularity (one archived run holding three tasks removes one
+/// `runs` row and up to three task entries) and merging them would make
+/// either number a claim about a list it does not describe.
+///
+/// Task-entry attribution uses only the orchestration capsule's
+/// `flowRunId` (the run that *created* the task), not the membership union
+/// [`apply_standup_usage`] also folds into `digest.runs` — reader-state
+/// stays runs-only and single-owner by design (see the issue's non-goals),
+/// so a task attached to an archived run by another run's flow does not
+/// vanish from that other run's stand-up. `digest.runs`, by contrast, is
+/// filtered (and counted) by its own `flowRunId` directly: a run that only
+/// *attached* a task (the W-316 shape) is archived exactly like a run that
+/// created one, and its cost row must not survive un-hidden while its count
+/// stays silently zero.
+///
+/// Both counts are accumulated by [`retain_counting`] as the collections are
+/// filtered, never by a separate recount over `details` or anything else. A
+/// detail whose run is archived but which produced no digest entry at all
+/// (still pending, filtered out by `source`, or otherwise never reached a
+/// bucket) must not be counted: nothing was hidden from a reader who did not
+/// see it in the first place. A recount over `details` cannot tell that
+/// difference; counting what was actually removed always can. See
+/// `apply_reader_state_to_standup_never_counts_an_archived_detail_that_produced_no_digest_entry`
+/// in this module's tests, which fails if this function is rewritten as a
+/// recount.
+///
+/// Two mechanisms hold the counts to the removals, and it is worth being
+/// exact about how far each reaches, because overstating this is a defect
+/// this function has already shipped twice:
+///
+/// - [`retain_counting`] makes counting inseparable from filtering for every
+///   collection routed through it. Unconditional.
+/// - The closing conservation check compares [`filterable_entries`] before
+///   and after against the two counters, catching a removal that bypassed
+///   `retain_counting` — a bare `retain`, or a second predicate on a
+///   collection already filtered. It reaches the fields
+///   `filterable_entries` names, and that enumeration is kept honest by an
+///   exhaustive destructure: a new [`StandupDigest`] field does not compile
+///   until it is named there. It is a `debug_assertions`-only backstop (see
+///   the assertion itself).
+///
+/// What is *not* claimed: that a removal can never miss a counter whatever
+/// collection it lives in. An author who meets the compile error and binds
+/// the new field to `_` has made that decision visibly, but they have made
+/// it, and nothing here revisits it.
+pub fn apply_reader_state_to_standup(
+    digest: &mut StandupDigest,
+    details: &[RowDetailFact],
+    reader_state: &ReaderState,
+    include_archived: bool,
+) -> usize {
+    let flow_run_by_task = details
+        .iter()
+        .filter_map(|detail| {
+            let flow_run = detail.orchestration.as_ref()?.flow_run_id().to_owned();
+            Some((detail.task_uuid.clone(), flow_run))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let entries_before = filterable_entries(digest);
+
+    // `include_archived` is folded into each predicate rather than taken as
+    // an early return, so the conservation check below covers that path too:
+    // an opted-in caller removes nothing and both counts are zero because
+    // nothing was removed, not because a branch skipped the counting.
+    let mut runs_hidden = 0;
+    retain_counting(&mut digest.runs, &mut runs_hidden, |run| {
+        include_archived || !reader_state.is_archived(&run.flow_run_id)
+    });
+    digest.archived_runs_hidden = runs_hidden;
+
+    let keep = |task_uuid: &Option<String>| -> bool {
+        include_archived
+            || !task_uuid
+                .as_ref()
+                .and_then(|task| flow_run_by_task.get(task))
+                .is_some_and(|flow_run| reader_state.is_archived(flow_run))
+    };
+    let mut task_hidden = 0;
+    retain_counting(&mut digest.completed, &mut task_hidden, |entry| {
+        keep(&entry.task_uuid)
+    });
+    retain_counting(&mut digest.gate_fails, &mut task_hidden, |entry| {
+        keep(&entry.task_uuid)
+    });
+    retain_counting(&mut digest.cancelled, &mut task_hidden, |entry| {
+        keep(&entry.task_uuid)
+    });
+    retain_counting(&mut digest.in_flight, &mut task_hidden, |entry| {
+        keep(&entry.task_uuid)
+    });
+    digest.archived_hidden = task_hidden;
+
+    // Every removal across the fields `filterable_entries` names reached a
+    // counter. A `debug_assert` rather than a hard one on purpose: a
+    // mis-accounted count is a correctness bug that the test suite must
+    // refuse, but panicking a live query path over it would trade a slightly
+    // wrong number for an unavailable digest, which is the worse failure for
+    // the operator this surface serves. The consequence is that this check
+    // binds only where `debug_assertions` is on — which includes every
+    // `cargo test` run the gate makes, and excludes a release build. It is a
+    // development-time backstop behind `retain_counting`, not a runtime
+    // guarantee.
+    debug_assert_eq!(
+        entries_before - filterable_entries(digest),
+        digest.archived_hidden + digest.archived_runs_hidden,
+        "every entry apply_reader_state_to_standup removes from a collection \
+         filterable_entries names must reach one of its two counters; an \
+         uncounted removal is exactly the defect archived_hidden and \
+         archived_runs_hidden exist to prevent"
+    );
+
+    // `usage_basis` states how the entries in `runs` were summed (#404), and
+    // `apply_standup_usage` sets it exactly when it leaves a non-empty
+    // `runs`. This function can empty `runs` afterwards, so the basis is
+    // cleared with them: a digest that shows no run must not carry a
+    // statement about how its runs were summed.
+    //
+    // The invariant `StandupDigest::usage_basis` documents — present exactly
+    // when `runs` is non-empty — is therefore a property of the COMPOSITION
+    // of the two calls, not of `apply_standup_usage` alone. It is kept rather
+    // than weakened deliberately. The alternative, "present when the producer
+    // had runs", is a claim about production history, which no consumer can
+    // check against the payload it holds; a reader CAN check this one. What
+    // distinguishes "the window touched no run" from "reader-state hid them
+    // all" is `archived_runs_hidden`, which is still set above.
+    //
+    // Clearing is lossless: `inherit_usage_basis` only fills entries of
+    // `runs`, so with `runs` empty there is nothing left the basis could tell.
+    if digest.runs.is_empty() {
+        digest.usage_basis = None;
+    }
+
+    digest.archived_hidden
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2209,6 +2496,7 @@ fn build_summary(
         }),
         credential_names: detail.map_or_else(Vec::new, |detail| detail.credential_names.clone()),
         trace: TraceAvailability::default(),
+        archived: false,
     }
 }
 
@@ -4482,6 +4770,8 @@ mod tests {
             cancelled: Vec::new(),
             canonical_gpu_seconds: 0.0,
             runs: Vec::new(),
+            archived_hidden: 0,
+            archived_runs_hidden: 0,
             usage_basis: None,
         }
     }
@@ -4813,5 +5103,523 @@ mod tests {
             read.runs[0].usage.cost.basis,
             crate::usage_rollup::ROLLUP_COST_BASIS
         );
+    }
+
+    fn reader_state_fixture(archived: &[(&str, Option<&str>)]) -> ReaderState {
+        use crate::reader_state::set_reader_state;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("reader-state.jsonl");
+        for (flow_run, tag) in archived {
+            set_reader_state(
+                &path,
+                flow_run,
+                crate::reader_state::ReaderStateUpdate {
+                    archived: Some(true),
+                    triage_tag: tag.map(|tag| Some(tag.to_owned())),
+                },
+            )
+            .unwrap();
+        }
+        ReaderState::read(&path).unwrap()
+    }
+
+    #[test]
+    fn apply_reader_state_to_run_exposes_archived_and_tag_without_changing_state() {
+        let flow_run = "00000000-0000-4000-8000-000000000249";
+        let node = flow_node_detail(flow_run, RowStatus::Completed);
+        let witness = terminal_witness(
+            &node.task_uuid,
+            Verdict::Pass,
+            node.orchestration.clone().unwrap(),
+        );
+        let mut view = query_run(
+            flow_run,
+            std::slice::from_ref(&node),
+            &[],
+            &history(),
+            std::slice::from_ref(&witness),
+            parse_timestamp("2026-08-01T10:00:12.000Z").unwrap(),
+            &FlowMembership::default(),
+            &AttestationEvidence::unavailable(),
+        )
+        .unwrap();
+        assert_eq!(view.state, RunState::Complete);
+        assert!(!view.archived);
+        assert_eq!(view.triage_tag, None);
+
+        let reader_state = reader_state_fixture(&[(flow_run, Some("needs-followup"))]);
+        apply_reader_state_to_run(&mut view, &reader_state);
+        assert!(view.archived);
+        assert_eq!(view.triage_tag.as_deref(), Some("needs-followup"));
+        // Reader-state is not a fact about execution: it must never move
+        // `state` the way a durable rollover does.
+        assert_eq!(view.state, RunState::Complete);
+
+        let mut unrelated = view.clone();
+        unrelated.flow_run_id = "00000000-0000-4000-8000-0000000002ff".to_owned();
+        unrelated.archived = false;
+        unrelated.triage_tag = None;
+        apply_reader_state_to_run(&mut unrelated, &reader_state);
+        assert!(!unrelated.archived);
+        assert_eq!(unrelated.triage_tag, None);
+    }
+
+    #[test]
+    fn apply_reader_state_to_jobs_hides_archived_run_jobs_by_default_and_counts_hidden() {
+        let archived_run = "00000000-0000-4000-8000-000000000260";
+        let live_run = "00000000-0000-4000-8000-000000000261";
+        let hidden_node = flow_node_detail(archived_run, RowStatus::Completed);
+        let mut visible_node = flow_node_detail(live_run, RowStatus::Completed);
+        visible_node.task_uuid = "00000000-0000-4000-8000-000000000262".to_owned();
+        let mut items = vec![
+            build_summary(
+                &hidden_node.task_uuid,
+                Some(&hidden_node),
+                None,
+                &[],
+                &[],
+                Vec::new(),
+                &BTreeMap::new(),
+            ),
+            build_summary(
+                &visible_node.task_uuid,
+                Some(&visible_node),
+                None,
+                &[],
+                &[],
+                Vec::new(),
+                &BTreeMap::new(),
+            ),
+        ];
+        let reader_state = reader_state_fixture(&[(archived_run, None)]);
+
+        let mut default_view = items.clone();
+        let hidden = apply_reader_state_to_jobs(&mut default_view, &reader_state, false);
+        assert_eq!(hidden, 1);
+        assert_eq!(default_view.len(), 1);
+        assert_eq!(default_view[0].anchor, visible_node.task_uuid);
+        assert!(!default_view[0].archived);
+
+        let mut included_view = items.clone();
+        let hidden = apply_reader_state_to_jobs(&mut included_view, &reader_state, true);
+        assert_eq!(hidden, 0);
+        assert_eq!(included_view.len(), 2);
+        let flagged = included_view
+            .iter()
+            .find(|item| item.anchor == hidden_node.task_uuid)
+            .unwrap();
+        assert!(flagged.archived);
+        let unflagged = included_view
+            .iter()
+            .find(|item| item.anchor == visible_node.task_uuid)
+            .unwrap();
+        assert!(!unflagged.archived);
+
+        // The returned hidden count always equals what was actually removed
+        // from the list beside it -- never a separately recomputed number.
+        items.clear();
+        assert_eq!(
+            apply_reader_state_to_jobs(&mut items, &reader_state, false),
+            0
+        );
+    }
+
+    #[test]
+    fn apply_reader_state_to_standup_hides_entries_and_runs_and_the_hidden_count_matches_what_it_removed(
+    ) {
+        let archived_run = "00000000-0000-4000-8000-000000000270";
+        let live_run = "00000000-0000-4000-8000-000000000271";
+        let hidden_task = "00000000-0000-4000-8000-000000000272";
+        let visible_task = "00000000-0000-4000-8000-000000000273";
+        let mut hidden_detail = detail(RowStatus::Completed);
+        hidden_detail.task_uuid = hidden_task.to_owned();
+        hidden_detail.orchestration =
+            Some(flow_orchestration(archived_run, 1, "agent-hidden", None));
+        let mut visible_detail = detail(RowStatus::Completed);
+        visible_detail.task_uuid = visible_task.to_owned();
+        visible_detail.orchestration = Some(flow_orchestration(live_run, 1, "agent-visible", None));
+        let details = [hidden_detail, visible_detail];
+
+        let empty_usage = || {
+            roll_up(
+                std::iter::empty::<&str>(),
+                &AttestationEvidence::unavailable(),
+            )
+        };
+
+        let mut digest = standup_fixture(hidden_task);
+        digest.completed.push(crate::query::CompletedEntry {
+            task_uuid: Some(visible_task.to_owned()),
+            task_ref: None,
+            gpu_seconds: None,
+            verdict: Verdict::Pass,
+            session_ref: None,
+            gh_origin: None,
+        });
+        digest.runs = vec![
+            StandupRunUsage {
+                flow_run_id: archived_run.to_owned(),
+                usage: empty_usage(),
+            },
+            StandupRunUsage {
+                flow_run_id: live_run.to_owned(),
+                usage: empty_usage(),
+            },
+        ];
+        let before_completed = digest.completed.len();
+
+        let reader_state = reader_state_fixture(&[(archived_run, None)]);
+        let hidden = apply_reader_state_to_standup(&mut digest, &details, &reader_state, false);
+
+        assert_eq!(hidden, 1);
+        assert_eq!(digest.archived_hidden, 1);
+        // Exactly one `runs` row was archived too, and it must be counted
+        // separately from the task-entry count above.
+        assert_eq!(digest.archived_runs_hidden, 1);
+        // What was actually removed: exactly the archived run's entry, and
+        // exactly one entry short of the pre-filter count -- the hidden
+        // count must not be able to disagree with the rows beside it.
+        assert_eq!(digest.completed.len(), before_completed - 1);
+        assert!(digest
+            .completed
+            .iter()
+            .all(|entry| entry.task_uuid.as_deref() != Some(hidden_task)));
+        assert_eq!(
+            digest
+                .runs
+                .iter()
+                .map(|run| run.flow_run_id.as_str())
+                .collect::<Vec<_>>(),
+            [live_run]
+        );
+
+        // With include_archived, nothing is hidden and both counts say so.
+        let mut included = standup_fixture(hidden_task);
+        included.runs = vec![StandupRunUsage {
+            flow_run_id: archived_run.to_owned(),
+            usage: empty_usage(),
+        }];
+        let hidden = apply_reader_state_to_standup(&mut included, &details, &reader_state, true);
+        assert_eq!(hidden, 0);
+        assert_eq!(included.archived_hidden, 0);
+        assert_eq!(included.archived_runs_hidden, 0);
+        assert_eq!(included.completed.len(), 1);
+        assert_eq!(included.runs.len(), 1);
+    }
+
+    /// The L3/L7 seam: `usage_basis` is present exactly when `runs` is
+    /// non-empty, across the COMPOSITION of the two calls the `query.standup`
+    /// handler makes — not just within either one.
+    ///
+    /// `apply_standup_usage` (#404) sets the basis when it leaves a non-empty
+    /// `runs`; `apply_reader_state_to_standup` (#389) can then hide every run.
+    /// Both lanes tested their own function in isolation and neither gate
+    /// could see the pair, so this asserts the invariant where a consumer
+    /// actually observes it: on the digest the handler hands out, and on the
+    /// wire, where both fields are `skip_serializing_if`-omitted and a basis
+    /// surviving alone would be a statement about runs the payload does not
+    /// contain.
+    #[test]
+    fn standup_usage_basis_is_present_exactly_when_runs_is_after_reader_state_is_applied() {
+        let run = "00000000-0000-4000-8000-0000000004c0";
+        let task = "00000000-0000-4000-8000-000000000250";
+        let details = vec![reconciliation_detail(run)];
+        let records = [scrape_attestation(1, task, 1, 32_842)];
+        let evidence = AttestationEvidence::new(true, &records);
+
+        // As the handler builds it: usage first, so the digest carries a run
+        // and the basis that describes how it was summed.
+        let mut digest = standup_fixture(task);
+        apply_standup_usage(
+            &mut digest,
+            &details,
+            &[],
+            &FlowMembership::default(),
+            &evidence,
+        );
+        assert_eq!(digest.runs.len(), 1);
+        assert!(
+            digest.usage_basis.is_some(),
+            "precondition: a digest with runs states a basis"
+        );
+
+        // Then reader-state, hiding the only run there is.
+        let reader_state = reader_state_fixture(&[(run, None)]);
+        apply_reader_state_to_standup(&mut digest, &details, &reader_state, false);
+
+        assert!(digest.runs.is_empty());
+        assert_eq!(digest.archived_runs_hidden, 1);
+        assert!(
+            digest.usage_basis.is_none(),
+            "a digest that shows no run must state no basis for summing runs"
+        );
+
+        // The wire shape a consumer sees: neither key, and the count that
+        // says the runs were hidden rather than never there.
+        let wire = serde_json::to_value(&digest).unwrap();
+        assert!(wire.get("runs").is_none());
+        assert!(wire.get("usageBasis").is_none());
+        assert_eq!(wire["archivedRunsHidden"], serde_json::json!(1));
+
+        // The other half of "exactly when": a run that survives keeps the
+        // basis, so the clear is conditional on emptiness and not on
+        // reader-state having run at all.
+        let mut kept = standup_fixture(task);
+        apply_standup_usage(
+            &mut kept,
+            &details,
+            &[],
+            &FlowMembership::default(),
+            &evidence,
+        );
+        let untouched = reader_state_fixture(&[]);
+        apply_reader_state_to_standup(&mut kept, &details, &untouched, false);
+        assert_eq!(kept.runs.len(), 1);
+        assert_eq!(kept.archived_runs_hidden, 0);
+        assert!(kept.usage_basis.is_some());
+    }
+
+    /// HIGH-3's exact reproduction: a run that only ATTACHED a task (the
+    /// W-316 shape -- present in `digest.runs` via `apply_standup_usage`'s
+    /// membership union, per its own doc comment, without being that task's
+    /// *creating* run) is archived. Task-entry attribution is
+    /// creating-run-only by design, so `archived_hidden` correctly stays 0
+    /// -- but the attached run's cost row is still removed from `runs`, and
+    /// that removal must not be invisible.
+    #[test]
+    fn apply_reader_state_to_standup_counts_an_attach_only_archived_run_that_hides_no_task_entry() {
+        let creating_run = "00000000-0000-4000-8000-000000000290";
+        let attach_only_run = "00000000-0000-4000-8000-000000000291";
+        let task = "00000000-0000-4000-8000-000000000292";
+        let mut only_detail = detail(RowStatus::Completed);
+        only_detail.task_uuid = task.to_owned();
+        only_detail.orchestration = Some(flow_orchestration(creating_run, 1, "agent-only", None));
+        let details = [only_detail];
+
+        let empty_usage = || {
+            roll_up(
+                std::iter::empty::<&str>(),
+                &AttestationEvidence::unavailable(),
+            )
+        };
+        let mut digest = standup_fixture(task);
+        digest.runs = vec![
+            StandupRunUsage {
+                flow_run_id: creating_run.to_owned(),
+                usage: empty_usage(),
+            },
+            StandupRunUsage {
+                flow_run_id: attach_only_run.to_owned(),
+                usage: empty_usage(),
+            },
+        ];
+
+        let reader_state = reader_state_fixture(&[(attach_only_run, None)]);
+        let hidden = apply_reader_state_to_standup(&mut digest, &details, &reader_state, false);
+
+        assert_eq!(hidden, 0, "no task entry's CREATING run is archived");
+        assert_eq!(digest.archived_hidden, 0);
+        assert_eq!(
+            digest.archived_runs_hidden, 1,
+            "the attach-only run's cost row was removed from `runs` and must be counted"
+        );
+        assert_eq!(
+            digest
+                .runs
+                .iter()
+                .map(|run| run.flow_run_id.as_str())
+                .collect::<Vec<_>>(),
+            [creating_run]
+        );
+    }
+
+    /// HIGH-4: proves `archived_hidden` is a before/after difference over the
+    /// digest's own collections, never a recount over `details`. A detail
+    /// whose run is archived but which produced no digest entry at all
+    /// (still pending, dropped by a `source` filter, or otherwise never
+    /// bucketed by `query_standup`) must contribute nothing to the count --
+    /// nothing was hidden from a reader who never saw it. A recount over
+    /// `details` cannot express that and gets it wrong, which is exactly
+    /// what mutation M1 in the round-1 eval substituted and which survived
+    /// 676/676 tests. This test is the one named in this function's own doc
+    /// comment as failing against that mutation.
+    #[test]
+    fn apply_reader_state_to_standup_never_counts_an_archived_detail_that_produced_no_digest_entry()
+    {
+        let archived_run = "00000000-0000-4000-8000-000000000295";
+        let phantom_task = "00000000-0000-4000-8000-000000000296";
+        let mut phantom = detail(RowStatus::Pending);
+        phantom.task_uuid = phantom_task.to_owned();
+        phantom.orchestration = Some(flow_orchestration(archived_run, 1, "agent-phantom", None));
+        let details = [phantom];
+
+        // The digest never mentions `phantom_task` at all: exactly the
+        // "produced no bucket entry" case.
+        let mut digest = standup_fixture("00000000-0000-4000-8000-000000000297");
+        let reader_state = reader_state_fixture(&[(archived_run, None)]);
+
+        let hidden = apply_reader_state_to_standup(&mut digest, &details, &reader_state, false);
+        assert_eq!(
+            hidden, 0,
+            "the archived detail never appeared in any digest bucket, so nothing was hidden"
+        );
+        assert_eq!(digest.archived_hidden, 0);
+
+        // What a recount over `details` -- mutation M1's exact shape --
+        // would compute instead, and get wrong:
+        let recount = details
+            .iter()
+            .filter(|item| {
+                item.orchestration
+                    .as_ref()
+                    .is_some_and(|o| reader_state.is_archived(o.flow_run_id()))
+            })
+            .count();
+        assert_eq!(recount, 1);
+        assert_ne!(
+            recount, digest.archived_hidden,
+            "a recount over `details` disagrees with what was actually hidden from the \
+             digest -- this is why archived_hidden must stay a before/after difference, \
+             never a recount"
+        );
+    }
+
+    /// Round-2 HIGH-11: `archived_hidden` claims to cover four collections,
+    /// and before this test only `completed` was pinned -- dropping
+    /// `cancelled`, `gate_fails` or `in_flight` from the count left all 679
+    /// tests green while the digest under-reported what it withheld. One
+    /// archived entry is placed in EVERY filtered collection, so no single
+    /// collection can be dropped from the count without this going red.
+    #[test]
+    fn apply_reader_state_to_standup_counts_a_removal_from_every_collection_it_filters() {
+        let archived_run = "00000000-0000-4000-8000-0000000002a0";
+        let empty_usage = || {
+            roll_up(
+                std::iter::empty::<&str>(),
+                &AttestationEvidence::unavailable(),
+            )
+        };
+
+        // One task per bucket, every one created by the archived run.
+        let tasks = [
+            "00000000-0000-4000-8000-0000000002a1",
+            "00000000-0000-4000-8000-0000000002a2",
+            "00000000-0000-4000-8000-0000000002a3",
+            "00000000-0000-4000-8000-0000000002a4",
+        ];
+        let details = tasks
+            .iter()
+            .enumerate()
+            .map(|(index, task)| {
+                let mut detail = detail(RowStatus::Completed);
+                detail.task_uuid = (*task).to_owned();
+                detail.orchestration = Some(flow_orchestration(
+                    archived_run,
+                    u64::try_from(index).unwrap(),
+                    "agent",
+                    None,
+                ));
+                detail
+            })
+            .collect::<Vec<_>>();
+
+        let completed_entry = |task: &str| crate::query::CompletedEntry {
+            task_uuid: Some(task.to_owned()),
+            task_ref: None,
+            gpu_seconds: None,
+            verdict: Verdict::Pass,
+            session_ref: None,
+            gh_origin: None,
+        };
+        let mut digest = standup_fixture(tasks[0]);
+        assert_eq!(digest.completed.len(), 1, "fixture seeds `completed`");
+        digest.gate_fails = vec![completed_entry(tasks[1])];
+        digest.cancelled = vec![completed_entry(tasks[2])];
+        digest.in_flight = vec![crate::query::InFlightEntry {
+            task_uuid: Some(tasks[3].to_owned()),
+            task_ref: None,
+            session_ref: None,
+            state: "running".to_owned(),
+            last_event_at: None,
+            gh_origin: None,
+        }];
+        digest.runs = vec![StandupRunUsage {
+            flow_run_id: archived_run.to_owned(),
+            usage: empty_usage(),
+        }];
+
+        let reader_state = reader_state_fixture(&[(archived_run, None)]);
+        let hidden = apply_reader_state_to_standup(&mut digest, &details, &reader_state, false);
+
+        // One entry removed from each of the four task collections. Drop any
+        // single collection from the count and this is 3, not 4.
+        assert_eq!(hidden, 4);
+        assert_eq!(digest.archived_hidden, 4);
+        assert_eq!(digest.archived_runs_hidden, 1);
+        assert!(digest.completed.is_empty());
+        assert!(digest.gate_fails.is_empty());
+        assert!(digest.cancelled.is_empty());
+        assert!(digest.in_flight.is_empty());
+        assert!(digest.runs.is_empty());
+    }
+
+    /// A *further* predicate on an already-enumerated collection — one this
+    /// test was not written for — must still be caught: the conservation
+    /// check inside `apply_reader_state_to_standup` compares
+    /// `filterable_entries` before and after, so a removal there that
+    /// reaches no counter fails. Round-2 MUT-C is exactly that shape and
+    /// this test catches it.
+    ///
+    /// Note the reach honestly. This test computes `before` and `removed`
+    /// by calling `filterable_entries` itself, so it is exactly as blind as
+    /// that enumerator: it cannot catch a removal from a collection the
+    /// enumerator does not name (round-3 MUTATION H). What stops that case
+    /// is not this test but the exhaustive destructure in
+    /// `filterable_entries`, which turns a new `StandupDigest` field into a
+    /// compile error. Also exercises the opted-in path, where the correct
+    /// answer is "nothing removed, both counts zero".
+    #[test]
+    fn apply_reader_state_to_standup_conserves_entries_between_removals_and_counts() {
+        let archived_run = "00000000-0000-4000-8000-0000000002b0";
+        let task = "00000000-0000-4000-8000-0000000002b1";
+        let mut only = detail(RowStatus::Completed);
+        only.task_uuid = task.to_owned();
+        only.orchestration = Some(flow_orchestration(archived_run, 1, "agent", None));
+        let details = [only];
+        // Carries a triage tag as well as `archived`, so a future edit that
+        // filters on any *other* reader-state property is inside this
+        // test's reach rather than only the daemon-level one's.
+        let reader_state = reader_state_fixture(&[(archived_run, Some("needs-followup"))]);
+        let empty_usage = || {
+            roll_up(
+                std::iter::empty::<&str>(),
+                &AttestationEvidence::unavailable(),
+            )
+        };
+
+        for include_archived in [false, true] {
+            let mut digest = standup_fixture(task);
+            digest.runs = vec![StandupRunUsage {
+                flow_run_id: archived_run.to_owned(),
+                usage: empty_usage(),
+            }];
+            let before = filterable_entries(&digest);
+
+            apply_reader_state_to_standup(&mut digest, &details, &reader_state, include_archived);
+
+            let removed = before - filterable_entries(&digest);
+            assert_eq!(
+                removed,
+                digest.archived_hidden + digest.archived_runs_hidden,
+                "every removal must reach a counter (include_archived={include_archived})"
+            );
+            if include_archived {
+                assert_eq!(removed, 0);
+                assert_eq!(digest.archived_hidden, 0);
+                assert_eq!(digest.archived_runs_hidden, 0);
+            } else {
+                assert_eq!(removed, 2, "one task entry and one run row");
+            }
+        }
     }
 }

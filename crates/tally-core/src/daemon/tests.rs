@@ -13876,4 +13876,263 @@ mod tests {
             })
             .await;
     }
+
+    /// #389: `query.jobs`/`query.run`/`query.standup` filter on archived
+    /// reader-state, and no *daemon* code path writes that file -- only
+    /// `crate::reader_state::set_reader_state`, called here exactly the way
+    /// the `tally reader-state` CLI calls it, off the daemon entirely.
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_run_jobs_and_standup_hide_archived_runs_by_default_and_expose_the_flag() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                const ARCHIVED_RUN: &str = "00000000-0000-4000-8000-000000000389";
+                const LIVE_RUN: &str = "00000000-0000-4000-8000-00000000038a";
+
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut daemon = fs1_daemon(&paths).await;
+
+                let enqueue_node = |flow_run: &'static str, node_label: &'static str| {
+                    let handler = &daemon.handler;
+                    async move {
+                        let admitted = handler
+                            .enqueue_as_client(Some(json!({
+                                "argv": ["true"],
+                                "pool": "slot",
+                                "adapter": "shell",
+                                "source": "manual",
+                                "evidence": ["exit:0"],
+                                "orchestration": {
+                                    "flowName": "test-flow",
+                                    "flowRunId": flow_run,
+                                    "nodeOrdinal": 1,
+                                    "nodeLabel": node_label
+                                }
+                            })))
+                            .await
+                            .unwrap();
+                        admitted["task_uuid"].as_str().unwrap().to_owned()
+                    }
+                };
+                let archived_task = enqueue_node(ARCHIVED_RUN, "agent-archived").await;
+                let live_task = enqueue_node(LIVE_RUN, "agent-live").await;
+                for _ in 0..2 {
+                    let finished = daemon.completion_rx.recv().await.unwrap();
+                    daemon.finish_job(finished).await.unwrap();
+                }
+                daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": archived_task})))
+                    .await
+                    .unwrap();
+                daemon
+                    .handler
+                    .await_job(Some(json!({"task_uuid": live_task})))
+                    .await
+                    .unwrap();
+
+                // Written exactly the way the CLI writes it: a direct call
+                // against the data-dir file, off the daemon's own RPC path.
+                crate::reader_state::set_reader_state(
+                    &crate::reader_state::reader_state_path(&paths.data_dir),
+                    ARCHIVED_RUN,
+                    crate::reader_state::ReaderStateUpdate {
+                        archived: Some(true),
+                        triage_tag: Some(Some("flaky-fixture".to_owned())),
+                    },
+                )
+                .unwrap();
+
+                // `query.run` always exposes the flag and tag; it never
+                // suppresses the single run an operator explicitly asked for.
+                let archived_view = daemon
+                    .handler
+                    .query("query.run", Some(json!({"id": ARCHIVED_RUN})))
+                    .await
+                    .unwrap();
+                assert_eq!(archived_view["archived"], true);
+                assert_eq!(archived_view["triageTag"], "flaky-fixture");
+                let live_view = daemon
+                    .handler
+                    .query("query.run", Some(json!({"id": LIVE_RUN})))
+                    .await
+                    .unwrap();
+                assert_eq!(live_view["archived"], false);
+                assert!(live_view["triageTag"].is_null());
+
+                // `query.jobs` defaults to hiding the archived run's job.
+                let default_jobs = daemon
+                    .handler
+                    .query("query.jobs", Some(json!({})))
+                    .await
+                    .unwrap();
+                let default_anchors = default_jobs["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|item| item["anchor"].as_str().unwrap().to_owned())
+                    .collect::<Vec<_>>();
+                assert!(!default_anchors.contains(&archived_task));
+                assert!(default_anchors.contains(&live_task));
+
+                // `--archived` includes it, and flags it.
+                let all_jobs = daemon
+                    .handler
+                    .query("query.jobs", Some(json!({"archived": true})))
+                    .await
+                    .unwrap();
+                let flagged = all_jobs["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["anchor"] == archived_task)
+                    .expect("archived job present when opted in");
+                assert_eq!(flagged["archived"], true);
+
+                // `query.standup` hides the archived run's entry and its run
+                // rollup by default. `archivedHidden` (task entries) and
+                // `archivedRunsHidden` (per-run cost rows) are two separate
+                // counts -- both say exactly one here -- each computed from
+                // the same pass that filters the list it describes, not a
+                // separate recount.
+                let default_standup = daemon
+                    .handler
+                    .query("query.standup", Some(json!({})))
+                    .await
+                    .unwrap();
+                assert_eq!(default_standup["archivedHidden"], 1);
+                assert_eq!(default_standup["archivedRunsHidden"], 1);
+                let completed = default_standup["completed"].as_array().unwrap();
+                assert!(completed
+                    .iter()
+                    .all(|entry| entry["taskUuid"] != archived_task));
+                assert!(completed.iter().any(|entry| entry["taskUuid"] == live_task));
+                let runs = default_standup["runs"].as_array().unwrap();
+                assert!(runs
+                    .iter()
+                    .all(|run| run["flowRunId"] != ARCHIVED_RUN));
+
+                let all_standup = daemon
+                    .handler
+                    .query("query.standup", Some(json!({"archived": true})))
+                    .await
+                    .unwrap();
+                assert_eq!(all_standup["archivedHidden"], 0);
+                assert_eq!(all_standup["archivedRunsHidden"], 0);
+                assert!(all_standup["completed"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|entry| entry["taskUuid"] == archived_task));
+
+                // Corruption of the reader-state file degrades every reader
+                // above to "nothing is archived" -- it never fails the query.
+                fs::write(
+                    crate::reader_state::reader_state_path(&paths.data_dir),
+                    b"not json at all\n",
+                )
+                .unwrap();
+                let degraded = daemon
+                    .handler
+                    .query("query.run", Some(json!({"id": ARCHIVED_RUN})))
+                    .await
+                    .unwrap();
+                assert_eq!(degraded["archived"], false);
+                let degraded_standup = daemon
+                    .handler
+                    .query("query.standup", Some(json!({})))
+                    .await
+                    .unwrap();
+                assert_eq!(degraded_standup["archivedHidden"], 0);
+                assert_eq!(degraded_standup["archivedRunsHidden"], 0);
+
+                // And the witness ledger is entirely indifferent: corrupting
+                // reader-state does not touch it or its verification.
+                let (report, _) = read_verified_records(&paths.witness_path()).unwrap();
+                assert!(report.ok);
+            })
+            .await;
+    }
+
+    /// #389 MEDIUM-6: `query.jobs`'s pagination cache-key fingerprint must
+    /// include `archived`, so a cursor minted under one archived selection
+    /// can never be followed under the other -- an operator would otherwise
+    /// be served rows their own `--archived`/`--no-archived` filter says are
+    /// absent. Nothing short of driving a real cursor through the daemon
+    /// pins this: `PageCache`'s own fingerprint-mismatch mechanism is
+    /// generic (`pagination::tests::cursors_are_snapshot_bound_and_expire_explicitly`
+    /// proves the cache itself), but nothing previously asserted that the
+    /// `query.jobs` RPC handler actually feeds `archived` into that
+    /// mechanism -- deleting `"archived": params.archived,` from its
+    /// fingerprint `json!` block passed all 676 tests.
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_jobs_cursor_from_one_archived_selection_is_refused_under_the_other() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+
+                // Two jobs, so a `limit: 1` page always mints a `nextCursor`.
+                for _ in 0..2 {
+                    daemon
+                        .handler
+                        .enqueue_as_client(Some(json!({
+                            "argv": ["true"],
+                            "pool": "slot",
+                            "adapter": "shell",
+                            "source": "manual",
+                            "evidence": ["exit:0"]
+                        })))
+                        .await
+                        .unwrap();
+                }
+
+                let first_page = daemon
+                    .handler
+                    .query(
+                        "query.jobs",
+                        Some(json!({"limit": 1, "archived": false})),
+                    )
+                    .await
+                    .unwrap();
+                let cursor = first_page["nextCursor"]
+                    .as_str()
+                    .expect("two rows at limit 1 must mint a continuation cursor")
+                    .to_owned();
+
+                // Following that cursor under the SAME archived selection
+                // works.
+                let same_selection = daemon
+                    .handler
+                    .query(
+                        "query.jobs",
+                        Some(json!({"cursor": cursor, "archived": false})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(same_selection["items"].as_array().unwrap().len(), 1);
+
+                // Following it under the OPPOSITE archived selection must be
+                // refused, not silently served -- exactly the property MEDIUM-6
+                // found unbound.
+                let error = daemon
+                    .handler
+                    .query(
+                        "query.jobs",
+                        Some(json!({"cursor": cursor, "archived": true})),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, WireErrorCode::InvalidParams);
+                assert!(
+                    error.message.contains("different query"),
+                    "{}",
+                    error.message
+                );
+            })
+            .await;
+    }
 }
