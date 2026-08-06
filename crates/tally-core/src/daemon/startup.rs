@@ -495,6 +495,8 @@ impl Daemon {
             dispatch_stall_hook: None,
             #[cfg(test)]
             finish_job_hook: None,
+            #[cfg(test)]
+            startup_report_hook: None,
         })
     }
 }

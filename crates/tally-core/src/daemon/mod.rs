@@ -1032,6 +1032,14 @@ pub struct Daemon {
     dispatch_stall_hook: Option<DispatchStallHook>,
     #[cfg(test)]
     finish_job_hook: Option<FinishJobHook>,
+    /// Receives the startup report line `run_loop` writes before `READY=1`.
+    ///
+    /// `run_loop` consumes the daemon, so the line it actually emits — the
+    /// artefact `doc/src/operating/recovery.md` advertises, and the only
+    /// surface carrying the phase `run_loop` itself opens — is otherwise
+    /// unobservable to a test (#379).
+    #[cfg(test)]
+    startup_report_hook: Option<mpsc::UnboundedSender<String>>,
 }
 
 #[cfg(test)]

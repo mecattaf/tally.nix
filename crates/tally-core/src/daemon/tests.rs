@@ -9332,10 +9332,79 @@ mod tests {
         }
     }
 
+    /// The full phase list, pinned through the line `run_loop` actually emits.
+    ///
+    /// `daemon_open_records_every_startup_phase_in_order` below can only see
+    /// what `Daemon::open` returns, so it stops one phase short:
+    /// `initial-recovery` is opened inside `run_loop`, which is precisely where
+    /// the `initial_lost_pools` / `initial_jobs` / `initial_gh_completions`
+    /// recovery loops live — the pre-`READY` work a later lane is most likely
+    /// to extend. Deleting that phase left the whole suite green, which made
+    /// #379's claim that the list is pinned one level stronger than the code.
+    ///
+    /// This asserts the artefact instead: the rendered report line, in order,
+    /// with the total and the budget it names. `doc/src/operating/recovery.md`
+    /// advertises exactly this string to operators.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_startup_report_line_names_every_phase_including_the_one_run_loop_opens() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut daemon = fs1_daemon(&paths).await;
+                let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+                daemon.startup_report_hook = Some(report_tx);
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                shutdown_tx.send(true).unwrap();
+                daemon.run_until(shutdown_rx).await.unwrap();
+
+                let report = report_rx.try_recv().expect("run_loop reports its startup");
+                assert!(
+                    report.starts_with("startup complete in "),
+                    "unexpected report: {report}"
+                );
+                assert!(
+                    report.contains("of a 90s per-phase budget"),
+                    "unexpected report: {report}"
+                );
+                // Every `name=` token, in the order the line carries them.
+                let phases = report
+                    .split_whitespace()
+                    .filter_map(|token| token.split_once('='))
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    phases,
+                    vec![
+                        "prepare",
+                        "row-migration",
+                        "durable-facts",
+                        "gcroots",
+                        "unit-facts",
+                        "recovery-plan",
+                        "storage",
+                        "lease-engine",
+                        "failure-stderr",
+                        "gh-orphan-sweep",
+                        "install-jobs",
+                        "initial-recovery",
+                    ],
+                    "the report line is what operators read; a phase that vanishes from it \
+                     under-attributes the startup budget silently: {report}"
+                );
+            })
+            .await;
+    }
+
     /// The phase list is a contract, not decoration: it is what a later lane
     /// adding startup work checks its own cost against (#379). Pinning it here
     /// means work added outside a named phase shows up as a failing test
     /// rather than as another silent minute in the journal.
+    ///
+    /// This covers the eleven phases `Daemon::open` owns and fails with the
+    /// offending name visible in the diff; the twelfth is covered by
+    /// `the_startup_report_line_names_every_phase_including_the_one_run_loop_opens`.
     #[tokio::test(flavor = "current_thread")]
     async fn daemon_open_records_every_startup_phase_in_order() {
         let local = LocalSet::new();

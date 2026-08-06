@@ -165,7 +165,12 @@ impl Daemon {
         // only record of where the pre-`READY` minute went; the journal is
         // otherwise silent from `Starting` to the first late-startup warning.
         if let Some(timeline) = self.startup.take() {
-            eprintln!("tally: {}", timeline.finish());
+            let report = timeline.finish();
+            #[cfg(test)]
+            if let Some(hook) = &self.startup_report_hook {
+                let _ = hook.send(report.clone());
+            }
+            eprintln!("tally: {report}");
         }
         let mut result = if let Some(error) = startup_error {
             Err(error)
