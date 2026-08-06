@@ -483,15 +483,15 @@ pub fn run_evidence_gate_with_store(
             spec,
             passed: hash_ok,
             reason: match (hash_ok, expected, artifact_hash.as_deref()) {
-                (true, Some(expected), _) => format!("content hash matches {expected}"),
-                (true, None, Some(actual)) => format!("content hash {actual} recorded"),
+                (true, Some(expected), _) => format!("Matched the content hash {expected}"),
+                (true, None, Some(actual)) => format!("Recorded the content hash {actual}"),
                 (false, Some(expected), Some(actual)) => {
-                    format!("content hash {actual} != declared {expected}")
+                    format!("Mismatched the content hash {actual}, declared {expected}")
                 }
                 (false, Some(expected), None) => {
-                    format!("content hash <none> != declared {expected}")
+                    format!("Hashed no content, declared {expected}")
                 }
-                (false, None, None) => "no artifact to hash".to_owned(),
+                (false, None, None) => "Found no artifact to hash".to_owned(),
                 (false, None, Some(_)) | (true, None, None) => {
                     unreachable!("hash-check truth table is exhaustive")
                 }
@@ -1457,9 +1457,13 @@ mod tests {
     #[test]
     fn evidence_check_reasons_lead_with_a_past_tense_outcome() {
         fn assert_outcome_first(reason: &str, label: &str) {
+            // Regular past tense ends in `-ed`; the irregulars are the ones
+            // this module's own vocabulary uses, mirroring the driver-side
+            // validator's list rather than trying to be exhaustive English.
+            const IRREGULAR: &[&str] = &["Found", "Held", "Kept", "Read", "Saw", "Wrote"];
             let opening = reason.split(' ').next().unwrap_or_default();
             assert!(
-                opening.ends_with("ed"),
+                opening.ends_with("ed") || IRREGULAR.contains(&opening),
                 "{label} reason {reason:?} does not open with a past-tense verb"
             );
             assert!(
@@ -1475,27 +1479,85 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let artifact = temp.path().join("artifact");
         fs::write(&artifact, b"content").unwrap();
+        let actual_hash = hash_artifact_file(&artifact).unwrap();
         const STORE: &str = "/nix/store/00000000000000000000000000000000-first";
+        // `hash:sha256` is included both bare and fixed: they take different
+        // arms of the hash-check truth table, and a scenario carrying neither
+        // would leave those reasons unaudited -- which is the exact narrowness
+        // this test exists to close.
         let evidence = parse(&[
             "exit:0",
             &format!("artifact:{}", artifact.display()),
             &format!("store:{STORE}"),
+            "hash:sha256",
+        ]);
+        let fixed = parse(&[
+            "exit:0",
+            &format!("artifact:{}", artifact.display()),
+            &format!("hash:{actual_hash}"),
         ]);
 
-        // The passing arm: matched exit, recorded span, confirmed artifact,
-        // validated store path -- four of the six.
-        let passing = run_evidence_gate_with_store(
+        // The passing arms: matched exit, recorded span, confirmed artifact,
+        // validated store path, recorded content hash, matched content hash.
+        for spec in [&evidence, &fixed] {
+            let passing = run_evidence_gate_with_store(
+                RunOutcome {
+                    exit_code: 0,
+                    wall_clock_seconds: 0.25,
+                    evidence: spec,
+                },
+                &FakeStore::with_valid([STORE]),
+            );
+            assert!(passing.passed);
+            for check in &passing.checks {
+                assert_outcome_first(&check.reason, &check.spec);
+            }
+        }
+
+        // The failing hash arms: a declared hash that does not match what was
+        // produced, and a declared hash with nothing to hash at all.
+        let other = format!("sha256:{}", "b".repeat(64));
+        let mismatched = parse(&[
+            &format!("artifact:{}", artifact.display()),
+            &format!("hash:{other}"),
+        ]);
+        let unhashable = parse(&[&format!("hash:{other}")]);
+        for spec in [&mismatched, &unhashable] {
+            let failing = run_evidence_gate_with_store(
+                RunOutcome {
+                    exit_code: 0,
+                    wall_clock_seconds: 0.25,
+                    evidence: spec,
+                },
+                &FakeStore::default(),
+            );
+            assert!(!failing.passed);
+            let hash_reason = &failing
+                .checks
+                .iter()
+                .find(|check| check.spec.starts_with("hash:"))
+                .expect("the hash check is present whenever one is declared")
+                .reason;
+            assert_outcome_first(hash_reason, "hash");
+        }
+
+        // The no-artifact-to-hash arm, which neither of the above reaches.
+        let bare = parse(&["hash:sha256"]);
+        let empty = run_evidence_gate_with_store(
             RunOutcome {
                 exit_code: 0,
                 wall_clock_seconds: 0.25,
-                evidence: &evidence,
+                evidence: &bare,
             },
-            &FakeStore::with_valid([STORE]),
+            &FakeStore::default(),
         );
-        assert!(passing.passed);
-        for check in &passing.checks {
-            assert_outcome_first(&check.reason, &check.spec);
-        }
+        let bare_reason = &empty
+            .checks
+            .iter()
+            .find(|check| check.spec == "hash:sha256")
+            .expect("the bare hash check is present")
+            .reason;
+        assert_outcome_first(bare_reason, "hash:sha256");
 
         // The failing arms this module authors: a mismatched exit code and a
         // non-finite witness span. A wrong exit code alone would leave the
