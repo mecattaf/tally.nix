@@ -203,8 +203,9 @@ pub fn is_supersession_code(code: &str) -> bool {
 #[derive(Debug, Clone, Default)]
 pub struct SupersessionDetails<'a> {
     /// The run whose recorded identity is in question. Every raising site in
-    /// this tree knows it; empty renders as `null` rather than as an empty
-    /// string, and suppresses the `remedy` derived from it.
+    /// this tree knows it; blank — empty or whitespace-only, the same test
+    /// `run_script` applies — renders as `null` rather than as a blank string,
+    /// and suppresses the `remedy` derived from it.
     pub flow_run_id: &'a str,
     /// The hash the ledger recorded for the divergent input.
     pub recorded_hash: Option<&'a str>,
@@ -274,19 +275,33 @@ pub fn supersession_error(
 /// diagnostic.
 fn complete_supersession_details(code: &str, details: &mut Map<String, Value>) {
     // A producer that named no run — a foreign client, or a `details` payload
-    // that was not an object — leaves this absent, and an empty string is the
+    // that was not an object — leaves this absent, and a blank string is the
     // same fact written differently. Both render as `null`: an error must not
     // say it does not know which run this is and hand over a command to fix
-    // that run in the same breath.
+    // that run in the same breath. "Blank" is `trim().is_empty()` because that
+    // is what `run_script` already means by it (`engine/mod.rs`); a
+    // whitespace-only id passes a bare `is_empty()` and renders a command that
+    // exits 2 in the operator's hands, which is the defect this guard exists to
+    // prevent, one shape narrower.
     let flow_run_id = details
         .get("flowRunId")
         .and_then(Value::as_str)
-        .filter(|flow_run_id| !flow_run_id.is_empty())
+        .filter(|flow_run_id| !flow_run_id.trim().is_empty())
         .map(ToOwned::to_owned);
     let mut ordered = Map::new();
     for field in SUPERSESSION_DETAIL_FIELDS {
         let value = match field {
-            "flowRunId" => flow_run_id.clone().map_or(Value::Null, Value::String),
+            // A producer that named its run as something other than a string
+            // named one badly, not not at all, and every other member of the
+            // contract keeps whatever the producer sent. Dropping the value
+            // here would make this the one member the completion filters rather
+            // than floors, and would make the doc row's "null only when the
+            // producer named no run" false. No `remedy` is derived from it —
+            // that reads the string form, which this value does not have.
+            "flowRunId" => match details.get("flowRunId") {
+                Some(named) if !named.is_string() => named.clone(),
+                _ => flow_run_id.clone().map_or(Value::Null, Value::String),
+            },
             "divergentInput" => family_divergent_input(code)
                 .map_or(Value::Null, |input| Value::String(input.to_owned())),
             // A remedy is a command an operator can type, so it exists only when
@@ -369,13 +384,26 @@ pub fn supersede_remedy(code: &str, flow_run_id: &str) -> String {
 
 /// The sentence appended to a mid-run identity refusal, naming both why a
 /// byte-identical input can still be refused and the command that clears it.
+///
+/// The command is omitted when no run is named, on the same rule
+/// `complete_supersession_details` applies to the `remedy` member: a refusal
+/// that cannot say which run this is must not hand an operator an invocation
+/// missing the argument that makes it run. `message` is the field a human
+/// actually reads, so the guard has to be here too — every call site in this
+/// tree sits downstream of `run_script`'s `flow-run-id-missing` refusal, but
+/// this function is public and a future one need not.
 #[must_use]
 pub fn identity_refusal_remedy_sentence(code: &str, flow_run_id: &str) -> String {
     let input = divergent_input(code).unwrap_or("input");
-    format!(
+    let why = format!(
         "; the pin covers the exact bytes this runner hashed, so a run recorded by an earlier \
-         tally can be refused for {input} it never changed. Retire the run and start a \
-         successor: {}",
+         tally can be refused for {input} it never changed"
+    );
+    if flow_run_id.trim().is_empty() {
+        return format!("{why}.");
+    }
+    format!(
+        "{why}. Retire the run and start a successor: {}",
         supersede_remedy(code, flow_run_id)
     )
 }

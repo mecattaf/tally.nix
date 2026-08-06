@@ -352,6 +352,24 @@ authorized.
     `expectedHash` / `expectedLabel` — on a real runner's stdout, the first
     live exit-20 assertion in the suite that is not an identity pin.
 
+  - **#401 — the `remedy` guard reaches the field a human reads, and agrees
+    with the repo's own definition of "no run named".** #397 guarded the
+    `remedy` *detail*; `identity_refusal_remedy_sentence`, which embeds the
+    same invocation in the operator-visible `message`, was left unguarded, so
+    a refusal that could not say which run it was about still advertised a
+    `tally flow supersede` missing its `--flow-run-id` value — exit 2 in an
+    operator's hands. It now returns the why-clause without the command. Both
+    guards test blankness as `trim().is_empty()`, which is what `run_script`
+    has always meant by it, so a whitespace-only or flag-shaped `flowRunId`
+    from a foreign producer no longer renders an inert command either. Neither
+    was reachable from any in-tree call site; both functions are public.
+
+    A `flowRunId` a producer sent as something other than a string is now
+    preserved rather than replaced with `null`. Every other member of the
+    contract keeps whatever the producer sent, and "the producer named a run
+    badly" is a different fact from "the producer named no run" — which is
+    what the doc row promises `null` means. No `remedy` is derived from it.
+
 - **The `pi` preset's launch and resume argv could not run (#387).** Both
   ended in `--`, tally's option-terminator convention across presets. pi has
   no end-of-options separator: it rejects one with `Error: Unknown option:
