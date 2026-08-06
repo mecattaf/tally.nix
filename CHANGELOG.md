@@ -342,8 +342,11 @@ authorized.
     and the derived members whose *values* the docs state (`transient`,
     `resolution`, `divergentInput`, and whether a code advertises a `remedy`).
     The `remedy` nullity rule is now stated once, in one wording, in both
-    pages, and the test fails if the two copies drift apart or if the shipped
-    code stops obeying the sentence. `errors.md` names `recordedLabel` and
+    pages. The value that rule states and the member it blames are read out of
+    the sentence and used to drive the check against the code, so the sentence
+    is load-bearing: the two copies drifting apart, a wording that states a
+    different value, a wording that blames a different member, and an empty
+    span all fail. `errors.md` names `recordedLabel` and
     `currentLabel` where it used to say "both labels", so its `replay-divergence`
     row also carries the renamed members. A live daemon-driven
     `replay-divergence` (`flow_live::a_live_replay_divergence_names_the_current_hash_and_label_on_the_wire`)

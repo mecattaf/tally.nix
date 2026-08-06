@@ -18,21 +18,27 @@ use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 use tally_flow::{
-    supersession_details, SupersessionDetails, SUPERSESSION_CODES, SUPERSESSION_DETAIL_FIELDS,
+    supersession_details, with_recovery_facts, FlowError, SupersessionDetails, SUPERSESSION_CODES,
+    SUPERSESSION_DETAIL_FIELDS,
 };
 
 const FLOW_DOC: &str = include_str!("../../../doc/src/flows/submission-and-replay.md");
 const ERROR_DOC: &str = include_str!("../../../doc/src/reference/errors.md");
 
-/// The text between one `<!-- name:start -->` / `<!-- name:end -->` pair.
-fn marked<'a>(doc: &'a str, name: &str) -> &'a str {
+/// The text between one `<!-- name:start -->` / `<!-- name:end -->` pair, and
+/// the text that follows the end marker.
+fn marked_and_after<'a>(doc: &'a str, name: &str) -> (&'a str, &'a str) {
     let (_, after_start) = doc
         .split_once(&format!("<!-- {name}:start -->"))
         .unwrap_or_else(|| panic!("documentation must contain the {name} start marker"));
-    let (marked, _) = after_start
+    after_start
         .split_once(&format!("<!-- {name}:end -->"))
-        .unwrap_or_else(|| panic!("documentation must contain the {name} end marker"));
-    marked
+        .unwrap_or_else(|| panic!("documentation must contain the {name} end marker"))
+}
+
+/// The text between one `<!-- name:start -->` / `<!-- name:end -->` pair.
+fn marked<'a>(doc: &'a str, name: &str) -> &'a str {
+    marked_and_after(doc, name).0
 }
 
 /// Every backticked span in a fragment of prose, in order.
@@ -53,8 +59,22 @@ fn backticked(text: &str) -> Vec<&str> {
 /// build` reports nothing, because that is all valid markdown. The pin has to
 /// carry this itself, so the convention it depends on cannot quietly ship a
 /// broken reference page.
+///
+/// Both ends are checked, because both ends can be wrong and the one that
+/// actually shipped was the *end*: a span that starts below the header leaves a
+/// bodiless table above it, and a span that ends between two rows leaves the
+/// remaining rows as prose below it. Guarding only the start would state an
+/// anti-recurrence guarantee this helper does not provide — which is the same
+/// gap between a claim and its evidence that these pins exist to close.
 fn marked_table<'a>(doc: &'a str, name: &str) -> &'a str {
-    let span = marked(doc, name);
+    let (span, after) = marked_and_after(doc, name);
+    if let Some(next) = after.lines().find(|line| !line.trim().is_empty()) {
+        assert!(
+            !next.trim_start().starts_with('|'),
+            "{name} must wrap the whole table: the end marker is followed by {next:?}, \
+             another table row — a marker inside a table splits it in the rendered book"
+        );
+    }
     let mut lines = span.lines().filter(|line| !line.trim().is_empty());
     let header = lines
         .next()
@@ -104,6 +124,22 @@ fn table_rows(table: &str) -> Vec<Vec<&str>> {
                 .is_some_and(|first| first.starts_with('`') && first.ends_with('`'))
         })
         .collect()
+}
+
+/// The `details` map a fully-informed raising site produces with one member
+/// withheld, completed through the production path.
+///
+/// This is how the nullity rule's *operand* becomes load-bearing: the member the
+/// sentence blames is read out of the sentence and withheld here, so a rule that
+/// blames the wrong member fails rather than passing on a coincidence.
+fn completed_without(code: &str, member: &str) -> Map<String, Value> {
+    let mut error = FlowError::new("FlowReplayError", code, "probe");
+    error.details = fully_populated(code);
+    assert!(
+        error.details.remove(member).is_some(),
+        "{member} is not a member of the completed map"
+    );
+    with_recovery_facts(error).details
 }
 
 /// The `details` map a raising site that knows everything would produce.
@@ -212,8 +248,24 @@ fn the_error_reference_states_the_derived_members_the_code_computes() {
     }
 }
 
+/// The `remedy` nullity rule is stated once, and the code check is driven by
+/// what that sentence says rather than run beside it.
+///
+/// The rule names two things: the value `remedy` takes, and the member whose
+/// absence produces it. Both are read out of the marked span and used to drive
+/// the code check, so the sentence is load-bearing: a span that states a
+/// different value, blames a different member, or states nothing at all fails
+/// here. An earlier version of this test asserted only that the two spans were
+/// identical *to each other* and, separately, that the code returns `null` —
+/// two claims sharing a name and nothing else, under which both public pages
+/// could be emptied or inverted in lockstep and the test still passed.
+///
+/// What it still cannot do is read English: a sentence built from the right
+/// operands but negated ("`null` is never returned when no `flowRunId` is
+/// known") would pass. It binds the rule's operands and its polarity, not its
+/// grammar, and it says so rather than claiming to check the prose.
 #[test]
-fn the_remedy_nullity_rule_is_stated_once_and_is_true() {
+fn the_remedy_nullity_rule_is_stated_once_and_the_code_obeys_the_stated_rule() {
     let flows = marked(FLOW_DOC, "remedy-nullity");
     let errors = marked(ERROR_DOC, "remedy-nullity");
     assert_eq!(
@@ -221,18 +273,51 @@ fn the_remedy_nullity_rule_is_stated_once_and_is_true() {
         "the two pages must state one rule in one wording"
     );
 
-    // And the wording must be true of the shipped code: a refusal that names no
-    // run carries no command, on every member of the family.
-    for code in SUPERSESSION_CODES {
-        let unnamed = supersession_details(code, &SupersessionDetails::default());
-        assert!(
-            unnamed["remedy"].is_null(),
-            "{code}: a refusal naming no run must advertise no command"
-        );
-    }
-    assert!(
-        !fully_populated("script-changed-mid-run")["remedy"].is_null(),
-        "a named run still gets its command"
+    // What the code does, computed before the sentence is read, so the sentence
+    // is checked against behaviour rather than against itself.
+    let unnamed = SUPERSESSION_CODES
+        .iter()
+        .map(|code| {
+            supersession_details(code, &SupersessionDetails::default())["remedy"].to_string()
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        unnamed,
+        BTreeSet::from(["null".to_owned()]),
+        "a refusal naming no run must advertise no command, on every code"
+    );
+    let value = unnamed.into_iter().next().expect("one distinct value");
+
+    // The rule must open on the value the code produces. An emptied span has no
+    // value to open on, and a wording like "always present and always a command"
+    // is describing something other than a `null`.
+    let stated = backticked(flows);
+    assert_eq!(
+        stated.first().copied(),
+        Some(value.as_str()),
+        "the rule must open on the value the code produces (`{value}`), not on {stated:?}"
+    );
+
+    // And it must blame a real contract member — the one whose absence actually
+    // produces that value. Withholding the member the sentence names has to
+    // reproduce it, and a fully-informed refusal has to not.
+    let operand = stated
+        .iter()
+        .find(|token| SUPERSESSION_DETAIL_FIELDS.contains(token))
+        .unwrap_or_else(|| {
+            panic!(
+                "the rule must name the contract member whose absence yields `{value}`: {stated:?}"
+            )
+        });
+    assert_eq!(
+        completed_without("script-changed-mid-run", operand)["remedy"].to_string(),
+        value,
+        "the rule blames {operand}, but withholding it does not yield `{value}`"
+    );
+    assert_ne!(
+        fully_populated("script-changed-mid-run")["remedy"].to_string(),
+        value,
+        "a refusal that supplies {operand} still gets its command"
     );
 }
 

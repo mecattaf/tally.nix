@@ -1898,7 +1898,13 @@ async fn a_live_replay_divergence_names_the_current_hash_and_label_on_the_wire()
                 flow_report(&recorded)["report"]["finalValue"]["disposition"],
                 "created"
             );
-            let recorded_task_uuid = runner_events(&recorded, "node-submitted")[0]["taskUuid"]
+            let recorded_submission = runner_events(&recorded, "node-submitted")[0].clone();
+            let recorded_task_uuid = recorded_submission["taskUuid"].as_str().unwrap().to_owned();
+            // The payload the ledger holds, taken from the *first* runner's own
+            // stdout. This is the independent oracle that tells the two sides of
+            // the divergence apart: the second runner never sees this value
+            // except through the refusal it is being checked against.
+            let ledger_payload_hash = recorded_submission["payloadHash"]
                 .as_str()
                 .unwrap()
                 .to_owned();
@@ -1932,11 +1938,13 @@ async fn a_live_replay_divergence_names_the_current_hash_and_label_on_the_wire()
                 details.keys().map(String::as_str).collect::<Vec<_>>(),
                 SUPERSESSION_DETAIL_FIELDS
             );
-            // The rename, on the wire: the runner's side of the disagreement is
-            // `currentHash`/`currentLabel`, and the pre-rename names are absent.
-            // These four are spelled out rather than read through the constant
-            // on purpose — comparing the wire with the constant the wire is
-            // built from would agree with whatever name the code picked.
+            // The rename, on the wire: the two sides of the disagreement are
+            // named `currentHash`/`currentLabel`, and the pre-rename names are
+            // absent. These four are spelled out rather than read through the
+            // constant on purpose — comparing the wire with the constant the
+            // wire is built from would agree with whatever name the code picked.
+            // Which member holds which side is bound for the hashes below, and
+            // deliberately not for the labels; see there.
             let current_hash = details
                 .get("currentHash")
                 .and_then(Value::as_str)
@@ -1948,6 +1956,26 @@ async fn a_live_replay_divergence_names_the_current_hash_and_label_on_the_wire()
             assert!(current_hash.starts_with("sha256:"));
             assert!(recorded_hash.starts_with("sha256:"));
             assert_ne!(current_hash, recorded_hash);
+            // Which member carries which side, bound against the first runner's
+            // own report rather than against the refusal itself. Asserting only
+            // that the two hashes differ would leave a swap at the raising site
+            // invisible here — which is what the comment above would then be
+            // claiming without evidence.
+            assert_eq!(
+                recorded_hash, ledger_payload_hash,
+                "recordedHash must be the payload the ledger already held"
+            );
+            assert_ne!(
+                current_hash, ledger_payload_hash,
+                "currentHash must be the payload this runner re-derived"
+            );
+            // The labels are pinned by name only. This fixture is structurally
+            // blind to a *label* swap: the recorded and current labels come from
+            // the same unchanged script, so they are the same string here. Making
+            // them differ would mean changing the script between the two runs,
+            // which the startup identity pin refuses before an ordinal is ever
+            // admitted, so no scenario in this suite can see it. The in-process
+            // tests in `tally-flow` cover the label sides.
             assert_eq!(
                 details.get("currentLabel").and_then(Value::as_str),
                 Some("task-ref-child")
