@@ -439,11 +439,11 @@ pub struct CollectionEnvelope<T> {
     /// still reports the true (unfiltered) membership size — so
     /// `flowRunTasks: 1, items: []` for an explicit `--flow-run <archived>`
     /// currently reads as one of the first two cases when it is really the
-    /// third, with nothing in the envelope saying so. Filed as a follow-up
-    /// (see the CHANGELOG's #389 entry) rather than resolved here: whether an
-    /// explicit `--flow-run` filter should withhold archived items at all —
-    /// `query run <id>` deliberately does not — is a design question for a
-    /// ruling, not a doc-comment fix.
+    /// third, with nothing in the envelope saying so. Filed as issue #415
+    /// rather than resolved here: whether an explicit `--flow-run` filter
+    /// should withhold archived items at all — `query run <id>`
+    /// deliberately does not — is a design question for a ruling, not a
+    /// doc-comment fix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow_run_tasks: Option<usize>,
     pub snapshot: QuerySnapshotMetadata,
@@ -1709,6 +1709,43 @@ pub fn apply_reader_state_to_jobs(
     before - items.len()
 }
 
+/// Remove every entry `keep` rejects from `items`, adding the number removed
+/// to `hidden`.
+///
+/// Filtering and counting are deliberately ONE operation. Round-2 HIGH-11
+/// found the previous shape — a `retain` here, a `before`/`after` sum over a
+/// hand-written list of collections there — pinned for exactly one of the
+/// five collections it filtered: dropping `cancelled`, `gate_fails` or
+/// `in_flight` from the sum left the whole suite green while the digest
+/// under-reported what it had withheld. Two things that must agree cannot be
+/// written separately here, so there is no longer a sum to forget a
+/// collection from.
+fn retain_counting<T>(items: &mut Vec<T>, hidden: &mut usize, keep: impl FnMut(&T) -> bool) {
+    let before = items.len();
+    items.retain(keep);
+    *hidden += before - items.len();
+}
+
+/// Every entry [`apply_reader_state_to_standup`] could remove, across every
+/// collection of the digest.
+///
+/// This is the *whole* of what that function is allowed to touch, and it is
+/// the backstop for the case [`retain_counting`] alone cannot prevent: a
+/// future edit that filters something new with a bare `retain`, or a sixth
+/// collection nobody adds here. The conservation check at the end of that
+/// function compares this before and after, so any removal that reaches no
+/// counter is a test failure rather than a silently short list.
+///
+/// **If you add a `Vec` field to [`StandupDigest`], add it here.** An
+/// omission makes the conservation check blind to that field.
+fn filterable_entries(digest: &StandupDigest) -> usize {
+    digest.runs.len()
+        + digest.completed.len()
+        + digest.gate_fails.len()
+        + digest.cancelled.len()
+        + digest.in_flight.len()
+}
+
 /// Overlay operator reader-state onto a stand-up digest, filtering entries
 /// whose creating run is archived unless `include_archived` is set, and
 /// setting [`StandupDigest::archived_hidden`] and
@@ -1730,17 +1767,21 @@ pub fn apply_reader_state_to_jobs(
 /// created one, and its cost row must not survive un-hidden while its count
 /// stays silently zero.
 ///
-/// Both counts are differences over the exact collections being filtered —
-/// `before.len() - after.len()`, taken in this same call — never a separate
-/// recount over `details` or anything else. A detail whose run is archived
-/// but which produced no digest entry at all (still pending, filtered out
-/// by `source`, or otherwise never reached a bucket) must not be counted:
-/// nothing was hidden from a reader who did not see it in the first place.
-/// A recount over `details` cannot tell that difference; a before/after
-/// count of the digest itself always can. See
+/// Both counts are accumulated by [`retain_counting`] as the collections are
+/// filtered, never by a separate recount over `details` or anything else. A
+/// detail whose run is archived but which produced no digest entry at all
+/// (still pending, filtered out by `source`, or otherwise never reached a
+/// bucket) must not be counted: nothing was hidden from a reader who did not
+/// see it in the first place. A recount over `details` cannot tell that
+/// difference; counting what was actually removed always can. See
 /// `apply_reader_state_to_standup_never_counts_an_archived_detail_that_produced_no_digest_entry`
 /// in this module's tests, which fails if this function is rewritten as a
 /// recount.
+///
+/// The closing conservation check is the guarantee that generalises: every
+/// entry this function removes from the digest reaches one of the two
+/// counters, whatever collection it lived in and however many collections a
+/// later edit adds. See [`filterable_entries`].
 pub fn apply_reader_state_to_standup(
     digest: &mut StandupDigest,
     details: &[RowDetailFact],
@@ -1754,44 +1795,52 @@ pub fn apply_reader_state_to_standup(
             Some((detail.task_uuid.clone(), flow_run))
         })
         .collect::<BTreeMap<_, _>>();
-    let runs_before = digest.runs.len();
-    digest
-        .runs
-        .retain(|run| include_archived || !reader_state.is_archived(&run.flow_run_id));
-    let runs_hidden = runs_before - digest.runs.len();
-    if include_archived {
-        digest.archived_hidden = 0;
-        digest.archived_runs_hidden = 0;
-        return 0;
-    }
+    let entries_before = filterable_entries(digest);
+
+    // `include_archived` is folded into each predicate rather than taken as
+    // an early return, so the conservation check below covers that path too:
+    // an opted-in caller removes nothing and both counts are zero because
+    // nothing was removed, not because a branch skipped the counting.
+    let mut runs_hidden = 0;
+    retain_counting(&mut digest.runs, &mut runs_hidden, |run| {
+        include_archived || !reader_state.is_archived(&run.flow_run_id)
+    });
     digest.archived_runs_hidden = runs_hidden;
-    let is_hidden = |task_uuid: &Option<String>| -> bool {
-        task_uuid
-            .as_ref()
-            .and_then(|task| flow_run_by_task.get(task))
-            .is_some_and(|flow_run| reader_state.is_archived(flow_run))
+
+    let keep = |task_uuid: &Option<String>| -> bool {
+        include_archived
+            || !task_uuid
+                .as_ref()
+                .and_then(|task| flow_run_by_task.get(task))
+                .is_some_and(|flow_run| reader_state.is_archived(flow_run))
     };
-    let before = digest.completed.len()
-        + digest.gate_fails.len()
-        + digest.cancelled.len()
-        + digest.in_flight.len();
-    digest
-        .completed
-        .retain(|entry| !is_hidden(&entry.task_uuid));
-    digest
-        .gate_fails
-        .retain(|entry| !is_hidden(&entry.task_uuid));
-    digest
-        .cancelled
-        .retain(|entry| !is_hidden(&entry.task_uuid));
-    digest
-        .in_flight
-        .retain(|entry| !is_hidden(&entry.task_uuid));
-    let after = digest.completed.len()
-        + digest.gate_fails.len()
-        + digest.cancelled.len()
-        + digest.in_flight.len();
-    digest.archived_hidden = before - after;
+    let mut task_hidden = 0;
+    retain_counting(&mut digest.completed, &mut task_hidden, |entry| {
+        keep(&entry.task_uuid)
+    });
+    retain_counting(&mut digest.gate_fails, &mut task_hidden, |entry| {
+        keep(&entry.task_uuid)
+    });
+    retain_counting(&mut digest.cancelled, &mut task_hidden, |entry| {
+        keep(&entry.task_uuid)
+    });
+    retain_counting(&mut digest.in_flight, &mut task_hidden, |entry| {
+        keep(&entry.task_uuid)
+    });
+    digest.archived_hidden = task_hidden;
+
+    // Every removal reached a counter. A `debug_assert` rather than a hard
+    // one on purpose: a mis-accounted count is a correctness bug that the
+    // test suite must refuse, but panicking a live query path over it would
+    // trade a slightly wrong number for an unavailable digest, which is the
+    // worse failure for the operator this surface serves.
+    debug_assert_eq!(
+        entries_before - filterable_entries(digest),
+        digest.archived_hidden + digest.archived_runs_hidden,
+        "every entry apply_reader_state_to_standup removes must reach one of \
+         its two counters; an uncounted removal is exactly the defect \
+         archived_hidden/archived_runs_hidden exist to make impossible"
+    );
     digest.archived_hidden
 }
 
@@ -4962,5 +5011,136 @@ mod tests {
              digest -- this is why archived_hidden must stay a before/after difference, \
              never a recount"
         );
+    }
+
+    /// Round-2 HIGH-11: `archived_hidden` claims to cover four collections,
+    /// and before this test only `completed` was pinned -- dropping
+    /// `cancelled`, `gate_fails` or `in_flight` from the count left all 679
+    /// tests green while the digest under-reported what it withheld. One
+    /// archived entry is placed in EVERY filtered collection, so no single
+    /// collection can be dropped from the count without this going red.
+    #[test]
+    fn apply_reader_state_to_standup_counts_a_removal_from_every_collection_it_filters() {
+        let archived_run = "00000000-0000-4000-8000-0000000002a0";
+        let empty_usage = || {
+            roll_up(
+                std::iter::empty::<&str>(),
+                &AttestationEvidence::unavailable(),
+            )
+        };
+
+        // One task per bucket, every one created by the archived run.
+        let tasks = [
+            "00000000-0000-4000-8000-0000000002a1",
+            "00000000-0000-4000-8000-0000000002a2",
+            "00000000-0000-4000-8000-0000000002a3",
+            "00000000-0000-4000-8000-0000000002a4",
+        ];
+        let details = tasks
+            .iter()
+            .enumerate()
+            .map(|(index, task)| {
+                let mut detail = detail(RowStatus::Completed);
+                detail.task_uuid = (*task).to_owned();
+                detail.orchestration = Some(flow_orchestration(
+                    archived_run,
+                    u64::try_from(index).unwrap(),
+                    "agent",
+                    None,
+                ));
+                detail
+            })
+            .collect::<Vec<_>>();
+
+        let completed_entry = |task: &str| crate::query::CompletedEntry {
+            task_uuid: Some(task.to_owned()),
+            task_ref: None,
+            gpu_seconds: None,
+            verdict: Verdict::Pass,
+            session_ref: None,
+            gh_origin: None,
+        };
+        let mut digest = standup_fixture(tasks[0]);
+        assert_eq!(digest.completed.len(), 1, "fixture seeds `completed`");
+        digest.gate_fails = vec![completed_entry(tasks[1])];
+        digest.cancelled = vec![completed_entry(tasks[2])];
+        digest.in_flight = vec![crate::query::InFlightEntry {
+            task_uuid: Some(tasks[3].to_owned()),
+            task_ref: None,
+            session_ref: None,
+            state: "running".to_owned(),
+            last_event_at: None,
+            gh_origin: None,
+        }];
+        digest.runs = vec![StandupRunUsage {
+            flow_run_id: archived_run.to_owned(),
+            usage: empty_usage(),
+        }];
+
+        let reader_state = reader_state_fixture(&[(archived_run, None)]);
+        let hidden = apply_reader_state_to_standup(&mut digest, &details, &reader_state, false);
+
+        // One entry removed from each of the four task collections. Drop any
+        // single collection from the count and this is 3, not 4.
+        assert_eq!(hidden, 4);
+        assert_eq!(digest.archived_hidden, 4);
+        assert_eq!(digest.archived_runs_hidden, 1);
+        assert!(digest.completed.is_empty());
+        assert!(digest.gate_fails.is_empty());
+        assert!(digest.cancelled.is_empty());
+        assert!(digest.in_flight.is_empty());
+        assert!(digest.runs.is_empty());
+    }
+
+    /// Round-2 HIGH-11's generalisation: the guarantee must survive a
+    /// collection or predicate this test was never written for. The
+    /// conservation check inside `apply_reader_state_to_standup` compares
+    /// `filterable_entries` before and after, so any removal that reaches no
+    /// counter fails there. This test states the invariant explicitly so a
+    /// reader can find it, and exercises the opted-in path too, where the
+    /// correct answer is "nothing removed, both counts zero".
+    #[test]
+    fn apply_reader_state_to_standup_conserves_entries_between_removals_and_counts() {
+        let archived_run = "00000000-0000-4000-8000-0000000002b0";
+        let task = "00000000-0000-4000-8000-0000000002b1";
+        let mut only = detail(RowStatus::Completed);
+        only.task_uuid = task.to_owned();
+        only.orchestration = Some(flow_orchestration(archived_run, 1, "agent", None));
+        let details = [only];
+        // Carries a triage tag as well as `archived`, so a future edit that
+        // filters on any *other* reader-state property is inside this
+        // test's reach rather than only the daemon-level one's.
+        let reader_state = reader_state_fixture(&[(archived_run, Some("needs-followup"))]);
+        let empty_usage = || {
+            roll_up(
+                std::iter::empty::<&str>(),
+                &AttestationEvidence::unavailable(),
+            )
+        };
+
+        for include_archived in [false, true] {
+            let mut digest = standup_fixture(task);
+            digest.runs = vec![StandupRunUsage {
+                flow_run_id: archived_run.to_owned(),
+                usage: empty_usage(),
+            }];
+            let before = filterable_entries(&digest);
+
+            apply_reader_state_to_standup(&mut digest, &details, &reader_state, include_archived);
+
+            let removed = before - filterable_entries(&digest);
+            assert_eq!(
+                removed,
+                digest.archived_hidden + digest.archived_runs_hidden,
+                "every removal must reach a counter (include_archived={include_archived})"
+            );
+            if include_archived {
+                assert_eq!(removed, 0);
+                assert_eq!(digest.archived_hidden, 0);
+                assert_eq!(digest.archived_runs_hidden, 0);
+            } else {
+                assert_eq!(removed, 2, "one task entry and one run row");
+            }
+        }
     }
 }

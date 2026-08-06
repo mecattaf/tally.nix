@@ -68,9 +68,9 @@ authorized.
   separate hidden counts — `archivedHidden` (task entries hidden, across
   `completed`/`gateFails`/`cancelled`/`inFlight`) and `archivedRunsHidden`
   (`runs` cost rows hidden, including a run that only *attached* a task
-  rather than creating it) — each computed from the exact filtering pass
-  that produced the entries beside it, never a separate recount; two
-  window-wide aggregates, `reused` and `canonicalGpuSeconds`, are
+  rather than creating it) — each accumulated as the collections are
+  filtered, by the same call that filters them and never by a separate
+  recount; two window-wide aggregates, `reused` and `canonicalGpuSeconds`, are
   deliberately **not** reader-state filtered and remain window totals. A
   corrupt or missing reader-state store degrades every reader to "nothing is
   archived" rather than failing the query (`ReaderState::read_advisory`),
@@ -88,8 +88,19 @@ authorized.
   and not a recount over `details`, and a third pins the `query.jobs`
   pagination cache-key fingerprint against dropping `archived`. `query jobs
   --flow-run <archived-run>` silently withholding items with no signal in
-  the response is a known follow-up, not fixed in this repair; see
-  `doc/src/operating/observability.md`'s "Archive a run" section.
+  the response is issue #415, not fixed in this repair; the direct-file
+  verbs' data-directory default is issue #416.
+
+  *Round-2 repair:* the "every removal is counted" property was pinned for
+  one of the five collections the filter touches — dropping `cancelled`,
+  `gateFails` or `inFlight` from the count, or adding any further uncounted
+  filter, left the whole suite green while the digest under-reported what it
+  had withheld. Rather than adding one test per hole, filtering and counting
+  are now a single operation (`retain_counting`), and the function closes
+  with a conservation check comparing every filterable entry before and
+  after against the sum of its two counters — so a removal that reaches no
+  counter is a test failure whatever collection it came from, including one
+  a future edit adds.
 
 - **`query run` and `query standup` answer "what did this run cost" (#384).**
   `query.run` gains a `usage` object and `query.standup` gains a `runs` array

@@ -189,7 +189,9 @@ socket — `tally reader-state` never talks to the daemon at all, so pass
 daemon normally runs against `/var/lib/tally/data`. Omitting it against a
 different data directory than the one the daemon reads is not an error — it
 creates a fresh, unrelated store, prints a normal-looking success line, and
-changes nothing any `query` command shows:
+changes nothing any `query` command shows. Making that misdirection harder
+to hit (an env var for the whole direct-file verb family) is tracked as
+issue #416:
 
 ```console
 $ tally reader-state archive <flow-run-uuid> --tag flaky-fixture --data-dir /var/lib/tally/data
@@ -222,9 +224,9 @@ the two numbers would make either a claim about a list it does not describe:
   run that only attached a task still has its cost row hidden and counted
   here even when no task entry moved.
 
-Both are computed from the exact same filter pass that produced the entries
-beside them, never a separate recount — so "the list looks short" is never
-silently indistinguishable from "the list is short." Two window-wide
+Both are accumulated as the collections are filtered, by the same call that
+filters them and never by a separate recount — so "the list looks short" is
+never silently indistinguishable from "the list is short." Two window-wide
 aggregates are the deliberate exception: `reused` and `canonicalGpuSeconds`
 are summed once over the whole window, before either hidden count is
 applied, so an archived run's GPU seconds and reuse count remain in those
@@ -242,7 +244,7 @@ exposes `archived` rather than hiding content, an explicit `--flow-run`
 filter on `query jobs` currently withholds silently. This is a known,
 unresolved tension in the design (`query run`'s own argument is that an
 explicit by-id request must not silently withhold what was asked for) and is
-tracked as a follow-up rather than fixed here.
+tracked as issue #415 rather than fixed here.
 
 A reader-state store that is missing, empty, truncated, or hand-edited into
 garbage degrades every query that consults it to "nothing is archived" rather

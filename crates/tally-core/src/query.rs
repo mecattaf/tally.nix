@@ -886,10 +886,11 @@ pub struct StandupDigest {
     /// archived operator reader-state. Filled by
     /// [`crate::query_v2::apply_reader_state_to_standup`], which owns the
     /// reader-state store this projection has no access to; an unfilled
-    /// digest carries zero rather than a wrong count. Always computed as a
-    /// difference over those four collections in the same call that
-    /// filters them, never from a separate recount — see that function's
-    /// doc comment for why a recount cannot be substituted here.
+    /// digest carries zero rather than a wrong count. Accumulated as those
+    /// four collections are filtered, by the same call that filters them
+    /// and never by a separate recount — see that function's doc comment
+    /// for why a recount cannot be substituted here, and its closing
+    /// conservation check for why no removal can miss a counter.
     ///
     /// This does NOT count `runs` entries removed; see
     /// [`Self::archived_runs_hidden`] for that, a deliberately separate
