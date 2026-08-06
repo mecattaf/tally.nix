@@ -4732,4 +4732,86 @@ mod tests {
         let round_tripped: StandupDigest = serde_json::from_value(wire).unwrap();
         assert_eq!(round_tripped, divergent);
     }
+
+    /// Issue #404, the half a same-build round-trip cannot see: what an omitted
+    /// entry field is filled from.
+    ///
+    /// Filling it from the *reader's* compiled constants makes the digest state
+    /// one thing and every entry in it state another, and it does so silently
+    /// on exactly the fleet this runs on — the coordinator pin is routinely one
+    /// generation behind the workers, so a `query standup` across that gap is
+    /// the normal case, not the exotic one. The producer's own answer travels
+    /// in the payload; the entries have to inherit *that*.
+    ///
+    /// So this deserializes a payload whose `usageBasis` is deliberately not
+    /// this build's constants — which is what a digest from another generation
+    /// looks like — and asserts the entries agree with the payload rather than
+    /// with the reader.
+    #[test]
+    fn acceptance_404_an_omitted_entry_field_is_filled_from_the_payloads_basis_not_the_readers() {
+        let run_a = "00000000-0000-4000-8000-0000000003a0";
+        let shared = "00000000-0000-4000-8000-000000000250";
+        let details = vec![reconciliation_detail(run_a)];
+        let membership = FlowMembership::default();
+        let records = [scrape_attestation(1, shared, 1, 32_842)];
+        let mut digest = standup_fixture(shared);
+        apply_standup_usage(
+            &mut digest,
+            &details,
+            &[],
+            &membership,
+            &AttestationEvidence::new(true, &records),
+        );
+        assert_eq!(digest.runs.len(), 1);
+
+        // A payload from a build whose rollup statements are not ours.
+        let mut wire = serde_json::to_value(&digest).unwrap();
+        wire["usageBasis"]["provenance"] = serde_json::json!("another generation's provenance");
+        wire["usageBasis"]["composition"] = serde_json::json!("another generation's composition");
+        wire["usageBasis"]["costBasis"] = serde_json::json!("another generation's cost basis");
+        // The entries really do omit all three: that is the case under test.
+        assert!(wire["runs"][0]["usage"].get("provenance").is_none());
+        assert!(wire["runs"][0]["usage"].get("composition").is_none());
+        assert!(wire["runs"][0]["usage"]["cost"].get("basis").is_none());
+
+        let read: StandupDigest = serde_json::from_value(wire).unwrap();
+        let basis = read.usage_basis.clone().unwrap();
+        assert_eq!(read.runs[0].usage.provenance, basis.provenance);
+        assert_eq!(read.runs[0].usage.composition, basis.composition);
+        assert_eq!(read.runs[0].usage.cost.basis, basis.cost_basis);
+        // Said the other way round, because this is the failure that matters:
+        // the reader must not have substituted its own strings.
+        assert_ne!(
+            read.runs[0].usage.provenance,
+            crate::usage_rollup::ROLLUP_PROVENANCE
+        );
+        assert_ne!(
+            read.runs[0].usage.composition,
+            crate::usage_rollup::ROLLUP_COMPOSITION
+        );
+        assert_ne!(
+            read.runs[0].usage.cost.basis,
+            crate::usage_rollup::ROLLUP_COST_BASIS
+        );
+
+        // A payload with no basis at all — what a digest produced before
+        // `usageBasis` existed looks like — still reads as this build's
+        // constants rather than as empty strings.
+        let mut legacy = serde_json::to_value(&digest).unwrap();
+        legacy.as_object_mut().unwrap().remove("usageBasis");
+        let read: StandupDigest = serde_json::from_value(legacy).unwrap();
+        assert!(read.usage_basis.is_none());
+        assert_eq!(
+            read.runs[0].usage.provenance,
+            crate::usage_rollup::ROLLUP_PROVENANCE
+        );
+        assert_eq!(
+            read.runs[0].usage.composition,
+            crate::usage_rollup::ROLLUP_COMPOSITION
+        );
+        assert_eq!(
+            read.runs[0].usage.cost.basis,
+            crate::usage_rollup::ROLLUP_COST_BASIS
+        );
+    }
 }

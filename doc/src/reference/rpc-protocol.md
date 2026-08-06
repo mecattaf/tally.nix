@@ -567,7 +567,12 @@ digest-level `usageBasis` object as `{provenance, composition, costBasis}` and o
 entry. They are safe to state once because each has a single writer assigning a compile-time
 constant with no dependence on the run; the omission is nevertheless conditional, so an entry whose
 statement ever differs from the digest's carries its own inline and a reader must prefer the
-entry's. `query.run` returns one rollup and keeps all three inline. A run is touched when the window holds an entry for a task it created
+entry's. Where an entry omits one, its value is the digest's `usageBasis` — that object is the
+**producer's** statement of what its own rollups summed, so a reader must take an omitted field
+from it and must not substitute a constant of its own, which would differ silently whenever the
+reader and the daemon are different generations. A digest that carries no `usageBasis` at all
+predates the field, and only then does a reader fall back to what it knows. `query.run` returns one
+rollup and keeps all three inline. A run is touched when the window holds an entry for a task it created
 *or* a task its durable membership names, so a run that only attached a node is still listed. The
 window selects which runs appear; it does not narrow what is summed, because a run's cost is a
 property of the run and a window-narrowed sum would shrink with the window while still being

@@ -908,9 +908,14 @@ impl Default for StandupUsageBasis {
 /// `query.run` returns one rollup and keeps all three inline; a digest walks
 /// every run history holds, so at 500 runs the repetition was ~325 KB of
 /// identical bytes per response. Omission is conditional, never assumed: a
-/// rollup whose statements differ from the constants carries its own, and a
-/// reader that finds none reconstructs the constants it was compiled with,
-/// which is exactly what the digest-level copy states.
+/// rollup whose statements differ from the constants carries its own inline.
+///
+/// A reader that finds a field omitted takes it from the digest's
+/// `usageBasis` — the producer's copy, which travelled with the payload — and
+/// only from its own compiled constants when the payload states no basis at
+/// all. See [`StandupDigest::inherit_usage_basis`], which is where that
+/// happens: this module cannot see the digest its entry belongs to, so it
+/// leaves an omitted field empty and the digest fills it.
 mod digest_rollup {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -967,27 +972,30 @@ mod digest_rollup {
         .serialize(serializer)
     }
 
+    /// An omitted field deserializes **empty**, not to this build's constant.
+    ///
+    /// Filling it here from `ROLLUP_*` would answer "what did the producer say
+    /// this was a sum over" with the *reader's* strings — silently, and
+    /// wrongly whenever the two builds differ, which on this fleet is the
+    /// normal state rather than the exception. The producer's own answer is in
+    /// the same payload, one level up, so the fill belongs where that is
+    /// visible: [`StandupDigest`]'s `Deserialize`, which calls
+    /// [`StandupDigest::inherit_usage_basis`] before handing the digest out.
+    /// No caller ever observes the empty state.
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<UsageRollup, D::Error> {
         let wire = Wire::deserialize(deserializer)?;
         Ok(UsageRollup {
             authority: wire.authority,
-            provenance: wire
-                .provenance
-                .unwrap_or_else(|| ROLLUP_PROVENANCE.to_owned()),
-            composition: wire
-                .composition
-                .unwrap_or_else(|| ROLLUP_COMPOSITION.to_owned()),
+            provenance: wire.provenance.unwrap_or_default(),
+            composition: wire.composition.unwrap_or_default(),
             coverage: wire.coverage,
             tokens: wire.tokens,
             cost: UsageCostRollup {
                 amount_usd: wire.cost.amount_usd,
                 attempts: wire.cost.attempts,
-                basis: wire
-                    .cost
-                    .basis
-                    .unwrap_or_else(|| ROLLUP_COST_BASIS.to_owned()),
+                basis: wire.cost.basis.unwrap_or_default(),
             },
             caveats: wire.caveats,
         })
@@ -995,7 +1003,7 @@ mod digest_rollup {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase", remote = "Self")]
 pub struct StandupDigest {
     pub schema_version: u32,
     pub protocol_version: u32,
@@ -1017,6 +1025,59 @@ pub struct StandupDigest {
     /// filled by the same function.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_basis: Option<StandupUsageBasis>,
+}
+
+impl StandupDigest {
+    /// Give every entry in `runs` the basis the *producer* stated (#404).
+    ///
+    /// [`digest_rollup`] omits the three constants from each entry and this
+    /// digest states them once, so on the way back in the entries have to be
+    /// told what they were. They are told by `usage_basis` — the copy that
+    /// travelled with the payload — and only by this build's own constants
+    /// when a payload carries no basis at all, which is what a digest produced
+    /// before `usageBasis` existed looks like. The alternative, filling from
+    /// the reader's constants while the payload's basis says otherwise, would
+    /// make the digest state one thing and every entry in it state another,
+    /// across exactly the mixed-generation fleet this runs on.
+    fn inherit_usage_basis(&mut self) {
+        let basis = self.usage_basis.clone().unwrap_or_default();
+        for run in &mut self.runs {
+            if run.usage.provenance.is_empty() {
+                run.usage.provenance.clone_from(&basis.provenance);
+            }
+            if run.usage.composition.is_empty() {
+                run.usage.composition.clone_from(&basis.composition);
+            }
+            if run.usage.cost.basis.is_empty() {
+                run.usage.cost.basis.clone_from(&basis.cost_basis);
+            }
+        }
+    }
+}
+
+impl Serialize for StandupDigest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Unchanged from the derive; `remote = "Self"` only moves it to an
+        // inherent function so the `Deserialize` side below can wrap.
+        StandupDigest::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StandupDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // The inherent `deserialize` the `remote = "Self"` derive above emits,
+        // wrapped so no caller can obtain a digest whose entries were never
+        // reconciled against the basis it carries.
+        let mut digest = StandupDigest::deserialize(deserializer)?;
+        digest.inherit_usage_basis();
+        Ok(digest)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
