@@ -72,9 +72,19 @@ discover the surface a findings file was supposed to cover, and that design
 is intentional. But it means the checker CANNOT independently know an eval
 reviewed anything at all: a manifest with empty `bullets`, empty `files`,
 and no `expected` is schema-valid on exactly the same terms as one that
-covered everything. The success line says so explicitly (see below) --
-"schema-valid" is a real but much weaker claim than "N/N covered," and the
-two must never print as the same word with nothing to tell them apart.
+accounted for everything. Both the success line and the EXIT CODE say so
+(see "Exit codes" below) -- "schema-valid" is a real but much weaker claim,
+and the two cases must be distinguishable without reading English, because
+the consumer this checker exists for is an orchestrator close-out reading a
+status, not a person reading a sentence.
+
+Note what the declared-surface count does and does not say. A declared key
+is *accounted for* when it has an entry; that entry may be `covered`,
+`reused`, or `failed`. So the line reads "N/N bullets accounted for
+(M covered, K reused, F failed)" and never "N/N covered" -- the number of
+declared keys is a count of surfaces the eval WROTE DOWN, not of surfaces it
+verified, and conflating the two is precisely the defect this whole file
+exists to make unrepeatable.
 
 The exact wire shape is designed to make a SECOND embedded copy of this
 schema example a hazard: an eval prompt built by quoting this docstring
@@ -87,13 +97,29 @@ make sure only the real manifest carries the literal marker line.
 
 Usage: eval_manifest_check.py <findings-file.md>...
 
-Exit 0 and a summary line per file when every manifest present is schema-valid
-and has no uncovered surface. Exit 1 and one line per problem otherwise. A
-findings file with no manifest section at all, or with more than one, is
-reported, not silently resolved -- "no manifest," "an invalid manifest," and
-"an ambiguous manifest" are three different failures, and all three are
-failures for a checker whose whole job is proving the eval made this claim
-at all, unambiguously.
+Exit codes (the contract for a mechanical consumer; the worst outcome across
+all files given wins):
+
+    0  every manifest is schema-valid, every declared surface is accounted
+       for, AND both categories declared a surface -- i.e. coverage was
+       actually checked. This is the only code that licenses "the eval
+       covered what it said it would."
+    1  at least one file was refused: schema-invalid, unparsable, missing a
+       manifest, carrying more than one, or declaring a surface with no
+       matching entry.
+    2  usage error (no paths given).
+    3  every manifest is schema-valid, but at least one declared no surface
+       in one or both categories, so its coverage was NOT checked. Schema
+       validity is real; a coverage claim is not available. A close-out that
+       treats 3 as success is asserting something this tool did not verify.
+
+Each success line also carries a stable `coverage=checked` / `coverage=unchecked`
+token for consumers that grep rather than branch on status. A findings file
+with no manifest section at all, or with more than one, is reported, not
+silently resolved -- "no manifest," "an invalid manifest," and "an ambiguous
+manifest" are three different failures, and all three are failures for a
+checker whose whole job is proving the eval made this claim at all,
+unambiguously.
 """
 
 from __future__ import annotations
@@ -114,6 +140,18 @@ ITEM_STATUSES = {"covered", "reused", "failed"}
 ITEM_FAILURE_CLASSES = {"timeout", "budget", "input", "unknown"}
 RUN_STATUSES = {"ok", "failed"}
 RUN_FAILURE_CLASSES = {"timeout", "budget", "crash", "unknown"}
+
+# Exit codes. These are the contract for a mechanical consumer (an
+# orchestrator close-out that "names the checker" per #388's second
+# acceptance bullet); see this module's docstring. The distinction between
+# EXIT_OK and EXIT_COVERAGE_UNCHECKED exists because a close-out reads a
+# status, not English: without it, a manifest that declared no surface to be
+# held to is indistinguishable from one that declared and accounted for
+# everything, which was round-2 HIGH-10.
+EXIT_OK = 0
+EXIT_INVALID = 1
+EXIT_USAGE = 2
+EXIT_COVERAGE_UNCHECKED = 3
 
 
 class ManifestError(Exception):
@@ -195,17 +233,33 @@ def _check_run(run: Any) -> None:
     _require(not extra, f"run has unknown field(s) {sorted(extra)}")
 
 
-def _check_expected(kind: str, expected: Any, actual_keys: set[str]) -> list[str]:
+def _declared_keys(kind: str, expected: Any) -> list[str]:
+    """The DISTINCT keys `expected.<kind>` names, in first-seen order.
+
+    Deduplicated on purpose. `["389:store", "389:store", "389:store"]` names
+    one surface three times, not three surfaces; counting the raw list length
+    would let a manifest inflate its own denominator by repeating itself
+    (round-2 HIGH-9's secondary shape).
+    """
     if expected is None:
         return []
     _require(isinstance(expected, list), f"expected.{kind} must be a list")
     for index, key in enumerate(expected):
-        _require(isinstance(key, str) and key.strip() != "", f"expected.{kind}[{index}] must be a non-empty string")
-    return [key for key in expected if key not in actual_keys]
+        _require(
+            isinstance(key, str) and key.strip() != "",
+            f"expected.{kind}[{index}] must be a non-empty string",
+        )
+    return list(dict.fromkeys(expected))
 
 
 class Report:
-    """The result of checking one manifest: valid or not, plus coverage counts."""
+    """The result of checking one manifest: valid or not, plus coverage counts.
+
+    `covered` / `reused` / `failed` tally EVERY entry in `bullets` + `files`.
+    `declared` and `status_by_key` describe only the subset an `expected`
+    block named, which is the only subset whose completeness this checker can
+    speak to at all.
+    """
 
     def __init__(self) -> None:
         self.errors: list[str] = []
@@ -213,10 +267,29 @@ class Report:
         self.covered = 0
         self.reused = 0
         self.failed = 0
+        # kind -> distinct declared keys, and kind -> key -> that entry's status.
+        self.declared: dict[str, list[str]] = {"bullets": [], "files": []}
+        self.status_by_key: dict[str, dict[str, str]] = {"bullets": {}, "files": {}}
 
     @property
     def ok(self) -> bool:
         return not self.errors and not self.uncovered
+
+    def declared_statuses(self, kind: str) -> dict[str, int]:
+        """How the entries satisfying `expected.<kind>` are actually typed.
+
+        This is the honest basis for any sentence about declared surface:
+        a declared key is *accounted for* when it has an entry, but that
+        entry may say `covered`, `reused`, or `failed`, and only the first
+        of those means what the English word "covered" means.
+        """
+        statuses = self.status_by_key[kind]
+        counts = {"covered": 0, "reused": 0, "failed": 0}
+        for key in self.declared[kind]:
+            status = statuses.get(key)
+            if status in counts:
+                counts[status] += 1
+        return counts
 
 
 def check_manifest(manifest: Any) -> Report:
@@ -231,23 +304,14 @@ def check_manifest(manifest: Any) -> Report:
             _require(kind in manifest, f"manifest is missing '{kind}'")
             _require(isinstance(manifest[kind], list), f"'{kind}' must be a list")
 
-        bullet_keys: set[str] = set()
-        seen_bullets: set[str] = set()
-        for index, entry in enumerate(manifest["bullets"]):
-            key = _check_item("bullets", entry, index)
-            _require(key not in seen_bullets, f"bullets[{index}] duplicates {key!r}")
-            seen_bullets.add(key)
-            bullet_keys.add(key)
-            _tally(report, entry.get("status"))
-
-        file_keys: set[str] = set()
-        seen_files: set[str] = set()
-        for index, entry in enumerate(manifest["files"]):
-            key = _check_item("files", entry, index)
-            _require(key not in seen_files, f"files[{index}] duplicates {key!r}")
-            seen_files.add(key)
-            file_keys.add(key)
-            _tally(report, entry.get("status"))
+        for kind in ("bullets", "files"):
+            seen: set[str] = set()
+            for index, entry in enumerate(manifest[kind]):
+                key = _check_item(kind, entry, index)
+                _require(key not in seen, f"{kind}[{index}] duplicates {key!r}")
+                seen.add(key)
+                report.status_by_key[kind][key] = entry.get("status")
+                _tally(report, entry.get("status"))
 
         _require("run" in manifest, "manifest is missing 'run'")
         _check_run(manifest["run"])
@@ -257,14 +321,14 @@ def check_manifest(manifest: Any) -> Report:
             _require(isinstance(expected, dict), "expected must be an object")
             extra = set(expected) - {"bullets", "files"}
             _require(not extra, f"expected has unknown field(s) {sorted(extra)}")
-            report.uncovered.extend(
-                f"bullet {key!r} is in expected.bullets but has no bullets[] entry"
-                for key in _check_expected("bullets", expected.get("bullets"), bullet_keys)
-            )
-            report.uncovered.extend(
-                f"file {key!r} is in expected.files but has no files[] entry"
-                for key in _check_expected("files", expected.get("files"), file_keys)
-            )
+            for kind, noun in (("bullets", "bullet"), ("files", "file")):
+                declared = _declared_keys(kind, expected.get(kind))
+                report.declared[kind] = declared
+                report.uncovered.extend(
+                    f"{noun} {key!r} is in expected.{kind} but has no {kind}[] entry"
+                    for key in declared
+                    if key not in report.status_by_key[kind]
+                )
     except ManifestError as error:
         report.errors.append(str(error))
     return report
@@ -310,31 +374,43 @@ def find_manifest(text: str) -> Any | None:
     return json.loads(matches[0].group(1))
 
 
-def _coverage_clause(kind: str, expected_value: object) -> str:
+def _coverage_clause(kind: str, report: Report) -> str:
     """What the success line says about ONE `expected` category.
 
+    Never uses the word "covered" for the declared-surface count. A declared
+    key is *accounted for* when it has an entry at all, and `_check_expected`
+    deliberately accepts an entry of any status -- so the number of declared
+    keys says how many surfaces the eval WROTE DOWN, not how many it
+    verified. Rendering that number as "N/N covered" was round-2 HIGH-9: the
+    headline word asserted from presence-of-a-key while `covered` is one of
+    three status terms three tokens later on the same line. The statuses of
+    the entries satisfying the declared keys are printed alongside, so the
+    sentence and the tally can never disagree.
+
     An `expected.<kind>` that is absent, or present but empty, means this
-    manifest made no claim the checker could hold it to for that category --
-    "0/0 covered" would print exactly like "everything named was covered,"
-    which is the reassuring-direction lie HIGH-1 is about. Say plainly that
-    coverage was not checked instead. A non-empty `expected.<kind>` only
-    reaches this function once `check_manifest` has already confirmed every
-    one of its entries matched something in `bullets`/`files` (an unmatched
-    entry is UNCOVERED and makes `report.ok` False, which keeps this
-    function from ever being asked to describe a partial match as if it were
-    whole).
+    manifest made no claim the checker could hold it to for that category.
+    Say plainly that coverage was not checked -- "0/0" would print exactly
+    like "everything named was accounted for," which is the
+    reassuring-direction lie round-1 HIGH-1 was about.
     """
-    count = len(expected_value) if isinstance(expected_value, list) else 0
-    if count == 0:
+    declared = report.declared[kind]
+    if not declared:
         return f"no expected {kind} declared -- {kind} coverage NOT checked"
-    return f"{count}/{count} {kind} covered"
+    statuses = report.declared_statuses(kind)
+    total = len(declared)
+    return (
+        f"{total}/{total} {kind} accounted for "
+        f"({statuses['covered']} covered, {statuses['reused']} reused, "
+        f"{statuses['failed']} failed)"
+    )
 
 
 def main(paths: list[str]) -> int:
     if not paths:
         print("usage: eval_manifest_check.py <findings-file.md>...", file=sys.stderr)
-        return 2
+        return EXIT_USAGE
     failures = 0
+    unchecked = 0
     for raw in paths:
         path = Path(raw)
         text = path.read_text(encoding="utf-8")
@@ -357,18 +433,28 @@ def main(paths: list[str]) -> int:
             print(f"{path}: {error}", file=sys.stderr)
         for gap in report.uncovered:
             print(f"{path}: UNCOVERED: {gap}", file=sys.stderr)
-        if report.ok:
-            expected = manifest.get("expected") if isinstance(manifest, dict) else None
-            expected = expected if isinstance(expected, dict) else {}
-            bullets_clause = _coverage_clause("bullets", expected.get("bullets"))
-            files_clause = _coverage_clause("files", expected.get("files"))
-            print(
-                f"{path}: ok (schema-valid; {bullets_clause}; {files_clause}; "
-                f"covered={report.covered} reused={report.reused} failed={report.failed})"
-            )
-        else:
+        if not report.ok:
             failures += 1
-    return 1 if failures else 0
+            continue
+        checked = bool(report.declared["bullets"]) and bool(report.declared["files"])
+        if not checked:
+            unchecked += 1
+        # `coverage=` is the documented machine token: a consumer greps for
+        # `coverage=checked` rather than for the absence of an English
+        # phrase. The exit code carries the same fact for consumers that
+        # read only the status.
+        print(
+            f"{path}: ok (schema-valid; "
+            f"coverage={'checked' if checked else 'unchecked'}; "
+            f"{_coverage_clause('bullets', report)}; "
+            f"{_coverage_clause('files', report)}; "
+            f"covered={report.covered} reused={report.reused} failed={report.failed})"
+        )
+    if failures:
+        return EXIT_INVALID
+    if unchecked:
+        return EXIT_COVERAGE_UNCHECKED
+    return EXIT_OK
 
 
 if __name__ == "__main__":

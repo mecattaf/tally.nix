@@ -46,14 +46,44 @@ def valid_manifest() -> dict:
 
 
 class FixtureTests(unittest.TestCase):
-    def test_valid_fixture_passes_with_the_strong_coverage_claim(self):
+    def test_valid_fixture_reports_declared_surface_accounted_for_not_covered(self):
+        """Round-2 HIGH-9. This test replaces one that asserted, byte for
+        byte, that `valid.md` prints "3/3 bullets covered" — while one of
+        its three bullet entries is `failed` and one of its two file
+        entries is `reused`. The old assertion did not protect a property;
+        it defended a false sentence. The line must now report what the
+        entries actually say."""
         code, out, err = run_main(FIXTURES / "valid.md")
-        self.assertEqual(code, 0, err)
+        self.assertEqual(code, checker.EXIT_OK, err)
         self.assertIn(
-            "ok (schema-valid; 3/3 bullets covered; 2/2 files covered; "
-            "covered=3 reused=1 failed=1)",
-            out,
+            "3/3 bullets accounted for (2 covered, 0 reused, 1 failed)", out
         )
+        self.assertIn("2/2 files accounted for (1 covered, 1 reused, 0 failed)", out)
+        # The word that caused HIGH-9 must not describe the declared count.
+        self.assertNotIn("bullets covered", out)
+        self.assertNotIn("files covered", out)
+
+    def test_all_declared_failed_fixture_never_says_covered(self):
+        """Round-2 HIGH-9's headline reproduction: every declared surface
+        has an entry, and every one of those entries is `failed`."""
+        code, out, err = run_main(FIXTURES / "all-declared-failed.md")
+        self.assertEqual(code, checker.EXIT_OK, err)
+        self.assertIn(
+            "2/2 bullets accounted for (0 covered, 0 reused, 2 failed)", out
+        )
+        self.assertIn("1/1 files accounted for (0 covered, 0 reused, 1 failed)", out)
+        self.assertNotIn("covered;", out)
+        # And the per-clause breakdown agrees with the whole-manifest tally
+        # on the same line, which is what HIGH-9 said it could not.
+        self.assertIn("covered=0 reused=0 failed=3", out)
+
+    def test_duplicate_declared_keys_do_not_inflate_the_denominator(self):
+        """Round-2 HIGH-9's secondary shape: one surface named three times
+        is one surface."""
+        code, out, err = run_main(FIXTURES / "duplicate-declared-keys.md")
+        self.assertEqual(code, checker.EXIT_OK, err)
+        self.assertIn("1/1 bullets accounted for", out)
+        self.assertNotIn("3/3", out)
 
     def test_missing_file_fixture_is_rejected(self):
         """Proof scenario 1: a manifest that omits a reviewed file."""
@@ -91,19 +121,72 @@ class FixtureTests(unittest.TestCase):
 
     def test_no_expected_surface_fixture_prints_the_weak_claim_not_ok(self):
         """HIGH-1 (round-1 eval): a manifest that reviewed nothing must not
-        print the same bare `ok` a fully-covered manifest gets."""
+        print the same bare `ok` a fully-accounted-for manifest gets."""
         code, out, err = run_main(FIXTURES / "no-expected-surface.md")
-        self.assertEqual(code, 0, err)
+        self.assertEqual(code, checker.EXIT_COVERAGE_UNCHECKED, err)
         self.assertIn("coverage NOT checked", out)
         # And the weak line must be textually distinct from the strong one.
-        strong_code, strong_out, _ = run_main(FIXTURES / "valid.md")
-        self.assertEqual(strong_code, 0)
+        _strong_code, strong_out, _ = run_main(FIXTURES / "valid.md")
         self.assertNotEqual(
             out.split(": ", 1)[1],
             strong_out.split(": ", 1)[1],
             "a reviewed-nothing manifest must not print byte-identically to a "
-            "fully-covered one",
+            "fully-accounted-for one",
         )
+
+    def test_weak_and_strong_cases_are_distinguishable_without_reading_english(self):
+        """Round-2 HIGH-10 (MUTATION G). The round-1 repair made the two
+        success lines textually distinct and left them MECHANICALLY
+        identical: both exited 0 and both matched `: ok`, so the
+        orchestrator close-out that #388's second acceptance bullet names —
+        a consumer that reads an exit status or greps, not English — could
+        not tell "coverage verified" from "coverage not checked."
+
+        Two independent machine signals now separate them: the exit code
+        and the `coverage=` token. Both are asserted here, in both
+        directions, so neither can be collapsed without this failing."""
+        strong_code, strong_out, err = run_main(FIXTURES / "valid.md")
+        weak_code, weak_out, weak_err = run_main(FIXTURES / "no-expected-surface.md")
+
+        self.assertEqual(strong_code, checker.EXIT_OK, err)
+        self.assertEqual(weak_code, checker.EXIT_COVERAGE_UNCHECKED, weak_err)
+        self.assertNotEqual(
+            strong_code,
+            weak_code,
+            "the exit code must separate a checked-coverage manifest from an "
+            "unchecked one; this is the whole of round-2 HIGH-10",
+        )
+
+        self.assertIn("coverage=checked", strong_out)
+        self.assertIn("coverage=unchecked", weak_out)
+        self.assertNotIn("coverage=unchecked", strong_out)
+        self.assertNotIn("coverage=checked", weak_out)
+
+    def test_worst_outcome_across_files_wins_the_exit_code(self):
+        """A close-out passing several findings files must not have a
+        checked one mask an unchecked one, nor an unchecked one mask a
+        refusal."""
+        # checked + unchecked -> unchecked wins.
+        code, _out, _err = run_main(
+            FIXTURES / "valid.md", FIXTURES / "no-expected-surface.md"
+        )
+        self.assertEqual(code, checker.EXIT_COVERAGE_UNCHECKED)
+        # unchecked + refused -> refused wins.
+        code, _out, _err = run_main(
+            FIXTURES / "no-expected-surface.md", FIXTURES / "two-blocks.md"
+        )
+        self.assertEqual(code, checker.EXIT_INVALID)
+
+    def test_partially_declared_surface_is_not_full_coverage(self):
+        """Declaring bullets but no files means files coverage was not
+        checked, so the run does not earn EXIT_OK. A partial declaration
+        reading as a full one is HIGH-10 in miniature."""
+        manifest = valid_manifest()
+        manifest["expected"] = {"bullets": ["388:schema"]}
+        report = checker.check_manifest(manifest)
+        self.assertTrue(report.ok, report.errors)
+        self.assertEqual(report.declared["bullets"], ["388:schema"])
+        self.assertEqual(report.declared["files"], [])
 
     def test_two_blocks_fixture_is_refused_not_silently_graded(self):
         """HIGH-2 (round-1 eval): a findings file that quotes the schema
@@ -199,21 +282,58 @@ class SchemaUnitTests(unittest.TestCase):
         self.assertTrue(any("run" in error for error in report.errors))
 
 
+def clause(kind: str, declared: list[str] | None, entries: dict[str, str]) -> str:
+    """Render one coverage clause from a hand-built report."""
+    report = checker.Report()
+    report.declared[kind] = list(dict.fromkeys(declared or []))
+    report.status_by_key[kind] = dict(entries)
+    return checker._coverage_clause(kind, report)
+
+
 class CoverageClauseTests(unittest.TestCase):
-    """HIGH-1: the success line must say what it actually verified."""
+    """HIGH-1 (weak vs strong) and HIGH-9 (what the strong claim may say)."""
 
     def test_absent_expected_is_not_checked(self):
-        self.assertIn("NOT checked", checker._coverage_clause("bullets", None))
+        self.assertIn("NOT checked", clause("bullets", None, {}))
 
     def test_empty_expected_list_is_not_checked(self):
         """Declaring `expected.bullets: []` must read the same as omitting
-        it entirely -- both are "nothing named," not "0/0 covered."""
-        self.assertIn("NOT checked", checker._coverage_clause("bullets", []))
+        it entirely -- both are "nothing named," not "0/0 accounted for."""
+        self.assertIn("NOT checked", clause("bullets", [], {}))
 
-    def test_non_empty_expected_is_the_strong_claim(self):
-        clause = checker._coverage_clause("files", ["a.rs", "b.rs"])
-        self.assertEqual(clause, "2/2 files covered")
-        self.assertNotIn("NOT checked", clause)
+    def test_declared_surface_is_accounted_for_never_covered(self):
+        """Round-2 HIGH-9. The declared-surface count is a count of
+        surfaces the eval WROTE DOWN. It may only be described as
+        "accounted for," and the statuses of the entries satisfying it must
+        be broken out beside it."""
+        rendered = clause(
+            "files",
+            ["a.rs", "b.rs"],
+            {"a.rs": "covered", "b.rs": "failed"},
+        )
+        self.assertEqual(
+            rendered, "2/2 files accounted for (1 covered, 0 reused, 1 failed)"
+        )
+        self.assertNotIn("NOT checked", rendered)
+
+    def test_a_wholly_failed_declared_surface_reports_zero_covered(self):
+        rendered = clause(
+            "bullets",
+            ["388:a", "388:b"],
+            {"388:a": "failed", "388:b": "failed"},
+        )
+        self.assertIn("2/2 bullets accounted for", rendered)
+        self.assertIn("(0 covered, 0 reused, 2 failed)", rendered)
+        self.assertNotIn("bullets covered", rendered)
+
+    def test_duplicate_declared_keys_collapse_to_one_surface(self):
+        rendered = clause(
+            "bullets",
+            ["389:store", "389:store", "389:store"],
+            {"389:store": "covered"},
+        )
+        self.assertIn("1/1 bullets accounted for", rendered)
+        self.assertNotIn("3/3", rendered)
 
     def test_degenerate_manifest_is_distinguishable_from_full_manifest(self):
         """The exact HIGH-1 reproduction: an eval that reviewed nothing
@@ -226,12 +346,8 @@ class CoverageClauseTests(unittest.TestCase):
         def render(manifest: dict) -> str:
             report = checker.check_manifest(manifest)
             assert report.ok, report.errors
-            expected = manifest.get("expected") or {}
             return "; ".join(
-                [
-                    checker._coverage_clause("bullets", expected.get("bullets")),
-                    checker._coverage_clause("files", expected.get("files")),
-                ]
+                checker._coverage_clause(kind, report) for kind in ("bullets", "files")
             )
 
         self.assertNotEqual(render(empty), render(full))

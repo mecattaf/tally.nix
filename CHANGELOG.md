@@ -31,11 +31,26 @@ authorized.
   *Round-1 repair:* the success line no longer prints a bare `ok` — a
   manifest with no `expected` surface declared (or one declaring only empty
   lists) now says so explicitly ("coverage NOT checked") instead of reading
-  identically to a fully-covered manifest. The checker also now refuses a
-  findings file carrying more than one marked block instead of silently
-  grading the first — the adoption path of quoting this module's own
-  docstring example inside a findings file previously meant the quoted
-  example got graded, not the real manifest.
+  identically to a manifest whose declared surface was fully accounted for.
+  The checker also now refuses a findings file carrying more than one marked
+  block instead of silently grading the first — the adoption path of quoting
+  this module's own docstring example inside a findings file previously
+  meant the quoted example got graded, not the real manifest.
+
+  *Round-2 repair:* the round-1 success line described the **declared**
+  surface count as "N/N covered", but `covered` is one of the schema's three
+  status terms and a declared key is satisfied by an entry of *any* status —
+  so a manifest whose every declared bullet `failed` printed "2/2 bullets
+  covered" beside `failed=3`. The clause now reads
+  `N/N bullets accounted for (M covered, K reused, F failed)`, computed from
+  the statuses of the entries themselves, and declared keys are deduplicated
+  so repeating one cannot inflate the denominator. Separately, the two
+  success cases were textually distinct but **mechanically identical** — both
+  exited 0 and both matched `: ok` — so the orchestrator close-out this
+  checker exists for could not tell them apart. Exit codes are now a
+  documented contract (`0` coverage checked, `1` refused, `2` usage, `3`
+  schema-valid but coverage not checked), and each success line carries a
+  stable `coverage=checked` / `coverage=unchecked` token.
 
 - **Lane: operator conveniences — reader-state (`archived`, a free-form
   triage tag) on flow runs, never set by a run (#389).** A new durable store
