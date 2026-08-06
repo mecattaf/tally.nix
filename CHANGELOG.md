@@ -13,10 +13,14 @@ regime and judged under another.
 
 #### #419 — the second `tally-core --lib` flake population, and what it actually was
 
-Two tests reproduced red on `main` inside the full `-p tally-core --lib` suite
-and green in isolation, at about one full-suite run in thirteen. Both were
-races against sibling tests in the same process, and neither was the mechanism
-the issue proposed.
+**Three** known members, not two: the issue body names two, and a comment on
+the issue names a third in a third module. All three reproduced red on `main`
+inside the full `-p tally-core --lib` suite and green in isolation, at about one
+full-suite run in thirteen to sixteen. All three are races against sibling tests
+in the same process, none is the mechanism the issue proposed, and all three are
+fixed here. They are **three distinct mechanisms**, not one shared one — which
+is the opposite of what the issue's comment expected, and is stated here because
+it bears on whether the population is closed.
 
 - `retention::tests::capture_locks_expire_by_age_only_when_no_holder_has_them`
   released its capture-lock holder by closing the file and immediately asserted
@@ -38,10 +42,26 @@ the issue proposed.
   design, so a terminal `await_job` says nothing about whether it has run. The
   test now calls `drain_post_ack_tasks`, which is what the eleven other tests
   that observe post-ack state already do.
+- `executor::tests::launcher_failure_without_visible_unit_preserves_error_promptly`
+  wrapped the call under test in a 100 ms `tokio::time::timeout` — a wall-clock
+  deadline assumption inside a test that forks and execs a shell script, so a
+  loaded host failed it with `Elapsed(())` while nothing was actually masked.
+  The property is now counted rather than timed: the masked behaviour is
+  `reclaim_identity_exact` entering its retry loop, which inspects the identity
+  201 times or waits out the 60 s launch-visibility timeout, where the prompt
+  path inspects exactly twice. Two orders of magnitude apart, and load cannot
+  perturb a count.
 
-Both fixes remove the window rather than retry through it, and the suite is
+Every fix removes the window rather than retrying through it, and the suite is
 still fully parallel — serializing it stays a non-goal, because a false red is
 cheap and a false green must remain impossible.
+
+**The population is not declared closed.** "Latent parallel-execution flakes" is
+not an enumerable set, the three known members turned out to have three
+unrelated mechanisms rather than one, and the exit criterion the issue states is
+a measured rate over a wave — which no single lane can observe. Three known
+members are fixed and each is proven under the load condition the issue names;
+the issue stays open for that wave-scale verification.
 
 #### #379 — the startup budget is per phase now, and it says where the time went
 
@@ -63,7 +83,9 @@ late-startup warning, so the 61 s could be measured but not attributed.
   the durable artefact: the next lane that adds startup work has a number to
   check against, and is expected to add a phase of its own so its cost is
   attributable rather than folded into a neighbour's. The phase list is pinned
-  by a test for the same reason.
+  by two tests for the same reason — one over what `Daemon::open` returns, and
+  one over the rendered report line `run_loop` actually emits, which is the only
+  surface carrying the phase `run_loop` itself opens.
 - Both modules now declare `TimeoutStartSec = "90s"` on the daemon unit,
   matching `daemon::startup::STARTUP_PHASE_BUDGET`, so the limit is a choice
   the module made rather than whichever default the manager carried.

@@ -1,6 +1,7 @@
 use std::ffi::CString;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use super::*;
 use crate::taskdb::{
@@ -2249,9 +2250,36 @@ async fn launcher_failure_without_visible_unit_preserves_error_promptly() {
         .with_systemd_run(systemd_run)
         .with_unit_probe(AbsentProbe);
 
-    let result = tokio::time::timeout(Duration::from_millis(100), executor.execute(request()))
-        .await
-        .expect("launcher failure was masked by reservation reclaim");
+    // "Promptly" is counted, not timed (#419). The masked behaviour this test
+    // exists to catch is `reclaim_identity_exact` entering its retry loop
+    // because the reservation is still held: with an absent unit that loop
+    // inspects the identity once per iteration, 201 times before it gives up,
+    // or for the whole 60 s `LAUNCH_VISIBILITY_TIMEOUT` if a launch was
+    // registered. The prompt path inspects exactly twice -- once in `execute`'s
+    // pre-launch check, once in `reclaim_identity_exact` before it observes the
+    // dropped reservation and returns.
+    //
+    // The previous form asserted a 100 ms wall clock, which is a deadline
+    // assumption inside a test that forks and execs a shell script, so a loaded
+    // host failed it with `Elapsed(())` while nothing was masked. Counting the
+    // probe separates the two states by two orders of magnitude and cannot be
+    // perturbed by load at all.
+    #[derive(Clone)]
+    struct CountingAbsentProbe(Arc<AtomicUsize>);
+    impl LocalUnitProbe for CountingAbsentProbe {
+        fn inspect(
+            &self,
+            unit: &str,
+            _paths: &ExecutionPaths,
+        ) -> Result<LocalUnitFact, ExecutorError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(LocalUnitFact::absent(unit))
+        }
+    }
+    let inspections = Arc::new(AtomicUsize::new(0));
+    let executor = executor.with_unit_probe(CountingAbsentProbe(Arc::clone(&inspections)));
+
+    let result = executor.execute(request()).await;
     assert!(
         matches!(
             result,
@@ -2261,6 +2289,12 @@ async fn launcher_failure_without_visible_unit_preserves_error_promptly() {
             })
         ),
         "unexpected launcher result: {result:?}"
+    );
+    assert_eq!(
+        inspections.load(Ordering::Relaxed),
+        2,
+        "the launcher failure went through reclaim's retry loop instead of past it; \
+         a prompt return inspects the identity exactly twice, a masked one at least 201 times"
     );
 }
 
