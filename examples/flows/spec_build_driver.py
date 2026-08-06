@@ -159,6 +159,66 @@ NARRATION_CLOSING_KEYWORD = re.compile(
 )
 NARRATION_MENTION = re.compile(r"(?<![0-9A-Za-z._-])@[0-9A-Za-z][0-9A-Za-z-]*")
 
+# #385: the managed-agents content guidelines the chips-and-log rendering
+# assumes -- an outcome-first leading sentence, a past-tense opening verb, no
+# exclamation, a bounded length -- made machine-checkable and applied to every
+# prose surface that crosses the publish boundary: PR prose (the narrate
+# slot's proposal body), the closing summary, and steering notes. One
+# validator, three callers, so the contract lives in exactly one place.
+OUTCOME_FIRST_LIST_MARKER = re.compile(r"^\s*(?:[-*]\s+|\d+[.)]\s+)")
+# Regular past-tense verbs end in "ed"; the irregulars below are the ones this
+# driver's own templates and a steward's plausible vocabulary actually use.
+# The set is deliberately not exhaustive prose-wide -- it only has to cover
+# what a campaign's own surfaces say -- and growing it never tightens an
+# already-accepted proposal, only widens what a future one may open with.
+OUTCOME_FIRST_IRREGULAR_VERBS = frozenset(
+    {
+        "began", "bound", "brought", "bought", "built", "came", "caught",
+        "chose", "cut", "did", "fell", "found", "gave", "grew", "held",
+        "hit", "kept", "knew", "left", "lost", "made", "met", "put", "ran",
+        "read", "said", "sat", "saw", "sent", "set", "shut", "spent",
+        "stood", "sold", "sought", "spoke", "spent", "taught", "thought",
+        "took", "understood", "went", "won", "wrote",
+    }
+)
+OUTCOME_FIRST_VERB = re.compile(
+    r"^(?:[A-Za-z]+ed|" + "|".join(sorted(OUTCOME_FIRST_IRREGULAR_VERBS)) + r")\b",
+    re.IGNORECASE,
+)
+OUTCOME_FIRST_LEAD_MAX = 240
+
+
+def validate_outcome_first(text: Any, *, max_chars: int, context: str) -> str | None:
+    """The machine-checkable half of the managed-agents content contract.
+
+    Returns `None` when `text` satisfies it, or the one reason it does not.
+    The four checks are independent and each names itself: a leading sentence
+    (ending `.` or `:`) precedes any list rather than a list opening the text,
+    that sentence opens with a past-tense verb, nothing in the text carries an
+    exclamation mark, and the whole text stays under `max_chars`. Applied
+    uniformly whether the text is steward-proposed or driver-rendered, so a
+    template that drifts from its own contract fails loudly instead of
+    shipping unchecked.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return f"{context} must be non-empty text"
+    if len(text) > max_chars:
+        return f"{context} is over the {max_chars} character cap"
+    if "!" in text:
+        return f"{context} contains an exclamation mark"
+    first_line = text.strip().split("\n", 1)[0].strip()
+    if OUTCOME_FIRST_LIST_MARKER.match(first_line):
+        return f"{context} must open with a sentence, not a list"
+    first_sentence = re.split(r"(?<=[.:])\s", first_line, maxsplit=1)[0].strip()
+    if not first_sentence.endswith((".", ":")):
+        return f"{context} leading sentence must end with a period"
+    if len(first_sentence) > OUTCOME_FIRST_LEAD_MAX:
+        return f"{context} leading sentence is over {OUTCOME_FIRST_LEAD_MAX} characters"
+    opening = re.match(r"^[A-Za-z]+", first_sentence)
+    if not opening or not OUTCOME_FIRST_VERB.match(opening.group(0)):
+        return f"{context} must open with a past-tense verb"
+    return None
+
 
 class DriverError(RuntimeError):
     pass
@@ -983,16 +1043,57 @@ def validated_narration(value: Any) -> tuple[dict[str, str] | None, str | None]:
             return None, "proposal contains a GitHub closing keyword"
         if NARRATION_MENTION.search(text):
             return None, "proposal contains an @mention"
+    if body:
+        # The body is PR prose (§3's crossing point splices it into the pull
+        # request) as well as the squash commit body, so it is where the
+        # outcome-first content contract applies -- the header stays
+        # conventional-commit-shaped (lower-case, no trailing period), which
+        # is a different, narrower grammar than a sentence. Checked last: a
+        # forged marker or trailer is the more serious refusal and names
+        # itself first when a proposal manages to trip both.
+        outcome_reason = validate_outcome_first(
+            body, max_chars=NARRATION_BODY_MAX, context="proposal body"
+        )
+        if outcome_reason:
+            return None, outcome_reason
     return {"subject": header, "body": body}, None
 
 
-def template_narration(task: dict[str, Any]) -> dict[str, Any]:
-    """The brief-derived fallback: exactly the pre-steward publication text."""
+def template_narration(task: dict[str, Any], *, body: str = "") -> dict[str, Any]:
+    """The brief-derived fallback: exactly the pre-steward publication text.
+
+    `body` defaults to empty: no steward configured, nothing to say. A
+    narrate() call that spent both attempts passes a durable fallback note
+    instead (#385) -- refusing loudly beats degrading silently, so the fact
+    that the fallback fired is never silent.
+    """
     return {
         "source": "template",
         "subject": f"{task['id']}: {task['title']}",
-        "body": "",
+        "body": body,
     }
+
+
+def narration_fallback_note(transcript: list[dict[str, Any]]) -> str:
+    """The durable fact a steward's narration fallback fires (#385).
+
+    Bounded and deterministic -- built from the driver's own rejection
+    reasons, never from the model's raw, unvalidated text -- and itself
+    outcome-first grammar-shaped, so it survives being spliced into the same
+    PR body and squash commit the steward's own prose would have occupied.
+    """
+    reasons = "; ".join(
+        f"attempt {entry['attempt']} ({entry['status']}): {entry['reason']}"
+        for entry in transcript
+        if entry.get("reason")
+    )
+    note = (
+        f"Rejected {len(transcript)} steward narration proposal(s) and used "
+        f"the task-id template instead. Reasons: {reasons}."
+    )
+    if len(note) > NARRATION_BODY_MAX:
+        note = note[: NARRATION_BODY_MAX - 1].rstrip() + "…"
+    return note
 
 
 def narrate(
@@ -1071,7 +1172,13 @@ def narrate(
             continue
         transcript.append({"attempt": attempt, "status": "accepted", "reason": None})
         return {"source": "steward", **narration}, transcript
-    return template_narration(task), transcript
+    fallback_body = narration_fallback_note(transcript)
+    self_check = validate_outcome_first(
+        fallback_body, max_chars=NARRATION_BODY_MAX, context="narration fallback note"
+    )
+    if self_check:
+        fail(f"narration fallback note violates its own grammar: {self_check}")
+    return template_narration(task, body=fallback_body), transcript
 
 
 def forge_gates(value: Any) -> list[dict[str, Any]]:
@@ -2817,22 +2924,39 @@ def render_campaign_summary(digest: dict[str, Any]) -> str:
     # keeps the one-line form it always had.
     worklist_source = digest["source"]
     worklist_repository = worklist_source.get("repository")
+    # #385: the closing summary is driver-rendered, not steward-proposed, but
+    # the outcome-first content contract governs it the same as PR prose and
+    # steering notes -- the outcome leads, in a past-tense sentence, before
+    # the provenance detail. `validate_outcome_first` below is a self-check:
+    # a future edit that drifts from the contract fails this node loudly
+    # instead of publishing a summary nothing enforced.
+    outcome_sentence = (
+        f"Settled {settled} of {digest['taskCount']} task(s) against durable "
+        "merge/checkpoint facts."
+    )
+    provenance_sentence = (
+        f"Worklist `{worklist_source['sha256']}` at "
+        f"`{worklist_source['revision']}`."
+        if worklist_repository is None
+        else (
+            f"Worklist `{worklist_source['sha256']}` at "
+            f"`{worklist_source['revision']}` in `{worklist_repository}`; "
+            f"code base `{digest['baseRevision']}` in "
+            f"`{digest['repository']}`."
+        )
+    )
+    outcome_reason = validate_outcome_first(
+        f"{outcome_sentence}\n{provenance_sentence}",
+        max_chars=2_000,
+        context="closing summary intro",
+    )
+    if outcome_reason:
+        fail(f"closing summary intro violates the outcome-first grammar: {outcome_reason}")
     lines = [
         heading,
         "",
-        (
-            f"Worklist `{worklist_source['sha256']}` at "
-            f"`{worklist_source['revision']}`."
-            if worklist_repository is None
-            else (
-                f"Worklist `{worklist_source['sha256']}` at "
-                f"`{worklist_source['revision']}` in `{worklist_repository}`; "
-                f"code base `{digest['baseRevision']}` in "
-                f"`{digest['repository']}`."
-            )
-        ),
-        f"{settled} of {digest['taskCount']} task(s) are bound to durable "
-        "merge/checkpoint facts.",
+        outcome_sentence,
+        provenance_sentence,
         "",
     ]
     if not complete:
@@ -3482,6 +3606,55 @@ def steering_thread(
     }
 
 
+FORBID_PATHS_DETAIL = re.compile(
+    r'forbidPaths gate \S+ rejected \d+ changed path\(s\): "((?:[^"\\]|\\.)*)"'
+)
+
+
+def gate_evidence_requirements(evidence: Any) -> tuple[str | None, str | None]:
+    """What a steering note must name, when gate evidence supplies it (#385).
+
+    Returns `(required_id, required_path)`, either half `None` when the
+    caller supplied nothing to require. `evidence` is
+    `{"id": <failing check id>, "detail": <raw gate failure text>}`: the id
+    is always structural (the failing gate's own identifier, e.g. from
+    `failure.stage`); the path is extracted only when the detail is shaped
+    like a `forbidPaths` rejection (`evaluate_forbid_paths`'s own message
+    format), since that is the only gate kind this driver runs that names an
+    offending path at all.
+    """
+    if not isinstance(evidence, dict):
+        return None, None
+    gate_id = evidence.get("id")
+    gate_id = gate_id if isinstance(gate_id, str) and gate_id else None
+    detail = evidence.get("detail")
+    path = None
+    if isinstance(detail, str):
+        matched = FORBID_PATHS_DETAIL.search(detail)
+        if matched:
+            path = matched.group(1)
+    return gate_id, path
+
+
+def diagnosis_fallback_note(reason: str, gate_id: str | None, path: str | None) -> str:
+    """The durable fact a steering note's validation failure fires (#385).
+
+    Deterministic and never model-authored -- built only from the driver's
+    own rejection reason and the gate evidence it was already given -- and
+    itself outcome-first shaped, so it survives being posted in the same
+    comment the rejected diagnosis would have occupied. AUGUST-02: refusing
+    loudly beats degrading silently, so this is never a silent template.
+    """
+    where = ""
+    if gate_id:
+        where = f" Investigate check {gate_id!r} directly"
+        where += f", path {path!r}." if path else "."
+    note = f"Rejected the steward's diagnosis: {reason}.{where}"
+    if len(note) > MAX_DIAGNOSIS_CHARS:
+        note = note[: MAX_DIAGNOSIS_CHARS - 1].rstrip() + "…"
+    return note
+
+
 def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     brief, capabilities = take_capabilities(brief)
     fields = {
@@ -3495,6 +3668,8 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     }
     if "taskIssue" in brief:
         fields.add("taskIssue")
+    if "gateEvidence" in brief:
+        fields.add("gateEvidence")
     data = object_exact(brief, seam_fields(brief, fields), "steer brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
@@ -3546,6 +3721,22 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     )
     diagnosis, redacted = redact_public_text(diagnosis)
     diagnosis = bound_public_diagnosis(diagnosis)
+    # #385: the same content contract that governs PR prose governs a
+    # steering note, plus a constructive-correction shape -- it must name the
+    # failing check (and offending path, when the gate evidence names one)
+    # rather than describe the failure in the abstract. A validation failure
+    # spends the attempt exactly as an unusable steward proposal spends the
+    # narrate slot, and the fallback is never a silent template.
+    required_id, required_path = gate_evidence_requirements(data.get("gateEvidence"))
+    validation_reason = validate_outcome_first(
+        diagnosis, max_chars=MAX_DIAGNOSIS_CHARS, context="diagnosis"
+    )
+    if not validation_reason and required_id and required_id not in diagnosis:
+        validation_reason = f"diagnosis omits the failing check id {required_id!r}"
+    if not validation_reason and required_path and required_path not in diagnosis:
+        validation_reason = f"diagnosis omits the offending path {required_path!r}"
+    if validation_reason:
+        diagnosis = diagnosis_fallback_note(validation_reason, required_id, required_path)
     marker = diagnosis_marker(campaign, issue["number"], task_id, attempt)
     body = f"{marker}\n\n{diagnosis_heading(task_id, attempt)}\n\n{diagnosis}"
     if config["forge"] == "github":

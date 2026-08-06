@@ -454,7 +454,7 @@ class TwoRepositoryCampaign(unittest.TestCase):
                 "issue": {"number": "7", "url": "local://acme/board/issues/7"},
                 "taskId": "task-1",
                 "attempt": 1,
-                "diagnosis": "The lane needs a narrower change.",
+                "diagnosis": "Diagnosed a lane that needs a narrower change.",
                 "specRepository": self.spec.coordinate,
                 "issueRepository": self.issues.coordinate,
             }
@@ -615,7 +615,7 @@ class IssueDefaultsToTheSpecRepository(unittest.TestCase):
                 "issue": {"number": "7", "url": "local://acme/spec/issues/7"},
                 "taskId": "task-1",
                 "attempt": 1,
-                "diagnosis": "Narrow the change.",
+                "diagnosis": "Narrowed the change.",
                 "specRepository": self.spec.coordinate,
             }
         )
@@ -713,7 +713,7 @@ class SingleRepositoryControl(unittest.TestCase):
                 "issue": {"number": "7", "url": "local://acme/solo/issues/7"},
                 "taskId": "task-1",
                 "attempt": 1,
-                "diagnosis": "Narrow the change.",
+                "diagnosis": "Narrowed the change.",
             }
         )
         prefix = driver.local_state_prefix("fixture", "7")

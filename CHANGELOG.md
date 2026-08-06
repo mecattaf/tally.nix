@@ -6,6 +6,45 @@ authorized.
 
 ## [Unreleased]
 
+### Steward driver gates (#385, #386)
+
+Two mechanisms that both live at the boundary between an unattended agent and
+the campaign's public or repository state: one holds every prose surface the
+steward publishes to a machine-checkable grammar, the other detects a lane
+that wrote outside its authorized paths after the write already happened.
+
+#### #385 — the narrate slot's content contract extends to PR prose, the closing summary, and steering notes
+
+The steward narrate slot already validated conventional-commit messages
+deterministically; PR prose, the closing summary, and steering notes had no
+outcome-first grammar check at all.
+
+- Added `validate_outcome_first()` to `spec_build_driver.py`: a leading
+  sentence before any list, a past-tense opening verb, no exclamation mark,
+  and a bounded length — the managed-agents content contract, made
+  machine-checkable and applied uniformly to steward-proposed and
+  driver-rendered text alike.
+- `validated_narration()` now enforces it on the proposal body (PR prose and
+  the squash commit body); a narrator whose proposal fails both attempts
+  falls back to the task-id template as before, but the fallback body now
+  carries a durable, bounded fact that it fired and why — no silent
+  template, per the AUGUST-02 lesson.
+- The closing summary's leading sentence now reads outcome-first ("Settled N
+  of M task(s) against durable merge/checkpoint facts.") and self-validates
+  against the same grammar, so a future template edit that drifts from the
+  contract fails the node loudly instead of publishing unchecked prose.
+- Steering notes (the diagnose slot's output) are now validated the same
+  way, and are constructive-correction shaped: when the failing task's gate
+  evidence names a check id (and, for a `forbidPaths` rejection, an
+  offending path), the diagnosis must name it too or it is replaced with a
+  deterministic fallback note carrying the rejection reason.
+- Audited the daemon's own default `MESSAGE` templates
+  (`crates/tally-core/src/journal.rs`): all 11 `TallyEvent` kinds now open
+  with a past-tense verb (`Enqueued`, `Dispatched`, `Recorded a heartbeat
+  for`, `Passed the evidence check for`, …); a new test asserts the format
+  for every kind by name, so a 12th event added later fails loudly instead
+  of shipping unaudited.
+
 ### Recurring-cost hygiene (#396, #411, #395, #404)
 
 One lane of four fixes with a shared shape: each one makes something the fleet

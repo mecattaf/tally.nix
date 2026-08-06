@@ -2376,6 +2376,23 @@ function sweepDeferral(sweepNode) {
       }
       const diagnosed = await job(diagnosisSpec, { settle: false });
       const attempt = previousDiagnoses.length + 1;
+      // #385: when the failure carries gate evidence, the steering note's
+      // validator requires the diagnosis name the failing check (and the
+      // offending path, for a forbidPaths rejection) rather than describe
+      // the failure in the abstract. The failing gate is always the last
+      // entry recorded before the task's own gate loop returned.
+      const lastGate = failure.gateOutputs.length
+        ? failure.gateOutputs[failure.gateOutputs.length - 1]
+        : null;
+      const gateEvidence = lastGate
+        ? {
+            id: lastGate.gateId,
+            detail: bounded(
+              lastGate.node && lastGate.node.error ? lastGate.node.error : lastGate.node,
+              2000
+            )
+          }
+        : null;
       const steerBrief = withCapabilities(withSeam({
         campaign: effective.campaign,
         repository: codeRepository,
@@ -2383,7 +2400,8 @@ function sweepDeferral(sweepNode) {
         issue: args.issue,
         taskId: task.id,
         attempt,
-        diagnosis: diagnosed.result
+        diagnosis: diagnosed.result,
+        ...(gateEvidence ? { gateEvidence } : {})
       }));
       const steerThread = taskThread(task);
       if (steerThread !== null) {

@@ -742,8 +742,8 @@ class GitHubForgeTests(unittest.TestCase):
                         "taskId": "task-1",
                         "attempt": 2,
                         "diagnosis": (
-                            "Retry after removing ghp_0123456789abcdefghijklmnopqrstuvwxyz "
-                            "from diagnostic output."
+                            "Removed the leaked ghp_0123456789abcdefghijklmnopqrstuvwxyz "
+                            "token before the retry."
                         ),
                     }
                 )
@@ -972,7 +972,7 @@ class GitHubForgeTests(unittest.TestCase):
                             "issue": issue(),
                             "taskId": "task-1",
                             "attempt": attempt,
-                            "diagnosis": f"Steering for attempt {attempt}.",
+                            "diagnosis": f"Steered attempt {attempt}.",
                         }
                     )
                     self.assertTrue(steered["posted"])
@@ -2253,7 +2253,7 @@ class NativeSubIssueTests(unittest.TestCase):
             }
             with FakeGitHub(root, state) as github:
                 steered = DRIVER.action_steer(
-                    {**base, "attempt": 1, "diagnosis": "narrow the failing gate"}
+                    {**base, "attempt": 1, "diagnosis": "Narrowed the failing gate."}
                 )
                 retried = DRIVER.action_retry(
                     {**base, "stage": "prep", "detail": "the lane vanished"}
@@ -2261,7 +2261,7 @@ class NativeSubIssueTests(unittest.TestCase):
                 # Reading the same thread back returns exactly what was posted,
                 # so a retry brief sees its own task's steering history.
                 replayed = DRIVER.action_steer(
-                    {**base, "attempt": 1, "diagnosis": "narrow the failing gate"}
+                    {**base, "attempt": 1, "diagnosis": "Narrowed the failing gate."}
                 )
             self.assertTrue(steered["posted"])
             self.assertTrue(retried["posted"])
@@ -3432,12 +3432,12 @@ class NarrationValidatorTests(unittest.TestCase):
                 "type": "feat",
                 "scope": "campaign",
                 "subject": "add the merge method option",
-                "body": "One conventional commit per task.",
+                "body": "Delivered one conventional commit per task.",
             }
         )
         self.assertIsNone(reason)
         self.assertEqual(narration["subject"], "feat(campaign): add the merge method option")
-        self.assertEqual(narration["body"], "One conventional commit per task.")
+        self.assertEqual(narration["body"], "Delivered one conventional commit per task.")
 
     def test_prose_that_only_looks_dangerous_is_still_accepted(self) -> None:
         """The refusals are narrow on purpose.
@@ -3447,9 +3447,9 @@ class NarrationValidatorTests(unittest.TestCase):
         not name an issue GitHub would then close.
         """
         for name, body in {
-            "bare-cross-reference": "Context: #42",
-            "address": "Reported by tally@example.invalid",
-            "prose-fix": "It fixes the drift the reconciler kept re-reading.",
+            "bare-cross-reference": "Linked the context in #42.",
+            "address": "Reported by tally@example.invalid.",
+            "prose-fix": "Fixed the drift the reconciler kept re-reading.",
         }.items():
             with self.subTest(name):
                 narration, reason = DRIVER.validated_narration(
@@ -3503,7 +3503,7 @@ class NarrationValidatorTests(unittest.TestCase):
                 {
                     "type": "feat",
                     "subject": "do a thing",
-                    "body": "<!-- tally:spec-build:v1 campaign=fixture -->",
+                    "body": "Noted an update.\n\n<!-- tally:spec-build:v1 campaign=fixture -->",
                 },
                 "managed campaign marker",
             ),
@@ -3511,7 +3511,11 @@ class NarrationValidatorTests(unittest.TestCase):
             # own `Closes #<sub-issue>`; a narrator that proposes one is
             # proposing to close an issue the campaign never named.
             "closing-keyword-in-body": (
-                {"type": "feat", "subject": "do a thing", "body": "Closes #1\nFixes #2"},
+                {
+                    "type": "feat",
+                    "subject": "do a thing",
+                    "body": "Reported the change.\n\nCloses #1\nFixes #2",
+                },
                 "GitHub closing keyword",
             ),
             "closing-keyword-in-subject": (
@@ -3519,23 +3523,35 @@ class NarrationValidatorTests(unittest.TestCase):
                 "GitHub closing keyword",
             ),
             "cross-repo-closing-keyword": (
-                {"type": "feat", "subject": "do a thing", "body": "resolved acme/spec#9"},
+                {
+                    "type": "feat",
+                    "subject": "do a thing",
+                    "body": "Investigated the issue.\n\nThis resolved acme/spec#9.",
+                },
                 "GitHub closing keyword",
             ),
             "closing-keyword-by-url": (
                 {
                     "type": "feat",
                     "subject": "do a thing",
-                    "body": "Fixed https://github.com/acme/spec/issues/3",
+                    "body": "Fixed https://github.com/acme/spec/issues/3.",
                 },
                 "GitHub closing keyword",
             ),
             "mention": (
-                {"type": "feat", "subject": "do a thing", "body": "cc @torvalds"},
+                {
+                    "type": "feat",
+                    "subject": "do a thing",
+                    "body": "Notified reviewers.\n\ncc @torvalds",
+                },
                 "@mention",
             ),
             "team-mention": (
-                {"type": "feat", "subject": "do a thing", "body": "ping @acme/security"},
+                {
+                    "type": "feat",
+                    "subject": "do a thing",
+                    "body": "Notified the team.\n\nping @acme/security",
+                },
                 "@mention",
             ),
         }
@@ -3587,7 +3603,7 @@ class StewardNarrationTests(unittest.TestCase):
                     "type": "feat",
                     "scope": "fixture",
                     "subject": "deliver the task",
-                    "body": "Body prose.",
+                    "body": "Delivered body prose.",
                 }))
                 """,
             )
@@ -3598,7 +3614,7 @@ class StewardNarrationTests(unittest.TestCase):
             )
             self.assertEqual(narration["source"], "steward")
             self.assertEqual(narration["subject"], "feat(fixture): deliver the task")
-            self.assertEqual(narration["body"], "Body prose.")
+            self.assertEqual(narration["body"], "Delivered body prose.")
             self.assertEqual(
                 transcript, [{"attempt": 1, "status": "accepted", "reason": None}]
             )
@@ -3626,7 +3642,7 @@ class StewardNarrationTests(unittest.TestCase):
                 print("TALLY_FINAL_MESSAGE=" + json.dumps({
                     "type": "feat",
                     "subject": "reach " + os.environ["NARRATOR_ENDPOINT"],
-                    "body": "brief=" + os.environ.get("TALLY_BRIEF", "absent"),
+                    "body": "Read brief=" + os.environ.get("TALLY_BRIEF", "absent") + ".",
                 }))
                 """,
             )
@@ -3640,7 +3656,7 @@ class StewardNarrationTests(unittest.TestCase):
                 )
             self.assertEqual(transcript[-1]["status"], "accepted")
             self.assertEqual(narration["subject"], "feat: reach narrator.invalid")
-            self.assertEqual(narration["body"], "brief=absent")
+            self.assertEqual(narration["body"], "Read brief=absent.")
 
     def test_the_adapters_own_final_message_capture_is_what_is_read(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3749,7 +3765,18 @@ class StewardNarrationTests(unittest.TestCase):
             )
             self.assertEqual(
                 narration,
-                {"source": "template", "subject": "task-1: Task task-1", "body": ""},
+                {
+                    "source": "template",
+                    "subject": "task-1: Task task-1",
+                    # #385: the fallback is never silent -- the durable fact
+                    # that both steward attempts were rejected rides along in
+                    # the body a reader of the PR/commit actually sees.
+                    "body": (
+                        "Rejected 2 steward narration proposal(s) and used the "
+                        "task-id template instead. Reasons: attempt 1 (failed): "
+                        "steward exited 7; attempt 2 (failed): steward exited 7."
+                    ),
+                },
             )
             self.assertEqual(
                 transcript,
@@ -3761,6 +3788,8 @@ class StewardNarrationTests(unittest.TestCase):
             for entry in transcript:
                 self.assertNotIn("secret", entry["reason"])
                 self.assertNotIn("narrator.invalid", entry["reason"])
+            self.assertNotIn("secret", narration["body"])
+            self.assertNotIn("narrator.invalid", narration["body"])
 
     def test_two_invalid_proposals_fall_back_to_the_template(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -3782,6 +3811,177 @@ class StewardNarrationTests(unittest.TestCase):
             )
             self.assertEqual(narration["source"], "template")
             self.assertEqual([entry["status"] for entry in transcript], ["rejected", "rejected"])
+
+
+class OutcomeFirstGrammarTests(unittest.TestCase):
+    """#385: the machine-checkable half of the managed-agents content contract.
+
+    One rule violated at a time, so a future rewrite that breaks exactly one
+    of them fails exactly one assertion here instead of one vague test.
+    """
+
+    def test_a_compliant_leading_sentence_is_accepted(self) -> None:
+        self.assertIsNone(
+            DRIVER.validate_outcome_first(
+                "Fixed the drift the reconciler kept re-reading.\n\n- detail one\n- detail two",
+                max_chars=1000,
+                context="body",
+            )
+        )
+
+    def test_empty_text_is_refused(self) -> None:
+        reason = DRIVER.validate_outcome_first("   ", max_chars=1000, context="body")
+        self.assertIn("non-empty", reason)
+
+    def test_over_length_text_is_refused(self) -> None:
+        reason = DRIVER.validate_outcome_first("Fixed it.", max_chars=4, context="body")
+        self.assertIn("character cap", reason)
+
+    def test_an_exclamation_mark_anywhere_is_refused(self) -> None:
+        reason = DRIVER.validate_outcome_first(
+            "Fixed the drift!", max_chars=1000, context="body"
+        )
+        self.assertIn("exclamation", reason)
+
+    def test_a_list_opening_the_text_is_refused(self) -> None:
+        reason = DRIVER.validate_outcome_first(
+            "- detail one\n- detail two", max_chars=1000, context="body"
+        )
+        self.assertIn("not a list", reason)
+
+    def test_a_leading_line_with_no_terminating_period_is_refused(self) -> None:
+        reason = DRIVER.validate_outcome_first(
+            "Fixed the drift", max_chars=1000, context="body"
+        )
+        self.assertIn("end with a period", reason)
+
+    def test_a_present_tense_or_non_verb_opening_is_refused(self) -> None:
+        for opening in ("Fixing the drift.", "The drift is fixed.", "Fix the drift."):
+            with self.subTest(opening):
+                reason = DRIVER.validate_outcome_first(
+                    opening, max_chars=1000, context="body"
+                )
+                self.assertIn("past-tense verb", reason)
+
+    def test_an_irregular_past_tense_opening_is_accepted_case_insensitively(self) -> None:
+        self.assertIsNone(
+            DRIVER.validate_outcome_first("read the log.", max_chars=1000, context="body")
+        )
+        self.assertIsNone(
+            DRIVER.validate_outcome_first("Read the log.", max_chars=1000, context="body")
+        )
+
+    def test_the_closing_summary_leads_with_an_outcome_first_sentence(self) -> None:
+        digest = {
+            "outcome": "complete",
+            "source": {"sha256": "sha256:" + "a" * 64, "revision": "b" * 40},
+            "baseRevision": "b" * 40,
+            "repository": "acme/spec",
+            "taskCount": 2,
+            "merged": [
+                {
+                    "taskId": "task-1",
+                    "title": "Task 1",
+                    "pullRequest": "local://acme/spec/task-1",
+                    "mergeCommit": "c" * 40,
+                }
+            ],
+            "checkpoints": [],
+            "blocked": [],
+            "outstanding": [],
+            "steering": [],
+            "retries": [],
+            "deferrals": [],
+            "anomalies": [],
+            "warnings": [],
+        }
+        summary = DRIVER.render_campaign_summary(digest)
+        self.assertIn("Settled 1 of 2 task(s) against durable merge/checkpoint facts.", summary)
+        lines = [line for line in summary.split("\n") if line]
+        # The heading is structural, not prose; the first prose line is what
+        # the grammar contract governs, and it must be the outcome sentence.
+        self.assertTrue(lines[1].startswith("Settled "))
+
+
+class SteeringGrammarTests(unittest.TestCase):
+    """#385: the narrate slot's contract extended to steering notes."""
+
+    def brief(self, root: Path, checkout: Path, **overrides: object) -> dict[str, object]:
+        base = {
+            "campaign": "fixture",
+            "repository": "acme/spec",
+            "repositoryConfig": repository_config(checkout, "local"),
+            "issue": issue(),
+            "taskId": "task-1",
+            "attempt": 1,
+            "diagnosis": "Investigated the failure.",
+        }
+        base.update(overrides)
+        return base
+
+    def posted_body(self, config: dict[str, object], steered: dict[str, object]) -> str:
+        ref = steered["comment"].split("acme/spec/", 1)[1]
+        return DRIVER.read_local_blob(config, ref)["diagnosis"]
+
+    def test_a_grammar_violating_diagnosis_falls_back_with_a_durable_fact(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = repository_config(checkout, "local")
+            steered = DRIVER.action_steer(
+                self.brief(root, checkout, diagnosis="narrow the failing gate")
+            )
+            self.assertTrue(steered["posted"])
+            body = self.posted_body(DRIVER.repo_config(config), steered)
+            # Never silent: the durable fact that the fallback fired, and why,
+            # rides in the same comment the rejected diagnosis would have.
+            self.assertIn("Rejected the steward's diagnosis", body)
+            self.assertIn("must end with a period", body)
+
+    def test_gate_evidence_requires_the_failing_id_and_offending_path(self) -> None:
+        detail = (
+            "forbidPaths gate 'forbid-secrets' rejected 1 changed path(s): "
+            '"secrets/key.pem" (matched "secrets/**")'
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = repository_config(checkout, "local")
+            omitted = DRIVER.action_steer(
+                self.brief(
+                    root,
+                    checkout,
+                    diagnosis="Investigated the failing gate carefully.",
+                    gateEvidence={"id": "gate:forbid-secrets", "detail": detail},
+                )
+            )
+            body = self.posted_body(DRIVER.repo_config(config), omitted)
+            self.assertIn("omits the failing check id", body)
+            self.assertIn("gate:forbid-secrets", body)
+
+    def test_a_diagnosis_naming_the_required_evidence_is_accepted_verbatim(self) -> None:
+        detail = (
+            "forbidPaths gate 'forbid-secrets' rejected 1 changed path(s): "
+            '"secrets/key.pem" (matched "secrets/**")'
+        )
+        diagnosis = (
+            "Investigated gate:forbid-secrets and found secrets/key.pem staged "
+            "accidentally."
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout, _ = initialize_repository(root, remote=True)
+            config = repository_config(checkout, "local")
+            steered = DRIVER.action_steer(
+                self.brief(
+                    root,
+                    checkout,
+                    diagnosis=diagnosis,
+                    gateEvidence={"id": "gate:forbid-secrets", "detail": detail},
+                )
+            )
+            body = self.posted_body(DRIVER.repo_config(config), steered)
+            self.assertEqual(body, diagnosis)
 
 
 class SquashMergeTests(unittest.TestCase):
@@ -4762,7 +4962,9 @@ class GitAiBindingTests(unittest.TestCase):
         # the node appends nothing after it, leaving the forged line as the
         # message's entire trailer block.
         for spelling in ("Assisted-by", "assisted-by", "ASSISTED-BY", "AsSiStEd-By"):
-            forged = f"{spelling}: someone:something (tally:x witness:1)"
+            forged = (
+                f"Noted context.\n\n{spelling}: someone:something (tally:x witness:1)"
+            )
             narration, reason = DRIVER.validated_narration(
                 {
                     "type": "feat",
@@ -4779,7 +4981,7 @@ class GitAiBindingTests(unittest.TestCase):
                 "type": "docs",
                 "scope": "fixture",
                 "subject": "explain the assisted-by pointer",
-                "body": "The trailer is a pointer, never the proof.",
+                "body": "Documented that the trailer is a pointer, never the proof.",
             }
         )
         self.assertIsNotNone(narration)

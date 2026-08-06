@@ -365,8 +365,36 @@ impl EmitEvent {
     }
 }
 
+/// The past-tense opening verb for each of the 11 lifecycle events' default
+/// `MESSAGE` template (#385): an outcome-first leading word, so a reader of
+/// the raw journal sees what happened before any key=value detail, the same
+/// content contract the narrate slot enforces at the publish boundary. Most
+/// events use a bare `Enqueued`/`Started`-shaped past participle; the two
+/// that read as an internal record of an action needed a said action
+/// spelled out (`Recorded a heartbeat for`, `Emitted the witness record
+/// for`) to stay grammatical.
+fn synthesize_message_verb(event: TallyEvent) -> &'static str {
+    match event {
+        TallyEvent::Enqueued => "Enqueued",
+        TallyEvent::Dispatched => "Dispatched",
+        TallyEvent::Started => "Started",
+        TallyEvent::Heartbeat => "Recorded a heartbeat for",
+        TallyEvent::Preempted => "Preempted",
+        TallyEvent::Resumed => "Resumed",
+        TallyEvent::Completed => "Completed",
+        TallyEvent::Failed => "Failed",
+        TallyEvent::EvidencePass => "Passed the evidence check for",
+        TallyEvent::EvidenceFail => "Failed the evidence check for",
+        TallyEvent::WitnessEmitted => "Emitted the witness record for",
+    }
+}
+
 fn synthesize_message(event: &EmitEvent) -> String {
-    let mut parts = vec![event.event.to_string(), event.task_uuid.clone()];
+    let mut parts = vec![format!(
+        "{} {}",
+        synthesize_message_verb(event.event),
+        event.task_uuid
+    )];
     if let Some(task_ref) = &event.task_ref {
         parts.push(format!("taskRef={task_ref}"));
     }
@@ -1098,13 +1126,71 @@ mod tests {
         event.task_ref = Some(TaskRef::new("crm/t07").unwrap());
         let fields = event.into_fields().unwrap();
 
-        assert_eq!(fields.message, "enqueued uuid-1 taskRef=crm/t07");
+        assert_eq!(fields.message, "Enqueued uuid-1 taskRef=crm/t07");
         assert_eq!(
             serde_json::to_value(&fields).unwrap()["TALLY_TASK_REF"],
             "crm/t07"
         );
         let native = String::from_utf8(encode_native_record(&fields).unwrap()).unwrap();
         assert!(native.lines().any(|line| line == "TALLY_TASK_REF=crm/t07"));
+    }
+
+    #[test]
+    fn daemon_authored_messages_lead_with_a_past_tense_outcome() {
+        // #385 audits the daemon's own default `MESSAGE` templates against the
+        // same outcome-first contract the narrate slot enforces at the publish
+        // boundary: every one of TALLY_EVENTS' 11 kinds gets its own assertion
+        // here, named explicitly, so a 12th event added later fails this test
+        // instead of silently going unaudited.
+        assert_eq!(TALLY_EVENTS.len(), 11, "audit every lifecycle event kind");
+        let expectations: &[(TallyEvent, &str)] = &[
+            (TallyEvent::Enqueued, "Enqueued task-abc"),
+            (TallyEvent::Dispatched, "Dispatched task-abc"),
+            (TallyEvent::Started, "Started task-abc"),
+            (TallyEvent::Heartbeat, "Recorded a heartbeat for task-abc"),
+            (TallyEvent::Preempted, "Preempted task-abc"),
+            (TallyEvent::Resumed, "Resumed task-abc"),
+            (TallyEvent::Completed, "Completed task-abc"),
+            (TallyEvent::Failed, "Failed task-abc"),
+            (
+                TallyEvent::EvidencePass,
+                "Passed the evidence check for task-abc",
+            ),
+            (
+                TallyEvent::EvidenceFail,
+                "Failed the evidence check for task-abc",
+            ),
+            (
+                TallyEvent::WitnessEmitted,
+                "Emitted the witness record for task-abc",
+            ),
+        ];
+        assert_eq!(expectations.len(), TALLY_EVENTS.len());
+        for &kind in TALLY_EVENTS {
+            let (matched, expected_prefix) = expectations
+                .iter()
+                .find(|(event, _)| *event == kind)
+                .unwrap();
+            assert_eq!(*matched, kind);
+            let event = full_event(kind);
+            let fields = event.into_fields().unwrap();
+            assert!(
+                fields.message.starts_with(expected_prefix),
+                "{kind:?} message {:?} does not open with {expected_prefix:?}",
+                fields.message
+            );
+            let opening_word = fields.message.split(' ').next().unwrap();
+            assert!(
+                opening_word.ends_with("ed"),
+                "{kind:?} message {:?} does not open with a past-tense verb",
+                fields.message
+            );
+            assert!(
+                !fields.message.contains('!'),
+                "{kind:?} message {:?} contains an exclamation mark",
+                fields.message
+            );
+        }
     }
 
     #[test]
