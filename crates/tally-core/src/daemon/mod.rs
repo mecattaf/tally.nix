@@ -1016,6 +1016,9 @@ pub struct Daemon {
     completion_rx: mpsc::UnboundedReceiver<ExecutionFinished>,
     fatal_rx: mpsc::UnboundedReceiver<DaemonError>,
     notifier: SystemdNotifier,
+    /// Per-phase startup accounting, reported at `READY=1` (#379). Taken in
+    /// `run_loop`, which owns the last pre-`READY` phase.
+    startup: Option<startup::StartupTimeline>,
     initial_jobs: Vec<Job>,
     initial_gh_completions: Vec<GhTerminalWork>,
     initial_lost_pools: Vec<String>,
@@ -1029,6 +1032,14 @@ pub struct Daemon {
     dispatch_stall_hook: Option<DispatchStallHook>,
     #[cfg(test)]
     finish_job_hook: Option<FinishJobHook>,
+    /// Receives the startup report line `run_loop` writes before `READY=1`.
+    ///
+    /// `run_loop` consumes the daemon, so the line it actually emits — the
+    /// artefact `doc/src/operating/recovery.md` advertises, and the only
+    /// surface carrying the phase `run_loop` itself opens — is otherwise
+    /// unobservable to a test (#379).
+    #[cfg(test)]
+    startup_report_hook: Option<mpsc::UnboundedSender<String>>,
 }
 
 #[cfg(test)]

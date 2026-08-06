@@ -2469,6 +2469,118 @@ mod tests {
         );
     }
 
+    /// #407: a terminal failure whose adapter stderr never existed was probed
+    /// again at every startup, forever, one warning per probe, all of it
+    /// charged to `TimeoutStartSec`.
+    ///
+    /// The mechanism is upstream of this pass. `write_capture_generation` is
+    /// fsynced before `systemd-run` creates the unit, and
+    /// `archive_current_capture` returns early when any of the capture set is
+    /// missing — so an attempt that failed before its stderr stream existed
+    /// leaves a generation marker nothing ever retires, and this pass read
+    /// that marker as "recoverable" at every start.
+    ///
+    /// What is asserted here is the disposition: a definitive answer is
+    /// recorded once, a transient one is not, and the pass stops before the
+    /// first transient record so a later start still retries it.
+    #[test]
+    fn failure_stderr_recovery_is_one_shot_and_stops_at_the_first_transient_record() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let executor = direct_executor(&state_dir);
+        let mut ledger = WitnessLedger::open(temp.path().join("witness.jsonl")).unwrap();
+
+        // Three terminal failures, each with a capture generation naming this
+        // attempt. The first and third have no adapter stderr at all: the
+        // permanent shape. The second has one that cannot be opened without
+        // following a link, which is a refusal rather than an absence and
+        // therefore must not be written off.
+        let mut seeded = Vec::new();
+        for index in 0..3_usize {
+            let uuid = Uuid::new_v4();
+            let row = durable_row(uuid, &format!("failure-{index}"), 1);
+            let identity = ExecutionIdentity {
+                job_id: uuid,
+                task_uuid: Some(uuid),
+                task_ref: None,
+            };
+            let paths = executor.paths(&identity);
+            fs::create_dir_all(paths.capture_generation.parent().unwrap()).unwrap();
+            fs::create_dir_all(paths.stderr.parent().unwrap()).unwrap();
+            fs::write(&paths.capture_generation, br#"{"attempt":1,"leaseEpoch":1}"#).unwrap();
+            if index == 1 {
+                std::os::unix::fs::symlink("absent-target", &paths.stderr).unwrap();
+            }
+            assert!(!paths.stderr.is_file());
+            let record = append_fixture_witness(
+                &mut ledger,
+                &row,
+                "2026-08-05T18:34:00.000Z",
+                Verdict::Failed,
+                1,
+                1,
+                1,
+            );
+            seeded.push((record, executor.capture_lock_path(&identity)));
+        }
+        let records = seeded
+            .iter()
+            .map(|(record, _)| record.clone())
+            .collect::<Vec<_>>();
+
+        // First pass: every record is probed. `persist_failure_stderr` takes
+        // the capture lock, so the lock file existing is the witness that the
+        // probe happened at all.
+        startup::reconcile_failure_stderr(&records, &executor, &state_dir).unwrap();
+        for (_, lock) in &seeded {
+            assert!(lock.exists(), "every record is probed on the first pass");
+        }
+        let cursor = state_dir.join(startup::FAILURE_STDERR_CURSOR_FILE);
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cursor).unwrap()).unwrap();
+        // Stops at the first record it could not settle, not at the last one
+        // it could: the third record is definitive but sits behind the second.
+        assert_eq!(recorded["reconciledThroughSeq"], json!(records[0].seq));
+        assert_eq!(recorded["schemaVersion"], json!(1));
+
+        // Second pass: the settled record is not probed again, and the two
+        // behind the cursor still are.
+        for (_, lock) in &seeded {
+            fs::remove_file(lock).unwrap();
+        }
+        startup::reconcile_failure_stderr(&records, &executor, &state_dir).unwrap();
+        assert!(
+            !seeded[0].1.exists(),
+            "a settled record must never be probed again"
+        );
+        assert!(seeded[1].1.exists(), "a deferred record is retried");
+        assert!(
+            seeded[2].1.exists(),
+            "a record behind a deferred one is retried"
+        );
+
+        // And once the refusal is gone the cursor clears the whole ledger, so
+        // the steady-state cost of this pass is zero probes.
+        let uuid_one = Uuid::parse_str(records[1].task_uuid.as_deref().unwrap()).unwrap();
+        let identity_one = ExecutionIdentity {
+            job_id: uuid_one,
+            task_uuid: Some(uuid_one),
+            task_ref: None,
+        };
+        fs::remove_file(executor.paths(&identity_one).stderr).unwrap();
+        startup::reconcile_failure_stderr(&records, &executor, &state_dir).unwrap();
+        for (_, lock) in &seeded {
+            let _ = fs::remove_file(lock);
+        }
+        startup::reconcile_failure_stderr(&records, &executor, &state_dir).unwrap();
+        for (_, lock) in &seeded {
+            assert!(!lock.exists(), "a fully reconciled ledger probes nothing");
+        }
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cursor).unwrap()).unwrap();
+        assert_eq!(recorded["reconciledThroughSeq"], json!(records[2].seq));
+    }
+
     #[test]
     fn recovery_replays_a_terminal_github_failure_with_its_stderr_tail() {
         let temp = tempdir().unwrap();
@@ -2523,7 +2635,8 @@ mod tests {
         });
 
         assert!(!paths.failure_stderr.exists());
-        startup::reconcile_failure_stderr(std::slice::from_ref(&record), &executor).unwrap();
+        startup::reconcile_failure_stderr(std::slice::from_ref(&record), &executor, temp.path())
+            .unwrap();
         assert_eq!(
             fs::read(&paths.failure_stderr).unwrap(),
             b"recovered actionable stderr\n"
@@ -5866,6 +5979,14 @@ mod tests {
 
                 // The completion lifecycle event carries the same measured
                 // value, not the old fabricated `Some(0.0)`.
+                //
+                // `completed_event` is emitted from the post-ack `spawn_local`
+                // task, so `await_job` returning terminal says nothing about
+                // whether that task has run (#419). Awaiting it is the only
+                // thing that puts the event before this assertion; without the
+                // drain the assertion wins the race almost always and loses it
+                // under a loaded host, which is a flake, not a bug.
+                daemon.handler.drain_post_ack_tasks().await;
                 assert!(history.borrow().snapshot().records.iter().any(|entry| {
                     entry.fields.task_uuid == task_uuid && entry.fields.gpu_seconds == Some(3.5)
                 }));
@@ -9164,6 +9285,152 @@ mod tests {
             let read = socket.recv(&mut buffer).unwrap();
             assert_eq!(&buffer[..read], expected.as_bytes());
         }
+    }
+
+    /// #379: startup is charged to `TimeoutStartSec`, so every phase boundary
+    /// has to buy more of it. `EXTEND_TIMEOUT_USEC=` restarts the start
+    /// timeout from receipt, which turns one budget for the whole of
+    /// `Daemon::open` into one budget per phase; `STATUS=` makes a slow start
+    /// legible in `systemctl status` instead of silent.
+    #[test]
+    fn every_startup_phase_extends_the_start_timeout_and_names_itself() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("notify.sock");
+        let socket = UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let notifier = SystemdNotifier::with_socket(path, None);
+
+        let mut timeline = startup::StartupTimeline::begin(notifier, "prepare");
+        timeline.phase("row-migration");
+        timeline.phase("unit-facts");
+        let report = timeline.finish();
+
+        for phase in ["prepare", "row-migration", "unit-facts"] {
+            let mut buffer = [0_u8; 256];
+            let read = socket.recv(&mut buffer).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&buffer[..read]).unwrap(),
+                format!("EXTEND_TIMEOUT_USEC=90000000\nSTATUS=starting: {phase}"),
+            );
+        }
+        // Nothing else is sent: the extension is per phase, not per operation.
+        let mut buffer = [0_u8; 256];
+        assert!(socket.recv(&mut buffer).is_err());
+
+        // The report is the durable half. Every phase is named with its own
+        // wall-clock, because a total alone is what #379 already had and could
+        // not attribute.
+        assert!(report.starts_with("startup complete in "), "{report}");
+        assert!(report.contains("of a 90s per-phase budget"), "{report}");
+        for phase in ["prepare", "row-migration", "unit-facts"] {
+            assert!(
+                report.contains(&format!(" {phase}=")),
+                "{report} omits {phase}"
+            );
+        }
+    }
+
+    /// The full phase list, pinned through the line `run_loop` actually emits.
+    ///
+    /// `daemon_open_records_every_startup_phase_in_order` below can only see
+    /// what `Daemon::open` returns, so it stops one phase short:
+    /// `initial-recovery` is opened inside `run_loop`, which is precisely where
+    /// the `initial_lost_pools` / `initial_jobs` / `initial_gh_completions`
+    /// recovery loops live — the pre-`READY` work a later lane is most likely
+    /// to extend. Deleting that phase left the whole suite green, which made
+    /// #379's claim that the list is pinned one level stronger than the code.
+    ///
+    /// This asserts the artefact instead: the rendered report line, in order,
+    /// with the total and the budget it names. `doc/src/operating/recovery.md`
+    /// advertises exactly this string to operators.
+    #[tokio::test(flavor = "current_thread")]
+    async fn the_startup_report_line_names_every_phase_including_the_one_run_loop_opens() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut daemon = fs1_daemon(&paths).await;
+                let (report_tx, mut report_rx) = mpsc::unbounded_channel();
+                daemon.startup_report_hook = Some(report_tx);
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                shutdown_tx.send(true).unwrap();
+                daemon.run_until(shutdown_rx).await.unwrap();
+
+                let report = report_rx.try_recv().expect("run_loop reports its startup");
+                assert!(
+                    report.starts_with("startup complete in "),
+                    "unexpected report: {report}"
+                );
+                assert!(
+                    report.contains("of a 90s per-phase budget"),
+                    "unexpected report: {report}"
+                );
+                // Every `name=` token, in the order the line carries them.
+                let phases = report
+                    .split_whitespace()
+                    .filter_map(|token| token.split_once('='))
+                    .map(|(name, _)| name)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    phases,
+                    vec![
+                        "prepare",
+                        "row-migration",
+                        "durable-facts",
+                        "gcroots",
+                        "unit-facts",
+                        "recovery-plan",
+                        "storage",
+                        "lease-engine",
+                        "failure-stderr",
+                        "gh-orphan-sweep",
+                        "install-jobs",
+                        "initial-recovery",
+                    ],
+                    "the report line is what operators read; a phase that vanishes from it \
+                     under-attributes the startup budget silently: {report}"
+                );
+            })
+            .await;
+    }
+
+    /// The phase list is a contract, not decoration: it is what a later lane
+    /// adding startup work checks its own cost against (#379). Pinning it here
+    /// means work added outside a named phase shows up as a failing test
+    /// rather than as another silent minute in the journal.
+    ///
+    /// This covers the eleven phases `Daemon::open` owns and fails with the
+    /// offending name visible in the diff; the twelfth is covered by
+    /// `the_startup_report_line_names_every_phase_including_the_one_run_loop_opens`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn daemon_open_records_every_startup_phase_in_order() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                assert_eq!(
+                    daemon.startup.as_ref().unwrap().phase_names(),
+                    vec![
+                        "prepare",
+                        "row-migration",
+                        "durable-facts",
+                        "gcroots",
+                        "unit-facts",
+                        "recovery-plan",
+                        "storage",
+                        "lease-engine",
+                        "failure-stderr",
+                        "gh-orphan-sweep",
+                        "install-jobs",
+                    ],
+                );
+            })
+            .await;
     }
 
     /// Read every datagram already queued on `socket`, with the instant each

@@ -440,6 +440,15 @@ in
             # which systemd takes one more period to restart. Moving this number
             # moves all four; daemon::notify pins them at 30s.
             WatchdogSec = "30s";
+            # Startup is charged here and never to WatchdogSec, because the
+            # service watchdog is not armed until READY=1. The daemon now sends
+            # EXTEND_TIMEOUT_USEC= at every startup phase boundary, so this is
+            # the budget for one phase rather than for the whole of
+            # Daemon::open; it matches daemon::startup::STARTUP_PHASE_BUDGET.
+            # Declared rather than inherited so the limit is a choice this
+            # module made, not whichever DefaultTimeoutStartSec the user
+            # manager happens to carry.
+            TimeoutStartSec = "90s";
             Restart = "always";
             RestartSec = "2s";
             Environment = [

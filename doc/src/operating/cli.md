@@ -880,3 +880,30 @@ durable rows, which exist only here — a worker runs no tally daemon and has no
 running it on a worker reads nothing and rewrites nothing. Remote-owned rows are therefore
 reported, never repaired, and `skipped[]` carries everything the hand repair on that host needs.
 See [recovery](recovery.md#startup-refuses-pre-label-unit-exit-records) for the procedure.
+
+```console
+$ tally migrate capture-labels --state-dir /var/lib/tally/state
+$ tally migrate capture-labels --state-dir /var/lib/tally/state --apply
+```
+
+Moves `capture/<uuid>.*` entries — and the `capture/archive/<uuid>/` directory — to the
+`<uuid>.<task>` stem the current binary derives for a row whose orchestration carries a
+`taskRef`. Same generation gap as `unit-exit-labels`, in the capture stem rather than the unit
+name, and no error names it: the daemon starts clean and `tally query run` simply reports such a
+failure as having no capture, because `capturePath`/`stderrTail` resolve through the derived
+stem with no bare-uuid fallback.
+
+Without `--apply` the plan is printed and nothing moves; read `renamed` first. The report is
+JSON:
+
+```text
+schemaVersion, applied, stateDir, labeledRows, renamed[], alreadyLabeled, skipped[]
+```
+
+`renamed[]` carries `uuid`, `from`, and `to`. `skipped[]` carries `uuid`, a `reason`, and — for a
+remote-owned row — `executor`, `captureDir`, `preLabelStem`, and `expectedStem`. Contents, modes
+and mtimes are untouched; only names change. `unit-exit/<uuid>.json` and
+`unit-exit/<uuid>.capture.json` are keyed on the bare uuid under both binaries and are not moved.
+An entry that exists under both stems is listed in `skipped[]` rather than resolved, because this
+command does not choose between two captures. The same `--state-dir`, ownership, and
+coordinator-only rules stated above apply unchanged.
