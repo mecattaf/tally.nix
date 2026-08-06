@@ -25,6 +25,18 @@ pub(super) fn exit_failure(code: i32, message: impl Into<String>) -> anyhow::Err
     })
 }
 
+/// Whether this failure is "there is no daemon listening on that socket".
+///
+/// Deliberately narrower than "exit code 3": `RearmDeadlineExceeded` maps to
+/// the same code but describes a daemon that is present and not answering,
+/// which is a real fault. Only the connect-time absence raised at
+/// [`WireIoError::Unreachable`] is an absence.
+pub(super) fn is_daemon_absent(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| matches!(cause.downcast_ref(), Some(WireIoError::Unreachable { .. })))
+}
+
 pub(super) fn error_exit_code(error: &anyhow::Error) -> i32 {
     for cause in error.chain() {
         if let Some(failure) = cause.downcast_ref::<ExitFailure>() {

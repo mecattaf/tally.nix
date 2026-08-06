@@ -1885,6 +1885,79 @@ async fn submitting_commands_exit_quietly_when_their_reader_is_gone() {
         .await;
 }
 
+/// A handler that is listening and refuses, so the "daemon is absent" case can
+/// be told apart from "the drain itself failed".
+#[derive(Clone, Copy)]
+struct RefusingDrainHandler;
+
+impl RpcHandler for RefusingDrainHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        Box::pin(async move {
+            assert_eq!(request.method, "queue.drain");
+            Err(WireError::invalid("drain refused"))
+        })
+    }
+}
+
+/// Issue #411: `tally-drain` runs every five seconds, so a daemon restart
+/// under it is routine, and exiting 3 on that turned every deploy that touches
+/// the daemon unit into a per-user unit failure the fleet's journal watcher
+/// reports as if it were the SIGABRT burst it was built to catch.
+///
+/// The absorption is scoped to the socket-absent case only, which is what this
+/// pins in all three directions: absent daemon exits 0 and still says so, the
+/// same absence on any other verb still exits 3, and a daemon that is present
+/// and refuses the drain still fails.
+#[tokio::test(flavor = "current_thread")]
+async fn a_periodic_drain_that_finds_no_daemon_is_not_a_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let absent = temp.path().join("absent.sock");
+
+    let skipped = run_tally(&absent, &["daemon", "drain"]).await;
+    assert_eq!(skipped.status.code(), Some(0), "{:?}", skipped.status);
+    let stderr = String::from_utf8_lossy(&skipped.stderr).into_owned();
+    assert!(
+        stderr.contains(&format!(
+            "daemon socket {} is unreachable",
+            absent.display()
+        )),
+        "the absorbed case must still name itself:\n{stderr}"
+    );
+    // Absence, not emptiness: nothing may claim a drain happened.
+    let stdout = String::from_utf8_lossy(&skipped.stdout).into_owned();
+    assert!(stdout.is_empty(), "{stdout}");
+
+    // The identical absence reached through another verb is untouched.
+    let unreachable = run_tally(&absent, &["queue", "drain"]).await;
+    assert_eq!(
+        unreachable.status.code(),
+        Some(3),
+        "{:?}",
+        unreachable.status
+    );
+
+    // A daemon that is listening and refuses is still a failure.
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_connection(stream, RefusingDrainHandler)
+                    .await
+                    .unwrap();
+            });
+            let refused = run_tally(&socket, &["daemon", "drain"]).await;
+            assert_eq!(refused.status.code(), Some(2), "{:?}", refused.status);
+            server.await.unwrap();
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn a_closed_stream_never_panics_the_help_or_the_error_printer() {
     let temp = tempfile::tempdir().unwrap();

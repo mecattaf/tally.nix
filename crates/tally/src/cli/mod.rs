@@ -240,14 +240,35 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
         Some(Command::Daemon {
             command: DaemonCommand::Drain,
         }) => {
-            print_rpc(
+            let drained = print_rpc(
                 &socket,
                 opts.config.as_deref(),
                 rpc_timeout,
                 "queue.drain",
                 Some(json!({})),
             )
-            .await
+            .await;
+            // A periodic drain that finds no daemon is not an error (#411).
+            // `tally-drain.timer` fires every five seconds and a daemon restart
+            // takes longer than that, so every activation that restarts
+            // `tally-daemon` has a good chance of catching a drain mid-flight;
+            // the exit 3 that produced surfaced as a genuine per-user unit
+            // failure, which is exactly the shape the fleet's journal watcher
+            // exists to catch. Spending that alarm on a benign restart is the
+            // cost being removed here.
+            //
+            // Narrow on purpose: only the socket-absent case is absorbed, and
+            // the line naming it is still written, so an operator running the
+            // verb by hand still learns which case it was. Every other drain
+            // failure -- including a daemon that is listening and refuses --
+            // keeps its exit code.
+            match drained {
+                Err(error) if is_daemon_absent(&error) => {
+                    let _ = out::write_error_line(format_args!("tally: {error:#}"));
+                    Ok(())
+                }
+                other => other,
+            }
         }
         Some(Command::Enqueue(args)) => {
             run_enqueue(&socket, opts.config.as_deref(), rpc_timeout, *args).await
