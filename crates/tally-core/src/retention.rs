@@ -1917,6 +1917,20 @@ mod tests {
 
         // Once the holder is gone the same file becomes collectable, which is
         // the only reason the age floor is not the whole rule.
+        //
+        // Release the lock explicitly rather than by closing the file (#419).
+        // `flock` binds to the open file description, and every `fork` in this
+        // process — every `Command::spawn` a sibling test makes, on any thread —
+        // duplicates that description into the child until it `exec`s. Closing
+        // only drops *this* descriptor, so the lock survives in a child that has
+        // not reached `exec` yet and the sweep below reads a live holder that no
+        // longer exists. `LOCK_UN` removes the lock from the description itself,
+        // so no duplicate can outlive it. Measured on this tree: 56 spurious
+        // `WouldBlock` probes in 8,000 close-only release/probe pairs under
+        // four concurrent spawner threads, 0 in 8,000 with the explicit unlock.
+        // This mirrors what the production holder already does — see
+        // `UnitReservation::drop` in `executor/lifecycle.rs`.
+        FileExt::unlock(&holder).unwrap();
         drop(holder);
         let released = run_gc(
             GcRequest {
