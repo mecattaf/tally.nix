@@ -30,10 +30,21 @@
 //! against codex's own separate rollout journal, which does carry a true
 //! `last_token_usage` beside the cumulative `total_token_usage` — a shape
 //! `codex exec --json` does not expose). The `codex` preset therefore
-//! declares no occupancy capture, exactly like `pi`'s undeclared usage
-//! mapping: declaring a key nobody has observed is a guess wearing a
-//! declaration's clothes, and reusing the cumulative total under
+//! declares no occupancy capture: reusing the cumulative total under
 //! occupancy's name is the mistake this module now exists to not repeat.
+//!
+//! `pi` is the mirror image and is worth stating exactly, because the two
+//! adapters decline opposite mappings for opposite reasons.
+//! `test/fixtures/traces/pi.jsonl` is a real `pi --mode json` capture, so
+//! pi's key names are not in doubt — the reason its preset declares **no
+//! usage mapping** is not absence of evidence but what the evidence says.
+//! pi states usage per assistant message and never per attempt: there is no
+//! `turn.completed`-style roll-up anywhere in its stream, so a declared
+//! `inputTokens` there would report one turn's figures as the attempt's
+//! spend. The per-turn reading the capture does support is occupancy, and
+//! that is what the preset declares. "We have no data" and "we have data
+//! and it does not support this mapping" are different claims, and pi's is
+//! the second.
 //!
 //! [`context_window`] is the ceiling that total is measured against, and it
 //! has two independent, distinguishable provenances:
@@ -49,8 +60,10 @@
 //! harness actually applied for this attempt's model; the config ceiling is
 //! what the operator believes true absent better information. Neither is
 //! fabricated: a harness that states nothing and a config that declares
-//! nothing together mean `context_window` is `None`, exactly like `pi`'s
-//! usage mapping staying undeclared until a real capture justifies one.
+//! nothing together mean `context_window` is `None` — the same refusal to
+//! invent a number that keeps `pi`'s usage mapping undeclared, there
+//! because the capture on hand states a per-message figure and no
+//! per-attempt one, here because nobody has stated a window at all.
 
 use serde::{Deserialize, Serialize};
 
@@ -95,8 +108,8 @@ pub struct ContextWindow {
 /// Tokens resident in the context window as of the attempt's last valid
 /// assistant turn: input plus both cache halves, excluding that turn's own
 /// output. `None` whenever no capture declared any of the three resident
-/// fields — an adapter with no occupancy scrape (`codex`, `pi`), or a
-/// stream that never reached an assistant turn — never a fabricated zero,
+/// fields — an adapter with no occupancy scrape (`codex`), or a stream
+/// that never reached a valid assistant turn — never a fabricated zero,
 /// and never `crate::usage`'s cumulative session total under a borrowed
 /// name. A component the capture did carry but this project's mapping could
 /// not read from is treated the same as one the harness omitted, mirroring

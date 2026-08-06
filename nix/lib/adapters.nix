@@ -136,6 +136,16 @@ let
       # advisory observation, which is the honest handling, so the framing
       # declaration stands -- but see the resume argv below for what that
       # path costs.
+      #
+      # Volume, because it is a property of this stream and not of the
+      # others: pi echoes the whole partial message on every
+      # `message_update`, so stdout grows with the square of a turn's
+      # length rather than linearly (the full two-turn run the capture
+      # below was excerpted from wrote 260 KB; the committed excerpt is
+      # 10 KB). A long pi campaign therefore reaches the 16 MiB trace
+      # read bound far sooner than a codex or claude-code one. Truncation
+      # is reported rather than hidden, so this costs trace depth, not
+      # correctness -- it is a sizing note, not a defect.
       trace = {
         stream = "stdout";
         framing = "json-lines";
@@ -147,7 +157,12 @@ let
       # dropping it is real and is not enforced anywhere: a workload argv
       # whose first element begins with `-` is parsed by pi as a flag. That
       # is a narrowing on leading-dash payloads; the alternative was an argv
-      # that failed on every payload.
+      # that failed on every payload. The narrowing has two halves and only
+      # one of them is loud: a leading-dash payload pi does not recognise
+      # fails outright, but one that happens to BE a pi flag (`-p`, say) is
+      # consumed as that flag and pi launches a fresh session with no work
+      # to do -- a successful attempt that did nothing, which is the quieter
+      # failure of the two.
       argv = [
         "pi"
         "--mode"
@@ -178,9 +193,54 @@ let
           mode = "jsonPath";
           pattern = "$.id";
         };
+        # Scoped to assistant `message_end` and guarded by the same two
+        # `stopReason` clauses as `occupancy` and `finalMessage`, because a
+        # bare `$..model` takes the last `model` anywhere in the stream and
+        # so pins the model of a turn the other two captures exclude. On
+        # `test/fixtures/traces/pi-aborted-turn.jsonl` that is
+        # `qwen3-vl-8b-ocr`, a model no valid turn of that session ever used,
+        # and it reaches an operator: the rendered resume argv carries it,
+        # and `daemon/completion.rs` records it as the job's model.
+        #
+        # The scoping is what makes the guard work, and a descendant filter
+        # does not, however it is clause-guarded. pi emits three records per
+        # assistant message -- `message_start`, `message_update`,
+        # `message_end` -- all carrying the same `AgentMessage`, so all
+        # carrying `role: assistant` and the same `model`, with `stopReason`
+        # `pending` until the message closes (pi's own `docs/json.md`
+        # message lifecycle, and visible in `pi.jsonl`). An aborted turn
+        # therefore contributes `pending` records *after* the last valid
+        # turn, and a descendant filter that excludes only `aborted`/`error`
+        # relocates the read to the same turn's `message_update` and
+        # resolves the identical model. Excluding `pending` as a third
+        # clause does not rescue it either: measured against a stream
+        # truncated mid-turn, that variant resolves no model at all, exactly
+        # like this one -- which is the point below.
+        #
+        # The cost, stated because it is a real narrowing: an attempt whose
+        # stream never closed an assistant `message_end` now yields no
+        # `model` capture, so a resume refuses loudly with
+        # `resume capture "model" is absent` instead of rendering. That is
+        # deliberate. Such a stream states only the model of a turn whose
+        # outcome is unknown, and an aborted turn's mid-stream records are
+        # indistinguishable from an open valid turn's until its
+        # `message_end` arrives -- so there is no pattern that both excludes
+        # the first and recovers from the second. Refusing beats pinning a
+        # model no completed turn is known to have used.
+        #
+        # Say the rest of it plainly, because this preset offers no way out.
+        # A pi-DERIVED adapter that declares `launch.model` can have a job
+        # pin one; this preset declares `launch = {}`, so a job-supplied
+        # model is refused before any template renders --
+        # `model override is not authorized by this adapter`. So a pi
+        # attempt whose stream never closed an assistant `message_end`
+        # cannot be resumed by tally at all. The operator re-runs it from
+        # scratch, or hand-authors a pi-derived adapter that declares
+        # `launch.model`. Nothing here makes that cheaper; it is the cost of
+        # not fabricating a model, and it is stated rather than discovered.
         model = mkScrapeCapture {
-          mode = "jsonPath";
-          pattern = "$..model";
+          mode = "jsonPathLast";
+          pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.model";
         };
         # Still no `fields` mapping, and now for a stated reason rather than
         # for want of evidence. A real `pi --mode json` capture is on hand
@@ -219,9 +279,19 @@ let
         # three resident fields are absent -- three resolved zeroes are
         # `Some(0)`, a fabricated emptiness for a session that was thousands
         # of tokens full. `test/fixtures/traces/pi-aborted-turn.jsonl` is that
-        # stream. `aborted` is proven from real pi data on this host;
-        # `error` is guarded by analogy with SSSF's `calculateContextTokens`,
-        # which skips both, and has not been observed here.
+        # stream.
+        #
+        # Both clauses are guarded, and the evidence for them runs the
+        # opposite way round from the order they are written in. `error` is
+        # the branch a non-interactive `pi --mode json` can actually reach
+        # in-stream: it is pi's own context-overflow signal, delivered on
+        # this same `message_end` shape. An in-stream `aborted`
+        # `message_end` could not be produced headlessly at all -- SIGINT
+        # truncates the run before any assistant `message_end` is written,
+        # exit 130 -- so the aborted turn in the fixture is real pi data
+        # taken from pi's **session store**, where aborted turns are
+        # recorded, not from a captured headless stream. `error` is
+        # corroborated by SSSF's `calculateContextTokens`, which skips both.
         occupancy = mkScrapeCapture {
           mode = "jsonPathLast";
           pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.usage";
@@ -231,9 +301,17 @@ let
             residentCacheWriteTokens = [ "cacheWrite" ];
           };
         };
+        # The same two `stopReason` clauses again, and this is the one where
+        # the cost of omitting them is read by a human. An attempt that ends
+        # on an aborted turn carrying partial text reported that truncated
+        # text as the node's answer, unmarked -- occupancy correctly held at
+        # the last valid turn while `finalMessage` moved to the aborted one.
+        # `test/fixtures/traces/pi-aborted-turn.jsonl` observes exactly that:
+        # unguarded it resolves to `The file notes.txt cont`, guarded to the
+        # last valid turn's `The file notes.txt contains 42.`
         finalMessage = mkScrapeCapture {
           mode = "jsonPathLast";
-          pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant'].message.content[?@.type == 'text'].text";
+          pattern = "$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.content[?@.type == 'text'].text";
         };
       };
       yieldHook = checkpointHook;
