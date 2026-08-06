@@ -13,14 +13,16 @@ regime and judged under another.
 
 #### #419 — the second `tally-core --lib` flake population, and what it actually was
 
-**Three** known members, not two: the issue body names two, and a comment on
-the issue names a third in a third module. All three reproduced red on `main`
-inside the full `-p tally-core --lib` suite and green in isolation, at about one
-full-suite run in thirteen to sixteen. All three are races against sibling tests
-in the same process, none is the mechanism the issue proposed, and all three are
-fixed here. They are **three distinct mechanisms**, not one shared one — which
-is the opposite of what the issue's comment expected, and is stated here because
-it bears on whether the population is closed.
+**Four** known members, not two: the issue body names two, a comment on the
+issue names a third in a third module, and verifying the repair of that third
+one surfaced a fourth in a fourth module. Every one reproduced red inside the
+full `-p tally-core --lib` suite and green in isolation, at roughly one
+full-suite run in thirteen to twenty-four, and every one is a race against
+sibling tests in the same process. None is the mechanism the issue proposed, and
+all four are fixed here. They are **four distinct mechanisms**, not four
+symptoms of one — the opposite of what the issue's comment expected, and the
+single most important thing this subsection records, because it is what decides
+whether the population can be called closed.
 
 - `retention::tests::capture_locks_expire_by_age_only_when_no_holder_has_them`
   released its capture-lock holder by closing the file and immediately asserted
@@ -51,17 +53,25 @@ it bears on whether the population is closed.
   201 times or waits out the 60 s launch-visibility timeout, where the prompt
   path inspects exactly twice. Two orders of magnitude apart, and load cannot
   perturb a count.
+- `producers::tests::interactive_cancellation_still_terminates_gh` waited for
+  its helper by polling for the existence of a pid file, but the fake `gh` it
+  installs published that pid with a bare `> file` redirection, which creates
+  the name before `printf` writes into it. Under load the reader wins that race,
+  reads `""` and fails `parse::<i32>` with `ParseIntError { kind: Empty }`. The
+  fake now writes a sibling and renames, so the name never resolves to a partial
+  state and existence really does imply a readable pid.
 
 Every fix removes the window rather than retrying through it, and the suite is
 still fully parallel — serializing it stays a non-goal, because a false red is
 cheap and a false green must remain impossible.
 
 **The population is not declared closed.** "Latent parallel-execution flakes" is
-not an enumerable set, the three known members turned out to have three
-unrelated mechanisms rather than one, and the exit criterion the issue states is
-a measured rate over a wave — which no single lane can observe. Three known
-members are fixed and each is proven under the load condition the issue names;
-the issue stays open for that wave-scale verification.
+not an enumerable set; the fourth member was found by verifying the third, and
+each new member has had its own unrelated mechanism rather than sharing one. The
+exit criterion the issue states is a measured rate over a wave, which no single
+lane can observe. Four known members are fixed and each is proven under the load
+condition the issue names; the issue stays open for that wave-scale
+verification.
 
 #### #379 — the startup budget is per phase now, and it says where the time went
 
