@@ -676,15 +676,33 @@ mod tests {
     }
 
     #[test]
-    fn acceptance_24_3_claude_and_codex_jsonl_are_lossless_ordered_and_advisory() {
-        for (adapter, fixture) in [
+    fn acceptance_24_3_harness_jsonl_captures_are_lossless_ordered_and_advisory() {
+        // The third element says whether the fixture carries the synthetic
+        // tail this test was originally written around: one unknown future
+        // event followed by one malformed line. `claude-code.jsonl` and
+        // `codex.jsonl` were authored with that tail; `pi.jsonl` is a pure
+        // real `pi --mode json` capture (see test/fixtures/traces/README.md)
+        // with no invented event type and no invented trailing garbage, so
+        // the tail assertions do not apply to it. Forcing them would mean
+        // corrupting the capture to satisfy the test — the opposite of what
+        // the fixture is for. What replaces them for pi is stronger in the
+        // direction that matters for a real capture: every one of its lines
+        // must parse.
+        for (adapter, fixture, synthetic_tail) in [
             (
                 "claude-code",
                 include_str!("../../../test/fixtures/traces/claude-code.jsonl"),
+                true,
             ),
             (
                 "codex",
                 include_str!("../../../test/fixtures/traces/codex.jsonl"),
+                true,
+            ),
+            (
+                "pi",
+                include_str!("../../../test/fixtures/traces/pi.jsonl"),
+                false,
             ),
         ] {
             let temp = tempfile::tempdir().unwrap();
@@ -748,18 +766,32 @@ mod tests {
                 expected,
                 "{adapter}"
             );
-            assert_eq!(
-                trace.items.last().unwrap().parse_status,
-                TraceParseStatus::Malformed
-            );
-            assert_eq!(
-                trace.items[expected.len() - 2].parse_status,
-                TraceParseStatus::Json
-            );
-            assert_eq!(
-                trace.items[expected.len() - 2].payload.as_ref().unwrap()["extension"]["preserve"],
-                "verbatim"
-            );
+            if synthetic_tail {
+                assert_eq!(
+                    trace.items.last().unwrap().parse_status,
+                    TraceParseStatus::Malformed,
+                    "{adapter}"
+                );
+                assert_eq!(
+                    trace.items[expected.len() - 2].parse_status,
+                    TraceParseStatus::Json,
+                    "{adapter}"
+                );
+                assert_eq!(
+                    trace.items[expected.len() - 2].payload.as_ref().unwrap()["extension"]
+                        ["preserve"],
+                    "verbatim",
+                    "{adapter}"
+                );
+            } else {
+                assert!(
+                    trace
+                        .items
+                        .iter()
+                        .all(|record| record.parse_status == TraceParseStatus::Json),
+                    "{adapter}"
+                );
+            }
             let payloads = trace
                 .items
                 .iter()
@@ -785,7 +817,7 @@ mod tests {
                             content.iter().any(|item| item["type"] == "tool_result")
                         })
                 }));
-            } else {
+            } else if adapter == "codex" {
                 assert!(payloads
                     .iter()
                     .any(|payload| payload["item"]["type"] == "agent_message"));
@@ -793,10 +825,43 @@ mod tests {
                     .iter()
                     .any(|payload| payload["item"]["type"] == "command_execution"
                         && payload["item"]["status"] == "completed"));
+            } else {
+                // pi's own framing, checked against the bytes pi emitted:
+                // the session header the `sessionRef` scrape reads, an
+                // assistant turn closing with `message_end`, the `toolCall`
+                // content block, and the separate `tool_execution_end`
+                // event that carries the result.
+                assert!(payloads
+                    .iter()
+                    .any(|payload| payload["type"] == "session" && payload["id"].is_string()));
+                assert!(payloads.iter().any(|payload| {
+                    payload["type"] == "message_end"
+                        && payload["message"]["role"] == "assistant"
+                        && payload["message"]["content"]
+                            .as_array()
+                            .is_some_and(|content| {
+                                content.iter().any(|item| item["type"] == "toolCall")
+                            })
+                }));
+                assert!(payloads
+                    .iter()
+                    .any(|payload| payload["type"] == "tool_execution_end"
+                        && payload["isError"] == false));
+                assert!(payloads
+                    .iter()
+                    .any(|payload| payload["type"] == "message_update"));
             }
-            assert!(payloads
-                .iter()
-                .any(|payload| payload.get("usage").is_some()));
+            // Where a harness states its usage is part of its framing: codex
+            // and claude-code state it at the top level of a roll-up event,
+            // pi states it inside each assistant message and nowhere else.
+            assert!(
+                payloads.iter().any(|payload| if adapter == "pi" {
+                    payload["message"]["usage"].is_object()
+                } else {
+                    payload.get("usage").is_some()
+                }),
+                "{adapter}"
+            );
             assert!(trace.items.iter().all(|record| {
                 record.authority == FactAuthority::AdvisoryProviderCapture
                     && record.provenance == "provider-capture"

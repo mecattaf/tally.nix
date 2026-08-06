@@ -6,6 +6,120 @@ authorized.
 
 ## [Unreleased]
 
+### pi adapter residue (#405, #406)
+
+The follow-ups the #387 lane's config-only cap deferred. #405 is the Rust-side
+and cosmetic residue of that cap; #406 is the config-side consistency work its
+round-2 evaluation found.
+
+#### #405 — the pi capture is now what the docs say it is, and a committed test runs it
+
+Three `crate::occupancy` doc statements still justified pi's undeclared usage
+mapping by "no real capture". The capture exists; what it justifies is
+*declining*, because pi states usage per assistant message and never per
+attempt, so a declared `inputTokens` there would report one turn's figures as
+an attempt's spend. The module doc now says that, and the `context_tokens`
+doc no longer lists pi among the adapters with no occupancy scrape — it has
+one.
+
+`test/fixtures/traces/pi.jsonl` is now read by the trace round-trip
+acceptance test, which previously covered only claude-code and codex. It is a
+pure real capture with no synthesised unknown event and no invented trailing
+garbage, so the two tail assertions written around the other two fixtures are
+conditional on that tail; what replaces them for pi is stronger in the
+direction a real capture cares about — every one of its lines must parse — plus
+assertions on pi's own framing (the session header, an assistant `message_end`
+carrying a `toolCall` block, the separate `tool_execution_end`, the
+`message_update` echo, and usage stated inside the message rather than at the
+top level).
+
+Placing a pre-prompt option on an adapter whose argv has no `--` terminator no
+longer fails. `render_launch_prefix` required a trailing `--` to place
+`prePromptArgv`, `approvalPolicy`, `sandboxPolicy`, `launch.cwdArgv`,
+`launch.model` or `launch.effort`, which made a **pi-derived** adapter — pi is
+the one preset that declares no terminator, because pi rejects one outright —
+refuse every pre-prompt option with an error naming a convention it abandoned
+on purpose. (The shipped `pi` preset never reached that error: it declares
+`launch = {}`, so a pre-prompt option is refused earlier, on authorization.)
+Options are now appended at the end of a terminator-less prefix, which is where
+a harness expects its own flags; a prefix that does end in `--` still gets them
+before the terminator, and an adapter with no argv at all still fails, now
+saying why.
+
+Two cosmetics: the synthetic `input_tokens` block in `flake.nix` is labelled as
+synthetic and as *not* pi's key set, so it cannot be misread as evidence about
+pi's wire format beside the real-capture block below it; and the pi preset
+records that its `message_update` echo makes stdout grow with the square of a
+turn's length, so a long pi campaign reaches the 16 MiB trace read bound far
+sooner than a codex or claude-code one. Truncation is reported rather than
+hidden, so that is a sizing note, not a defect.
+
+#### #406 — the valid-turn guard now covers every pi capture an operator reads
+
+#387 guarded `occupancy` against `stopReason: aborted` and `error` and left
+`finalMessage` reading every assistant `message_end`. An attempt that ended on
+an aborted turn carrying partial text therefore reported that truncated
+fragment as the node's answer, unmarked and indistinguishable from a complete
+one, while occupancy correctly held at the last valid turn. `model`
+(`$..model`, last match) had the same shape and a louder consequence: it
+pinned a model from an excluded turn, and both the rendered resume argv and
+the model recorded for the completed job carried it. All three captures now
+carry the same two `stopReason` clauses **and** the same scoping to assistant
+`message_end`, and the scoping is the half that does the work: pi emits
+`message_start` / `message_update` / `message_end` for every message, all
+carrying the same `AgentMessage` and so the same model, under
+`stopReason: pending` until the message closes. A filter that matches those
+mid-stream records excludes an invalid turn's `message_end` and then reads the
+same model straight back out of its `pending` records. `usage` stays
+unguarded, as before and for the stated reason. The `adapter-presets` check
+asserts the aborted fixture's whole rendered argv, not just the capture,
+because the argv is where the wrong model became operator-visible.
+
+The scoping narrows one case, deliberately: an attempt whose stream never
+closed an assistant `message_end` — a SIGINT-truncated run, say — now yields
+no `model` capture, so its resume refuses with `resume capture "model" is
+absent` instead of rendering one. Such a stream states only the model of a
+turn whose outcome is unknown, and an aborted turn's mid-stream records are
+indistinguishable from an open valid turn's until its `message_end` arrives,
+so no pattern both excludes the first and recovers from the second.
+
+There is no way out of that on this preset, and the consequence is worth
+stating rather than leaving to be discovered. A pi-*derived* adapter that
+declares `launch.model` can have a job pin one, but the shipped `pi` preset
+declares `launch = {}`, so a job-supplied model is refused before any template
+renders — `model override is not authorized by this adapter`. A pi attempt
+whose stream never closed an assistant `message_end` therefore cannot be
+resumed by tally at all: the operator re-runs it from scratch, or hand-authors
+a pi-derived adapter that declares `launch.model`. That is a real narrowing
+against the previous `$..model`, which did render such a resume — pinned to a
+model no completed turn was known to have used.
+
+`test/fixtures/traces/pi-aborted-turn.jsonl` could not observe any of this.
+Its real aborted message was aborted during model load, so it carried no
+`text` block at all and `finalMessage` fell through to the last valid turn
+whether guarded or not. It now carries a partial `text` block, and the aborted
+turn is spliced in as a whole turn — `message_start`, `message_update`,
+`message_end` — rather than as a bare `message_end`, because that bare shape
+is not one `pi --mode json` can emit and a fixture without the mid-stream
+records cannot see a `model` guard reading an excluded turn's model out of
+them. The added block and the two derived lifecycle records are labelled in
+the directory's README beside the splice it already documented. That README
+also now answers, once, what these fixtures structurally cannot see: the
+`error` half of the guard, a turn left open at end of stream, the echo's
+growth at campaign scale, anything about resume behaviour, and anything about
+redaction.
+
+Two comment corrections. The occupancy guard's evidence ordering was inverted:
+for a non-interactive `pi --mode json`, `error` is the reachable in-stream
+invalid-turn branch (pi's own context-overflow signal), while an in-stream
+`aborted` `message_end` cannot be produced headlessly at all — SIGINT
+truncates before any assistant `message_end`, exit 130 — so the aborted turn's
+provenance is pi's session store, and the comment now says that instead of
+"proven from real pi data". And the leading-dash narrowing has a quiet half
+worth naming: a payload that *is* a pi flag is consumed as that flag and pi
+launches a fresh session with no work to do, where a non-flag leading-dash
+payload fails loudly.
+
 ### Daemon startup & generation residue (#419, #379, #407, #378)
 
 One lane about work that runs at daemon startup, and state written under one

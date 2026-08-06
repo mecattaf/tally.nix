@@ -193,7 +193,7 @@ rendering, while tests
 `open_adapter_dispatches_direct_argv_and_multi_capture_resume`,
 `json_path_last_selects_only_the_normative_final_agent_events`,
 `unconfigured_pre_prompt_and_unauthorized_values_fail_closed`, and
-`acceptance_24_3_claude_and_codex_jsonl_are_lossless_ordered_and_advisory` pin
+`acceptance_24_3_harness_jsonl_captures_are_lossless_ordered_and_advisory` pin
 the runtime contract.
 
 Find jobs that used one adapter and inspect its sourced captures:

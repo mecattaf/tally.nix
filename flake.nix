@@ -5233,10 +5233,16 @@
             for preset in pi claude-code codex; do
               test "$(jq -c --arg preset "$preset" '.adapters[$preset].yieldHook' ${adapterConfig})" = '["tally","lease","status"]'
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.sessionRef.mode' ${adapterConfig})" = jsonPath
-              test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.model.mode' ${adapterConfig})" = jsonPath
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.usage.mode' ${adapterConfig})" = jsonPath
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.finalMessage.mode' ${adapterConfig})" = jsonPathLast
             done
+            # `model` is the one capture whose mode is not uniform. codex and
+            # claude-code read a document-scoped `$..model`; pi's must select
+            # across the whole stream to exclude an invalid turn, and a
+            # `$[?...]` filter over the document array is `jsonPathLast`.
+            test "$(jq -r '.adapters.codex.scrape.model.mode' ${adapterConfig})" = jsonPath
+            test "$(jq -r '.adapters["claude-code"].scrape.model.mode' ${adapterConfig})" = jsonPath
+            test "$(jq -r '.adapters.pi.scrape.model.mode' ${adapterConfig})" = jsonPathLast
             # The per-harness usage key mapping is a declaration, and these are
             # the declarations. `crates/tally-core/src/usage.rs` mirrors these
             # exact strings in its fixture tests, so a preset that drifts from
@@ -5272,6 +5278,18 @@
             test "$(jq -r '.adapters.codex.scrape.occupancy // "absent"' ${adapterConfig})" = absent
             test "$(jq -c '.adapters.pi.scrape.occupancy.fields' ${adapterConfig})" = '{"residentCacheReadTokens":["cacheRead"],"residentCacheWriteTokens":["cacheWrite"],"residentInputTokens":["input"]}'
             test "$(jq -r '.adapters.pi.scrape.occupancy.pattern' ${adapterConfig})" = "\$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.usage"
+            # The valid-turn guard is applied to every capture an operator
+            # reads, not only to occupancy: `finalMessage` would otherwise
+            # report an aborted turn's partial text as the node's answer and
+            # `model` would pin a model no valid turn used. All three are
+            # scoped to assistant `message_end` -- that scoping is load
+            # bearing, not stylistic, because pi repeats the same message
+            # (same role, same model) on `message_start`/`message_update`
+            # with `stopReason: pending`, so a filter that matches those
+            # records reads an excluded turn's model out of them. `usage`
+            # stays unguarded on purpose -- see the aborted-fixture render.
+            test "$(jq -r '.adapters.pi.scrape.finalMessage.pattern' ${adapterConfig})" = "\$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.content[?@.type == 'text'].text"
+            test "$(jq -r '.adapters.pi.scrape.model.pattern' ${adapterConfig})" = "\$[?@.type == 'message_end' && @.message.role == 'assistant' && @.message.stopReason != 'aborted' && @.message.stopReason != 'error'].message.model"
             test "$(jq -r '.adapters.pi.scrape.sessionRef.pattern' ${adapterConfig})" = '$.id'
             test "$(jq -r '.adapters["claude-code"].scrape.sessionRef.pattern' ${adapterConfig})" = '$..session_id'
             test "$(jq -r '.adapters.codex.scrape.sessionRef.pattern' ${adapterConfig})" = '$..thread_id'
@@ -5287,6 +5305,16 @@
             resume="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render nix-custom --captures '{"sessionRef":"nix-session"}' -- '--option-looking')"
             test "$(printf '%s' "$resume" | jq -c '.argv')" = '["custom-agent","--resume","nix-session","--option-looking"]'
             : > empty.err
+            # SYNTHETIC, and deliberately not pi's key set. This block
+            # predates the real-capture block below and exists only to pin
+            # the preset's *selection* rules -- `$.id` over the session
+            # header, the last assistant `message_end` for `finalMessage`, a
+            # `user` message ignored in between -- against a stream small
+            # enough to read in one screen. Its `usage` keys are
+            # `input_tokens`, which pi does not emit: pi's real keys are
+            # `input`/`output`/`cacheRead`/`cacheWrite`, and they are
+            # asserted from the recorded bytes further down. Nothing here
+            # should be read as evidence about pi's wire format.
             printf '%s\n' \
               '{"type":"session","id":"pi-session","model":"Pi/Exact.Model"}' \
               '{"type":"message_end","message":{"role":"assistant","model":"Pi/Exact.Model","content":[{"type":"text","text":"pi first"}],"usage":{"input_tokens":5}}}' \
@@ -5322,11 +5350,35 @@
             # zero-filled usage object: three resolved zeroes are `Some(0)`,
             # which reads as an empty context for a session that was over a
             # thousand tokens full. The fixture is the capture above with one
-            # real aborted assistant message appended -- see
-            # test/fixtures/traces/README.md.
+            # real aborted assistant turn appended, carrying the
+            # `message_start` / `message_update` / `message_end` lifecycle pi
+            # emits for every message -- see test/fixtures/traces/README.md.
+            # That lifecycle is why this render can see the `model` defect at
+            # all: the mid-stream records repeat the aborted turn's model
+            # under `stopReason: pending`, so a guard that is not scoped to
+            # `message_end` reads it back out of them and the assertions
+            # below pass on a bare spliced `message_end` while failing on
+            # every shape pi can actually emit.
             pi_aborted="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render pi --scrape-stdout ${./test/fixtures/traces/pi-aborted-turn.jsonl} --scrape-stderr "$PWD/empty.err" -- work)"
             test "$(printf '%s' "$pi_aborted" | jq -c '.captures.occupancy')" = "$pi_last_turn_usage"
             test "$(printf '%s' "$pi_aborted" | jq -r '.captures.occupancy.input')" != 0
+            # The guard is on every capture an operator reads, not just on
+            # occupancy. `finalMessage` must be the last VALID turn's answer:
+            # the aborted turn in this fixture carries partial text
+            # (`The file notes.txt cont`), and reporting that truncated
+            # fragment as the node's answer -- unmarked, indistinguishable
+            # from a complete one -- is what the clauses on that capture
+            # prevent.
+            test "$(printf '%s' "$pi_aborted" | jq -r '.captures.finalMessage')" = 'The file notes.txt contains 42.'
+            # And this argv is where the same defect on `model` became
+            # operator-visible. The spliced aborted turn genuinely came from
+            # another session and states `qwen3-vl-8b-ocr`; an unguarded
+            # `$..model` pinned it, so the resume tally would have run named
+            # a model no valid turn of this session ever used. Asserting the
+            # whole argv rather than the capture is deliberate: the argv is
+            # the surface an operator sees.
+            test "$(printf '%s' "$pi_aborted" | jq -c '.argv')" = '["pi","--mode","json","--session","019f0000-0000-7000-8000-000000000001","--model","qwen3.6-35b-a3b","work"]'
+            test "$(printf '%s' "$pi_aborted" | jq -r '.argv | index("qwen3-vl-8b-ocr") // "absent"')" = absent
             # `usage` is deliberately unguarded, and this is what that costs:
             # the stream-wide `$..usage` does land on the aborted turn. It is
             # never read as occupancy, and no spend mapping is declared for
