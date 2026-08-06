@@ -28,6 +28,26 @@ authorized.
   real eval is an adoption step for the next dispatched wave, not a code
   change this lane can claim.
 
+- **Lane: operator conveniences — reader-state (`archived`, a free-form
+  triage tag) on flow runs, never set by a run (#389).** A new durable store
+  (`crates/tally-core/src/reader_state.rs`, `reader-state.jsonl` in the
+  daemon's data directory) holds per-flow-run `archived` and a triage tag,
+  outside the witness/attestation ledgers and excluded from every hash
+  chain. It is written **only** by a new `tally reader-state
+  {archive,unarchive,tag,untag,show}` CLI verb, which writes the file
+  directly — no daemon socket, no RPC call, so no daemon or reconciler code
+  path can touch it. `query run` now exposes `archived` and `triageTag` (and
+  prints a loud `-- ARCHIVED` banner in its human text view); `query jobs`
+  and `query standup` gain `--archived`/`--no-archived` (default: hidden) and
+  filter on it, and `query standup`'s digest gains `archivedHidden`, a count
+  computed from the exact same filtering pass that produced the entries
+  beside it, never a separate recount. A corrupt or missing reader-state
+  store degrades every reader to "nothing is archived" rather than failing
+  the query (`ReaderState::read_advisory`), and the store self-compacts past
+  `READER_STATE_COMPACT_THRESHOLD` records so a scripted toggle loop cannot
+  grow it forever. Runs only, by design: no UI, no cross-host sync, no
+  per-task granularity.
+
 - **`query run` and `query standup` answer "what did this run cost" (#384).**
   `query.run` gains a `usage` object and `query.standup` gains a `runs` array
   carrying the same object per flow run the window touched. Both are summed

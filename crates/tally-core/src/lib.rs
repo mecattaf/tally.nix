@@ -24,6 +24,7 @@ pub mod producers;
 pub mod provenance;
 pub mod query;
 pub mod query_v2;
+pub mod reader_state;
 pub mod recovery;
 pub mod retention;
 pub mod storage;

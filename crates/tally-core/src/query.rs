@@ -881,6 +881,15 @@ pub struct StandupDigest {
     /// unfilled digest carries an empty list rather than a wrong one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<StandupRunUsage>,
+    /// How many entries this call hid because their creating run is archived
+    /// operator reader-state. Filled by
+    /// [`crate::query_v2::apply_reader_state_to_standup`], which owns the
+    /// reader-state store this projection has no access to; an unfilled
+    /// digest carries zero rather than a wrong count. Always computed from
+    /// the same filtering pass that produced the entries beside it, never
+    /// from a separate recount.
+    #[serde(default)]
+    pub archived_hidden: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1049,6 +1058,7 @@ pub fn query_standup(
         cancelled,
         canonical_gpu_seconds,
         runs: Vec::new(),
+        archived_hidden: 0,
     }
 }
 

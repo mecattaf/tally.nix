@@ -60,6 +60,7 @@ assertions.
 | `query` | Jobs, run status, lifecycle, proof, traces, producers, watch, status, and pool headroom. | JSON, JSONL, or compact text. |
 | `flow` | Check or execute a deterministic JavaScript flow. | Meta JSON or lifecycle JSONL. |
 | `migrate` | Run a one-shot forward migration of durable state written by an older binary. | Migration report JSON. |
+| `reader-state` | Archive/unarchive a flow run and set/clear its triage tag. Writes directly to disk, no daemon involved. | Reader-state record JSON. |
 
 The installed `tallyd` symlink with no arguments is equivalent to `tally daemon run`.
 `tally --mode daemon` with no subcommand is another compatibility spelling.
@@ -557,6 +558,11 @@ The RPC `query.render` supports an additional `scope` field, but the current CLI
 it and always requests the default `all` scope. Likewise, the RPC stand-up method supports a
 `source` filter that the CLI does not expose. Every completed, in-flight, gate-failed, or
 cancelled stand-up entry includes `taskRef` when the job belongs to a campaign task.
+
+`query jobs` and `query standup` both take `--archived` (include jobs/entries whose creating run
+is archived reader-state) and `--no-archived` (the default, spelled explicitly). `query standup`'s
+digest additionally carries `archivedHidden`, how many entries this call hid. See
+[Archive a run](observability.md#archive-a-run).
 
 ### Watch
 

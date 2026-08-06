@@ -179,6 +179,37 @@ Both spellings of the run ID work everywhere: `--flow-run` and `--flow-run-id`
 are aliases on `tally query jobs`, `tally query log`, `tally query proof`, and
 `tally flow run`.
 
+## Archive a run
+
+Once a run is dealt with, mark it so it stops crowding the standup and job
+lists:
+
+```console
+$ tally reader-state archive <flow-run-uuid> --tag flaky-fixture
+$ tally reader-state unarchive <flow-run-uuid>
+$ tally reader-state tag <flow-run-uuid> needs-followup
+$ tally reader-state untag <flow-run-uuid>
+$ tally reader-state show <flow-run-uuid>
+```
+
+This is **reader-state**, not evidence: `archived` and the triage tag live in
+their own file (`reader-state.jsonl`), outside the witness and attestation
+ledgers and excluded from every hash chain. Nothing durable about the run
+itself changes, and no daemon or reconciler code path can write this file —
+only the CLI verb above, which writes it directly. `query run` always exposes
+the current `archived` flag and `triageTag` (and prints a loud `-- ARCHIVED`
+banner in its human text view, however you got to that run); `query jobs` and
+`query standup` default to **hiding** archived runs, add `--archived` to see
+them, or `--no-archived` to say the default explicitly. `query standup`'s
+digest also carries `archivedHidden`, so "the list looks short" is never
+silently indistinguishable from "the list is short" — the count is computed
+from the exact same filter pass that produced the entries beside it.
+
+A reader-state store that is missing, empty, truncated, or hand-edited into
+garbage degrades every query that consults it to "nothing is archived" rather
+than failing the query; it carries no weight `witness verify` or `tally
+attest` care about either way.
+
 For one node, inspect all attempt lanes:
 
 ```console
@@ -469,6 +500,7 @@ snapshot, then start a new watch. Do not pretend the stream was continuous.
 | Data | Home Manager default | NixOS default | Retention |
 |---|---|---|---|
 | Witness and attestation ledgers | `~/.local/share/tally/` | `/var/lib/tally/data/` | Append-only |
+| Reader-state (`archived`, triage tag) | same data directory, `reader-state.jsonl` | same data directory | Self-compacts to one record per run past `READER_STATE_COMPACT_THRESHOLD`; outside every hash chain, written only by `tally reader-state` |
 | Lifecycle history and watch log | same data directory | same data directory | Lifecycle compacts an old prefix after `lifecycleMaxBytes`, preserving `lifecycleHorizon`; watch keeps 4,096 records |
 | Enqueue events, captures, unit exits, meters | `~/.local/state/tally/` | `/var/lib/tally/state/` | Selected sets only; see retention policy |
 | Current stdout/raw adapter stderr | Ordinary: `<stateDir>/capture/<uuid>.out` and `.adapter.err`; task-ref node: `<uuid>.<task-id>.out` and `.adapter.err` | same layout | Accumulates |

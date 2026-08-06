@@ -7,6 +7,7 @@ mod exit;
 mod flow;
 mod out;
 mod queue;
+mod reader_state;
 mod text;
 
 #[cfg(test)]
@@ -73,6 +74,7 @@ use exit::*;
 use flow::*;
 use out::{errln, outln};
 use queue::*;
+use reader_state::*;
 
 pub(crate) fn main() {
     let mut args = std::env::args_os().collect::<Vec<_>>();
@@ -286,6 +288,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             .await
         }
         Some(Command::Migrate { command }) => run_migrate(opts.config.as_deref(), command),
+        Some(Command::ReaderState { command }) => run_reader_state(command),
         None => {
             Opts::command().print_help().map_err(out::map_write_error)?;
             outln!();

@@ -89,6 +89,64 @@ pub(super) enum Command {
         #[command(subcommand)]
         command: MigrateCommand,
     },
+    /// Operator reader-state on flow runs: `archived` and a free-form triage
+    /// tag. Never touched by the daemon, a reconciler, or any run — only by
+    /// this verb family. See `doc/src/operating/observability.md`.
+    ReaderState {
+        #[command(subcommand)]
+        command: ReaderStateCommand,
+    },
+}
+
+/// One durable reader-state change, made directly against the store file —
+/// no daemon socket involved, the same way `witness verify` reads the
+/// witness ledger straight off disk. This is deliberate: the acceptance
+/// property under test is that no *daemon* code path can write this file,
+/// and a CLI verb that went through the daemon at all would blur that line.
+#[derive(Debug, Subcommand)]
+pub(super) enum ReaderStateCommand {
+    /// Mark a flow run archived. Its jobs and stand-up entries are hidden by
+    /// default from `query jobs` / `query standup` until `--archived` is
+    /// passed to one of those commands.
+    Archive {
+        #[arg(value_name = "FLOW_RUN_ID")]
+        flow_run: String,
+        /// Set the triage tag at the same time.
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
+    },
+    /// Clear the archived flag. Leaves any triage tag untouched.
+    Unarchive {
+        #[arg(value_name = "FLOW_RUN_ID")]
+        flow_run: String,
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
+    },
+    /// Set the free-form triage tag. Leaves the archived flag untouched.
+    Tag {
+        #[arg(value_name = "FLOW_RUN_ID")]
+        flow_run: String,
+        #[arg(value_name = "TAG")]
+        tag: String,
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
+    },
+    /// Clear the triage tag. Leaves the archived flag untouched.
+    Untag {
+        #[arg(value_name = "FLOW_RUN_ID")]
+        flow_run: String,
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
+    },
+    /// Print the reader-state record for one run, or `null` if it has none.
+    Show {
+        #[arg(value_name = "FLOW_RUN_ID")]
+        flow_run: String,
+        #[arg(long, value_name = "PATH")]
+        data_dir: Option<PathBuf>,
+    },
 }
 
 /// One-shot forward migrations of durable state written by an older binary.
@@ -968,6 +1026,14 @@ pub(super) enum QueryCommand {
         /// it the command follows the cursor and prints the whole window.
         #[arg(long)]
         json: bool,
+        /// Include jobs whose creating run is archived operator reader-state.
+        /// The default hides them.
+        #[arg(long, conflicts_with = "no_archived")]
+        archived: bool,
+        /// Explicit spelling of the default: hide jobs whose creating run is
+        /// archived.
+        #[arg(long)]
+        no_archived: bool,
     },
     Job {
         id: String,
@@ -1063,6 +1129,13 @@ pub(super) enum QueryCommand {
     Standup {
         #[arg(long)]
         since: Option<String>,
+        /// Include entries and runs archived as operator reader-state. The
+        /// default hides them and reports how many it hid.
+        #[arg(long, conflicts_with = "no_archived")]
+        archived: bool,
+        /// Explicit spelling of the default: hide archived entries and runs.
+        #[arg(long)]
+        no_archived: bool,
     },
     Pools,
 }
