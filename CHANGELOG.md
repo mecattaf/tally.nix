@@ -6,7 +6,7 @@ authorized.
 
 ## [Unreleased]
 
-### Daemon startup & generation residue (#419, #379)
+### Daemon startup & generation residue (#419, #379, #407)
 
 One lane about work that runs at daemon startup, and state written under one
 regime and judged under another.
@@ -74,6 +74,43 @@ late-startup warning, so the 61 s could be measured but not attributed.
 Raising a static budget was the alternative and was rejected: it buys headroom
 without telling anyone when it is being consumed, which is the state that
 produced this issue.
+
+#### #407 — failure-stderr recovery is a one-shot, and says so in one line
+
+`reconcile_failure_stderr` walked every terminal `Failed` witness record at
+every startup and re-probed captures that were permanently gone: 227 identical
+warnings on the startup #379 measured, about 2,951 across five days, enough to
+bury the genuine startup signal beside them, and a cost that grew with failure
+history without bound.
+
+The files are missing for a reason upstream of this pass, and it is not
+retention. `write_capture_generation` is fsynced before `systemd-run` creates
+the unit, and `archive_current_capture` returns early when any of the capture
+set is absent — so an attempt that failed before its stderr stream existed
+leaves a generation marker that nothing ever retires, and the recovery pass
+read that marker as "recoverable" at every start, forever.
+
+- The pass now persists a cursor, `state/failure-stderr-cursor.json`, holding
+  the witness sequence through which recovery has reached a definitive answer.
+  A record's captures are final by the time it is terminal, so a second attempt
+  can only reach the same answer; the steady-state cost is now zero probes
+  rather than one per historical failure.
+- Only two outcomes are definitive: the projection was written, or the source
+  is absent (`NotFound`). Anything else — a contended lock, a stream that
+  cannot be opened without following a link — leaves the cursor short of that
+  record, so a later start retries it. The cursor is a contiguous high-water
+  mark, not a maximum, so a record behind a deferred one is retried too.
+- The 227 per-record warnings are one line with named fields:
+  `examined= recovered= absent= deferred= reconciledThroughSeq=`. A per-record
+  line survives only for the deferred class, which is rare and actionable.
+- Measured: 227 doomed probes cost 10.7 ms of filesystem work, falling to 37 µs
+  once reconciled. Against #379's 61 s that saving is negligible and is stated
+  as such; what the fix actually buys is that the cost stops growing, and that
+  a startup's log is readable.
+
+The richer answer for the log line would have been a `TALLY_EVENT` journal
+record with real fields. That was deliberately not done: adding an event type
+this phase would collide with the audit of the existing eleven.
 
 ### Recurring-cost hygiene (#396, #411, #395, #404)
 

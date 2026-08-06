@@ -461,7 +461,7 @@ pub(super) fn read_capture_generation(
     serde_json::from_reader(file).map(Some).map_err(Into::into)
 }
 
-pub(super) fn replace_private_file(path: &Path, contents: &[u8]) -> Result<(), ExecutorError> {
+pub(crate) fn replace_private_file(path: &Path, contents: &[u8]) -> Result<(), ExecutorError> {
     let parent = path.parent().ok_or_else(|| {
         ExecutorError::InvalidRequest("private file path has no parent".to_owned())
     })?;

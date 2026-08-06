@@ -2469,6 +2469,118 @@ mod tests {
         );
     }
 
+    /// #407: a terminal failure whose adapter stderr never existed was probed
+    /// again at every startup, forever, one warning per probe, all of it
+    /// charged to `TimeoutStartSec`.
+    ///
+    /// The mechanism is upstream of this pass. `write_capture_generation` is
+    /// fsynced before `systemd-run` creates the unit, and
+    /// `archive_current_capture` returns early when any of the capture set is
+    /// missing — so an attempt that failed before its stderr stream existed
+    /// leaves a generation marker nothing ever retires, and this pass read
+    /// that marker as "recoverable" at every start.
+    ///
+    /// What is asserted here is the disposition: a definitive answer is
+    /// recorded once, a transient one is not, and the pass stops before the
+    /// first transient record so a later start still retries it.
+    #[test]
+    fn failure_stderr_recovery_is_one_shot_and_stops_at_the_first_transient_record() {
+        let temp = tempdir().unwrap();
+        let state_dir = temp.path().join("state");
+        let executor = direct_executor(&state_dir);
+        let mut ledger = WitnessLedger::open(temp.path().join("witness.jsonl")).unwrap();
+
+        // Three terminal failures, each with a capture generation naming this
+        // attempt. The first and third have no adapter stderr at all: the
+        // permanent shape. The second has one that cannot be opened without
+        // following a link, which is a refusal rather than an absence and
+        // therefore must not be written off.
+        let mut seeded = Vec::new();
+        for index in 0..3_usize {
+            let uuid = Uuid::new_v4();
+            let row = durable_row(uuid, &format!("failure-{index}"), 1);
+            let identity = ExecutionIdentity {
+                job_id: uuid,
+                task_uuid: Some(uuid),
+                task_ref: None,
+            };
+            let paths = executor.paths(&identity);
+            fs::create_dir_all(paths.capture_generation.parent().unwrap()).unwrap();
+            fs::create_dir_all(paths.stderr.parent().unwrap()).unwrap();
+            fs::write(&paths.capture_generation, br#"{"attempt":1,"leaseEpoch":1}"#).unwrap();
+            if index == 1 {
+                std::os::unix::fs::symlink("absent-target", &paths.stderr).unwrap();
+            }
+            assert!(!paths.stderr.is_file());
+            let record = append_fixture_witness(
+                &mut ledger,
+                &row,
+                "2026-08-05T18:34:00.000Z",
+                Verdict::Failed,
+                1,
+                1,
+                1,
+            );
+            seeded.push((record, executor.capture_lock_path(&identity)));
+        }
+        let records = seeded
+            .iter()
+            .map(|(record, _)| record.clone())
+            .collect::<Vec<_>>();
+
+        // First pass: every record is probed. `persist_failure_stderr` takes
+        // the capture lock, so the lock file existing is the witness that the
+        // probe happened at all.
+        startup::reconcile_failure_stderr(&records, &executor, &state_dir).unwrap();
+        for (_, lock) in &seeded {
+            assert!(lock.exists(), "every record is probed on the first pass");
+        }
+        let cursor = state_dir.join(startup::FAILURE_STDERR_CURSOR_FILE);
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cursor).unwrap()).unwrap();
+        // Stops at the first record it could not settle, not at the last one
+        // it could: the third record is definitive but sits behind the second.
+        assert_eq!(recorded["reconciledThroughSeq"], json!(records[0].seq));
+        assert_eq!(recorded["schemaVersion"], json!(1));
+
+        // Second pass: the settled record is not probed again, and the two
+        // behind the cursor still are.
+        for (_, lock) in &seeded {
+            fs::remove_file(lock).unwrap();
+        }
+        startup::reconcile_failure_stderr(&records, &executor, &state_dir).unwrap();
+        assert!(
+            !seeded[0].1.exists(),
+            "a settled record must never be probed again"
+        );
+        assert!(seeded[1].1.exists(), "a deferred record is retried");
+        assert!(
+            seeded[2].1.exists(),
+            "a record behind a deferred one is retried"
+        );
+
+        // And once the refusal is gone the cursor clears the whole ledger, so
+        // the steady-state cost of this pass is zero probes.
+        let uuid_one = Uuid::parse_str(records[1].task_uuid.as_deref().unwrap()).unwrap();
+        let identity_one = ExecutionIdentity {
+            job_id: uuid_one,
+            task_uuid: Some(uuid_one),
+            task_ref: None,
+        };
+        fs::remove_file(executor.paths(&identity_one).stderr).unwrap();
+        startup::reconcile_failure_stderr(&records, &executor, &state_dir).unwrap();
+        for (_, lock) in &seeded {
+            let _ = fs::remove_file(lock);
+        }
+        startup::reconcile_failure_stderr(&records, &executor, &state_dir).unwrap();
+        for (_, lock) in &seeded {
+            assert!(!lock.exists(), "a fully reconciled ledger probes nothing");
+        }
+        let recorded: serde_json::Value =
+            serde_json::from_slice(&fs::read(&cursor).unwrap()).unwrap();
+        assert_eq!(recorded["reconciledThroughSeq"], json!(records[2].seq));
+    }
+
     #[test]
     fn recovery_replays_a_terminal_github_failure_with_its_stderr_tail() {
         let temp = tempdir().unwrap();
@@ -2523,7 +2635,8 @@ mod tests {
         });
 
         assert!(!paths.failure_stderr.exists());
-        startup::reconcile_failure_stderr(std::slice::from_ref(&record), &executor).unwrap();
+        startup::reconcile_failure_stderr(std::slice::from_ref(&record), &executor, temp.path())
+            .unwrap();
         assert_eq!(
             fs::read(&paths.failure_stderr).unwrap(),
             b"recovered actionable stderr\n"
