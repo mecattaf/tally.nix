@@ -324,6 +324,63 @@ authorized.
 
 ### Fixed
 
+- **The exit-20 `details` contract is now held to evidence instead of to
+  itself (#400).** #397 gave the five supersession codes one fourteen-member
+  `details` shape and documented it in two pages. What it could not give was a
+  reason to believe either claim: the contract test compared production output
+  with the same constant production iterates over, so a member could be added
+  or reordered while every assertion passed and all three prose copies rotted,
+  and the family's one wire rename was exercised only by in-process stubs that
+  would have agreed with any name.
+
+  - **#400 — the prose copies are pinned to the constant, and the rename is
+    proved by a real process.** `crates/tally-flow/tests/supersession_docs.rs`
+    parses the marker-delimited member table in
+    `doc/src/flows/submission-and-replay.md` and the per-code table in
+    `doc/src/reference/errors.md` and holds both to
+    `SUPERSESSION_DETAIL_FIELDS` / `SUPERSESSION_CODES` — membership, order,
+    and the derived members whose *values* the docs state (`transient`,
+    `resolution`, `divergentInput`, and whether a code advertises a `remedy`).
+    The `remedy` nullity rule is now stated once, in one wording, in both
+    pages. The value that rule states and the member it blames are read out of
+    the sentence and used to drive the check against the code, so the sentence
+    is load-bearing: the two copies drifting apart, a wording that states a
+    different value, a wording that blames a different member, and an empty
+    span all fail. `errors.md` names `recordedLabel` and
+    `currentLabel` where it used to say "both labels", so its `replay-divergence`
+    row also carries the renamed members. A live daemon-driven
+    `replay-divergence` (`flow_live::a_live_replay_divergence_names_the_current_hash_and_label_on_the_wire`)
+    replays an admitted ordinal whose payload changed and asserts
+    `currentHash` / `currentLabel` — and the absence of the pre-rename
+    `expectedHash` / `expectedLabel` — on a real runner's stdout, the first
+    live exit-20 assertion in the suite that is not an identity pin.
+
+  - **#401 — the `remedy` guard reaches the field a human reads, and agrees
+    with the repo's own definition of "no run named".** #397 guarded the
+    `remedy` *detail*; `identity_refusal_remedy_sentence`, which embeds the
+    same invocation in the operator-visible `message`, was left unguarded, so
+    a refusal that could not say which run it was about still advertised a
+    `tally flow supersede` missing its `--flow-run-id` value — exit 2 in an
+    operator's hands. It now returns the why-clause without the command. Both
+    guards test blankness as `trim().is_empty()`, which is what `run_script`
+    has always meant by it, so a whitespace-only `flowRunId` from a foreign
+    producer no longer renders an inert command either. Neither was reachable
+    from any in-tree call site; both functions are public.
+
+    A **flag-shaped** `flowRunId` — a foreign producer sending `--reason` or
+    `-h` as the run id — is *not* closed by this, and is not claimed to be: it
+    is not blank under anyone's definition, so both the `remedy` and the
+    message still render a command that exits 2. Suppressing it would
+    contradict the ruling below, and validating the member as a UUID is a wider
+    contract change than this asked for, so the correct behaviour is left to be
+    decided rather than assumed.
+
+    A `flowRunId` a producer sent as something other than a string is now
+    preserved rather than replaced with `null`. Every other member of the
+    contract keeps whatever the producer sent, and "the producer named a run
+    badly" is a different fact from "the producer named no run" — which is
+    what the doc row promises `null` means. No `remedy` is derived from it.
+
 - **The `pi` preset's launch and resume argv could not run (#387).** Both
   ended in `--`, tally's option-terminator convention across presets. pi has
   no end-of-options separator: it rejects one with `Error: Unknown option:

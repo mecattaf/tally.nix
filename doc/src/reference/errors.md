@@ -166,7 +166,7 @@ fields for exactly that:
 |---|---|
 | `transient` | `true` when repeating the identical command can produce a different answer; `false` when it cannot. |
 | `resolution` | The bounded operation that clears it: `retry`, `supersede`, `run-successor`, `investigate`, or `repair-lineage-ledger`. |
-| `remedy` | The `tally flow supersede` invocation that clears this run, with the successor UUID left as a placeholder because it must be persisted before the call. `null` on a code no single command clears. |
+| `remedy` | The `tally flow supersede` invocation that clears this run, with the successor UUID left as a placeholder because it must be persisted before the call. It is <!-- remedy-nullity:start -->`null` when no single command does — including when no `flowRunId` is known, since the command needs one<!-- remedy-nullity:end -->. |
 
 The classification is fixed per code and is the same wherever the error was raised — the
 runner's own startup scan, a daemon refusal handed back mid-run, or the client's translation of
@@ -179,13 +179,20 @@ listed in
 all fourteen are always present, and `null` means this code has nothing to say through that
 member. The column below names what each code populates.
 
+<!-- supersession-code-rows:start -->
 | Code | `transient` | `resolution` | Populates |
 |---|---|---|---|
 | `script-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "script"`, `recordedHash`, `currentHash`, `remedy` |
 | `args-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "args"`, `recordedHash`, `currentHash`, `remedy` |
 | `catalog-changed-mid-run` | `false` | `supersede` | `flowRunId`, `divergentInput: "catalog"`, `recordedHash`, `currentHash`, `remedy` |
 | `flow-run-superseded` | `false` | `run-successor` | `flowRunId`, `successorFlowRunId`, `reason`, `recordedAt` |
-| `replay-divergence` | `false` | `investigate` | `flowRunId`, `divergentInput: "payload"`, `recordedHash`, `currentHash`, both labels, `taskUuid`, and `kernelError` when a kernel dedup-key conflict revealed it. A rollover does **not** clear it: the same ordinal re-derived different work, which is a question about the script or the configuration. |
+| `replay-divergence` | `false` | `investigate` | `flowRunId`, `divergentInput: "payload"`, `recordedHash`, `currentHash`, `recordedLabel`, `currentLabel`, `taskUuid`, and `kernelError` when a kernel dedup-key conflict revealed it. A rollover does **not** clear it: the same ordinal re-derived different work, which is a question about the script or the configuration. |
+<!-- supersession-code-rows:end -->
+
+Every other classified code carries the two branching fields and nothing more:
+
+| Code | `transient` | `resolution` | Populates |
+|---|---|---|---|
 | `script-history-conflict`, `args-history-conflict`, `catalog-history-conflict` | `false` | `investigate` | The run's own history already holds more than one hash. |
 | `flow-lineage-conflict` | `false` | `investigate` | The supersede contradicts durable lineage. |
 | `flow-lineage-unusable` | `false` | `repair-lineage-ledger` | The durable lineage index holds an undecodable complete record. |
