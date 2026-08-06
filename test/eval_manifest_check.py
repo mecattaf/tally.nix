@@ -66,14 +66,34 @@ legitimate, typed outcome, but an item silently missing an entry at all is
 the omission this checker exists to catch. An `expected` key with no matching
 entry is reported as UNCOVERED SURFACE and fails the check.
 
+Declining `expected` (or declaring it with empty lists) is a legitimate,
+self-contained choice -- this checker never shells out to `git`/`gh` to
+discover the surface a findings file was supposed to cover, and that design
+is intentional. But it means the checker CANNOT independently know an eval
+reviewed anything at all: a manifest with empty `bullets`, empty `files`,
+and no `expected` is schema-valid on exactly the same terms as one that
+covered everything. The success line says so explicitly (see below) --
+"schema-valid" is a real but much weaker claim than "N/N covered," and the
+two must never print as the same word with nothing to tell them apart.
+
+The exact wire shape is designed to make a SECOND embedded copy of this
+schema example a hazard: an eval prompt built by quoting this docstring
+verbatim (a natural thing to do, and the intended adoption path) reproduces
+the same marker line inside a findings file that also carries the eval's
+real manifest. Rather than silently picking one, this checker refuses a
+findings file with more than one marked block -- do not paste this example
+into a findings document verbatim; describe the shape in prose instead, or
+make sure only the real manifest carries the literal marker line.
+
 Usage: eval_manifest_check.py <findings-file.md>...
 
 Exit 0 and a summary line per file when every manifest present is schema-valid
 and has no uncovered surface. Exit 1 and one line per problem otherwise. A
-findings file with no manifest section at all is reported, not silently
-skipped -- "no manifest" and "an invalid manifest" are different failures,
-but both are failures for a checker whose whole job is proving the eval
-made this claim at all.
+findings file with no manifest section at all, or with more than one, is
+reported, not silently resolved -- "no manifest," "an invalid manifest," and
+"an ambiguous manifest" are three different failures, and all three are
+failures for a checker whose whole job is proving the eval made this claim
+at all, unambiguously.
 """
 
 from __future__ import annotations
@@ -259,17 +279,55 @@ def _tally(report: Report, status: object) -> None:
         report.failed += 1
 
 
+class MultipleManifestsError(Exception):
+    """More than one marked block was found; picking one would be a guess."""
+
+    def __init__(self, count: int) -> None:
+        self.count = count
+        super().__init__(
+            f"{count} coverage-manifest blocks found; exactly one is allowed "
+            "(did this findings file quote the schema example verbatim?)"
+        )
+
+
 def find_manifest(text: str) -> Any | None:
     """The parsed manifest block, or None if the marker is absent.
 
     A marker present with unparsable JSON after it is not "absent" -- that is
     a malformed manifest, reported by the caller as a JSON decode failure,
-    not silently treated as "no manifest here."
+    not silently treated as "no manifest here." More than one marked block
+    is not "the first one wins" or "the last one wins" either -- both are a
+    guess about which block is the real manifest, and a findings file that
+    quotes this module's own docstring example ends up with a decoy block
+    that a first-match search would silently grade instead of the real one.
+    Raises [`MultipleManifestsError`] rather than choosing.
     """
-    match = BLOCK.search(text)
-    if match is None:
+    matches = list(BLOCK.finditer(text))
+    if not matches:
         return None
-    return json.loads(match.group(1))
+    if len(matches) > 1:
+        raise MultipleManifestsError(len(matches))
+    return json.loads(matches[0].group(1))
+
+
+def _coverage_clause(kind: str, expected_value: object) -> str:
+    """What the success line says about ONE `expected` category.
+
+    An `expected.<kind>` that is absent, or present but empty, means this
+    manifest made no claim the checker could hold it to for that category --
+    "0/0 covered" would print exactly like "everything named was covered,"
+    which is the reassuring-direction lie HIGH-1 is about. Say plainly that
+    coverage was not checked instead. A non-empty `expected.<kind>` only
+    reaches this function once `check_manifest` has already confirmed every
+    one of its entries matched something in `bullets`/`files` (an unmatched
+    entry is UNCOVERED and makes `report.ok` False, which keeps this
+    function from ever being asked to describe a partial match as if it were
+    whole).
+    """
+    count = len(expected_value) if isinstance(expected_value, list) else 0
+    if count == 0:
+        return f"no expected {kind} declared -- {kind} coverage NOT checked"
+    return f"{count}/{count} {kind} covered"
 
 
 def main(paths: list[str]) -> int:
@@ -282,6 +340,10 @@ def main(paths: list[str]) -> int:
         text = path.read_text(encoding="utf-8")
         try:
             manifest = find_manifest(text)
+        except MultipleManifestsError as error:
+            print(f"{path}: {error}", file=sys.stderr)
+            failures += 1
+            continue
         except json.JSONDecodeError as error:
             print(f"{path}: manifest block is not valid JSON: {error}", file=sys.stderr)
             failures += 1
@@ -296,9 +358,13 @@ def main(paths: list[str]) -> int:
         for gap in report.uncovered:
             print(f"{path}: UNCOVERED: {gap}", file=sys.stderr)
         if report.ok:
+            expected = manifest.get("expected") if isinstance(manifest, dict) else None
+            expected = expected if isinstance(expected, dict) else {}
+            bullets_clause = _coverage_clause("bullets", expected.get("bullets"))
+            files_clause = _coverage_clause("files", expected.get("files"))
             print(
-                f"{path}: ok "
-                f"(covered={report.covered} reused={report.reused} failed={report.failed})"
+                f"{path}: ok (schema-valid; {bullets_clause}; {files_clause}; "
+                f"covered={report.covered} reused={report.reused} failed={report.failed})"
             )
         else:
             failures += 1

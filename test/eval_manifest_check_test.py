@@ -46,10 +46,14 @@ def valid_manifest() -> dict:
 
 
 class FixtureTests(unittest.TestCase):
-    def test_valid_fixture_passes(self):
+    def test_valid_fixture_passes_with_the_strong_coverage_claim(self):
         code, out, err = run_main(FIXTURES / "valid.md")
         self.assertEqual(code, 0, err)
-        self.assertIn("ok (covered=3 reused=1 failed=1)", out)
+        self.assertIn(
+            "ok (schema-valid; 3/3 bullets covered; 2/2 files covered; "
+            "covered=3 reused=1 failed=1)",
+            out,
+        )
 
     def test_missing_file_fixture_is_rejected(self):
         """Proof scenario 1: a manifest that omits a reviewed file."""
@@ -84,6 +88,32 @@ class FixtureTests(unittest.TestCase):
         code, _out, err = run_main()
         self.assertEqual(code, 2)
         self.assertIn("usage:", err)
+
+    def test_no_expected_surface_fixture_prints_the_weak_claim_not_ok(self):
+        """HIGH-1 (round-1 eval): a manifest that reviewed nothing must not
+        print the same bare `ok` a fully-covered manifest gets."""
+        code, out, err = run_main(FIXTURES / "no-expected-surface.md")
+        self.assertEqual(code, 0, err)
+        self.assertIn("coverage NOT checked", out)
+        # And the weak line must be textually distinct from the strong one.
+        strong_code, strong_out, _ = run_main(FIXTURES / "valid.md")
+        self.assertEqual(strong_code, 0)
+        self.assertNotEqual(
+            out.split(": ", 1)[1],
+            strong_out.split(": ", 1)[1],
+            "a reviewed-nothing manifest must not print byte-identically to a "
+            "fully-covered one",
+        )
+
+    def test_two_blocks_fixture_is_refused_not_silently_graded(self):
+        """HIGH-2 (round-1 eval): a findings file that quotes the schema
+        example is refused outright, not graded against the quoted decoy."""
+        code, out, err = run_main(FIXTURES / "two-blocks.md")
+        self.assertEqual(code, 1)
+        self.assertIn("2 coverage-manifest blocks found", err)
+        # The old defect: the decoy's `covered=2` must never appear as a
+        # success line for this file.
+        self.assertNotIn("ok (", out)
 
 
 class SchemaUnitTests(unittest.TestCase):
@@ -167,6 +197,69 @@ class SchemaUnitTests(unittest.TestCase):
         report = checker.check_manifest(manifest)
         self.assertFalse(report.ok)
         self.assertTrue(any("run" in error for error in report.errors))
+
+
+class CoverageClauseTests(unittest.TestCase):
+    """HIGH-1: the success line must say what it actually verified."""
+
+    def test_absent_expected_is_not_checked(self):
+        self.assertIn("NOT checked", checker._coverage_clause("bullets", None))
+
+    def test_empty_expected_list_is_not_checked(self):
+        """Declaring `expected.bullets: []` must read the same as omitting
+        it entirely -- both are "nothing named," not "0/0 covered."""
+        self.assertIn("NOT checked", checker._coverage_clause("bullets", []))
+
+    def test_non_empty_expected_is_the_strong_claim(self):
+        clause = checker._coverage_clause("files", ["a.rs", "b.rs"])
+        self.assertEqual(clause, "2/2 files covered")
+        self.assertNotIn("NOT checked", clause)
+
+    def test_degenerate_manifest_is_distinguishable_from_full_manifest(self):
+        """The exact HIGH-1 reproduction: an eval that reviewed nothing
+        must not be byte-indistinguishable from one that reviewed
+        everything."""
+        empty = {"version": 1, "bullets": [], "files": [], "run": {"status": "ok"}}
+        full = valid_manifest()
+        full["expected"] = {"bullets": ["388:schema"], "files": ["test/eval_manifest_check.py"]}
+
+        def render(manifest: dict) -> str:
+            report = checker.check_manifest(manifest)
+            assert report.ok, report.errors
+            expected = manifest.get("expected") or {}
+            return "; ".join(
+                [
+                    checker._coverage_clause("bullets", expected.get("bullets")),
+                    checker._coverage_clause("files", expected.get("files")),
+                ]
+            )
+
+        self.assertNotEqual(render(empty), render(full))
+
+
+class MultipleManifestsTests(unittest.TestCase):
+    """HIGH-2: a second marked block must refuse, never silently pick one."""
+
+    def test_single_block_parses_normally(self):
+        text = (
+            "prose\n\n"
+            + checker.MARKER
+            + '\n```json\n{"version": 1}\n```\n'
+        )
+        self.assertEqual(checker.find_manifest(text), {"version": 1})
+
+    def test_two_blocks_raise_instead_of_picking_the_first(self):
+        one = checker.MARKER + '\n```json\n{"version": 1, "decoy": true}\n```\n'
+        two = checker.MARKER + '\n```json\n{"version": 1, "real": true}\n```\n'
+        with self.assertRaises(checker.MultipleManifestsError) as raised:
+            checker.find_manifest(f"{one}\n{two}")
+        self.assertEqual(raised.exception.count, 2)
+
+    def test_three_blocks_report_the_true_count(self):
+        block = checker.MARKER + '\n```json\n{"version": 1}\n```\n'
+        with self.assertRaises(checker.MultipleManifestsError) as raised:
+            checker.find_manifest("\n".join([block] * 3))
+        self.assertEqual(raised.exception.count, 3)
 
 
 if __name__ == "__main__":

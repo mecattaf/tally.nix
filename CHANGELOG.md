@@ -28,6 +28,15 @@ authorized.
   real eval is an adoption step for the next dispatched wave, not a code
   change this lane can claim.
 
+  *Round-1 repair:* the success line no longer prints a bare `ok` — a
+  manifest with no `expected` surface declared (or one declaring only empty
+  lists) now says so explicitly ("coverage NOT checked") instead of reading
+  identically to a fully-covered manifest. The checker also now refuses a
+  findings file carrying more than one marked block instead of silently
+  grading the first — the adoption path of quoting this module's own
+  docstring example inside a findings file previously meant the quoted
+  example got graded, not the real manifest.
+
 - **Lane: operator conveniences — reader-state (`archived`, a free-form
   triage tag) on flow runs, never set by a run (#389).** A new durable store
   (`crates/tally-core/src/reader_state.rs`, `reader-state.jsonl` in the
