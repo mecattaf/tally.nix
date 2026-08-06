@@ -6,6 +6,43 @@ authorized.
 
 ## [Unreleased]
 
+### Daemon startup & generation residue (#419)
+
+One lane about work that runs at daemon startup, and state written under one
+regime and judged under another.
+
+#### #419 — the second `tally-core --lib` flake population, and what it actually was
+
+Two tests reproduced red on `main` inside the full `-p tally-core --lib` suite
+and green in isolation, at about one full-suite run in thirteen. Both were
+races against sibling tests in the same process, and neither was the mechanism
+the issue proposed.
+
+- `retention::tests::capture_locks_expire_by_age_only_when_no_holder_has_them`
+  released its capture-lock holder by closing the file and immediately asserted
+  that the sweep collects it. `flock` binds to the open file description, not
+  the descriptor, so every `fork` this process performs — every
+  `Command::spawn` a sibling test makes, on any thread — duplicates that
+  description into the child until the child `exec`s, and the lock outlives the
+  close. The sweep then reads a live holder that no longer exists and prunes 0
+  instead of 1. The test now releases with an explicit `LOCK_UN`, which removes
+  the lock from the description itself so no duplicate can outlive it — the
+  same thing the production holder (`UnitReservation::drop`) already does.
+  The issue's hypothesis — a probe answering "cannot determine" as "do not
+  prune" — is not what happens: the sweep maps only `WouldBlock` to a skip and
+  every other errno to a hard error, so an exhausted descriptor table would
+  have failed the test with an I/O error, not a `0`.
+- `daemon::tests::a_gpu_pool_jobs_witness_carries_measured_gpu_seconds_and_charge`
+  asserted on the completion lifecycle event without awaiting the post-ack
+  task that emits it. `completed_event` is emitted from `spawn_local` by
+  design, so a terminal `await_job` says nothing about whether it has run. The
+  test now calls `drain_post_ack_tasks`, which is what the eleven other tests
+  that observe post-ack state already do.
+
+Both fixes remove the window rather than retry through it, and the suite is
+still fully parallel — serializing it stays a non-goal, because a false red is
+cheap and a false green must remain impossible.
+
 ### Recurring-cost hygiene (#396, #411, #395, #404)
 
 One lane of four fixes with a shared shape: each one makes something the fleet

@@ -5866,6 +5866,14 @@ mod tests {
 
                 // The completion lifecycle event carries the same measured
                 // value, not the old fabricated `Some(0.0)`.
+                //
+                // `completed_event` is emitted from the post-ack `spawn_local`
+                // task, so `await_job` returning terminal says nothing about
+                // whether that task has run (#419). Awaiting it is the only
+                // thing that puts the event before this assertion; without the
+                // drain the assertion wins the race almost always and loses it
+                // under a loaded host, which is a flake, not a bug.
+                daemon.handler.drain_post_ack_tasks().await;
                 assert!(history.borrow().snapshot().records.iter().any(|entry| {
                     entry.fields.task_uuid == task_uuid && entry.fields.gpu_seconds == Some(3.5)
                 }));
