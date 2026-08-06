@@ -3620,12 +3620,95 @@ mod tests {
         }
     }
 
+    /// The immutable executable this tree installs instead of writing one
+    /// (#117). It reads its behaviour from a sibling script file, so the file
+    /// the kernel is asked to `execve` is a checked-in fixture that no test
+    /// ever opens for writing.
+    const SHELL_COMMAND_PROVIDER: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../test/fixtures/shell-command-provider"
+    );
+
+    fn shell_program_source(path: &Path) -> PathBuf {
+        let mut source = OsString::from(path.as_os_str());
+        source.push(".tally-test-script");
+        PathBuf::from(source)
+    }
+
+    /// Install a fake `gh` at `directory/name` that runs `body`.
+    ///
+    /// This used to write the script itself and then `chmod +x` it, which is a
+    /// load-dependent `ETXTBSY` race and red-gated an innocent sha (#396):
+    /// `fs::write` holds a write fd across its open/write/close, and a sibling
+    /// thread of a parallel test binary that `fork`s inside that window carries
+    /// the fd into its child until that child reaches `execve` (`O_CLOEXEC`
+    /// closes it there, not at `fork`). While any process holds a write fd on a
+    /// file, the kernel refuses to execute it — `Text file busy`.
+    ///
+    /// Publishing the behaviour through a non-executable sidecar removes the
+    /// race rather than retrying through it: the executed path is a symlink to
+    /// the checked-in provider, which is never written, so the window in which
+    /// the exec target is open for writing never opens at all. The script the
+    /// provider reads may be held open for writing by anyone — reading a file
+    /// is not an exec of it.
     fn fake_gh(directory: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt as _;
         let path = directory.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(shell_program_source(&path), format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::os::unix::fs::symlink(SHELL_COMMAND_PROVIDER, &path).unwrap();
         path
+    }
+
+    /// The race #396 filed, made deterministic, on both shapes.
+    ///
+    /// Under load the window is a fork landing between `fs::write`'s open and
+    /// close; here the write fd is simply held open, which is the same state
+    /// the kernel refuses on. The first half asserts the hazard is real rather
+    /// than theorised — a written-then-`chmod`ed program is refused with
+    /// `ETXTBSY` while a write fd is open on it. The second asserts the shape
+    /// `fake_gh` now uses is immune under exactly that condition, because what
+    /// gets executed is the checked-in provider and the file held open is only
+    /// ever *read*.
+    ///
+    /// This is deliberately not "the suite is still green": the suite was green
+    /// on the sha this race red-gated.
+    #[test]
+    fn a_written_program_is_unexecutable_while_open_for_writing_and_a_provided_one_is_not() {
+        use std::io::Write as _;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::tempdir().unwrap();
+
+        // The shape `fake_gh` used to have.
+        let written = temporary.path().join("gh-written");
+        let mut open_for_writing = fs::File::create(&written).unwrap();
+        open_for_writing.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        open_for_writing.flush().unwrap();
+        fs::set_permissions(&written, fs::Permissions::from_mode(0o755)).unwrap();
+        let refused = std::process::Command::new(&written)
+            .status()
+            .expect_err("a program still open for writing must not be executable");
+        assert_eq!(
+            refused.raw_os_error(),
+            Some(libc::ETXTBSY),
+            "expected Text file busy, got: {refused}"
+        );
+        drop(open_for_writing);
+        // Deliberately not asserted here: that the same program is executable
+        // once the fd is closed. It usually is, and that is exactly why the
+        // original failure only ever showed up under load — but this binary's
+        // other threads are forking the whole time, and any of those forks
+        // landing in the window above inherits a write fd on this file and
+        // makes the retry fail too. Asserting it would rebuild the flake.
+
+        // The shape it has now, under the identical condition.
+        let provided = fake_gh(temporary.path(), "gh-provided", "exit 0");
+        let source = shell_program_source(&provided);
+        let held_open = fs::OpenOptions::new().write(true).open(&source).unwrap();
+        let status = std::process::Command::new(&provided)
+            .status()
+            .expect("a provided program must execute while its script is open for writing");
+        assert!(status.success(), "{status}");
+        drop(held_open);
     }
 
     const WALK_PAYLOAD: &str = r#"{"data":{"repository":{"issue":{"subIssues":{

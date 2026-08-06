@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -11,6 +10,9 @@ use tally_core::wire::{serve_connection, RpcHandler};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
+
+#[path = "support/shell_program.rs"]
+mod shell_program;
 
 #[derive(Clone, Copy)]
 struct CliHandler;
@@ -1065,13 +1067,14 @@ async fn internal_exit_recorder_is_silent_and_fail_closed() {
     // accounting probe being skipped. The probe's own failure-is-logged
     // behavior is covered by
     // `crates/tally/tests/record_unit_exit_accounting.rs`.
+    // Installed through the immutable provider, never written-then-chmoded:
+    // an executable this process wrote is unexecutable for as long as any
+    // process on the host still holds a write fd on it (#396).
     let systemctl = temp.path().join("fake-systemctl-ok");
-    std::fs::write(
+    shell_program::install(
         &systemctl,
         "#!/bin/sh\necho \"CPUUsageNSec=1000000000\"\necho \"ExecMainStartTimestampMonotonic=0\"\necho \"ExecMainExitTimestampMonotonic=1000000\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let success = Command::new(env!("CARGO_BIN_EXE_tally"))
         .args([
             "__record-unit-exit",

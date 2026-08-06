@@ -7,18 +7,24 @@
 //! are set on that one child rather than mutated on the shared test-process
 //! environment, which `cargo test`'s default parallel threads would race.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
 use tally_core::executor::{read_exit_record, UNIT_EXIT_SCHEMA_VERSION};
 
+#[path = "support/shell_program.rs"]
+mod shell_program;
+
 const UNIT: &str = "tally-job-00000000-0000-4000-8000-000000000001.service";
 
+/// Install a fake `systemctl` through the immutable provider rather than
+/// writing an executable and `chmod`ing it (#396): a program still open for
+/// writing anywhere on the host cannot be `execve`d, and in a parallel test
+/// binary a sibling thread's fork holds exactly such an fd until its own
+/// `execve` closes it.
 fn fake_systemctl(dir: &Path, name: &str, script: &str) -> std::path::PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    shell_program::install(&path, format!("#!/bin/sh\n{script}\n"));
     path
 }
 
