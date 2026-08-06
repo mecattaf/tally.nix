@@ -369,6 +369,16 @@ The two drain spellings call the same `queue.drain` method. They claim pending e
 files and return a snapshot barrier for all active jobs. The CLI does not expose the RPC
 `producer` filter.
 
+They differ in one place. `tally daemon drain` is what `tally-drain.timer` runs every five
+seconds, and a daemon restart takes longer than that, so it treats an unreachable socket as
+nothing to drain and exits **0** rather than 3 — otherwise every activation that restarts the
+daemon raises a unit failure indistinguishable from a real one. The line naming the unreachable
+socket is still written to stderr, so an operator running it by hand still sees which case it was,
+and every other drain failure — including a daemon that is listening and refuses — keeps its exit
+code. `tally queue drain` is unchanged and still exits 3 on an unreachable socket. The unit also
+carries `ConditionPathExists` on the socket, so a drain scheduled while the daemon is down is
+recorded as a skipped start rather than being invoked at all.
+
 `await-job` and `await-barrier` print raw terminal JSON. Unlike `enqueue --wait`, they do not map
 a failed returned verdict to a non-zero process exit; inspect the JSON in scripts. Job awaits
 use the same bounded reconnect/re-arm window as `enqueue --wait`. Exhausting that window is an

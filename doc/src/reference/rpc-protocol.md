@@ -561,7 +561,13 @@ summaries, cancellations, and canonical GPU seconds. The RPC accepts a `source` 
 though the current CLI exposes only `--since`. Each completed, in-flight, gate-failed, and
 cancelled entry includes optional `taskRef`. `runs` carries one `{flowRunId, usage}` entry per
 flow run the window touched, whose `usage` is the same rollup `query.run` returns — see [Usage
-rollups](#usage-rollups). A run is touched when the window holds an entry for a task it created
+rollups](#usage-rollups) — with one wire difference: the three fixed statements every entry would
+otherwise repeat verbatim (`provenance`, `composition`, and `cost.basis`) are stated once in the
+digest-level `usageBasis` object as `{provenance, composition, costBasis}` and omitted from each
+entry. They are safe to state once because each has a single writer assigning a compile-time
+constant with no dependence on the run; the omission is nevertheless conditional, so an entry whose
+statement ever differs from the digest's carries its own inline and a reader must prefer the
+entry's. `query.run` returns one rollup and keeps all three inline. A run is touched when the window holds an entry for a task it created
 *or* a task its durable membership names, so a run that only attached a node is still listed. The
 window selects which runs appear; it does not narrow what is summed, because a run's cost is a
 property of the run and a window-narrowed sum would shrink with the window while still being
