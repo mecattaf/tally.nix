@@ -1076,9 +1076,13 @@ pub struct StandupDigest {
     /// statement about how its runs were summed. Both fields are skipped on
     /// the wire when empty, so they appear and disappear together.
     ///
-    /// Absence therefore means "this digest has no runs", not "this producer
-    /// is old". What separates a window that touched no run from one whose
-    /// runs were all hidden is [`Self::archived_runs_hidden`].
+    /// That is a statement about what THIS build emits, not a rule a reader
+    /// may apply to any payload: a producer predating the field emits `runs`
+    /// with no basis at all, stating the three constants inline on each entry
+    /// instead. So absence must not be read as "this digest has no runs".
+    /// Among digests this build produces, what separates a window that
+    /// touched no run from one whose runs were all hidden is
+    /// [`Self::archived_runs_hidden`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage_basis: Option<StandupUsageBasis>,
 }
@@ -1092,10 +1096,16 @@ impl StandupDigest {
     /// travelled with the payload — and only by this build's own constants
     /// when a payload carries no basis at all. A payload like that is not
     /// necessarily an old one: a current producer emits no basis whenever the
-    /// digest has no `runs` (see [`StandupDigest::usage_basis`]). In every
-    /// such case `runs` is empty too, so the loop below runs zero times and
-    /// the fallback is never actually applied to anything. The alternative,
-    /// filling from
+    /// digest has no `runs` (see [`StandupDigest::usage_basis`]), and then the
+    /// loop below is zero-trip.
+    ///
+    /// The `unwrap_or_default()` is nevertheless live, and must not be deleted
+    /// as unreachable. A basis-less payload from a producer that predates the
+    /// field carries a NON-empty `runs`, so the loop does run over it — it
+    /// simply substitutes nothing, because each of that producer's entries
+    /// states all three constants inline and the `is_empty()` guards never
+    /// fire. The default is what makes that path total rather than a panic.
+    /// The alternative, filling from
     /// the reader's constants while the payload's basis says otherwise, would
     /// make the digest state one thing and every entry in it state another,
     /// across exactly the mixed-generation fleet this runs on.

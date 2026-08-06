@@ -110,7 +110,8 @@ all files given wins):
        that needs "and they passed" must read those, because a manifest
        whose every declared item `failed` exits 0 (see
        `test/fixtures/eval-manifest/all-declared-failed.md`, and
-       `test_a_wholly_failed_declared_surface_reports_zero_covered`).
+       `test_all_declared_failed_fixture_never_says_covered`, which is the
+       test that asserts this exit code on that fixture).
     1  at least one file was refused: schema-invalid, unparsable, missing a
        manifest, carrying more than one, or declaring a surface with no
        matching entry.

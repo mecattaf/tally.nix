@@ -166,8 +166,10 @@ ledger and scoped by the run's durable membership — so a retried task is charg
 attempt and a node the run attached rather than created is inside the sum. Read the coverage
 beside the number: it is a sum over advisory captures, it says how many attempts reported usage
 against how many it observed, and it names every reason it is partial. `query standup` carries
-the same rollup for every run its window touched, with the three fixed statements every entry
-would repeat stated once instead in a digest-level `usageBasis`.
+the same rollup for every run its window touched and reader-state did not hide (see
+[Archive a run](#archive-a-run) below, and `archivedRunsHidden` for how many were withheld),
+with the three fixed statements every entry would repeat stated once instead in a digest-level
+`usageBasis`.
 
 `query log` restricts the lifecycle stream to the run's nodes, resolved from the
 orchestration capsule on the durable rows and the witness chain, because a

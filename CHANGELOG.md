@@ -106,12 +106,15 @@ the `(task, attempt, leaseEpoch)`.
   fleet whose coordinator pin trails its workers is the ordinary case rather
   than the exotic one.
 
-  `usageBasis` is present exactly when `runs` is non-empty, and both are omitted
-  from the wire when empty — so a digest with no basis has no runs either, and
-  the fallback is never applied to anything. Such a digest is **not** necessarily
-  an old one: a current producer emits neither key whenever the window touched no
-  flow run, or when reader-state hid every run it had (`archivedRunsHidden` is
-  what separates those two cases).
+  On any payload a current build produces, `usageBasis` is present exactly when
+  `runs` is non-empty, and both are omitted from the wire when empty — because
+  the window touched no flow run, or because reader-state hid every run it had
+  (`archivedRunsHidden` separates those two). That is a property of what this
+  build emits, not a rule for reading any payload: **a producer that predates the
+  field emits `runs` with no basis**, stating the three constants inline on each
+  entry, so a reader must not infer an empty `runs` from an absent `usageBasis`.
+  In both cases there is nothing for the reader's own constants to displace —
+  the entries carry their own statements, or there are no entries.
 
 ### Added
 
