@@ -570,8 +570,16 @@ statement ever differs from the digest's carries its own inline and a reader mus
 entry's. Where an entry omits one, its value is the digest's `usageBasis` — that object is the
 **producer's** statement of what its own rollups summed, so a reader must take an omitted field
 from it and must not substitute a constant of its own, which would differ silently whenever the
-reader and the daemon are different generations. A digest that carries no `usageBasis` at all
-predates the field, and only then does a reader fall back to what it knows. `query.run` returns one
+reader and the daemon are different generations. **On any payload a current build produces**,
+`usageBasis` is present exactly when `runs` is non-empty, and both are omitted from the wire when
+empty — either because the window touched no flow run, or because reader-state hid every run it did
+have (`archivedRunsHidden` is then non-zero, and is what distinguishes the two). **Do not read that
+as "no `usageBasis` implies no `runs`":** a producer that predates the field emits `runs` *without*
+a basis, because its entries state all three inline rather than omitting them. So a reader holding
+a basis-less payload has nothing to substitute in either case — the entries carry their own
+statements (old producer), or there are no entries (current producer) — and it never needs to tell
+which case it holds. What it must not do is infer an empty `runs` from an absent `usageBasis` and
+skip the array. `query.run` returns one
 rollup and keeps all three inline. A run is touched when the window holds an entry for a task it created
 *or* a task its durable membership names, so a run that only attached a node is still listed. The
 window selects which runs appear; it does not narrow what is summed, because a run's cost is a
