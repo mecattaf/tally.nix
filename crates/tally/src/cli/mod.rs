@@ -333,6 +333,19 @@ fn run_migrate(config_path: Option<&Path>, command: MigrateCommand) -> Result<()
             outln!("{}", serde_json::to_string(&report)?);
             Ok(())
         }
+        MigrateCommand::CaptureLabels(args) => {
+            let state_dir = args.state_dir.map_or_else(default_state_dir, Ok)?;
+            if !state_dir.is_absolute() {
+                return Err(invalid("--state-dir must be absolute"));
+            }
+            let report = tally_core::capture_migration::migrate_capture_labels(
+                &state_dir,
+                &migration_executors(config_path)?,
+                args.apply,
+            )?;
+            outln!("{}", serde_json::to_string(&report)?);
+            Ok(())
+        }
     }
 }
 

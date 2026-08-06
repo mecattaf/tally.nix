@@ -32,6 +32,105 @@ impl Drop for DaemonLockGuard {
     }
 }
 
+/// How long any single startup phase may take before systemd gives up.
+///
+/// Deliberately the same 90 s the user manager's `DefaultTimeoutStartSec`
+/// already imposed on the whole of startup, so the number an operator sees in
+/// a failure is the one they are used to. What changed is what it measures:
+/// one phase rather than all of them.
+pub(super) const STARTUP_PHASE_BUDGET: Duration = Duration::from_secs(90);
+
+/// Per-phase startup accounting, and the systemd budget that pays for it.
+///
+/// Everything `Daemon::open` and the pre-`READY` half of `run_loop` do is
+/// charged to `TimeoutStartSec` and never to `WatchdogSec`, because the
+/// service watchdog is not armed until `READY=1` (#370). #379 measured what
+/// that costs at estate scale — 61 s of a 90 s budget on the coordinator, on a
+/// trend that had added 20 s in two days — and could attribute none of it,
+/// because the daemon says nothing at all between `Starting` and its first
+/// late-startup log line. This type is the answer to both halves of that.
+///
+/// It tells systemd, at every phase boundary, that startup is still making
+/// progress, via `EXTEND_TIMEOUT_USEC=`. A growing estate no longer walks into
+/// a restart loop the operator only diagnoses afterwards; a phase that wedges
+/// still fails, on the same clock, with `STATUS=` naming which one.
+///
+/// It tells the operator, in one line at `READY`, what each phase cost. That
+/// line is the durable artefact #379 asks for: the next lane that adds startup
+/// work has a number to check against instead of a silent minute.
+pub(super) struct StartupTimeline {
+    notifier: SystemdNotifier,
+    started: std::time::Instant,
+    phase_started: std::time::Instant,
+    current: &'static str,
+    phases: Vec<(&'static str, Duration)>,
+}
+
+impl StartupTimeline {
+    pub(super) fn begin(notifier: SystemdNotifier, first: &'static str) -> Self {
+        let now = std::time::Instant::now();
+        let timeline = Self {
+            notifier,
+            started: now,
+            phase_started: now,
+            current: first,
+            phases: Vec::new(),
+        };
+        timeline.extend(first);
+        timeline
+    }
+
+    /// Close the running phase and open `next`.
+    pub(super) fn phase(&mut self, next: &'static str) {
+        let now = std::time::Instant::now();
+        self.phases
+            .push((self.current, now.duration_since(self.phase_started)));
+        self.current = next;
+        self.phase_started = now;
+        self.extend(next);
+    }
+
+    /// Close the last phase and render the report line for `READY`.
+    pub(super) fn finish(mut self) -> String {
+        let now = std::time::Instant::now();
+        self.phases
+            .push((self.current, now.duration_since(self.phase_started)));
+        let total = now.duration_since(self.started);
+        let mut line = format!(
+            "startup complete in {:.3}s of a {}s per-phase budget",
+            total.as_secs_f64(),
+            STARTUP_PHASE_BUDGET.as_secs()
+        );
+        // Field-per-phase rather than prose: an operator watching the trend
+        // #379 recorded needs to grep one phase out of the line, not read it.
+        for (name, elapsed) in &self.phases {
+            line.push_str(&format!(" {name}={:.3}s", elapsed.as_secs_f64()));
+        }
+        line
+    }
+
+    /// Every phase opened so far, the running one last.
+    #[cfg(test)]
+    pub(super) fn phase_names(&self) -> Vec<&'static str> {
+        self.phases
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(std::iter::once(self.current))
+            .collect()
+    }
+
+    fn extend(&self, phase: &str) {
+        // A notification failure is not made fatal here. Before #379 the
+        // daemon sent nothing at all between spawn and `READY=1`, so a broken
+        // notify socket could not fail startup earlier than `ready()`, and
+        // adding a new way for it to do so would trade a measured budget
+        // problem for an unmeasured availability one. `ready()` still reports.
+        let _ = self
+            .notifier
+            .extend_start_timeout(STARTUP_PHASE_BUDGET, &format!("starting: {phase}"));
+    }
+}
+
 impl Daemon {
     pub async fn open(
         config: Config,
@@ -51,6 +150,10 @@ impl Daemon {
         settings: DaemonSettings,
         executor: Executor,
     ) -> Result<Self, DaemonError> {
+        // The notifier is built first so every phase below is inside the
+        // extended budget, not just the ones after the listener exists (#379).
+        let notifier = SystemdNotifier::from_environment()?;
+        let mut timeline = StartupTimeline::begin(notifier.clone(), "prepare");
         config
             .validate()
             .map_err(|error| DaemonError::Invalid(error.to_string()))?;
@@ -58,6 +161,7 @@ impl Daemon {
         let settings = settings.validate()?;
         prepare_paths(&paths)?;
         let state_lock = DaemonLockGuard::acquire(&paths.state_dir)?;
+        timeline.phase("row-migration");
         // Preserve the clean-cut refusal: predecessor bytes are never parsed.
         // Once the final ledger is confirmed, migrate under this lock before
         // any acknowledged-event reader or recovery reconciliation can run.
@@ -67,11 +171,13 @@ impl Daemon {
         migrate_acknowledged_events(&paths.events_dir())?;
         let host_id = current_host_id()?;
         let epoch = bump_epoch(&paths.state_dir)?;
+        timeline.phase("durable-facts");
         reconcile_pool_loss_intents(&paths, &executor, &mut witness_ledger, &host_id).await?;
         let mut durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
         if reconcile_reuse_witnesses(&paths, &durable, &mut witness_ledger)? {
             durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
         }
+        timeline.phase("gcroots");
         {
             let _lock = lock_gcroot_registration(&paths)?;
             let horizon = parse_horizon(&config.retention.horizon)?;
@@ -92,7 +198,9 @@ impl Daemon {
                 }
             }
         }
+        timeline.phase("unit-facts");
         let units = collect_local_unit_facts(&executor, &durable).await?;
+        timeline.phase("recovery-plan");
         let producer_engine = ProducerEngine::new(
             &config.producers,
             paths.events_dir(),
@@ -149,6 +257,7 @@ impl Daemon {
         hydrate_adopted_adapter_metadata(&mut plan, &mut attestations)?;
         hydrate_represent_adapter_metadata(&mut plan, &config, &executor, &mut attestations)?;
 
+        timeline.phase("storage");
         let storage_data_dir = paths.data_dir.clone();
         let storage_state_dir = paths.state_dir.clone();
         let storage_config = config.storage.clone();
@@ -178,6 +287,8 @@ impl Daemon {
             attestations,
             witness_ledger,
             facts.durable.witness().to_vec(),
+            notifier,
+            timeline,
         )?;
         daemon.handler.refresh_storage_now().await;
         Ok(daemon)
@@ -197,7 +308,10 @@ impl Daemon {
         mut attestations: SharedAttestations,
         witness_ledger: WitnessLedger,
         witness_records: Vec<crate::witness::WitnessRecord>,
+        notifier: SystemdNotifier,
+        mut timeline: StartupTimeline,
     ) -> Result<Self, DaemonError> {
+        timeline.phase("lease-engine");
         validate_recovery_briefs(&plan, &paths.data_dir)?;
         let event_log = LeaseEventLog::in_state_dir(&paths.state_dir);
         let completed_witness = witness_records;
@@ -210,7 +324,9 @@ impl Daemon {
             &completed_witness,
             Utc::now(),
         )?;
-        reconcile_failure_stderr(&completed_witness, &executor)?;
+        timeline.phase("failure-stderr");
+        reconcile_failure_stderr(&completed_witness, &executor, &paths.state_dir)?;
+        timeline.phase("gh-orphan-sweep");
         let initial_gh_completions = sweep_orphaned_gh_completions(
             recovery_gh_completions(&plan, &completed_witness, &executor)?,
             &config,
@@ -227,6 +343,7 @@ impl Daemon {
         .map_err(|error| DaemonError::Invalid(error.to_string()))?
         .into_iter()
         .collect::<Vec<_>>();
+        timeline.phase("install-jobs");
         let query_rows = recovery_query_rows(&plan);
         let query_details = recovery_query_details(&plan);
         let rows = plan
@@ -276,7 +393,6 @@ impl Daemon {
         restore_guardrail_parents(&mut context, &plan)?;
         let job_tokens = restore_job_tokens(&context)?;
 
-        let notifier = SystemdNotifier::from_environment()?;
         if paths.socket.exists() {
             std::fs::remove_file(&paths.socket)
                 .map_err(|source| io_error(&paths.socket, source))?;
@@ -365,6 +481,7 @@ impl Daemon {
             completion_rx,
             fatal_rx,
             notifier,
+            startup: Some(timeline),
             initial_jobs,
             initial_gh_completions,
             initial_lost_pools,
@@ -378,6 +495,8 @@ impl Daemon {
             dispatch_stall_hook: None,
             #[cfg(test)]
             finish_job_hook: None,
+            #[cfg(test)]
+            startup_report_hook: None,
         })
     }
 }
@@ -713,17 +832,88 @@ pub(super) fn recovery_gh_completions(
         .collect())
 }
 
+/// Where the failure-stderr recovery pass records how far it has got.
+pub(super) const FAILURE_STDERR_CURSOR_FILE: &str = "failure-stderr-cursor.json";
+
+/// The high-water mark of the failure-stderr recovery pass.
+///
+/// Recovery of one terminal record is a one-shot: the capture it reads is
+/// final by the time the record is terminal, so a second attempt on the same
+/// record can only reach the same answer. Persisting how far the pass got is
+/// what makes that true across restarts (#407).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct FailureStderrCursor {
+    schema_version: u32,
+    /// Every terminal record at or below this witness sequence has had its
+    /// failure-stderr recovery attempted and reached a definitive answer.
+    reconciled_through_seq: u64,
+}
+
+/// What one record's recovery attempt settled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureStderrOutcome {
+    /// The projection exists now, or the generation says this attempt's
+    /// captures are not the current ones. Either way, settled.
+    Settled,
+    /// The capture stream this record names does not exist and never will.
+    /// The generation marker was written and fsynced before `systemd-run`
+    /// created the unit, and `archive_current_capture` returns early when any
+    /// of the capture set is missing — so an attempt that failed before its
+    /// stderr stream existed leaves a generation marker that is never retired,
+    /// and this pass read it as "recoverable" at every startup, forever.
+    SourceAbsent,
+    /// Something else went wrong: a contended capture lock, a permission
+    /// failure, a malformed generation. That can succeed later, so the cursor
+    /// does not advance past it.
+    Deferred,
+}
+
+/// Attempt failure-stderr recovery for every terminal record not yet reconciled.
+///
+/// Before #407 this walked every terminal `Failed` record at every startup and
+/// called `persist_failure_stderr` on each. On an estate with real failure
+/// history that is hundreds of probes per start whose answer cannot change,
+/// each one printing its own warning line: 227 on the startup #379 measured,
+/// about 2,951 across five days, and enough noise to bury the genuine startup
+/// signal beside it. All of it charged to `TimeoutStartSec`.
+///
+/// The cost is now one-shot. The cursor advances only across a contiguous run
+/// of definitive outcomes, so a transient failure — a lock this daemon lost a
+/// race for — is retried on the next start rather than silently abandoned, and
+/// the pass reports itself in one line with named fields instead of one line
+/// per doomed probe.
 pub(super) fn reconcile_failure_stderr(
     records: &[crate::witness::WitnessRecord],
     executor: &Executor,
+    state_dir: &Path,
 ) -> Result<(), DaemonError> {
+    let cursor_path = state_dir.join(FAILURE_STDERR_CURSOR_FILE);
+    let previous = read_failure_stderr_cursor(&cursor_path)?;
+    let mut examined = 0_usize;
+    let mut recovered = 0_usize;
+    let mut absent = 0_usize;
+    let mut deferred = 0_usize;
+    // Only advanced while every record so far settled: the cursor is a
+    // contiguous high-water mark, not a maximum.
+    let mut contiguous = previous;
+    let mut deferred_seen = false;
     for record in records {
+        if record.seq <= previous {
+            continue;
+        }
         if terminal_lifecycle_event(record.verdict, record.artifact_content_hash.is_some())
             != TallyEvent::Failed
         {
+            if !deferred_seen {
+                contiguous = contiguous.max(record.seq);
+            }
             continue;
         }
         let Some(task_uuid) = record.task_uuid.as_deref() else {
+            if !deferred_seen {
+                contiguous = contiguous.max(record.seq);
+            }
             continue;
         };
         let task_uuid = Uuid::parse_str(task_uuid).map_err(|_| {
@@ -740,16 +930,84 @@ pub(super) fn reconcile_failure_stderr(
                 .as_ref()
                 .and_then(Orchestration::task_ref),
         };
-        if let Err(error) =
-            executor.persist_failure_stderr(&identity, record.attempt, record.lease_epoch)
-        {
-            eprintln!(
-                "tally: could not recover failure stderr for {task_uuid} attempt={} leaseEpoch={}: {error}",
-                record.attempt, record.lease_epoch
-            );
+        examined += 1;
+        let outcome =
+            match executor.persist_failure_stderr(&identity, record.attempt, record.lease_epoch) {
+                Ok(Some(_)) => {
+                    recovered += 1;
+                    FailureStderrOutcome::Settled
+                }
+                Ok(None) => FailureStderrOutcome::Settled,
+                Err(ExecutorError::Io { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    absent += 1;
+                    FailureStderrOutcome::SourceAbsent
+                }
+                Err(error) => {
+                    deferred += 1;
+                    // Kept per-record, unlike the absent case: this one is both
+                    // rare and actionable, and it is the only class a later
+                    // start can still repair.
+                    eprintln!(
+                        "tally: failure-stderr recovery deferred for {task_uuid} \
+                         attempt={} leaseEpoch={} seq={}: {error}",
+                        record.attempt, record.lease_epoch, record.seq
+                    );
+                    FailureStderrOutcome::Deferred
+                }
+            };
+        match outcome {
+            FailureStderrOutcome::Deferred => deferred_seen = true,
+            _ if !deferred_seen => contiguous = contiguous.max(record.seq),
+            _ => {}
         }
     }
+    if examined > 0 {
+        // One line with named fields, not one line per probe. `absent` is
+        // non-zero only for records this pass is seeing for the first time,
+        // because it never sees them again.
+        eprintln!(
+            "tally: failure-stderr recovery examined={examined} recovered={recovered} \
+             absent={absent} deferred={deferred} reconciledThroughSeq={contiguous}"
+        );
+    }
+    if contiguous > previous {
+        write_failure_stderr_cursor(&cursor_path, contiguous)?;
+    }
     Ok(())
+}
+
+fn read_failure_stderr_cursor(path: &Path) -> Result<u64, DaemonError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(source) => return Err(io_error(path, source)),
+    };
+    // A cursor this daemon cannot parse is treated as absent rather than
+    // fatal: the worst outcome is one more full pass, which is exactly the
+    // behaviour that preceded this file.
+    match serde_json::from_slice::<FailureStderrCursor>(&bytes) {
+        Ok(cursor) if cursor.schema_version == 1 => Ok(cursor.reconciled_through_seq),
+        _ => {
+            eprintln!(
+                "tally: failure-stderr recovery cursor at {} is unreadable; reconciling from the \
+                 start of the ledger",
+                path.display()
+            );
+            Ok(0)
+        }
+    }
+}
+
+fn write_failure_stderr_cursor(path: &Path, through_seq: u64) -> Result<(), DaemonError> {
+    let bytes = serde_json::to_vec(&FailureStderrCursor {
+        schema_version: 1,
+        reconciled_through_seq: through_seq,
+    })
+    .map_err(|error| DaemonError::Invalid(error.to_string()))?;
+    crate::executor::replace_private_file(path, &bytes)
+        .map_err(|error| DaemonError::Invalid(error.to_string()))
 }
 
 pub(super) fn reconcile_reuse_witnesses(

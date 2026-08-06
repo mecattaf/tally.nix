@@ -222,13 +222,20 @@ fn interactive_cancellation_still_terminates_gh() {
     let temp = tempdir().unwrap();
     let gh_pid_path = temp.path().join("gh-pid");
     let gh = temp.path().join("fake-gh");
+    // Publish the pid atomically (#419). The readiness signal below is the
+    // existence of this path, and a bare `> file` redirection creates the file
+    // before `printf` writes into it, so under load the reader wins that race,
+    // reads "" and fails `parse::<i32>` with `ParseIntError { kind: Empty }`.
+    // Writing to a sibling and renaming means the name never resolves to a
+    // partial state at all, so existence really does imply a readable pid.
     crate::test_support::install_shell_program(
         &gh,
         format!(
             "#!/bin/sh\n\
-                 printf '%s' \"$$\" > '{}'\n\
+                 printf '%s' \"$$\" > '{path}.partial'\n\
+                 mv '{path}.partial' '{path}'\n\
                  exec sleep 300\n",
-            gh_pid_path.display()
+            path = gh_pid_path.display()
         ),
     );
     let mut helper = Command::new(std::env::current_exe().unwrap())

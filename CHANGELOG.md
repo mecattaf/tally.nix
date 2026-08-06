@@ -104,6 +104,179 @@ lands where the unified worktree manager already owns lane lifecycle.
 - A new e2e scenario proves the reversion case against a real worktree and a
   real `git checkout` reversion, not a mocked file-state dict.
 
+### Daemon startup & generation residue (#419, #379, #407, #378)
+
+One lane about work that runs at daemon startup, and state written under one
+regime and judged under another.
+
+#### #419 — the second `tally-core --lib` flake population, and what it actually was
+
+**Four** known members, not two: the issue body names two, a comment on the
+issue names a third in a third module, and verifying the repair of that third
+one surfaced a fourth in a fourth module. Every one reproduced red inside the
+full `-p tally-core --lib` suite and green in isolation, at roughly one
+full-suite run in thirteen to twenty-four, and every one is a race against
+sibling tests in the same process. None is the mechanism the issue proposed, and
+all four are fixed here. They are **four distinct mechanisms**, not four
+symptoms of one — the opposite of what the issue's comment expected, and the
+single most important thing this subsection records, because it is what decides
+whether the population can be called closed.
+
+- `retention::tests::capture_locks_expire_by_age_only_when_no_holder_has_them`
+  released its capture-lock holder by closing the file and immediately asserted
+  that the sweep collects it. `flock` binds to the open file description, not
+  the descriptor, so every `fork` this process performs — every
+  `Command::spawn` a sibling test makes, on any thread — duplicates that
+  description into the child until the child `exec`s, and the lock outlives the
+  close. The sweep then reads a live holder that no longer exists and prunes 0
+  instead of 1. The test now releases with an explicit `LOCK_UN`, which removes
+  the lock from the description itself so no duplicate can outlive it — the
+  same thing the production holder (`UnitReservation::drop`) already does.
+  The issue's hypothesis — a probe answering "cannot determine" as "do not
+  prune" — is not what happens: the sweep maps only `WouldBlock` to a skip and
+  every other errno to a hard error, so an exhausted descriptor table would
+  have failed the test with an I/O error, not a `0`.
+- `daemon::tests::a_gpu_pool_jobs_witness_carries_measured_gpu_seconds_and_charge`
+  asserted on the completion lifecycle event without awaiting the post-ack
+  task that emits it. `completed_event` is emitted from `spawn_local` by
+  design, so a terminal `await_job` says nothing about whether it has run. The
+  test now calls `drain_post_ack_tasks`, which is what the eleven other tests
+  that observe post-ack state already do.
+- `executor::tests::launcher_failure_without_visible_unit_preserves_error_promptly`
+  wrapped the call under test in a 100 ms `tokio::time::timeout` — a wall-clock
+  deadline assumption inside a test that forks and execs a shell script, so a
+  loaded host failed it with `Elapsed(())` while nothing was actually masked.
+  The property is now counted rather than timed: the masked behaviour is
+  `reclaim_identity_exact` entering its retry loop, which inspects the identity
+  201 times or waits out the 60 s launch-visibility timeout, where the prompt
+  path inspects exactly twice. Two orders of magnitude apart, and load cannot
+  perturb a count.
+- `producers::tests::interactive_cancellation_still_terminates_gh` waited for
+  its helper by polling for the existence of a pid file, but the fake `gh` it
+  installs published that pid with a bare `> file` redirection, which creates
+  the name before `printf` writes into it. Under load the reader wins that race,
+  reads `""` and fails `parse::<i32>` with `ParseIntError { kind: Empty }`. The
+  fake now writes a sibling and renames, so the name never resolves to a partial
+  state and existence really does imply a readable pid.
+
+Every fix removes the window rather than retrying through it, and the suite is
+still fully parallel — serializing it stays a non-goal, because a false red is
+cheap and a false green must remain impossible.
+
+**The population is not declared closed.** "Latent parallel-execution flakes" is
+not an enumerable set; the fourth member was found by verifying the third, and
+each new member has had its own unrelated mechanism rather than sharing one. The
+exit criterion the issue states is a measured rate over a wave, which no single
+lane can observe. Four known members are fixed and each is proven under the load
+condition the issue names; the issue stays open for that wave-scale
+verification.
+
+#### #379 — the startup budget is per phase now, and it says where the time went
+
+Everything before `READY=1` is charged to `TimeoutStartSec` and never to
+`WatchdogSec`, and the first estate-scale measurement of that budget was 61 s of
+90 s, on a trend adding 5–8 s per heavy day. The 90 s was not a decision: the
+daemon unit declared no `TimeoutStartSec` at all and inherited the manager
+default. Worse, the journal was silent from `Starting` to the first
+late-startup warning, so the 61 s could be measured but not attributed.
+
+- `Daemon::open` and the pre-`READY` half of `run_loop` are divided into twelve
+  named phases, and each boundary sends `EXTEND_TIMEOUT_USEC=` — the mechanism
+  systemd provides for exactly this case, and which this daemon did not use.
+  The limit stops being "how long may the whole of startup take" and becomes
+  "how long may any one phase take", so an estate that has grown keeps starting
+  while a daemon wedged in a phase still dies on the same clock. `STATUS=`
+  names the running phase, so a slow start is legible in `systemctl status`.
+- One line before `READY=1` names every phase and its wall-clock. That line is
+  the durable artefact: the next lane that adds startup work has a number to
+  check against, and is expected to add a phase of its own so its cost is
+  attributable rather than folded into a neighbour's. The phase list is pinned
+  by two tests for the same reason — one over what `Daemon::open` returns, and
+  one over the rendered report line `run_loop` actually emits, which is the only
+  surface carrying the phase `run_loop` itself opens.
+- Both modules now declare `TimeoutStartSec = "90s"` on the daemon unit,
+  matching `daemon::startup::STARTUP_PHASE_BUDGET`, so the limit is a choice
+  the module made rather than whichever default the manager carried.
+- `doc/src/operating/recovery.md` records the measurement, the mechanism, and
+  how to grep one phase across restarts to see which part of startup is
+  growing.
+
+Raising a static budget was the alternative and was rejected: it buys headroom
+without telling anyone when it is being consumed, which is the state that
+produced this issue.
+
+#### #407 — failure-stderr recovery is a one-shot, and says so in one line
+
+`reconcile_failure_stderr` walked every terminal `Failed` witness record at
+every startup and re-probed captures that were permanently gone: 227 identical
+warnings on the startup #379 measured, about 2,951 across five days, enough to
+bury the genuine startup signal beside them, and a cost that grew with failure
+history without bound.
+
+The files are missing for a reason upstream of this pass, and it is not
+retention. `write_capture_generation` is fsynced before `systemd-run` creates
+the unit, and `archive_current_capture` returns early when any of the capture
+set is absent — so an attempt that failed before its stderr stream existed
+leaves a generation marker that nothing ever retires, and the recovery pass
+read that marker as "recoverable" at every start, forever.
+
+- The pass now persists a cursor, `state/failure-stderr-cursor.json`, holding
+  the witness sequence through which recovery has reached a definitive answer.
+  A record's captures are final by the time it is terminal, so a second attempt
+  can only reach the same answer; the steady-state cost is now zero probes
+  rather than one per historical failure.
+- Only two outcomes are definitive: the projection was written, or the source
+  is absent (`NotFound`). Anything else — a contended lock, a stream that
+  cannot be opened without following a link — leaves the cursor short of that
+  record, so a later start retries it. The cursor is a contiguous high-water
+  mark, not a maximum, so a record behind a deferred one is retried too.
+- The 227 per-record warnings are one line with named fields:
+  `examined= recovered= absent= deferred= reconciledThroughSeq=`. A per-record
+  line survives only for the deferred class, which is rare and actionable.
+- Measured: 227 doomed probes cost 10.7 ms of filesystem work, falling to 37 µs
+  once reconciled. Against #379's 61 s that saving is negligible and is stated
+  as such; what the fix actually buys is that the cost stops growing, and that
+  a startup's log is readable.
+
+The richer answer for the log line would have been a `TALLY_EVENT` journal
+record with real fields. That was deliberately not done: adding an event type
+this phase would collide with the audit of the existing eleven.
+
+#### #378 — pre-label campaign captures are stranded, and `tally migrate capture-labels` moves them
+
+The issue claimed no impact and asked for the trace first. The trace says the
+data is operator-visible and silently unreachable.
+
+`retained_capture_paths` is what `query.run` calls to attach `capturePath` and
+`stderrTail` to a failure, and it resolves every stream through `capture_stem`
+with no fallback to the bare-uuid name — the only fallbacks it carries are
+`.err`-versus-`.adapter.err` suffix ones. `query.log` does not resolve captures
+at all, so the surface named in the issue was the wrong one; the affected
+surfaces are `query.run`, `query.trace`, and the recovery-time stderr excerpt.
+The capture *generation* marker is keyed on the bare uuid in both binaries, so
+it still matches, and that is what makes this quiet: the lookup succeeds and
+reports the failure as having no capture rather than reporting that it could
+not find one. So the answer is (a) — genuinely unreachable — with the sting
+that nothing anywhere says the bytes are still on disk.
+
+- `tally migrate capture-labels` is the `unit-exit-labels` sibling the issue
+  predicted. It moves `capture/<uuid>.*` and `capture/archive/<uuid>/` to the
+  `<uuid>.<task>` stem, plan-first, idempotent, coordinator-only, with
+  remote-owned rows reported rather than claimed. The rename is a prefix
+  substitution, so a stream this migration has never heard of moves with the
+  rest; nothing is rewritten, and the bare-uuid-keyed `unit-exit/` records are
+  deliberately untouched.
+- An entry present under both stems is reported in `skipped[]`, not resolved:
+  the command does not choose between two captures.
+- Strict derivation stays. A permanent bare-uuid read-path fallback was
+  rejected under the policy #371 settled — it would make every future reader
+  carry a historical naming scheme, and would silently resolve a different
+  row's capture on a stem collision.
+- `doc/src/operating/recovery.md` and `doc/src/operating/cli.md` record the
+  finding and the procedure. Unlike its sibling, no startup error names this
+  command, because nothing refuses — which is precisely why the finding had to
+  be written down.
+
 ### Recurring-cost hygiene (#396, #411, #395, #404)
 
 One lane of four fixes with a shared shape: each one makes something the fleet

@@ -113,6 +113,9 @@ impl Daemon {
                     return Err(DaemonError::Notify(error.to_string()));
                 }
             };
+        if let Some(timeline) = self.startup.as_mut() {
+            timeline.phase("initial-recovery");
+        }
         let mut startup_error = None;
         for pool in std::mem::take(&mut self.initial_lost_pools) {
             if let Err(error) = self.handler.apply_pool_loss(&pool).await {
@@ -157,6 +160,18 @@ impl Daemon {
         #[cfg(test)]
         let dispatch_stall_hook = self.dispatch_stall_hook.clone();
         let mut keepalive = None;
+        // Written before `READY=1`, so the phase breakdown is in the journal
+        // even for a start that then fails to notify (#379). This line is the
+        // only record of where the pre-`READY` minute went; the journal is
+        // otherwise silent from `Starting` to the first late-startup warning.
+        if let Some(timeline) = self.startup.take() {
+            let report = timeline.finish();
+            #[cfg(test)]
+            if let Some(hook) = &self.startup_report_hook {
+                let _ = hook.send(report.clone());
+            }
+            eprintln!("tally: {report}");
+        }
         let mut result = if let Some(error) = startup_error {
             Err(error)
         } else {
