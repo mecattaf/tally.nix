@@ -52,7 +52,7 @@ daemon unit declared no `TimeoutStartSec` at all and inherited the manager
 default. Worse, the journal was silent from `Starting` to the first
 late-startup warning, so the 61 s could be measured but not attributed.
 
-- `Daemon::open` and the pre-`READY` half of `run_loop` are divided into eleven
+- `Daemon::open` and the pre-`READY` half of `run_loop` are divided into twelve
   named phases, and each boundary sends `EXTEND_TIMEOUT_USEC=` — the mechanism
   systemd provides for exactly this case, and which this daemon did not use.
   The limit stops being "how long may the whole of startup take" and becomes
