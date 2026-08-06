@@ -9174,6 +9174,83 @@ mod tests {
         }
     }
 
+    /// #379: startup is charged to `TimeoutStartSec`, so every phase boundary
+    /// has to buy more of it. `EXTEND_TIMEOUT_USEC=` restarts the start
+    /// timeout from receipt, which turns one budget for the whole of
+    /// `Daemon::open` into one budget per phase; `STATUS=` makes a slow start
+    /// legible in `systemctl status` instead of silent.
+    #[test]
+    fn every_startup_phase_extends_the_start_timeout_and_names_itself() {
+        let temp = tempdir().unwrap();
+        let path = temp.path().join("notify.sock");
+        let socket = UnixDatagram::bind(&path).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let notifier = SystemdNotifier::with_socket(path, None);
+
+        let mut timeline = startup::StartupTimeline::begin(notifier, "prepare");
+        timeline.phase("row-migration");
+        timeline.phase("unit-facts");
+        let report = timeline.finish();
+
+        for phase in ["prepare", "row-migration", "unit-facts"] {
+            let mut buffer = [0_u8; 256];
+            let read = socket.recv(&mut buffer).unwrap();
+            assert_eq!(
+                std::str::from_utf8(&buffer[..read]).unwrap(),
+                format!("EXTEND_TIMEOUT_USEC=90000000\nSTATUS=starting: {phase}"),
+            );
+        }
+        // Nothing else is sent: the extension is per phase, not per operation.
+        let mut buffer = [0_u8; 256];
+        assert!(socket.recv(&mut buffer).is_err());
+
+        // The report is the durable half. Every phase is named with its own
+        // wall-clock, because a total alone is what #379 already had and could
+        // not attribute.
+        assert!(report.starts_with("startup complete in "), "{report}");
+        assert!(report.contains("of a 90s per-phase budget"), "{report}");
+        for phase in ["prepare", "row-migration", "unit-facts"] {
+            assert!(
+                report.contains(&format!(" {phase}=")),
+                "{report} omits {phase}"
+            );
+        }
+    }
+
+    /// The phase list is a contract, not decoration: it is what a later lane
+    /// adding startup work checks its own cost against (#379). Pinning it here
+    /// means work added outside a named phase shows up as a failing test
+    /// rather than as another silent minute in the journal.
+    #[tokio::test(flavor = "current_thread")]
+    async fn daemon_open_records_every_startup_phase_in_order() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                assert_eq!(
+                    daemon.startup.as_ref().unwrap().phase_names(),
+                    vec![
+                        "prepare",
+                        "row-migration",
+                        "durable-facts",
+                        "gcroots",
+                        "unit-facts",
+                        "recovery-plan",
+                        "storage",
+                        "lease-engine",
+                        "failure-stderr",
+                        "gh-orphan-sweep",
+                        "install-jobs",
+                    ],
+                );
+            })
+            .await;
+    }
+
     /// Read every datagram already queued on `socket`, with the instant each
     /// one was observed. The socket must carry a short read timeout.
     fn drain_notifications(socket: &UnixDatagram) -> Vec<(String, Instant)> {

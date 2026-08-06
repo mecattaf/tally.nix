@@ -1016,6 +1016,9 @@ pub struct Daemon {
     completion_rx: mpsc::UnboundedReceiver<ExecutionFinished>,
     fatal_rx: mpsc::UnboundedReceiver<DaemonError>,
     notifier: SystemdNotifier,
+    /// Per-phase startup accounting, reported at `READY=1` (#379). Taken in
+    /// `run_loop`, which owns the last pre-`READY` phase.
+    startup: Option<startup::StartupTimeline>,
     initial_jobs: Vec<Job>,
     initial_gh_completions: Vec<GhTerminalWork>,
     initial_lost_pools: Vec<String>,

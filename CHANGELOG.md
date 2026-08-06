@@ -6,7 +6,7 @@ authorized.
 
 ## [Unreleased]
 
-### Daemon startup & generation residue (#419)
+### Daemon startup & generation residue (#419, #379)
 
 One lane about work that runs at daemon startup, and state written under one
 regime and judged under another.
@@ -42,6 +42,38 @@ the issue proposed.
 Both fixes remove the window rather than retry through it, and the suite is
 still fully parallel — serializing it stays a non-goal, because a false red is
 cheap and a false green must remain impossible.
+
+#### #379 — the startup budget is per phase now, and it says where the time went
+
+Everything before `READY=1` is charged to `TimeoutStartSec` and never to
+`WatchdogSec`, and the first estate-scale measurement of that budget was 61 s of
+90 s, on a trend adding 5–8 s per heavy day. The 90 s was not a decision: the
+daemon unit declared no `TimeoutStartSec` at all and inherited the manager
+default. Worse, the journal was silent from `Starting` to the first
+late-startup warning, so the 61 s could be measured but not attributed.
+
+- `Daemon::open` and the pre-`READY` half of `run_loop` are divided into eleven
+  named phases, and each boundary sends `EXTEND_TIMEOUT_USEC=` — the mechanism
+  systemd provides for exactly this case, and which this daemon did not use.
+  The limit stops being "how long may the whole of startup take" and becomes
+  "how long may any one phase take", so an estate that has grown keeps starting
+  while a daemon wedged in a phase still dies on the same clock. `STATUS=`
+  names the running phase, so a slow start is legible in `systemctl status`.
+- One line before `READY=1` names every phase and its wall-clock. That line is
+  the durable artefact: the next lane that adds startup work has a number to
+  check against, and is expected to add a phase of its own so its cost is
+  attributable rather than folded into a neighbour's. The phase list is pinned
+  by a test for the same reason.
+- Both modules now declare `TimeoutStartSec = "90s"` on the daemon unit,
+  matching `daemon::startup::STARTUP_PHASE_BUDGET`, so the limit is a choice
+  the module made rather than whichever default the manager carried.
+- `doc/src/operating/recovery.md` records the measurement, the mechanism, and
+  how to grep one phase across restarts to see which part of startup is
+  growing.
+
+Raising a static budget was the alternative and was rejected: it buys headroom
+without telling anyone when it is being consumed, which is the state that
+produced this issue.
 
 ### Recurring-cost hygiene (#396, #411, #395, #404)
 

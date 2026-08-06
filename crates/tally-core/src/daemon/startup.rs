@@ -32,6 +32,105 @@ impl Drop for DaemonLockGuard {
     }
 }
 
+/// How long any single startup phase may take before systemd gives up.
+///
+/// Deliberately the same 90 s the user manager's `DefaultTimeoutStartSec`
+/// already imposed on the whole of startup, so the number an operator sees in
+/// a failure is the one they are used to. What changed is what it measures:
+/// one phase rather than all of them.
+pub(super) const STARTUP_PHASE_BUDGET: Duration = Duration::from_secs(90);
+
+/// Per-phase startup accounting, and the systemd budget that pays for it.
+///
+/// Everything `Daemon::open` and the pre-`READY` half of `run_loop` do is
+/// charged to `TimeoutStartSec` and never to `WatchdogSec`, because the
+/// service watchdog is not armed until `READY=1` (#370). #379 measured what
+/// that costs at estate scale — 61 s of a 90 s budget on the coordinator, on a
+/// trend that had added 20 s in two days — and could attribute none of it,
+/// because the daemon says nothing at all between `Starting` and its first
+/// late-startup log line. This type is the answer to both halves of that.
+///
+/// It tells systemd, at every phase boundary, that startup is still making
+/// progress, via `EXTEND_TIMEOUT_USEC=`. A growing estate no longer walks into
+/// a restart loop the operator only diagnoses afterwards; a phase that wedges
+/// still fails, on the same clock, with `STATUS=` naming which one.
+///
+/// It tells the operator, in one line at `READY`, what each phase cost. That
+/// line is the durable artefact #379 asks for: the next lane that adds startup
+/// work has a number to check against instead of a silent minute.
+pub(super) struct StartupTimeline {
+    notifier: SystemdNotifier,
+    started: std::time::Instant,
+    phase_started: std::time::Instant,
+    current: &'static str,
+    phases: Vec<(&'static str, Duration)>,
+}
+
+impl StartupTimeline {
+    pub(super) fn begin(notifier: SystemdNotifier, first: &'static str) -> Self {
+        let now = std::time::Instant::now();
+        let timeline = Self {
+            notifier,
+            started: now,
+            phase_started: now,
+            current: first,
+            phases: Vec::new(),
+        };
+        timeline.extend(first);
+        timeline
+    }
+
+    /// Close the running phase and open `next`.
+    pub(super) fn phase(&mut self, next: &'static str) {
+        let now = std::time::Instant::now();
+        self.phases
+            .push((self.current, now.duration_since(self.phase_started)));
+        self.current = next;
+        self.phase_started = now;
+        self.extend(next);
+    }
+
+    /// Close the last phase and render the report line for `READY`.
+    pub(super) fn finish(mut self) -> String {
+        let now = std::time::Instant::now();
+        self.phases
+            .push((self.current, now.duration_since(self.phase_started)));
+        let total = now.duration_since(self.started);
+        let mut line = format!(
+            "startup complete in {:.3}s of a {}s per-phase budget",
+            total.as_secs_f64(),
+            STARTUP_PHASE_BUDGET.as_secs()
+        );
+        // Field-per-phase rather than prose: an operator watching the trend
+        // #379 recorded needs to grep one phase out of the line, not read it.
+        for (name, elapsed) in &self.phases {
+            line.push_str(&format!(" {name}={:.3}s", elapsed.as_secs_f64()));
+        }
+        line
+    }
+
+    /// Every phase opened so far, the running one last.
+    #[cfg(test)]
+    pub(super) fn phase_names(&self) -> Vec<&'static str> {
+        self.phases
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(std::iter::once(self.current))
+            .collect()
+    }
+
+    fn extend(&self, phase: &str) {
+        // A notification failure is not made fatal here. Before #379 the
+        // daemon sent nothing at all between spawn and `READY=1`, so a broken
+        // notify socket could not fail startup earlier than `ready()`, and
+        // adding a new way for it to do so would trade a measured budget
+        // problem for an unmeasured availability one. `ready()` still reports.
+        let _ = self
+            .notifier
+            .extend_start_timeout(STARTUP_PHASE_BUDGET, &format!("starting: {phase}"));
+    }
+}
+
 impl Daemon {
     pub async fn open(
         config: Config,
@@ -51,6 +150,10 @@ impl Daemon {
         settings: DaemonSettings,
         executor: Executor,
     ) -> Result<Self, DaemonError> {
+        // The notifier is built first so every phase below is inside the
+        // extended budget, not just the ones after the listener exists (#379).
+        let notifier = SystemdNotifier::from_environment()?;
+        let mut timeline = StartupTimeline::begin(notifier.clone(), "prepare");
         config
             .validate()
             .map_err(|error| DaemonError::Invalid(error.to_string()))?;
@@ -58,6 +161,7 @@ impl Daemon {
         let settings = settings.validate()?;
         prepare_paths(&paths)?;
         let state_lock = DaemonLockGuard::acquire(&paths.state_dir)?;
+        timeline.phase("row-migration");
         // Preserve the clean-cut refusal: predecessor bytes are never parsed.
         // Once the final ledger is confirmed, migrate under this lock before
         // any acknowledged-event reader or recovery reconciliation can run.
@@ -67,11 +171,13 @@ impl Daemon {
         migrate_acknowledged_events(&paths.events_dir())?;
         let host_id = current_host_id()?;
         let epoch = bump_epoch(&paths.state_dir)?;
+        timeline.phase("durable-facts");
         reconcile_pool_loss_intents(&paths, &executor, &mut witness_ledger, &host_id).await?;
         let mut durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
         if reconcile_reuse_witnesses(&paths, &durable, &mut witness_ledger)? {
             durable = collect_durable_recovery_facts(&paths.events_dir(), &witness_path)?;
         }
+        timeline.phase("gcroots");
         {
             let _lock = lock_gcroot_registration(&paths)?;
             let horizon = parse_horizon(&config.retention.horizon)?;
@@ -92,7 +198,9 @@ impl Daemon {
                 }
             }
         }
+        timeline.phase("unit-facts");
         let units = collect_local_unit_facts(&executor, &durable).await?;
+        timeline.phase("recovery-plan");
         let producer_engine = ProducerEngine::new(
             &config.producers,
             paths.events_dir(),
@@ -149,6 +257,7 @@ impl Daemon {
         hydrate_adopted_adapter_metadata(&mut plan, &mut attestations)?;
         hydrate_represent_adapter_metadata(&mut plan, &config, &executor, &mut attestations)?;
 
+        timeline.phase("storage");
         let storage_data_dir = paths.data_dir.clone();
         let storage_state_dir = paths.state_dir.clone();
         let storage_config = config.storage.clone();
@@ -178,6 +287,8 @@ impl Daemon {
             attestations,
             witness_ledger,
             facts.durable.witness().to_vec(),
+            notifier,
+            timeline,
         )?;
         daemon.handler.refresh_storage_now().await;
         Ok(daemon)
@@ -197,7 +308,10 @@ impl Daemon {
         mut attestations: SharedAttestations,
         witness_ledger: WitnessLedger,
         witness_records: Vec<crate::witness::WitnessRecord>,
+        notifier: SystemdNotifier,
+        mut timeline: StartupTimeline,
     ) -> Result<Self, DaemonError> {
+        timeline.phase("lease-engine");
         validate_recovery_briefs(&plan, &paths.data_dir)?;
         let event_log = LeaseEventLog::in_state_dir(&paths.state_dir);
         let completed_witness = witness_records;
@@ -210,7 +324,9 @@ impl Daemon {
             &completed_witness,
             Utc::now(),
         )?;
+        timeline.phase("failure-stderr");
         reconcile_failure_stderr(&completed_witness, &executor)?;
+        timeline.phase("gh-orphan-sweep");
         let initial_gh_completions = sweep_orphaned_gh_completions(
             recovery_gh_completions(&plan, &completed_witness, &executor)?,
             &config,
@@ -227,6 +343,7 @@ impl Daemon {
         .map_err(|error| DaemonError::Invalid(error.to_string()))?
         .into_iter()
         .collect::<Vec<_>>();
+        timeline.phase("install-jobs");
         let query_rows = recovery_query_rows(&plan);
         let query_details = recovery_query_details(&plan);
         let rows = plan
@@ -276,7 +393,6 @@ impl Daemon {
         restore_guardrail_parents(&mut context, &plan)?;
         let job_tokens = restore_job_tokens(&context)?;
 
-        let notifier = SystemdNotifier::from_environment()?;
         if paths.socket.exists() {
             std::fs::remove_file(&paths.socket)
                 .map_err(|source| io_error(&paths.socket, source))?;
@@ -365,6 +481,7 @@ impl Daemon {
             completion_rx,
             fatal_rx,
             notifier,
+            startup: Some(timeline),
             initial_jobs,
             initial_gh_completions,
             initial_lost_pools,

@@ -97,6 +97,76 @@ decide whether replay is safe. An old-format events directory produces an
 explicit archive-aside error; archive the named directory exactly as the error
 instructs, rather than converting or deleting it.
 
+## The startup budget, and where the time goes
+
+Everything the daemon does before `READY=1` — the row migration, durable fact
+collection, unit-fact collection, the gcroot and GitHub sweeps, recovery-plan
+hydration, job installation — is charged to `TimeoutStartSec`. It is never
+charged to `WatchdogSec`: the service watchdog is not armed until `READY=1`, so
+a long startup cannot miss a watchdog deadline and cannot be diagnosed from one.
+
+That budget grows with the estate, not with the workload of any one job. The
+first measurement at estate scale, on a coordinator carrying roughly 7,000
+acknowledged events, was **61 s** — against a 90 s budget the daemon had merely
+inherited from the manager's `DefaultTimeoutStartSec`, having declared none of
+its own. The trend mattered more than the number: the same estate had taken
+25–41 s a few days earlier, and about 5–8 s per heavy-workload day was being
+added. A daemon that crosses its start timeout does not report a slow startup;
+it is killed and restarted, forever, and the operator sees a restart loop.
+
+Two things changed as a result.
+
+**The budget is per phase.** The daemon sends `EXTEND_TIMEOUT_USEC=` at every
+startup phase boundary, which is the mechanism systemd provides for exactly
+this case. Each notification restarts the start timeout from the moment it is
+received, so the limit is no longer "how long may the whole of startup take"
+but "how long may any one phase of it take". An estate that has simply grown
+keeps starting. A daemon wedged inside one phase still dies, on the same 90 s
+clock, and `systemctl status tally-daemon` names the phase it was in:
+
+```console
+$ systemctl --user status tally-daemon
+   Active: activating (start) since ...
+   Status: "starting: unit-facts"
+```
+
+That 90 s is now declared by the shipped units rather than inherited, and it
+matches `daemon::startup::STARTUP_PHASE_BUDGET`.
+
+**The phases are reported.** Immediately before `READY=1` the daemon writes one
+line naming every phase and its wall-clock. Before this, the journal was
+completely silent from `Starting` to the first late-startup warning, so a slow
+start could be measured but not attributed. The line below is a real one, from
+a daemon opened on an empty state directory — the shape is what matters, and
+every phase is present even when it costs nothing:
+
+```console
+$ journalctl --user -u tally-daemon | grep 'startup complete'
+tally: startup complete in 0.008s of a 90s per-phase budget prepare=0.000s
+row-migration=0.003s durable-facts=0.000s gcroots=0.000s unit-facts=0.000s
+recovery-plan=0.000s storage=0.001s lease-engine=0.000s failure-stderr=0.000s
+gh-orphan-sweep=0.000s install-jobs=0.003s initial-recovery=0.000s
+```
+
+The 61 s estate measurement above predates this line and has no per-phase
+attribution; the next start on an estate of that size is the first one that
+will.
+
+The phase names are stable and pinned by a test. Grep one of them across
+restarts to see which part of startup is growing:
+
+```console
+$ journalctl --user -u tally-daemon --since -7d \
+    | grep -o 'unit-facts=[0-9.]*s'
+```
+
+`unit-facts` probes every acknowledged row's local execution state — one probe
+per row — so it is the phase whose cost tracks estate size most directly, and
+the first place to look when total startup grows. Which phase actually
+dominates on a given estate is what this line is for; do not assume it. A lane
+that adds pre-`READY` work is expected to add a phase for it, so its cost is
+attributable here rather than folded into a neighbour's.
+
 ## Startup refuses pre-label unit-exit records
 
 Campaign task labels entered the execution unit name, so a row whose

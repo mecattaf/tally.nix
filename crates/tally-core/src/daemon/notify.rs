@@ -195,6 +195,23 @@ impl SystemdNotifier {
         self.send("READY=1\nSTATUS=tally daemon ready")
     }
 
+    /// Restart the start timeout from now, and name the phase being entered.
+    ///
+    /// `EXTEND_TIMEOUT_USEC=` is the mechanism systemd provides for a service
+    /// whose startup is legitimately long: each notification gives startup a
+    /// fresh `budget` measured from receipt, so the limit stops being "how
+    /// long may the whole of `Daemon::open` take" and becomes "how long may
+    /// any one phase of it take" (#379). A daemon whose estate has grown keeps
+    /// starting; one wedged inside a phase still dies on a clock the operator
+    /// already recognises. systemd ignores the field outside a start, stop or
+    /// reload job, so sending it is safe wherever the notifier reaches.
+    pub fn extend_start_timeout(&self, budget: Duration, status: &str) -> Result<(), DaemonError> {
+        self.send(&format!(
+            "EXTEND_TIMEOUT_USEC={}\nSTATUS={status}",
+            budget.as_micros()
+        ))
+    }
+
     pub fn watchdog(&self) -> Result<(), DaemonError> {
         self.send("WATCHDOG=1")
     }
