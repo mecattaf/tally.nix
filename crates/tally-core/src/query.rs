@@ -889,8 +889,16 @@ pub struct StandupDigest {
     /// digest carries zero rather than a wrong count. Accumulated as those
     /// four collections are filtered, by the same call that filters them
     /// and never by a separate recount — see that function's doc comment
-    /// for why a recount cannot be substituted here, and its closing
-    /// conservation check for why no removal can miss a counter.
+    /// for why a recount cannot be substituted here.
+    ///
+    /// That accumulation is unconditional: the helper those collections are
+    /// filtered through cannot remove an entry without counting it. Behind
+    /// it sits a conservation check for removals that bypass the helper
+    /// entirely; it covers the fields its enumerator names (a new
+    /// `StandupDigest` field does not compile until that enumerator names
+    /// it) and binds only where `debug_assertions` is on, so it is a
+    /// development-time backstop rather than a property of the shipped
+    /// binary.
     ///
     /// This does NOT count `runs` entries removed; see
     /// [`Self::archived_runs_hidden`] for that, a deliberately separate

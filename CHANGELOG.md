@@ -106,11 +106,13 @@ authorized.
   `gateFails` or `inFlight` from the count, or adding any further uncounted
   filter, left the whole suite green while the digest under-reported what it
   had withheld. Rather than adding one test per hole, filtering and counting
-  are now a single operation (`retain_counting`), and the function closes
-  with a conservation check comparing every filterable entry before and
-  after against the sum of its two counters — so a removal that reaches no
-  counter is a test failure whatever collection it came from, including one
-  a future edit adds.
+  are now a single operation (`retain_counting`) — a removal made through
+  that helper cannot miss its counter — and the function closes with a
+  `debug_assertions`-only conservation check that catches a removal
+  bypassing the helper in any of the collections its enumerator names. That
+  enumerator destructures `StandupDigest` exhaustively, so a new field does
+  not compile until it is named; binding it to `_` is then a visible
+  decision that the field is not filtered here.
 
 - **`query run` and `query standup` answer "what did this run cost" (#384).**
   `query.run` gains a `usage` object and `query.standup` gains a `runs` array

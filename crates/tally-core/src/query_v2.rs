@@ -1712,38 +1712,66 @@ pub fn apply_reader_state_to_jobs(
 /// Remove every entry `keep` rejects from `items`, adding the number removed
 /// to `hidden`.
 ///
-/// Filtering and counting are deliberately ONE operation. Round-2 HIGH-11
-/// found the previous shape — a `retain` here, a `before`/`after` sum over a
+/// Filtering and counting are deliberately ONE operation, and *this* part is
+/// unconditional: a caller cannot remove an entry through this helper without
+/// the removal reaching the counter it passed. Round-2 HIGH-11 found the
+/// previous shape — a `retain` here, a `before`/`after` sum over a
 /// hand-written list of collections there — pinned for exactly one of the
 /// five collections it filtered: dropping `cancelled`, `gate_fails` or
 /// `in_flight` from the sum left the whole suite green while the digest
-/// under-reported what it had withheld. Two things that must agree cannot be
-/// written separately here, so there is no longer a sum to forget a
-/// collection from.
+/// under-reported what it had withheld.
+///
+/// A sum over the digest's collections still exists — [`filterable_entries`],
+/// which the conservation backstop compares before and after. What changed is
+/// that the sum can no longer silently omit a field: it destructures
+/// `StandupDigest` exhaustively, so a new field is a compile error there
+/// rather than a quiet blind spot. Using this helper is what keeps the two
+/// numbers in agreement; the exhaustive destructure is what keeps the
+/// enumeration honest. Neither alone is the whole guarantee.
 fn retain_counting<T>(items: &mut Vec<T>, hidden: &mut usize, keep: impl FnMut(&T) -> bool) {
     let before = items.len();
     items.retain(keep);
     *hidden += before - items.len();
 }
 
-/// Every entry [`apply_reader_state_to_standup`] could remove, across every
-/// collection of the digest.
+/// Every entry [`apply_reader_state_to_standup`] could remove, summed across
+/// the digest's filterable collections.
 ///
-/// This is the *whole* of what that function is allowed to touch, and it is
-/// the backstop for the case [`retain_counting`] alone cannot prevent: a
-/// future edit that filters something new with a bare `retain`, or a sixth
-/// collection nobody adds here. The conservation check at the end of that
-/// function compares this before and after, so any removal that reaches no
-/// counter is a test failure rather than a silently short list.
+/// Deliberately written as an exhaustive destructure rather than a sum of
+/// field accesses. Round-3 (MUTATION H) showed why: when the enumerator is a
+/// hand-written list, a removal from a collection it does not mention changes
+/// neither side of the conservation check, so the backstop was blind to
+/// exactly the case it was introduced for. Destructuring without `..` makes a
+/// new `StandupDigest` field a compile error here —
+/// `error[E0027]: pattern does not mention field ...` — so the decision about
+/// whether that field is filterable is *forced and visible*.
 ///
-/// **If you add a `Vec` field to [`StandupDigest`], add it here.** An
-/// omission makes the conservation check blind to that field.
+/// What this does **not** buy: an author facing that error can bind the new
+/// field to `_` and move on, and nothing here will notice a bare `retain` on
+/// it later. The honest invariant is only this:
+///
+/// > A new `Vec` field on [`StandupDigest`] does not compile until this
+/// > function names it. Naming it `_` is a deliberate, visible decision that
+/// > the field is not filterable here.
+///
+/// Do not add `..` to this pattern; `..` is precisely the escape hatch that
+/// restores the blindness MUTATION H found.
 fn filterable_entries(digest: &StandupDigest) -> usize {
-    digest.runs.len()
-        + digest.completed.len()
-        + digest.gate_fails.len()
-        + digest.cancelled.len()
-        + digest.in_flight.len()
+    let StandupDigest {
+        schema_version: _,
+        protocol_version: _,
+        window: _,
+        completed,
+        in_flight,
+        reused: _,
+        gate_fails,
+        cancelled,
+        canonical_gpu_seconds: _,
+        runs,
+        archived_hidden: _,
+        archived_runs_hidden: _,
+    } = digest;
+    runs.len() + completed.len() + gate_fails.len() + cancelled.len() + in_flight.len()
 }
 
 /// Overlay operator reader-state onto a stand-up digest, filtering entries
@@ -1778,10 +1806,25 @@ fn filterable_entries(digest: &StandupDigest) -> usize {
 /// in this module's tests, which fails if this function is rewritten as a
 /// recount.
 ///
-/// The closing conservation check is the guarantee that generalises: every
-/// entry this function removes from the digest reaches one of the two
-/// counters, whatever collection it lived in and however many collections a
-/// later edit adds. See [`filterable_entries`].
+/// Two mechanisms hold the counts to the removals, and it is worth being
+/// exact about how far each reaches, because overstating this is a defect
+/// this function has already shipped twice:
+///
+/// - [`retain_counting`] makes counting inseparable from filtering for every
+///   collection routed through it. Unconditional.
+/// - The closing conservation check compares [`filterable_entries`] before
+///   and after against the two counters, catching a removal that bypassed
+///   `retain_counting` — a bare `retain`, or a second predicate on a
+///   collection already filtered. It reaches the fields
+///   `filterable_entries` names, and that enumeration is kept honest by an
+///   exhaustive destructure: a new [`StandupDigest`] field does not compile
+///   until it is named there. It is a `debug_assertions`-only backstop (see
+///   the assertion itself).
+///
+/// What is *not* claimed: that a removal can never miss a counter whatever
+/// collection it lives in. An author who meets the compile error and binds
+/// the new field to `_` has made that decision visibly, but they have made
+/// it, and nothing here revisits it.
 pub fn apply_reader_state_to_standup(
     digest: &mut StandupDigest,
     details: &[RowDetailFact],
@@ -1829,17 +1872,23 @@ pub fn apply_reader_state_to_standup(
     });
     digest.archived_hidden = task_hidden;
 
-    // Every removal reached a counter. A `debug_assert` rather than a hard
-    // one on purpose: a mis-accounted count is a correctness bug that the
-    // test suite must refuse, but panicking a live query path over it would
-    // trade a slightly wrong number for an unavailable digest, which is the
-    // worse failure for the operator this surface serves.
+    // Every removal across the fields `filterable_entries` names reached a
+    // counter. A `debug_assert` rather than a hard one on purpose: a
+    // mis-accounted count is a correctness bug that the test suite must
+    // refuse, but panicking a live query path over it would trade a slightly
+    // wrong number for an unavailable digest, which is the worse failure for
+    // the operator this surface serves. The consequence is that this check
+    // binds only where `debug_assertions` is on — which includes every
+    // `cargo test` run the gate makes, and excludes a release build. It is a
+    // development-time backstop behind `retain_counting`, not a runtime
+    // guarantee.
     debug_assert_eq!(
         entries_before - filterable_entries(digest),
         digest.archived_hidden + digest.archived_runs_hidden,
-        "every entry apply_reader_state_to_standup removes must reach one of \
-         its two counters; an uncounted removal is exactly the defect \
-         archived_hidden/archived_runs_hidden exist to make impossible"
+        "every entry apply_reader_state_to_standup removes from a collection \
+         filterable_entries names must reach one of its two counters; an \
+         uncounted removal is exactly the defect archived_hidden and \
+         archived_runs_hidden exist to prevent"
     );
     digest.archived_hidden
 }
@@ -5092,13 +5141,21 @@ mod tests {
         assert!(digest.runs.is_empty());
     }
 
-    /// Round-2 HIGH-11's generalisation: the guarantee must survive a
-    /// collection or predicate this test was never written for. The
-    /// conservation check inside `apply_reader_state_to_standup` compares
-    /// `filterable_entries` before and after, so any removal that reaches no
-    /// counter fails there. This test states the invariant explicitly so a
-    /// reader can find it, and exercises the opted-in path too, where the
-    /// correct answer is "nothing removed, both counts zero".
+    /// A *further* predicate on an already-enumerated collection — one this
+    /// test was not written for — must still be caught: the conservation
+    /// check inside `apply_reader_state_to_standup` compares
+    /// `filterable_entries` before and after, so a removal there that
+    /// reaches no counter fails. Round-2 MUT-C is exactly that shape and
+    /// this test catches it.
+    ///
+    /// Note the reach honestly. This test computes `before` and `removed`
+    /// by calling `filterable_entries` itself, so it is exactly as blind as
+    /// that enumerator: it cannot catch a removal from a collection the
+    /// enumerator does not name (round-3 MUTATION H). What stops that case
+    /// is not this test but the exhaustive destructure in
+    /// `filterable_entries`, which turns a new `StandupDigest` field into a
+    /// compile error. Also exercises the opted-in path, where the correct
+    /// answer is "nothing removed, both counts zero".
     #[test]
     fn apply_reader_state_to_standup_conserves_entries_between_removals_and_counts() {
         let archived_run = "00000000-0000-4000-8000-0000000002b0";
