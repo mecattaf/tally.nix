@@ -6,6 +6,52 @@ authorized.
 
 ## [Unreleased]
 
+### pi adapter residue (#405, #406)
+
+The follow-ups the #387 lane's config-only cap deferred. #405 is the Rust-side
+and cosmetic residue of that cap; #406 is the config-side consistency work its
+round-2 evaluation found.
+
+#### #405 — the pi capture is now what the docs say it is, and a committed test runs it
+
+Three `crate::occupancy` doc statements still justified pi's undeclared usage
+mapping by "no real capture". The capture exists; what it justifies is
+*declining*, because pi states usage per assistant message and never per
+attempt, so a declared `inputTokens` there would report one turn's figures as
+an attempt's spend. The module doc now says that, and the `context_tokens`
+doc no longer lists pi among the adapters with no occupancy scrape — it has
+one.
+
+`test/fixtures/traces/pi.jsonl` is now read by the trace round-trip
+acceptance test, which previously covered only claude-code and codex. It is a
+pure real capture with no synthesised unknown event and no invented trailing
+garbage, so the two tail assertions written around the other two fixtures are
+conditional on that tail; what replaces them for pi is stronger in the
+direction a real capture cares about — every one of its lines must parse — plus
+assertions on pi's own framing (the session header, an assistant `message_end`
+carrying a `toolCall` block, the separate `tool_execution_end`, the
+`message_update` echo, and usage stated inside the message rather than at the
+top level).
+
+Placing a pre-prompt option on an adapter whose argv has no `--` terminator no
+longer fails. `render_launch_prefix` required a trailing `--` to place
+`prePromptArgv`, `approvalPolicy`, `sandboxPolicy`, `launch.cwdArgv`,
+`launch.model` or `launch.effort`, which made `pi` — the one preset that
+declares no terminator, because pi rejects one outright — refuse every
+pre-prompt option with an error naming a convention it abandoned on purpose.
+Options are now appended at the end of a terminator-less prefix, which is where
+a harness expects its own flags; a prefix that does end in `--` still gets them
+before the terminator, and an adapter with no argv at all still fails, now
+saying why.
+
+Two cosmetics: the synthetic `input_tokens` block in `flake.nix` is labelled as
+synthetic and as *not* pi's key set, so it cannot be misread as evidence about
+pi's wire format beside the real-capture block below it; and the pi preset
+records that its `message_update` echo makes stdout grow with the square of a
+turn's length, so a long pi campaign reaches the 16 MiB trace read bound far
+sooner than a codex or claude-code one. Truncation is reported rather than
+hidden, so that is a sizing note, not a defect.
+
 ### Recurring-cost hygiene (#396, #411, #395, #404)
 
 One lane of four fixes with a shared shape: each one makes something the fleet

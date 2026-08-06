@@ -594,22 +594,39 @@ fn render_launch_prefix(
     if inserted.is_empty() {
         return Ok(base.to_vec());
     }
-    let Some((delimiter, prefix)) = base.split_last() else {
+    // Pre-prompt options go at the end of the prefix, which is where a
+    // harness expects its own flags: after the subcommand, before the
+    // payload. An adapter that terminates its prefix with `--` is the one
+    // case where "the end of the prefix" is not the last element -- the
+    // options must precede the terminator or the harness reads them as
+    // payload -- so that case is spelled out and every other prefix simply
+    // gets them appended.
+    //
+    // Requiring the terminator was the previous rule and it was wrong for a
+    // preset that has no terminator to give. `pi` declares none on purpose
+    // (it rejects `--` outright, exit 1, zero bytes on stdout), so the first
+    // operator to pin a model or a cwd flag on a pi-derived adapter met
+    // `pre-prompt options require an adapter prefix ending in '--'` -- an
+    // error naming a convention that preset deliberately abandoned, for a
+    // request tally can place perfectly well.
+    let Some((last, prefix)) = base.split_last() else {
+        // An adapter with no argv at all has nowhere to put them: appending
+        // here would make the first option the executable.
         return invalid_config(
             name,
-            "pre-prompt options require an adapter prefix ending in '--'".to_owned(),
+            "pre-prompt options require an adapter argv to place them in".to_owned(),
         );
     };
-    if delimiter != "--" {
-        return invalid_config(
-            name,
-            "pre-prompt options require an adapter prefix ending in '--'".to_owned(),
-        );
+    if last == "--" {
+        let mut rendered = prefix.to_vec();
+        rendered.extend(inserted);
+        rendered.push(last.clone());
+        Ok(rendered)
+    } else {
+        let mut rendered = base.to_vec();
+        rendered.extend(inserted);
+        Ok(rendered)
     }
-    let mut rendered = prefix.to_vec();
-    rendered.extend(inserted);
-    rendered.push(delimiter.clone());
-    Ok(rendered)
 }
 
 fn render_policy(
@@ -1762,6 +1779,138 @@ mod tests {
                 "--",
                 "continue",
             ]
+        );
+    }
+
+    #[test]
+    fn a_terminator_less_prefix_takes_pre_prompt_options_at_its_end() {
+        // The shape `pi` declares: no `--`, because pi rejects one outright.
+        // Every pre-prompt placement used to be refused on that ground, which
+        // is a rule about codex's argv convention rather than about whether
+        // the options can be placed. They can: the end of the prefix is
+        // exactly where the harness expects its own flags.
+        let terminator_less = AdapterConfig {
+            argv: vec!["pi".to_owned(), "--mode".to_owned(), "json".to_owned()],
+            resume: Some(vec![
+                "pi".to_owned(),
+                "--mode".to_owned(),
+                "json".to_owned(),
+                "--session".to_owned(),
+                "%<sessionRef>%".to_owned(),
+            ]),
+            scrape: BTreeMap::from([(
+                "sessionRef".to_owned(),
+                ScrapeCapture {
+                    stream: ScrapeStream::Stdout,
+                    mode: ScrapeMode::JsonPath,
+                    pattern: "$.id".to_owned(),
+                    fields: Default::default(),
+                },
+            )]),
+            launch: AdapterLaunchConfig {
+                allow_pre_prompt_argv: true,
+                cwd_argv: Some(vec!["--project".to_owned(), "%<cwd>%".to_owned()]),
+                model: Some(AdapterValueOverride {
+                    argv: vec!["--model".to_owned(), "%<value>%".to_owned()],
+                    allowed_values: vec!["qwen3.6-35b-a3b".to_owned()],
+                }),
+                ..AdapterLaunchConfig::default()
+            },
+            ..AdapterConfig::default()
+        };
+        let adapters = BTreeMap::from([("terminator-less".to_owned(), terminator_less)]);
+        let engine = engine(&adapters);
+        engine.validate_all().unwrap();
+        let options = AdapterJobOptions {
+            pre_prompt_argv: vec!["--quiet".to_owned()],
+            model: Some("qwen3.6-35b-a3b".to_owned()),
+            ..AdapterJobOptions::default()
+        };
+        let cwd = Path::new("/worktrees/issue-405");
+        assert_eq!(
+            engine
+                .launch_with_options(
+                    "terminator-less",
+                    &["do the work".to_owned()],
+                    &options,
+                    Some(cwd),
+                )
+                .unwrap()
+                .argv,
+            [
+                "pi",
+                "--mode",
+                "json",
+                "--quiet",
+                "--project",
+                "/worktrees/issue-405",
+                "--model",
+                "qwen3.6-35b-a3b",
+                "do the work",
+            ]
+        );
+        // The resume template pins no `%<model>%`, so the override is placed
+        // here too rather than suppressed.
+        let scraped = engine
+            .scrape_text(
+                "terminator-less",
+                "{\"type\":\"session\",\"id\":\"s-1\"}\n",
+                "",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .resume_with_options(
+                    "terminator-less",
+                    &["continue".to_owned()],
+                    &scraped,
+                    &options,
+                    Some(cwd),
+                )
+                .unwrap()
+                .argv,
+            [
+                "pi",
+                "--mode",
+                "json",
+                "--session",
+                "s-1",
+                "--quiet",
+                "--project",
+                "/worktrees/issue-405",
+                "--model",
+                "qwen3.6-35b-a3b",
+                "continue",
+            ]
+        );
+        // An adapter with no argv at all still fails, and now says why:
+        // appending would make the first option the executable.
+        let empty = BTreeMap::from([(
+            "no-argv".to_owned(),
+            AdapterConfig {
+                launch: AdapterLaunchConfig {
+                    allow_pre_prompt_argv: true,
+                    ..AdapterLaunchConfig::default()
+                },
+                ..AdapterConfig::default()
+            },
+        )]);
+        let empty_engine = AdapterEngine::new(&empty);
+        let error = empty_engine
+            .launch_with_options(
+                "no-argv",
+                &["payload".to_owned()],
+                &AdapterJobOptions {
+                    pre_prompt_argv: vec!["--quiet".to_owned()],
+                    ..AdapterJobOptions::default()
+                },
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("pre-prompt options require an adapter argv to place them in"),
+            "{error}"
         );
     }
 

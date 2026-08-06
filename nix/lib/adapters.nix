@@ -136,6 +136,15 @@ let
       # advisory observation, which is the honest handling, so the framing
       # declaration stands -- but see the resume argv below for what that
       # path costs.
+      #
+      # Volume, because it is a property of this stream and not of the
+      # others: pi echoes the whole partial message on every
+      # `message_update`, so stdout grows with the square of a turn's
+      # length rather than linearly (the two-turn capture below wrote
+      # 260 KB). A long pi campaign therefore reaches the 16 MiB trace
+      # read bound far sooner than a codex or claude-code one. Truncation
+      # is reported rather than hidden, so this costs trace depth, not
+      # correctness -- it is a sizing note, not a defect.
       trace = {
         stream = "stdout";
         framing = "json-lines";

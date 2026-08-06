@@ -5287,6 +5287,16 @@
             resume="$(${tally}/bin/tally --config ${adapterConfig} __adapter-render nix-custom --captures '{"sessionRef":"nix-session"}' -- '--option-looking')"
             test "$(printf '%s' "$resume" | jq -c '.argv')" = '["custom-agent","--resume","nix-session","--option-looking"]'
             : > empty.err
+            # SYNTHETIC, and deliberately not pi's key set. This block
+            # predates the real-capture block below and exists only to pin
+            # the preset's *selection* rules -- `$.id` over the session
+            # header, the last assistant `message_end` for `finalMessage`, a
+            # `user` message ignored in between -- against a stream small
+            # enough to read in one screen. Its `usage` keys are
+            # `input_tokens`, which pi does not emit: pi's real keys are
+            # `input`/`output`/`cacheRead`/`cacheWrite`, and they are
+            # asserted from the recorded bytes further down. Nothing here
+            # should be read as evidence about pi's wire format.
             printf '%s\n' \
               '{"type":"session","id":"pi-session","model":"Pi/Exact.Model"}' \
               '{"type":"message_end","message":{"role":"assistant","model":"Pi/Exact.Model","content":[{"type":"text","text":"pi first"}],"usage":{"input_tokens":5}}}' \
