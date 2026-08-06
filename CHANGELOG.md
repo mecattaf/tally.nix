@@ -44,18 +44,37 @@ authorized.
   outside the witness/attestation ledgers and excluded from every hash
   chain. It is written **only** by a new `tally reader-state
   {archive,unarchive,tag,untag,show}` CLI verb, which writes the file
-  directly — no daemon socket, no RPC call, so no daemon or reconciler code
-  path can touch it. `query run` now exposes `archived` and `triageTag` (and
-  prints a loud `-- ARCHIVED` banner in its human text view); `query jobs`
-  and `query standup` gain `--archived`/`--no-archived` (default: hidden) and
-  filter on it, and `query standup`'s digest gains `archivedHidden`, a count
-  computed from the exact same filtering pass that produced the entries
-  beside it, never a separate recount. A corrupt or missing reader-state
-  store degrades every reader to "nothing is archived" rather than failing
-  the query (`ReaderState::read_advisory`), and the store self-compacts past
-  `READER_STATE_COMPACT_THRESHOLD` records so a scripted toggle loop cannot
-  grow it forever. Runs only, by design: no UI, no cross-host sync, no
-  per-task granularity.
+  directly against the daemon's data directory (pass `--data-dir` if it is
+  not the default) — no daemon socket, no RPC call, so no daemon or
+  reconciler code path can touch it. `query run` now exposes `archived` and
+  `triageTag` (and prints a loud `-- ARCHIVED` banner in its human text
+  view); `query jobs` and `query standup` gain `--archived`/`--no-archived`
+  (default: hidden) and filter on it. `query standup`'s digest gains two
+  separate hidden counts — `archivedHidden` (task entries hidden, across
+  `completed`/`gateFails`/`cancelled`/`inFlight`) and `archivedRunsHidden`
+  (`runs` cost rows hidden, including a run that only *attached* a task
+  rather than creating it) — each computed from the exact filtering pass
+  that produced the entries beside it, never a separate recount; two
+  window-wide aggregates, `reused` and `canonicalGpuSeconds`, are
+  deliberately **not** reader-state filtered and remain window totals. A
+  corrupt or missing reader-state store degrades every reader to "nothing is
+  archived" rather than failing the query (`ReaderState::read_advisory`),
+  and the store self-compacts past `READER_STATE_COMPACT_THRESHOLD` records
+  so a scripted toggle loop cannot grow it forever. Runs only, by design: no
+  UI, no cross-host sync, no per-task granularity.
+
+  *Round-1 repair:* the initial `archivedHidden` count omitted `runs` row
+  removals entirely — a run that only attached a task (durable membership,
+  not its orchestration capsule) had its cost row silently dropped with the
+  count staying zero. Split into `archivedHidden`/`archivedRunsHidden` and
+  covered by a regression test reproducing exactly that shape
+  (`apply_reader_state_to_standup_counts_an_attach_only_archived_run_that_hides_no_task_entry`).
+  A second test now pins that `archivedHidden` is a before/after difference
+  and not a recount over `details`, and a third pins the `query.jobs`
+  pagination cache-key fingerprint against dropping `archived`. `query jobs
+  --flow-run <archived-run>` silently withholding items with no signal in
+  the response is a known follow-up, not fixed in this repair; see
+  `doc/src/operating/observability.md`'s "Archive a run" section.
 
 - **`query run` and `query standup` answer "what did this run cost" (#384).**
   `query.run` gains a `usage` object and `query.standup` gains a `runs` array

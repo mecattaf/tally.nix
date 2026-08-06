@@ -881,15 +881,41 @@ pub struct StandupDigest {
     /// unfilled digest carries an empty list rather than a wrong one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<StandupRunUsage>,
-    /// How many entries this call hid because their creating run is archived
-    /// operator reader-state. Filled by
+    /// How many TASK ENTRIES (summed across `completed`, `gateFails`,
+    /// `cancelled`, `inFlight`) this call hid because their creating run is
+    /// archived operator reader-state. Filled by
     /// [`crate::query_v2::apply_reader_state_to_standup`], which owns the
     /// reader-state store this projection has no access to; an unfilled
-    /// digest carries zero rather than a wrong count. Always computed from
-    /// the same filtering pass that produced the entries beside it, never
-    /// from a separate recount.
+    /// digest carries zero rather than a wrong count. Always computed as a
+    /// difference over those four collections in the same call that
+    /// filters them, never from a separate recount — see that function's
+    /// doc comment for why a recount cannot be substituted here.
+    ///
+    /// This does NOT count `runs` entries removed; see
+    /// [`Self::archived_runs_hidden`] for that, a deliberately separate
+    /// number because the two lists are not the same unit (one archived run
+    /// can hold several task entries).
+    ///
+    /// Two window-wide aggregates are deliberately NOT reader-state
+    /// filtered and this count says nothing about them: `reused` and
+    /// `canonical_gpu_seconds` are both summed once, over the whole
+    /// window, before this call removes anything — an archived run's GPU
+    /// seconds and reuse count remain in those totals even once its
+    /// entries and cost row are hidden. Window cost is currently
+    /// reader-state-independent by construction; see
+    /// `doc/src/operating/observability.md`'s "Archive a run" section.
     #[serde(default)]
     pub archived_hidden: usize,
+    /// How many `runs` entries (per-run usage rollups) this call hid
+    /// because that run is archived operator reader-state — counted
+    /// directly from `runs`'s own filter, independent of
+    /// [`Self::archived_hidden`]'s task-entry attribution. `runs` is
+    /// populated from two sources on purpose (the creating run AND every
+    /// run that attached the task via durable membership — the W-316
+    /// shape), so a run that only attached a task still has its cost row
+    /// hidden and counted here even when no task entry was hidden for it.
+    #[serde(default)]
+    pub archived_runs_hidden: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1059,6 +1085,7 @@ pub fn query_standup(
         canonical_gpu_seconds,
         runs: Vec::new(),
         archived_hidden: 0,
+        archived_runs_hidden: 0,
     }
 }
 

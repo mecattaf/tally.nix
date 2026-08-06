@@ -561,7 +561,8 @@ cancelled stand-up entry includes `taskRef` when the job belongs to a campaign t
 
 `query jobs` and `query standup` both take `--archived` (include jobs/entries whose creating run
 is archived reader-state) and `--no-archived` (the default, spelled explicitly). `query standup`'s
-digest additionally carries `archivedHidden`, how many entries this call hid. See
+digest additionally carries `archivedHidden` (task entries hidden) and `archivedRunsHidden` (`runs`
+rows hidden) — two separate counts, since one archived run can hold several task entries. See
 [Archive a run](observability.md#archive-a-run).
 
 ### Watch

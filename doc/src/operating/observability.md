@@ -182,14 +182,21 @@ are aliases on `tally query jobs`, `tally query log`, `tally query proof`, and
 ## Archive a run
 
 Once a run is dealt with, mark it so it stops crowding the standup and job
-lists:
+lists. Every verb below targets the daemon's own **data directory**, not the
+socket — `tally reader-state` never talks to the daemon at all, so pass
+`--data-dir` explicitly if it differs from the default
+(`$XDG_DATA_HOME/tally`, else `~/.local/share/tally`); a NixOS deployment's
+daemon normally runs against `/var/lib/tally/data`. Omitting it against a
+different data directory than the one the daemon reads is not an error — it
+creates a fresh, unrelated store, prints a normal-looking success line, and
+changes nothing any `query` command shows:
 
 ```console
-$ tally reader-state archive <flow-run-uuid> --tag flaky-fixture
-$ tally reader-state unarchive <flow-run-uuid>
-$ tally reader-state tag <flow-run-uuid> needs-followup
-$ tally reader-state untag <flow-run-uuid>
-$ tally reader-state show <flow-run-uuid>
+$ tally reader-state archive <flow-run-uuid> --tag flaky-fixture --data-dir /var/lib/tally/data
+$ tally reader-state unarchive <flow-run-uuid> --data-dir /var/lib/tally/data
+$ tally reader-state tag <flow-run-uuid> needs-followup --data-dir /var/lib/tally/data
+$ tally reader-state untag <flow-run-uuid> --data-dir /var/lib/tally/data
+$ tally reader-state show <flow-run-uuid> --data-dir /var/lib/tally/data
 ```
 
 This is **reader-state**, not evidence: `archived` and the triage tag live in
@@ -200,10 +207,42 @@ only the CLI verb above, which writes it directly. `query run` always exposes
 the current `archived` flag and `triageTag` (and prints a loud `-- ARCHIVED`
 banner in its human text view, however you got to that run); `query jobs` and
 `query standup` default to **hiding** archived runs, add `--archived` to see
-them, or `--no-archived` to say the default explicitly. `query standup`'s
-digest also carries `archivedHidden`, so "the list looks short" is never
-silently indistinguishable from "the list is short" — the count is computed
-from the exact same filter pass that produced the entries beside it.
+them, or `--no-archived` to say the default explicitly.
+
+`query standup`'s digest carries two separate hidden counts, because they
+count different lists at different granularity — one archived run holding
+three tasks removes one `runs` row and up to three task entries, and merging
+the two numbers would make either a claim about a list it does not describe:
+
+- **`archivedHidden`** — task entries hidden, summed across `completed`,
+  `gateFails`, `cancelled`, and `inFlight`.
+- **`archivedRunsHidden`** — `runs` rows (per-run cost rollups) hidden.
+  `runs` is populated from both the *creating* run and every run that
+  merely *attached* the task (durable membership, the W-316 shape), so a
+  run that only attached a task still has its cost row hidden and counted
+  here even when no task entry moved.
+
+Both are computed from the exact same filter pass that produced the entries
+beside them, never a separate recount — so "the list looks short" is never
+silently indistinguishable from "the list is short." Two window-wide
+aggregates are the deliberate exception: `reused` and `canonicalGpuSeconds`
+are summed once over the whole window, before either hidden count is
+applied, so an archived run's GPU seconds and reuse count remain in those
+totals even once its rows are hidden elsewhere in the same digest. Window
+cost is currently reader-state-independent by construction; treat
+`reused`/`canonicalGpuSeconds` as window totals, not as totals over what the
+digest currently shows.
+
+`query jobs --flow-run <archived-run-id>` has a related sharp edge: it
+returns `items: []` exactly as it would for a quiet run or one with no
+members, and `flowRunTasks` still reports the run's true (unfiltered)
+membership size with nothing in the response distinguishing "quiet," "no
+members," and "archived and withheld." Unlike `query run`, which always
+exposes `archived` rather than hiding content, an explicit `--flow-run`
+filter on `query jobs` currently withholds silently. This is a known,
+unresolved tension in the design (`query run`'s own argument is that an
+explicit by-id request must not silently withhold what was asked for) and is
+tracked as a follow-up rather than fixed here.
 
 A reader-state store that is missing, empty, truncated, or hand-edited into
 garbage degrades every query that consults it to "nothing is archived" rather

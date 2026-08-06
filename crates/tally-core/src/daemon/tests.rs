@@ -13544,14 +13544,18 @@ mod tests {
                 assert_eq!(flagged["archived"], true);
 
                 // `query.standup` hides the archived run's entry and its run
-                // rollup by default, and its hidden count says exactly one --
-                // computed from the same pass, not a separate recount.
+                // rollup by default. `archivedHidden` (task entries) and
+                // `archivedRunsHidden` (per-run cost rows) are two separate
+                // counts -- both say exactly one here -- each computed from
+                // the same pass that filters the list it describes, not a
+                // separate recount.
                 let default_standup = daemon
                     .handler
                     .query("query.standup", Some(json!({})))
                     .await
                     .unwrap();
                 assert_eq!(default_standup["archivedHidden"], 1);
+                assert_eq!(default_standup["archivedRunsHidden"], 1);
                 let completed = default_standup["completed"].as_array().unwrap();
                 assert!(completed
                     .iter()
@@ -13568,6 +13572,7 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(all_standup["archivedHidden"], 0);
+                assert_eq!(all_standup["archivedRunsHidden"], 0);
                 assert!(all_standup["completed"]
                     .as_array()
                     .unwrap()
@@ -13593,11 +13598,93 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(degraded_standup["archivedHidden"], 0);
+                assert_eq!(degraded_standup["archivedRunsHidden"], 0);
 
                 // And the witness ledger is entirely indifferent: corrupting
                 // reader-state does not touch it or its verification.
                 let (report, _) = read_verified_records(&paths.witness_path()).unwrap();
                 assert!(report.ok);
+            })
+            .await;
+    }
+
+    /// #389 MEDIUM-6: `query.jobs`'s pagination cache-key fingerprint must
+    /// include `archived`, so a cursor minted under one archived selection
+    /// can never be followed under the other -- an operator would otherwise
+    /// be served rows their own `--archived`/`--no-archived` filter says are
+    /// absent. Nothing short of driving a real cursor through the daemon
+    /// pins this: `PageCache`'s own fingerprint-mismatch mechanism is
+    /// generic (`pagination::tests::cursors_are_snapshot_bound_and_expire_explicitly`
+    /// proves the cache itself), but nothing previously asserted that the
+    /// `query.jobs` RPC handler actually feeds `archived` into that
+    /// mechanism -- deleting `"archived": params.archived,` from its
+    /// fingerprint `json!` block passed all 676 tests.
+    #[tokio::test(flavor = "current_thread")]
+    async fn query_jobs_cursor_from_one_archived_selection_is_refused_under_the_other() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+
+                // Two jobs, so a `limit: 1` page always mints a `nextCursor`.
+                for _ in 0..2 {
+                    daemon
+                        .handler
+                        .enqueue_as_client(Some(json!({
+                            "argv": ["true"],
+                            "pool": "slot",
+                            "adapter": "shell",
+                            "source": "manual",
+                            "evidence": ["exit:0"]
+                        })))
+                        .await
+                        .unwrap();
+                }
+
+                let first_page = daemon
+                    .handler
+                    .query(
+                        "query.jobs",
+                        Some(json!({"limit": 1, "archived": false})),
+                    )
+                    .await
+                    .unwrap();
+                let cursor = first_page["nextCursor"]
+                    .as_str()
+                    .expect("two rows at limit 1 must mint a continuation cursor")
+                    .to_owned();
+
+                // Following that cursor under the SAME archived selection
+                // works.
+                let same_selection = daemon
+                    .handler
+                    .query(
+                        "query.jobs",
+                        Some(json!({"cursor": cursor, "archived": false})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(same_selection["items"].as_array().unwrap().len(), 1);
+
+                // Following it under the OPPOSITE archived selection must be
+                // refused, not silently served -- exactly the property MEDIUM-6
+                // found unbound.
+                let error = daemon
+                    .handler
+                    .query(
+                        "query.jobs",
+                        Some(json!({"cursor": cursor, "archived": true})),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.code, WireErrorCode::InvalidParams);
+                assert!(
+                    error.message.contains("different query"),
+                    "{}",
+                    error.message
+                );
             })
             .await;
     }
