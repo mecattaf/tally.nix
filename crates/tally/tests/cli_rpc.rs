@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
@@ -11,6 +10,9 @@ use tally_core::wire::{serve_connection, RpcHandler};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::process::Command;
+
+#[path = "support/shell_program.rs"]
+mod shell_program;
 
 #[derive(Clone, Copy)]
 struct CliHandler;
@@ -1065,13 +1067,14 @@ async fn internal_exit_recorder_is_silent_and_fail_closed() {
     // accounting probe being skipped. The probe's own failure-is-logged
     // behavior is covered by
     // `crates/tally/tests/record_unit_exit_accounting.rs`.
+    // Installed through the immutable provider, never written-then-chmoded:
+    // an executable this process wrote is unexecutable for as long as any
+    // process on the host still holds a write fd on it (#396).
     let systemctl = temp.path().join("fake-systemctl-ok");
-    std::fs::write(
+    shell_program::install(
         &systemctl,
         "#!/bin/sh\necho \"CPUUsageNSec=1000000000\"\necho \"ExecMainStartTimestampMonotonic=0\"\necho \"ExecMainExitTimestampMonotonic=1000000\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+    );
     let success = Command::new(env!("CARGO_BIN_EXE_tally"))
         .args([
             "__record-unit-exit",
@@ -1877,6 +1880,79 @@ async fn submitting_commands_exit_quietly_when_their_reader_is_gone() {
                     output.status
                 );
             }
+            server.await.unwrap();
+        })
+        .await;
+}
+
+/// A handler that is listening and refuses, so the "daemon is absent" case can
+/// be told apart from "the drain itself failed".
+#[derive(Clone, Copy)]
+struct RefusingDrainHandler;
+
+impl RpcHandler for RefusingDrainHandler {
+    fn handle<'a>(
+        &'a self,
+        request: RequestFrame,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, WireError>> + 'a>> {
+        Box::pin(async move {
+            assert_eq!(request.method, "queue.drain");
+            Err(WireError::invalid("drain refused"))
+        })
+    }
+}
+
+/// Issue #411: `tally-drain` runs every five seconds, so a daemon restart
+/// under it is routine, and exiting 3 on that turned every deploy that touches
+/// the daemon unit into a per-user unit failure the fleet's journal watcher
+/// reports as if it were the SIGABRT burst it was built to catch.
+///
+/// The absorption is scoped to the socket-absent case only, which is what this
+/// pins in all three directions: absent daemon exits 0 and still says so, the
+/// same absence on any other verb still exits 3, and a daemon that is present
+/// and refuses the drain still fails.
+#[tokio::test(flavor = "current_thread")]
+async fn a_periodic_drain_that_finds_no_daemon_is_not_a_failure() {
+    let temp = tempfile::tempdir().unwrap();
+    let absent = temp.path().join("absent.sock");
+
+    let skipped = run_tally(&absent, &["daemon", "drain"]).await;
+    assert_eq!(skipped.status.code(), Some(0), "{:?}", skipped.status);
+    let stderr = String::from_utf8_lossy(&skipped.stderr).into_owned();
+    assert!(
+        stderr.contains(&format!(
+            "daemon socket {} is unreachable",
+            absent.display()
+        )),
+        "the absorbed case must still name itself:\n{stderr}"
+    );
+    // Absence, not emptiness: nothing may claim a drain happened.
+    let stdout = String::from_utf8_lossy(&skipped.stdout).into_owned();
+    assert!(stdout.is_empty(), "{stdout}");
+
+    // The identical absence reached through another verb is untouched.
+    let unreachable = run_tally(&absent, &["queue", "drain"]).await;
+    assert_eq!(
+        unreachable.status.code(),
+        Some(3),
+        "{:?}",
+        unreachable.status
+    );
+
+    // A daemon that is listening and refuses is still a failure.
+    let socket = temp.path().join("tally.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let server = tokio::task::spawn_local(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                serve_connection(stream, RefusingDrainHandler)
+                    .await
+                    .unwrap();
+            });
+            let refused = run_tally(&socket, &["daemon", "drain"]).await;
+            assert_eq!(refused.status.code(), Some(2), "{:?}", refused.status);
             server.await.unwrap();
         })
         .await;

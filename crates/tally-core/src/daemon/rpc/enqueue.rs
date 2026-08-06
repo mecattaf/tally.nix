@@ -141,10 +141,12 @@ impl DaemonHandler {
         // A usage record belongs to the attempt that produced it. Carrying one
         // into a retry would render attempt N−1's tokens under attempt N with
         // provider-capture authority — a measurement claimed for work that has
-        // not run. Today the cloned row is usage-free because completion
-        // writes only to `context.jobs`, so this line is currently redundant;
-        // it is here so the discipline survives anyone making completion write
-        // rows back.
+        // not run. Today the cloned row is usage-free because nothing writes a
+        // scraped usage record back into `context.rows` at all: completion
+        // records it on the query fact instead (#395 removed the last writes it
+        // made to `context.jobs`), and `context.rows` is only written before
+        // execution. So this line is currently redundant; it is here so the
+        // discipline survives anyone making completion write rows back.
         row.usage = None;
 
         let engine = AdapterEngine::new(&context.config.adapters);
@@ -547,44 +549,46 @@ impl DaemonHandler {
         if let Some(caller_job_id) = caller_job_id.as_deref() {
             ensure_guardrail_parent(&mut context, caller_job_id, false)?;
         }
-        let resumed_job = if let Some(resume_from) = payload.resume_from.as_deref() {
-            let previous = find_job(&context, resume_from)?.clone();
-            if previous.state != JobState::Completed {
+        let resumed_row = if let Some(resume_from) = payload.resume_from.as_deref() {
+            let found = find_job(&context, resume_from)?;
+            if !found.terminal() {
                 return Err(WireError::invalid(format!(
                     "job {resume_from} is not terminal and cannot be continued"
                 )));
             }
-            if previous.row.session_ref.is_none() {
+            // The seed the job was admitted with, carrying the session pointer
+            // and model its post-ack scrape observed — which for a job retired
+            // out of `context.jobs` come from the query fact (#395).
+            let previous = found.observed_row();
+            if previous.session_ref.is_none() {
                 return Err(WireError::invalid(format!(
                     "job {resume_from} has no scraped session reference"
                 )));
             }
-            payload
-                .pools
-                .get_or_insert_with(|| previous.row.pools.clone());
+            payload.pools.get_or_insert_with(|| previous.pools.clone());
             if payload.executor.is_none() {
-                payload.executor.clone_from(&previous.row.executor);
+                payload.executor.clone_from(&previous.executor);
             }
-            payload.priority.get_or_insert(previous.row.priority);
+            payload.priority.get_or_insert(previous.priority);
             payload
                 .adapter
-                .get_or_insert_with(|| previous.row.adapter.clone());
-            payload.source.get_or_insert(previous.row.source);
+                .get_or_insert_with(|| previous.adapter.clone());
+            payload.source.get_or_insert(previous.source);
             if payload.origin.is_none() {
-                payload.origin.clone_from(&previous.row.origin);
+                payload.origin.clone_from(&previous.origin);
             }
             if payload.cwd.is_none() {
-                payload.cwd.clone_from(&previous.row.cwd);
+                payload.cwd.clone_from(&previous.cwd);
             }
             if payload.workspace.is_none() {
-                payload.workspace.clone_from(&previous.row.workspace);
+                payload.workspace.clone_from(&previous.workspace);
             }
             if payload.adapter_options.is_none() {
-                payload.adapter_options = Some(previous.row.adapter_options.clone());
+                payload.adapter_options = Some(previous.adapter_options.clone());
             }
-            if previous.row.source == EnqueueSource::Gh {
-                payload.gh_origin.clone_from(&previous.row.gh_origin);
-                if let Some(origin) = &previous.row.gh_origin {
+            if previous.source == EnqueueSource::Gh {
+                payload.gh_origin.clone_from(&previous.gh_origin);
+                if let Some(origin) = &previous.gh_origin {
                     payload.gh_trigger_actor = Some(origin.trigger_actor.clone());
                     payload.gh_self_actor = Some(origin.self_actor.clone());
                 }
@@ -674,8 +678,8 @@ impl DaemonHandler {
             }
         }
         let engine = AdapterEngine::new(&context.config.adapters);
-        let rendered = if let Some(previous) = &resumed_job {
-            if resolved.adapter != previous.row.adapter {
+        let rendered = if let Some(previous) = &resumed_row {
+            if resolved.adapter != previous.adapter {
                 Err(AdapterError::InvalidConfig {
                     adapter: resolved.adapter.clone(),
                     detail: "a continuation must use the original adapter".to_owned(),
@@ -685,13 +689,12 @@ impl DaemonHandler {
                     "sessionRef".to_owned(),
                     Value::String(
                         previous
-                            .row
                             .session_ref
                             .clone()
                             .expect("continued jobs were checked for a session reference"),
                     ),
                 )]);
-                if let Some(model) = &previous.row.model {
+                if let Some(model) = &previous.model {
                     captures.insert("model".to_owned(), Value::String(model.clone()));
                 }
                 engine.resume_with_options(
@@ -780,7 +783,7 @@ impl DaemonHandler {
             adapter: resolved.adapter.clone(),
             pools: resolved.pools.clone(),
             executor: resolved.executor.clone(),
-            model: resumed_job.as_ref().and_then(|job| job.row.model.clone()),
+            model: resumed_row.as_ref().and_then(|row| row.model.clone()),
             cwd: resolved.cwd,
             workspace: resolved.workspace,
             adapter_options: resolved.adapter_options,
@@ -790,9 +793,7 @@ impl DaemonHandler {
             payload_hash,
             brief_hash: resolved.brief_hash.clone(),
             orchestration: resolved.orchestration.clone(),
-            session_ref: resumed_job
-                .as_ref()
-                .and_then(|job| job.row.session_ref.clone()),
+            session_ref: resumed_row.as_ref().and_then(|row| row.session_ref.clone()),
             final_message: None,
             // Usage is per attempt and is never inherited across a resume:
             // the prior attempt's record stays on the prior row and in the
@@ -1262,7 +1263,10 @@ impl DaemonHandler {
                         row_uuid,
                         RowDetailFact::from_seed(&row, RowStatus::Completed, LaborClass::Reused),
                     );
-                    context.jobs.insert(job_id, job.clone());
+                    // A reused disposition is terminal on arrival, so it never
+                    // joins the live map at all -- the same end state as a job
+                    // that runs and is then retired (#395). The three maps
+                    // written just above are what answers for it afterwards.
                     let evidence = serde_json::to_string(&row.evidence).map_err(internal_wire)?;
                     drop(context);
                     self.complete_gh_post_ack(job.row.clone(), result.clone());

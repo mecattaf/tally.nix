@@ -7,19 +7,75 @@
 //! are set on that one child rather than mutated on the shared test-process
 //! environment, which `cargo test`'s default parallel threads would race.
 
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Command;
 
 use tally_core::executor::{read_exit_record, UNIT_EXIT_SCHEMA_VERSION};
 
+#[path = "support/shell_program.rs"]
+mod shell_program;
+
 const UNIT: &str = "tally-job-00000000-0000-4000-8000-000000000001.service";
 
+/// Install a fake `systemctl` through the immutable provider rather than
+/// writing an executable and `chmod`ing it (#396): a program still open for
+/// writing anywhere on the host cannot be `execve`d, and in a parallel test
+/// binary a sibling thread's fork holds exactly such an fd until its own
+/// `execve` closes it.
 fn fake_systemctl(dir: &Path, name: &str, script: &str) -> std::path::PathBuf {
     let path = dir.join(name);
-    std::fs::write(&path, format!("#!/bin/sh\n{script}\n")).unwrap();
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    shell_program::install(&path, format!("#!/bin/sh\n{script}\n"));
     path
+}
+
+/// Issue #396: every caller of `shell_program::install` is immune to `ETXTBSY`
+/// for one reason only — the file the kernel is asked to `execve` is a
+/// checked-in fixture this process never opens. That is a property of the
+/// installer, so it is pinned once, here, rather than once per caller.
+///
+/// It is deliberately not "the installed program runs". A program written and
+/// `chmod +x`'d a microsecond earlier also runs, whenever no fork happens to be
+/// holding it — which is precisely the race that red-gated an innocent sha and
+/// never reproduced on a quiet host.
+#[test]
+fn an_installed_program_is_a_symlink_to_the_checked_in_provider_not_a_written_file() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = tempfile::tempdir().unwrap();
+    let program = temp.path().join("probe");
+    shell_program::install(&program, "#!/bin/sh\nexit 0\n");
+
+    let installed = std::fs::symlink_metadata(&program).unwrap();
+    assert!(
+        installed.file_type().is_symlink(),
+        "the exec target must be a symlink to the checked-in provider, not a file this \
+         process wrote"
+    );
+    let target = std::fs::read_link(&program).unwrap();
+    assert!(
+        target.ends_with("test/fixtures/shell-command-provider"),
+        "unexpected provider target {}",
+        target.display()
+    );
+    assert!(
+        !target.starts_with(temp.path()),
+        "the exec target resolves inside the directory this test writes into, so it is a \
+         file this process can hold open for writing: {}",
+        target.display()
+    );
+    assert!(target.exists(), "{} is not checked in", target.display());
+
+    let mut sidecar = program.clone().into_os_string();
+    sidecar.push(".tally-test-script");
+    assert_eq!(
+        std::fs::metadata(std::path::PathBuf::from(sidecar))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o111,
+        0,
+        "the file the installer writes must never be executable"
+    );
 }
 
 fn record_unit_exit(temp: &Path, systemctl: &Path, record: &Path) -> std::process::Output {

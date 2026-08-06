@@ -376,6 +376,8 @@ impl Daemon {
             connection_count_hook: None,
             #[cfg(test)]
             dispatch_stall_hook: None,
+            #[cfg(test)]
+            finish_job_hook: None,
         })
     }
 }

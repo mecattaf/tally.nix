@@ -628,12 +628,16 @@ impl DaemonHandler {
         // holding one, so a campaign cannot lose its membership to a bound
         // crossed by unrelated traffic while its work is still outstanding.
         //
-        // The cost is one pass over `context.jobs`, which is never pruned and so
-        // grows with every job this daemon has admitted since it started. It is
-        // therefore *not* bounded by concurrency — the earlier comment here said
-        // it was, and was wrong. It is collected below the `already_held` return
-        // so a repeat admission, which writes nothing, pays nothing for it; it is
-        // still built on every admission that does write, because the writer
+        // The cost is one pass over `context.jobs`. That map used to keep every
+        // job this daemon had admitted since it started, which made this pass
+        // grow without bound — a comment here once claimed it was bounded by
+        // concurrency, and for as long as the map was never pruned that was
+        // wrong. #395 retired terminal jobs out of it, so the map is now the
+        // live set and this pass is bounded by outstanding work after all. The
+        // filter below is what that prune removes, so the set it produces is
+        // unchanged. It is still collected below the `already_held` return so a
+        // repeat admission, which writes nothing, pays nothing for it, and it
+        // is still built on every admission that does write, because the writer
         // cannot know in advance whether it will need to compact.
         let live_tasks = {
             let context = self.context.read().await;
@@ -702,20 +706,26 @@ impl DaemonHandler {
         force: bool,
     ) -> Result<Value, WireError> {
         let mut context = self.context.write().await;
-        let job = find_job(&context, task_uuid)?.clone();
-        let was = state_name(job.state);
-        if job.state == JobState::Completed {
+        let found = find_job(&context, task_uuid)?;
+        // Answered before the live job is unwrapped, because a terminal job is
+        // retired out of `context.jobs` and there is nothing to unwrap (#395).
+        if found.terminal() {
             let mut response = json!({
                 "ok": true,
                 "affected": 0,
-                "task_uuid": job.task_uuid.map(|uuid| uuid.to_string()),
-                "was": was,
-                "lease_epoch": job.row.lease_epoch,
+                "task_uuid": found.task_uuid().map(|uuid| uuid.to_string()),
+                "was": state_name(JobState::Completed),
+                "lease_epoch": found.lease_epoch(),
                 "already_terminal": true,
             });
-            insert_job_task_ref(&mut response, &job);
+            insert_found_task_ref(&mut response, &found);
             return Ok(response);
         }
+        let job = found
+            .live()
+            .expect("a job that is not terminal is live")
+            .clone();
+        let was = state_name(job.state);
         if job.state == JobState::Running && !force {
             let mut response = json!({
                 "ok": true,
@@ -866,10 +876,14 @@ impl DaemonHandler {
         let lease = match (params.lease, params.job_id) {
             (Some(lease), None) if !lease.trim().is_empty() => lease,
             (None, Some(job_id)) if !job_id.trim().is_empty() => {
-                let job = find_job(&context, &job_id)?;
-                job.lease_id.clone().ok_or_else(|| {
-                    WireError::not_found(format!("job {job_id} has no active lease"))
-                })?
+                // A retired job holds no lease by construction, so it answers
+                // the same "no active lease" a live terminal job answered.
+                find_job(&context, &job_id)?
+                    .live()
+                    .and_then(|job| job.lease_id.clone())
+                    .ok_or_else(|| {
+                        WireError::not_found(format!("job {job_id} has no active lease"))
+                    })?
             }
             _ => {
                 return Err(WireError::invalid(
@@ -1109,12 +1123,125 @@ fn selected_pools(
     Ok(vec![pool])
 }
 
-pub(crate) fn find_job<'a>(context: &'a Context, presented: &str) -> Result<&'a Job, WireError> {
-    context
+/// A job the daemon can still answer for.
+///
+/// `context.jobs` is the *live* set: a job that reaches a terminal disposition
+/// is retired out of it (#395). Two verbs can still be asked about a job after
+/// that — `cancel`, which answers `alreadyTerminal`, and `--resume-from`, which
+/// continues a finished session — so a retired job is answered from the two
+/// maps that outlive it: the row seed it was admitted with, and the query fact
+/// its post-ack scrape enriched.
+pub(crate) enum FoundJob<'a> {
+    Live(&'a Job),
+    /// Terminal, and no longer in `context.jobs`.
+    Retired {
+        row: &'a RowSeed,
+        /// From `context.query_rows`. The row seed carries what the job was
+        /// *admitted* with; these two are what its post-ack scrape observed,
+        /// and a continuation needs the observations, not the seed.
+        session_ref: Option<&'a str>,
+        model: Option<&'a str>,
+    },
+}
+
+impl<'a> FoundJob<'a> {
+    pub(crate) const fn terminal(&self) -> bool {
+        match self {
+            Self::Live(job) => matches!(job.state, JobState::Completed),
+            Self::Retired { .. } => true,
+        }
+    }
+
+    pub(crate) const fn live(&self) -> Option<&'a Job> {
+        match self {
+            Self::Live(job) => Some(job),
+            Self::Retired { .. } => None,
+        }
+    }
+
+    pub(crate) const fn lease_epoch(&self) -> u64 {
+        match self {
+            Self::Live(job) => job.row.lease_epoch,
+            Self::Retired { row, .. } => row.lease_epoch,
+        }
+    }
+
+    /// The row as the job last knew it, scraped observations included.
+    pub(crate) fn observed_row(&self) -> RowSeed {
+        match self {
+            Self::Live(job) => job.row.clone(),
+            Self::Retired {
+                row,
+                session_ref,
+                model,
+            } => {
+                let mut row = (*row).clone();
+                row.session_ref = session_ref.map(ToOwned::to_owned);
+                row.model = model.map(ToOwned::to_owned);
+                row
+            }
+        }
+    }
+
+    pub(crate) fn task_uuid(&self) -> Option<Uuid> {
+        match self {
+            Self::Live(job) => job.task_uuid,
+            Self::Retired { row, .. } => Some(row.uuid),
+        }
+    }
+
+    pub(crate) fn task_ref(&self) -> Option<TaskRef> {
+        match self {
+            Self::Live(job) => job.task_ref(),
+            Self::Retired { row, .. } => {
+                row.orchestration.as_ref().and_then(Orchestration::task_ref)
+            }
+        }
+    }
+}
+
+pub(crate) fn find_job<'a>(
+    context: &'a Context,
+    presented: &str,
+) -> Result<FoundJob<'a>, WireError> {
+    let job_id = context
         .aliases
         .get(presented)
-        .and_then(|job_id| context.jobs.get(job_id))
-        .ok_or_else(|| WireError::not_found(format!("job {presented} was not found")))
+        .copied()
+        .ok_or_else(|| WireError::not_found(format!("job {presented} was not found")))?;
+    if let Some(job) = context.jobs.get(&job_id) {
+        return Ok(FoundJob::Live(job));
+    }
+    // Retired, or never live here. `query_rows` decides which, and it has to:
+    // `context.rows` also holds rows whose job is not installed for reasons
+    // that are *not* terminal — a recovery row with no executable action, for
+    // one — and answering "already terminal" for one of those would be wrong
+    // in exactly the direction nobody checks.
+    let terminal = context
+        .query_rows
+        .get(&job_id)
+        .is_some_and(|fact| matches!(fact.status, RowStatus::Completed | RowStatus::Deleted));
+    if !terminal {
+        return Err(WireError::not_found(format!(
+            "job {presented} was not found"
+        )));
+    }
+    let row = context
+        .rows
+        .get(&job_id)
+        .ok_or_else(|| WireError::not_found(format!("job {presented} was not found")))?;
+    let fact = context.query_rows.get(&job_id);
+    Ok(FoundJob::Retired {
+        row,
+        session_ref: fact.and_then(|fact| fact.session_ref.as_deref()),
+        model: fact.and_then(|fact| fact.model.as_deref()),
+    })
+}
+
+fn insert_found_task_ref(response: &mut Value, found: &FoundJob<'_>) {
+    if let Some(task_ref) = found.task_ref() {
+        response["taskRef"] = Value::String(task_ref.to_string());
+    }
 }
 
 fn insert_job_task_ref(response: &mut Value, job: &Job) {

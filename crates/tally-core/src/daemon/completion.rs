@@ -296,10 +296,11 @@ impl DaemonHandler {
                         .and_then(|adapter| occupancy::context_window(adapter, None))
                 };
                 if job.row.context_window.is_some() {
+                    // Not written back to `context.jobs`: this runs post-ack,
+                    // by which point the job is terminal and retired out of the
+                    // live map (#395). The query fact is where every reader of
+                    // a finished job's occupancy looks anyway.
                     let mut context = handler.context.write().await;
-                    if let Some(stored) = context.jobs.get_mut(&job.job_id) {
-                        stored.row.context_window = job.row.context_window;
-                    }
                     if let Some(detail) = job
                         .task_uuid
                         .and_then(|task_uuid| context.query_details.get_mut(&task_uuid))
@@ -339,11 +340,10 @@ impl DaemonHandler {
                     .get(&job.row.adapter)
                     .and_then(|adapter| occupancy::context_window(adapter, None));
                 {
+                    // Post-ack, so the job is terminal and already retired out
+                    // of `context.jobs` (#395); the query fact is the durable
+                    // home of a finished job's observations.
                     let mut context = handler.context.write().await;
-                    if let Some(stored) = context.jobs.get_mut(&job.job_id) {
-                        stored.row.usage.clone_from(&job.row.usage);
-                        stored.row.context_window = job.row.context_window;
-                    }
                     if let Some(detail) = job
                         .task_uuid
                         .and_then(|task_uuid| context.query_details.get_mut(&task_uuid))
@@ -475,18 +475,12 @@ impl DaemonHandler {
             enriched.row.context_tokens = context_tokens;
             enriched.row.context_window = context_window;
             {
+                // Post-ack, so the job is terminal and already retired out of
+                // `context.jobs` (#395). The two facts a continuation needs --
+                // the session pointer and the observed model -- land in
+                // `query_rows` just below, which is where `find_job` reads them
+                // back for a retired job.
                 let mut context = handler.context.write().await;
-                if let Some(stored) = context.jobs.get_mut(&enriched.job_id) {
-                    stored.row.session_ref.clone_from(&enriched.row.session_ref);
-                    stored.row.model.clone_from(&enriched.row.model);
-                    stored
-                        .row
-                        .final_message
-                        .clone_from(&enriched.row.final_message);
-                    stored.row.usage.clone_from(&enriched.row.usage);
-                    stored.row.context_tokens = enriched.row.context_tokens;
-                    stored.row.context_window = enriched.row.context_window;
-                }
                 if let Some(task_uuid) = enriched.task_uuid {
                     if let Some(row) = context.query_rows.get_mut(&task_uuid) {
                         row.session_ref.clone_from(&enriched.row.session_ref);
@@ -1299,11 +1293,21 @@ pub(super) fn finalize_forced_locked(
     release_lease: bool,
     scrape_capture: bool,
 ) -> Result<Option<TerminalWork>, DaemonError> {
-    let job = context
-        .jobs
-        .get(&job_id)
-        .cloned()
-        .ok_or_else(|| DaemonError::Invalid(format!("unknown forced-terminal job {job_id}")))?;
+    let Some(job) = context.jobs.get(&job_id).cloned() else {
+        // A job that already reached a terminal disposition is retired out of
+        // the live map (#395), so its absence there is the same fact the
+        // `Completed` check below reports: nothing left to force. An id the
+        // daemon has never heard of is still an error, which is why this asks
+        // the maps that do keep terminal jobs rather than answering `Ok(None)`
+        // for anything at all.
+        return if context.rows.contains_key(&job_id) || context.query_rows.contains_key(&job_id) {
+            Ok(None)
+        } else {
+            Err(DaemonError::Invalid(format!(
+                "unknown forced-terminal job {job_id}"
+            )))
+        };
+    };
     if job.state == JobState::Completed {
         return Ok(None);
     }
@@ -1328,11 +1332,10 @@ pub(super) fn finalize_forced_locked(
     context
         .barriers
         .complete_job(&job.stable_key(), result.value());
-    let stored = context.jobs.get_mut(&job_id).expect("job exists");
-    stored.state = JobState::Completed;
-    if release_lease {
-        stored.lease_id = None;
-    }
+    // Terminal: the job leaves the live map (#395). `release_lease` used to
+    // clear the stored lease id; retiring the whole entry subsumes it, and the
+    // lease itself is still released below from the `job` clone.
+    retire_job(context, job_id);
     release_child_charge(context, &job)?;
     context.guardrails.retire_parent(&job.stable_key());
     if let Some(task_uuid) = job.task_uuid {
