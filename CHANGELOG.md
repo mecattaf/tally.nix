@@ -6,6 +6,86 @@ authorized.
 
 ## [Unreleased]
 
+### Recurring-cost hygiene (#396, #411, #395, #404)
+
+One lane of four fixes with a shared shape: each one makes something the fleet
+pays for repeatedly stop costing. A flake stops red-gating innocent shas, a
+deploy stops raising a false alarm, a map stops growing, a response stops
+repeating itself.
+
+#### #396 — the `ETXTBSY` race in `fake_gh` no longer red-gates innocent shas
+
+`fake_gh` wrote a shell script and marked it executable, then exec'd it. The
+kernel refuses to `execve` a file any process still holds open for writing, and
+in a parallel test binary a sibling thread that forks between `fs::write`'s open
+and close carries that write fd into its child until the child's own `execve`
+closes it. Under load that is a `Text file busy` failure in a test whose diff
+never touched `campaign.rs`; it cost a full gate cycle on sha `80eb6c0`, which
+passed on a quiet host.
+
+Rather than retry through the race, `fake_gh` and the three remaining
+write-then-`chmod` helpers now use the idiom #117 introduced for exactly this:
+the behaviour is published through a non-executable sidecar and the exec target
+is a symlink to a checked-in provider nothing ever opens for writing, so the
+window never opens. A new test pins both directions deterministically, by
+holding the write fd open instead of waiting for load to hold it.
+
+#### #411 — a periodic drain that finds no daemon is a skip, not a failure
+
+`tally-drain.timer` fires every five seconds and a `tally-daemon` restart takes
+longer than that, so every activation that changes the daemon unit had a good
+chance of catching a drain mid-flight, exiting 3 against a socket being
+replaced, and producing a real per-user unit failure. It self-clears, but the
+fleet's journal watcher cannot tell it apart from the failure burst that watcher
+exists to catch.
+
+- `ConditionPathExists` on `tally-drain` now also names the socket the command
+  connects to, in both the NixOS and home-manager modules. The existing config
+  guard is kept rather than replaced, because systemd ANDs repeated conditions.
+  A drain scheduled while the daemon is down is recorded as a skip, not a
+  failure.
+- `tally daemon drain` exits 0 when that socket is unreachable, covering the
+  narrow race the condition cannot. Scoped to the connect-time absence alone:
+  `tally queue drain` is untouched, a daemon that is listening and refuses the
+  drain still fails, and the line naming the case is still written to stderr.
+
+`BindsTo`/`PartOf` was considered and rejected — it changes stop-time semantics
+for an in-flight drain to buy a problem these two already solve.
+
+#### #395 — `context.jobs` is the daemon's live set, and stays one
+
+The map had no `remove`, `retain` or `clear` anywhere in the tree: it grew with
+every job the daemon had admitted since start and never shrank, and a `Job` is
+far larger than the membership record whose growth it dominates. The cost is on
+the hot path, not just resident — the compaction live set, the dedup sweep and
+the guardrail child count are all rebuilt over it on the admission path.
+
+A job that reaches a terminal disposition now leaves the map. Every one of those
+consumers already discarded terminal entries on the way past, so this is neutral
+for all of them by construction. Nothing is lost with the entry: `cancel` still
+answers `alreadyTerminal` and `--resume-from` still continues a finished
+session, both from the row seed and query fact that already outlive the job and
+are restored across a restart. An id the daemon never admitted is still not
+found.
+
+#### #404 — the attestation chain is not read before it is needed, and a standup states its constants once
+
+- **Deferred read.** `read_attestations` parsed and hash-verified the whole
+  append-only ledger on every `query.run` and `query.standup`, before the run id
+  was known to exist. Both now defer that read behind the predicate that decides
+  whether there is anything to sum, and in each case the deferral predicate is
+  the *same function* the real answer is computed from, so skipping the read
+  cannot change what comes back.
+- **`usageBasis`.** `StandupDigest` gains a `usageBasis` object stating the
+  rollup's `provenance`, `composition` and `costBasis` once; each entry in
+  `runs` omits the three it would otherwise repeat verbatim (~650 bytes per run,
+  ~325 KB per response at 500 runs). The hoist is safe because those three are
+  invariant by construction — one writer each, assigned from compile-time
+  constants with no dependence on the run — and it is not assumed: a rollup
+  whose statements ever differ carries its own inline rather than inheriting a
+  digest-level claim that would be false for it. `query run`, which returns one
+  rollup, still carries all three inline.
+
 ### Added
 
 - **`query run` and `query standup` answer "what did this run cost" (#384).**

@@ -13,7 +13,7 @@ use crate::occupancy::{ContextWindow, ContextWindowSource};
 use crate::provenance::{Orchestration, TaskRef};
 use crate::query::{
     GhOriginProjection, HeadroomSignal, RowStatus, StandupDigest, StandupRunUsage,
-    QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
+    StandupUsageBasis, QUERY_PROTOCOL_VERSION, QUERY_SCHEMA_VERSION,
 };
 use crate::taskdb::{
     related_trigger_from_gh_origin, AdmissionOrigin, ProducerOrigin, RelatedTrigger, RowSeed,
@@ -1159,6 +1159,36 @@ struct ReconcileCheckpointTask {
     task_id: String,
 }
 
+/// Whether [`query_run`] would find this run.
+///
+/// Split out and made the sole definition of that check so a caller can answer
+/// an unknown run id *before* reading the attestation chain (#404).
+/// `read_attestations` parses and hash-verifies the whole append-only ledger on
+/// every `query.run` — measured at ~2.7 ms/MB — and an id that does not resolve
+/// never reaches the rollup that needs it. Because `query_run` raises its own
+/// `UnknownJob` from this same predicate, a caller that skips the read on a
+/// `false` here cannot answer differently from one that did not.
+#[must_use]
+pub fn flow_run_exists(
+    flow_run: &str,
+    details: &[RowDetailFact],
+    live: &[LiveJobFact],
+    history: &LifecycleSnapshot,
+    witness: &[WitnessRecord],
+    membership: &FlowMembership,
+) -> bool {
+    !flow_run_tasks(flow_run, details, witness, membership).is_empty()
+        || details.iter().any(|detail| detail.task_uuid == flow_run)
+        || live.iter().any(|fact| fact.anchor == flow_run)
+        || history
+            .records
+            .iter()
+            .any(|record| record.fields.task_uuid == flow_run)
+        || witness
+            .iter()
+            .any(|record| record.task_uuid.as_deref() == Some(flow_run))
+}
+
 /// Project one flow run without returning the large argv, brief, evidence, and
 /// provenance fields carried by the general job collection. For spec-build,
 /// the schema-validated reconciliation result is the task-state source; live
@@ -1191,12 +1221,7 @@ pub fn query_run(
         .iter()
         .filter(|record| record.task_uuid.as_deref() == Some(flow_run))
         .collect::<Vec<_>>();
-    if flow_tasks.is_empty()
-        && parent_detail.is_none()
-        && parent_live.is_none()
-        && parent_events.is_empty()
-        && parent_witness.is_empty()
-    {
+    if !flow_run_exists(flow_run, details, live, history, witness, membership) {
         return Err(ObservabilityError::UnknownJob(flow_run.to_owned()));
     }
 
@@ -1588,13 +1613,19 @@ pub fn apply_run_lineage(view: &mut RunView, lineage: &FlowLineage) {
 /// the membership ledger names every run that was *handed* it — so a node one
 /// run created and another attached (the W-316 shape) appears under both, and
 /// the run that only attached it does not silently drop out of the digest.
-pub fn apply_standup_usage(
-    digest: &mut StandupDigest,
+/// The flow runs a digest's window touched, in run-ID order.
+///
+/// Split out and made the sole definition so a caller can find out whether
+/// there is anything to roll up *before* reading the attestation chain (#404):
+/// a window that touched no run needs no attestations at all, and the read is a
+/// full parse and hash-verify of the append-only ledger. [`apply_standup_usage`]
+/// uses this same function, so the two cannot disagree about emptiness.
+#[must_use]
+pub fn standup_touched_runs(
+    digest: &StandupDigest,
     details: &[RowDetailFact],
-    witness: &[WitnessRecord],
     membership: &FlowMembership,
-    attestations: &AttestationEvidence<'_>,
-) {
+) -> BTreeSet<String> {
     let flow_run_by_task = details
         .iter()
         .filter_map(|detail| {
@@ -1622,6 +1653,17 @@ pub fn apply_standup_usage(
         }
         runs.extend(membership.runs_holding(task).map(ToOwned::to_owned));
     }
+    runs
+}
+
+pub fn apply_standup_usage(
+    digest: &mut StandupDigest,
+    details: &[RowDetailFact],
+    witness: &[WitnessRecord],
+    membership: &FlowMembership,
+    attestations: &AttestationEvidence<'_>,
+) {
+    let runs = standup_touched_runs(digest, details, membership);
     digest.runs = runs
         .into_iter()
         .map(|flow_run| {
@@ -1632,6 +1674,10 @@ pub fn apply_standup_usage(
             }
         })
         .collect();
+    // Stated once beside the list rather than ~650 bytes per entry (#404). Set
+    // only when there is a list to state it for, so a digest that touched no
+    // run carries no claim about how its runs were summed.
+    digest.usage_basis = (!digest.runs.is_empty()).then(StandupUsageBasis::default);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -4436,6 +4482,7 @@ mod tests {
             cancelled: Vec::new(),
             canonical_gpu_seconds: 0.0,
             runs: Vec::new(),
+            usage_basis: None,
         }
     }
 
@@ -4491,5 +4538,198 @@ mod tests {
             &AttestationEvidence::new(true, &records),
         );
         assert!(orphan.runs.is_empty());
+        // Nothing to roll up means nothing to state a basis for, and it is what
+        // lets `query.standup` skip the chain read entirely (#404).
+        assert!(orphan.usage_basis.is_none());
+        assert!(standup_touched_runs(&orphan, &details, &ledger).is_empty());
+    }
+
+    /// Issue #404: the predicate that lets the RPC layer skip the attestation
+    /// chain read is exactly the one `query_run` raises `UnknownJob` from.
+    ///
+    /// The read is a full parse and hash-verify of the append-only ledger on
+    /// every call, before the run id is even known to exist. Deferring it is
+    /// only safe if the cheap check and the real one can never disagree, so
+    /// this pins them together on both answers: an id nothing knows about, and
+    /// each of the sources `query_run` accepts as evidence a run exists.
+    #[test]
+    fn acceptance_404_the_deferral_predicate_agrees_with_the_run_view_it_gates() {
+        let flow_run = "00000000-0000-4000-8000-0000000003a0";
+        let details = vec![reconciliation_detail(flow_run)];
+        let membership = FlowMembership::default();
+        let history = history();
+        let unverified = AttestationEvidence::new(true, &[]);
+
+        // Known through the detail row's orchestration.
+        assert!(flow_run_exists(
+            flow_run,
+            &details,
+            &[],
+            &history,
+            &[],
+            &membership
+        ));
+        assert!(query_run(
+            flow_run,
+            &details,
+            &[],
+            &history,
+            &[],
+            "2026-08-01T10:00:12Z".parse().unwrap(),
+            &membership,
+            &unverified,
+        )
+        .is_ok());
+
+        // Unknown to every source, so the chain would be read for nothing.
+        let absent = "00000000-0000-4000-8000-0000000009f0";
+        assert!(!flow_run_exists(
+            absent,
+            &details,
+            &[],
+            &history,
+            &[],
+            &membership
+        ));
+        assert!(matches!(
+            query_run(
+                absent,
+                &details,
+                &[],
+                &history,
+                &[],
+                "2026-08-01T10:00:12Z".parse().unwrap(),
+                &membership,
+                &unverified,
+            ),
+            Err(ObservabilityError::UnknownJob(id)) if id == absent
+        ));
+
+        // Known only through durable membership -- the source a caller that
+        // guessed from the detail rows alone would have missed, turning a real
+        // run into a not-found.
+        let mut held = FlowMembership::default();
+        held.insert(crate::flow_membership::FlowMembershipRecord::new(
+            absent.to_owned(),
+            "00000000-0000-4000-8000-000000000250".to_owned(),
+            crate::flow_membership::MembershipDisposition::Attached,
+            Some(7),
+            Some("node-7".to_owned()),
+        ));
+        assert!(flow_run_exists(absent, &details, &[], &history, &[], &held));
+        assert!(query_run(
+            absent,
+            &details,
+            &[],
+            &history,
+            &[],
+            "2026-08-01T10:00:12Z".parse().unwrap(),
+            &held,
+            &unverified,
+        )
+        .is_ok());
+    }
+
+    /// Issue #404: a digest states the three rollup constants once instead of
+    /// repeating ~650 bytes of them per run.
+    ///
+    /// Hoisting is only honest if the fields really are invariant across every
+    /// run a window can contain. They are, structurally: `provenance` and
+    /// `composition` have one writer (`roll_up`) that assigns them from
+    /// compile-time constants with no dependence on the run, and `cost.basis`
+    /// has one writer (`UsageCostRollup::default`). This asserts that on real
+    /// rollups over two different runs with different membership, and then
+    /// asserts the wire keeps the escape hatch: a rollup whose statements are
+    /// *not* the constants carries its own inline rather than inheriting a
+    /// digest-level claim that would be false for it.
+    #[test]
+    fn acceptance_404_standup_states_the_rollup_constants_once_without_flattening_a_difference() {
+        let run_a = "00000000-0000-4000-8000-0000000003a0";
+        let run_b = "00000000-0000-4000-8000-0000000003b0";
+        let shared = "00000000-0000-4000-8000-000000000250";
+        let details = vec![reconciliation_detail(run_a)];
+        let mut ledger = FlowMembership::default();
+        ledger.insert(crate::flow_membership::FlowMembershipRecord::new(
+            run_b.to_owned(),
+            shared.to_owned(),
+            crate::flow_membership::MembershipDisposition::Attached,
+            Some(7),
+            Some("b-node-7".to_owned()),
+        ));
+        let records = [scrape_attestation(1, shared, 1, 32_842)];
+        let mut digest = standup_fixture(shared);
+        apply_standup_usage(
+            &mut digest,
+            &details,
+            &[],
+            &ledger,
+            &AttestationEvidence::new(true, &records),
+        );
+        assert_eq!(digest.runs.len(), 2);
+
+        // The premise, checked against the rollups themselves rather than
+        // assumed: every run states the same three things.
+        let basis = digest
+            .usage_basis
+            .clone()
+            .expect("a filled digest states a basis");
+        for run in &digest.runs {
+            assert_eq!(run.usage.provenance, basis.provenance);
+            assert_eq!(run.usage.composition, basis.composition);
+            assert_eq!(run.usage.cost.basis, basis.cost_basis);
+        }
+        assert_eq!(basis, crate::query::StandupUsageBasis::default());
+
+        // On the wire the three appear once, at the digest, and not per run.
+        let wire = serde_json::to_value(&digest).unwrap();
+        assert_eq!(
+            wire["usageBasis"]["provenance"],
+            serde_json::json!(basis.provenance)
+        );
+        assert_eq!(
+            wire["usageBasis"]["composition"],
+            serde_json::json!(basis.composition)
+        );
+        assert_eq!(
+            wire["usageBasis"]["costBasis"],
+            serde_json::json!(basis.cost_basis)
+        );
+        for run in wire["runs"].as_array().unwrap() {
+            assert!(run["usage"].get("provenance").is_none(), "{run}");
+            assert!(run["usage"].get("composition").is_none(), "{run}");
+            assert!(run["usage"]["cost"].get("basis").is_none(), "{run}");
+            // Everything that is genuinely per run is untouched.
+            assert_eq!(
+                run["usage"]["coverage"]["attemptsReported"],
+                serde_json::json!(1)
+            );
+            assert_eq!(
+                run["usage"]["tokens"]["outputTokens"]["value"],
+                serde_json::json!(32_842)
+            );
+        }
+        // And it round-trips back to the identical value, constants included.
+        let round_tripped: StandupDigest = serde_json::from_value(wire).unwrap();
+        assert_eq!(round_tripped, digest);
+
+        // The escape hatch. If a run's statements ever stop matching the
+        // constants, the omission stops: a digest may not say something about a
+        // run it did not measure.
+        let mut divergent = digest.clone();
+        divergent.runs[0].usage.composition = "a different composition".to_owned();
+        divergent.runs[0].usage.cost.basis = "a different cost basis".to_owned();
+        let wire = serde_json::to_value(&divergent).unwrap();
+        assert_eq!(
+            wire["runs"][0]["usage"]["composition"],
+            serde_json::json!("a different composition")
+        );
+        assert_eq!(
+            wire["runs"][0]["usage"]["cost"]["basis"],
+            serde_json::json!("a different cost basis")
+        );
+        assert!(wire["runs"][0]["usage"].get("provenance").is_none());
+        assert!(wire["runs"][1]["usage"].get("composition").is_none());
+        let round_tripped: StandupDigest = serde_json::from_value(wire).unwrap();
+        assert_eq!(round_tripped, divergent);
     }
 }

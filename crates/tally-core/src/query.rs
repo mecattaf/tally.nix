@@ -8,8 +8,12 @@ use thiserror::Error;
 use crate::completion::{GateSummaryStatus, SemanticCompletion};
 use crate::journal::{JournalEntry, TallyEvent};
 use crate::provenance::{Orchestration, TaskRef};
+use crate::query_v2::FactAuthority;
 use crate::taskdb::{GhOrigin, RelatedTrigger, WorkspaceMetadata};
-use crate::usage_rollup::UsageRollup;
+use crate::usage_rollup::{
+    UsageCostRollup, UsageCoverage, UsageRollup, UsageRollupCaveat, UsageTokenRollup,
+    ROLLUP_COMPOSITION, ROLLUP_COST_BASIS, ROLLUP_PROVENANCE,
+};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
 pub const QUERY_SCHEMA_VERSION: u32 = 1;
@@ -860,7 +864,134 @@ pub struct InFlightEntry {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StandupRunUsage {
     pub flow_run_id: String,
+    /// The full rollup in memory; on the wire, the three constants every entry
+    /// repeats verbatim are stated once at [`StandupDigest::usage_basis`]
+    /// instead of ~650 bytes per run (#404). See [`digest_rollup`].
+    #[serde(with = "digest_rollup")]
     pub usage: UsageRollup,
+}
+
+/// The three rollup statements a digest states once instead of per entry.
+///
+/// They are safe to hoist because they are invariant *by construction*, not
+/// merely equal on the data at hand: `provenance` and `composition` have a
+/// single writer ([`crate::usage_rollup::roll_up`]) that assigns them from
+/// compile-time constants with no input dependence, and `cost.basis` has a
+/// single writer ([`UsageCostRollup::default`]) from a third. A digest that
+/// hoisted a field a run could actually differ on would be stating something
+/// false about runs it never measured, which is why [`digest_rollup`] still
+/// serializes any of the three that does *not* match, rather than assuming.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StandupUsageBasis {
+    /// See [`crate::usage_rollup::ROLLUP_PROVENANCE`].
+    pub provenance: String,
+    /// See [`crate::usage_rollup::ROLLUP_COMPOSITION`].
+    pub composition: String,
+    /// See [`crate::usage_rollup::ROLLUP_COST_BASIS`].
+    pub cost_basis: String,
+}
+
+impl Default for StandupUsageBasis {
+    fn default() -> Self {
+        Self {
+            provenance: ROLLUP_PROVENANCE.to_owned(),
+            composition: ROLLUP_COMPOSITION.to_owned(),
+            cost_basis: ROLLUP_COST_BASIS.to_owned(),
+        }
+    }
+}
+
+/// `UsageRollup` on a standup digest's wire, with the three fields
+/// [`StandupUsageBasis`] states once omitted when they match it (#404).
+///
+/// `query.run` returns one rollup and keeps all three inline; a digest walks
+/// every run history holds, so at 500 runs the repetition was ~325 KB of
+/// identical bytes per response. Omission is conditional, never assumed: a
+/// rollup whose statements differ from the constants carries its own, and a
+/// reader that finds none reconstructs the constants it was compiled with,
+/// which is exactly what the digest-level copy states.
+mod digest_rollup {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{
+        FactAuthority, UsageCostRollup, UsageCoverage, UsageRollup, UsageRollupCaveat,
+        UsageTokenRollup, ROLLUP_COMPOSITION, ROLLUP_COST_BASIS, ROLLUP_PROVENANCE,
+    };
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct WireCost {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        amount_usd: Option<f64>,
+        attempts: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct Wire {
+        authority: FactAuthority,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        composition: Option<String>,
+        coverage: UsageCoverage,
+        tokens: UsageTokenRollup,
+        cost: WireCost,
+        caveats: Vec<UsageRollupCaveat>,
+    }
+
+    fn differing(value: &str, constant: &str) -> Option<String> {
+        (value != constant).then(|| value.to_owned())
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        rollup: &UsageRollup,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Wire {
+            authority: rollup.authority,
+            provenance: differing(&rollup.provenance, ROLLUP_PROVENANCE),
+            composition: differing(&rollup.composition, ROLLUP_COMPOSITION),
+            coverage: rollup.coverage,
+            tokens: rollup.tokens,
+            cost: WireCost {
+                amount_usd: rollup.cost.amount_usd,
+                attempts: rollup.cost.attempts,
+                basis: differing(&rollup.cost.basis, ROLLUP_COST_BASIS),
+            },
+            caveats: rollup.caveats.clone(),
+        }
+        .serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<UsageRollup, D::Error> {
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(UsageRollup {
+            authority: wire.authority,
+            provenance: wire
+                .provenance
+                .unwrap_or_else(|| ROLLUP_PROVENANCE.to_owned()),
+            composition: wire
+                .composition
+                .unwrap_or_else(|| ROLLUP_COMPOSITION.to_owned()),
+            coverage: wire.coverage,
+            tokens: wire.tokens,
+            cost: UsageCostRollup {
+                amount_usd: wire.cost.amount_usd,
+                attempts: wire.cost.attempts,
+                basis: wire
+                    .cost
+                    .basis
+                    .unwrap_or_else(|| ROLLUP_COST_BASIS.to_owned()),
+            },
+            caveats: wire.caveats,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -881,6 +1012,11 @@ pub struct StandupDigest {
     /// unfilled digest carries an empty list rather than a wrong one.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runs: Vec<StandupRunUsage>,
+    /// The three statements every entry in `runs` would otherwise repeat
+    /// verbatim, stated once (#404). Present exactly when `runs` is, and
+    /// filled by the same function.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_basis: Option<StandupUsageBasis>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1049,6 +1185,9 @@ pub fn query_standup(
         cancelled,
         canonical_gpu_seconds,
         runs: Vec::new(),
+        // Both are filled together by `query_v2::apply_standup_usage`; an
+        // unfilled digest states no basis rather than one it never applied.
+        usage_basis: None,
     }
 }
 

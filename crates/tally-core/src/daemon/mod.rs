@@ -140,10 +140,11 @@ use crate::query::{
     RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
 };
 use crate::query_v2::{
-    apply_run_lineage, apply_standup_usage, collapse_lifecycle_echoes, log_position_floor,
-    log_position_head, query_flow_proofs, query_job as query_job_v2, query_jobs as query_jobs_v2,
-    query_lifecycle_log, query_proof, query_run, snapshot_metadata, JobsFilter, LifecycleLogFilter,
-    LiveJobFact, LogPosition, ObservabilityError, PositionGap, RowDetailFact,
+    apply_run_lineage, apply_standup_usage, collapse_lifecycle_echoes, flow_run_exists,
+    log_position_floor, log_position_head, query_flow_proofs, query_job as query_job_v2,
+    query_jobs as query_jobs_v2, query_lifecycle_log, query_proof, query_run, snapshot_metadata,
+    standup_touched_runs, JobsFilter, LifecycleLogFilter, LiveJobFact, LogPosition,
+    ObservabilityError, PositionGap, RowDetailFact,
 };
 use crate::recovery::{
     collect_durable_recovery_facts, collect_local_unit_facts, recover, DurableRecoveryFacts,
