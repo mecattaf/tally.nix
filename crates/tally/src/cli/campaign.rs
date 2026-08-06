@@ -3700,7 +3700,10 @@ mod tests {
         // landing in the window above inherits a write fd on this file and
         // makes the retry fail too. Asserting it would rebuild the flake.
 
-        // The shape it has now, under the identical condition.
+        // The shape it has now. Executing while the *script* is held open for
+        // writing is necessary but nowhere near sufficient — that also passes
+        // for a written-then-chmoded target that simply is not open right now,
+        // which is the whole race. So the property itself is asserted below.
         let provided = fake_gh(temporary.path(), "gh-provided", "exit 0");
         let source = shell_program_source(&provided);
         let held_open = fs::OpenOptions::new().write(true).open(&source).unwrap();
@@ -3709,6 +3712,53 @@ mod tests {
             .expect("a provided program must execute while its script is open for writing");
         assert!(status.success(), "{status}");
         drop(held_open);
+
+        assert_exec_target_is_never_written(temporary.path(), &provided);
+    }
+
+    /// The property #396 actually rests on, asserted rather than approximated.
+    ///
+    /// `ETXTBSY` is raised for an exec target some process holds open for
+    /// writing. What makes the converted helpers immune is not that the window
+    /// is small — it is that the exec target is a file this process never opens
+    /// at all: a symlink to the checked-in provider, outside the directory the
+    /// test writes into. The only thing installed here that *is* written is the
+    /// sidecar, and `/bin/sh` merely reads it.
+    ///
+    /// Asserting the exec succeeds is not this property. A written-then-chmoded
+    /// program that happens not to be open at that instant also executes, which
+    /// is exactly how the race stayed invisible on a quiet host.
+    fn assert_exec_target_is_never_written(written_root: &Path, program: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let installed = fs::symlink_metadata(program).unwrap();
+        assert!(
+            installed.file_type().is_symlink(),
+            "the exec target must be a symlink to the checked-in provider, not a file \
+             this process wrote: {}",
+            program.display()
+        );
+        let target = fs::read_link(program).unwrap();
+        assert!(
+            target.ends_with("test/fixtures/shell-command-provider"),
+            "unexpected provider target {}",
+            target.display()
+        );
+        assert!(
+            !target.starts_with(written_root),
+            "the exec target resolves inside the directory this test writes into ({}), \
+             so it is a file this process can hold open for writing",
+            target.display()
+        );
+        assert!(target.exists(), "{} is not checked in", target.display());
+        let sidecar = shell_program_source(program);
+        assert_eq!(
+            fs::metadata(&sidecar).unwrap().permissions().mode() & 0o111,
+            0,
+            "the file the installer writes must never be executable, or it becomes an \
+             exec target this process wrote: {}",
+            sidecar.display()
+        );
     }
 
     const WALK_PAYLOAD: &str = r#"{"data":{"repository":{"issue":{"subIssues":{
