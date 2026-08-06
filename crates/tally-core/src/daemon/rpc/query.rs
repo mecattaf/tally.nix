@@ -165,8 +165,26 @@ impl DaemonHandler {
                 if params.id.trim().is_empty() {
                     return Err(WireError::invalid("query run ID must not be empty"));
                 }
-                let (ledger_verified, attestations) =
-                    read_attestations_advisory(&attestations_path).await;
+                // Not read until the id is known to resolve (#404). The chain
+                // is parsed and hash-verified end to end on every read --
+                // ~2.7 ms/MB, projecting ~120 ms per call at this repo's own
+                // completion count -- and an id that does not resolve never
+                // reaches the rollup that consumes it. `query_run` raises its
+                // `UnknownJob` from the same predicate, so it, not this, is
+                // still what answers; skipping the read cannot change what
+                // comes back.
+                let (ledger_verified, attestations) = if flow_run_exists(
+                    &params.id,
+                    &details,
+                    &live,
+                    &history,
+                    &witness,
+                    &membership,
+                ) {
+                    read_attestations_advisory(&attestations_path).await
+                } else {
+                    (false, Vec::new())
+                };
                 let mut result = query_run(
                     &params.id,
                     &details,
@@ -396,8 +414,17 @@ impl DaemonHandler {
                         entry.state.clone_from(state);
                     }
                 }
+                // Same deferral as `query.run` (#404): a window that touched no
+                // flow run has nothing to roll up, and the chain read is a full
+                // parse and hash-verify. `apply_standup_usage` computes the
+                // touched set from this same function, so it cannot find work
+                // this skipped the evidence for.
                 let (ledger_verified, attestations) =
-                    read_attestations_advisory(&attestations_path).await;
+                    if standup_touched_runs(&digest, &details, &membership).is_empty() {
+                        (false, Vec::new())
+                    } else {
+                        read_attestations_advisory(&attestations_path).await
+                    };
                 apply_standup_usage(
                     &mut digest,
                     &details,

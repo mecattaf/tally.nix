@@ -3123,11 +3123,13 @@ echo "ExecMainExitTimestampMonotonic=100100"
     assert!(calls.contains("tally-job-example.service"));
 }
 
+/// Install a fake program through the immutable provider rather than writing
+/// an executable and marking it executable (#396): the kernel refuses to
+/// `execve` a file any process still holds open for writing, and in a parallel
+/// test binary a sibling thread's fork inherits exactly such an fd until its
+/// own `execve` closes it.
 fn write_fake_program(path: &Path, body: &str) {
-    std::fs::write(path, format!("#!/bin/sh\n{body}")).unwrap();
-    let mut permissions = std::fs::metadata(path).unwrap().permissions();
-    permissions.set_mode(0o700);
-    std::fs::set_permissions(path, permissions).unwrap();
+    crate::test_support::install_shell_program(path, format!("#!/bin/sh\n{body}"));
 }
 
 /// An `N-1` fixture: the exact `UnitExitRecord` shape written before #382,

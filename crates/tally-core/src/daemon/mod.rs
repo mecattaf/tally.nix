@@ -54,7 +54,7 @@ use run::{
     resume_paused_jobs_locked,
 };
 #[cfg(test)]
-use run::{DispatchStallHook, LeaseTickHook};
+use run::{DispatchStallHook, FinishJobHook, LeaseTickHook};
 #[cfg(test)]
 use startup::{
     acquire_daemon_lock, hydrate_adopted_adapter_metadata, hydrate_completed_adapter_metadata,
@@ -140,10 +140,11 @@ use crate::query::{
     RenderScope, RowFact, RowStatus, StandupOptions, WindowConsumptionFact,
 };
 use crate::query_v2::{
-    apply_run_lineage, apply_standup_usage, collapse_lifecycle_echoes, log_position_floor,
-    log_position_head, query_flow_proofs, query_job as query_job_v2, query_jobs as query_jobs_v2,
-    query_lifecycle_log, query_proof, query_run, snapshot_metadata, JobsFilter, LifecycleLogFilter,
-    LiveJobFact, LogPosition, ObservabilityError, PositionGap, RowDetailFact,
+    apply_run_lineage, apply_standup_usage, collapse_lifecycle_echoes, flow_run_exists,
+    log_position_floor, log_position_head, query_flow_proofs, query_job as query_job_v2,
+    query_jobs as query_jobs_v2, query_lifecycle_log, query_proof, query_run, snapshot_metadata,
+    standup_touched_runs, JobsFilter, LifecycleLogFilter, LiveJobFact, LogPosition,
+    ObservabilityError, PositionGap, RowDetailFact,
 };
 use crate::recovery::{
     collect_durable_recovery_facts, collect_local_unit_facts, recover, DurableRecoveryFacts,
@@ -542,6 +543,28 @@ impl Job {
             .as_ref()
             .and_then(Orchestration::task_ref)
     }
+}
+
+/// Retire a job that has reached its terminal disposition (#395).
+///
+/// `context.jobs` used to keep every job the daemon had ever admitted, for the
+/// daemon's whole lifetime, and a `Job` is a `RowSeed` plus a rendered adapter
+/// invocation — far larger than the membership record whose growth it
+/// dominated. It is not only resident cost: the compaction live set
+/// (`rpc::control`) and the dedup, guardrail, and pool sweeps all walk this map
+/// on the admission path, and every one of them already discards `Completed`
+/// entries on the way past. Retiring those entries is therefore neutral for all
+/// of them by construction — the filter they apply is the removal.
+///
+/// Nothing is lost. `context.rows` keeps the row seed and `context.query_rows`
+/// keeps the query fact the post-ack scrape enriched, both for the daemon's
+/// lifetime and both restored across a restart; [`rpc::control::find_job`]
+/// answers the two verbs that can still be asked about a terminal job from
+/// those. The startup path never installed terminal jobs in the first place, so
+/// this makes the live map mean the same thing at minute one as at minute
+/// ten thousand.
+fn retire_job(context: &mut Context, job_id: Uuid) {
+    context.jobs.remove(&job_id);
 }
 
 pub struct Context {
@@ -1004,6 +1027,8 @@ pub struct Daemon {
     connection_count_hook: Option<mpsc::UnboundedSender<usize>>,
     #[cfg(test)]
     dispatch_stall_hook: Option<DispatchStallHook>,
+    #[cfg(test)]
+    finish_job_hook: Option<FinishJobHook>,
 }
 
 #[cfg(test)]

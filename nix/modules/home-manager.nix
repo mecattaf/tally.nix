@@ -488,7 +488,18 @@ in
           Unit = {
             Description = "drain tally producer event files";
             After = [ "tally-daemon.service" ];
-            ConditionPathExists = configPath;
+            # `After` orders startup but says nothing about the daemon being
+            # gone. The timer fires every five seconds and a daemon restart
+            # takes longer than that, so an activation that restarts
+            # tally-daemon reliably catches a drain mid-flight and turns a
+            # benign deploy into a per-user unit failure (#411). Conditioning
+            # on the socket the command actually connects to makes that
+            # invocation a recorded *skip* instead. systemd ANDs repeated
+            # conditions, so the config guard is kept, not replaced.
+            ConditionPathExists = [
+              configPath
+              socketPath
+            ];
           };
           Service = {
             Type = "oneshot";

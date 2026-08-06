@@ -78,6 +78,11 @@
             # macro list has to travel with it or the lint silently weakens.
             ./clippy.toml
             ./crates
+            # Pages a test `include_str!`s to hold the prose to the constant it
+            # describes; a doc page a Rust test reads is a fixture, and the
+            # packaged build cannot see one that is not named here.
+            ./doc/src/flows/submission-and-replay.md
+            ./doc/src/reference/errors.md
             ./doc/src/reference/rpc-protocol.md
             ./examples/flows/academic-ocr.js
             ./examples/flows/agency-nightly.js

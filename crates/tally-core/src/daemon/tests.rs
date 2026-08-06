@@ -3263,7 +3263,12 @@ mod tests {
                 let task_uuid = Uuid::parse_str(admitted["task_uuid"].as_str().unwrap()).unwrap();
                 {
                     let context = daemon.handler.context.read().await;
-                    assert_eq!(context.jobs[&task_uuid].state, JobState::Completed);
+                    // Terminal, therefore retired from the live map (#395).
+                    assert!(!context.jobs.contains_key(&task_uuid));
+                    assert_eq!(
+                        context.query_rows[&task_uuid].status,
+                        RowStatus::Completed
+                    );
                     assert!(context.unreachable_pools.contains("slot"));
                 }
                 let (_, records) = read_verified_records(&paths.witness_path()).unwrap();
@@ -3306,19 +3311,16 @@ mod tests {
                     loop {
                         let finished = daemon.completion_rx.recv().await.unwrap();
                         daemon.finish_job(finished).await.unwrap();
-                        if daemon
-                            .handler
-                            .context
-                            .read()
-                            .await
-                            .jobs
-                            .get(&task_uuid)
-                            .is_some_and(|job| {
-                                job.state == JobState::Completed && job.row.attempt == 2
-                            })
+                        // The second attempt is terminal once it has left the
+                        // live map (#395); the row it left behind still says
+                        // which attempt reached that state.
+                        let context = daemon.handler.context.read().await;
+                        if !context.jobs.contains_key(&task_uuid)
+                            && context.rows[&task_uuid].attempt == 2
                         {
                             break;
                         }
+                        drop(context);
                     }
                 })
                 .await
@@ -5582,20 +5584,19 @@ mod tests {
                 daemon.finish_job(finished).await.unwrap();
                 daemon.handler.drain_post_ack_tasks().await;
                 let first_id = first["job_id"].as_str().unwrap();
-                assert_eq!(
-                    daemon
-                        .handler
-                        .context
-                        .read()
-                        .await
-                        .jobs
-                        .get(&Uuid::parse_str(first_id).unwrap())
-                        .unwrap()
-                        .row
-                        .session_ref
-                        .as_deref(),
-                    Some("session-28")
-                );
+                // The scraped session pointer outlives the job: the job is
+                // terminal and retired from the live map (#395), and the
+                // continuation below reads the pointer back from exactly this
+                // fact.
+                let first_uuid = Uuid::parse_str(first_id).unwrap();
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert!(!context.jobs.contains_key(&first_uuid));
+                    assert_eq!(
+                        context.query_rows[&first_uuid].session_ref.as_deref(),
+                        Some("session-28")
+                    );
+                }
 
                 let continued = daemon
                     .handler
@@ -6185,15 +6186,17 @@ mod tests {
                 assert_eq!(absent_result["completion"]["gates"]["status"], "not-run");
                 let absent_uuid =
                     Uuid::parse_str(absent["task_uuid"].as_str().unwrap()).unwrap();
+                // From `context.rows`, which keeps the admitted seed for the
+                // daemon's lifetime; the job itself is terminal and retired
+                // out of the live map (#395).
                 assert!(daemon
                     .handler
                     .context
                     .read()
                     .await
-                    .jobs
+                    .rows
                     .get(&absent_uuid)
                     .unwrap()
-                    .row
                     .gate_manifest
                     .is_none());
                 assert_eq!(
@@ -6622,14 +6625,18 @@ mod tests {
 
                 tokio::time::timeout(Duration::from_secs(2), async {
                     loop {
+                        // Read from the query fact, not `context.jobs`: the
+                        // job is terminal by now and terminal jobs are retired
+                        // out of the live map (#395). The query fact is where
+                        // the post-ack scrape has always landed too.
                         let enriched = daemon
                             .handler
                             .context
                             .read()
                             .await
-                            .jobs
+                            .query_rows
                             .get(&Uuid::parse_str(job_id).unwrap())
-                            .and_then(|job| job.row.session_ref.as_deref())
+                            .and_then(|fact| fact.session_ref.as_deref())
                             == Some("session-opaque");
                         if enriched && paths.attestations_path().exists() {
                             break;
@@ -6680,16 +6687,17 @@ mod tests {
                 assert_eq!(witness[0].gpu_seconds, None);
                 assert_eq!(witness[0].charge, None);
                 assert_eq!(witness[0].model, None);
+                // Same reason as the poll above: the observed model survives
+                // the job on the query fact, not in the live map (#395).
                 assert_eq!(
                     daemon
                         .handler
                         .context
                         .read()
                         .await
-                        .jobs
+                        .query_rows
                         .get(&Uuid::parse_str(job_id).unwrap())
                         .unwrap()
-                        .row
                         .model
                         .as_deref(),
                     Some("Provider/Model.Exact-CASE")
@@ -7826,14 +7834,17 @@ mod tests {
                 assert_eq!(low_result["verdict"], "preempted");
                 tokio::time::timeout(Duration::from_secs(2), async {
                     loop {
-                        if daemon
+                        // Terminal now means retired from the live map
+                        // (#395), not present-and-`Completed`.
+                        if !daemon
                             .handler
                             .context
                             .read()
                             .await
                             .jobs
-                            .get(&Uuid::parse_str(urgent["job_id"].as_str().unwrap()).unwrap())
-                            .is_some_and(|job| job.state == JobState::Completed)
+                            .contains_key(
+                                &Uuid::parse_str(urgent["job_id"].as_str().unwrap()).unwrap(),
+                            )
                         {
                             break;
                         }
@@ -8681,7 +8692,9 @@ mod tests {
                     witness_after.last().unwrap().labor_class,
                     LaborClass::Reused
                 );
-                assert_eq!(context.read().await.jobs.len(), 2);
+                // Every job in this fixture is terminal, so the live map is
+                // empty (#395).
+                assert!(context.read().await.jobs.is_empty());
                 let standup = client.call("query.standup", Some(json!({}))).await.unwrap();
                 assert_eq!(standup["reused"], 1);
                 let missing = client
@@ -9745,6 +9758,239 @@ mod tests {
             .await;
     }
 
+    /// Issue #395, the guard the prune's neutrality actually rests on.
+    ///
+    /// `finish_job` reads the job, then awaits the scrape, the capture and the
+    /// accounting **with the context lock dropped**, then re-checks under the
+    /// write lock. Before the prune the job was still in the map when it
+    /// reached a terminal disposition mid-flight, so `is_some_and` was the
+    /// right polarity there; after it, a job retired underneath that window is
+    /// *absent*, and reading absence as "still eligible" falls straight through
+    /// to `append_context_witness` — a **second canonical witness for one
+    /// execution**, on top of the cancelled witness the forced path already
+    /// appended.
+    ///
+    /// That is durable, on the append-only ledger `query run`, `query proof`,
+    /// the standup rollup and the attestation chain all sum over, and it is
+    /// reachable only under a race — so no ordinary fixture reaches it. Every
+    /// other forced-cancel test in this file retires the job *before*
+    /// `finish_job` runs and is answered by its **first** lookup, which is why
+    /// they cannot see this branch at all.
+    ///
+    /// This one steps into the window on purpose: hold `finish_job` between its
+    /// two phases, force-cancel the job there, let it resume, and count the
+    /// canonical witnesses for that exact `(task, attempt, leaseEpoch)`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_retired_between_finish_jobs_two_phases_is_witnessed_exactly_once() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let mut daemon = fs1_daemon(&paths).await;
+                let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+                let (release_tx, release_rx) = watch::channel(false);
+                daemon.finish_job_hook = Some(FinishJobHook {
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+
+                let admitted = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["true"],
+                        "pool": "slot",
+                        "adapter": "shell",
+                        "source": "manual",
+                        "evidence": ["exit:0"]
+                    })))
+                    .await
+                    .unwrap();
+                let task_uuid = admitted["task_uuid"].as_str().unwrap().to_owned();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                let attempt = finished.attempt;
+                let lease_epoch = finished.lease_epoch;
+
+                // Phase one has read the job and dropped the lock. Everything
+                // after this point in `finish_job` is the window.
+                let finishing = daemon.finish_job(finished);
+                tokio::pin!(finishing);
+                tokio::select! {
+                    result = &mut finishing => {
+                        panic!("finish_job must stall in its own window, returned {result:?}")
+                    }
+                    entered = entered_rx.recv() => {
+                        entered.expect("finish_job must reach the window");
+                    }
+                }
+
+                // Retire it inside the window, through the real path that does
+                // it: a forced cancel. This is the shape the guard exists for.
+                let cancelled = daemon.handler.cancel_one(&task_uuid, true).await.unwrap();
+                assert_eq!(cancelled["affected"], 1, "{cancelled}");
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert!(
+                        !context
+                            .jobs
+                            .contains_key(&Uuid::parse_str(&task_uuid).unwrap()),
+                        "the forced cancel must have retired the job before finish_job resumes"
+                    );
+                }
+
+                // Let the second phase run against the map it now finds.
+                release_tx.send(true).unwrap();
+                // Held, not unwrapped yet: the ledger is the property under
+                // test, and a `finish_job` that both double-witnesses *and*
+                // fails afterwards must be reported as the double-witness it
+                // is, not as whatever it tripped over next.
+                let outcome = finishing.await;
+                daemon.handler.drain_post_ack_tasks().await;
+
+                let (report, records) = read_verified_records(&paths.witness_path()).unwrap();
+                assert!(report.ok);
+                let for_execution = records
+                    .iter()
+                    .filter(|record| {
+                        record.task_uuid.as_deref() == Some(task_uuid.as_str())
+                            && record.attempt == attempt
+                            && record.lease_epoch == lease_epoch
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    for_execution.len(),
+                    1,
+                    "one execution must leave exactly one canonical witness; got {:?}",
+                    for_execution
+                        .iter()
+                        .map(|record| record.verdict)
+                        .collect::<Vec<_>>()
+                );
+                // And it is the forced one, not a second verdict invented by
+                // the execution that lost the race.
+                assert_eq!(for_execution[0].verdict, Verdict::Cancelled);
+                // The execution that lost the race is a quiet no-op, not an
+                // error: nothing went wrong, it simply has nothing left to do.
+                outcome.expect("a job retired mid-flight is a no-op for finish_job");
+            })
+            .await;
+    }
+
+    /// Issue #395: `context.jobs` is the daemon's *live* set, and stays one.
+    ///
+    /// It used to keep every job the daemon had admitted since it started, for
+    /// the daemon's whole lifetime, with no `remove`, `retain` or `clear`
+    /// anywhere in the tree. That is hot-path cost and not only resident
+    /// memory: the compaction live set, the dedup sweep and the guardrail
+    /// child count are all rebuilt over this map on the admission path, and
+    /// every one of them discards `Completed` entries on the way past.
+    ///
+    /// Three things have to hold together, so all three are pinned here: a job
+    /// that reaches a terminal disposition is gone from the map, the map does
+    /// not grow across repeated terminal work, and the verb that can still be
+    /// asked about a finished job still answers it. (The other such verb,
+    /// `--resume-from`, is covered end to end by
+    /// `public_continuation_uses_the_scraped_session_without_manual_captures`.)
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_job_that_reaches_a_terminal_state_leaves_the_live_job_map() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = fs1_paths(temp.path());
+                let daemon = fs1_daemon(&paths).await;
+                let context = daemon.handler.context.clone();
+                let (shutdown_tx, shutdown_rx) = watch::channel(false);
+                let daemon_task = tokio::task::spawn_local(daemon.run_until(shutdown_rx));
+                let client = RpcClient::connect(&paths.socket).await.unwrap();
+
+                let mut first = None;
+                for index in 0..4 {
+                    let created = client
+                        .call(
+                            "queue.enqueue",
+                            Some(fs1_full_payload(
+                                &format!("prune-395-{index}"),
+                                &["true"],
+                                ["exit:0".to_owned()],
+                            )),
+                        )
+                        .await
+                        .unwrap();
+                    assert_eq!(created["disposition"], "created");
+                    let terminal = fs1_wait(&client, &created).await;
+                    assert_eq!(terminal["verdict"], "pass");
+
+                    let task_uuid =
+                        Uuid::parse_str(created["task_uuid"].as_str().unwrap()).unwrap();
+                    let context = context.read().await;
+                    assert!(
+                        !context.jobs.contains_key(&task_uuid),
+                        "job {task_uuid} reached a terminal state and must not remain in \
+                         context.jobs"
+                    );
+                    // Not just "this one left": the map does not accumulate.
+                    // A count that grew by one per round would be the same
+                    // leak wearing a passing assertion.
+                    assert!(
+                        context.jobs.is_empty(),
+                        "context.jobs grew to {} after {} terminal jobs",
+                        context.jobs.len(),
+                        index + 1
+                    );
+                    // The invariant every consumer of this map already relied
+                    // on, now true by construction rather than by filtering:
+                    // the live set the compaction builds (`jobs.values()`
+                    // filtered to `state != Completed`) sees exactly the same
+                    // entries it would have seen before.
+                    assert!(context.jobs.values().all(|job| job.state
+                        != JobState::Completed));
+                    // And nothing the daemon can still be asked about was
+                    // dropped with it.
+                    assert!(context.rows.contains_key(&task_uuid));
+                    assert_eq!(context.query_rows[&task_uuid].status, RowStatus::Completed);
+                    drop(context);
+                    first.get_or_insert(created["task_uuid"].clone());
+                }
+
+                // A retired job still answers `cancel`, from the row and query
+                // fact that outlived it, rather than 404ing because the live
+                // map forgot it.
+                let already = client
+                    .call(
+                        "queue.cancel",
+                        Some(json!({"task_uuid": first.unwrap(), "force": true})),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(already["already_terminal"], true);
+                assert_eq!(already["affected"], 0);
+                assert_eq!(already["was"], "completed");
+
+                // An id the daemon has never admitted is still not found: the
+                // fallback answers for jobs it retired, not for anything.
+                let unknown = client
+                    .call(
+                        "queue.cancel",
+                        Some(json!({"task_uuid": Uuid::new_v4().to_string(), "force": true})),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(unknown, WireIoError::Rpc(WireErrorCode::NotFound, _, _)),
+                    "{unknown:?}"
+                );
+
+                shutdown_tx.send(true).unwrap();
+                daemon_task.await.unwrap().unwrap();
+            })
+            .await;
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn fleet_conformance_submission_terminal_pass_is_reused_without_side_effects() {
         let local = LocalSet::new();
@@ -9788,7 +10034,10 @@ mod tests {
                 assert_eq!(reused["verdict"], "pass");
                 assert_eq!(reused["witnessSeq"], terminal["witness_seq"]);
                 assert_eq!(reused["payloadHash"], created["payloadHash"]);
-                assert_eq!(context.read().await.jobs.len(), 1);
+                // Both dispositions are terminal, so neither is in the live map
+                // (#395): the first was retired when it completed, the reused
+                // one was terminal on arrival and never joined.
+                assert!(context.read().await.jobs.is_empty());
                 assert_eq!(
                     read_acknowledged_events(&paths.events_dir()).unwrap().len(),
                     1

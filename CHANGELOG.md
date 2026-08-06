@@ -6,6 +6,113 @@ authorized.
 
 ## [Unreleased]
 
+### Recurring-cost hygiene (#396, #411, #395, #404)
+
+One lane of four fixes with a shared shape: each one makes something the fleet
+pays for repeatedly stop costing. A flake stops red-gating innocent shas, a
+deploy stops raising a false alarm, a map stops growing, a response stops
+repeating itself.
+
+#### #396 — the `ETXTBSY` race in `fake_gh` no longer red-gates innocent shas
+
+`fake_gh` wrote a shell script and marked it executable, then exec'd it. The
+kernel refuses to `execve` a file any process still holds open for writing, and
+in a parallel test binary a sibling thread that forks between `fs::write`'s open
+and close carries that write fd into its child until the child's own `execve`
+closes it. Under load that is a `Text file busy` failure in a test whose diff
+never touched `campaign.rs`; it cost a full gate cycle on sha `80eb6c0`, which
+passed on a quiet host.
+
+Rather than retry through the race, `fake_gh` and the three remaining
+write-then-`chmod` helpers now use the idiom #117 introduced for exactly this:
+the behaviour is published through a non-executable sidecar and the exec target
+is a symlink to a checked-in provider nothing ever opens for writing, so the
+window never opens. That property — the exec target is a file this process
+never opens at all — is asserted at both shared installers, so all four
+converted helpers are covered by construction; asserting only that the program
+runs would have passed for a written-then-`chmod`ed one too, which is the whole
+race. A test also holds a write fd open to show the hazard is real rather than
+theorised, instead of waiting for load to hold it.
+
+#### #411 — a periodic drain that finds no daemon is a skip, not a failure
+
+`tally-drain.timer` fires every five seconds and a `tally-daemon` restart takes
+longer than that, so every activation that changes the daemon unit had a good
+chance of catching a drain mid-flight, exiting 3 against a socket being
+replaced, and producing a real per-user unit failure. It self-clears, but the
+fleet's journal watcher cannot tell it apart from the failure burst that watcher
+exists to catch.
+
+- `ConditionPathExists` on `tally-drain` now also names the socket the command
+  connects to, in both the NixOS and home-manager modules. The existing config
+  guard is kept rather than replaced, because systemd ANDs repeated conditions.
+  A drain scheduled while the daemon is down is recorded as a skip, not a
+  failure.
+- `tally daemon drain` exits 0 when that socket is unreachable, covering the
+  narrow race the condition cannot. Scoped to the connect-time absence alone:
+  `tally queue drain` is untouched, a daemon that is listening and refuses the
+  drain still fails, and the line naming the case is still written to stderr.
+
+`BindsTo`/`PartOf` was considered and rejected — it changes stop-time semantics
+for an in-flight drain to buy a problem these two already solve.
+
+#### #395 — `context.jobs` is the daemon's live set, and stays one
+
+The map had no `remove`, `retain` or `clear` anywhere in the tree: it grew with
+every job the daemon had admitted since start and never shrank, and a `Job` is
+far larger than the membership record whose growth it dominates. The cost is on
+the hot path, not just resident — the compaction live set, the dedup sweep and
+the guardrail child count are all rebuilt over it on the admission path.
+
+A job that reaches a terminal disposition now leaves the map. Every one of those
+consumers already discarded terminal entries on the way past, so this is neutral
+for all of them by construction. Nothing is lost with the entry: `cancel` still
+answers `alreadyTerminal` and `--resume-from` still continues a finished
+session, both from the row seed and query fact that already outlive the job and
+are restored across a restart. An id the daemon never admitted is still not
+found.
+
+One guard changes meaning with the prune and is worth naming, because it is
+durable if it is wrong: `finish_job` re-checks the job under the write lock
+after awaiting the scrape, capture and accounting without it, and a job retired
+inside that window must end that execution quietly rather than append a second
+canonical witness for it. That window is now reachable in a test, which
+force-cancels the job inside it and asserts exactly one canonical witness for
+the `(task, attempt, leaseEpoch)`.
+
+#### #404 — the attestation chain is not read before it is needed, and a standup states its constants once
+
+- **Deferred read.** `read_attestations` parsed and hash-verified the whole
+  append-only ledger on every `query.run` and `query.standup`, before the run id
+  was known to exist. Both now defer that read behind the predicate that decides
+  whether there is anything to sum, and in each case the deferral predicate is
+  the *same function* the real answer is computed from, so skipping the read
+  cannot change what comes back.
+- **`usageBasis`.** `StandupDigest` gains a `usageBasis` object stating the
+  rollup's `provenance`, `composition` and `costBasis` once; each entry in
+  `runs` omits the three it would otherwise repeat verbatim (~650 bytes per run,
+  ~325 KB per response at 500 runs). The hoist is safe because those three are
+  invariant by construction — one writer each, assigned from compile-time
+  constants with no dependence on the run — and it is not assumed: a rollup
+  whose statements ever differ carries its own inline rather than inheriting a
+  digest-level claim that would be false for it. `query run`, which returns one
+  rollup, still carries all three inline.
+
+  `usageBasis` is what an omitted entry field is filled from on the way back in
+  — the **producer's** copy, which travelled with the payload — and a reader
+  falls back to its own compiled constants only for a digest that carries no
+  basis at all. Filling from the reader's constants instead would make the
+  digest and its own entries disagree whenever the two builds differ, which on a
+  fleet whose coordinator pin trails its workers is the ordinary case rather
+  than the exotic one.
+
+  `usageBasis` is present exactly when `runs` is non-empty, and both are omitted
+  from the wire when empty — so a digest with no basis has no runs either, and
+  the fallback is never applied to anything. Such a digest is **not** necessarily
+  an old one: a current producer emits neither key whenever the window touched no
+  flow run, or when reader-state hid every run it had (`archivedRunsHidden` is
+  what separates those two cases).
+
 ### Added
 
 - **Lane: operator conveniences — evals gain a checkable coverage-manifest
@@ -113,6 +220,15 @@ authorized.
   enumerator destructures `StandupDigest` exhaustively, so a new field does
   not compile until it is named; binding it to `_` is then a visible
   decision that the field is not filtered here.
+
+  *Seam with #404:* reader-state filtering can empty `runs` after
+  `apply_standup_usage` has already stated a `usageBasis` for it, which would
+  have left a digest claiming how its runs were summed while showing no runs.
+  The invariant `usageBasis` documents — present exactly when `runs` is
+  non-empty — is kept rather than weakened: the reader-state pass clears the
+  basis when it hides the last run. It is now a property of the *composition*
+  of the two calls, pinned by a composition-level test, since each lane tested
+  its own function in isolation and neither gate could see the pair.
 
 - **`query run` and `query standup` answer "what did this run cost" (#384).**
   `query.run` gains a `usage` object and `query.standup` gains a `runs` array
@@ -429,6 +545,63 @@ authorized.
   charges.
 
 ### Fixed
+
+- **The exit-20 `details` contract is now held to evidence instead of to
+  itself (#400).** #397 gave the five supersession codes one fourteen-member
+  `details` shape and documented it in two pages. What it could not give was a
+  reason to believe either claim: the contract test compared production output
+  with the same constant production iterates over, so a member could be added
+  or reordered while every assertion passed and all three prose copies rotted,
+  and the family's one wire rename was exercised only by in-process stubs that
+  would have agreed with any name.
+
+  - **#400 — the prose copies are pinned to the constant, and the rename is
+    proved by a real process.** `crates/tally-flow/tests/supersession_docs.rs`
+    parses the marker-delimited member table in
+    `doc/src/flows/submission-and-replay.md` and the per-code table in
+    `doc/src/reference/errors.md` and holds both to
+    `SUPERSESSION_DETAIL_FIELDS` / `SUPERSESSION_CODES` — membership, order,
+    and the derived members whose *values* the docs state (`transient`,
+    `resolution`, `divergentInput`, and whether a code advertises a `remedy`).
+    The `remedy` nullity rule is now stated once, in one wording, in both
+    pages. The value that rule states and the member it blames are read out of
+    the sentence and used to drive the check against the code, so the sentence
+    is load-bearing: the two copies drifting apart, a wording that states a
+    different value, a wording that blames a different member, and an empty
+    span all fail. `errors.md` names `recordedLabel` and
+    `currentLabel` where it used to say "both labels", so its `replay-divergence`
+    row also carries the renamed members. A live daemon-driven
+    `replay-divergence` (`flow_live::a_live_replay_divergence_names_the_current_hash_and_label_on_the_wire`)
+    replays an admitted ordinal whose payload changed and asserts
+    `currentHash` / `currentLabel` — and the absence of the pre-rename
+    `expectedHash` / `expectedLabel` — on a real runner's stdout, the first
+    live exit-20 assertion in the suite that is not an identity pin.
+
+  - **#401 — the `remedy` guard reaches the field a human reads, and agrees
+    with the repo's own definition of "no run named".** #397 guarded the
+    `remedy` *detail*; `identity_refusal_remedy_sentence`, which embeds the
+    same invocation in the operator-visible `message`, was left unguarded, so
+    a refusal that could not say which run it was about still advertised a
+    `tally flow supersede` missing its `--flow-run-id` value — exit 2 in an
+    operator's hands. It now returns the why-clause without the command. Both
+    guards test blankness as `trim().is_empty()`, which is what `run_script`
+    has always meant by it, so a whitespace-only `flowRunId` from a foreign
+    producer no longer renders an inert command either. Neither was reachable
+    from any in-tree call site; both functions are public.
+
+    A **flag-shaped** `flowRunId` — a foreign producer sending `--reason` or
+    `-h` as the run id — is *not* closed by this, and is not claimed to be: it
+    is not blank under anyone's definition, so both the `remedy` and the
+    message still render a command that exits 2. Suppressing it would
+    contradict the ruling below, and validating the member as a UUID is a wider
+    contract change than this asked for, so the correct behaviour is left to be
+    decided rather than assumed.
+
+    A `flowRunId` a producer sent as something other than a string is now
+    preserved rather than replaced with `null`. Every other member of the
+    contract keeps whatever the producer sent, and "the producer named a run
+    badly" is a different fact from "the producer named no run" — which is
+    what the doc row promises `null` means. No `remedy` is derived from it.
 
 - **The `pi` preset's launch and resume argv could not run (#387).** Both
   ended in `--`, tally's option-terminator convention across presets. pi has

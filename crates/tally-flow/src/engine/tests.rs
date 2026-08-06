@@ -814,6 +814,77 @@ fn a_concurrent_identity_change_stops_the_admission_frontier() {
     }
 }
 
+/// The `remedy` guard has to hold on the field a human reads, not only on the
+/// machine-readable member — and "no run named" has to mean the same thing here
+/// as it does in `run_script`.
+#[test]
+fn a_refusal_that_names_no_run_advertises_no_command_anywhere() {
+    for blank in ["", "   ", "\t\n"] {
+        for code in crate::error::SUPERSESSION_CODES {
+            let details = crate::error::supersession_details(
+                code,
+                &crate::error::SupersessionDetails {
+                    flow_run_id: blank,
+                    ..crate::error::SupersessionDetails::default()
+                },
+            );
+            assert!(
+                details["flowRunId"].is_null(),
+                "{code} with {blank:?}: a blank id is the same fact as no id"
+            );
+            assert!(
+                details["remedy"].is_null(),
+                "{code} with {blank:?}: {}",
+                details["remedy"]
+            );
+        }
+        // The message twin. Its call sites all sit downstream of
+        // `flow-run-id-missing` today, but it is public, and an advertised
+        // command missing its `--flow-run-id` value exits 2 in an operator's
+        // hands whichever field carried it.
+        let sentence =
+            crate::error::identity_refusal_remedy_sentence("script-changed-mid-run", blank);
+        assert!(!sentence.contains("--flow-run-id"), "{blank:?}: {sentence}");
+        assert!(
+            sentence.contains("refused for script it never changed"),
+            "the why-clause survives the missing command: {sentence}"
+        );
+    }
+
+    // A named run is untouched by the guard, in both fields.
+    let named = crate::error::identity_refusal_remedy_sentence("script-changed-mid-run", "run-1");
+    let remedy = "tally flow supersede --flow-run-id run-1 --new-flow-run-id <FRESH-UUID> \
+                  --reason script-changed";
+    assert!(named.ends_with(remedy), "{named}");
+    assert_eq!(
+        crate::error::supersession_details(
+            "script-changed-mid-run",
+            &crate::error::SupersessionDetails {
+                flow_run_id: "run-1",
+                ..crate::error::SupersessionDetails::default()
+            },
+        )["remedy"],
+        remedy
+    );
+}
+
+/// Completion is a floor under the contract, not a filter over it.
+#[test]
+fn a_run_named_badly_is_preserved_rather_than_dropped() {
+    let mut error = FlowError::new("FlowReplayError", "script-changed-mid-run", "refused");
+    error.details.insert("flowRunId".to_owned(), json!(12345));
+    let error = crate::error::with_recovery_facts(error);
+    // The producer named a run — badly. Rendering `null` would say it named
+    // none, which is a different fact and the one the doc row promises.
+    assert_eq!(error.details["flowRunId"], json!(12345));
+    // No command is derived from it: the invocation needs the string form.
+    assert!(error.details["remedy"].is_null());
+    assert_eq!(
+        error.details.keys().map(String::as_str).collect::<Vec<_>>(),
+        crate::error::SUPERSESSION_DETAIL_FIELDS
+    );
+}
+
 #[test]
 fn a_transient_daemon_failure_says_so_where_a_permanent_one_does_not() {
     let source = format!(

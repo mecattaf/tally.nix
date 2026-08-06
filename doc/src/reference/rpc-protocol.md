@@ -561,7 +561,23 @@ summaries, cancellations, and canonical GPU seconds. The RPC accepts a `source` 
 though the current CLI exposes only `--since`. Each completed, in-flight, gate-failed, and
 cancelled entry includes optional `taskRef`. `runs` carries one `{flowRunId, usage}` entry per
 flow run the window touched, whose `usage` is the same rollup `query.run` returns — see [Usage
-rollups](#usage-rollups). A run is touched when the window holds an entry for a task it created
+rollups](#usage-rollups) — with one wire difference: the three fixed statements every entry would
+otherwise repeat verbatim (`provenance`, `composition`, and `cost.basis`) are stated once in the
+digest-level `usageBasis` object as `{provenance, composition, costBasis}` and omitted from each
+entry. They are safe to state once because each has a single writer assigning a compile-time
+constant with no dependence on the run; the omission is nevertheless conditional, so an entry whose
+statement ever differs from the digest's carries its own inline and a reader must prefer the
+entry's. Where an entry omits one, its value is the digest's `usageBasis` — that object is the
+**producer's** statement of what its own rollups summed, so a reader must take an omitted field
+from it and must not substitute a constant of its own, which would differ silently whenever the
+reader and the daemon are different generations. `usageBasis` is present exactly when `runs` is
+non-empty, and both are omitted from the wire when empty — so a digest that carries no `usageBasis`
+carries no `runs` either, and there is no entry for a fallback to be applied to. That happens three
+ways: the window touched no flow run, reader-state hid every run it did have (`archivedRunsHidden`
+is then non-zero, and is what distinguishes the two), or the producer predates the field. Only in
+that last case does a reader fall back to what it knows, and it cannot tell which case it is
+holding — it does not need to, because there are no entries to fill. `query.run` returns one
+rollup and keeps all three inline. A run is touched when the window holds an entry for a task it created
 *or* a task its durable membership names, so a run that only attached a node is still listed. The
 window selects which runs appear; it does not narrow what is summed, because a run's cost is a
 property of the run and a window-narrowed sum would shrink with the window while still being

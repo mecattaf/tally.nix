@@ -8,8 +8,12 @@ use thiserror::Error;
 use crate::completion::{GateSummaryStatus, SemanticCompletion};
 use crate::journal::{JournalEntry, TallyEvent};
 use crate::provenance::{Orchestration, TaskRef};
+use crate::query_v2::FactAuthority;
 use crate::taskdb::{GhOrigin, RelatedTrigger, WorkspaceMetadata};
-use crate::usage_rollup::UsageRollup;
+use crate::usage_rollup::{
+    UsageCostRollup, UsageCoverage, UsageRollup, UsageRollupCaveat, UsageTokenRollup,
+    ROLLUP_COMPOSITION, ROLLUP_COST_BASIS, ROLLUP_PROVENANCE,
+};
 use crate::witness::{counts_toward_canonical_gpu_seconds, LaborClass, Verdict, WitnessRecord};
 
 pub const QUERY_SCHEMA_VERSION: u32 = 1;
@@ -860,11 +864,146 @@ pub struct InFlightEntry {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StandupRunUsage {
     pub flow_run_id: String,
+    /// The full rollup in memory; on the wire, the three constants every entry
+    /// repeats verbatim are stated once at [`StandupDigest::usage_basis`]
+    /// instead of ~650 bytes per run (#404). See [`digest_rollup`].
+    #[serde(with = "digest_rollup")]
     pub usage: UsageRollup,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// The three rollup statements a digest states once instead of per entry.
+///
+/// They are safe to hoist because they are invariant *by construction*, not
+/// merely equal on the data at hand: `provenance` and `composition` have a
+/// single writer ([`crate::usage_rollup::roll_up`]) that assigns them from
+/// compile-time constants with no input dependence, and `cost.basis` has a
+/// single writer ([`UsageCostRollup::default`]) from a third. A digest that
+/// hoisted a field a run could actually differ on would be stating something
+/// false about runs it never measured, which is why [`digest_rollup`] still
+/// serializes any of the three that does *not* match, rather than assuming.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StandupUsageBasis {
+    /// See [`crate::usage_rollup::ROLLUP_PROVENANCE`].
+    pub provenance: String,
+    /// See [`crate::usage_rollup::ROLLUP_COMPOSITION`].
+    pub composition: String,
+    /// See [`crate::usage_rollup::ROLLUP_COST_BASIS`].
+    pub cost_basis: String,
+}
+
+impl Default for StandupUsageBasis {
+    fn default() -> Self {
+        Self {
+            provenance: ROLLUP_PROVENANCE.to_owned(),
+            composition: ROLLUP_COMPOSITION.to_owned(),
+            cost_basis: ROLLUP_COST_BASIS.to_owned(),
+        }
+    }
+}
+
+/// `UsageRollup` on a standup digest's wire, with the three fields
+/// [`StandupUsageBasis`] states once omitted when they match it (#404).
+///
+/// `query.run` returns one rollup and keeps all three inline; a digest walks
+/// every run history holds, so at 500 runs the repetition was ~325 KB of
+/// identical bytes per response. Omission is conditional, never assumed: a
+/// rollup whose statements differ from the constants carries its own inline.
+///
+/// A reader that finds a field omitted takes it from the digest's
+/// `usageBasis` — the producer's copy, which travelled with the payload — and
+/// only from its own compiled constants when the payload states no basis at
+/// all. See [`StandupDigest::inherit_usage_basis`], which is where that
+/// happens: this module cannot see the digest its entry belongs to, so it
+/// leaves an omitted field empty and the digest fills it.
+mod digest_rollup {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{
+        FactAuthority, UsageCostRollup, UsageCoverage, UsageRollup, UsageRollupCaveat,
+        UsageTokenRollup, ROLLUP_COMPOSITION, ROLLUP_COST_BASIS, ROLLUP_PROVENANCE,
+    };
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct WireCost {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        amount_usd: Option<f64>,
+        attempts: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        basis: Option<String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct Wire {
+        authority: FactAuthority,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provenance: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        composition: Option<String>,
+        coverage: UsageCoverage,
+        tokens: UsageTokenRollup,
+        cost: WireCost,
+        caveats: Vec<UsageRollupCaveat>,
+    }
+
+    fn differing(value: &str, constant: &str) -> Option<String> {
+        (value != constant).then(|| value.to_owned())
+    }
+
+    pub(super) fn serialize<S: Serializer>(
+        rollup: &UsageRollup,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        Wire {
+            authority: rollup.authority,
+            provenance: differing(&rollup.provenance, ROLLUP_PROVENANCE),
+            composition: differing(&rollup.composition, ROLLUP_COMPOSITION),
+            coverage: rollup.coverage,
+            tokens: rollup.tokens,
+            cost: WireCost {
+                amount_usd: rollup.cost.amount_usd,
+                attempts: rollup.cost.attempts,
+                basis: differing(&rollup.cost.basis, ROLLUP_COST_BASIS),
+            },
+            caveats: rollup.caveats.clone(),
+        }
+        .serialize(serializer)
+    }
+
+    /// An omitted field deserializes **empty**, not to this build's constant.
+    ///
+    /// Filling it here from `ROLLUP_*` would answer "what did the producer say
+    /// this was a sum over" with the *reader's* strings — silently, and
+    /// wrongly whenever the two builds differ, which on this fleet is the
+    /// normal state rather than the exception. The producer's own answer is in
+    /// the same payload, one level up, so the fill belongs where that is
+    /// visible: [`StandupDigest`]'s `Deserialize`, which calls
+    /// [`StandupDigest::inherit_usage_basis`] before handing the digest out.
+    /// No caller ever observes the empty state.
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<UsageRollup, D::Error> {
+        let wire = Wire::deserialize(deserializer)?;
+        Ok(UsageRollup {
+            authority: wire.authority,
+            provenance: wire.provenance.unwrap_or_default(),
+            composition: wire.composition.unwrap_or_default(),
+            coverage: wire.coverage,
+            tokens: wire.tokens,
+            cost: UsageCostRollup {
+                amount_usd: wire.cost.amount_usd,
+                attempts: wire.cost.attempts,
+                basis: wire.cost.basis.unwrap_or_default(),
+            },
+            caveats: wire.caveats,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase", remote = "Self")]
 pub struct StandupDigest {
     pub schema_version: u32,
     pub protocol_version: u32,
@@ -925,6 +1064,80 @@ pub struct StandupDigest {
     /// hidden and counted here even when no task entry was hidden for it.
     #[serde(default)]
     pub archived_runs_hidden: usize,
+    /// The three statements every entry in `runs` would otherwise repeat
+    /// verbatim, stated once (#404).
+    ///
+    /// **Present exactly when `runs` is non-empty.** That is an invariant of
+    /// the *composition* of the two calls that build a digest, not of either
+    /// alone: [`crate::query_v2::apply_standup_usage`] sets it when it leaves
+    /// a non-empty `runs`, and
+    /// [`crate::query_v2::apply_reader_state_to_standup`] clears it again if
+    /// it hides every run — a digest that shows no run must not carry a
+    /// statement about how its runs were summed. Both fields are skipped on
+    /// the wire when empty, so they appear and disappear together.
+    ///
+    /// Absence therefore means "this digest has no runs", not "this producer
+    /// is old". What separates a window that touched no run from one whose
+    /// runs were all hidden is [`Self::archived_runs_hidden`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_basis: Option<StandupUsageBasis>,
+}
+
+impl StandupDigest {
+    /// Give every entry in `runs` the basis the *producer* stated (#404).
+    ///
+    /// [`digest_rollup`] omits the three constants from each entry and this
+    /// digest states them once, so on the way back in the entries have to be
+    /// told what they were. They are told by `usage_basis` — the copy that
+    /// travelled with the payload — and only by this build's own constants
+    /// when a payload carries no basis at all. A payload like that is not
+    /// necessarily an old one: a current producer emits no basis whenever the
+    /// digest has no `runs` (see [`StandupDigest::usage_basis`]). In every
+    /// such case `runs` is empty too, so the loop below runs zero times and
+    /// the fallback is never actually applied to anything. The alternative,
+    /// filling from
+    /// the reader's constants while the payload's basis says otherwise, would
+    /// make the digest state one thing and every entry in it state another,
+    /// across exactly the mixed-generation fleet this runs on.
+    fn inherit_usage_basis(&mut self) {
+        let basis = self.usage_basis.clone().unwrap_or_default();
+        for run in &mut self.runs {
+            if run.usage.provenance.is_empty() {
+                run.usage.provenance.clone_from(&basis.provenance);
+            }
+            if run.usage.composition.is_empty() {
+                run.usage.composition.clone_from(&basis.composition);
+            }
+            if run.usage.cost.basis.is_empty() {
+                run.usage.cost.basis.clone_from(&basis.cost_basis);
+            }
+        }
+    }
+}
+
+impl Serialize for StandupDigest {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        // Unchanged from the derive; `remote = "Self"` only moves it to an
+        // inherent function so the `Deserialize` side below can wrap.
+        StandupDigest::serialize(self, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StandupDigest {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        // The inherent `deserialize` the `remote = "Self"` derive above emits,
+        // wrapped so no caller can obtain a digest whose entries were never
+        // reconciled against the basis it carries.
+        let mut digest = StandupDigest::deserialize(deserializer)?;
+        digest.inherit_usage_basis();
+        Ok(digest)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1095,6 +1308,9 @@ pub fn query_standup(
         runs: Vec::new(),
         archived_hidden: 0,
         archived_runs_hidden: 0,
+        // Both are filled together by `query_v2::apply_standup_usage`; an
+        // unfilled digest states no basis rather than one it never applied.
+        usage_basis: None,
     }
 }
 
