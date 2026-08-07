@@ -24,6 +24,7 @@ const DEFAULT_RUNNER_POOL: &str = "campaign";
 const DEFAULT_AGENT_PRIORITY: &str = "low";
 const DEFAULT_AGENT_APPROVAL_POLICY: &str = "never";
 const DEFAULT_AGENT_SANDBOX_POLICY: &str = "danger-full-access";
+const DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY: &str = "read-only";
 const BRIEF_SENTINEL: &str = "Read the file whose path is in the TALLY_BRIEF environment variable and execute the mission it contains. That brief is your complete instruction set.";
 const REGISTRY_SCHEMA_VERSION: u32 = 2;
 const SYSTEM_COMMENT_PREFIX: &str = "<!-- tally:spec-build:";
@@ -55,6 +56,14 @@ struct CampaignAgent {
     approval_policy: Option<String>,
     #[serde(default = "default_agent_sandbox_policy")]
     sandbox_policy: Option<String>,
+    /// Named adapter sandbox policy for diagnosis nodes. The diagnosis brief
+    /// prohibits mutation, so the default holds that node to a read-only
+    /// policy rather than inheriting the implementation node's writable one.
+    /// The packaged driver normalizes this exact field and default into the
+    /// canonical agent it digests, so both halves of the pin must carry it
+    /// byte-identically (#429).
+    #[serde(default = "default_agent_diagnosis_sandbox_policy")]
+    diagnosis_sandbox_policy: Option<String>,
     /// The model this campaign dispatches its coder with. Absent leaves the
     /// adapter's own resolution alone and leaves the merge node with no model
     /// to name in an `Assisted-by:` trailer.
@@ -254,6 +263,17 @@ struct CampaignRegistration {
     /// written before this existed, which only costs one extra walk.
     #[serde(default)]
     last_forge_observation: Option<String>,
+    /// How long each pass of this campaign waits for a node's advisory
+    /// finalMessage projection before classifying the node
+    /// `retryable-projection` (#432). Absent leaves the flow host's own 10 s
+    /// default alone, which is what a registration written before this
+    /// existed carries and what every campaign armed without the flag carries.
+    /// It lives here rather than in the manifest because it is a property of
+    /// this host's daemon congestion, not of the campaign: putting it in the
+    /// manifest would fold a host tuning knob into the executable graph digest
+    /// and force a re-arm to change it.
+    #[serde(default)]
+    projection_wait_ms: Option<u64>,
     flow: PathBuf,
     driver: PathBuf,
     workspace_root: PathBuf,
@@ -293,6 +313,10 @@ fn default_agent_approval_policy() -> Option<String> {
 
 fn default_agent_sandbox_policy() -> Option<String> {
     Some(DEFAULT_AGENT_SANDBOX_POLICY.to_owned())
+}
+
+fn default_agent_diagnosis_sandbox_policy() -> Option<String> {
+    Some(DEFAULT_AGENT_DIAGNOSIS_SANDBOX_POLICY.to_owned())
 }
 
 const fn default_gate_runtime_max_sec() -> u64 {
@@ -1222,6 +1246,7 @@ fn validate_agent(agent: &CampaignAgent) -> Result<()> {
     if agent.runtime_max_sec == Some(0)
         || agent.approval_policy.as_deref() == Some("")
         || agent.sandbox_policy.as_deref() == Some("")
+        || agent.diagnosis_sandbox_policy.as_deref() == Some("")
         || agent.model.as_deref() == Some("")
     {
         return Err(invalid(
@@ -1912,6 +1937,56 @@ fn max_flow_nodes(manifest: &CampaignManifest) -> u32 {
     (3 + preflight + manifest.max_parallel * (11 + 2 * manifest.gates.len())) as u32
 }
 
+/// The `--projection-wait-ms` an arm may record (#432).
+///
+/// Refused at arm rather than at the first pass, because the value is durable:
+/// a zero here would be written into the registration and then rejected by
+/// every `tally flow run` this campaign ever dispatches, including the ones the
+/// poll timer dispatches unattended. Absent stays absent, which is what leaves
+/// the flow host's own 10 s default alone.
+fn validated_projection_wait_ms(value: Option<u64>) -> Result<Option<u64>> {
+    if value == Some(0) {
+        return Err(invalid("--projection-wait-ms must be greater than zero"));
+    }
+    Ok(value)
+}
+
+/// Argv of the `tally flow run` this campaign dispatches for one pass.
+///
+/// Split out of `dispatch_campaign` for the same reason `continuation_argv` is:
+/// it is the only place a durable registration turns into something the pass
+/// actually executes, and an argv nothing constructs in a test is an argv
+/// nothing notices the loss of (#432).
+///
+/// `projection_wait_ms` is the seam that carries `campaign arm
+/// --projection-wait-ms` to the pass. It travels on the argv rather than in the
+/// environment because the pass runs as a daemon-launched transient unit whose
+/// environment is an explicit `--setenv` list, so nothing an operator exports at
+/// arm time is visible to it. `None` must leave the argv byte-identical to the
+/// pre-#432 shape: this vector is hashed into the enqueue payload, so a stray
+/// element would move every existing campaign's payload identity.
+fn dispatch_flow_argv(
+    executable: &Path,
+    flow: &Path,
+    max_nodes: u32,
+    projection_wait_ms: Option<u64>,
+) -> Vec<String> {
+    let mut argv = vec![
+        executable.display().to_string(),
+        "flow".to_owned(),
+        "run".to_owned(),
+        flow.display().to_string(),
+        "--args-from-brief".to_owned(),
+        "--max-nodes".to_owned(),
+        max_nodes.to_string(),
+    ];
+    if let Some(millis) = projection_wait_ms {
+        argv.push("--result-projection-wait-ms".to_owned());
+        argv.push(millis.to_string());
+    }
+    argv
+}
+
 /// Argv the pass writes into the events directory to admit its own successor.
 ///
 /// It is the poll the timer already runs: one registry scan that refetches the
@@ -1995,6 +2070,12 @@ async fn dispatch_campaign(
             "kind": "github-issue",
             "graphDigest": &registration.approved_graph_digest,
         },
+        // The arm CLI's canonical manifest, carried so a reconcile digest
+        // mismatch can name its first divergent canonical path (#433). This
+        // dispatch only runs because the graph's Rust digest still equals the
+        // armed digest, so this value IS the armed manifest. It is evidence
+        // for the receipt, never part of the executable graph digest.
+        "armedManifest": &graph.manifest,
         "steering": steering.master,
         "taskSteering": steering.tasks,
         "capabilities": {"subIssueWalk": registration.sub_issue_walk},
@@ -2015,15 +2096,12 @@ async fn dispatch_campaign(
     });
     let payload = EnqueuePayload {
         invocation: None,
-        argv: Some(vec![
-            executable.display().to_string(),
-            "flow".to_owned(),
-            "run".to_owned(),
-            registration.flow.display().to_string(),
-            "--args-from-brief".to_owned(),
-            "--max-nodes".to_owned(),
-            max_flow_nodes(&graph.manifest).to_string(),
-        ]),
+        argv: Some(dispatch_flow_argv(
+            &executable,
+            &registration.flow,
+            max_flow_nodes(&graph.manifest),
+            registration.projection_wait_ms,
+        )),
         pools: Some(vec!["flow".to_owned(), graph.manifest.pool.clone()]),
         executor: None,
         priority: Some(priority(&graph.manifest.agent.priority)),
@@ -2118,6 +2196,7 @@ async fn run_campaign_arm(
     if !workspace_root.is_absolute() {
         return Err(invalid("campaign workspace root must be absolute"));
     }
+    let projection_wait_ms = validated_projection_wait_ms(args.projection_wait_ms)?;
     let arm_serial = prior.as_ref().map_or(Ok(1), |value| {
         value
             .arm_serial
@@ -2144,6 +2223,7 @@ async fn run_campaign_arm(
         // Arming always dispatches, so the cheap precondition starts empty and
         // the first poll after an arm re-establishes it.
         last_forge_observation: None,
+        projection_wait_ms,
         flow,
         driver,
         workspace_root,
@@ -4557,6 +4637,349 @@ mod tests {
         );
     }
 
+    /// The packaged driver and this CLI must agree on the canonical campaign
+    /// agent byte-for-byte, because each digests it independently and the
+    /// reconcile node refuses any mismatch. #429: the driver's `forge_manifest`
+    /// unconditionally normalized an 8th agent field (`diagnosisSandboxPolicy`)
+    /// that this struct did not carry, so no manifest could make the two
+    /// digests agree and every forge-native arm failed reconcile. This test
+    /// computes the graph digest through BOTH halves — the Rust `sha256_json`
+    /// path here, and the real `spec_build_driver.py` `canonical_sha256` path
+    /// run as a `python3` subprocess (the packaged file, not a copy of its
+    /// logic) — and asserts byte equality, so a future version skew inside a
+    /// pin fails in CI instead of at first arm.
+    ///
+    /// Two manifests, because a schema has two ways to skew. The first carries
+    /// every optional field explicitly, which catches a field one half omits
+    /// or renames. The second carries only the required ones, which catches a
+    /// field whose two halves disagree on the DEFAULT — the shape an ad-hoc
+    /// campaign manifest actually has, and the shape dotfiles#163 arm'd under.
+    #[test]
+    fn graph_digest_is_byte_identical_between_the_cli_and_the_packaged_driver() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let driver = repo_root.join("examples/flows/spec_build_driver.py");
+        assert!(
+            driver.is_file(),
+            "packaged driver missing: {}",
+            driver.display()
+        );
+
+        // `forge_manifest` validates `repository.checkout` as an existing Git
+        // directory, so the fixture needs a real one. Canonicalize it so the
+        // driver's `Path.resolve()` cannot rewrite it into a different digest.
+        let checkout_dir = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(checkout_dir.path())
+            .status()
+            .expect("git init must run for the schema-parity fixture");
+        assert!(
+            status.success(),
+            "git init failed for the schema-parity fixture"
+        );
+        let checkout = fs::canonicalize(checkout_dir.path()).unwrap();
+        let checkout = checkout.to_str().expect("checkout path must be UTF-8");
+
+        // The packaged driver's digest path, run once per fixture: load the
+        // real file under python3, normalize the manifest through the driver's
+        // own `forge_manifest`, and hash it with the driver's own
+        // `canonical_sha256`.
+        let driver_digest = |manifest: &Value, tasks: &Value| -> String {
+            let input_dir = tempfile::tempdir().unwrap();
+            let input_path = input_dir.path().join("parity-graph.json");
+            fs::write(
+                &input_path,
+                serde_json::to_string(&json!({"manifest": manifest, "tasks": tasks})).unwrap(),
+            )
+            .unwrap();
+            let script = r#"
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("spec_build_driver", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    data = json.load(handle)
+_, _, normalized_manifest = module.forge_manifest(data["manifest"])
+source = {"manifest": normalized_manifest, "tasks": data["tasks"]}
+sys.stdout.write(module.canonical_sha256(source))
+"#;
+            let output = std::process::Command::new("python3")
+                .args(["-c", script])
+                .arg(&driver)
+                .arg(&input_path)
+                .output()
+                .expect("python3 must run the packaged driver for the schema-parity test");
+            assert!(
+                output.status.success(),
+                "packaged driver parity probe failed (status {:?}):\nstdout: {}\nstderr: {}",
+                output.status.code(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            String::from_utf8(output.stdout)
+                .expect("driver parity probe must print UTF-8")
+                .trim()
+                .to_owned()
+        };
+
+        // The arm CLI's digest path: parse the manifest, canonicalize, hash.
+        let cli_digest = |manifest: &Value, tasks: &Value| -> String {
+            let parsed: CampaignManifest = serde_json::from_value(manifest.clone())
+                .expect("the parity manifest must parse as a CampaignManifest");
+            validate_manifest(&parsed).expect("the parity manifest must validate");
+            sha256_json(&json!({"manifest": &parsed, "tasks": tasks}))
+                .expect("sha256_json must succeed on the parity graph")
+        };
+
+        // One manifest carrying every optional field at every level.
+        let manifest = json!({
+            "schemaVersion": 1,
+            "name": "parity",
+            "repository": {
+                "checkout": checkout,
+                "baseBranch": "main",
+                "remote": "origin",
+                "forge": "github"
+            },
+            "maxTasks": 4,
+            "maxParallel": 1,
+            "driverRuntimeMaxSec": 900,
+            "runtimeMaxSec": 86_400,
+            "pool": "campaign",
+            "mergeMethod": "squash",
+            "gitAiBinding": "off",
+            "gitAiAwaitSec": 60,
+            "agent": {
+                "adapter": "codex",
+                "argv": [BRIEF_SENTINEL],
+                "priority": "low",
+                "runtimeMaxSec": 14_400,
+                "approvalPolicy": "never",
+                "sandboxPolicy": "danger-full-access",
+                "diagnosisSandboxPolicy": "read-only",
+                "model": "parity/model"
+            },
+            "steward": {
+                "adapter": "narrator",
+                "argv": ["narrate"],
+                "env": {"STEWARD_MODE": "narrate"},
+                "finalMessagePattern": "^TALLY_FINAL_MESSAGE=(.*)$",
+                "runtimeMaxSec": 900
+            },
+            "gates": [
+                {
+                    "kind": "command",
+                    "id": "gate-command",
+                    "preflightArgv": ["true"],
+                    "argv": ["true"],
+                    "runtimeMaxSec": 900
+                },
+                {
+                    "kind": "forbidPaths",
+                    "id": "gate-forbid",
+                    "forbidPaths": ["*.db"],
+                    "runtimeMaxSec": 900
+                }
+            ],
+            "tasks": [
+                {
+                    "id": "task-a",
+                    "kind": "implementation",
+                    "issue": 101,
+                    "dependencies": [],
+                    "conflictDomains": ["src"]
+                },
+                {
+                    "id": "task-b",
+                    "kind": "checkpoint",
+                    "issue": 102,
+                    "dependencies": ["task-a"],
+                    "argv": ["true"],
+                    "runtimeMaxSec": 60
+                }
+            ]
+        });
+        let tasks = json!([
+            {"number": 101, "title": "Implement the thing", "body": "Brief for task-a."},
+            {"number": 102, "title": "Checkpoint the thing", "body": "Brief for task-b."}
+        ]);
+
+        assert_eq!(
+            cli_digest(&manifest, &tasks),
+            driver_digest(&manifest, &tasks),
+            "the CLI and the packaged driver disagree on the campaign graph digest \
+             for a manifest carrying every optional field; a forge-native campaign \
+             would fail reconcile with this skew"
+        );
+
+        // The same graph with every optional field left out, so each half fills
+        // it from its OWN default. This is the shape an ad-hoc campaign manifest
+        // has, and it is the one that failed at dotfiles#163: a field the two
+        // halves default differently is invisible to the maximal fixture above.
+        let defaults = json!({
+            "schemaVersion": 1,
+            "name": "parity",
+            "repository": {"checkout": checkout},
+            "agent": {},
+            "gates": [{"kind": "forbidPaths", "id": "gate-forbid", "forbidPaths": ["*.db"]}],
+            "tasks": [
+                {"id": "task-a", "kind": "implementation", "issue": 101}
+            ]
+        });
+        let default_tasks = json!([
+            {"number": 101, "title": "Implement the thing", "body": "Brief for task-a."}
+        ]);
+        assert_eq!(
+            cli_digest(&defaults, &default_tasks),
+            driver_digest(&defaults, &default_tasks),
+            "the CLI and the packaged driver disagree on the campaign graph digest \
+             for a manifest that leaves every optional field to each half's own \
+             default; a forge-native campaign would fail reconcile with this skew"
+        );
+
+        // Explicit nulls, the third way the two halves can disagree: absent
+        // (defaulted) and present-but-null are different manifests, and the CLI
+        // reaches them through `Option::None` while the driver reaches them
+        // through Python `None`. An operator whose adapter declares no
+        // read-only policy writes exactly this.
+        let mut nulled = defaults.clone();
+        nulled["agent"] = json!({
+            "diagnosisSandboxPolicy": null,
+            "approvalPolicy": null,
+            "sandboxPolicy": null,
+            "runtimeMaxSec": null,
+            "model": null
+        });
+        assert_eq!(
+            cli_digest(&nulled, &default_tasks),
+            driver_digest(&nulled, &default_tasks),
+            "the CLI and the packaged driver disagree on the campaign graph digest \
+             for a manifest whose optional agent fields are explicitly null"
+        );
+    }
+
+    /// #433: the reconcile digest-mismatch receipt must stop starving the
+    /// operator. Two manifests differing in exactly one nested key must yield a
+    /// receipt that prints BOTH digests and names that exact canonical path —
+    /// presence/shape only, never the value. Removing the path computation from
+    /// the driver makes this red, which is the mutation this test pins.
+    #[test]
+    fn digest_mismatch_receipt_names_both_digests_and_the_first_divergent_path() {
+        let repo_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let driver = repo_root.join("examples/flows/spec_build_driver.py");
+        assert!(
+            driver.is_file(),
+            "packaged driver missing: {}",
+            driver.display()
+        );
+
+        // One agent, shared shape; the live side carries exactly one extra
+        // nested key, exactly the #429 skew shape.
+        let agent = json!({
+            "adapter": "codex",
+            "argv": [BRIEF_SENTINEL],
+            "priority": "low",
+            "runtimeMaxSec": 14_400,
+            "approvalPolicy": "never",
+            "sandboxPolicy": "danger-full-access",
+            "model": null
+        });
+        let armed_agent = agent.clone();
+        let mut live_agent = agent.clone();
+        live_agent["diagnosisSandboxPolicy"] = json!("read-only");
+        let manifest = |agent: Value| {
+            json!({
+                "schemaVersion": 1,
+                "name": "parity",
+                "agent": agent,
+                "tasks": []
+            })
+        };
+        let armed = manifest(armed_agent);
+        let live = manifest(live_agent);
+        let tasks = json!([]);
+
+        let input_dir = tempfile::tempdir().unwrap();
+        let input_path = input_dir.path().join("divergence.json");
+        fs::write(
+            &input_path,
+            serde_json::to_string(&json!({"armed": armed, "live": live, "tasks": tasks})).unwrap(),
+        )
+        .unwrap();
+        let script = r#"
+import importlib.util
+import json
+import sys
+
+spec = importlib.util.spec_from_file_location("spec_build_driver", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    data = json.load(handle)
+tasks = data["tasks"]
+armed_digest = module.canonical_sha256({"manifest": data["armed"], "tasks": tasks})
+live_digest = module.canonical_sha256({"manifest": data["live"], "tasks": tasks})
+receipt = module.graph_digest_mismatch_receipt(
+    data["armed"], data["live"], armed_digest, live_digest
+)
+path = module.first_divergent_canonical_path(data["armed"], data["live"])
+print(json.dumps({
+    "armedDigest": armed_digest,
+    "liveDigest": live_digest,
+    "receipt": receipt,
+    "path": path,
+}))
+"#;
+        let output = std::process::Command::new("python3")
+            .args(["-c", script])
+            .arg(&driver)
+            .arg(&input_path)
+            .output()
+            .expect("python3 must run the packaged driver for the divergence test");
+        assert!(
+            output.status.success(),
+            "packaged driver divergence probe failed (status {:?}):\nstdout: {}\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let probe: Value = serde_json::from_str(
+            &String::from_utf8(output.stdout).expect("divergence probe must print UTF-8"),
+        )
+        .expect("divergence probe must print JSON");
+
+        let armed_digest = probe["armedDigest"].as_str().unwrap();
+        let live_digest = probe["liveDigest"].as_str().unwrap();
+        let receipt = probe["receipt"].as_str().unwrap();
+        assert_ne!(armed_digest, live_digest);
+        assert_eq!(
+            probe["path"].as_str().unwrap(),
+            "agent.diagnosisSandboxPolicy: absent-in-armed / present-in-live"
+        );
+        // Both digests, in the arm CLI's `sha256:` form.
+        assert!(receipt.contains(armed_digest), "{receipt}");
+        assert!(receipt.contains(live_digest), "{receipt}");
+        // The first divergent canonical path, prefixed under the manifest.
+        assert!(
+            receipt.contains(
+                "manifest.agent.diagnosisSandboxPolicy: absent-in-armed / present-in-live"
+            ),
+            "{receipt}"
+        );
+        // The existing instruction survives: this adds evidence, it does not
+        // change the verdict.
+        assert!(
+            receipt.contains("inspect it and explicitly re-arm"),
+            "{receipt}"
+        );
+        // The receipt must not widen what it publishes: the withheld value
+        // never appears.
+        assert!(!receipt.contains("read-only"), "{receipt}");
+    }
+
     #[test]
     fn registration_v2_round_trips_local_authority() {
         let root = tempfile::tempdir().unwrap();
@@ -4577,6 +5000,7 @@ mod tests {
             sub_issue_walk: true,
             last_observation: None,
             last_forge_observation: None,
+            projection_wait_ms: Some(240_000),
             flow: PathBuf::from("/nix/store/flow.js"),
             driver: PathBuf::from("/nix/store/driver"),
             workspace_root: PathBuf::from("/srv/tally-campaigns"),
@@ -4591,6 +5015,139 @@ mod tests {
             loaded.approved_graph_digest,
             registration.approved_graph_digest
         );
+        // #432: the durable projection wait survives the round trip, which is
+        // what makes `campaign poll` dispatch later passes with the same
+        // widened window the operator armed with.
+        assert_eq!(loaded.projection_wait_ms, Some(240_000));
+    }
+
+    /// #432 acceptance 2, the DELIVERY half of the seam.
+    ///
+    /// Recording `--projection-wait-ms` in the registration is worth nothing on
+    /// its own: what the operator is promised is that every pass this campaign
+    /// dispatches waits that long. `dispatch_flow_argv` is the only place that
+    /// promise is kept, so it is asserted here directly — a registration
+    /// carrying `Some(n)` must put `--result-projection-wait-ms n` on the
+    /// dispatched pass's argv, spelled exactly as `FlowRunArgs` parses it.
+    ///
+    /// The `None` half is not decoration. This argv is hashed into the enqueue
+    /// payload, so a stray element would move the payload identity of every
+    /// campaign armed without the flag; it is asserted element-by-element
+    /// against the literal pre-#432 shape.
+    ///
+    /// Deleting the `--result-projection-wait-ms` push from `dispatch_flow_argv`
+    /// makes this test red — that mutation used to leave the whole crate green.
+    #[test]
+    fn a_recorded_projection_wait_reaches_the_dispatched_pass_argv() {
+        let executable = Path::new("/nix/store/tally/bin/tally");
+        let flow = Path::new("/nix/store/spec-build.js");
+
+        // The pre-#432 shape, byte for byte. A campaign armed without the flag
+        // must dispatch exactly this.
+        let unset = dispatch_flow_argv(executable, flow, 51, None);
+        assert_eq!(
+            unset,
+            vec![
+                "/nix/store/tally/bin/tally".to_owned(),
+                "flow".to_owned(),
+                "run".to_owned(),
+                "/nix/store/spec-build.js".to_owned(),
+                "--args-from-brief".to_owned(),
+                "--max-nodes".to_owned(),
+                "51".to_owned(),
+            ],
+            "a campaign armed without --projection-wait-ms must dispatch the \
+             pre-#432 argv byte-identically; this vector is hashed into the \
+             enqueue payload"
+        );
+
+        // The recorded wait, delivered.
+        let widened = dispatch_flow_argv(executable, flow, 51, Some(240_000));
+        assert_eq!(
+            widened,
+            [
+                unset.as_slice(),
+                &[
+                    "--result-projection-wait-ms".to_owned(),
+                    "240000".to_owned()
+                ]
+            ]
+            .concat(),
+            "a registration carrying a projection wait must put it on the \
+             dispatched pass's argv"
+        );
+
+        // The flag this argv names must be the flag `flow run` parses, or the
+        // dispatched pass dies on an unknown argument instead of waiting.
+        let parsed = Opts::try_parse_from(widened.iter().map(String::as_str))
+            .expect("the dispatched argv must parse as a tally invocation");
+        assert!(matches!(
+            parsed.command,
+            Some(Command::Flow {
+                command: FlowCommand::Run(FlowRunArgs {
+                    args_from_brief: true,
+                    max_nodes: 51,
+                    result_projection_wait_ms: Some(240_000),
+                    ..
+                })
+            })
+        ));
+    }
+
+    /// #432, the arm-side half of the refusal (the flow-side zero and
+    /// unparsable refusals are pinned in `cli::flow::tests`). A zero recorded
+    /// here would be durable: every pass this campaign ever dispatches,
+    /// including the unattended poll ones, would then die on its own argv.
+    #[test]
+    fn a_zero_projection_wait_is_refused_at_arm() {
+        assert_eq!(validated_projection_wait_ms(None).unwrap(), None);
+        assert_eq!(
+            validated_projection_wait_ms(Some(240_000)).unwrap(),
+            Some(240_000)
+        );
+        assert_eq!(validated_projection_wait_ms(Some(1)).unwrap(), Some(1));
+        let refused = validated_projection_wait_ms(Some(0)).unwrap_err();
+        assert!(
+            refused.to_string().contains("--projection-wait-ms"),
+            "{refused}"
+        );
+    }
+
+    /// #432 acceptance 2, the seam that actually reaches a campaign pass. A
+    /// registration written before `--projection-wait-ms` existed carries no
+    /// field at all; it must still load, and it must leave the flow host's own
+    /// default alone rather than being refused or defaulted to zero.
+    #[test]
+    fn a_registration_without_a_projection_wait_still_loads() {
+        let root = tempfile::tempdir().unwrap();
+        let state_dir = root.path();
+        let url = "https://github.com/acme/widgets/issues/42";
+        let path = registration_path(state_dir, url);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            serde_json::to_string(&json!({
+                "schemaVersion": REGISTRY_SCHEMA_VERSION,
+                "registrationId": uuid::Uuid::now_v7().to_string(),
+                "issueUrl": url,
+                "repository": "acme/widgets",
+                "issueNumber": 42,
+                "armedAt": "2026-08-01T00:00:00Z",
+                "armSerial": 1,
+                "approvedGraphDigest": format!("sha256:{}", "a".repeat(64)),
+                "authenticatedActor": "operator",
+                "allowedActors": ["operator"],
+                "allowTestLocalForge": false,
+                "subIssueWalk": true,
+                "flow": "/nix/store/flow.js",
+                "driver": "/nix/store/driver",
+                "workspaceRoot": "/srv/tally-campaigns",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let loaded = read_registration(&path).unwrap();
+        assert_eq!(loaded.projection_wait_ms, None);
     }
 
     fn codex_shaped_adapter(commit_capable: &[&str]) -> AdapterConfig {
@@ -4634,6 +5191,7 @@ mod tests {
             runtime_max_sec: default_agent_runtime_max_sec(),
             approval_policy: default_agent_approval_policy(),
             sandbox_policy: sandbox.map(str::to_owned),
+            diagnosis_sandbox_policy: default_agent_diagnosis_sandbox_policy(),
             model: None,
         }
     }

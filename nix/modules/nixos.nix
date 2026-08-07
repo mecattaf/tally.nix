@@ -363,6 +363,17 @@ in
       ];
       environment.etc."tally/config.json".source = checkedConfig;
 
+      # The deployment's data directory in the login environment as well as in
+      # the units below (#416). The units are given `--data-dir` explicitly and
+      # never needed it; the operator's own shell is where an omitted
+      # `--data-dir` used to resolve to `~/.local/share/tally` and turn
+      # `reader-state archive` into a silent no-op with a success message.
+      # This store is mode 0700 and owned by `cfg.user`, so an operator who is
+      # not that user now gets a refusal naming the path instead — which is the
+      # point: the failure becomes visible. `mkDefault`, so a host that wants a
+      # different value keeps it.
+      environment.variables.TALLY_DATA_DIR = lib.mkDefault (toString cfg.dataDir);
+
       users.groups.${cfg.group} = { };
       users.users.${cfg.user} = {
         isSystemUser = true;
@@ -429,6 +440,11 @@ in
             "TALLY_CONFIG_GENERATION=${checkedConfig}"
             "TALLY_NIX_PROGRAM=${pkgs.nix}/bin/nix"
             "TALLY_NIX_STORE_PROGRAM=${pkgs.nix}/bin/nix-store"
+            # The deployment's data directory, exported wherever this module
+            # configures one (#416): a direct-file verb that resolves its
+            # default through TALLY_DATA_DIR aims at this store instead of
+            # creating a fresh one wherever its XDG fallback lands.
+            "TALLY_DATA_DIR=${toString cfg.dataDir}"
           ];
           RuntimeDirectory = "tally";
           RuntimeDirectoryMode = "0700";
@@ -481,7 +497,10 @@ in
             "${witnessEmitter}/bin/tally-witness-emit"
             "%i"
           ];
-          Environment = [ "TALLY_ATTESTATION_LEDGER=${toString cfg.dataDir}/attestations.jsonl" ];
+          Environment = [
+            "TALLY_ATTESTATION_LEDGER=${toString cfg.dataDir}/attestations.jsonl"
+            "TALLY_DATA_DIR=${toString cfg.dataDir}"
+          ];
           UMask = "0077";
           NoNewPrivileges = true;
           ProtectSystem = "strict";
@@ -538,7 +557,10 @@ in
           Group = cfg.group;
           TimeoutStartSec = "infinity";
           ExecStart = lib.escapeShellArgs (common.mkRetentionArgv cfg);
-          Environment = [ "PATH=${lib.makeBinPath [ pkgs.nix ]}" ];
+          Environment = [
+            "PATH=${lib.makeBinPath [ pkgs.nix ]}"
+            "TALLY_DATA_DIR=${toString cfg.dataDir}"
+          ];
           UMask = "0077";
           NoNewPrivileges = true;
           PrivateTmp = true;

@@ -20,6 +20,7 @@ pub(super) struct InheritedFlowEnvironment {
 #[derive(Debug, Default)]
 pub(super) struct InvocationEnvironment {
     pub(super) rpc_timeout: Option<OsString>,
+    pub(super) result_projection_timeout: Option<OsString>,
     pub(super) flow_runner: Option<InheritedFlowEnvironment>,
 }
 
@@ -40,6 +41,7 @@ impl InvocationEnvironment {
         });
         Self {
             rpc_timeout: std::env::var_os(RPC_TIMEOUT_ENV),
+            result_projection_timeout: std::env::var_os(RESULT_PROJECTION_TIMEOUT_ENV),
             flow_runner,
         }
     }
@@ -86,6 +88,7 @@ pub(super) async fn run_flow(
     rpc_timeout: Duration,
     command: FlowCommand,
     inherited: InheritedFlowEnvironment,
+    result_projection_timeout: Option<OsString>,
 ) -> Result<()> {
     match command {
         FlowCommand::Cancel(args) => {
@@ -158,6 +161,10 @@ pub(super) async fn run_flow(
                 return Err(invalid("--rpc-call-deadline-sec must be greater than zero"));
             }
             let rpc_call_timeout = args.rpc_call_deadline_sec.map(Duration::from_secs);
+            let projection_wait = resolve_result_projection_timeout(
+                args.result_projection_wait_ms,
+                result_projection_timeout,
+            )?;
             let source = std::fs::read_to_string(&args.script)
                 .with_context(|| format!("cannot read flow script {}", args.script.display()))?;
             let InheritedFlowEnvironment {
@@ -270,6 +277,9 @@ pub(super) async fn run_flow(
                 if let Some(timeout) = rpc_call_timeout {
                     client = client.with_call_timeout(timeout);
                 }
+                if let Some(timeout) = projection_wait {
+                    client = client.with_result_projection_timeout(timeout);
+                }
                 let client = client.with_lifecycle_sink(Rc::clone(&lifecycle));
                 run_script(&source, Some(&script), Rc::new(client), lifecycle, options)
                     .map_err(Box::new)
@@ -295,6 +305,55 @@ pub(super) async fn run_flow(
             }
         }
     }
+}
+
+/// Resolve the projection wait from `--result-projection-wait-ms` and
+/// `TALLY_RESULT_PROJECTION_TIMEOUT_MS` (#432), flag first.
+///
+/// Neither set keeps the client's 10 s default. A set value must be a positive
+/// whole number of milliseconds: widening the window is how an operator who
+/// knows the daemon stalls out-waits the stall instead of losing a node whose
+/// exit evidence already passed. An unparsable or zero value is refused loudly
+/// rather than silently falling back to the default, and the flag wins over the
+/// environment — both rules mirror `--rpc-timeout-sec`/`TALLY_RPC_TIMEOUT_SEC`.
+///
+/// The flag is the seam that reaches a campaign. A campaign pass runs as a
+/// daemon-launched transient unit whose environment is built from an explicit
+/// `--setenv` list, so an operator's shell environment never reaches it;
+/// `campaign arm --projection-wait-ms` records the value and `dispatch_campaign`
+/// puts it on this flag. The environment channel is for a `tally flow run` the
+/// operator launches themselves.
+fn resolve_result_projection_timeout(
+    flag: Option<u64>,
+    value: Option<OsString>,
+) -> Result<Option<Duration>> {
+    if let Some(millis) = flag {
+        if millis == 0 {
+            return Err(invalid(
+                "--result-projection-wait-ms must be greater than zero",
+            ));
+        }
+        return Ok(Some(Duration::from_millis(millis)));
+    }
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let text = value.to_str().ok_or_else(|| {
+        invalid(format!(
+            "{RESULT_PROJECTION_TIMEOUT_ENV} must be valid UTF-8"
+        ))
+    })?;
+    let millis = text.parse::<u64>().map_err(|_| {
+        invalid(format!(
+            "{RESULT_PROJECTION_TIMEOUT_ENV} must be a whole number of milliseconds"
+        ))
+    })?;
+    if millis == 0 {
+        return Err(invalid(format!(
+            "{RESULT_PROJECTION_TIMEOUT_ENV} must be greater than zero"
+        )));
+    }
+    Ok(Some(Duration::from_millis(millis)))
 }
 
 fn load_flow_args(path: &Path) -> Result<Value> {
@@ -451,4 +510,49 @@ pub(super) fn flow_error(error: FlowError) -> anyhow::Error {
     };
     let message = serde_json::to_string(&error.report()).unwrap_or_else(|_| error.to_string());
     anyhow::Error::new(ExitFailure { code, message })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #432 acceptance 2: the projection wait is configurable through
+    /// `--result-projection-wait-ms` and `TALLY_RESULT_PROJECTION_TIMEOUT_MS`.
+    /// Neither set keeps the client default (the caller does not override); a
+    /// positive value widens the window; a zero or unparsable value is refused
+    /// loudly rather than silently falling back; and the flag wins over the
+    /// environment, because the flag is the channel a campaign dispatch uses.
+    #[test]
+    fn result_projection_timeout_override_is_parsed_and_refused_loudly() {
+        assert_eq!(resolve_result_projection_timeout(None, None).unwrap(), None);
+        assert_eq!(
+            resolve_result_projection_timeout(None, Some(OsString::from("300000"))).unwrap(),
+            Some(Duration::from_millis(300_000))
+        );
+        assert_eq!(
+            resolve_result_projection_timeout(None, Some(OsString::from("1"))).unwrap(),
+            Some(Duration::from_millis(1))
+        );
+        assert!(resolve_result_projection_timeout(None, Some(OsString::from("0"))).is_err());
+        assert!(resolve_result_projection_timeout(None, Some(OsString::from("10s"))).is_err());
+        assert!(resolve_result_projection_timeout(None, Some(OsString::from("-5"))).is_err());
+        assert!(resolve_result_projection_timeout(None, Some(OsString::from(""))).is_err());
+
+        assert_eq!(
+            resolve_result_projection_timeout(Some(240_000), None).unwrap(),
+            Some(Duration::from_millis(240_000))
+        );
+        assert!(resolve_result_projection_timeout(Some(0), None).is_err());
+        // The flag wins, and it wins even over an environment value the
+        // environment parser would have refused.
+        assert_eq!(
+            resolve_result_projection_timeout(Some(240_000), Some(OsString::from("5"))).unwrap(),
+            Some(Duration::from_millis(240_000))
+        );
+        assert_eq!(
+            resolve_result_projection_timeout(Some(240_000), Some(OsString::from("nonsense")))
+                .unwrap(),
+            Some(Duration::from_millis(240_000))
+        );
+    }
 }

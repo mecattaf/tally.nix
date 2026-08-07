@@ -166,7 +166,7 @@ fields for exactly that:
 |---|---|
 | `transient` | `true` when repeating the identical command can produce a different answer; `false` when it cannot. |
 | `resolution` | The bounded operation that clears it: `retry`, `supersede`, `run-successor`, `investigate`, or `repair-lineage-ledger`. |
-| `remedy` | The `tally flow supersede` invocation that clears this run, with the successor UUID left as a placeholder because it must be persisted before the call. It is <!-- remedy-nullity:start -->`null` when no single command does — including when no `flowRunId` is known, since the command needs one<!-- remedy-nullity:end -->. |
+| `remedy` | The `tally flow supersede` invocation that clears this run, with the successor UUID left as a placeholder because it must be persisted before the call. It is <!-- remedy-nullity:start -->`null` when no single command does — including when no `flowRunId` is known, since the command needs one, and when the `flowRunId` given reads as a command flag rather than a run id, since interpolating it would advertise an invocation that cannot parse<!-- remedy-nullity:end -->. |
 
 The classification is fixed per code and is the same wherever the error was raised — the
 runner's own startup scan, a daemon refusal handed back mid-run, or the client's translation of

@@ -322,6 +322,113 @@ def canonical_sha256(value: Any) -> str:
     return "sha256:" + hashlib.sha256(encoded).hexdigest()
 
 
+def json_type(value: Any) -> str:
+    """The JSON type name of a canonical value, with `bool` told apart from
+    `integer` (Python subclasses the former into the latter, but canonical
+    JSON keeps `true` and `1` distinct)."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, dict):
+        return "object"
+    return "unknown"
+
+
+def first_divergent_canonical_path(armed: Any, live: Any, prefix: str = "") -> str | None:
+    """The first canonical path at which two values disagree, or None if equal.
+
+    Walks canonical JSON key order (sorted keys), so the answer is
+    deterministic and identical to the order `canonical_sha256` hashes. (#433)
+
+    What it publishes, stated exactly, because a receipt that under-states its
+    own reach is worse than one that says nothing. The answer is a path plus a
+    shape: `absent-in-armed`/`present-in-live`, a JSON type name, an array
+    length, or the bare fact that a scalar differs. It is never a value. A path
+    segment is a manifest key name or an array index, so a key an operator
+    chose -- a gate id, a task id, a steward environment variable's NAME --
+    can appear; the string, number or path stored under it cannot. Task titles
+    and bodies are outside the manifest, and this walk is only ever given the
+    two manifests, so operator prose never reaches it at all.
+    """
+    where = prefix or "<root>"
+    if isinstance(armed, dict) and isinstance(live, dict):
+        for key in sorted(set(armed) | set(live)):
+            child = f"{prefix}.{key}" if prefix else key
+            if key not in armed:
+                return f"{child}: absent-in-armed / present-in-live"
+            if key not in live:
+                return f"{child}: present-in-armed / absent-in-live"
+            found = first_divergent_canonical_path(armed[key], live[key], child)
+            if found is not None:
+                return found
+        return None
+    if isinstance(armed, list) and isinstance(live, list):
+        if len(armed) != len(live):
+            return f"{where}: array-length armed={len(armed)} live={len(live)}"
+        for index, (armed_item, live_item) in enumerate(zip(armed, live)):
+            found = first_divergent_canonical_path(
+                armed_item, live_item, f"{prefix}[{index}]"
+            )
+            if found is not None:
+                return found
+        return None
+    if type(armed) is not type(live):
+        return f"{where}: type-mismatch armed={json_type(armed)} live={json_type(live)}"
+    if armed != live:
+        return f"{where}: value-differs ({json_type(armed)}); value withheld"
+    return None
+
+
+def graph_digest_mismatch_receipt(
+    armed_manifest: Any,
+    live_manifest: dict[str, Any],
+    admitted_digest: str,
+    live_digest: str,
+) -> str:
+    """The reconcile digest-mismatch receipt, with the evidence to act on it.
+
+    Prints BOTH digests in the `sha256:` form the arm CLI uses, and the first
+    divergent canonical path from a canonical-key-order walk of the armed
+    manifest against the live normalized one (#433). The walk reports presence
+    and shape only — never values — because canonical values can carry operator
+    content (task bodies). The gate's verdict is unchanged: it still refuses
+    and tells the operator to inspect and re-arm; this only stops the receipt
+    starving them of the evidence. If no armed manifest was recorded (a
+    campaign armed before this existed), the path is said to be unavailable
+    rather than invented.
+    """
+    lines = [
+        "live issue executable graph does not match the armed digest; "
+        "inspect it and explicitly re-arm",
+        f"armed digest: {admitted_digest}",
+        f"live digest: {live_digest}",
+    ]
+    if isinstance(armed_manifest, dict):
+        path = first_divergent_canonical_path(armed_manifest, live_manifest)
+        if path is None:
+            lines.append(
+                "first divergent canonical path: none within the manifest; the "
+                "divergence lies in the task set or its canonicalization"
+            )
+        else:
+            lines.append(f"first divergent canonical path: manifest.{path}")
+    else:
+        lines.append(
+            "first divergent canonical path: unavailable (no armed manifest "
+            "recorded at arm); compare the armed and live digests above"
+        )
+    return "; ".join(lines)
+
+
 def run(
     command: list[str],
     *,
@@ -1238,6 +1345,30 @@ def forge_gates(value: Any) -> list[dict[str, Any]]:
     return result
 
 
+def forge_manifest_repository(value: Any) -> dict[str, Any]:
+    """`manifest.repository` with the arm CLI's own defaults filled in first.
+
+    `repo_config` validates a *brief's* `repositoryConfig`, which this driver
+    emits itself and therefore always spells in full. A campaign manifest is
+    written by hand, and the arm CLI's `CampaignRepository` defaults
+    `baseBranch`, `remote` and `forge`. Handing the raw manifest object to
+    `repo_config` made those three required here and optional there: a manifest
+    omitting any of them armed cleanly and then died at reconcile. The defaults
+    are spelled to match `CampaignRepository`'s exactly, so both halves
+    normalize the same manifest to the same canonical value (#429).
+    """
+    if not isinstance(value, dict):
+        fail("campaign manifest.repository must be an object")
+    return repo_config(
+        {
+            "baseBranch": "main",
+            "remote": "origin",
+            "forge": "github",
+            **value,
+        }
+    )
+
+
 def forge_manifest(
     value: Any,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
@@ -1267,7 +1398,7 @@ def forge_manifest(
     campaign = required_string(manifest.get("name"), "campaign manifest.name", 80)
     if not COMPONENT.fullmatch(campaign):
         fail("campaign manifest.name is not a safe component")
-    repository_config = repo_config(manifest.get("repository"))
+    repository_config = forge_manifest_repository(manifest.get("repository"))
     max_tasks = manifest.get("maxTasks", 64)
     if not isinstance(max_tasks, int) or isinstance(max_tasks, bool) or not 1 <= max_tasks <= 100:
         fail("campaign manifest.maxTasks must be in 1..=100")
@@ -1402,7 +1533,9 @@ def forge_manifest(
 
 
 def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
-    data = object_exact(brief, {"repository", "issue", "worklist"}, "reconcile brief")
+    data = object_exact(
+        brief, {"repository", "issue", "worklist", "armedManifest"}, "reconcile brief"
+    )
     repository = required_string(data.get("repository"), "repository")
     if not REPOSITORY.fullmatch(repository):
         fail("repository must use owner/name form")
@@ -1503,8 +1636,12 @@ def issue_graph_worklist(brief: dict[str, Any]) -> dict[str, Any]:
     digest = canonical_sha256(source_value)
     if digest != admitted_digest:
         fail(
-            "live issue executable graph does not match the armed digest; "
-            "inspect it and explicitly re-arm"
+            graph_digest_mismatch_receipt(
+                data.get("armedManifest"),
+                normalized_manifest,
+                admitted_digest,
+                digest,
+            )
         )
     for task in tasks:
         task["revision"] = canonical_sha256(
@@ -3284,7 +3421,9 @@ def action_reconcile(brief: dict[str, Any]) -> dict[str, Any]:
         for name in SEAM_COORDINATES:
             if brief.get(name) is not None:
                 fail(f"a forge-native campaign cannot carry {name}")
-        data = object_exact(brief, {"repository", "issue", "worklist"}, "reconcile brief")
+        data = object_exact(
+            brief, {"repository", "issue", "worklist", "armedManifest"}, "reconcile brief"
+        )
         worklist = issue_graph_worklist(data)
         campaign = worklist["config"]["campaign"]
         issue = campaign_issue(data.get("issue"))
@@ -3737,8 +3876,29 @@ def validated_diagnosis(diagnosis: str, gate_evidence: Any) -> str:
     return diagnosis
 
 
-def breach_note(diagnosis: str, detail_text: str) -> str:
-    """The posted breach body: a deterministic label plus witnessed evidence.
+# The label sentence each lane-aborting tree-delta verdict posts. Two verdicts
+# abort a lane and neither may be published under the other's sentence (#424):
+# a gate that CAUGHT an out-of-allowlist write and a gate that could not judge
+# the pass at all are different facts about the repository, and a receipt is a
+# claim surface.
+ABORT_REASONS = {
+    "tree-delta-breach": (
+        "Aborted the lane: a tree-delta permission breach found "
+        "out-of-allowlist change(s), so this task will not be retried."
+    ),
+    "tree-delta-ungated": (
+        "Aborted the lane: the tree-delta permission gate could not judge this "
+        "pass -- the agent node failed, so the ownership node never ran and "
+        "certified no paths, and this task declares no conflictDomains, leaving "
+        "no allowlist. No out-of-allowlist change has been established. Declare "
+        "conflictDomains for this task and re-arm; this task will not be retried "
+        "until then."
+    ),
+}
+
+
+def breach_note(diagnosis: str, detail_text: str, reason: str = "tree-delta-breach") -> str:
+    """The posted lane-abort body: a deterministic label plus witnessed evidence.
 
     #386: an out-of-allowlist delta aborts the lane -- a breach, not a
     gate-fail, because the write already happened and gates are for redoable
@@ -3746,13 +3906,14 @@ def breach_note(diagnosis: str, detail_text: str) -> str:
     wrote, so the driver's own tree-delta detail is always appended verbatim
     rather than merely required as a substring the model might paraphrase
     away. The heading stays `diagnosis_heading`'s ordinary shape -- the forge
-    read-back parses that exact prefix -- so the breach identifies itself
+    read-back parses that exact prefix -- so the abort identifies itself
     through this leading sentence instead of a second heading grammar.
+
+    #424: `reason` selects which leading sentence. Both abort and both are
+    priced identically; only one of them is a claim that a write happened, and
+    that claim is only made when the gate actually found one.
     """
-    parts = [
-        "Aborted the lane: a tree-delta permission breach found "
-        "out-of-allowlist change(s), so this task will not be retried.",
-    ]
+    parts = [ABORT_REASONS[reason]]
     if diagnosis:
         parts.append(diagnosis)
     if detail_text:
@@ -3760,7 +3921,9 @@ def breach_note(diagnosis: str, detail_text: str) -> str:
     return "\n\n".join(parts)
 
 
-def bounded_breach_note(diagnosis: str, detail_text: str) -> str:
+def bounded_breach_note(
+    diagnosis: str, detail_text: str, reason: str = "tree-delta-breach"
+) -> str:
     """`breach_note` held to the same public bound the ordinary path keeps.
 
     The ordinary steering path posts `bound_public_diagnosis(diagnosis)`, so
@@ -3771,11 +3934,11 @@ def bounded_breach_note(diagnosis: str, detail_text: str) -> str:
     what gives way, rather than truncating the paths off the end of the one
     comment that exists to name them.
     """
-    composed = breach_note(diagnosis, detail_text)
+    composed = breach_note(diagnosis, detail_text, reason)
     overflow = len(composed) - MAX_DIAGNOSIS_CHARS
     if overflow > 0:
         kept = max(0, len(diagnosis) - overflow)
-        composed = breach_note(diagnosis[:kept].rstrip(), detail_text)
+        composed = breach_note(diagnosis[:kept].rstrip(), detail_text, reason)
     # Backstop for the pathological case where the evidence alone exceeds the
     # bound: truncation there is unavoidable, and `bound_public_diagnosis`
     # leaves a visible marker rather than trimming silently.
@@ -3801,6 +3964,8 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         fields.add("breach")
     if "breachDetail" in brief:
         fields.add("breachDetail")
+    if "abortReason" in brief:
+        fields.add("abortReason")
     data = object_exact(brief, seam_fields(brief, fields), "steer brief")
     campaign = required_string(data.get("campaign"), "campaign")
     if not COMPONENT.fullmatch(campaign):
@@ -3823,6 +3988,11 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
     if attempt not in {1, 2}:
         fail("attempt must equal 1 or 2")
     breach = bool(data.get("breach", False))
+    # #424: which lane-aborting tree-delta verdict this receipt is for. Absent
+    # is the #386 breach, which is what every caller before this sent.
+    abort_reason = data.get("abortReason", "tree-delta-breach")
+    if abort_reason not in ABORT_REASONS:
+        fail("abortReason is not a declared lane-abort reason")
     thread_number, threads = steering_thread(
         repository, config, data, capabilities, task_id
     )
@@ -3869,7 +4039,7 @@ def action_steer(brief: dict[str, Any]) -> dict[str, Any]:
         if isinstance(detail, str) and detail.strip():
             detail_text, redacted_detail = redact_public_text(detail)
             detail_text = bound_public_diagnosis(detail_text)
-        composed = bounded_breach_note(diagnosis, detail_text)
+        composed = bounded_breach_note(diagnosis, detail_text, abort_reason)
         posted_comment: str | None = None
         for post_attempt in (1, 2):
             if any(receipt["attempt"] == post_attempt for receipt in task_receipts):
@@ -4493,18 +4663,30 @@ def worktree_call(operation: Any, *arguments: Any, **keywords: Any) -> Any:
         fail(error.message)
 
 
-def snapshot_before_agent(worktree: Path) -> None:
+def snapshot_before_agent(worktree: Path) -> bool:
     """The pre-agent change-set fingerprint the tree-delta gate compares
-    against (#386). Called once per `prep`, whether the lane is fresh or
-    resumed: on a resumed lane the worktree may already carry legitimate
-    uncommitted content from an earlier pass, and that is exactly the state
-    the gate must be able to tell a reversion of apart later, so every prep
-    of an implementation task takes a fresh baseline right before its own
-    agent dispatch -- the earliest point after the lane is known-good and
-    the latest point before anything the gate must witness could happen.
+    against (#386). Called once per `prep` of an implementation task -- the
+    earliest point after the lane is known-good and the latest point before
+    anything the gate must witness could happen.
+
+    **A baseline is never overwritten unjudged (#424).** `action_tree_delta`
+    clears the snapshot the instant it reads it, pass or fail, so a snapshot
+    still on disk at prep time means exactly one thing: the pass it belongs to
+    ended without the gate judging it. Overwriting it there was the laundering
+    path -- pass 1's agent clobbered an out-of-allowlist file and failed, pass
+    2's prep re-fingerprinted the worktree with that write already in it, and
+    the write could never be seen again by anything. So: judged (no snapshot on
+    disk) rotates, unjudged (snapshot present) is preserved, and the next gate
+    to run judges the whole span since the last judged baseline.
+
+    Returns whether a fresh baseline was taken, so a caller can say which of
+    the two happened rather than guess.
     """
+    if worktree_call(worktrees.read_change_set_snapshot, worktree) is not None:
+        return False
     fingerprint = worktree_call(worktrees.change_set_fingerprint, worktree)
     worktree_call(worktrees.write_change_set_snapshot, worktree, fingerprint)
+    return True
 
 
 def tally_executable(value: Any) -> Path:
@@ -5689,11 +5871,13 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
     uncommitted change back to its prior content is caught the same as a
     forward edit no commit ever recorded.
 
-    Scope, stated so it is not read wider than it is: this node runs after
-    the agent node passes and after `ownership`, so a pass whose agent node
-    fails returns before it and its uncommitted writes are not judged here.
-    A committed stray is still caught by `ownership` on the next pass; the
-    uncommitted case on a failing pass is open. Refs #424.
+    Scope (#424): this node runs on both outcomes of the agent node. On a pass
+    whose agent node passed it runs after `ownership`, which is what lets an
+    undeclared allowlist fall back to certified `ownedPaths`. On a pass whose
+    agent node FAILED it runs instead of `ownership` -- a failing agent is the
+    single most likely context for a rogue write, and it used to be the one
+    context this gate was silent in -- and `ownershipRan` is false, so no
+    `ownedPaths` exist and only a declared allowlist can govern.
 
     The allowlist is per-task, derived from the brief/worklist entry, with no
     silently permissive default -- an absent allowlist and an empty one are
@@ -5704,10 +5888,15 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
         allowlist, and not glob matching.
       - `task.conflictDomains` declared and explicitly empty (`[]`): the
         allowlist is empty, so any delta at all is a breach.
-      - `task.conflictDomains` absent: the allowlist falls back to exactly
-        `ownedPaths`, the paths the ownership node just certified as this
-        task's own committed change-set. The agent's proven work is
-        self-authorizing; nothing else is.
+      - `task.conflictDomains` absent AND `ownershipRan`: the allowlist falls
+        back to exactly `ownedPaths`, the paths the ownership node just
+        certified as this task's own committed change-set. The agent's proven
+        work is self-authorizing; nothing else is.
+      - `task.conflictDomains` absent AND ownership never ran: no allowlist,
+        no pass (#424). The node refuses, naming exactly why, and leaves the
+        snapshot on disk so the writes it could not judge stay judgeable by a
+        later pass that does have an allowlist. Passing here would be a gate
+        that reports success over content it never inspected.
 
     An out-of-allowlist delta fails this node with every offending path
     named -- the same mechanism every other campaign gate uses to become
@@ -5715,8 +5904,14 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
     ordinary witnessed job like any other campaign node.
     """
     data = object_exact(
-        brief, {"task", "workspace", "ownedPaths"}, "tree-delta brief"
+        brief, {"task", "workspace", "ownedPaths", "ownershipRan"}, "tree-delta brief"
     )
+    # Absent means true: the node's original and still most common caller is
+    # the post-ownership one, and a brief written before this field existed
+    # described exactly that call.
+    ownership_ran = data.get("ownershipRan", True)
+    if not isinstance(ownership_ran, bool):
+        fail("ownershipRan must be a boolean")
     task = data.get("task")
     if not isinstance(task, dict):
         fail("task must be an object")
@@ -5735,15 +5930,9 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
         fail("workspace.worktreePath must be an absolute existing directory")
     git(worktree, "rev-parse", "--git-dir")
 
-    before = worktree_call(worktrees.read_change_set_snapshot, worktree)
-    if before is None:
-        fail(
-            "no change-set snapshot was recorded before the agent node; "
-            "cannot evaluate the tree-delta gate"
-        )
-    after = worktree_call(worktrees.change_set_fingerprint, worktree)
-    deltas = worktrees.change_set_delta(before, after)
-
+    # The allowlist is settled before the snapshot is touched. A pass this gate
+    # cannot judge must leave the baseline exactly as it found it, and reading
+    # it here then refusing below would put the clear() between the two.
     raw_domains = task.get("conflictDomains")
     if isinstance(raw_domains, list) and raw_domains:
         allowlist = normalize_conflict_domains(
@@ -5753,10 +5942,32 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
     elif isinstance(raw_domains, list):
         allowlist = []
         basis = "declared-empty"
-    else:
+    elif ownership_ran:
         owned = data.get("ownedPaths")
         allowlist = list(string_list(owned, "ownedPaths")) if owned is not None else []
         basis = "owned-paths-fallback"
+    else:
+        # #424 rule 3: no allowlist, no pass. This is a gate refusing to
+        # certify, not the agent being at fault, so it must be loud and it must
+        # not look like a clean pass. The snapshot stays on disk: the writes
+        # this pass could not judge remain judgeable once an allowlist exists.
+        fail(
+            f"tree-delta gate refuses to judge task {task_id!r}: its agent node "
+            "failed, so the ownership node never ran and certified no ownedPaths, "
+            "and the task declares no conflictDomains -- there is no allowlist to "
+            "judge the worktree against. Declare conflictDomains for this task and "
+            "re-arm. The pre-agent baseline is left in place, so the writes this "
+            "pass could not judge are still judgeable then."
+        )
+
+    before = worktree_call(worktrees.read_change_set_snapshot, worktree)
+    if before is None:
+        fail(
+            "no change-set snapshot was recorded before the agent node; "
+            "cannot evaluate the tree-delta gate"
+        )
+    after = worktree_call(worktrees.change_set_fingerprint, worktree)
+    deltas = worktrees.change_set_delta(before, after)
 
     breaches = [
         delta
@@ -5782,6 +5993,11 @@ def action_tree_delta(brief: dict[str, Any]) -> dict[str, Any]:
         "checkedPaths": len(deltas),
         "allowlistBasis": basis,
         "allowlist": allowlist,
+        # #424: which of the gate's two call sites this verdict came from, so a
+        # reader of the witnessed result knows whether an `ownedPaths` fallback
+        # was even available to it -- and can see that a pass whose agent
+        # failed was in fact judged.
+        "ownershipRan": ownership_ran,
     }
 
 

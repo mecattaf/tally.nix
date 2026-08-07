@@ -65,6 +65,12 @@ use crate::flow_live::{LiveFlowClient, RunnerIdentity};
 
 const DEFAULT_RPC_TIMEOUT_SEC: u64 = 60;
 const RPC_TIMEOUT_ENV: &str = "TALLY_RPC_TIMEOUT_SEC";
+/// How long `flow run` waits for an advisory finalMessage projection after a
+/// node's exit evidence passes (#432). Milliseconds, so a test can widen the
+/// window without touching seconds. Unset keeps the 10 s default. It is
+/// captured before the inherited-environment sanitize removes `TALLY_*`, the
+/// same way `TALLY_RPC_TIMEOUT_SEC` is.
+const RESULT_PROJECTION_TIMEOUT_ENV: &str = "TALLY_RESULT_PROJECTION_TIMEOUT_MS";
 use adapter::*;
 use args::*;
 use campaign::*;
@@ -259,14 +265,28 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
             // exists to catch. Spending that alarm on a benign restart is the
             // cost being removed here.
             //
-            // Narrow on purpose: only the socket-absent case is absorbed, and
-            // the line naming it is still written, so an operator running the
-            // verb by hand still learns which case it was. Every other drain
-            // failure -- including a daemon that is listening and refuses --
-            // keeps its exit code.
+            // Narrow on purpose: only the socket-absent case and #427's
+            // deadline-expired case are absorbed, and the line naming each is
+            // still written, so an operator running the verb by hand still
+            // learns which case it was. Every other drain failure -- including
+            // a daemon that is listening and refuses -- keeps its exit code.
             match drained {
                 Err(error) if is_daemon_absent(&error) => {
                     let _ = out::write_error_line(format_args!("tally: {error:#}"));
+                    Ok(())
+                }
+                // #427: the daemon is present -- the connection was
+                // established -- but too busy to answer `queue.drain` within
+                // the deadline. The producer event files are durable on disk
+                // and the next `tally-drain` tick picks them up, so nothing is
+                // lost: the periodic drain records a retryable skip (systemd
+                // success plus the warning line below) instead of a unit
+                // failure the fleet watcher would report dozens of times a day.
+                Err(error) if is_drain_deadline_exceeded(&error) => {
+                    let _ = out::write_error_line(format_args!(
+                        "tally: {error:#} (retryable skip: the event files remain on disk and \
+                         the next drain picks them up)"
+                    ));
                     Ok(())
                 }
                 other => other,
@@ -305,6 +325,7 @@ async fn execute(opts: Opts, environment: InvocationEnvironment) -> Result<()> {
                 rpc_timeout,
                 command,
                 environment.flow_runner.unwrap_or_default(),
+                environment.result_projection_timeout,
             )
             .await
         }

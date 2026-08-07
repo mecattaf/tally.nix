@@ -1974,8 +1974,23 @@ async fn a_live_replay_divergence_names_the_current_hash_and_label_on_the_wire()
             // the same unchanged script, so they are the same string here. Making
             // them differ would mean changing the script between the two runs,
             // which the startup identity pin refuses before an ordinal is ever
-            // admitted, so no scenario in this suite can see it. The in-process
-            // tests in `tally-flow` cover the label sides.
+            // admitted, so no scenario in this suite can see it.
+            //
+            // What compensates for that blindness has to guard *this* refusal's
+            // raising site, and this refusal carries a `kernelError` (asserted
+            // below), so it is raised by the dedup-conflict path in
+            // `crates/tally/src/flow_live.rs::submission_error`. The tests that
+            // bind the two label members there, against two different strings,
+            // are in that same file:
+            // `flow_live::tests::matching_kernel_conflict_becomes_replay_divergence_with_both_labels`
+            // and `flow_live::tests::every_exit_twenty_refusal_carries_the_same_details_contract`.
+            // Swap the two members at that site and both go red.
+            //
+            // `payload_divergence_stops_admission_at_the_mismatched_ordinal`
+            // (crates/tally-flow/src/engine/tests.rs) binds the same two members
+            // additionally at the *runner's* own comparison site, which this
+            // fixture never reaches — extra coverage of a sibling site, not the
+            // guard for this one.
             assert_eq!(
                 details.get("currentLabel").and_then(Value::as_str),
                 Some("task-ref-child")
