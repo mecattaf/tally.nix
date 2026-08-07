@@ -176,6 +176,8 @@ impl FlowClient for TestClient {
     }
 }
 
+/// A frontier task shaped like `implementationTaskSchema`: the arm a file-based
+/// worklist produces.
 fn implementation_task(conflict_domains: Option<Value>) -> Value {
     let mut task = json!({
         "id": TASK_ID,
@@ -188,6 +190,30 @@ fn implementation_task(conflict_domains: Option<Value>) -> Value {
             {"id": "focused", "description": "The focused check passes.", "argv": ["true"]}
         ],
         "dependencies": []
+    });
+    if let Some(domains) = conflict_domains {
+        task["conflictDomains"] = domains;
+    }
+    task
+}
+
+/// A frontier task shaped like `issueTaskSchema`: the arm the forge-native
+/// issue-graph builder produces, and therefore the arm every ad-hoc campaign in
+/// production actually runs on. `taskSchema` is one `oneOf` over both arms and
+/// does not depend on the campaign mode, so a fixture may exercise this arm
+/// through the same run as the other one; what is being pinned is the schema,
+/// not the producer.
+fn issue_task(conflict_domains: Option<Value>) -> Value {
+    let mut task = json!({
+        "id": TASK_ID,
+        "kind": "implementation",
+        "title": "Build the thing",
+        "brief": {
+            "issue": {"number": "8", "url": "https://github.test/acme/spec/issues/8"},
+            "body": "Deliver the bounded behaviour."
+        },
+        "dependencies": [],
+        "revision": DIGEST
     });
     if let Some(domains) = conflict_domains {
         task["conflictDomains"] = domains;
@@ -446,8 +472,33 @@ fn a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure() {
     assert_eq!(steer["attempt"], json!(1), "{steer}");
 }
 
+/// One arm of the pin below: a frontier carrying `task` must be refused by the
+/// flow's own reconcile result schema, before any lane starts.
+fn assert_keyless_task_is_refused(arm: &str, task: Value) {
+    let client = TestClient::new(replies(
+        task,
+        Reply::passed(json!({
+            "taskId": TASK_ID,
+            "checkedPaths": 0,
+            "allowlistBasis": "declared",
+            "allowlist": [],
+            "ownershipRan": false
+        })),
+    ));
+    let error = *run(client.clone()).expect_err(&format!(
+        "the {arm} frontier task must be refused for carrying no conflictDomains"
+    ));
+
+    assert_eq!(error.code, "result-schema-mismatch", "{arm} arm: {error:?}");
+    assert!(
+        !client.submitted(&format!("prep-{TASK_ID}")),
+        "{arm} arm: the refusal must land before any lane starts; submissions were {:?}",
+        client.labels()
+    );
+}
+
 /// Why `treeDelta:ungated` cannot be reached through this flow, pinned rather
-/// than asserted in prose.
+/// than asserted in prose — on BOTH implementation arms of `taskSchema`.
 ///
 /// The refusal branch of `action_tree_delta` — #424 ruling 3, "no allowlist, no
 /// pass" — fires when the task declares no `conflictDomains` at all. The flow
@@ -460,28 +511,25 @@ fn a_failed_agent_pass_whose_gate_passes_still_reports_the_agent_failure() {
 /// reachable failed-agent paths are `declared` and `declared-empty` — both of
 /// which judge, and neither of which can silently pass.
 ///
-/// If a future change relaxes that schema, this test goes red and the doc
-/// sentence that depends on it has to be revisited rather than quietly becoming
-/// false.
+/// `taskSchema` is a `oneOf` over four arms and two of them are implementation
+/// arms: `implementationTaskSchema`, which a file-based worklist produces, and
+/// `issueTaskSchema`, which the forge-native issue-graph builder produces and
+/// which every ad-hoc campaign in production therefore runs on. Round 2 of the
+/// eval found that relaxing `required` on the second arm alone left every suite
+/// green, so both are exercised here. The `oneOf` does not depend on the
+/// campaign mode, so one run shape reaches both arms; what is pinned is the
+/// schema, not the producer. (The two checkpoint arms do not carry the key and
+/// do not need to: a checkpoint lane returns before the agent node and can
+/// reach neither treeDelta call.)
+///
+/// If a future change relaxes either arm, this test goes red and the doc and
+/// CHANGELOG sentences that depend on it have to be revisited rather than
+/// quietly becoming false.
 #[test]
 fn the_flow_cannot_send_an_implementation_task_without_conflict_domains() {
-    let task = implementation_task(None);
-    let client = TestClient::new(replies(
-        task,
-        Reply::passed(json!({
-            "taskId": TASK_ID,
-            "checkedPaths": 0,
-            "allowlistBasis": "declared",
-            "allowlist": [],
-            "ownershipRan": false
-        })),
-    ));
-    let error = *run(client.clone()).expect_err("the frontier task must be refused");
-
-    assert_eq!(error.code, "result-schema-mismatch", "{error:?}");
-    assert!(
-        !client.submitted(&format!("prep-{TASK_ID}")),
-        "the refusal must land before any lane starts; submissions were {:?}",
-        client.labels()
+    assert_keyless_task_is_refused(
+        "file-based implementationTaskSchema",
+        implementation_task(None),
     );
+    assert_keyless_task_is_refused("forge-native issueTaskSchema", issue_task(None));
 }

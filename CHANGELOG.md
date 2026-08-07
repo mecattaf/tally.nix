@@ -158,9 +158,22 @@ gate was silent in.
   declaration, not an absence, and still judges (any delta is a breach). The
   refusal is a fail-closed guard on the driver's own contract rather than a
   state a campaign reaches: `spec-build.js`'s reconcile result schema requires
-  `conflictDomains` on every implementation task in the frontier, so the bases
-  reachable on a failed pass are `declared` and `declared-empty` — both judge.
-  That reachability is pinned by a test, not asserted in prose.
+  `conflictDomains` on every implementation task in the frontier — on the
+  file-based arm and on the forge-native arm alike — so the bases reachable on a
+  failed pass are `declared` and `declared-empty`, and both judge. That
+  reachability is pinned by a test on both arms, not asserted in prose:
+  relaxing `required` on either arm makes
+  `the_flow_cannot_send_an_implementation_task_without_conflict_domains` red,
+  naming the arm that was relaxed.
+- The same is true of the passing path, and `doc/src/flows/campaigns.md` now
+  says so: through the flow the gate is governed by `declared` or
+  `declared-empty` on BOTH agent outcomes. The `owned-paths-fallback` derivation
+  needs a task whose `conflictDomains` key is absent rather than empty, and both
+  worklist producers normalize an omitted field to `[]`, so like the ungated
+  refusal it is reachable only through the directly-invoked driver. Whether the
+  producers should instead preserve absence is an open design question tracked
+  in #439; the doc describes the shipped behaviour and does not promise either
+  resolution.
 - The refusal is priced as a gate verdict (`failureClass` → `"ungated"`), never
   as the agent's work being wrong: it spends none of the task's two steering
   attempts. It aborts the lane through the same both-receipts-at-once path a

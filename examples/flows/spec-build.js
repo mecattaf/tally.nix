@@ -1988,8 +1988,9 @@ function sweepDeferral(sweepNode) {
       // can only fail this node by breaching them, and a task that declares
       // none can only fail it by being unjudgeable. In practice only the first
       // arm is reachable from here -- `reconcileSchema` requires
-      // `conflictDomains` on every implementation task in the frontier, so a
-      // task without it never reaches a lane at all (pinned by
+      // `conflictDomains` on every implementation task in the frontier, on both
+      // the file-based and the forge-native task arm, so a task without it
+      // never reaches a lane at all (both arms pinned by
       // `the_flow_cannot_send_an_implementation_task_without_conflict_domains`).
       // The second arm is kept as the honest label for the driver's own
       // fail-closed refusal, so that if the schema ever relaxes, the receipt
@@ -2090,6 +2091,14 @@ function sweepDeferral(sweepNode) {
     // after ownership so an absent `conflictDomains` can fall back to
     // `ownership.result.ownedPaths`, the paths the ownership node just
     // certified as this task's own committed change-set.
+    //
+    // That fallback is not reachable from here today: `taskSchema` requires
+    // `conflictDomains` on both implementation arms and both worklist producers
+    // normalize an omitted field to `[]`, so the gate sees a declared-empty
+    // allowlist rather than an absent one and every delta breaches. The
+    // certified paths are still sent, because whether the producers should
+    // preserve absence and make this fallback live is the open question in
+    // #439; nothing here decides it.
     const treeDelta = await driverNode(
       "treeDelta",
       {

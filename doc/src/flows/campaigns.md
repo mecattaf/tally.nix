@@ -971,22 +971,34 @@ the worktree afterwards, so an appearing, disappearing or edited path is caught
 whether or not any commit records it.
 
 It runs on both outcomes of the agent node. After a passing agent it runs after
-`ownership`, which lets a task that declares no `conflictDomains` fall back to
-the paths ownership just certified as the task's own committed change-set. After
-a *failing* agent — the single most likely context for a rogue write — it runs
-in place of `ownership`, so only a declared allowlist can govern: there are no
-certified owned paths to fall back to. A declared allowlist that is explicitly
-empty is still a declaration: every delta is then a breach, so a failed pass is
-judged either way and cannot quietly pass.
+`ownership`; after a *failing* agent — the single most likely context for a
+rogue write — it runs in place of `ownership`, since ownership never ran. What
+governs is the same on both outcomes: the task's declared `conflictDomains`. A
+non-empty declaration allows exactly those prefixes. A declaration that is
+explicitly empty allows nothing, so every delta is a breach. A failed pass is
+therefore judged either way and cannot quietly pass.
 
-A task that declares no `conflictDomains` at all could not be judged on that
-path, and the gate refuses rather than reporting success over content it never
-inspected — the refusal aborts the lane with a receipt naming exactly why, and
-is priced as a gate verdict rather than as the agent's work being wrong, so it
-spends none of the task's steering attempts. That refusal is a fail-closed guard
-on the driver's own contract rather than a state a campaign reaches: the flow's
-reconcile result schema requires `conflictDomains` on every implementation task
-in the frontier, so a task without it is refused before any lane starts.
+Those two are the only bases a campaign reaches. The driver knows two further
+allowlist derivations, and both require a task whose `conflictDomains` key is
+*absent* rather than empty — a shape the flow cannot produce, because its
+reconcile result schema requires the key on every implementation task in the
+frontier (on both the file-based and the forge-native arm), so such a task is
+refused before any lane starts. With the key absent the driver would, on the
+passing path, fall back to the paths `ownership` certified as the task's own
+committed change-set; and on the failing path, where there is nothing certified
+to fall back to, refuse outright rather than report a clean gate — aborting the
+lane with a receipt naming exactly why, priced as a gate verdict rather than as
+the agent's work being wrong, so it spends none of the task's steering attempts.
+Both are fail-closed guards on the driver's own contract, which is directly
+invocable; neither is a state a campaign reaches today.
+
+That has a consequence worth stating plainly: a serial campaign whose tasks omit
+`conflictDomains` is judged by this gate as *declared-empty*, not by the
+owned-paths fallback, because both worklist producers normalize an omitted field
+to `[]`. Whether that is the right answer — or whether the producers should
+preserve absence so the fallback becomes reachable — is an open design question
+tracked in #439; this page describes what the shipped code does, not which way
+that question will be resolved.
 
 The pre-agent fingerprint is never replaced until a gate has judged the pass it
 belongs to. A pass that ends without the gate running — a machinery fault, a
