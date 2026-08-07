@@ -6,6 +6,41 @@ authorized.
 
 ## [Unreleased]
 
+### Adapters and observability (#425, #434, #419)
+
+Three surfaces the operator reads to decide what is broken: a resume that
+must land in the directory its session lives in, a preflight tool that must
+not report failure for work that passed, and a test suite whose reds must
+mean something.
+
+#### #425 — the cross-cwd resume invariant is enforced rather than documented
+
+A harness that resolves a session by the directory it was launched in cannot
+reach that session from anywhere else. For `pi` the failure is soft: exit 0,
+`Session found in different project` on stdout, an interactive prompt on
+stderr, no work done — which in a headless pipeline reads as a successful
+attempt. No adapter argv can assert the invariant (pi exposes no cwd flag and
+a `--session-dir` pin does not bypass the filter), so enforcement is now
+Rust-side.
+
+- New adapter declaration `resumeRequiresLaunchCwd` (Nix option and
+  `AdapterConfig` field, default `false`). The `pi` preset declares it on
+  reproduced evidence; `codex` and `claude-code` do not, because codex
+  re-presents the directory in its own resume argv and claude-code has not
+  been measured here. A `false` says "unmeasured", never "safe".
+- `RowSeed` gained `session_cwd`, recorded beside `session_ref` at every seam
+  that writes the pointer from a scrape. It is `#[serde(skip)]` — transport
+  only, no durable-format change, no row-version move — because it is exactly
+  as durable as the pointer it qualifies: startup re-derives both from the
+  retained captures and the durable row.
+- `queue.continue` now refuses a continuation whose working directory is not
+  the recorded launch directory, naming **both** directories, and refuses
+  fail-closed when no launch directory was recorded rather than assuming
+  compatibility. Directory equality resolves before it compares, matching
+  pi's own `sessionCwdMatches(session.cwd, resolvedCwd)`.
+- `queue.retry` and recovery are deliberately not guarded: both re-render one
+  row's own resume against that row's own cwd and cannot move it.
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and

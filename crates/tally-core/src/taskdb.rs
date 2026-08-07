@@ -890,6 +890,25 @@ pub struct RowSeed {
     pub orchestration: Option<Orchestration>,
     #[serde(default)]
     pub session_ref: Option<String>,
+    /// The directory the attempt that yielded `session_ref` ran in, recorded
+    /// beside the pointer at the moment the pointer was observed.
+    ///
+    /// A harness that resolves a session by its launch directory — `pi` is the
+    /// measured one, see [`crate::adapters::AdapterConfig::resume_requires_launch_cwd`] —
+    /// cannot reach that session from anywhere else, so the pointer alone is
+    /// not enough to resume: what is missing is where it points *from*.
+    /// `None` states that tally does not know, which is what a row with no
+    /// declared cwd is: its unit inherited whatever directory the service
+    /// manager gave the daemon, and nothing recorded that.
+    ///
+    /// **Deliberately transport-only: `#[serde(skip)]`, so no write path can
+    /// persist it and no wire shape widens.** That is not a shortcut around a
+    /// row migration; it is the same rule `session_ref` itself lives under.
+    /// Neither survives a restart as bytes — startup re-derives both from the
+    /// retained captures and the durable row that produced them, so this field
+    /// is exactly as durable as the pointer it qualifies, and never more.
+    #[serde(skip)]
+    pub session_cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_message: Option<String>,
     /// Normalized usage for the attempt this row last recorded a scrape for.
@@ -984,6 +1003,18 @@ impl RowSeed {
     /// fallback included.
     pub fn effective_cwd(&self) -> Option<&Path> {
         effective_cwd(self.cwd.as_deref(), self.workspace.as_ref())
+    }
+
+    /// Record where this row's attempt ran, beside the session pointer its
+    /// stream just yielded. Called at every seam that writes `session_ref`
+    /// from a scrape, so the two are always written together or not at all.
+    ///
+    /// The directory is this row's own effective cwd because this row is the
+    /// attempt that produced the pointer: the executor passes
+    /// [`Self::effective_cwd`] to the unit verbatim as its working directory,
+    /// so it is the launch directory rather than a guess at one.
+    pub fn record_session_launch_cwd(&mut self) {
+        self.session_cwd = self.effective_cwd().map(Path::to_path_buf);
     }
 
     pub fn validate(&self) -> Result<(), TaskDbError> {
@@ -1771,6 +1802,7 @@ mod tests {
             brief_hash: None,
             orchestration: None,
             session_ref: None,
+            session_cwd: None,
             final_message: None,
             job_token_hash: None,
             lease_epoch: 7,

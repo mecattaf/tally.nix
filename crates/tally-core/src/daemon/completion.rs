@@ -460,6 +460,7 @@ impl DaemonHandler {
             let mut enriched = job;
             if let Ok(Some(session_ref)) = captures.session_ref() {
                 enriched.row.session_ref = Some(session_ref.to_owned());
+                enriched.row.record_session_launch_cwd();
             }
             if let Ok(Some(model)) = captures.model() {
                 enriched.row.model = Some(model.to_owned());

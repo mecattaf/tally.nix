@@ -365,6 +365,7 @@ pub(crate) mod fixtures {
                 .unwrap()
             }),
             session_ref: None,
+            session_cwd: None,
             final_message: None,
             job_token_hash: None,
             lease_epoch: 3,

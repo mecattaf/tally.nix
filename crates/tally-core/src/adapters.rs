@@ -209,6 +209,25 @@ pub struct AdapterConfig {
     pub skill_bundle: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skill_revision: Option<String>,
+    /// Whether this adapter's harness resolves a session by the directory the
+    /// session was launched in, so that a resume run anywhere else does not
+    /// reach that session.
+    ///
+    /// Declared rather than inferred, and false by default, because it is a
+    /// property of the target binary that only a measurement can establish.
+    /// The `pi` preset declares it on reproduced evidence: pi's own
+    /// `SessionManager.list` filters by `sessionCwdMatches(session.cwd,
+    /// resolvedCwd)` — exact resolved-path equality — and a cross-cwd
+    /// `--session` resume therefore prints `Session found in different
+    /// project`, prompts on stderr, and exits 0 having done no work. Nothing
+    /// in an adapter's argv can assert the invariant: pi offers no cwd flag,
+    /// and a `--session-dir` pin does not bypass the filter.
+    ///
+    /// An adapter that leaves this false says nothing, and tally enforces
+    /// nothing — silence is not a claim that cross-cwd resume is safe for that
+    /// harness, only that nobody has measured it here.
+    #[serde(default)]
+    pub resume_requires_launch_cwd: bool,
     #[serde(default)]
     pub extra_config: BTreeMap<String, Value>,
 }
@@ -300,6 +319,21 @@ pub enum AdapterError {
     CaptureNotUtf8(String),
     #[error("capture {capture:?} could not be scraped: {detail}")]
     Scrape { capture: String, detail: String },
+    /// Both directories are named because the operator's next action depends on
+    /// which one is wrong: re-run the continuation from the recorded directory,
+    /// or accept that this session belongs to a workspace that is gone.
+    #[error(
+        "adapter {adapter:?} resolves a session by its launch directory, so this resume would reach no session: it was launched in {recorded} and this attempt would run in {current}"
+    )]
+    CrossCwdResume {
+        adapter: String,
+        recorded: String,
+        current: String,
+    },
+    #[error(
+        "adapter {adapter:?} resolves a session by its launch directory, and no launch cwd was recorded for this session, so this resume ({current}) cannot be shown to reach it"
+    )]
+    UnrecordedLaunchCwd { adapter: String, current: String },
 }
 
 pub struct AdapterEngine<'a> {
@@ -424,6 +458,47 @@ impl<'a> AdapterEngine<'a> {
         invocation(name, adapter, options, compose_argv(&prefix, workload_argv))
     }
 
+    /// Refuse a resume that would run somewhere other than where the session
+    /// was launched, for an adapter that declares
+    /// [`AdapterConfig::resume_requires_launch_cwd`].
+    ///
+    /// This is a separate call rather than a parameter of
+    /// [`Self::resume_with_options`] because the two answer different
+    /// questions: rendering asks what argv the harness takes, and this asks
+    /// whether the session that argv names is reachable from where the attempt
+    /// will run. Only a caller that continues a *different* row can get the
+    /// second one wrong; re-rendering one row's own resume cannot move its cwd.
+    ///
+    /// Both refusals are fail-closed. `recorded` absent is refused rather than
+    /// assumed compatible: a session whose launch directory tally never
+    /// recorded is one whose reachability tally cannot state, and rendering it
+    /// anyway is how a cross-cwd pi resume exits 0 having done nothing.
+    pub fn guard_resume_launch_cwd(
+        &self,
+        name: &str,
+        recorded: Option<&Path>,
+        current: Option<&Path>,
+    ) -> Result<(), AdapterError> {
+        if !self.adapter(name)?.resume_requires_launch_cwd {
+            return Ok(());
+        }
+        let current_label = display_cwd(current);
+        let Some(recorded) = recorded else {
+            return Err(AdapterError::UnrecordedLaunchCwd {
+                adapter: name.to_owned(),
+                current: current_label,
+            });
+        };
+        if current.is_some_and(|current| same_directory(recorded, current)) {
+            return Ok(());
+        }
+        Err(AdapterError::CrossCwdResume {
+            adapter: name.to_owned(),
+            recorded: recorded.display().to_string(),
+            current: current_label,
+        })
+    }
+
     pub fn scrape_text(
         &self,
         name: &str,
@@ -482,6 +557,36 @@ impl<'a> AdapterEngine<'a> {
             String::new()
         };
         self.scrape_text(name, &stdout, &stderr)
+    }
+}
+
+/// How an absent working directory is named in a refusal. A job with no cwd
+/// runs wherever the service manager put the daemon, which tally never
+/// recorded — so this is a statement of ignorance, not a path.
+fn display_cwd(cwd: Option<&Path>) -> String {
+    cwd.map_or_else(
+        || "<no working directory declared>".to_owned(),
+        |cwd| cwd.display().to_string(),
+    )
+}
+
+/// Whether two spellings name the directory a cwd-keyed harness would resolve
+/// them to.
+///
+/// Literal equality answers first and is what the common case hits. Otherwise
+/// both are resolved, because pi compares `sessionCwdMatches(session.cwd,
+/// resolvedCwd)` — a symlinked or `.`-laden spelling of the launch directory
+/// *is* the launch directory to it. A path that cannot be resolved at all is
+/// never treated as equal: a resume into a directory that no longer exists
+/// reaches no session either, so refusing is the honest answer rather than a
+/// conservative one.
+fn same_directory(recorded: &Path, current: &Path) -> bool {
+    if recorded == current {
+        return true;
+    }
+    match (recorded.canonicalize(), current.canonicalize()) {
+        (Ok(recorded), Ok(current)) => recorded == current,
+        _ => false,
     }
 }
 
@@ -1186,6 +1291,7 @@ mod tests {
     fn adapter() -> AdapterConfig {
         AdapterConfig {
             argv: vec!["agent".to_owned(), "--batch".to_owned()],
+            resume_requires_launch_cwd: false,
             resume: Some(vec![
                 "agent".to_owned(),
                 "resume".to_owned(),
@@ -1704,6 +1810,108 @@ mod tests {
                 .argv,
             ["/bin/echo", "literal;value"]
         );
+    }
+
+    /// #425. The invariant a cwd-keyed harness holds and tally cannot express
+    /// in argv: the session lives where it was launched, so a resume anywhere
+    /// else reaches nothing and — for pi specifically — exits 0 having done no
+    /// work. The refusal names both directories because which one is wrong
+    /// decides what the operator does next.
+    #[test]
+    fn a_cwd_keyed_resume_is_refused_off_its_launch_directory_and_names_both() {
+        let mut keyed = adapter();
+        keyed.resume_requires_launch_cwd = true;
+        let adapters = BTreeMap::from([
+            ("keyed".to_owned(), keyed),
+            // The same adapter declaring nothing. Silence must enforce
+            // nothing, or every adapter inherits an invariant only pi was
+            // measured to hold.
+            ("silent".to_owned(), adapter()),
+        ]);
+        let engine = engine(&adapters);
+        engine.validate_all().unwrap();
+
+        let launched = Path::new("/workspace/repo-a");
+        let elsewhere = Path::new("/workspace/repo-b");
+
+        engine
+            .guard_resume_launch_cwd("keyed", Some(launched), Some(launched))
+            .unwrap();
+
+        let refused = engine
+            .guard_resume_launch_cwd("keyed", Some(launched), Some(elsewhere))
+            .unwrap_err();
+        let message = refused.to_string();
+        assert!(matches!(refused, AdapterError::CrossCwdResume { .. }));
+        assert!(
+            message.contains("/workspace/repo-a") && message.contains("/workspace/repo-b"),
+            "the refusal must name both directories: {message}"
+        );
+
+        // A row that declared no working directory ran wherever the service
+        // manager put the daemon. Naming that absence is the honest refusal;
+        // guessing the current directory would be a fabricated launch site.
+        let undeclared = engine
+            .guard_resume_launch_cwd("keyed", Some(launched), None)
+            .unwrap_err();
+        assert!(matches!(undeclared, AdapterError::CrossCwdResume { .. }));
+        assert!(
+            undeclared
+                .to_string()
+                .contains("<no working directory declared>"),
+            "{undeclared}"
+        );
+
+        // No record at all — a pointer observed before this field existed, or
+        // one whose row never declared a cwd. Refusing beats assuming.
+        let unrecorded = engine
+            .guard_resume_launch_cwd("keyed", None, Some(launched))
+            .unwrap_err();
+        assert!(matches!(
+            unrecorded,
+            AdapterError::UnrecordedLaunchCwd { .. }
+        ));
+        assert!(
+            unrecorded.to_string().contains("/workspace/repo-a"),
+            "{unrecorded}"
+        );
+
+        // An adapter that declares nothing is unaffected in every one of those
+        // shapes, including the unrecorded one.
+        engine
+            .guard_resume_launch_cwd("silent", Some(launched), Some(elsewhere))
+            .unwrap();
+        engine
+            .guard_resume_launch_cwd("silent", None, None)
+            .unwrap();
+    }
+
+    /// Two spellings of one directory are one directory to a harness that
+    /// resolves the path before comparing it, which is exactly what pi's
+    /// `sessionCwdMatches(session.cwd, resolvedCwd)` does. A path that cannot
+    /// be resolved is not equal to anything, because a resume into a directory
+    /// that no longer exists reaches no session either.
+    #[test]
+    fn launch_directory_equality_resolves_before_it_compares() {
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().join("session-home");
+        std::fs::create_dir(&real).unwrap();
+        let link = temp.path().join("via-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert!(same_directory(&real, &link));
+        assert!(same_directory(&real, &real.join(".")));
+        assert!(!same_directory(&real, &temp.path().join("absent")));
+        assert!(!same_directory(
+            &temp.path().join("absent"),
+            &temp.path().join("absent-too")
+        ));
+        // Two identical spellings of a directory that does not exist still name
+        // one directory; literal equality answers before resolution is tried.
+        assert!(same_directory(
+            &temp.path().join("absent"),
+            &temp.path().join("absent")
+        ));
     }
 
     #[test]

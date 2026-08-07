@@ -441,6 +441,7 @@ mod tests {
                 program.to_string_lossy().into_owned(),
                 "--structured".to_owned(),
             ],
+            resume_requires_launch_cwd: false,
             resume: Some(vec![
                 program.to_string_lossy().into_owned(),
                 "--resume".to_owned(),
@@ -2150,6 +2151,7 @@ mod tests {
             brief_hash: None,
             orchestration: None,
             session_ref: None,
+            session_cwd: None,
             final_message: None,
             job_token_hash: None,
             lease_epoch,
@@ -3258,6 +3260,7 @@ mod tests {
                     "resumable".to_owned(),
                     AdapterConfig {
                         argv: vec![program.to_string_lossy().into_owned()],
+                        resume_requires_launch_cwd: false,
                         resume: Some(vec![
                             program.to_string_lossy().into_owned(),
                             "--resume".to_owned(),
@@ -5754,6 +5757,152 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(terminal["verdict"], "pass");
+            })
+            .await;
+    }
+
+    /// #425. A harness that resolves a session by the directory it was
+    /// launched in cannot reach that session from anywhere else, and pi's
+    /// version of "cannot reach" is exit 0 with an interactive prompt on
+    /// stderr — a successful attempt that did no work, which is the worst
+    /// shape a headless pipeline can be handed. `queue.continue` is the one
+    /// seam where the directory can move, so it is the one that refuses.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_continuation_off_the_launch_directory_is_refused_naming_both_directories() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let temp = tempdir().unwrap();
+                let paths = DaemonPaths {
+                    socket: temp.path().join("run/tally.sock"),
+                    state_dir: temp.path().join("state"),
+                    data_dir: temp.path().join("data"),
+                };
+                let launched_in = temp.path().join("session-home");
+                let elsewhere = temp.path().join("another-checkout");
+                std::fs::create_dir(&launched_in).unwrap();
+                std::fs::create_dir(&elsewhere).unwrap();
+                let program = temp.path().join("cwd-keyed-agent");
+                crate::test_support::install_shell_program(
+                    &program,
+                    "#!/bin/sh\nprintf '%s\\n' '{\"thread_id\":\"session-31\"}'\n",
+                );
+                let mut config = one_pool_config();
+                config.adapters.insert(
+                    "cwd-keyed".to_owned(),
+                    AdapterConfig {
+                        argv: vec![
+                            program.to_string_lossy().into_owned(),
+                            "fresh".to_owned(),
+                            "--".to_owned(),
+                        ],
+                        resume_requires_launch_cwd: true,
+                        resume: Some(vec![
+                            program.to_string_lossy().into_owned(),
+                            "resume".to_owned(),
+                            "%<sessionRef>%".to_owned(),
+                            "--".to_owned(),
+                        ]),
+                        scrape: BTreeMap::from([(
+                            "sessionRef".to_owned(),
+                            ScrapeCapture {
+                                stream: ScrapeStream::Stdout,
+                                mode: ScrapeMode::JsonPath,
+                                pattern: "$..thread_id".to_owned(),
+                                fields: Default::default(),
+                            },
+                        )]),
+                        ..AdapterConfig::default()
+                    },
+                );
+                config.validate().unwrap();
+                let executor = direct_executor(&paths.state_dir)
+                    .with_systemd_run(temp.path().join("absent-systemd-run"))
+                    .with_unit_probe(ExitFileProbe);
+                let mut daemon = Daemon::open_with_executor(config, paths, settings(), executor)
+                    .await
+                    .unwrap();
+                let first = daemon
+                    .handler
+                    .enqueue_as_client(Some(json!({
+                        "argv": ["initial request"],
+                        "pool": "slot",
+                        "adapter": "cwd-keyed",
+                        "cwd": launched_in.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap();
+                let finished =
+                    tokio::time::timeout(Duration::from_secs(2), daemon.completion_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                daemon.finish_job(finished).await.unwrap();
+                daemon.handler.drain_post_ack_tasks().await;
+                let first_id = first["job_id"].as_str().unwrap().to_owned();
+
+                let refused = daemon
+                    .handler
+                    .continue_job_as_client(Some(json!({
+                        "resumeFrom": first_id,
+                        "argv": ["address review"],
+                        "cwd": elsewhere.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap_err();
+                let message = format!("{refused:?}");
+                assert!(
+                    message.contains(launched_in.to_str().unwrap())
+                        && message.contains(elsewhere.to_str().unwrap()),
+                    "the refusal must name the recorded and the requested directory: {message}"
+                );
+
+                // Fail-closed means nothing was admitted: no second row, no
+                // unit, nothing for an operator to mistake for progress.
+                {
+                    let context = daemon.handler.context.read().await;
+                    assert_eq!(context.rows.len(), 1);
+                }
+
+                // The control. The same continuation in the directory the
+                // session was launched in is admitted and renders the resume
+                // argv, so the refusal above is about the directory and not
+                // about continuation being broken.
+                let continued = daemon
+                    .handler
+                    .continue_job_as_client(Some(json!({
+                        "resumeFrom": first_id,
+                        "argv": ["address review"],
+                        "cwd": launched_in.to_string_lossy(),
+                    })))
+                    .await
+                    .unwrap();
+                let continued_id = Uuid::parse_str(continued["job_id"].as_str().unwrap()).unwrap();
+                let continued_job = daemon
+                    .handler
+                    .context
+                    .read()
+                    .await
+                    .jobs
+                    .get(&continued_id)
+                    .cloned()
+                    .unwrap();
+                assert_eq!(
+                    continued_job.invocation.argv,
+                    [
+                        program.to_string_lossy().into_owned(),
+                        "resume".to_owned(),
+                        "session-31".to_owned(),
+                        "--".to_owned(),
+                        "address review".to_owned(),
+                    ]
+                );
+                // The record travels with the pointer: the continuation row
+                // carries both, so continuing the continuation is guarded too.
+                assert_eq!(
+                    continued_job.row.session_cwd.as_deref(),
+                    Some(launched_in.as_path())
+                );
             })
             .await;
     }

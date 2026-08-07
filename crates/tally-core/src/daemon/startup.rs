@@ -1261,6 +1261,7 @@ pub(super) fn apply_adapter_metadata(
     }
     if let Ok(Some(session_ref)) = captures.session_ref() {
         row.session_ref = Some(session_ref.to_owned());
+        row.record_session_launch_cwd();
     }
     if let Ok(Some(model)) = captures.model() {
         row.model = Some(model.to_owned());
@@ -1303,6 +1304,7 @@ pub(super) fn hydrate_represent_adapter_metadata(
             .ok_or_else(|| DaemonError::Invalid(format!("recovery row {uuid} is absent")))?;
         if session_ref.is_some() {
             recovery.row.session_ref = session_ref;
+            recovery.row.record_session_launch_cwd();
         }
         if model.is_some() {
             recovery.row.model = model;
@@ -1361,6 +1363,7 @@ pub(super) fn hydrate_adopted_adapter_metadata(
         };
         if let Some(session_ref) = captures.session_ref()? {
             recovery.row.session_ref = Some(session_ref.to_owned());
+            recovery.row.record_session_launch_cwd();
         }
         if let Some(model) = captures.model()? {
             recovery.row.model = Some(model.to_owned());
@@ -1873,6 +1876,7 @@ pub(super) fn install_recovery_jobs(
         if let Some(captures) = captures {
             if let Some(session_ref) = captures.session_ref()? {
                 row.session_ref = Some(session_ref.to_owned());
+                row.record_session_launch_cwd();
             }
             if let Some(model) = captures.model()? {
                 row.model = Some(model.to_owned());

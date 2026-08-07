@@ -5229,7 +5229,18 @@
             test "$(jq -c '.adapters.codex.resume' ${adapterConfig})" = '["codex","-C","%<cwd>%","exec","resume","--json","--model","%<model>%","%<sessionRef>%","--"]'
             test "$(jq -c '.adapters.codex.launch.cwdArgv' ${adapterConfig})" = '["-C","%<cwd>%"]'
             test "$(jq -c '.adapters.codex.launch.sandboxPolicies["dangerously-bypass"]' ${adapterConfig})" = '["--dangerously-bypass-approvals-and-sandbox"]'
-            test "$(jq -c '.adapters.shell' ${adapterConfig})" = '{"argv":[],"env":{},"extraConfig":{},"extraWritablePaths":[],"launch":{},"resume":null,"scrape":{},"trace":null,"yieldHook":null}'
+            test "$(jq -c '.adapters.shell' ${adapterConfig})" = '{"argv":[],"env":{},"extraConfig":{},"extraWritablePaths":[],"launch":{},"resume":null,"resumeRequiresLaunchCwd":false,"scrape":{},"trace":null,"yieldHook":null}'
+            # The cross-cwd resume invariant is a declaration, and pi is the
+            # only preset with the measurement behind it: pi's SessionManager
+            # filters by exact resolved-path equality, so a resume from another
+            # directory prints `Session found in different project`, prompts on
+            # stderr, and exits 0 having done no work. codex re-presents the
+            # directory in its own resume argv (`-C %<cwd>%`) and claude-code
+            # has not been measured here, so neither declares it -- silence is
+            # "unmeasured", never "safe".
+            test "$(jq -r '.adapters.pi.resumeRequiresLaunchCwd' ${adapterConfig})" = true
+            test "$(jq -r '.adapters.codex.resumeRequiresLaunchCwd' ${adapterConfig})" = false
+            test "$(jq -r '.adapters["claude-code"].resumeRequiresLaunchCwd' ${adapterConfig})" = false
             for preset in pi claude-code codex; do
               test "$(jq -c --arg preset "$preset" '.adapters[$preset].yieldHook' ${adapterConfig})" = '["tally","lease","status"]'
               test "$(jq -r --arg preset "$preset" '.adapters[$preset].scrape.sessionRef.mode' ${adapterConfig})" = jsonPath
