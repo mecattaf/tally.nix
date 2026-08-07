@@ -258,16 +258,55 @@ pub(super) async fn run_query(
             )
             .await
         }
-        QueryCommand::Run { id, json, status } => {
+        QueryCommand::Run {
+            id,
+            json,
+            status,
+            durable,
+            state_dir,
+            data_dir,
+        } => {
+            let status = status.map(RunTaskFilter::as_str);
+            // Asked for outright: no daemon is contacted at all, which is the
+            // point when the socket is answering but the daemon is not.
+            if durable {
+                return print_durable_run(socket, state_dir, data_dir, &id, json, status);
+            }
             let client = connect_rpc(socket, config_path).await?;
-            let result = client
+            let result = match client
                 .call_with_deadline("query.run", Some(json!({"id": id})), rpc_timeout)
-                .await?;
+                .await
+            {
+                Ok(result) => result,
+                // Automatic rather than flag-only, deliberately. A read that
+                // exceeds its deadline is the exact moment an operator is
+                // diagnosing a stalled daemon (#431), and making them rerun the
+                // command with a flag they have to remember costs the minutes
+                // this fallback exists to give back. The fallback is safe to
+                // take automatically because it is labelled in both renderings
+                // and never claims to be live, and it is scoped to a timeout so
+                // no other failure quietly changes what this command answers.
+                Err(error) if is_rpc_timeout(&error) => {
+                    errln!(
+                        "tally: query.run did not return within {} s; the daemon may be stalled (see #431). Falling back to the durable-state view.",
+                        rpc_timeout.as_secs()
+                    );
+                    return print_durable_run(socket, state_dir, data_dir, &id, json, status);
+                }
+                Err(error) => return Err(error.into()),
+            };
             if json {
+                let mut result = result;
+                if let Some(object) = result.as_object_mut() {
+                    // Stated on the live rendering too, so a consumer can tell
+                    // the two apart by reading a field rather than by noticing
+                    // the absence of one.
+                    object.insert("view".to_owned(), json!("live"));
+                }
                 outln!("{}", serde_json::to_string(&result)?);
                 Ok(())
             } else {
-                print_run_human(&result, status.map(RunTaskFilter::as_str))
+                print_run_human(&result, status)
             }
         }
         QueryCommand::Status { pool } => {
@@ -846,6 +885,66 @@ fn print_run_usage(usage: &Value) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Whether this failure is "the daemon did not answer in time" rather than "the
+/// daemon answered, and the answer was an error". Only the first justifies
+/// answering from disk instead.
+fn is_rpc_timeout(error: &WireIoError) -> bool {
+    matches!(
+        error,
+        WireIoError::DeadlineExceeded { .. } | WireIoError::RearmDeadlineExceeded { .. }
+    )
+}
+
+/// Render one run from the durable stores, labelled as such in both shapes.
+///
+/// The label is the whole reason this is allowed to be automatic. A durable
+/// view that read as a live one would be a worse defect than the blindness it
+/// cures, so JSON carries `view: "durable-state"` plus the caveats, and the
+/// human rendering leads with them.
+fn print_durable_run(
+    socket: &Path,
+    state_dir: Option<PathBuf>,
+    data_dir: Option<PathBuf>,
+    id: &str,
+    json: bool,
+    status_filter: Option<&str>,
+) -> Result<()> {
+    let paths = DaemonPaths {
+        socket: socket.to_owned(),
+        state_dir: state_dir.map_or_else(default_state_dir, Ok)?,
+        data_dir: data_dir.map_or_else(default_data_dir, Ok)?,
+    };
+    // Built for one purpose: resolving retained capture paths for failing
+    // tasks, the same pointers the live `query.run` attaches. It executes
+    // nothing here.
+    let executor = std::env::current_exe()
+        .ok()
+        .map(|program| Executor::new(&paths.state_dir, program));
+    let durable =
+        durable_run_view(&paths, id, executor.as_ref(), Utc::now()).map_err(
+            |error| match error {
+                DurableViewError::Projection(ObservabilityError::UnknownJob(id)) => {
+                    exit_failure(4, format!("run {id} is not in durable state"))
+                }
+                error => exit_failure(1, error.to_string()),
+            },
+        )?;
+    let mut value = serde_json::to_value(&durable.view)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("view".to_owned(), json!("durable-state"));
+        object.insert("live".to_owned(), json!(false));
+        object.insert("caveats".to_owned(), json!(durable.caveats));
+    }
+    if json {
+        outln!("{}", serde_json::to_string(&value)?);
+        return Ok(());
+    }
+    for caveat in &durable.caveats {
+        outln!("! {caveat}");
+    }
+    print_run_human(&value, status_filter)
 }
 
 fn print_run_human(run: &Value, status_filter: Option<&str>) -> Result<()> {

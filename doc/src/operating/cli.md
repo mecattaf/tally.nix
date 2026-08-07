@@ -124,6 +124,13 @@ $ tally adapter smoke codex --sandbox danger-full-access \
     --approval-policy never --assert-commit
 ```
 
+The smoke's own verdict is three-valued and is reported on `verdictState`: `PASS` (exit 0),
+`FAIL` (exit 1), or `VERDICT-UNAVAILABLE` (exit 5) when a result read exceeded its RPC deadline.
+The third is never a statement about the adapter — see
+[Exit codes](../reference/errors.md#i-could-not-read-the-verdict-is-not-the-adapter-failed).
+The deadline for that read is `--rpc-timeout-sec` / `TALLY_RPC_TIMEOUT_SEC`, and the value used
+is echoed on `rpcTimeoutSec`.
+
 Every invocation is keyless, so it creates a new execution rather than reusing
 an earlier pass. The job is bounded to five minutes, carries `noEnqueue`, and
 records this witnessed `evidenceClass` marker:

@@ -171,6 +171,43 @@ the same rollup for every run its window touched and reader-state did not hide (
 with the three fixed statements every entry would repeat stated once instead in a digest-level
 `usageBasis`.
 
+### When the daemon stops answering
+
+Every read above goes through the daemon, so a stalled daemon takes observability with it —
+exactly when an operator is diagnosing the stall (#431). `query run` therefore has a second
+source. When a live `query.run` exceeds its RPC deadline the command falls back **automatically**
+to a durable-state view read from disk, and `--durable` asks for the same view without contacting
+the daemon at all:
+
+```console
+$ tally query run <flow-run-uuid> --durable \
+    --state-dir /var/lib/tally/state --data-dir /var/lib/tally/data
+```
+
+The fallback is automatic rather than flag-only because a deadline is exactly the moment an
+operator has no time to spend rerunning a command with a flag they have to remember. It is safe
+to take automatically because it is labelled in both renderings and never claims to be live:
+`--json` carries `view: "durable-state"`, `live: false`, and a `caveats` array; the human
+rendering leads with the same caveats on `!` lines. The live rendering states `view: "live"` for
+the same reason, so a consumer tells them apart by reading a field rather than by noticing the
+absence of one. Only a *timeout* falls back; no other failure quietly changes what the command
+answers.
+
+Read it as strictly weaker than the live view. It is reconstructed from the durable enqueue
+events, the verified witness ledger, the lifecycle history, durable flow membership, the advisory
+attestation ledger, and the retained capture tree — so it carries the reconciled task table,
+terminal verdicts, the usage rollup, and failure capture pointers. It cannot carry in-flight
+state: a task the daemon is running right now has no terminal witness yet and reads as pending,
+because the systemd unit facts that distinguish the two are the daemon's to collect. It is also
+not a snapshot at one instant, and it is read-only — it never creates, locks, or repairs a
+durable store, because a diagnostic must not be able to damage the thing it is diagnosing.
+
+The two directories are the daemon's own, and they default to `$XDG_STATE_HOME/tally` and
+`$XDG_DATA_HOME/tally`. Pass `--state-dir` and `--data-dir` when the daemon's are elsewhere — a
+NixOS deployment's are `/var/lib/tally/state` and `/var/lib/tally/data` — for the same reason
+`tally reader-state` needs them: a wrong directory is not an error, it is an empty answer about a
+run that is not there.
+
 `query log` restricts the lifecycle stream to the run's nodes, resolved from the
 orchestration capsule on the durable rows and the witness chain, because a
 lifecycle event carries no capsule of its own. `query proof` returns one proof

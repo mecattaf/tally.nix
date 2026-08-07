@@ -7,6 +7,7 @@ pub mod capture_migration;
 pub mod completion;
 pub mod config;
 pub mod daemon;
+pub mod durable_view;
 pub mod evidence;
 pub mod exec_attestation;
 pub mod executor;

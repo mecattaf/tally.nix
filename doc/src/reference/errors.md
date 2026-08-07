@@ -89,11 +89,37 @@ The general CLI contract is:
 | 2 | CLI/request usage failure, RPC `invalid_params`, selected flow startup identity failures, or invalid witness-comparison inputs. |
 | 3 | Daemon socket unreachable **or** a waited job ended `clean-exit-no-artifact`. |
 | 4 | RPC `not_found` **or** a waited job was `cancelled`. |
+| 5 | `tally adapter smoke` could not read its verdict: a result read exceeded its RPC deadline. Never a statement about the adapter. |
 | 10 | Flow script, evaluation, determinism, or runtime-bound failure. |
 | 20 | Flow replay-integrity failure. |
 
 Clap parse errors also exit 2; `--help` and `--version` exit 0. Generic configuration and local
 I/O failures normally exit 1.
+
+### "I could not read the verdict" is not "the adapter failed"
+
+`tally adapter smoke` reports a three-valued verdict on its `verdictState` field, beside the
+daemon's own `verdict` for the job:
+
+| `verdictState` | Exit | Meaning |
+|---|---:|---|
+| `PASS` | 0 | The adapter ran, every declared capture projected, and any commit probe verified. |
+| `FAIL` | 1 | The adapter, or something the smoke asserts about it, failed. |
+| `VERDICT-UNAVAILABLE` | 5 | A result read exceeded its RPC deadline. The adapter may have passed, failed, or still be running; the smoke states only that the daemon did not answer. |
+
+`VERDICT-UNAVAILABLE` exists because conflating it with `FAIL` cost real diagnosis time on
+2026-08-07: two smokes whose daemon-side verdicts were exit 0 and witness-emitted **pass** were
+reported as failures because their `query.job` read timed out during a daemon stall (#431). The
+diagnostic object is still printed in this state, carrying the task UUID, the execution verdict
+if one was read, and `rpcTimeoutSec` — the deadline that run actually used. A retained commit
+probe is kept rather than judged: nothing in this state established that it may go.
+
+The deadline for the smoke's result read is the ordinary `--rpc-timeout-sec` /
+`TALLY_RPC_TIMEOUT_SEC` knob (default 60). It previously used a private 10-second constant no
+flag could reach, so the one knob an operator had did not govern the one read that timed out
+under a stall. The 10-second *capture projection* window is a separate bound and still its own:
+it answers "the daemon replied and has not projected this capture yet", which is a missing-capture
+`FAIL`.
 
 ### Admission is not completion
 

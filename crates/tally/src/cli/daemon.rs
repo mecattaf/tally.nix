@@ -1,5 +1,20 @@
 use super::*;
 
+/// The recovery policy this CLI starts its daemon under.
+///
+/// Named rather than spelled inline because a second reader now depends on it:
+/// `query run --durable` derives row states by running the same recovery
+/// derivation over the same durable facts, and a durable view computed under a
+/// different policy would report states the daemon would not.
+pub(super) const DAEMON_RECOVERY_POLICY: RecoveryPolicy = RecoveryPolicy {
+    retry: RetryPolicy {
+        auto_pool_return: true,
+        auto_resource_return: false,
+        auto_bounded_requeue: false,
+    },
+    max_attempts: 2,
+};
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_daemon_runtime(
     config_path: Option<PathBuf>,
@@ -34,14 +49,7 @@ pub(super) async fn run_daemon_runtime(
                 memory_max_bytes,
             },
             yield_grace: std::time::Duration::from_secs(yield_grace_sec),
-            recovery_policy: RecoveryPolicy {
-                retry: RetryPolicy {
-                    auto_pool_return: true,
-                    auto_resource_return: false,
-                    auto_bounded_requeue: false,
-                },
-                max_attempts: 2,
-            },
+            recovery_policy: DAEMON_RECOVERY_POLICY,
             max_connections: DEFAULT_MAX_CONNECTIONS,
         },
         recorder_program,

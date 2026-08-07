@@ -41,6 +41,34 @@ Rust-side.
 - `queue.retry` and recovery are deliberately not guarded: both re-render one
   row's own resume against that row's own cwd and cannot move it.
 
+#### #434 — RPC reads stay honest during a daemon stall
+
+`adapter smoke` reported **failure** for two smokes whose daemon-side verdicts
+were exit 0 and witness-emitted PASS, because their `query.job` read timed out
+during a stall (#431). A false negative from the estate's preflight tool costs
+diagnosis time and poisons the operator's model of what is broken.
+
+- `adapter smoke`'s verdict is now three-valued on a `verdictState` field:
+  `PASS` (exit 0), `FAIL` (exit 1), `VERDICT-UNAVAILABLE` (exit **5**). A
+  timed-out result read is never rendered as adapter failure, the diagnostic
+  object is still printed in that state, and a retained commit probe is kept
+  rather than judged.
+- The smoke's result read is now bounded by `--rpc-timeout-sec` /
+  `TALLY_RPC_TIMEOUT_SEC` (default 60) instead of a private 10-second constant
+  no flag could reach; the value used is echoed on `rpcTimeoutSec`. The
+  10-second capture-*projection* window remains its own separate bound, because
+  "not projected yet" and "not answered at all" are different failures.
+- `tally query run` gained a durable-state view: automatic on RPC timeout, and
+  available outright as `--durable` (with `--state-dir`/`--data-dir`). It
+  reconstructs the run from durable enqueue events, the verified witness
+  ledger, the lifecycle history, durable membership, the advisory attestation
+  ledger, and the retained capture tree — reconciled task table, terminal
+  verdicts, usage rollup, and failure capture pointers, with no live RPC. It is
+  labelled in both renderings (`view: "durable-state"`, `live: false`, plus
+  caveats; the live path now states `view: "live"`), shows no in-flight state,
+  and is strictly read-only: it never creates, locks, or repairs a durable
+  store.
+
 ### Steward driver gates (#385, #386)
 
 Two mechanisms that both live at the boundary between an unattended agent and
