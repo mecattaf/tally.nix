@@ -411,6 +411,13 @@ in
         witnessEmitter
       ];
 
+      # The deployment's data directory, in the operator's own session
+      # environment (#416): the direct-file verbs are the operator's, run
+      # from the operator's shell on this module, so the export belongs to
+      # the session as well as to the units below. mkDefault, so an
+      # operator's own sessionVariables declaration wins.
+      home.sessionVariables.TALLY_DATA_DIR = lib.mkDefault (toString cfg.dataDir);
+
       home.activation.tallyRuntimeDirectories =
         lib.hm.dag.entryBetween [ "reloadSystemd" ] [ "writeBoundary" ]
           ''
@@ -455,6 +462,12 @@ in
               "TALLY_CONFIG_GENERATION=${checkedConfig}"
               "TALLY_NIX_PROGRAM=${pkgs.nix}/bin/nix"
               "TALLY_NIX_STORE_PROGRAM=${pkgs.nix}/bin/nix-store"
+              # The deployment's data directory, exported wherever this
+              # module configures one (#416): a direct-file verb that
+              # resolves its default through TALLY_DATA_DIR aims at this
+              # store instead of creating a fresh one wherever its XDG
+              # fallback lands.
+              "TALLY_DATA_DIR=${toString cfg.dataDir}"
             ];
             RuntimeDirectory = "tally";
             RuntimeDirectoryMode = "0700";
@@ -531,7 +544,10 @@ in
               "${witnessEmitter}/bin/tally-witness-emit"
               "%i"
             ];
-            Environment = [ "TALLY_ATTESTATION_LEDGER=${toString cfg.dataDir}/attestations.jsonl" ];
+            Environment = [
+              "TALLY_ATTESTATION_LEDGER=${toString cfg.dataDir}/attestations.jsonl"
+              "TALLY_DATA_DIR=${toString cfg.dataDir}"
+            ];
             UMask = "0077";
           };
         };
@@ -555,7 +571,10 @@ in
             Type = "oneshot";
             TimeoutStartSec = "infinity";
             ExecStart = lib.escapeShellArgs (common.mkRetentionArgv cfg);
-            Environment = [ "PATH=${lib.makeBinPath [ pkgs.nix ]}" ];
+            Environment = [
+              "PATH=${lib.makeBinPath [ pkgs.nix ]}"
+              "TALLY_DATA_DIR=${toString cfg.dataDir}"
+            ];
             UMask = "0077";
             NoNewPrivileges = true;
             PrivateTmp = true;
